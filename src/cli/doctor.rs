@@ -132,15 +132,21 @@ pub(crate) fn doctor() -> ExitCode {
             // Say it plainly even when present: unlike bubblewrap and nix above, git is not a
             // prerequisite — a sandbox launches without it. It only enables `sbx plugins store`.
             println!(
-                "         {dim}· optional — needed only for `sbx plugins store`, not to run a \
-                 sandbox{r}",
-                dim = pal.dim
+                "         {}",
+                style::dim_prose(
+                    "· optional — needed only for `sbx plugins store`, not to run a sandbox",
+                    &pal
+                )
             );
         }
         None => println!(
-            "  {} git               not found on PATH — optional, needed only for \
-             `sbx plugins store`",
-            tag_warn(&pal)
+            "  {} {}",
+            tag_warn(&pal),
+            style::prose(
+                "git               not found on PATH — optional, needed only for \
+                 `sbx plugins store`",
+                &pal
+            )
         ),
     }
 
@@ -205,12 +211,12 @@ pub(crate) fn doctor() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
-        eprintln!(
+        crate::diag::error(&format!(
             "{}sbx: missing prerequisite(s) — sbx CANNOT run until these are resolved:{}",
             epal.err, epal.reset
-        );
+        ));
         for hint in remediation {
-            eprintln!("       {}•{} {hint}", epal.err, epal.reset);
+            crate::diag::hint(&format!("       {}•{} {hint}", epal.err, epal.reset));
         }
         ExitCode::FAILURE
     }
@@ -291,7 +297,10 @@ fn report_storage(pal: &style::Palette) {
         println!("         {dim}· an encapsulated volume would add little{r}");
     } else if pre.recommends_volume() {
         println!("  {ok} storage           {ty} — a compressed btrfs volume is available");
-        println!("         {dim}· adopt one with `sbx storage init`{r}");
+        println!(
+            "         {}",
+            style::dim_prose("· adopt one with `sbx storage init`", pal)
+        );
     } else if let Some(blocker) = pre.mount_blocker() {
         println!("  {warn} storage           {ty} — no encapsulated volume here: {blocker}");
         println!("         {dim}· $SBX_DATA_DIR can still point sbx at an existing btrfs mount{r}");
@@ -299,11 +308,21 @@ fn report_storage(pal: &style::Palette) {
         // Mountable in principle, but udisks needs a local active session to do it unattended.
         println!("  {ok} storage           {ty} — a volume needs a local active session");
         println!(
-            "         {dim}· udisks asks for authentication over SSH; `sbx storage init` to try{r}"
+            "         {}",
+            style::dim_prose(
+                "· udisks asks for authentication over SSH; `sbx storage init` to try",
+                pal
+            )
         );
     } else if !pre.kernel_btrfs {
         println!("  {ok} storage           {ty} — btrfs kernel support not detected");
-        println!("         {dim}· a mount would try to autoload it; `sbx storage init` to try{r}");
+        println!(
+            "         {}",
+            style::dim_prose(
+                "· a mount would try to autoload it; `sbx storage init` to try",
+                pal
+            )
+        );
     } else {
         println!("  {ok} storage           {ty}");
     }

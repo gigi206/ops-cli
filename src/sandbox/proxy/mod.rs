@@ -168,7 +168,7 @@ pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()
                 // A transient accept error (host fd exhaustion, an aborted connection) must not
                 // take the whole session's egress down — skip this connection and keep serving. A
                 // short sleep avoids a hot spin if the condition persists.
-                eprintln!("sbx: egress proxy: accept error: {e}");
+                crate::diag::error(&format!("sbx: egress proxy: accept error: {e}"));
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }

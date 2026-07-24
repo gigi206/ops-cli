@@ -74,9 +74,9 @@ fn resolve_session_target<'a>(
             .iter()
             .find(|s| s.pid.to_string() == id)
             .ok_or_else(|| {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: {verb}: no live session '{id}' — run `sbx session ls` to list them."
-                );
+                ));
                 ExitCode::from(2)
             }),
         None => match sessions {
@@ -193,8 +193,8 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
         match a.to_str() {
             Some("--json") => json = true,
             Some(other) => {
-                eprintln!("sbx: path: unknown argument `{other}`");
-                eprintln!("       run `sbx help path` for usage.");
+                diag::error(&format!("sbx: path: unknown argument `{other}`"));
+                diag::hint("       run `sbx help path` for usage.");
                 return ExitCode::from(2);
             }
             None => {
@@ -247,7 +247,7 @@ fn take_flag_value(
             Ok(())
         }
         None => {
-            eprintln!("sbx: {verb}: `{flag}` needs a value");
+            diag::error(&format!("sbx: {verb}: `{flag}` needs a value"));
             Err(ExitCode::from(2))
         }
     }

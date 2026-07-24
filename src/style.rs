@@ -78,6 +78,68 @@ impl Palette {
             Self::plain()
         }
     }
+
+    /// Whether this palette paints nothing — the discriminant every span painter keys on, so a
+    /// plain stream keeps its backtick markup verbatim instead of having it silently dropped.
+    pub(crate) fn is_plain(&self) -> bool {
+        self.reset.is_empty()
+    }
+}
+
+/// Lift each `` `…` `` span in `text` to `hue` — the one backtick-span scanner every painter
+/// shares. A plain palette returns the text verbatim (backticks kept), so a piped/captured stream
+/// is byte-for-byte the bare markup and existing substring assertions hold. A colored palette
+/// drops the backticks and wraps the span's content in `hue`; after the span's reset it re-emits
+/// `resume` (the enclosing style — e.g. [`Palette::dim`] — or empty), so a span inside a styled
+/// wrapper does not cancel the wrapper for the rest of the line. An unmatched backtick is emitted
+/// verbatim and ends the scan, so malformed input can only under-style.
+pub(crate) fn paint_spans(text: &str, hue: &str, resume: &str, pal: &Palette) -> String {
+    // The plain fast-path is the load-bearing guarantee: the text is returned unchanged, so a
+    // non-terminal is byte-for-byte the bare markup. (Backtick is ASCII, so every slice below
+    // lands on a char boundary regardless of the bytes between the ticks.)
+    if pal.is_plain() {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('`') {
+            Some(end) => {
+                out.push_str(hue);
+                out.push_str(&after[..end]);
+                out.push_str(pal.reset);
+                out.push_str(resume);
+                rest = &after[end + 1..];
+            }
+            None => {
+                // An unmatched backtick: not a span — emit the remainder as-is and stop.
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Prose for stdout reports with its `` `…` `` spans lifted to the code hue (the same hue help
+/// text gives inline code). Plain palette: verbatim, backticks kept.
+pub(crate) fn prose(text: &str, pal: &Palette) -> String {
+    paint_spans(text, pal.code, "", pal)
+}
+
+/// A dimmed prose line — the recurring `{dim}…{reset}` hint shape — with each `` `…` `` span
+/// lifted *out* of the dim into the code hue and the dim resumed after it, so the hint stays
+/// de-emphasized while its commands read as code. Plain palette: the bare text, no wrapper.
+pub(crate) fn dim_prose(text: &str, pal: &Palette) -> String {
+    format!(
+        "{}{}{}",
+        pal.dim,
+        paint_spans(text, pal.code, pal.dim, pal),
+        pal.reset
+    )
 }
 
 #[cfg(test)]
@@ -114,5 +176,43 @@ mod tests {
         // `.output()` test asserts byte-identical plain text regardless of the host's $TERM.
         let p = Palette::for_stream(false);
         assert!(p.name.is_empty() && p.reset.is_empty());
+    }
+
+    #[test]
+    fn plain_spans_keep_their_backticks_verbatim() {
+        // The painters' plain path must be byte-identical to the input — backticks kept — so a
+        // captured stream still shows the markup the substring assertions pin.
+        let p = Palette::plain();
+        assert_eq!(super::paint_spans("a `b` c", p.name, "", &p), "a `b` c");
+        assert_eq!(super::prose("run `sbx gc`", &p), "run `sbx gc`");
+        assert_eq!(super::dim_prose("see `sbx help`", &p), "see `sbx help`");
+    }
+
+    #[test]
+    fn colored_spans_drop_the_backticks_and_take_the_hue() {
+        let p = Palette::colored();
+        let out = super::paint_spans("run `sbx gc` now", p.name, "", &p);
+        assert!(out.contains(&format!("{}sbx gc{}", p.name, p.reset)));
+        assert!(!out.contains('`'), "color replaces the markup");
+    }
+
+    #[test]
+    fn a_span_inside_a_wrapper_resumes_the_enclosing_style() {
+        // The `{dim}…{reset}` hint shape: the span's reset must not cancel the dim for the rest
+        // of the line — `resume` re-opens it.
+        let p = Palette::colored();
+        let out = super::dim_prose("see `sbx gc` for details", &p);
+        assert!(out.starts_with(p.dim));
+        assert!(out.contains(&format!("{}sbx gc{}{}", p.code, p.reset, p.dim)));
+        assert!(out.ends_with(&format!("for details{}", p.reset)));
+        assert!(!out.contains('`'));
+    }
+
+    #[test]
+    fn an_unmatched_backtick_is_kept_verbatim() {
+        let p = Palette::colored();
+        let out = super::paint_spans("a `real` span then a lone ` tick", p.name, "", &p);
+        assert!(out.contains(&format!("{}real{}", p.name, p.reset)));
+        assert!(out.contains("` tick"));
     }
 }

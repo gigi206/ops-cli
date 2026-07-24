@@ -164,6 +164,8 @@ fn run_loop(
                             // foreground path (an interactive terminal reads `sbx proc logs`/`live`
                             // instead), so no raw-mode `\r` framing is needed — plain newlines are
                             // correct here.
+                            // Verbatim, never through the span painter: `cmd` is the agent's own
+                            // argv, and a backtick pair inside it is command text, not markup.
                             eprintln!("{}[sbx:exec]{} {}", pal.dim, pal.reset, cmd);
                         }
                     }

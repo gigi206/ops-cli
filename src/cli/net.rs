@@ -51,7 +51,7 @@ pub(crate) fn net_cmd(args: Vec<OsString>) -> ExitCode {
         // the way `sbx config` and bare `sbx` guide.
         other => {
             if let Some(tok) = other {
-                eprintln!("sbx: net: unknown subcommand {tok:?}");
+                diag::error(&format!("sbx: net: unknown subcommand {tok:?}"));
             }
             eprint!("{}", help::page_usage(&["net"]).unwrap_or_default());
             ExitCode::from(2)
@@ -110,12 +110,15 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
             Some("--app") | Some("-a") => match it.next() {
                 Some(name) => app = Some(name.to_string_lossy().into_owned()),
                 None => {
-                    eprintln!("sbx: `--app` needs an app name");
+                    diag::error("sbx: `--app` needs an app name");
                     return ExitCode::from(2);
                 }
             },
             _ => {
-                eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "pending"]));
+                diag::error(&format!(
+                    "sbx: usage: {}",
+                    help::synopsis_of(&["net", "pending"])
+                ));
                 return ExitCode::from(2);
             }
         }
@@ -123,7 +126,7 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -228,22 +231,22 @@ fn net_pending_watch(args: &[OsString]) -> ExitCode {
     let parsed = match parse_watch_args(args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::from(2);
         }
     };
     let is_tty = std::io::stdout().is_terminal();
     if !is_tty {
-        eprintln!(
+        diag::error(
             "sbx: `watch` needs a terminal — use `sbx net pending` for a one-shot listing, \
-             or `--json` to script it"
+             or `--json` to script it",
         );
         return ExitCode::from(2);
     }
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -363,8 +366,13 @@ fn render_live(
             Some(name) => {
                 let _ = writeln!(
                     o,
-                    "{h}open egress flows:{r} {dim}(none for app `{name}` — its session(s) have no \
-                     tunnel open right now){r}"
+                    "{h}open egress flows:{r} {}",
+                    style::dim_prose(
+                        &format!(
+                            "(none for app `{name}` — its session(s) have no tunnel open right now)"
+                        ),
+                        pal
+                    )
                 );
             }
             None => {
@@ -464,21 +472,21 @@ fn net_live(args: &[OsString]) -> ExitCode {
     let parsed = match parse_live_args(args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::from(2);
         }
     };
     let is_tty = std::io::stdout().is_terminal();
     if !parsed.json && !is_tty {
-        eprintln!(
-            "sbx: `net live` needs a terminal — use `--json` to script it (one snapshot per tick)"
+        diag::error(
+            "sbx: `net live` needs a terminal — use `--json` to script it (one snapshot per tick)",
         );
         return ExitCode::from(2);
     }
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -576,15 +584,23 @@ fn render_pending(
             Some(name) => {
                 let _ = writeln!(
                     o,
-                    "{h}pending egress requests:{r} {dim}(none for app `{name}` — nothing parked in \
-                     its `ask`-mode session(s)){r}"
+                    "{h}pending egress requests:{r} {}",
+                    style::dim_prose(
+                        &format!(
+                            "(none for app `{name}` — nothing parked in its `ask`-mode session(s))"
+                        ),
+                        pal
+                    )
                 );
             }
             None => {
                 let _ = writeln!(
                     o,
-                    "{h}pending egress requests:{r} {dim}(none — a request parks here only under \
-                     `[network] mode = \"ask\"`){r}"
+                    "{h}pending egress requests:{r} {}",
+                    style::dim_prose(
+                        "(none — a request parks here only under `[network] mode = \"ask\"`)",
+                        pal
+                    )
                 );
             }
         }
@@ -673,14 +689,14 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         let parsed = match split_scope(&rest) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("sbx: {e}");
+                diag::error(&format!("sbx: {e}"));
                 return ExitCode::from(2);
             }
         };
         if !parsed.positionals.is_empty() {
-            eprintln!(
+            diag::error(
                 "sbx: `--all` answers every parked request and takes no id \
-                 (use `--app <name>` to limit it to one app; `--session` to remember)"
+                 (use `--app <name>` to limit it to one app; `--session` to remember)",
             );
             return ExitCode::from(2);
         }
@@ -693,9 +709,9 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             );
         }
         if parsed.scope_explicit {
-            eprintln!(
+            diag::error(
                 "sbx: `--all` without `--save` takes no scope (--local/--global/-c) — add `--save` \
-                 to persist a rule per host, or use `--app <name>` to limit the drain to one app"
+                 to persist a rule per host, or use `--app <name>` to limit the drain to one app",
             );
             return ExitCode::from(2);
         }
@@ -704,22 +720,24 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
     let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::from(2);
         }
     };
     let id = match parsed.positionals.as_slice() {
         [id] => id.as_str(),
         _ => {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: usage: {}",
                 help::synopsis_of(&["net", "pending", verb])
-            );
+            ));
             return ExitCode::from(2);
         }
     };
     let Some((pid, seq)) = sandbox::control::parse_id(id) else {
-        eprintln!("sbx: invalid pending id '{id}' (expected <pid>.<seq>, e.g. 12345.1)");
+        diag::error(&format!(
+            "sbx: invalid pending id '{id}' (expected <pid>.<seq>, e.g. 12345.1)"
+        ));
         return ExitCode::from(2);
     };
     // A *config* scope (--global / -c) without `--save` is meaningless — there is no rule to write, so
@@ -728,14 +746,16 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
     // honored without `--save` too (a natural carry-over from `sbx net pending -a <app>`) and validated
     // against the id below.
     if !save && !matches!(parsed.scope, config::manage::Scope::Local) {
-        eprintln!("sbx: --global/-c only applies with --save (it names where to persist the rule)");
+        diag::error(
+            "sbx: --global/-c only applies with --save (it names where to persist the rule)",
+        );
         return ExitCode::from(2);
     }
 
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -747,7 +767,9 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
     if let Some(name) = parsed.app.as_deref() {
         if let Some(actual) = session_app_of(&data_dir, pid) {
             if actual != name {
-                eprintln!("sbx: {id} is a session of app `{actual}`, not `{name}`");
+                diag::error(&format!(
+                    "sbx: {id} is a session of app `{actual}`, not `{name}`"
+                ));
                 return ExitCode::from(2);
             }
         }
@@ -756,16 +778,16 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         match sandbox::control::answer_request(&data_dir, pid, seq, verdict, session) {
             Ok(sandbox::control::AnswerOutcome::Answered { host, count }) => (host, count),
             Ok(sandbox::control::AnswerOutcome::NotFound) => {
-                eprintln!(
+                diag::error(&format!(
                 "sbx: no pending request '{id}' (it may have been answered already or timed out)"
-            );
+            ));
                 return ExitCode::from(2);
             }
             Err(_) => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: no live session for '{id}' (the launch may have ended, or its socket is \
                  stale)"
-                );
+                ));
                 return ExitCode::from(2);
             }
         };
@@ -800,7 +822,13 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         match persist_egress_rule(list, &host, &parsed.scope, parsed.app.as_deref(), &base) {
-            Ok(message) => println!("{message}"),
+            Ok(message) => println!(
+                "{}",
+                style::prose(
+                    &message,
+                    &style::Palette::for_stream(std::io::stdout().is_terminal())
+                )
+            ),
             Err((_, message)) => {
                 diag::warn(&format!("answered, but could not save the rule: {message}"));
                 return ExitCode::FAILURE;
@@ -829,7 +857,7 @@ fn net_pending_answer_all(
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -897,7 +925,7 @@ fn render_drain(
     pal: &style::Palette,
 ) -> String {
     use std::fmt::Write as _;
-    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let mut o = String::new();
     let total: usize = answered.iter().map(|(_, hosts)| hosts.len()).sum();
     if total == 0 {
@@ -909,8 +937,14 @@ fn render_drain(
                 Some(name) => {
                     let _ = writeln!(
                         o,
-                        "{dim}no pending requests for app `{name}` (nothing parked in its ask-mode \
-                         session(s)){r}"
+                        "{}",
+                        style::dim_prose(
+                            &format!(
+                                "no pending requests for app `{name}` (nothing parked in its \
+                                 ask-mode session(s))"
+                            ),
+                            pal
+                        )
                     );
                 }
                 None => {
@@ -921,7 +955,7 @@ fn render_drain(
                 }
             }
         }
-        write_unsupported_note(&mut o, unsupported, warn, dim, r);
+        write_unsupported_note(&mut o, unsupported, pal);
         return o;
     }
     let _ = writeln!(o, "{h}{past} {total} parked request(s):{r}");
@@ -949,7 +983,7 @@ fn render_drain(
     if session {
         let _ = writeln!(o, "  {dim}(remembered for each session — not re-asked){r}");
     }
-    write_unsupported_note(&mut o, unsupported, warn, dim, r);
+    write_unsupported_note(&mut o, unsupported, pal);
     o
 }
 
@@ -957,11 +991,12 @@ fn render_drain(
 /// old to understand `--all`, and point at the only fix (relaunch the agent). Answering their requests
 /// by id is deliberately *not* offered — destination grouping is server-side, so an old server's
 /// `ALLOW <seq>` wakes one connection of a retried group and leaves the rest blocked.
-fn write_unsupported_note(o: &mut String, unsupported: &[u32], warn: &str, dim: &str, r: &str) {
+fn write_unsupported_note(o: &mut String, unsupported: &[u32], pal: &style::Palette) {
     use std::fmt::Write as _;
     if unsupported.is_empty() {
         return;
     }
+    let (warn, r) = (pal.warn, pal.reset);
     let pids = unsupported
         .iter()
         .map(|p| p.to_string())
@@ -969,12 +1004,24 @@ fn write_unsupported_note(o: &mut String, unsupported: &[u32], warn: &str, dim: 
         .join(", ");
     let _ = writeln!(
         o,
-        "{warn}session(s) {pids} were launched by an older sbx without `--all` support — their \
-         parked requests stay blocked.{r}"
+        "{}",
+        style::paint_spans(
+            &format!(
+                "{warn}session(s) {pids} were launched by an older sbx without `--all` support — \
+                 their parked requests stay blocked.{r}"
+            ),
+            pal.code,
+            pal.warn,
+            pal
+        )
     );
     let _ = writeln!(
         o,
-        "  {dim}relaunch the agent with the current sbx to drain them in bulk.{r}"
+        "  {}",
+        style::dim_prose(
+            "relaunch the agent with the current sbx to drain them in bulk.",
+            pal
+        )
     );
 }
 
@@ -994,13 +1041,16 @@ fn net_stats(args: &[OsString]) -> ExitCode {
             Some("--reset") => reset = true,
             Some("--app") | Some("-a") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("sbx: net stats: `--app` needs an app name");
+                    diag::error("sbx: net stats: `--app` needs an app name");
                     return ExitCode::from(2);
                 };
                 app = Some(v.to_string());
             }
             _ => {
-                eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "stats"]));
+                diag::error(&format!(
+                    "sbx: usage: {}",
+                    help::synopsis_of(&["net", "stats"])
+                ));
                 return ExitCode::from(2);
             }
         }
@@ -1008,14 +1058,14 @@ fn net_stats(args: &[OsString]) -> ExitCode {
     // `--reset` reports how many files it cleared; pairing it with `--json` is meaningless — flag it
     // rather than silently pick one.
     if reset && json {
-        eprintln!("sbx: net stats: `--reset` does not combine with `--json`");
+        diag::error("sbx: net stats: `--reset` does not combine with `--json`");
         return ExitCode::from(2);
     }
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1024,14 +1074,14 @@ fn net_stats(args: &[OsString]) -> ExitCode {
     let project = match sandbox::project_identity(&cwd) {
         Ok((_, canon)) => canon.display().to_string(),
         Err(e) => {
-            eprintln!("sbx: cannot resolve the project directory: {e}");
+            diag::error(&format!("sbx: cannot resolve the project directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
     let egress_dir = match egress_data_dir() {
         Ok(d) => d.join("egress"),
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1282,14 +1332,14 @@ fn net_logs(args: &[OsString]) -> ExitCode {
     let view = match parse_log_args(args) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("sbx: net logs: {e}");
+            diag::error(&format!("sbx: net logs: {e}"));
             return ExitCode::from(2);
         }
     };
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1392,7 +1442,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     if flush_stream(&seed).is_err() {
         return ExitCode::SUCCESS;
     }
-    eprintln!("sbx: following egress (Ctrl-C to quit)");
+    diag::error("sbx: following egress (Ctrl-C to quit)");
 
     let mut last_pid: Option<u32> = None; // the session whose header was last printed (human view)
     loop {
@@ -1747,14 +1797,14 @@ fn net_rules(args: &[OsString]) -> ExitCode {
             Some("--expand") | Some("-e") => expand = true,
             Some("--app") | Some("-a") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("sbx: net rules: `--app` needs an app name");
+                    diag::error("sbx: net rules: `--app` needs an app name");
                     return ExitCode::from(2);
                 };
                 app = Some(v.to_string());
             }
             Some("--source") | Some("-s") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("sbx: `--source` needs a value (config, builtin, session)");
+                    diag::error("sbx: `--source` needs a value (config, builtin, session)");
                     return ExitCode::from(2);
                 };
                 source = Some(match v {
@@ -1764,22 +1814,25 @@ fn net_rules(args: &[OsString]) -> ExitCode {
                     // accepted alias for the same source.
                     "session" | "manual" => RuleSourceView::Manual,
                     other => {
-                        eprintln!(
+                        diag::error(&format!(
                             "sbx: unknown rule source '{other}' (known: config, builtin, session)"
-                        );
+                        ));
                         return ExitCode::from(2);
                     }
                 });
             }
             Some("--filter") | Some("-f") => {
                 let Some(v) = it.next().and_then(|a| a.to_str()) else {
-                    eprintln!("sbx: `--filter` needs a substring");
+                    diag::error("sbx: `--filter` needs a substring");
                     return ExitCode::from(2);
                 };
                 filter = Some(v.to_lowercase());
             }
             _ => {
-                eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "rules"]));
+                diag::error(&format!(
+                    "sbx: usage: {}",
+                    help::synopsis_of(&["net", "rules"])
+                ));
                 return ExitCode::from(2);
             }
         }
@@ -1788,7 +1841,7 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1810,7 +1863,7 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     // `sbx test net --app` uses, so the two read the same policy.
     if let Some(name) = &app {
         if let Err(e) = fold_app_overlay(&mut resolved, name) {
-            eprintln!("sbx: net rules: {e}");
+            diag::error(&format!("sbx: net rules: {e}"));
             return ExitCode::from(2);
         }
     }
@@ -1891,13 +1944,16 @@ fn net_groups_list(args: &[OsString]) -> ExitCode {
         match arg.to_str() {
             Some("--json") => json = true,
             Some(s) if s.starts_with('-') => {
-                eprintln!("sbx: net groups: unknown flag `{s}`");
-                eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "groups"]));
+                diag::error(&format!("sbx: net groups: unknown flag `{s}`"));
+                diag::error(&format!(
+                    "sbx: usage: {}",
+                    help::synopsis_of(&["net", "groups"])
+                ));
                 return ExitCode::from(2);
             }
             Some(s) => names.push(s.to_string()),
             None => {
-                eprintln!("sbx: net groups: a group name must be valid UTF-8");
+                diag::error("sbx: net groups: a group name must be valid UTF-8");
                 return ExitCode::from(2);
             }
         }
@@ -1916,15 +1972,18 @@ fn net_groups_list(args: &[OsString]) -> ExitCode {
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
-            eprintln!("sbx: net groups: no such group: {}", missing.join(", "));
+            diag::error(&format!(
+                "sbx: net groups: no such group: {}",
+                missing.join(", ")
+            ));
             if groups.is_empty() {
-                eprintln!(
+                diag::error(
                     "sbx: no egress groups are defined — declare them under [net.groups] in the \
-                     global config"
+                     global config",
                 );
             } else {
                 let avail: Vec<&str> = groups.keys().map(String::as_str).collect();
-                eprintln!("sbx: defined groups: {}", avail.join(", "));
+                diag::error(&format!("sbx: defined groups: {}", avail.join(", ")));
             }
             return ExitCode::from(2);
         }
@@ -1971,22 +2030,22 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
         match arg.to_str() {
             Some("--out") | Some("-o") => {
                 let Some(v) = it.next() else {
-                    eprintln!("sbx: net groups export: `--out` needs a file path");
+                    diag::error("sbx: net groups export: `--out` needs a file path");
                     return ExitCode::from(2);
                 };
                 out = Some(PathBuf::from(v));
             }
             Some(s) if s.starts_with('-') => {
-                eprintln!("sbx: net groups export: unknown flag `{s}`");
-                eprintln!(
+                diag::error(&format!("sbx: net groups export: unknown flag `{s}`"));
+                diag::error(&format!(
                     "sbx: usage: {}",
                     help::synopsis_of(&["net", "groups", "export"])
-                );
+                ));
                 return ExitCode::from(2);
             }
             Some(s) => names.push(s.to_string()),
             None => {
-                eprintln!("sbx: net groups export: a group name must be valid UTF-8");
+                diag::error("sbx: net groups export: a group name must be valid UTF-8");
                 return ExitCode::from(2);
             }
         }
@@ -2007,10 +2066,10 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: net groups export: no such group: {}",
                 missing.join(", ")
-            );
+            ));
             return ExitCode::from(2);
         }
         names
@@ -2019,9 +2078,9 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
             .collect()
     };
     if selected.is_empty() {
-        eprintln!(
+        diag::error(
             "sbx: net groups export: no egress groups to export (none are defined under \
-             [net.groups] in the global config)"
+             [net.groups] in the global config)",
         );
         return ExitCode::from(2);
     }
@@ -2040,10 +2099,10 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: net groups export: cannot write {}: {e}",
                     path.display()
-                );
+                ));
                 ExitCode::FAILURE
             }
         },
@@ -2063,16 +2122,16 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
         match arg.to_str() {
             Some("--force") | Some("-f") => force = true,
             Some(s) if s.starts_with('-') => {
-                eprintln!("sbx: net groups import: unknown flag `{s}`");
-                eprintln!(
+                diag::error(&format!("sbx: net groups import: unknown flag `{s}`"));
+                diag::error(&format!(
                     "sbx: usage: {}",
                     help::synopsis_of(&["net", "groups", "import"])
-                );
+                ));
                 return ExitCode::from(2);
             }
             _ => {
                 if file.is_some() {
-                    eprintln!("sbx: net groups import: expected exactly one file");
+                    diag::error("sbx: net groups import: expected exactly one file");
                     return ExitCode::from(2);
                 }
                 file = Some(PathBuf::from(arg));
@@ -2080,40 +2139,40 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
         }
     }
     let Some(file) = file else {
-        eprintln!(
+        diag::error(&format!(
             "sbx: usage: {}",
             help::synopsis_of(&["net", "groups", "import"])
-        );
+        ));
         return ExitCode::from(2);
     };
 
     let groups = match config::read_net_groups_fragment(&file) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("sbx: net groups import: {e}");
+            diag::error(&format!("sbx: net groups import: {e}"));
             return ExitCode::from(2);
         }
     };
     // Validate every name before writing (a name keys a referenceable identifier and, if invalid,
     // would be dropped at load) — fail closed, naming the offender.
     if let Some(bad) = groups.keys().find(|n| !config::is_valid_group_name(n)) {
-        eprintln!(
+        diag::error(&format!(
             "sbx: net groups import: invalid group name `{bad}` (1–64 of [A-Za-z0-9._-]); nothing imported"
-        );
+        ));
         return ExitCode::from(2);
     }
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
     let path = match config::manage::scope_path(&config::manage::Scope::Global, &cwd) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: net groups import: {e}");
+            diag::error(&format!("sbx: net groups import: {e}"));
             return ExitCode::from(1);
         }
     };
@@ -2153,16 +2212,16 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(config::manage::ManageError::GroupCollision(names)) => {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: net groups import: {} already defined: {} — re-run with --force to overwrite, \
                  or rename in the fragment (nothing was written)",
                 if names.len() == 1 { "group" } else { "groups" },
                 names.join(", ")
-            );
+            ));
             ExitCode::from(2)
         }
         Err(e) => {
-            eprintln!("sbx: net groups import: {e}");
+            diag::error(&format!("sbx: net groups import: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -2210,7 +2269,11 @@ fn render_net_groups(
                 plural(entries.len())
             );
         }
-        let _ = writeln!(o, "  {dim}resolve one with `sbx net groups <name>`{r}");
+        let _ = writeln!(
+            o,
+            "  {}",
+            style::dim_prose("resolve one with `sbx net groups <name>`", pal)
+        );
         return o;
     }
 
@@ -2253,7 +2316,7 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -2369,8 +2432,12 @@ fn render_net_rules(
         "ask" => {
             let _ = writeln!(
                 o,
-                "{h}network{scope}:{r} ask {dim}— an unmatched host parks for a live `sbx net pending` decision; \
-                 allow rules auto-pass, deny rules auto-fail{r}"
+                "{h}network{scope}:{r} ask {}",
+                style::dim_prose(
+                    "— an unmatched host parks for a live `sbx net pending` decision; \
+                     allow rules auto-pass, deny rules auto-fail",
+                    pal
+                )
             );
         }
         // The live session-rule listing (`--source session`): runtime rules from `--session`
@@ -2384,8 +2451,14 @@ fn render_net_rules(
             };
             let _ = writeln!(
                 o,
-                "{h}session egress rules{r} {dim}— live, loaded with `sbx net allow|deny --session` \
-                 (or a `sbx net pending … --session` answer) into {where_} (gone when they end){r}"
+                "{h}session egress rules{r} {}",
+                style::dim_prose(
+                    &format!(
+                        "— live, loaded with `sbx net allow|deny --session` \
+                         (or a `sbx net pending … --session` answer) into {where_} (gone when they end)"
+                    ),
+                    pal
+                )
             );
         }
         _ => {
@@ -2463,24 +2536,27 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::from(2);
         }
     };
     let rule = match parsed.positionals.as_slice() {
         [r] => r.clone(),
         [] => {
-            eprintln!("sbx: usage: {}", help::synopsis_of(&["net", verb]));
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["net", verb])
+            ));
             return ExitCode::from(2);
         }
         _ => {
-            eprintln!("sbx: net {verb}: expected exactly one rule");
+            diag::error(&format!("sbx: net {verb}: expected exactly one rule"));
             return ExitCode::from(2);
         }
     };
     if let Some(name) = &parsed.app {
         if !config::is_valid_app_name(name) {
-            eprintln!("sbx: invalid app name '{name}'");
+            diag::error(&format!("sbx: invalid app name '{name}'"));
             return ExitCode::from(2);
         }
     }
@@ -2494,13 +2570,13 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     if is_group {
         let group = rule.trim().strip_prefix('@').unwrap_or_default();
         if !config::is_valid_group_name(group) {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
-            );
+            ));
             return ExitCode::from(2);
         }
     } else if let Err(e) = allowlist::classify(&rule) {
-        eprintln!("sbx: invalid rule {rule:?}: {e}");
+        diag::error(&format!("sbx: invalid rule {rule:?}: {e}"));
         return ExitCode::from(2);
     }
 
@@ -2508,7 +2584,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         // `--session` writes no config file, so the file-scope flags do not apply — point at the
         // session-scope flags instead of silently ignoring a `--global` the user expected to matter.
         if parsed.scope_explicit {
-            eprintln!(
+            diag::error(
                 "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not \
                  apply — use -a <app> or --all to scope the session(s)"
             );
@@ -2517,7 +2593,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         // A `@group` is expanded from the config at launch; the live overlay has no group vocabulary,
         // so it cannot carry one. Point at the two ways to use a group.
         if is_group {
-            eprintln!(
+            diag::error(
                 "sbx: --session cannot load a @group (a group is expanded from the config at launch) \
                  — pass the concrete rules, or add the group to the config without --session"
             );
@@ -2526,7 +2602,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("sbx: cannot read the current directory: {e}");
+                diag::error(&format!("sbx: cannot read the current directory: {e}"));
                 return ExitCode::FAILURE;
             }
         };
@@ -2535,7 +2611,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
 
     // `--all` is a session-scope widener, meaningless for a config write (which targets one file).
     if all {
-        eprintln!(
+        diag::error(
             "sbx: --all only applies with --session (it widens a live rule to every session); a config \
              write targets one file — drop --all"
         );
@@ -2547,17 +2623,23 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
     match persist_egress_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
         Ok(message) => {
-            println!("{message}");
+            println!(
+                "{}",
+                style::prose(
+                    &message,
+                    &style::Palette::for_stream(std::io::stdout().is_terminal())
+                )
+            );
             ExitCode::SUCCESS
         }
         Err((code, message)) => {
-            eprintln!("sbx: {message}");
+            diag::error(&format!("sbx: {message}"));
             ExitCode::from(code)
         }
     }
@@ -2573,7 +2655,7 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
         .iter()
         .any(|a| matches!(a.to_str(), Some("--session") | Some("--all")))
     {
-        eprintln!(
+        diag::error(
             "sbx: net unmute: --session/--all do not apply — this removes a rule from a config file"
         );
         return ExitCode::from(2);
@@ -2581,41 +2663,50 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
     let parsed = match split_scope(args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::from(2);
         }
     };
     let rule = match parsed.positionals.as_slice() {
         [r] => r.clone(),
         [] => {
-            eprintln!("sbx: usage: {}", help::synopsis_of(&["net", "unmute"]));
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["net", "unmute"])
+            ));
             return ExitCode::from(2);
         }
         _ => {
-            eprintln!("sbx: net unmute: expected exactly one rule");
+            diag::error("sbx: net unmute: expected exactly one rule");
             return ExitCode::from(2);
         }
     };
     if let Some(name) = &parsed.app {
         if !config::is_valid_app_name(name) {
-            eprintln!("sbx: invalid app name '{name}'");
+            diag::error(&format!("sbx: invalid app name '{name}'"));
             return ExitCode::from(2);
         }
     }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
     match persist_egress_removal(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
         Ok(message) => {
-            println!("{message}");
+            println!(
+                "{}",
+                style::prose(
+                    &message,
+                    &style::Palette::for_stream(std::io::stdout().is_terminal())
+                )
+            );
             ExitCode::SUCCESS
         }
         Err((code, message)) => {
-            eprintln!("sbx: {message}");
+            diag::error(&format!("sbx: {message}"));
             ExitCode::from(code)
         }
     }
@@ -2646,7 +2737,7 @@ fn net_inject_session(
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -2658,7 +2749,9 @@ fn net_inject_session(
         let canonical = match sandbox::project_identity(cwd) {
             Ok((_, c)) => c,
             Err(e) => {
-                eprintln!("sbx: cannot resolve the current project directory: {e}");
+                diag::error(&format!(
+                    "sbx: cannot resolve the current project directory: {e}"
+                ));
                 return ExitCode::FAILURE;
             }
         };
@@ -2726,8 +2819,16 @@ fn render_inject(
     if !loaded.is_empty() {
         let _ = writeln!(
             o,
-            "{h}loaded {verb} rule `{rule}` into {} live session(s):{r}",
-            loaded.len()
+            "{}",
+            style::paint_spans(
+                &format!(
+                    "{h}loaded {verb} rule `{rule}` into {} live session(s):{r}",
+                    loaded.len()
+                ),
+                pal.name,
+                pal.head,
+                pal
+            )
         );
         for pid in loaded {
             match context.iter().find(|(p, _, _)| p == pid) {
@@ -2743,7 +2844,11 @@ fn render_inject(
         // policy) will not show it. Point at where it *is* visible.
         let _ = writeln!(
             o,
-            "  {dim}see it with `sbx net rules --source session` (it is not in the config){r}"
+            "  {}",
+            style::dim_prose(
+                "see it with `sbx net rules --source session` (it is not in the config)",
+                pal
+            )
         );
     }
     if !refused.is_empty() {
@@ -2803,7 +2908,7 @@ fn net_pending_drain_and_save(
         sandbox::control::Verdict::Deny => (EgressList::Deny, "deny", "denied"),
     };
     if matches!(scope, Scope::File(_)) {
-        eprintln!("sbx: `--all --save` takes --local or --global, not `-c <file>`");
+        diag::error("sbx: `--all --save` takes --local or --global, not `-c <file>`");
         return ExitCode::from(2);
     }
     let local = matches!(scope, Scope::Local);
@@ -2811,7 +2916,7 @@ fn net_pending_drain_and_save(
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -2821,19 +2926,21 @@ fn net_pending_drain_and_save(
     let cwd = match std::env::current_dir() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
     let project_canonical = if local {
         if let Err((code, msg)) = precheck_local_save(&cwd) {
-            eprintln!("sbx: {msg}");
+            diag::error(&format!("sbx: {msg}"));
             return ExitCode::from(code);
         }
         match sandbox::project_identity(&cwd) {
             Ok((_, canonical)) => Some(canonical),
             Err(e) => {
-                eprintln!("sbx: cannot resolve the current project directory: {e}");
+                diag::error(&format!(
+                    "sbx: cannot resolve the current project directory: {e}"
+                ));
                 return ExitCode::FAILURE;
             }
         }
@@ -2886,12 +2993,13 @@ fn net_pending_drain_and_save(
             } else {
                 "across any ask-mode session".to_string()
             };
-            out.push_str(&format!(
-                "{}no pending requests {scope_note} — nothing to answer or save{}\n",
-                pal.dim, pal.reset
+            out.push_str(&style::dim_prose(
+                &format!("no pending requests {scope_note} — nothing to answer or save"),
+                &pal,
             ));
+            out.push('\n');
         }
-        write_unsupported_note(&mut out, &unsupported, pal.warn, pal.dim, pal.reset);
+        write_unsupported_note(&mut out, &unsupported, &pal);
         print!("{out}");
         return ExitCode::SUCCESS;
     }

@@ -14,7 +14,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::{help, sandbox, session, storage, store, style};
+use crate::{diag, help, sandbox, session, storage, store, style};
 
 /// The data directory sbx would use with no volume in play. Everything here is anchored to it
 /// rather than to the live one: once a pointer redirects sbx into a volume, the live directory
@@ -73,8 +73,8 @@ pub(crate) fn storage_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
         Some(other) => {
-            eprintln!("sbx: storage: unknown subcommand `{other}`");
-            eprintln!("       run `sbx help storage` for usage.");
+            diag::error(&format!("sbx: storage: unknown subcommand `{other}`"));
+            diag::hint("       run `sbx help storage` for usage.");
             ExitCode::from(2)
         }
     }
@@ -123,7 +123,7 @@ fn parse_opts(args: Vec<OsString>) -> Result<Opts, String> {
 }
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
-    eprintln!("sbx storage: {msg}");
+    diag::error(&format!("sbx storage: {msg}"));
     ExitCode::FAILURE
 }
 
@@ -162,9 +162,11 @@ fn init(args: Vec<OsString>) -> ExitCode {
     if let Some(blocker) =
         storage::Preflight::probe(image.parent().unwrap_or(&image)).mount_blocker()
     {
-        eprintln!("sbx storage: note: this host cannot mount it — {blocker}");
-        eprintln!(
-            "       the volume will still be created; `sbx storage use` needs those to start using it."
+        diag::error(&format!(
+            "sbx storage: note: this host cannot mount it — {blocker}"
+        ));
+        diag::hint(
+            "       the volume will still be created; `sbx storage use` needs those to start using it.",
         );
     }
     println!(
@@ -183,8 +185,10 @@ fn init(args: Vec<OsString>) -> ExitCode {
         return fail(e);
     }
     println!(
-        "  {}created{} — start using it with `sbx storage use`",
-        pal.ok, pal.reset
+        "  {}created{} — {}",
+        pal.ok,
+        pal.reset,
+        style::prose("start using it with `sbx storage use`", &pal)
     );
     ExitCode::SUCCESS
 }
@@ -256,9 +260,14 @@ fn down(args: Vec<OsString>) -> ExitCode {
     // mounts it again. Saying so beats leaving the user to wonder why it came back.
     if let Ok(dir) = default_dir() {
         if storage::read_pointer(&dir).as_deref() == Some(image.as_path()) {
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
-                "\nnote: sbx is still set to use this volume, so the next command will mount \
-                 it again.\n      `sbx storage unuse` stops that."
+                "\n{}",
+                style::prose(
+                    "note: sbx is still set to use this volume, so the next command will mount \
+                     it again.\n      `sbx storage unuse` stops that.",
+                    &pal
+                )
             );
         }
     }
@@ -488,8 +497,10 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
                 pal.reset,
                 mount_point.display()
             );
-            eprintln!("sbx storage: could not set the previous data aside: {e}");
-            eprintln!("       it is unused now; remove it by hand when you are satisfied.");
+            diag::error(&format!(
+                "sbx storage: could not set the previous data aside: {e}"
+            ));
+            diag::hint("       it is unused now; remove it by hand when you are satisfied.");
         }
     }
     ExitCode::SUCCESS
@@ -575,7 +586,14 @@ fn unuse_volume(args: Vec<OsString>) -> ExitCode {
         return fail(format!("cannot clear the volume record: {e}"));
     }
     println!("sbx now uses {} again.", dir.display());
-    println!("the volume is untouched — `sbx storage use` goes back to it.");
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    println!(
+        "{}",
+        style::prose(
+            "the volume is untouched — `sbx storage use` goes back to it.",
+            &pal
+        )
+    );
     ExitCode::SUCCESS
 }
 
@@ -750,7 +768,10 @@ fn render(v: &StatusView) {
     println!("  type        {}", v.kind);
     println!("  state       {}", v.state);
     if !v.exists {
-        println!("\ncreate one with `sbx storage init`.");
+        println!(
+            "\n{}",
+            style::prose("create one with `sbx storage init`.", &pal)
+        );
         return;
     }
     if let (Some(host), Some(cap)) = (v.host_bytes, v.capacity_bytes) {
@@ -785,7 +806,13 @@ fn render(v: &StatusView) {
             println!("\n  {}sbx is reading its data from this volume.{r}", pal.ok);
         }
         StatusHint::MountedNotAdopted => {
-            println!("\n  {dim}mounted but not in use — start using it with{r} `sbx storage use`");
+            println!(
+                "\n  {}",
+                style::dim_prose(
+                    "mounted but not in use — start using it with `sbx storage use`",
+                    &pal
+                )
+            );
             if let Some(mp) = &v.mount_point {
                 println!(
                     "    {dim}(or, for a one-off, export SBX_DATA_DIR={}){r}",
@@ -795,12 +822,19 @@ fn render(v: &StatusView) {
         }
         StatusHint::AdoptedUnmounted => {
             println!(
-                "\nadopted — sbx mounts it automatically next command; \
-                 `sbx storage up` mounts it now."
+                "\n{}",
+                style::prose(
+                    "adopted — sbx mounts it automatically next command; \
+                     `sbx storage up` mounts it now.",
+                    &pal
+                )
             );
         }
         StatusHint::StartUse => {
-            println!("\nstart using it with `sbx storage use`.");
+            println!(
+                "\n{}",
+                style::prose("start using it with `sbx storage use`.", &pal)
+            );
         }
     }
 
@@ -898,16 +932,16 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
 
     if !occupied_subtrees(default_dir).is_empty() {
         storage::mark_offered(default_dir);
-        eprintln!(
+        diag::error(&format!(
             "{}sbx:{} your data directory is on {fs}. A compressed btrfs volume would cut its \
              inode use to one and roughly halve its size.",
             pal.head, pal.reset
-        );
-        eprintln!(
+        ));
+        diag::hint(&format!(
             "     migrate into one when convenient: {}sbx storage migrate{} \
              (shown once; `sbx doctor` repeats the suggestion).",
             pal.head, pal.reset
-        );
+        ));
         return;
     }
 
@@ -926,20 +960,20 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
     // Recorded whatever the answer, so the question is asked exactly once.
     storage::mark_offered(default_dir);
     if !yes {
-        eprintln!(
+        diag::error(
             "sbx: keeping the plain data directory — adopt one later with `sbx storage init` \
-             then `sbx storage use`."
+             then `sbx storage use`.",
         );
         return;
     }
     match adopt_empty(default_dir) {
         Ok(mount_point) => {
-            eprintln!(
+            diag::error(&format!(
                 "{}sbx: now using the volume at {}{}",
                 pal.ok,
                 mount_point.display(),
                 pal.reset
-            );
+            ));
             // The pointer-following path is memoised once per process and may already have been
             // consulted — and cached as "no volume" — while provisioning btrfs-progs into the
             // host store just above. So this process is steered onto the volume by the override,
@@ -949,9 +983,9 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
             std::env::set_var("SBX_DATA_DIR", &mount_point);
         }
         Err(e) => {
-            eprintln!("sbx: could not set up the volume: {e}");
-            eprintln!(
-                "     continuing on the plain data directory; `sbx storage init` retries it."
+            diag::error(&format!("sbx: could not set up the volume: {e}"));
+            diag::hint(
+                "     continuing on the plain data directory; `sbx storage init` retries it.",
             );
         }
     }
@@ -977,7 +1011,10 @@ fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
         storage::State::Absent
     ) {
         let mkfs = storage::resolve_mkfs()?;
-        eprintln!("sbx: formatting a new volume with {}…", mkfs.origin());
+        diag::error(&format!(
+            "sbx: formatting a new volume with {}…",
+            mkfs.origin()
+        ));
         storage::init(
             &image,
             storage::DEFAULT_SIZE_BYTES,

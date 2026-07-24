@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use crate::{help, sandbox, store, style};
+use crate::{diag, help, sandbox, store, style};
 
 pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
     // The query is the first non-flag argument; any further words are ignored (nixhub
@@ -15,17 +15,19 @@ pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
         .filter_map(|a| a.to_str())
         .find(|a| !a.starts_with('-'));
     let Some(query) = query else {
-        eprintln!("sbx: usage: {}", help::synopsis("search"));
+        diag::error(&format!("sbx: usage: {}", help::synopsis("search")));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
     let Some(nix) = store::resolve_nix(Some(&layout)) else {
-        eprintln!("sbx: nix not found — `sbx search` needs it to query nixhub. See `sbx doctor`.");
+        diag::error(
+            "sbx: nix not found — `sbx search` needs it to query nixhub. See `sbx doctor`.",
+        );
         return ExitCode::FAILURE;
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -35,7 +37,7 @@ pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("sbx search: {e}");
+            diag::error(&format!("sbx search: {e}"));
             ExitCode::FAILURE
         }
     }

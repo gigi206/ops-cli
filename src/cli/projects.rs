@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use crate::{help, sandbox, style};
+use crate::{diag, help, sandbox, style};
 
 /// `sbx projects` — manage the per-project runtime trees under `<data>/projects/`: `list` (the
 /// default) and `rm`. The reaping primitives it drives are shared with `sbx gc` (which keeps the
@@ -31,8 +31,8 @@ pub(crate) fn projects_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
         Some(other) => {
-            eprintln!("sbx: projects: unknown subcommand `{other}`");
-            eprintln!("       run `sbx help projects` for usage.");
+            diag::error(&format!("sbx: projects: unknown subcommand `{other}`"));
+            diag::hint("       run `sbx help projects` for usage.");
             ExitCode::from(2)
         }
     }
@@ -45,12 +45,12 @@ fn projects_list_cmd(args: &[OsString]) -> ExitCode {
             Some("--json") => json = true,
             Some("--help") | Some("-h") => return help::show(&["projects"]),
             Some(other) => {
-                eprintln!("sbx: projects: unknown argument `{other}`");
-                eprintln!("       run `sbx help projects` for usage.");
+                diag::error(&format!("sbx: projects: unknown argument `{other}`"));
+                diag::hint("       run `sbx help projects` for usage.");
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("sbx: projects: argument is not valid UTF-8");
+                diag::error("sbx: projects: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
@@ -68,26 +68,28 @@ fn projects_show_cmd(args: &[OsString]) -> ExitCode {
             Some("--json") => json = true,
             Some("--help") | Some("-h") => return help::show(&["projects", "show"]),
             Some(flag) if flag.starts_with('-') => {
-                eprintln!("sbx: projects show: unknown flag `{flag}`");
-                eprintln!("       run `sbx help projects show` for usage.");
+                diag::error(&format!("sbx: projects show: unknown flag `{flag}`"));
+                diag::hint("       run `sbx help projects show` for usage.");
                 return ExitCode::from(2);
             }
             Some(other) if id.is_none() => id = Some(other),
             Some(extra) => {
-                eprintln!("sbx: projects show: unexpected extra argument `{extra}`");
+                diag::error(&format!(
+                    "sbx: projects show: unexpected extra argument `{extra}`"
+                ));
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("sbx: projects show: argument is not valid UTF-8");
+                diag::error("sbx: projects show: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(id) = id else {
-        eprintln!(
+        diag::error(&format!(
             "sbx: projects show: name a tree id — usage: {}",
             help::synopsis_of(&["projects", "show"])
-        );
+        ));
         return ExitCode::from(2);
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -109,28 +111,28 @@ fn projects_rm_cmd(args: &[OsString]) -> ExitCode {
             Some("-f") | Some("--force") => force = true,
             Some("--help") | Some("-h") => return help::show(&["projects"]),
             Some(flag) if flag.starts_with('-') => {
-                eprintln!("sbx: projects rm: unknown flag `{flag}`");
-                eprintln!("       run `sbx help projects` for usage.");
+                diag::error(&format!("sbx: projects rm: unknown flag `{flag}`"));
+                diag::hint("       run `sbx help projects` for usage.");
                 return ExitCode::from(2);
             }
             Some(id) => ids.push(id.to_string()),
             None => {
-                eprintln!("sbx: projects rm: argument is not valid UTF-8");
+                diag::error("sbx: projects rm: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
     if ids.is_empty() && !dead && !markerless {
-        eprintln!(
+        diag::error(
             "sbx: projects rm: name a project id, or use --dead / --markerless. \
-             Run `sbx projects` to list them."
+             Run `sbx projects` to list them.",
         );
         return ExitCode::from(2);
     }
     let targeted = !ids.is_empty();
     let bulk = dead || markerless;
     let Some(apply) = sandbox::projects_rm_apply(targeted, bulk, dry_run, yes) else {
-        eprintln!("sbx: projects rm: `--dry-run` and `--yes` are contradictory — pick one.");
+        diag::error("sbx: projects rm: `--dry-run` and `--yes` are contradictory — pick one.");
         return ExitCode::from(2);
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());

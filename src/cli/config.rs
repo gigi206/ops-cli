@@ -42,12 +42,12 @@ pub(crate) fn config_cmd(args: Vec<OsString>) -> ExitCode {
                 // now `show`, so point straight at it. Other flags belong to a specific subcommand
                 // (get/set/… take -c/--local/--trust), so name no verb and let the page below guide.
                 Some("--json") => {
-                    eprintln!("sbx: config: --json is now `sbx config show --json`")
+                    diag::error("sbx: config: --json is now `sbx config show --json`")
                 }
-                Some(tok) if tok.starts_with('-') => eprintln!(
+                Some(tok) if tok.starts_with('-') => diag::error(&format!(
                     "sbx: config: {tok:?} is an option of a subcommand — pick one from the list below"
-                ),
-                Some(tok) => eprintln!("sbx: config: unknown subcommand {tok:?}"),
+                )),
+                Some(tok) => diag::error(&format!("sbx: config: unknown subcommand {tok:?}")),
                 None => {}
             }
             eprint!("{}", help::page_usage(&["config"]).unwrap_or_default());
@@ -70,8 +70,13 @@ fn set_show_source(
     match current {
         Some((prev, _)) if *prev == flag => Ok(()),
         Some((prev, _)) => {
-            eprintln!("sbx: config show: `{flag}` conflicts with `{prev}` (choose one source)");
-            eprintln!("sbx: usage: {}", help::synopsis_of(&["config", "show"]));
+            diag::error(&format!(
+                "sbx: config show: `{flag}` conflicts with `{prev}` (choose one source)"
+            ));
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["config", "show"])
+            ));
             Err(ExitCode::from(2))
         }
         None => {
@@ -94,8 +99,11 @@ fn config_show(args: &[OsString]) -> ExitCode {
             Some("--app") | Some("-a") => match it.next() {
                 Some(name) => app = Some(name.to_string_lossy().into_owned()),
                 None => {
-                    eprintln!("sbx: config show: `--app` needs an app name");
-                    eprintln!("sbx: usage: {}", help::synopsis_of(&["config", "show"]));
+                    diag::error("sbx: config show: `--app` needs an app name");
+                    diag::error(&format!(
+                        "sbx: usage: {}",
+                        help::synopsis_of(&["config", "show"])
+                    ));
                     return ExitCode::from(2);
                 }
             },
@@ -118,11 +126,14 @@ fn config_show(args: &[OsString]) -> ExitCode {
                 }
             }
             _ => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: config show: unexpected argument {:?}",
                     arg.to_string_lossy()
-                );
-                eprintln!("sbx: usage: {}", help::synopsis_of(&["config", "show"]));
+                ));
+                diag::error(&format!(
+                    "sbx: usage: {}",
+                    help::synopsis_of(&["config", "show"])
+                ));
                 return ExitCode::from(2);
             }
         }
@@ -133,8 +144,13 @@ fn config_show(args: &[OsString]) -> ExitCode {
     // ignoring one flag.
     if app.is_some() {
         if let Some((flag, _)) = source {
-            eprintln!("sbx: config show: `--app` does not combine with `{flag}`");
-            eprintln!("sbx: usage: {}", help::synopsis_of(&["config", "show"]));
+            diag::error(&format!(
+                "sbx: config show: `--app` does not combine with `{flag}`"
+            ));
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["config", "show"])
+            ));
             return ExitCode::from(2);
         }
     }
@@ -142,7 +158,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -167,7 +183,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
         match serde_json::to_string_pretty(&view) {
             Ok(doc) => println!("{doc}"),
             Err(e) => {
-                eprintln!("sbx: cannot serialize the configuration: {e}");
+                diag::error(&format!("sbx: cannot serialize the configuration: {e}"));
                 return ExitCode::FAILURE;
             }
         }
@@ -188,16 +204,16 @@ fn config_show(args: &[OsString]) -> ExitCode {
 /// Errors (listing the declared apps) when no such app exists.
 fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCode {
     let Some(view) = config::view::build_app_detail(cwd, name) else {
-        eprintln!("sbx: config show: no app named {name:?}");
+        diag::error(&format!("sbx: config show: no app named {name:?}"));
         let declared: Vec<String> = config::view::build(cwd)
             .apps
             .into_iter()
             .map(|a| a.name)
             .collect();
         if declared.is_empty() {
-            eprintln!("sbx: no apps are declared for this directory");
+            diag::error("sbx: no apps are declared for this directory");
         } else {
-            eprintln!("sbx: declared apps: {}", declared.join(", "));
+            diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
         }
         return ExitCode::FAILURE;
     };
@@ -206,7 +222,7 @@ fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCod
         match serde_json::to_string_pretty(&view) {
             Ok(doc) => println!("{doc}"),
             Err(e) => {
-                eprintln!("sbx: cannot serialize the app configuration: {e}");
+                diag::error(&format!("sbx: cannot serialize the app configuration: {e}"));
                 return ExitCode::FAILURE;
             }
         }
@@ -402,9 +418,17 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             } else {
                 let _ = writeln!(
                     o,
-                    "    {n}{}{r} = {}  {warn}(needs network — not equipped under \
-                     `network = \"none\"`){r}",
-                    t.token, t.version
+                    "    {n}{}{r} = {}  {}",
+                    t.token,
+                    t.version,
+                    style::paint_spans(
+                        &format!(
+                            "{warn}(needs network — not equipped under `network = \"none\"`){r}"
+                        ),
+                        pal.code,
+                        pal.warn,
+                        pal
+                    )
                 );
             }
         }
@@ -460,8 +484,12 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             if matches!(ask_notice, Some(false)) {
                 let _ = writeln!(
                     o,
-                    "    {dim}ask notice: off (parked requests are silent — answer via \
-                     `sbx net pending`){r}"
+                    "    {}",
+                    style::dim_prose(
+                        "ask notice: off (parked requests are silent — answer via \
+                         `sbx net pending`)",
+                        pal
+                    )
                 );
             }
             match default_action {
@@ -514,8 +542,12 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 NetDefaultView::Ask => {
                     let _ = writeln!(
                         o,
-                        "    {dim}an unlisted host parks for a live `sbx net pending` decision; \
-                         these are pre-decided:{r}"
+                        "    {}",
+                        style::dim_prose(
+                            "an unlisted host parks for a live `sbx net pending` decision; \
+                             these are pre-decided:",
+                            pal
+                        )
                     );
                     if !allow.is_empty() {
                         let _ = writeln!(o, "    {dim}auto-allow:{r}");
@@ -541,7 +573,11 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             if !mute.is_empty() {
                 let _ = writeln!(
                     o,
-                    "    {dim}mute (refusals kept out of `sbx net log`; see `--all`):{r}"
+                    "    {}",
+                    style::dim_prose(
+                        "mute (refusals kept out of `sbx net log`; see `--all`):",
+                        pal
+                    )
                 );
                 for rule in mute {
                     let _ = writeln!(o, "      {dim}mute{r}  {n}{rule}{r}");
@@ -1045,8 +1081,12 @@ fn render_app_detail(
             if matches!(ask_notice, Some(false)) {
                 let _ = writeln!(
                     o,
-                    "    {dim}ask notice: off (parked requests are silent — answer via \
-                     `sbx net pending`){r}"
+                    "    {}",
+                    style::dim_prose(
+                        "ask notice: off (parked requests are silent — answer via \
+                         `sbx net pending`)",
+                        pal
+                    )
                 );
             }
             if details {
@@ -1351,7 +1391,10 @@ fn app_prefixed_key(name: &str, key: &str) -> Result<String, String> {
 
 /// Print the usage synopsis for a `config` verb and return the usage exit code.
 fn config_usage(verb: &str) -> ExitCode {
-    eprintln!("sbx: usage: {}", help::synopsis_of(&["config", verb]));
+    diag::error(&format!(
+        "sbx: usage: {}",
+        help::synopsis_of(&["config", verb])
+    ));
     ExitCode::from(2)
 }
 
@@ -1369,7 +1412,7 @@ fn config_get(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("sbx: config get: {e}");
+            diag::error(&format!("sbx: config get: {e}"));
             return config_usage("get");
         }
     };
@@ -1391,11 +1434,15 @@ fn config_get(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(None) => {
-            eprintln!("sbx: config: `{}` is not set in {}", key, path.display());
+            diag::error(&format!(
+                "sbx: config: `{}` is not set in {}",
+                key,
+                path.display()
+            ));
             ExitCode::from(1)
         }
         Err(e) => {
-            eprintln!("sbx: config: {e}");
+            diag::error(&format!("sbx: config: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -1406,7 +1453,9 @@ fn config_get(args: &[OsString]) -> ExitCode {
 /// `--app` was passed, else `None`.
 fn reject_app(verb: &str, app: &Option<String>) -> Option<ExitCode> {
     if app.is_some() {
-        eprintln!("sbx: config {verb}: `--app` does not apply to `{verb}` (it takes no key)");
+        diag::error(&format!(
+            "sbx: config {verb}: `--app` does not apply to `{verb}` (it takes no key)"
+        ));
         Some(config_usage(verb))
     } else {
         None
@@ -1437,7 +1486,7 @@ fn resolve_key_target(
     let gated = !matches!(scope, Scope::Global);
     let scope_path = |scope: &Scope| {
         manage::scope_path(scope, cwd).map_err(|e| {
-            eprintln!("sbx: config: {e}");
+            diag::error(&format!("sbx: config: {e}"));
             ExitCode::FAILURE
         })
     };
@@ -1447,11 +1496,11 @@ fn resolve_key_target(
             // A global app is its own profile file with top-level keys. The name keys that
             // filename, so validate it (anti-traversal) the way `sbx net … -a <name> -g` does.
             if !config::is_valid_app_name(name) {
-                eprintln!("sbx: config {verb}: invalid app name `{name}`");
+                diag::error(&format!("sbx: config {verb}: invalid app name `{name}`"));
                 return Err(config_usage(verb));
             }
             let path = manage::scope_app_path(scope, cwd, name).map_err(|e| {
-                eprintln!("sbx: config: {e}");
+                diag::error(&format!("sbx: config: {e}"));
                 ExitCode::FAILURE
             })?;
             Ok((path, raw_key.to_string(), false))
@@ -1459,7 +1508,7 @@ fn resolve_key_target(
         (Some(name), _) => {
             // An inline app (project `.sbx.toml` or a `-c` file) is addressed under `app.<name>.`.
             let key = app_prefixed_key(name, raw_key).map_err(|e| {
-                eprintln!("sbx: config {verb}: {e}");
+                diag::error(&format!("sbx: config {verb}: {e}"));
                 config_usage(verb)
             })?;
             Ok((scope_path(scope)?, key, gated))
@@ -1481,7 +1530,7 @@ fn config_set(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("sbx: config set: {e}");
+            diag::error(&format!("sbx: config set: {e}"));
             return config_usage("set");
         }
     };
@@ -1516,7 +1565,7 @@ fn config_set(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("sbx: config: {e}");
+            diag::error(&format!("sbx: config: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -1535,7 +1584,7 @@ fn config_unset(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("sbx: config unset: {e}");
+            diag::error(&format!("sbx: config unset: {e}"));
             return config_usage("unset");
         }
     };
@@ -1570,7 +1619,7 @@ fn config_unset(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("sbx: config: {e}");
+            diag::error(&format!("sbx: config: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -1586,7 +1635,7 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("sbx: config path: {e}");
+            diag::error(&format!("sbx: config path: {e}"));
             return config_usage("path");
         }
     };
@@ -1616,7 +1665,7 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("sbx: config: {e}");
+            diag::error(&format!("sbx: config: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -1651,7 +1700,11 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
             }
         }
     }
-    let _ = writeln!(o, "{dim}for the resolved values, see `sbx config show`.{r}");
+    let _ = writeln!(
+        o,
+        "{}",
+        style::dim_prose("for the resolved values, see `sbx config show`.", pal)
+    );
     o
 }
 
@@ -1671,7 +1724,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("sbx: config edit: {e}");
+            diag::error(&format!("sbx: config edit: {e}"));
             return config_usage("edit");
         }
     };
@@ -1688,7 +1741,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
     let path = match config::manage::scope_path(&scope, &cwd) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: config: {e}");
+            diag::error(&format!("sbx: config: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1696,7 +1749,10 @@ fn config_edit(args: &[OsString]) -> ExitCode {
     // directory may not exist yet).
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("sbx: config: cannot create {}: {e}", parent.display());
+            diag::error(&format!(
+                "sbx: config: cannot create {}: {e}",
+                parent.display()
+            ));
             return ExitCode::FAILURE;
         }
     }
@@ -1720,7 +1776,9 @@ fn config_edit(args: &[OsString]) -> ExitCode {
         // The editor ran (whatever its exit) — the file is now whatever the user saved.
         Ok(_) => {}
         Err(e) => {
-            eprintln!("sbx: config: could not launch the editor `{editor}`: {e}");
+            diag::error(&format!(
+                "sbx: config: could not launch the editor `{editor}`: {e}"
+            ));
             return ExitCode::FAILURE;
         }
     }

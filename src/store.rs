@@ -72,7 +72,7 @@ impl Layout {
             // check it consulted, so the two cannot describe different refusals.
             if let Some(over) = over.as_deref().filter(|o| !o.is_empty()) {
                 if let Err(why) = check_data_dir_override(over) {
-                    eprintln!("sbx: {why}");
+                    crate::diag::error(&format!("sbx: {why}"));
                 }
             }
         }
@@ -89,8 +89,12 @@ impl Layout {
                     // Fail closed. The mount point exists only while mounted, and it lives
                     // under `/run` — a tmpfs. Carrying on with the unmounted path would
                     // provision gigabytes into RAM and present an empty store as the truth.
-                    eprintln!("sbx: sbx's data is in a volume that could not be mounted: {why}");
-                    eprintln!("sbx: refusing to continue rather than use an empty data directory");
+                    crate::diag::error(&format!(
+                        "sbx: sbx's data is in a volume that could not be mounted: {why}"
+                    ));
+                    crate::diag::error(
+                        "sbx: refusing to continue rather than use an empty data directory",
+                    );
                     return None;
                 }
             }
@@ -103,7 +107,7 @@ impl Layout {
         // `sbx storage` anchors to `default_data_dir`, not this path, so a volume can still be
         // adopted to fix it.
         if let Err(why) = check_resolved_data_dir(&data_dir) {
-            eprintln!("sbx: {why}");
+            crate::diag::error(&format!("sbx: {why}"));
             return None;
         }
         Some(Self { data_dir })

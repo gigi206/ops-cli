@@ -20,7 +20,7 @@ pub(crate) fn test_cmd(args: Vec<OsString>) -> ExitCode {
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {
             if let Some(tok) = other {
-                eprintln!("sbx: test: unknown kind {tok:?}");
+                diag::error(&format!("sbx: test: unknown kind {tok:?}"));
             }
             eprint!("{}", help::page_usage(&["test"]).unwrap_or_default());
             ExitCode::from(2)
@@ -46,38 +46,38 @@ fn net_test(args: &[OsString]) -> ExitCode {
         match a.to_str() {
             Some("--app") | Some("-a") => {
                 let Some(name) = it.next().and_then(|n| n.to_str()) else {
-                    eprintln!("sbx: test net: `--app` needs an app name");
+                    diag::error("sbx: test net: `--app` needs an app name");
                     return ExitCode::from(2);
                 };
                 app = Some(name.to_string());
             }
             Some("--method") | Some("-X") => {
                 let Some(m) = it.next().and_then(|n| n.to_str()) else {
-                    eprintln!("sbx: test net: `--method` needs an HTTP verb (e.g. GET, POST)");
+                    diag::error("sbx: test net: `--method` needs an HTTP verb (e.g. GET, POST)");
                     return ExitCode::from(2);
                 };
                 method = m.to_ascii_uppercase();
             }
             Some(s) if target.is_none() => target = Some(s),
             Some(s) => {
-                eprintln!("sbx: test net: unexpected argument `{s}`");
+                diag::error(&format!("sbx: test net: unexpected argument `{s}`"));
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("sbx: test net: an argument is not valid UTF-8");
+                diag::error("sbx: test net: an argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(target) = target else {
-        eprintln!("sbx: usage: {}", help::synopsis("test"));
+        diag::error(&format!("sbx: usage: {}", help::synopsis("test")));
         return ExitCode::from(2);
     };
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -90,7 +90,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
     // not the bare baseline.
     if let Some(name) = &app {
         if let Err(e) = fold_app_overlay(&mut resolved, name) {
-            eprintln!("sbx: test net: {e}");
+            diag::error(&format!("sbx: test net: {e}"));
             return ExitCode::from(2);
         }
     }
@@ -146,7 +146,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 let (host, port) = match allowlist::parse_tcp_target(target) {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!("sbx: {e}");
+                        diag::error(&format!("sbx: {e}"));
                         return ExitCode::from(2);
                     }
                 };
@@ -157,7 +157,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
             let (host, port, path) = match allowlist::parse_url_target(&url) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("sbx: {e}");
+                    diag::error(&format!("sbx: {e}"));
                     return ExitCode::from(2);
                 }
             };
@@ -252,7 +252,11 @@ fn render_net_decision(
             let _ = writeln!(o, "{dim}WOULD ASK{r} {n}{url}{r}");
             let _ = writeln!(
                 o,
-                "  {dim}no rule matches (ask-by-default — it would park for `sbx net pending`){r}"
+                "  {}",
+                style::dim_prose(
+                    "no rule matches (ask-by-default — it would park for `sbx net pending`)",
+                    pal
+                )
             );
         }
     }
@@ -291,9 +295,13 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
             let _ = writeln!(o, "{err}NOT SPLICED{r} {n}{target}{r}");
             let _ = writeln!(
                 o,
-                "  {dim}no tcp:// rule covers this host:port — a raw tunnel needs an explicit \
-                 `tcp://host:port` allow (a bare/https:// rule is inspected L7, which a non-HTTP \
-                 protocol cannot satisfy){r}"
+                "  {}",
+                style::dim_prose(
+                    "no tcp:// rule covers this host:port — a raw tunnel needs an explicit \
+                     `tcp://host:port` allow (a bare/https:// rule is inspected L7, which a \
+                     non-HTTP protocol cannot satisfy)",
+                    pal
+                )
             );
         }
     }

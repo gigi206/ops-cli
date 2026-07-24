@@ -257,10 +257,10 @@ pub(crate) fn resolve_userland(
     let system = super::current_system();
     let locales = provision_locale_archive(nix, layout, &roots, nixpkgs, &system, &host_locales())
         .or_else(|e| {
-            eprintln!(
-                "sbx: warning: could not build the host locale archive ({e}); \
+            crate::diag::warn(&format!(
+                "could not build the host locale archive ({e}); \
                  falling back to {ANCHOR_LOCALE}"
-            );
+            ));
             provision_locale_archive(
                 nix,
                 layout,

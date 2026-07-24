@@ -31,7 +31,7 @@ pub(crate) fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {
             if let Some(tok) = other {
-                eprintln!("sbx: plugins: unknown subcommand {tok:?}");
+                diag::error(&format!("sbx: plugins: unknown subcommand {tok:?}"));
             }
             eprint!("{}", help::page_usage(&["plugins"]).unwrap_or_default());
             ExitCode::from(2)
@@ -57,8 +57,8 @@ fn load_plugin_registry() -> Option<(plugins::PluginRegistry, Vec<String>)> {
 /// scheme) go to stderr. No nix, no network, no launch.
 fn plugins_list() -> ExitCode {
     let Some((registry, warnings)) = load_plugin_registry() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
@@ -108,12 +108,15 @@ fn plugins_list() -> ExitCode {
 /// launcher will and refused, fail-closed, on any flaw. No fetch, no network, no signature.
 fn plugins_install(source: Option<&OsString>) -> ExitCode {
     let Some(source) = source else {
-        eprintln!("sbx: usage: {}", help::synopsis_of(&["plugins", "install"]));
+        diag::error(&format!(
+            "sbx: usage: {}",
+            help::synopsis_of(&["plugins", "install"])
+        ));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
@@ -125,7 +128,9 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
     } else if let Some(name) = source.to_str() {
         plugins::install_embedded(&layout, name)
     } else {
-        eprintln!("sbx: a built-in plugin name must be valid UTF-8 (use ./<dir> for a local path)");
+        diag::error(
+            "sbx: a built-in plugin name must be valid UTF-8 (use ./<dir> for a local path)",
+        );
         return ExitCode::from(2);
     };
     match result {
@@ -138,7 +143,7 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("sbx: cannot install plugin: {why}");
+            diag::error(&format!("sbx: cannot install plugin: {why}"));
             ExitCode::FAILURE
         }
     }
@@ -172,7 +177,7 @@ fn plugins_store(args: &[OsString]) -> ExitCode {
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {
             if let Some(tok) = other {
-                eprintln!("sbx: plugins store: unknown subcommand {tok:?}");
+                diag::error(&format!("sbx: plugins store: unknown subcommand {tok:?}"));
             }
             eprint!(
                 "{}",
@@ -206,10 +211,10 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
             Some("--key") => key = it.next().and_then(|v| v.to_str()),
             Some("--trust") => trust = true,
             other => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: unexpected argument '{}'",
                     other.unwrap_or("(non-UTF-8)")
-                );
+                ));
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             }
@@ -222,28 +227,28 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
 
     // The trust anchor is exactly one of --key (pin a known key) or --trust (accept the shipped one).
     if key.is_some() && trust {
-        eprintln!(
+        diag::error(
             "sbx: --key and --trust are mutually exclusive: --key pins a key you supply, \
-             --trust accepts the key the store ships"
+             --trust accepts the key the store ships",
         );
         return ExitCode::from(2);
     }
     if key.is_none() && !trust {
-        eprintln!(
+        diag::error(
             "sbx: supply --key <hex|@file> to pin a known key, or --trust to accept the key the \
-             store ships on first use"
+             store ships on first use",
         );
         return ExitCode::from(2);
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
     let Some(git) = store::resolve_git() else {
-        eprintln!("sbx: git is not on PATH — a remote plugin store is a git repository");
+        diag::error("sbx: git is not on PATH — a remote plugin store is a git repository");
         return ExitCode::FAILURE;
     };
 
@@ -252,7 +257,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
             let pubkey = match stores::parse_pubkey_arg(key) {
                 Ok(k) => k,
                 Err(why) => {
-                    eprintln!("sbx: invalid --key: {why}");
+                    diag::error(&format!("sbx: invalid --key: {why}"));
                     return ExitCode::from(2);
                 }
             };
@@ -288,7 +293,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("sbx: cannot add store: {why}");
+            diag::error(&format!("sbx: cannot add store: {why}"));
             ExitCode::FAILURE
         }
     }
@@ -321,20 +326,20 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
                 match value.parse::<u64>() {
                     Ok(n) => rev = Some(n),
                     Err(_) => {
-                        eprintln!("sbx: --rev must be a non-negative integer");
+                        diag::error("sbx: --rev must be a non-negative integer");
                         return ExitCode::from(2);
                     }
                 }
             }
             Some(flag) if flag.starts_with('-') => {
-                eprintln!("sbx: unexpected argument '{flag}'");
+                diag::error(&format!("sbx: unexpected argument '{flag}'"));
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             }
             // Anything else (including a non-UTF-8 path) is the positional directory.
             _ => {
                 if dir.is_some() {
-                    eprintln!("sbx: publish takes a single directory");
+                    diag::error("sbx: publish takes a single directory");
                     eprintln!("{usage}");
                     return ExitCode::from(2);
                 }
@@ -368,7 +373,7 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("sbx: cannot publish store: {why}");
+            diag::error(&format!("sbx: cannot publish store: {why}"));
             ExitCode::FAILURE
         }
     }
@@ -381,20 +386,20 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
 /// failure on one is reported and the rest still run, with a non-zero exit if any failed.
 fn plugins_store_update(args: &[OsString]) -> ExitCode {
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
     let Some(git) = store::resolve_git() else {
-        eprintln!("sbx: git is not on PATH — a remote plugin store is a git repository");
+        diag::error("sbx: git is not on PATH — a remote plugin store is a git repository");
         return ExitCode::FAILURE;
     };
 
     let names: Vec<String> = match args.first() {
         Some(arg) => {
             let Some(name) = arg.to_str() else {
-                eprintln!("sbx: a store name must be valid UTF-8");
+                diag::error("sbx: a store name must be valid UTF-8");
                 return ExitCode::from(2);
             };
             vec![name.to_string()]
@@ -431,7 +436,7 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
                 );
             }
             Err(why) => {
-                eprintln!("sbx: cannot update store '{name}': {why}");
+                diag::error(&format!("sbx: cannot update store '{name}': {why}"));
                 failed = true;
             }
         }
@@ -453,15 +458,15 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
         args.first().and_then(|a| a.to_str()),
         args.get(1).and_then(|a| a.to_str()),
     ) else {
-        eprintln!(
+        diag::error(&format!(
             "sbx: usage: {}",
             help::synopsis_of(&["plugins", "store", "install"])
-        );
+        ));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
@@ -475,7 +480,7 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("sbx: cannot install plugin: {why}");
+            diag::error(&format!("sbx: cannot install plugin: {why}"));
             ExitCode::FAILURE
         }
     }
@@ -486,22 +491,22 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
 /// owner-only cache (trusted by location): no fetch, no network.
 fn plugins_store_info(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
-        eprintln!(
+        diag::error(&format!(
             "sbx: usage: {}",
             help::synopsis_of(&["plugins", "store", "info"])
-        );
+        ));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
     let cfg = match stores::read_configured(&layout, name) {
         Ok(cfg) => cfg,
         Err(why) => {
-            eprintln!("sbx: {why}");
+            diag::error(&format!("sbx: {why}"));
             return ExitCode::FAILURE;
         }
     };
@@ -544,15 +549,15 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
 /// like `add`; refuses a name that is not configured.
 fn plugins_store_remove(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
-        eprintln!(
+        diag::error(&format!(
             "sbx: usage: {}",
             help::synopsis_of(&["plugins", "store", "rm"])
-        );
+        ));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
@@ -563,7 +568,7 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("sbx: cannot remove store: {why}");
+            diag::error(&format!("sbx: cannot remove store: {why}"));
             ExitCode::FAILURE
         }
     }
@@ -635,12 +640,15 @@ fn plugins_store_list() -> ExitCode {
 /// shows). Host-level, like `install`; refuses an unsafe name or a directory that is not a plugin.
 fn plugins_remove(name: Option<&str>) -> ExitCode {
     let Some(name) = name else {
-        eprintln!("sbx: usage: {}", help::synopsis_of(&["plugins", "rm"]));
+        diag::error(&format!(
+            "sbx: usage: {}",
+            help::synopsis_of(&["plugins", "rm"])
+        ));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
@@ -651,7 +659,7 @@ fn plugins_remove(name: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(why) => {
-            eprintln!("sbx: cannot remove plugin: {why}");
+            diag::error(&format!("sbx: cannot remove plugin: {why}"));
             ExitCode::FAILURE
         }
     }
@@ -662,7 +670,10 @@ fn plugins_remove(name: Option<&str>) -> ExitCode {
 /// non-zero "no such plugin". Like `list`, host-level and side-effect-free.
 fn plugins_info(scheme: Option<&str>) -> ExitCode {
     let Some(scheme) = scheme else {
-        eprintln!("sbx: usage: {}", help::synopsis_of(&["plugins", "info"]));
+        diag::error(&format!(
+            "sbx: usage: {}",
+            help::synopsis_of(&["plugins", "info"])
+        ));
         return ExitCode::from(2);
     };
     if plugins::builtin_schemes().contains(&scheme) {
@@ -670,8 +681,8 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let Some((registry, warnings)) = load_plugin_registry() else {
-        eprintln!(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
@@ -683,7 +694,9 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         for w in &warnings {
             diag::warn(w);
         }
-        eprintln!("sbx: no installed resolver plugin claims the scheme '{scheme}'");
+        diag::error(&format!(
+            "sbx: no installed resolver plugin claims the scheme '{scheme}'"
+        ));
         return ExitCode::FAILURE;
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());

@@ -890,10 +890,10 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
 
     // Best-effort: an uncompressed volume is a working volume, just a larger one.
     if let Err(e) = set_compression(&mount_point, "zstd") {
-        eprintln!(
+        crate::diag::error(&format!(
             "sbx: could not enable compression on {}: {e}",
             mount_point.display()
-        );
+        ));
     }
     Ok(mount_point)
 }

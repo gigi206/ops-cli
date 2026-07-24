@@ -19,7 +19,8 @@ pub(crate) fn render_config_write(
 ) -> String {
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
     format!(
-        "sbx: {ok}{verb}{r} `{n}{key}{r}` in {n}{}{r}",
+        "sbx: {ok}{verb}{r} {} in {n}{}{r}",
+        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
         path.display()
     )
 }
@@ -27,9 +28,10 @@ pub(crate) fn render_config_write(
 /// The no-op confirmation for `sbx config unset` on a key that was not set — dimmed, since nothing
 /// changed (and so trust is never re-armed). A pure presenter.
 pub(crate) fn render_config_unchanged(key: &str, path: &Path, pal: &style::Palette) -> String {
-    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    let (dim, r) = (pal.dim, pal.reset);
     format!(
-        "sbx: `{n}{key}{r}` {dim}was not set in {}{r}",
+        "sbx: {} {dim}was not set in {}{r}",
+        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
         path.display()
     )
 }
@@ -79,7 +81,8 @@ pub(crate) fn render_app_imported(
 pub(crate) fn render_app_exported(name: &str, path: &Path, pal: &style::Palette) -> String {
     let (ok, n, r) = (pal.ok, pal.name, pal.reset);
     format!(
-        "{ok}exported{r} app `{n}{name}{r}` -> {n}{}{r}",
+        "{ok}exported{r} app {} -> {n}{}{r}",
+        style::paint_spans(&format!("`{name}`"), pal.name, "", pal),
         path.display()
     )
 }
@@ -119,11 +122,14 @@ pub(crate) fn render_removed(label: Option<&str>, name: &str, pal: &style::Palet
 /// could not pre-verify. The pinned key is highlighted for an out-of-band comparison; the
 /// follow-up hint is dimmed. Goes to stderr, so its palette is decided from stderr's stream.
 pub(crate) fn render_store_tofu(pubkey_hex: &str, name: &str, pal: &style::Palette) -> String {
-    let (warn, n, dim, r) = (pal.warn, pal.name, pal.dim, pal.reset);
+    let (warn, n, r) = (pal.warn, pal.name, pal.reset);
     format!(
         "{warn}⚠ trust-on-first-use: pinned the key this store ships, unverified{r}\n  \
-         pinned key: {n}{pubkey_hex}{r}\n  \
-         {dim}verify it out of band; re-shown by `sbx plugins store info {name}`{r}"
+         pinned key: {n}{pubkey_hex}{r}\n  {}",
+        style::dim_prose(
+            &format!("verify it out of band; re-shown by `sbx plugins store info {name}`"),
+            pal
+        )
     )
 }
 
@@ -158,11 +164,11 @@ pub(crate) fn render_store_configured(
 /// The keep-the-key-secret caution after a publish — yellow, over the highlighted key path. Goes
 /// to stderr, so its palette is decided from stderr's stream.
 pub(crate) fn render_publish_key_warning(key_path: &Path, pal: &style::Palette) -> String {
-    let (warn, n, r) = (pal.warn, pal.name, pal.reset);
+    let (warn, r) = (pal.warn, pal.reset);
     format!(
-        "{warn}⚠ keep the signing key{r} {n}`{}`{r} \
+        "{warn}⚠ keep the signing key{r} {} \
          {warn}secret — it is this store's identity{r}",
-        key_path.display()
+        style::paint_spans(&format!("`{}`", key_path.display()), pal.name, "", pal)
     )
 }
 
@@ -361,7 +367,9 @@ mod tests {
         let cfg = Path::new("/p/.sbx.toml");
         let set = render_config_write("set", "env.FOO", cfg, &p);
         assert!(set.contains(&format!("{}set{}", p.ok, p.reset)));
-        assert!(set.contains(&format!("`{}env.FOO{}`", p.name, p.reset)));
+        // Color replaces the backtick markup — the key rides the name hue, ticks dropped.
+        assert!(set.contains(&format!("{}env.FOO{}", p.name, p.reset)));
+        assert!(!set.contains('`'));
         let unchanged = render_config_unchanged("env.FOO", cfg, &p);
         assert!(
             unchanged.contains(p.dim),

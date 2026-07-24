@@ -27,14 +27,26 @@ pub(crate) fn note(msg: &str) {
     );
 }
 
-/// Print an already-indented continuation line for a preceding [`warn`]/[`note`] (stderr) — no
-/// prefix, but its `` `identifiers` `` highlighted like the family, so a multi-line diagnostic does
-/// not mix the family's cyan with literal backticks. The caller owns the indent (it is part of
-/// `line`), which is preserved verbatim in plain mode.
+/// Print a bare stderr line — a continuation of a preceding [`warn`]/[`note`], a `run `sbx help
+/// …` for usage.` pointer, a status note — with its `` `identifiers` `` highlighted like the
+/// family, so a multi-line diagnostic does not mix the family's cyan with literal backticks. No
+/// prefix is added; the caller owns any indent (it is part of `line`), preserved verbatim in
+/// plain mode.
 pub(crate) fn hint(line: &str) {
     eprintln!(
         "{}",
         highlight(line, &Palette::for_stream(std::io::stderr().is_terminal()))
+    );
+}
+
+/// Print a bare stderr error line (a usage error, a refusal) with its `` `identifiers` ``
+/// highlighted. The message carries its own `sbx: …` prefix verbatim — unlike [`warn`]/[`note`],
+/// nothing is added — so converting a plain `eprintln!` here changes no byte of a captured
+/// stream, only lifts the spans when stderr is a terminal.
+pub(crate) fn error(msg: &str) {
+    eprintln!(
+        "{}",
+        highlight(msg, &Palette::for_stream(std::io::stderr().is_terminal()))
     );
 }
 
@@ -59,39 +71,12 @@ fn note_line(msg: &str, pal: &Palette) -> String {
     )
 }
 
-/// Lift each `` `…` `` span in `msg` to the identifier hue. A plain palette returns the message
+/// Lift each `` `…` `` span in `msg` to the identifier hue — the diagnostic family's view over
+/// the shared span scanner ([`crate::style::paint_spans`]). A plain palette returns the message
 /// verbatim — backticks kept — so a captured stream is byte-identical and every existing substring
-/// assertion (including ones that match a backtick-delimited token) still holds. A colored palette
-/// emits the span's content in the identifier hue with the backticks dropped, so the color replaces
-/// the markup. An unmatched backtick is emitted verbatim and ends the scan.
+/// assertion (including ones that match a backtick-delimited token) still holds.
 fn highlight(msg: &str, pal: &Palette) -> String {
-    // The plain fast-path is the load-bearing guarantee: the message is returned unchanged, so a
-    // non-terminal is byte-for-byte the bare text. (Backtick is ASCII, so every slice below lands
-    // on a char boundary regardless of the bytes between the ticks.)
-    if pal.name.is_empty() {
-        return msg.to_owned();
-    }
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    while let Some(start) = rest.find('`') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        match after.find('`') {
-            Some(end) => {
-                out.push_str(pal.name);
-                out.push_str(&after[..end]);
-                out.push_str(pal.reset);
-                rest = &after[end + 1..];
-            }
-            None => {
-                // An unmatched backtick: not a span — emit the remainder as-is and stop.
-                out.push_str(&rest[start..]);
-                return out;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    crate::style::paint_spans(msg, pal.name, "", pal)
 }
 
 #[cfg(test)]
@@ -127,6 +112,22 @@ mod tests {
         let n = note_line("`network` is a security field", &p);
         assert!(n.contains(&format!("{}note:{}", p.head, p.reset)));
         assert!(n.contains(&format!("{}network{}", p.name, p.reset)));
+    }
+
+    #[test]
+    fn an_error_line_is_the_bare_message_with_identifiers_lifted() {
+        // `error` adds no prefix — the plain path is byte-identical to the message (a converted
+        // `eprintln!` changes nothing captured), and color only lifts the spans.
+        let plain = Palette::plain();
+        assert_eq!(
+            highlight("sbx: store: unknown argument `--bogus`", &plain),
+            "sbx: store: unknown argument `--bogus`"
+        );
+        let p = Palette::colored();
+        let out = highlight("sbx: store: unknown argument `--bogus`", &p);
+        assert!(out.starts_with("sbx: store: unknown argument "));
+        assert!(out.contains(&format!("{}--bogus{}", p.name, p.reset)));
+        assert!(!out.contains('`'));
     }
 
     #[test]

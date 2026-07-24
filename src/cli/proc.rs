@@ -35,8 +35,8 @@ pub(crate) fn proc_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
         Some(other) => {
-            eprintln!("sbx: proc: unknown subcommand `{other}`");
-            eprintln!("       run `sbx help proc` for usage.");
+            diag::error(&format!("sbx: proc: unknown subcommand `{other}`"));
+            diag::hint("       run `sbx help proc` for usage.");
             ExitCode::from(2)
         }
     }
@@ -65,35 +65,38 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
     let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::from(2);
         }
     };
     let rule = match parsed.positionals.as_slice() {
         [r] => r.trim().to_string(),
         [] => {
-            eprintln!("sbx: usage: {}", help::synopsis_of(&["proc", verb]));
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["proc", verb])
+            ));
             return ExitCode::from(2);
         }
         _ => {
-            eprintln!("sbx: proc {verb}: expected exactly one rule");
+            diag::error(&format!("sbx: proc {verb}: expected exactly one rule"));
             return ExitCode::from(2);
         }
     };
     if let Some(name) = &parsed.app {
         if !config::is_valid_app_name(name) {
-            eprintln!("sbx: invalid app name '{name}'");
+            diag::error(&format!("sbx: invalid app name '{name}'"));
             return ExitCode::from(2);
         }
     }
     if let Err(e) = proc_policy::validate_rule(&rule) {
-        eprintln!("sbx: invalid rule {rule:?}: {e}");
+        diag::error(&format!("sbx: invalid rule {rule:?}: {e}"));
         return ExitCode::from(2);
     }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -102,7 +105,7 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
         // `--session` writes no config file, so the file-scope flags do not apply — point at the
         // session-scope flags rather than silently ignore a `--global` the user expected to matter.
         if parsed.scope_explicit {
-            eprintln!(
+            diag::error(
                 "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not \
                  apply — use -a <app> or --all to scope the session(s)"
             );
@@ -113,7 +116,7 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
 
     // `--all` is a session-scope widener, meaningless for a config write (which targets one file).
     if all {
-        eprintln!(
+        diag::error(
             "sbx: --all only applies with --session (it widens a live rule to every session); a config \
              write targets one file — drop --all"
         );
@@ -122,11 +125,17 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
 
     match persist_proc_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
         Ok(message) => {
-            println!("{message}");
+            println!(
+                "{}",
+                style::prose(
+                    &message,
+                    &style::Palette::for_stream(std::io::stdout().is_terminal())
+                )
+            );
             ExitCode::SUCCESS
         }
         Err((code, message)) => {
-            eprintln!("sbx: {message}");
+            diag::error(&format!("sbx: {message}"));
             ExitCode::from(code)
         }
     }
@@ -156,7 +165,7 @@ fn proc_inject_session(
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -167,7 +176,9 @@ fn proc_inject_session(
         let canonical = match sandbox::project_identity(cwd) {
             Ok((_, c)) => c,
             Err(e) => {
-                eprintln!("sbx: cannot resolve the current project directory: {e}");
+                diag::error(&format!(
+                    "sbx: cannot resolve the current project directory: {e}"
+                ));
                 return ExitCode::FAILURE;
             }
         };
@@ -178,7 +189,7 @@ fn proc_inject_session(
     let sessions = match session::Registry::at(&data_dir).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry: {e}");
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -202,14 +213,21 @@ fn proc_inject_session(
     }
 
     if !loaded.is_empty() {
+        let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
         println!(
-            "loaded {verb} rule `{rule}` into {} live session(s): {}",
-            loaded.len(),
-            loaded
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+            "{}",
+            style::prose(
+                &format!(
+                    "loaded {verb} rule `{rule}` into {} live session(s): {}",
+                    loaded.len(),
+                    loaded
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                &pal
+            )
         );
     }
     if !inert.is_empty() {
@@ -225,9 +243,9 @@ fn proc_inject_session(
         ));
     }
     if loaded.is_empty() && inert.is_empty() {
-        eprintln!(
+        diag::error(
             "sbx: no enforcing session in scope to load the rule into — launch one with `[proc] mode \
-             = \"enforce\"`/`\"ask\"`, or write it to config (drop --session)"
+             = \"enforce\"`/`\"ask\"`, or write it to config (drop --session)",
         );
         return ExitCode::from(1);
     }
@@ -247,28 +265,28 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
     let parsed = match split_scope(&rest) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::from(2);
         }
     };
     if !parsed.positionals.is_empty() {
-        eprintln!(
+        diag::error(&format!(
             "sbx: proc rules: unexpected argument `{}`",
             parsed.positionals[0]
-        );
+        ));
         return ExitCode::from(2);
     }
     if parsed.scope_explicit {
-        eprintln!(
+        diag::error(
             "sbx: proc rules lists live session rules, not a config file — use -a <app>/--all to \
-             scope, and `sbx config show` for the config policy"
+             scope, and `sbx config show` for the config policy",
         );
         return ExitCode::from(2);
     }
     let data_dir = match egress_data_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -288,7 +306,7 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
     let sessions = match session::Registry::at(&data_dir).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry: {e}");
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -342,19 +360,19 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
         .iter()
         .find(|a| a.to_str().is_none_or(|s| s.starts_with('-')))
     {
-        eprintln!("sbx: proc pending: unexpected argument {a:?}");
+        diag::error(&format!("sbx: proc pending: unexpected argument {a:?}"));
         return ExitCode::from(2);
     }
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry: {e}");
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -384,22 +402,24 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
 /// Decide one (or, with `*`, all) parked `execve` by id `<session-pid>.<notif-id>`.
 fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
     let Some(id) = args.first().and_then(|a| a.to_str()) else {
-        eprintln!("sbx: proc pending {}: an id is required (`<session-pid>.<notif-id>`, or `<session-pid>.*`)", if allow { "allow" } else { "deny" });
+        diag::error(&format!("sbx: proc pending {}: an id is required (`<session-pid>.<notif-id>`, or `<session-pid>.*`)", if allow { "allow" } else { "deny" }));
         return ExitCode::from(2);
     };
     let Some((pid_s, notif_s)) = id.split_once('.') else {
-        eprintln!(
-            "sbx: proc pending: id must be `<session-pid>.<notif-id>` (from `sbx proc pending`)"
+        diag::error(
+            "sbx: proc pending: id must be `<session-pid>.<notif-id>` (from `sbx proc pending`)",
         );
         return ExitCode::from(2);
     };
     let Ok(pid) = pid_s.parse::<u32>() else {
-        eprintln!("sbx: proc pending: `{pid_s}` is not a session pid");
+        diag::error(&format!(
+            "sbx: proc pending: `{pid_s}` is not a session pid"
+        ));
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
@@ -414,17 +434,23 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Ok(_) => {
-                eprintln!("sbx: proc pending: nothing parked in session {pid}");
+                diag::error(&format!(
+                    "sbx: proc pending: nothing parked in session {pid}"
+                ));
                 ExitCode::from(2)
             }
             Err(_) => {
-                eprintln!("sbx: proc pending: session {pid} is not enforcing (no control socket)");
+                diag::error(&format!(
+                    "sbx: proc pending: session {pid} is not enforcing (no control socket)"
+                ));
                 ExitCode::from(2)
             }
         }
     } else {
         let Ok(notif_id) = notif_s.parse::<u64>() else {
-            eprintln!("sbx: proc pending: `{notif_s}` is not a notification id");
+            diag::error(&format!(
+                "sbx: proc pending: `{notif_s}` is not a notification id"
+            ));
             return ExitCode::from(2);
         };
         match sandbox::proc_control::answer_pending(&socket, notif_id, allow) {
@@ -433,13 +459,15 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Ok(None) => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: proc pending: no parked exec `{id}` (already decided or timed out)"
-                );
+                ));
                 ExitCode::from(2)
             }
             Err(_) => {
-                eprintln!("sbx: proc pending: session {pid} is not enforcing (no control socket)");
+                diag::error(&format!(
+                    "sbx: proc pending: session {pid} is not enforcing (no control socket)"
+                ));
                 ExitCode::from(2)
             }
         }
@@ -458,16 +486,16 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
             Some("--json") => json = true,
             Some(s) if !s.starts_with('-') => {
                 if id.is_some() {
-                    eprintln!("sbx: proc ls: at most one session id");
+                    diag::error("sbx: proc ls: at most one session id");
                     return ExitCode::from(2);
                 }
                 id = Some(s);
             }
             other => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: proc ls: unexpected argument {:?}",
                     other.unwrap_or_default()
-                );
+                ));
                 eprint!("{}", help::page_usage(&["proc", "ls"]).unwrap_or_default());
                 return ExitCode::from(2);
             }
@@ -475,15 +503,15 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry: {e}");
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -494,10 +522,10 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
     };
 
     let Some(tree) = observe::tree(target.pid) else {
-        eprintln!(
+        diag::error(&format!(
             "sbx: proc ls: session {} has no readable process tree (it may have just exited).",
             target.pid
-        );
+        ));
         return ExitCode::from(2);
     };
 
@@ -584,27 +612,27 @@ fn proc_live(args: &[OsString]) -> ExitCode {
     let parsed = match parse_proc_live_args(args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::from(2);
         }
     };
     let is_tty = std::io::stdout().is_terminal();
     if !parsed.json && !is_tty {
-        eprintln!(
-            "sbx: `proc live` needs a terminal — use `--json` to script it (one snapshot per tick)"
+        diag::error(
+            "sbx: `proc live` needs a terminal — use `--json` to script it (one snapshot per tick)",
         );
         return ExitCode::from(2);
     }
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry: {e}");
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -677,16 +705,16 @@ fn proc_logs(args: &[OsString]) -> ExitCode {
             Some("-f") | Some("--follow") => follow = true,
             Some(s) if !s.starts_with('-') => {
                 if id.is_some() {
-                    eprintln!("sbx: proc logs: at most one session id");
+                    diag::error("sbx: proc logs: at most one session id");
                     return ExitCode::from(2);
                 }
                 id = Some(s);
             }
             other => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: proc logs: unexpected argument {:?}",
                     other.unwrap_or_default()
-                );
+                ));
                 eprint!(
                     "{}",
                     help::page_usage(&["proc", "logs"]).unwrap_or_default()
@@ -697,15 +725,15 @@ fn proc_logs(args: &[OsString]) -> ExitCode {
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry: {e}");
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -720,11 +748,11 @@ fn proc_logs(args: &[OsString]) -> ExitCode {
     let first = match sandbox::proc_control::read_exec_log(&socket, None) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: proc logs: session {} is not being observed — relaunch it with `--observe` to \
                  record the processes it spawns.",
                 target.pid
-            );
+            ));
             return ExitCode::from(2);
         }
     };

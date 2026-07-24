@@ -14,7 +14,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{help, paths, sandbox, storage, store, style};
+use crate::{diag, help, paths, sandbox, storage, store, style};
 
 /// One top-level subtree of the data directory.
 #[derive(serde::Serialize)]
@@ -83,18 +83,18 @@ pub(crate) fn store_cmd(args: Vec<OsString>) -> ExitCode {
         match a.to_str() {
             Some("--json") => json = true,
             Some(other) => {
-                eprintln!("sbx: store: unknown argument `{other}`");
-                eprintln!("       run `sbx help store` for usage.");
+                diag::error(&format!("sbx: store: unknown argument `{other}`"));
+                diag::hint("       run `sbx help store` for usage.");
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("sbx: store: argument is not valid UTF-8");
+                diag::error("sbx: store: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx store: cannot locate sbx's data directory.");
+        diag::error("sbx store: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
     let mut view = build(layout.data_dir(), &layout.store_dir());
@@ -107,7 +107,7 @@ pub(crate) fn store_cmd(args: Vec<OsString>) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("sbx store: failed to serialize: {e}");
+                diag::error(&format!("sbx store: failed to serialize: {e}"));
                 ExitCode::FAILURE
             }
         };
@@ -247,9 +247,15 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
     if let Some(store) = &v.shared_store {
         let _ = writeln!(
             s,
-            "\n  shared store: {} realised path(s), {} file(s) deduplicated into `.links`",
-            thousands(store.paths),
-            thousands(store.deduplicated_files),
+            "\n  {}",
+            style::prose(
+                &format!(
+                    "shared store: {} realised path(s), {} file(s) deduplicated into `.links`",
+                    thousands(store.paths),
+                    thousands(store.deduplicated_files),
+                ),
+                pal
+            )
         );
     }
 
@@ -275,7 +281,11 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
     }
     let _ = writeln!(
         s,
-        "{dim}reclaim with `sbx gc --all --prune`, `sbx projects rm <id>`, `sbx app rm <name> --purge`.{r}"
+        "{}",
+        style::dim_prose(
+            "reclaim with `sbx gc --all --prune`, `sbx projects rm <id>`, `sbx app rm <name> --purge`.",
+            pal
+        )
     );
     s
 }

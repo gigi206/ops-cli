@@ -148,7 +148,9 @@ pub(crate) fn run_shim(args: &[OsString]) -> ExitCode {
     let (sock, payload) = match sep {
         Some(i) if i >= 1 && i + 1 < args.len() => (&args[0], &args[i + 1..]),
         _ => {
-            eprintln!("sbx {SHIM_VERB}: usage: {SHIM_VERB} <notif-socket> -- <command…>");
+            crate::diag::error(&format!(
+                "sbx {SHIM_VERB}: usage: {SHIM_VERB} <notif-socket> -- <command…>"
+            ));
             return ExitCode::from(2);
         }
     };
@@ -156,14 +158,18 @@ pub(crate) fn run_shim(args: &[OsString]) -> ExitCode {
     let notif_fd = match install_notif_filter() {
         Ok(fd) => fd,
         Err(e) => {
-            eprintln!("sbx {SHIM_VERB}: cannot install the exec filter ({e}) — refusing to run");
+            crate::diag::error(&format!(
+                "sbx {SHIM_VERB}: cannot install the exec filter ({e}) — refusing to run"
+            ));
             return ExitCode::from(97);
         }
     };
     if let Err(e) = hand_off(sock, notif_fd) {
         // SAFETY: notif_fd is our owned descriptor from install_notif_filter.
         unsafe { libc::close(notif_fd) };
-        eprintln!("sbx {SHIM_VERB}: cannot reach the exec supervisor ({e}) — refusing to run");
+        crate::diag::error(&format!(
+            "sbx {SHIM_VERB}: cannot reach the exec supervisor ({e}) — refusing to run"
+        ));
         return ExitCode::from(96);
     }
     // The supervisor holds the only reference now; drop ours so a supervisor exit tears the filter
@@ -299,7 +305,7 @@ fn exec_payload(payload: &[OsString]) -> ExitCode {
     let prog = match CString::new(payload[0].as_bytes()) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("sbx {SHIM_VERB}: command contains a NUL byte");
+            crate::diag::error(&format!("sbx {SHIM_VERB}: command contains a NUL byte"));
             return ExitCode::from(94);
         }
     };
@@ -308,7 +314,7 @@ fn exec_payload(payload: &[OsString]) -> ExitCode {
         .filter_map(|a| CString::new(a.as_bytes()).ok())
         .collect();
     if args.len() != payload.len() {
-        eprintln!("sbx {SHIM_VERB}: an argument contains a NUL byte");
+        crate::diag::error(&format!("sbx {SHIM_VERB}: an argument contains a NUL byte"));
         return ExitCode::from(94);
     }
     let mut ptrs: Vec<*const libc::c_char> = args.iter().map(|c| c.as_ptr()).collect();
@@ -316,10 +322,10 @@ fn exec_payload(payload: &[OsString]) -> ExitCode {
     // SAFETY: prog and ptrs live until execvp returns (which only happens on failure).
     unsafe { libc::execvp(prog.as_ptr(), ptrs.as_ptr()) };
     let err = io::Error::last_os_error();
-    eprintln!(
+    crate::diag::error(&format!(
         "sbx {SHIM_VERB}: cannot execute {}: {err}",
         payload[0].to_string_lossy()
-    );
+    ));
     // A supervisor `EPERM` (a denied command) lands here; report as a blocked run.
     ExitCode::from(if err.raw_os_error() == Some(libc::EPERM) {
         126

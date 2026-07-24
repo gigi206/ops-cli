@@ -20,8 +20,8 @@ fn config_path_arg(arg: Option<OsString>) -> std::path::PathBuf {
 /// cloned repo pre-approve itself), so an unresolved store is a hard failure.
 fn trust_store_dir() -> Result<std::path::PathBuf, ExitCode> {
     trust::default_store_dir().ok_or_else(|| {
-        eprintln!(
-            "sbx: cannot locate the trust store — set HOME or XDG_STATE_HOME to an absolute path."
+        crate::diag::error(
+            "sbx: cannot locate the trust store — set HOME or XDG_STATE_HOME to an absolute path.",
         );
         ExitCode::FAILURE
     })
@@ -35,7 +35,7 @@ pub(crate) fn trust_cmd(args: Vec<OsString>) -> ExitCode {
     let (show, path) = match parse_trust_args(args) {
         Ok(parsed) => parsed,
         Err(msg) => {
-            eprintln!("sbx: {msg} — usage: sbx trust [--show] [path]");
+            crate::diag::error(&format!("sbx: {msg} — usage: sbx trust [--show] [path]"));
             return ExitCode::from(2);
         }
     };
@@ -82,7 +82,7 @@ fn record_trust(path: std::path::PathBuf) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("sbx: cannot trust {}: {e}", path.display());
+            crate::diag::error(&format!("sbx: cannot trust {}: {e}", path.display()));
             ExitCode::FAILURE
         }
     }
@@ -136,7 +136,10 @@ pub(crate) fn untrust_cmd(arg: Option<OsString>) -> ExitCode {
     let result = match trust::untrust(&store_dir, &path) {
         Ok(existed) => existed,
         Err(e) => {
-            eprintln!("sbx: cannot revoke trust for {}: {e}", path.display());
+            crate::diag::error(&format!(
+                "sbx: cannot revoke trust for {}: {e}",
+                path.display()
+            ));
             return ExitCode::FAILURE;
         }
     };

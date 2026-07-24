@@ -30,10 +30,10 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         Some(arg) => match arg.to_str() {
             Some(w @ ("all" | "nix" | "mise" | "flake" | "deb" | "appimage" | "tarball")) => w,
             _ => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: unknown upgrade target '{}' (known: all, nix, mise, flake, deb, appimage, tarball)",
                     arg.to_string_lossy()
-                );
+                ));
                 return ExitCode::from(2);
             }
         },
@@ -41,24 +41,24 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // Exactly one (optional) target. A trailing token — a mistyped flag or a second target —
     // is rejected, not silently swallowed (so `sbx upgrade nix mise` does not roll only `nix`).
     if args.len() > 1 {
-        eprintln!("sbx: usage: {}", help::synopsis("upgrade"));
+        diag::error(&format!("sbx: usage: {}", help::synopsis("upgrade")));
         return ExitCode::from(2);
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
     let Some(nix) = store::resolve_nix(Some(&layout)) else {
-        eprintln!("sbx: nix not found — cannot upgrade. See `sbx doctor`.");
+        diag::error("sbx: nix not found — cannot upgrade. See `sbx doctor`.");
         return ExitCode::FAILURE;
     };
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -139,14 +139,14 @@ fn upgrade_nix_channel(
     let target = match sandbox::effective_lock_target(cwd, layout, cfg) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("sbx: cannot resolve the channel target: {e}");
+            diag::error(&format!("sbx: cannot resolve the channel target: {e}"));
             return false;
         }
     };
     let upgrade = match target.refresh(nix, layout) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("sbx: cannot upgrade the nixpkgs channel: {e}");
+            diag::error(&format!("sbx: cannot upgrade the nixpkgs channel: {e}"));
             return false;
         }
     };
@@ -179,7 +179,7 @@ fn upgrade_mise_engine(
     let upgrade = match target.refresh(nix, layout) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("sbx: cannot upgrade the mise engine: {e}");
+            diag::error(&format!("sbx: cannot upgrade the mise engine: {e}"));
             return false;
         }
     };
@@ -226,7 +226,7 @@ fn upgrade_mise_tools(
         match sandbox::upgrade_tools(nix, layout, cwd, &mise.files, &sandbox::current_system()) {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("sbx: cannot roll the mise tools: {e}");
+                diag::error(&format!("sbx: cannot roll the mise tools: {e}"));
                 return false;
             }
         };
@@ -304,7 +304,7 @@ fn upgrade_flake_packages(
     let outcomes = match sandbox::upgrade_flake(nix, layout, cwd, cfg) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("sbx: cannot roll the flake packages: {e}");
+            diag::error(&format!("sbx: cannot roll the flake packages: {e}"));
             return false;
         }
     };
@@ -331,8 +331,12 @@ fn flake_upgrade_summary(
     );
     let mut lines = vec![format!("{h}sbx upgrade — flake packages{r}")];
     let withheld_note = || {
-        format!(
-            "  {warn}{withheld} flake: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
+        style::prose(
+            &format!(
+                "  {warn}{withheld} flake: package(s) withheld (untrusted){r} — not rolled; \
+                 run `sbx trust`."
+            ),
+            pal,
         )
     };
     if outcomes.is_empty() {
@@ -399,7 +403,7 @@ fn upgrade_deb_packages(
     let outcomes = match sandbox::upgrade_deb(nix, layout, cwd, cfg) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("sbx: cannot roll the deb packages: {e}");
+            diag::error(&format!("sbx: cannot roll the deb packages: {e}"));
             return false;
         }
     };
@@ -432,8 +436,12 @@ fn deb_upgrade_summary(
     );
     let mut lines = vec![format!("{h}sbx upgrade — deb packages{r}")];
     let withheld_note = || {
-        format!(
-            "  {warn}{withheld} deb: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
+        style::prose(
+            &format!(
+                "  {warn}{withheld} deb: package(s) withheld (untrusted){r} — not rolled; \
+                 run `sbx trust`."
+            ),
+            pal,
         )
     };
     if outcomes.is_empty() {
@@ -487,7 +495,7 @@ fn upgrade_appimage_packages(
     let outcomes = match sandbox::upgrade_appimage(nix, layout, cwd, cfg) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("sbx: cannot roll the appimage packages: {e}");
+            diag::error(&format!("sbx: cannot roll the appimage packages: {e}"));
             return false;
         }
     };
@@ -513,8 +521,12 @@ fn appimage_upgrade_summary(
     );
     let mut lines = vec![format!("{h}sbx upgrade — appimage packages{r}")];
     let withheld_note = || {
-        format!(
-            "  {warn}{withheld} appimage: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
+        style::prose(
+            &format!(
+                "  {warn}{withheld} appimage: package(s) withheld (untrusted){r} — not rolled; \
+                 run `sbx trust`."
+            ),
+            pal,
         )
     };
     if outcomes.is_empty() {
@@ -566,7 +578,7 @@ fn upgrade_tarball_packages(
     let outcomes = match sandbox::upgrade_tarball(nix, layout, cwd, cfg) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("sbx: cannot roll the tarball packages: {e}");
+            diag::error(&format!("sbx: cannot roll the tarball packages: {e}"));
             return false;
         }
     };
@@ -592,8 +604,12 @@ fn tarball_upgrade_summary(
     );
     let mut lines = vec![format!("{h}sbx upgrade — tarball packages{r}")];
     let withheld_note = || {
-        format!(
-            "  {warn}{withheld} tarball: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
+        style::prose(
+            &format!(
+                "  {warn}{withheld} tarball: package(s) withheld (untrusted){r} — not rolled; \
+                 run `sbx trust`."
+            ),
+            pal,
         )
     };
     if outcomes.is_empty() {

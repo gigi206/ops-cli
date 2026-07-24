@@ -1886,28 +1886,7 @@ fn paint_synopsis(syn: &str, pal: &Palette) -> String {
 /// piped/plain output, and the non-terminal-is-plain invariant holds. An unterminated backtick is
 /// emitted verbatim (never a dangling open span), so malformed input can only under-style.
 fn paint_inline_code(text: &str, pal: &Palette) -> String {
-    if pal.code.is_empty() {
-        return text.to_string(); // color off: keep the backticks, unchanged
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        out.push_str(&rest[..start]);
-        match rest[start + 1..].find('`') {
-            Some(end) => {
-                out.push_str(pal.code);
-                out.push_str(&rest[start + 1..start + 1 + end]); // inner text, backticks dropped
-                out.push_str(pal.reset);
-                rest = &rest[start + 1 + end + 1..];
-            }
-            None => {
-                out.push_str(&rest[start..]); // lone backtick: emit the remainder as-is
-                return out;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    crate::style::paint_spans(text, pal.code, "", pal)
 }
 
 /// Render the top-level command list — the body of `sbx --help` and the no-command usage.
@@ -2013,10 +1992,10 @@ pub fn show(path: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx: no help for `sbx {}` — run `sbx --help` for the list of commands.",
                 path.join(" ")
-            );
+            ));
             ExitCode::from(2)
         }
     }

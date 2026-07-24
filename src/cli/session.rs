@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::{format_age, help, sandbox, session, store, style, uptime_seconds};
+use crate::{diag, format_age, help, sandbox, session, store, style, uptime_seconds};
 
 /// `sbx session <subcommand>` (alias `sbx sessions`): the namespace grouping every operation on a
 /// live sandbox session — `ls` lists them, `attach` runs a shell or a command inside one, `stop`
@@ -27,8 +27,8 @@ pub(crate) fn session_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
         Some(other) => {
-            eprintln!("sbx: session: unknown subcommand `{other}`");
-            eprintln!("       run `sbx help session` for usage.");
+            diag::error(&format!("sbx: session: unknown subcommand `{other}`"));
+            diag::hint("       run `sbx help session` for usage.");
             ExitCode::from(2)
         }
     }
@@ -39,15 +39,15 @@ pub(crate) fn session_cmd(args: Vec<OsString>) -> ExitCode {
 /// list is always current without a daemon.
 fn list_sessions() -> ExitCode {
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry: {e}");
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -125,10 +125,10 @@ fn attach_cmd(args: Vec<OsString>) -> ExitCode {
         None => (&args[..], Vec::new()),
     };
     let usage = || {
-        eprintln!(
+        diag::error(&format!(
             "sbx: usage: {}   (the PID shown by `sbx session ls`)",
             help::synopsis_of(&["session", "attach"])
-        );
+        ));
         ExitCode::from(2)
     };
     // A `--` with nothing after it is a mistake (attach either takes a command or opens a shell).
@@ -160,16 +160,16 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
         match arg.to_str() {
             Some("--delay") => {
                 let Some(value) = it.next() else {
-                    eprintln!("sbx: --delay needs a value in seconds (e.g. --delay 10).");
+                    diag::error("sbx: --delay needs a value in seconds (e.g. --delay 10).");
                     return ExitCode::from(2);
                 };
                 match value.to_str().and_then(|v| v.parse::<u64>().ok()) {
                     Some(secs) => delay = Duration::from_secs(secs),
                     None => {
-                        eprintln!(
+                        diag::error(&format!(
                             "sbx: --delay must be a whole number of seconds, not '{}'.",
                             value.to_string_lossy()
-                        );
+                        ));
                         return ExitCode::from(2);
                     }
                 }
@@ -177,20 +177,22 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
             Some("--all") => all = true,
             Some(id) => ids.push(id.to_string()),
             None => {
-                eprintln!("sbx: stop ids must be valid text (the PID shown by `sbx session ls`).");
+                diag::error(
+                    "sbx: stop ids must be valid text (the PID shown by `sbx session ls`).",
+                );
                 return ExitCode::from(2);
             }
         }
     }
     if all && !ids.is_empty() {
-        eprintln!("sbx: stop takes either explicit ids or --all, not both.");
+        diag::error("sbx: stop takes either explicit ids or --all, not both.");
         return ExitCode::from(2);
     }
     if !all && ids.is_empty() {
-        eprintln!(
+        diag::error(&format!(
             "sbx: usage: {}\n   (ids are the PIDs shown by `sbx session ls`)",
             help::synopsis_of(&["session", "stop"])
-        );
+        ));
         return ExitCode::from(2);
     }
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();

@@ -20,6 +20,7 @@ pub(crate) mod test;
 pub(crate) mod trust;
 pub(crate) mod upgrade;
 
+use crate::diag;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
@@ -112,8 +113,8 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "fs" => fs::fs_cmd(rest),
         "plugins" => plugins::plugins_cmd(rest),
         other => {
-            eprintln!("sbx: unknown command '{other}'");
-            eprintln!("Run `sbx --help` for the list of commands.");
+            diag::error(&format!("sbx: unknown command '{other}'"));
+            diag::hint("Run `sbx --help` for the list of commands.");
             ExitCode::from(2)
         }
     }

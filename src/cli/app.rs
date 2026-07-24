@@ -34,7 +34,9 @@ pub(crate) fn app_cmd(args: Vec<OsString>) -> ExitCode {
         // No valid subcommand: a bare `sbx app`, an unknown token, a leading flag, or a non-UTF-8
         // token. There is no launch to act on — name the launch verb and print the usage page.
         _ => {
-            eprintln!("sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`.");
+            diag::error(
+                "sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`.",
+            );
             eprint!("{}", help::page_usage(&["app"]).unwrap_or_default());
             ExitCode::from(2)
         }
@@ -80,8 +82,15 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
         diag::warn(note);
     }
     if synth.rules.is_empty() {
+        let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
         println!(
-            "sbx net-learn: no new egress rules — app `{name}` was refused nothing it lacked a rule for."
+            "{}",
+            style::prose(
+                &format!(
+                    "sbx net-learn: no new egress rules — app `{name}` was refused nothing it lacked a rule for."
+                ),
+                &pal
+            )
         );
         return ExitCode::SUCCESS;
     }
@@ -94,7 +103,7 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
     let target = match egress_write_target(&nl.scope, Some(name), &cwd) {
         Ok((_, _, target)) => target,
         Err((code, msg)) => {
-            eprintln!("sbx net-learn: {msg}");
+            diag::error(&format!("sbx net-learn: {msg}"));
             return ExitCode::from(code);
         }
     };
@@ -115,9 +124,15 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
     let mut failed = false;
     for rule in &synth.rules {
         match persist_egress_rule(EgressList::Allow, rule, &nl.scope, Some(name), &cwd) {
-            Ok(msg) => println!("{msg}"),
+            Ok(msg) => println!(
+                "{}",
+                style::prose(
+                    &msg,
+                    &style::Palette::for_stream(std::io::stdout().is_terminal())
+                )
+            ),
             Err((_, msg)) => {
-                eprintln!("sbx net-learn: {msg}");
+                diag::error(&format!("sbx net-learn: {msg}"));
                 failed = true;
             }
         }
@@ -166,10 +181,10 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         // Decide on the leading token, then act — the match ends the immutable borrow so a
         // value-taking flag can mutate the queue.
         let Some(raw) = head[0].to_str().map(str::to_string) else {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: app name must be valid text — usage: {}",
                 help::synopsis_of(&["app", "run"])
-            );
+            ));
             return Err(ExitCode::from(2));
         };
         match flag_name(&raw) {
@@ -188,7 +203,7 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                     Some((_, value)) => match sandbox::Granularity::parse(value) {
                         Ok(g) => g,
                         Err(e) => {
-                            eprintln!("sbx: {e}");
+                            diag::error(&format!("sbx: {e}"));
                             return Err(ExitCode::from(2));
                         }
                     },
@@ -216,17 +231,17 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                 Some(res) => res?,
                 None => {
                     if raw.starts_with('-') {
-                        eprintln!(
+                        diag::error(&format!(
                             "sbx: unknown flag {raw} — usage: {}",
                             help::synopsis_of(&["app", "run"])
-                        );
+                        ));
                         return Err(ExitCode::from(2));
                     }
                     if name.is_some() {
-                        eprintln!(
+                        diag::error(&format!(
                             "sbx: app takes a single name — usage: {}",
                             help::synopsis_of(&["app", "run"])
-                        );
+                        ));
                         return Err(ExitCode::from(2));
                     }
                     name = Some(raw);
@@ -243,15 +258,15 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
     };
     // `--net-learn` reviews and writes rules in the foreground; `--detach` has no session to observe.
     if learn_gran.is_some() && detach {
-        eprintln!(
-            "sbx: --net-learn cannot be combined with --detach (it observes a foreground run)."
+        diag::error(
+            "sbx: --net-learn cannot be combined with --detach (it observes a foreground run).",
         );
         return Err(ExitCode::from(2));
     }
     // The write scope and `--dry-run` only shape where `--net-learn` puts its rules; refuse them on a
     // plain launch rather than silently ignoring a flag the user expected to matter.
     if learn_gran.is_none() && (scope_seen || dry_run) {
-        eprintln!("sbx: --global/--local/--dry-run apply only with --net-learn.");
+        diag::error("sbx: --global/--local/--dry-run apply only with --net-learn.");
         return Err(ExitCode::from(2));
     }
     let net_learn = learn_gran.map(|gran| NetLearn {
@@ -305,27 +320,30 @@ fn app_import(args: &[OsString]) -> ExitCode {
             Some("--as") => match it.next().and_then(|a| a.to_str()) {
                 Some(n) => as_name = Some(n.to_string()),
                 None => {
-                    eprintln!("sbx: --as needs a name");
+                    diag::error("sbx: --as needs a name");
                     return ExitCode::from(2);
                 }
             },
             Some("--force") => force = true,
             Some(flag) if flag.starts_with("--") => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: unknown flag '{flag}' (usage: {})",
                     help::synopsis_of(&["app", "import"])
-                );
+                ));
                 return ExitCode::from(2);
             }
             _ if source.is_none() => source = Some(arg),
             _ => {
-                eprintln!("sbx: sbx app import takes a single file");
+                diag::error("sbx: sbx app import takes a single file");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(source) = source else {
-        eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "import"]));
+        diag::error(&format!(
+            "sbx: usage: {}",
+            help::synopsis_of(&["app", "import"])
+        ));
         return ExitCode::from(2);
     };
     let src_path = Path::new(source);
@@ -337,21 +355,23 @@ fn app_import(args: &[OsString]) -> ExitCode {
         None => match src_path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s.to_string(),
             None => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: cannot derive a name from {} — pass --as <name>",
                     src_path.display()
-                );
+                ));
                 return ExitCode::from(2);
             }
         },
     };
     if !config::is_valid_app_name(&name) {
-        eprintln!("sbx: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not `.`/`..`)");
+        diag::error(&format!(
+            "sbx: '{name}' is not a usable app name (1–64 of [A-Za-z0-9._-], not `.`/`..`)"
+        ));
         return ExitCode::from(2);
     }
 
     let Some(dir) = config::profiles_dir() else {
-        eprintln!("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        diag::error("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
         return ExitCode::FAILURE;
     };
 
@@ -360,31 +380,31 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let bytes = match config::safety::read_safe_bytes(src_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("sbx: cannot read {}: {e}", src_path.display());
+            diag::error(&format!("sbx: cannot read {}: {e}", src_path.display()));
             return ExitCode::FAILURE;
         }
     };
     let preview = match config::validate_profile(&bytes) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: {} is not a valid app profile: {e}",
                 src_path.display()
-            );
+            ));
             return ExitCode::FAILURE;
         }
     };
 
     let dest = dir.join(format!("{name}.toml"));
     if dest.exists() && !force {
-        eprintln!(
+        diag::error(&format!(
             "sbx: a profile '{name}' already exists at {} (use --force to overwrite)",
             dest.display()
-        );
+        ));
         return ExitCode::FAILURE;
     }
     if let Err(e) = write_profile_file(&dir, &dest, &bytes) {
-        eprintln!("sbx: cannot write {}: {e}", dest.display());
+        diag::error(&format!("sbx: cannot write {}: {e}", dest.display()));
         return ExitCode::FAILURE;
     }
 
@@ -441,48 +461,51 @@ fn app_export(args: &[OsString]) -> ExitCode {
             Some("--out") => match it.next() {
                 Some(p) => out = Some(p),
                 None => {
-                    eprintln!("sbx: --out needs a file");
+                    diag::error("sbx: --out needs a file");
                     return ExitCode::from(2);
                 }
             },
             Some(flag) if flag.starts_with("--") => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: unknown flag '{flag}' (usage: {})",
                     help::synopsis_of(&["app", "export"])
-                );
+                ));
                 return ExitCode::from(2);
             }
             Some(n) if name.is_none() => name = Some(n),
             None if name.is_none() => {
-                eprintln!("sbx: the app name must be valid UTF-8");
+                diag::error("sbx: the app name must be valid UTF-8");
                 return ExitCode::from(2);
             }
             _ => {
-                eprintln!("sbx: sbx app export takes a single name");
+                diag::error("sbx: sbx app export takes a single name");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(name) = name else {
-        eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "export"]));
+        diag::error(&format!(
+            "sbx: usage: {}",
+            help::synopsis_of(&["app", "export"])
+        ));
         return ExitCode::from(2);
     };
     // The name reaches a filesystem lookup, so validate it (charset/length, no traversal).
     if !config::is_valid_app_name(name) {
-        eprintln!("sbx: '{name}' is not a valid app name");
+        diag::error(&format!("sbx: '{name}' is not a valid app name"));
         return ExitCode::from(2);
     }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
             return ExitCode::FAILURE;
         }
     };
     let bytes = match config::export_profile(&cwd, name) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            diag::error(&format!("sbx: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -490,14 +513,14 @@ fn app_export(args: &[OsString]) -> ExitCode {
         None => {
             use std::io::Write as _;
             if let Err(e) = std::io::stdout().write_all(&bytes) {
-                eprintln!("sbx: cannot write the profile: {e}");
+                diag::error(&format!("sbx: cannot write the profile: {e}"));
                 return ExitCode::FAILURE;
             }
         }
         Some(path) => {
             let path = Path::new(path);
             if let Err(e) = std::fs::write(path, &bytes) {
-                eprintln!("sbx: cannot write {}: {e}", path.display());
+                diag::error(&format!("sbx: cannot write {}: {e}", path.display()));
                 return ExitCode::FAILURE;
             }
             // The confirmation goes to stderr (stdout is reserved for the profile bytes), so its
@@ -523,32 +546,40 @@ fn app_rm(args: &[OsString]) -> ExitCode {
     let (purge, gc, name) = match parse_app_rm(args) {
         AppRmArgs::Ok { purge, gc, name } => (purge, gc, name),
         AppRmArgs::MissingName => {
-            eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "rm"]));
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["app", "rm"])
+            ));
             return ExitCode::from(2);
         }
         AppRmArgs::UnknownOption(tok) => {
-            eprintln!("sbx: app rm: unknown option `{tok}`");
-            eprintln!("sbx: usage: {}", help::synopsis_of(&["app", "rm"]));
+            diag::error(&format!("sbx: app rm: unknown option `{tok}`"));
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["app", "rm"])
+            ));
             return ExitCode::from(2);
         }
         AppRmArgs::Extra(tok) => {
-            eprintln!("sbx: app rm: unexpected argument `{tok}` (one app name only)");
+            diag::error(&format!(
+                "sbx: app rm: unexpected argument `{tok}` (one app name only)"
+            ));
             return ExitCode::from(2);
         }
         AppRmArgs::NonUtf8 => {
-            eprintln!("sbx: app rm: argument is not valid UTF-8");
+            diag::error("sbx: app rm: argument is not valid UTF-8");
             return ExitCode::from(2);
         }
     };
     if !config::is_valid_app_name(name) {
-        eprintln!("sbx: '{name}' is not a valid app name");
+        diag::error(&format!("sbx: '{name}' is not a valid app name"));
         return ExitCode::from(2);
     }
     // `--gc` reclaims the store an app's homes referenced, so it only makes sense alongside the
     // home removal `--purge` performs — never on a bare profile removal.
     if gc && !purge {
-        eprintln!(
-            "sbx: app rm: `--gc` requires `--purge` (it sweeps the store the purged home used)"
+        diag::error(
+            "sbx: app rm: `--gc` requires `--purge` (it sweeps the store the purged home used)",
         );
         return ExitCode::from(2);
     }
@@ -599,7 +630,7 @@ fn parse_app_rm(args: &[OsString]) -> AppRmArgs<'_> {
 /// missing profile is tolerated, since the homes may still exist).
 fn app_rm_profile(name: &str) -> ExitCode {
     let Some(dir) = config::profiles_dir() else {
-        eprintln!("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        diag::error("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
         return ExitCode::FAILURE;
     };
     let path = dir.join(format!("{name}.toml"));
@@ -610,15 +641,15 @@ fn app_rm_profile(name: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: no imported profile '{name}' (a project [app.{name}] overlay lives in a \
                  project's .sbx.toml — edit it there). To also remove an app's home/tools, use \
                  `sbx app rm {name} --purge`."
-            );
+            ));
             ExitCode::FAILURE
         }
         Err(e) => {
-            eprintln!("sbx: cannot remove {}: {e}", path.display());
+            diag::error(&format!("sbx: cannot remove {}: {e}", path.display()));
             ExitCode::FAILURE
         }
     }
@@ -647,8 +678,8 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     let (ok, n, warn, dim, r) = (pal.ok, pal.name, pal.warn, pal.dim, pal.reset);
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot locate sbx's data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        diag::error(
+            "sbx: cannot locate sbx's data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
@@ -663,17 +694,19 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
                 .map(|s| s.pid.to_string())
                 .collect();
             if !pids.is_empty() {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: app '{name}' has a running session (pid {}); stop it first \
                      (see `sbx session ls`; then `sbx session stop {}`).",
                     pids.join(", "),
                     pids.join(" ")
-                );
+                ));
                 return ExitCode::FAILURE;
             }
         }
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry ({e}); not purging '{name}'.");
+            diag::error(&format!(
+                "sbx: cannot read the session registry ({e}); not purging '{name}'."
+            ));
             return ExitCode::FAILURE;
         }
     }
@@ -688,7 +721,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
-                eprintln!("sbx: cannot remove {}: {e}", path.display());
+                diag::error(&format!("sbx: cannot remove {}: {e}", path.display()));
                 false
             }
         },
@@ -705,12 +738,17 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
         );
     }
     for (path, e) in &report.failed {
-        eprintln!("{warn}sbx: could not remove {}: {e}{r}", path.display());
+        diag::error(&format!(
+            "{warn}sbx: could not remove {}: {e}{r}",
+            path.display()
+        ));
     }
 
     // 3. Nothing found across either source → a no-op (likely a typo); do not report success.
     if !profile_removed && report.found_nothing() {
-        eprintln!("sbx: nothing to purge for '{name}' (no profile and no home)");
+        diag::error(&format!(
+            "sbx: nothing to purge for '{name}' (no profile and no home)"
+        ));
         return ExitCode::FAILURE;
     }
 
@@ -741,8 +779,12 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
         println!();
         let gc_code = sandbox::gc(true, false, false, &pal);
         println!(
-            "{dim}note: `--gc` swept this project's store; run `sbx gc --prune` in the app's other \
-             projects to reclaim their copies too.{r}"
+            "{}",
+            style::dim_prose(
+                "note: `--gc` swept this project's store; run `sbx gc --prune` in the app's other \
+                 projects to reclaim their copies too.",
+                &pal
+            )
         );
         // The purge succeeded independently of the sweep; when it did, defer to the sweep's own exit
         // code so a sweep that could not run (no capable host, nix missing) is not hidden — but never
@@ -751,9 +793,13 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     }
 
     println!(
-        "{dim}note: an app's nix:/flake: tool closures live in the shared per-project store; \
-         run `sbx gc --prune` in a project to reclaim any no longer referenced there \
-         (or re-run with --gc for the current project).{r}"
+        "{}",
+        style::dim_prose(
+            "note: an app's nix:/flake: tool closures live in the shared per-project store; \
+             run `sbx gc --prune` in a project to reclaim any no longer referenced there \
+             (or re-run with --gc for the current project).",
+            &pal
+        )
     );
     if purge_ok {
         ExitCode::SUCCESS
@@ -792,7 +838,7 @@ fn app_list() -> ExitCode {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                eprintln!("sbx: cannot read {}: {e}", dir.display());
+                diag::error(&format!("sbx: cannot read {}: {e}", dir.display()));
                 return ExitCode::FAILURE;
             }
         }
@@ -888,26 +934,28 @@ fn app_show(args: &[OsString]) -> ExitCode {
             Some("--json") => json = true,
             Some("--help") | Some("-h") => return help::show(&["app", "show"]),
             Some(flag) if flag.starts_with('-') => {
-                eprintln!("sbx: app show: unknown flag `{flag}`");
-                eprintln!("       run `sbx help app show` for usage.");
+                diag::error(&format!("sbx: app show: unknown flag `{flag}`"));
+                diag::hint("       run `sbx help app show` for usage.");
                 return ExitCode::from(2);
             }
             Some(other) if name.is_none() => name = Some(other),
             Some(extra) => {
-                eprintln!("sbx: app show: unexpected extra argument `{extra}`");
+                diag::error(&format!(
+                    "sbx: app show: unexpected extra argument `{extra}`"
+                ));
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("sbx: app show: argument is not valid UTF-8");
+                diag::error("sbx: app show: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(name) = name else {
-        eprintln!(
+        diag::error(&format!(
             "sbx: app show: name an app — usage: {}",
             help::synopsis_of(&["app", "show"])
-        );
+        ));
         return ExitCode::from(2);
     };
     let cwd = match config_cwd() {
@@ -915,7 +963,7 @@ fn app_show(args: &[OsString]) -> ExitCode {
         Err(code) => return code,
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: app show: cannot locate sbx's data directory.");
+        diag::error("sbx: app show: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
 
@@ -925,12 +973,12 @@ fn app_show(args: &[OsString]) -> ExitCode {
     // An app that is neither declared for this directory nor has an installed home on disk does not
     // exist — surface the declared set, like `config show --app`.
     if app.is_none() && homes.is_empty() {
-        eprintln!("sbx: app show: no app named {name:?}");
+        diag::error(&format!("sbx: app show: no app named {name:?}"));
         let declared: Vec<String> = resolved.apps.keys().cloned().collect();
         if declared.is_empty() {
-            eprintln!("sbx: no apps are declared for this directory");
+            diag::error("sbx: no apps are declared for this directory");
         } else {
-            eprintln!("sbx: declared apps: {}", declared.join(", "));
+            diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
         }
         return ExitCode::FAILURE;
     }
@@ -943,7 +991,7 @@ fn app_show(args: &[OsString]) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("sbx: app show: cannot serialize: {e}");
+                diag::error(&format!("sbx: app show: cannot serialize: {e}"));
                 ExitCode::FAILURE
             }
         };
@@ -1380,26 +1428,28 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             Some("-y") | Some("--yes") => apply = true,
             Some("--help") | Some("-h") => return help::show(&["app", "prune"]),
             Some(flag) if flag.starts_with('-') => {
-                eprintln!("sbx: app prune: unknown flag `{flag}`");
-                eprintln!("       run `sbx help app prune` for usage.");
+                diag::error(&format!("sbx: app prune: unknown flag `{flag}`"));
+                diag::hint("       run `sbx help app prune` for usage.");
                 return ExitCode::from(2);
             }
             Some(other) if name.is_none() => name = Some(other),
             Some(extra) => {
-                eprintln!("sbx: app prune: unexpected extra argument `{extra}`");
+                diag::error(&format!(
+                    "sbx: app prune: unexpected extra argument `{extra}`"
+                ));
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("sbx: app prune: argument is not valid UTF-8");
+                diag::error("sbx: app prune: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(name) = name else {
-        eprintln!(
+        diag::error(&format!(
             "sbx: app prune: name an app — usage: {}",
             help::synopsis_of(&["app", "prune"])
-        );
+        ));
         return ExitCode::from(2);
     };
     let cwd = match config_cwd() {
@@ -1407,7 +1457,7 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         Err(code) => return code,
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: app prune: cannot locate sbx's data directory.");
+        diag::error("sbx: app prune: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
 
@@ -1415,10 +1465,10 @@ fn app_prune(args: &[OsString]) -> ExitCode {
     let app = resolved.apps.get(name);
     let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), name);
     if app.is_none() && homes.is_empty() {
-        eprintln!("sbx: app prune: no app named {name:?}");
+        diag::error(&format!("sbx: app prune: no app named {name:?}"));
         let declared: Vec<String> = resolved.apps.keys().cloned().collect();
         if !declared.is_empty() {
-            eprintln!("sbx: declared apps: {}", declared.join(", "));
+            diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
         }
         return ExitCode::FAILURE;
     }
@@ -1470,7 +1520,11 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         println!("{ok}pruned {count} undeclared tool(s), freeing {size}.{r}");
     } else {
         println!(
-            "{dim}would prune {count} undeclared tool(s) ({size}) — re-run with `--yes` to apply.{r}"
+            "{}",
+            style::dim_prose(
+                &format!("would prune {count} undeclared tool(s) ({size}) — re-run with `--yes` to apply."),
+                &pal
+            )
         );
     }
     ExitCode::SUCCESS

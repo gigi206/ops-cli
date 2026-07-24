@@ -586,7 +586,11 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
     let _ = writeln!(o);
     let _ = writeln!(
         o,
-        "{dim}for the config files in resolution order, see `sbx config path`.{r}"
+        "{}",
+        crate::style::dim_prose(
+            "for the config files in resolution order, see `sbx config path`.",
+            pal
+        )
     );
     o
 }

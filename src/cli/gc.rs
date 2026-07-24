@@ -17,11 +17,11 @@ pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
             Some("--all") => all = true,
             Some("--optimise") | Some("--optimize") => optimise = true,
             Some(_) => {
-                eprintln!("sbx: usage: {}", help::synopsis("gc"));
+                crate::diag::error(&format!("sbx: usage: {}", help::synopsis("gc")));
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("sbx: gc: argument is not valid UTF-8");
+                crate::diag::error("sbx: gc: argument is not valid UTF-8");
                 return ExitCode::from(2);
             }
         }

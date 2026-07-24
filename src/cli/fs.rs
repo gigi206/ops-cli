@@ -7,7 +7,7 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::{format_log_time, help, resolve_session_target, sandbox, session, store, style};
+use crate::{diag, format_log_time, help, resolve_session_target, sandbox, session, store, style};
 
 /// `sbx fs <subcommand>`: observe the files a running session writes in its project tree. Currently
 /// one subcommand, `logs`; `log` is accepted as an alias.
@@ -22,8 +22,8 @@ pub(crate) fn fs_cmd(args: Vec<OsString>) -> ExitCode {
             ExitCode::from(2)
         }
         Some(other) => {
-            eprintln!("sbx: fs: unknown subcommand `{other}`");
-            eprintln!("       run `sbx help fs` for usage.");
+            diag::error(&format!("sbx: fs: unknown subcommand `{other}`"));
+            diag::hint("       run `sbx help fs` for usage.");
             ExitCode::from(2)
         }
     }
@@ -45,16 +45,16 @@ fn fs_logs(args: &[OsString]) -> ExitCode {
             Some("-f") | Some("--follow") => follow = true,
             Some(s) if !s.starts_with('-') => {
                 if id.is_some() {
-                    eprintln!("sbx: fs logs: at most one session id");
+                    diag::error("sbx: fs logs: at most one session id");
                     return ExitCode::from(2);
                 }
                 id = Some(s);
             }
             other => {
-                eprintln!(
+                diag::error(&format!(
                     "sbx: fs logs: unexpected argument {:?}",
                     other.unwrap_or_default()
-                );
+                ));
                 eprint!("{}", help::page_usage(&["fs", "logs"]).unwrap_or_default());
                 return ExitCode::from(2);
             }
@@ -62,15 +62,15 @@ fn fs_logs(args: &[OsString]) -> ExitCode {
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot read the session registry: {e}");
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -85,11 +85,11 @@ fn fs_logs(args: &[OsString]) -> ExitCode {
     let first = match sandbox::fs_control::read_fs_log(&socket, None) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!(
+            diag::error(&format!(
                 "sbx: fs logs: session {} is not being observed — relaunch it with `--observe` to \
                  record the files it writes.",
                 target.pid
-            );
+            ));
             return ExitCode::from(2);
         }
     };

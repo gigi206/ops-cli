@@ -96,7 +96,9 @@ pub(crate) fn run(
     // With no command, `sbx run` opens the project shell — which needs a terminal, so a detached
     // no-command launch is refused rather than started into the void.
     if cmd.is_empty() && detach {
-        eprintln!("sbx: `sbx run --detach` needs a command (a detached shell has no terminal).");
+        crate::diag::error(
+            "sbx: `sbx run --detach` needs a command (a detached shell has no terminal).",
+        );
         return ExitCode::from(2);
     }
     let mut prep = match prepare_with(&ov) {
@@ -194,7 +196,7 @@ fn apply_launch_override(
 ) -> Result<(), ExitCode> {
     cfg.apply_override(ov).map_err(|errs| {
         for e in errs {
-            eprintln!("sbx: {e}");
+            crate::diag::error(&format!("sbx: {e}"));
         }
         ExitCode::from(2)
     })
@@ -262,7 +264,7 @@ fn launch_foreground(
         None if !observe => {
             // On success this never returns; reaching past it means exec itself failed.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
-            eprintln!("sbx: failed to launch the sandbox: {err}");
+            crate::diag::error(&format!("sbx: failed to launch the sandbox: {err}"));
             ExitCode::FAILURE
         }
         // Supervise instead of exec-replace — fork bwrap, wait, propagate the exit status — whenever
@@ -322,10 +324,10 @@ fn launch_detached(
     // SAFETY: `pipe2` fills the two-element array; `O_CLOEXEC` so neither end leaks into the
     // eventual `exec` of bwrap.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        eprintln!(
+        crate::diag::error(&format!(
             "sbx: cannot create the detach pipe: {}",
             io::Error::last_os_error()
-        );
+        ));
         return ExitCode::FAILURE;
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
@@ -338,10 +340,10 @@ fn launch_detached(
                 libc::close(read_fd);
                 libc::close(write_fd);
             }
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx: cannot start the detached session: {}",
                 io::Error::last_os_error()
-            );
+            ));
             ExitCode::FAILURE
         }
         0 => {
@@ -393,10 +395,10 @@ fn detached_child(
     let log = match open_detach_log(&log_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx: cannot open the session log {}: {e}",
                 log_path.display()
-            );
+            ));
             fail_detached(write_fd);
         }
     };
@@ -428,7 +430,7 @@ fn detached_child(
         None if !observe => {
             // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
-            eprintln!("sbx: failed to launch the sandbox: {err}");
+            crate::diag::error(&format!("sbx: failed to launch the sandbox: {err}"));
             std::process::exit(1);
         }
         maybe_guard => {
@@ -461,21 +463,21 @@ fn detach_parent(
     use std::io::Read;
     if matches!(pipe.read(&mut byte), Ok(1) if byte[0] == DETACH_READY) {
         let log = detach_log_path(data_dir, child as u32);
-        eprintln!(
+        crate::diag::error(&format!(
             "sbx: started `{label}` as detached session {child} (logs: {})",
             log.display()
-        );
-        eprintln!(
+        ));
+        crate::diag::hint(&format!(
             "sbx: `sbx session ls` lists it, `sbx session attach {child}` opens a shell inside its live cage, \
              `sbx session stop {child}` ends it."
-        );
+        ));
         ExitCode::SUCCESS
     } else {
         // The daemon closed the pipe without signalling success: it failed before launch (the
         // error is already on this terminal). Reap it.
         // SAFETY: `waitpid` on our own child.
         unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
-        eprintln!("sbx: the detached session failed to start (see the error above).");
+        crate::diag::error("sbx: the detached session failed to start (see the error above).");
         ExitCode::FAILURE
     }
 }
@@ -582,13 +584,16 @@ pub(crate) fn app(
         Err(code) => return AppOutcome::plain(code),
     };
     let Some(app) = prep.cfg.apps.remove(name) else {
-        eprintln!("sbx: no app named `{name}`.{}", available_apps(&prep.cfg));
+        crate::diag::error(&format!(
+            "sbx: no app named `{name}`.{}",
+            available_apps(&prep.cfg)
+        ));
         return AppOutcome::plain(ExitCode::from(2));
     };
     if app.cmd.is_empty() {
-        eprintln!(
+        crate::diag::error(&format!(
             "sbx: app `{name}` declares no command — add a `cmd` to its `[app.{name}]` table."
-        );
+        ));
         return AppOutcome::plain(ExitCode::FAILURE);
     }
     // The argv and the home scope are owned by the app; read them before the overlay is folded
@@ -602,7 +607,7 @@ pub(crate) fn app(
         crate::config::AppHomeScope::Global => binds::Runtime::GlobalApp(name),
         crate::config::AppHomeScope::Project => binds::Runtime::ProjectApp(name),
     };
-    eprintln!("sbx: launching app `{name}`");
+    crate::diag::hint(&format!("sbx: launching app `{name}`"));
     prep.cfg.merge_app(app);
     // The override is the authoritative final word — applied *after* the app overlay so a one-shot
     // `sbx app <name> --config …`/`SBX_*` beats the app's own posture, not the other way round.
@@ -622,11 +627,11 @@ pub(crate) fn app(
         let policy = match &prep.cfg.network {
             crate::config::NetworkPolicy::Allowlist(p) => p.clone(),
             other => {
-                eprintln!(
+                crate::diag::error(&format!(
                     "sbx: --net-learn needs a filtering network posture (mode allow/deny/ask); \
                      app `{name}` has `{}` — nothing logs egress to learn from.",
                     network_posture_name(other)
-                );
+                ));
                 return AppOutcome::plain(ExitCode::from(2));
             }
         };
@@ -701,7 +706,7 @@ fn launch_foreground_learning(
         match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
             Ok(c) => ExitCode::from(c as u8),
             Err(e) => {
-                eprintln!("sbx: sandbox session failed: {e}");
+                crate::diag::error(&format!("sbx: sandbox session failed: {e}"));
                 ExitCode::FAILURE
             }
         }
@@ -927,7 +932,13 @@ pub(crate) fn upgrade_mise_packages(
     let withheld = withheld_mise_packages(cfg);
     if withheld > 0 {
         println!(
-            "  {warn}{withheld} mise: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
+            "{}",
+            crate::style::prose(
+                &format!(
+                    "  {warn}{withheld} mise: package(s) withheld (untrusted){r} — not rolled; run `sbx trust`."
+                ),
+                pal
+            )
         );
     }
     if groups.is_empty() {
@@ -1116,7 +1127,7 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
                 runtime_housekeeping(&layout, prune, pal);
                 shared_store_gc(&layout, prune, optimise, pal);
             }
-            None => eprintln!(
+            None => crate::diag::error(
                 "sbx gc: cannot locate sbx's data directory; skipping the shared-store housekeeping."
             ),
         }
@@ -1128,7 +1139,7 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
         // must not fail the whole command. Its own message is already printed above; only the exit
         // code is flattened.
         Err(_) if all => {
-            eprintln!(
+            crate::diag::error(
                 "sbx gc: the current project's store was not swept (see above); the shared-store collection ran."
             );
             ExitCode::SUCCESS
@@ -1162,9 +1173,9 @@ fn session_housekeeping(
             live.iter().map(|s| binds::project_id(&s.project)).collect()
         }
         Err(e) => {
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx gc: cannot read the session registry ({e}); skipping session housekeeping."
-            );
+            ));
             std::collections::BTreeSet::new()
         }
     }
@@ -1244,10 +1255,16 @@ fn reap_dead_trees(
             );
         } else {
             println!(
-                "{h}sbx projects rm:{r} {} dead project tree(s) reclaimable (up to {}) — \
-                 run `sbx projects rm --dead --yes` to reclaim.",
-                report.dead.len(),
-                super::gc::human_bytes(freed)
+                "{}",
+                crate::style::prose(
+                    &format!(
+                        "{h}sbx projects rm:{r} {} dead project tree(s) reclaimable (up to {}) — \
+                         run `sbx projects rm --dead --yes` to reclaim.",
+                        report.dead.len(),
+                        super::gc::human_bytes(freed)
+                    ),
+                    pal
+                )
             );
         }
     }
@@ -1428,15 +1445,15 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     use crate::config::Backend;
 
     let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!("sbx projects show: cannot locate sbx's data directory.");
+        crate::diag::error("sbx projects show: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
     let data = layout.data_dir();
     let dir = data.join("projects").join(id);
     if !dir.is_dir() {
-        eprintln!(
+        crate::diag::error(&format!(
             "sbx projects show: no runtime tree `{id}` — run `sbx projects list` to see them."
-        );
+        ));
         return ExitCode::FAILURE;
     }
 
@@ -1574,7 +1591,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("sbx projects show: failed to serialize: {e}");
+                crate::diag::error(&format!("sbx projects show: failed to serialize: {e}"));
                 ExitCode::FAILURE
             }
         };
@@ -1687,7 +1704,7 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
 /// or `--json`.
 pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode {
     let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!("sbx projects: cannot locate sbx's data directory.");
+        crate::diag::error("sbx projects: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
     let rows = collect_project_trees(&layout, pal);
@@ -1699,7 +1716,7 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("sbx projects: failed to serialize: {e}");
+                crate::diag::error(&format!("sbx projects: failed to serialize: {e}"));
                 ExitCode::FAILURE
             }
         };
@@ -1734,7 +1751,11 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
         );
     }
     println!(
-        "{dim}remove one with `sbx projects rm <id>`; sweep dead trees with `sbx projects rm --dead --yes`.{r}"
+        "{}",
+        crate::style::dim_prose(
+            "remove one with `sbx projects rm <id>`; sweep dead trees with `sbx projects rm --dead --yes`.",
+            pal
+        )
     );
     ExitCode::SUCCESS
 }
@@ -1781,7 +1802,7 @@ pub(crate) fn projects_rm(
 ) -> ExitCode {
     let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
     let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!("sbx projects rm: cannot locate sbx's data directory.");
+        crate::diag::error("sbx projects rm: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
     let live_ids = session_housekeeping(&layout, pal);
@@ -1791,35 +1812,35 @@ pub(crate) fn projects_rm(
 
     for id in ids {
         if !super::gc::is_safe_tree_id(id) {
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx projects rm: invalid project id `{id}` — expected a single tree name \
                  (an id `sbx projects` lists), not a path."
-            );
+            ));
             had_error = true;
             continue;
         }
         // Guard the tree you are standing in: an idle current project is not `Live`, so naming its
         // exact id would delete the store and home of this very directory. `--force` is the opt-in.
         if rm_refuses_current(id, current.as_deref(), force) {
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx projects rm: {n}{id}{r} is the current project — refusing without {n}--force{r}."
-            );
+            ));
             had_error = true;
             continue;
         }
         match super::gc::reap_one(&projects_dir, id, &live_ids, apply) {
             super::gc::ReapOneOutcome::NotFound => {
-                eprintln!(
+                crate::diag::error(&format!(
                     "sbx projects rm: no project tree for id `{id}` under {}.",
                     projects_dir.display()
-                );
+                ));
                 had_error = true;
             }
             super::gc::ReapOneOutcome::Live => {
-                eprintln!(
+                crate::diag::error(&format!(
                     "sbx projects rm: project tree {n}{id}{r} is held by a live session — \
                      stop it first with {n}sbx stop{r}, then `sbx projects rm {id}`."
-                );
+                ));
                 had_error = true;
             }
             super::gc::ReapOneOutcome::Tree { dir, bytes } => {
@@ -1835,9 +1856,15 @@ pub(crate) fn projects_rm(
                 );
                 if !apply {
                     println!(
-                        "{h}sbx projects rm:{r} {n}{id}{r} removable ({}) — \
-                         run `sbx projects rm {id}` (without `--dry-run`) to remove.",
-                        super::gc::human_bytes(bytes)
+                        "{}",
+                        crate::style::prose(
+                            &format!(
+                                "{h}sbx projects rm:{r} {n}{id}{r} removable ({}) — \
+                                 run `sbx projects rm {id}` (without `--dry-run`) to remove.",
+                                super::gc::human_bytes(bytes)
+                            ),
+                            pal
+                        )
                     );
                 }
             }
@@ -1852,10 +1879,10 @@ pub(crate) fn projects_rm(
         if apply {
             shared_store_gc(&layout, true, false, pal);
         } else {
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx projects rm: {dim}--gc runs the shared-store collection only when the removal \
                  is applied (add --yes, or drop --dry-run).{r}"
-            );
+            ));
         }
     }
 
@@ -1970,11 +1997,18 @@ fn shared_store_gc(
         // yet counted as collectable; the count of stale roots is the signal, and `--prune` frees
         // their closures on top of the orphans reported here (a lower bound).
         println!(
-            "{h}sbx gc:{r} shared store — {} stale gc root(s) would be dropped; {} orphaned path(s) \
-             reclaimable now ({}). Run `sbx gc --all --prune` to drop the roots and reclaim their closures.",
-            stale.len(),
-            report.paths,
-            super::gc::human_bytes(report.bytes)
+            "{}",
+            crate::style::prose(
+                &format!(
+                    "{h}sbx gc:{r} shared store — {} stale gc root(s) would be dropped; \
+                     {} orphaned path(s) reclaimable now ({}). Run `sbx gc --all --prune` to \
+                     drop the roots and reclaim their closures.",
+                    stale.len(),
+                    report.paths,
+                    super::gc::human_bytes(report.bytes)
+                ),
+                pal
+            )
         );
     }
 
@@ -2060,8 +2094,8 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // writes could drop a path it still needs. The registry list prunes dead records as it goes.
     if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list() {
         if sessions.iter().any(|s| s.project == project) {
-            eprintln!(
-                "sbx gc: a sandbox is running in this project — stop it first (see `sbx session ls`)."
+            crate::diag::error(
+                "sbx gc: a sandbox is running in this project — stop it first (see `sbx session ls`).",
             );
             return Err(ExitCode::FAILURE);
         }
@@ -2171,9 +2205,15 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         // A dry run cannot size the roots it would drop (their builds are still held, so not yet in
         // the dead set), so report their counts separately from the currently-dead total.
         println!(
-            "  {dim}{} store path(s) collectable now, {} would be freed — run `sbx gc --prune` to reclaim.{r}",
-            report.paths,
-            super::gc::human_bytes(report.bytes)
+            "  {}",
+            crate::style::dim_prose(
+                &format!(
+                    "{} store path(s) collectable now, {} would be freed — run `sbx gc --prune` to reclaim.",
+                    report.paths,
+                    super::gc::human_bytes(report.bytes)
+                ),
+                pal
+            )
         );
         if pruned > 0 || superseded > 0 {
             println!(
@@ -2236,8 +2276,13 @@ pub(crate) fn superseded_reclaimable_hint(
     let n = super::gc::prune_superseded_roots(&store_dir, &keep, false).len();
     if n > 0 {
         println!(
-            "  {}{} superseded build(s) in this project's store are reclaimable — run `sbx gc --prune`.{}",
-            pal.dim, n, pal.reset,
+            "  {}",
+            crate::style::dim_prose(
+                &format!(
+                    "{n} superseded build(s) in this project's store are reclaimable — run `sbx gc --prune`."
+                ),
+                pal
+            )
         );
     }
 }
@@ -2283,7 +2328,9 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         ) {
             Ok((_, root)) => packages.roots.push(root),
             Err(e) => {
-                eprintln!("sbx gc: cannot provision deb package `{name}` ({url}): {e}");
+                crate::diag::error(&format!(
+                    "sbx gc: cannot provision deb package `{name}` ({url}): {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2301,7 +2348,9 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         ) {
             Ok((_, root)) => packages.roots.push(root),
             Err(e) => {
-                eprintln!("sbx gc: cannot provision appimage package `{name}` ({url}): {e}");
+                crate::diag::error(&format!(
+                    "sbx gc: cannot provision appimage package `{name}` ({url}): {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2318,7 +2367,9 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         ) {
             Ok((_, root)) => packages.roots.push(root),
             Err(e) => {
-                eprintln!("sbx gc: cannot provision tarball package `{name}` ({url}): {e}");
+                crate::diag::error(&format!(
+                    "sbx gc: cannot provision tarball package `{name}` ({url}): {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2338,7 +2389,9 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
             Ok(Some((_, root))) => packages.roots.push(root),
             Ok(None) => {}
             Err(e) => {
-                eprintln!("sbx gc: cannot build the pinned tarball resolver package `{name}`: {e}");
+                crate::diag::error(&format!(
+                    "sbx gc: cannot build the pinned tarball resolver package `{name}`: {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2357,7 +2410,9 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
             Ok(Some((_, root))) => packages.roots.push(root),
             Ok(None) => {}
             Err(e) => {
-                eprintln!("sbx gc: cannot build the pinned deb resolver package `{name}`: {e}");
+                crate::diag::error(&format!(
+                    "sbx gc: cannot build the pinned deb resolver package `{name}`: {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2373,9 +2428,9 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
             Ok(Some((_, root))) => packages.roots.push(root),
             Ok(None) => {}
             Err(e) => {
-                eprintln!(
+                crate::diag::error(&format!(
                     "sbx gc: cannot build the pinned appimage resolver package `{name}`: {e}"
-                );
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -2517,10 +2572,13 @@ fn launch_pty_supervised(
 /// announcement, not a completed change, so the verb stays plain; the session pid and label are the
 /// identifier (cyan) and the parenthetical is secondary detail (dim).
 fn render_attaching(pid: u32, label: &str, pal: &crate::style::Palette) -> String {
-    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    let (n, r) = (pal.name, pal.reset);
     format!(
-        "sbx: attaching to session {n}{pid}{r} ({n}{label}{r}) {dim}\
-         (a shell in its live cage — type `exit` to leave the agent running){r}"
+        "sbx: attaching to session {n}{pid}{r} ({n}{label}{r}) {}",
+        crate::style::dim_prose(
+            "(a shell in its live cage — type `exit` to leave the agent running)",
+            pal
+        )
     )
 }
 
@@ -2551,8 +2609,14 @@ fn launch_display_name(runtime: &binds::Runtime, cmd: &[OsString]) -> String {
 fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> String {
     let (n, r) = (pal.name, pal.reset);
     format!(
-        "sbx: {n}{name}{r} is graphical — press Ctrl+C twice here to quit (closing its window may only \
-         hide it — a tray app keeps running); `sbx session stop {pid}` also stops it."
+        "sbx: {n}{name}{r} {}",
+        crate::style::prose(
+            &format!(
+                "is graphical — press Ctrl+C twice here to quit (closing its window may only \
+                 hide it — a tray app keeps running); `sbx session stop {pid}` also stops it."
+            ),
+            pal
+        )
     )
 }
 
@@ -2584,9 +2648,9 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     // A pid is unique among live processes, so this is a 0-or-1 match. Resolve the target before
     // the terminal check, so an unknown id is reported even without a tty.
     let Some(target) = sessions.into_iter().find(|s| s.pid.to_string() == id) else {
-        eprintln!(
+        crate::diag::error(&format!(
             "sbx session attach: no live session '{id}' — run `sbx session ls` to list them."
-        );
+        ));
         return ExitCode::from(2);
     };
     // SAFETY: `isatty` only inspects fd 0. A bare attach opens an interactive shell, which needs a
@@ -2594,7 +2658,9 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     // has one, inherited stdio otherwise — so it imposes no terminal requirement.
     let stdin_tty = unsafe { libc::isatty(0) } == 1;
     if cmd.is_empty() && !stdin_tty {
-        eprintln!("sbx: `sbx session attach` needs a terminal on stdin (or pass `-- command`).");
+        crate::diag::error(
+            "sbx: `sbx session attach` needs a terminal on stdin (or pass `-- command`).",
+        );
         return ExitCode::from(2);
     }
 
@@ -2602,10 +2668,10 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     // `None` here means the cage has no in-namespace process left — it exited between `sbx session ls` and
     // now, or the host has no user namespaces (then it never had a cage).
     let Some(cage_pid) = super::attach::find_cage_pid(target.pid) else {
-        eprintln!(
+        crate::diag::error(&format!(
             "sbx session attach: session '{id}' has no live process to enter — it may have just exited \
              (run `sbx session ls`)."
-        );
+        ));
         return ExitCode::FAILURE;
     };
     let cage = match super::attach::open_cage_handle(cage_pid) {
@@ -2907,9 +2973,9 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let mut any_missing = false;
     for id in ids {
         let Some(target) = sessions.iter().find(|s| s.pid.to_string() == *id) else {
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx session stop: no live session '{id}' — run `sbx session ls` to list them."
-            );
+            ));
             any_missing = true;
             continue;
         };
@@ -2998,8 +3064,8 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
         return Err(missing("bubblewrap (the sandbox engine)"));
     };
     if !matches!(crate::probe_userns(), crate::Userns::Ok) {
-        eprintln!(
-            "sbx: no capability-bearing user namespace — the sandbox cannot run. See `sbx doctor`."
+        crate::diag::error(
+            "sbx: no capability-bearing user namespace — the sandbox cannot run. See `sbx doctor`.",
         );
         return Err(ExitCode::FAILURE);
     }
@@ -3269,7 +3335,9 @@ fn build(
                 packages.roots.push(root);
             }
             Err(e) => {
-                eprintln!("sbx: cannot provision deb package `{name}` ({url}): {e}");
+                crate::diag::error(&format!(
+                    "sbx: cannot provision deb package `{name}` ({url}): {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3294,7 +3362,9 @@ fn build(
                 packages.roots.push(root);
             }
             Err(e) => {
-                eprintln!("sbx: cannot provision appimage package `{name}` ({url}): {e}");
+                crate::diag::error(&format!(
+                    "sbx: cannot provision appimage package `{name}` ({url}): {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3319,7 +3389,9 @@ fn build(
                 packages.roots.push(root);
             }
             Err(e) => {
-                eprintln!("sbx: cannot provision tarball package `{name}` ({url}): {e}");
+                crate::diag::error(&format!(
+                    "sbx: cannot provision tarball package `{name}` ({url}): {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3356,7 +3428,9 @@ fn build(
                 packages.roots.push(root);
             }
             Err(e) => {
-                eprintln!("sbx: cannot provision tarball resolver package `{name}`: {e}");
+                crate::diag::error(&format!(
+                    "sbx: cannot provision tarball resolver package `{name}`: {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3380,7 +3454,9 @@ fn build(
                 packages.roots.push(root);
             }
             Err(e) => {
-                eprintln!("sbx: cannot provision deb resolver package `{name}`: {e}");
+                crate::diag::error(&format!(
+                    "sbx: cannot provision deb resolver package `{name}`: {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -3404,7 +3480,9 @@ fn build(
                 packages.roots.push(root);
             }
             Err(e) => {
-                eprintln!("sbx: cannot provision appimage resolver package `{name}`: {e}");
+                crate::diag::error(&format!(
+                    "sbx: cannot provision appimage resolver package `{name}`: {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -4941,7 +5019,9 @@ fn extra_cage_env(
 }
 
 fn missing(what: &str) -> ExitCode {
-    eprintln!("sbx: {what} not found — the sandbox cannot run. See `sbx doctor`.");
+    crate::diag::error(&format!(
+        "sbx: {what} not found — the sandbox cannot run. See `sbx doctor`."
+    ));
     ExitCode::FAILURE
 }
 
