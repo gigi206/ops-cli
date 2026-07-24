@@ -14,7 +14,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{help, paths, sandbox, store, style};
+use crate::{help, paths, sandbox, storage, store, style};
 
 /// One top-level subtree of the data directory.
 #[derive(serde::Serialize)]
@@ -45,6 +45,22 @@ struct StoreView {
     /// The shared nix store's own detail, absent until it has been provisioned.
     #[serde(skip_serializing_if = "Option::is_none")]
     shared_store: Option<SharedStoreView>,
+    /// When sbx's data lives in a storage volume, what that volume's image really costs the host.
+    /// Absent on a plain data directory. Distinct from the tree sizes above, which are apparent:
+    /// this is the sparse image's actual on-disk footprint, after btrfs compression and sharing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<VolumeView>,
+}
+
+/// The storage volume backing the data directory, when there is one.
+#[derive(serde::Serialize)]
+struct VolumeView {
+    /// The image file on the host — where the volume actually lives.
+    image: String,
+    /// Bytes the image occupies on the host: the true cost, after compression and block sharing.
+    host_bytes: u64,
+    /// Rendered `host_bytes`, so `--json` need not reimplement the units.
+    host_size: String,
 }
 
 /// The shared nix store, described in its own terms rather than as a plain directory.
@@ -81,7 +97,8 @@ pub(crate) fn store_cmd(args: Vec<OsString>) -> ExitCode {
         eprintln!("sbx store: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
-    let view = build(layout.data_dir(), &layout.store_dir());
+    let mut view = build(layout.data_dir(), &layout.store_dir());
+    view.volume = volume_view();
 
     if json {
         return match serde_json::to_string_pretty(&view) {
@@ -134,7 +151,29 @@ fn build(data_dir: &Path, store_dir: &Path) -> StoreView {
         shares_storage: sandbox::supports_reflink(data_dir),
         subtrees,
         shared_store: shared_store_view(store_dir),
+        // Filled in by the caller, which has the environment `build` deliberately does not touch.
+        volume: None,
     }
+}
+
+/// The storage volume sbx is currently following, if any — for the real host cost of its image.
+///
+/// Only when sbx is *following* a volume: an explicit `SBX_DATA_DIR` override runs against that
+/// directory directly, not through a volume pointer, so it reports no volume even if an image and
+/// its pointer happen to exist. The pointer and image live in the default (unfollowed) data
+/// directory, which stays reachable after a pointer has redirected everything else.
+fn volume_view() -> Option<VolumeView> {
+    if store::data_dir_overridden() {
+        return None;
+    }
+    let default_dir = store::Layout::default_data_dir()?;
+    let image = storage::read_pointer(&default_dir)?;
+    let host_bytes = storage::image_bytes(&image)?;
+    Some(VolumeView {
+        image: image.display().to_string(),
+        host_bytes,
+        host_size: sandbox::human_bytes(host_bytes),
+    })
 }
 
 /// Count the shared store's realised paths and its dedup pool. `None` before the store exists.
@@ -171,6 +210,15 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
         v.size,
         thousands(v.inodes)
     );
+    // On a volume the header size is apparent; the image's real host cost is the number that
+    // answers "what does this actually take on my disk", so state it plainly, right at the top.
+    if let Some(vol) = &v.volume {
+        let _ = writeln!(
+            s,
+            "  {dim}btrfs volume — {r}{}{dim} on host ({}){r}",
+            vol.host_size, vol.image
+        );
+    }
     if v.subtrees.is_empty() {
         let _ = writeln!(s, "  {dim}(nothing provisioned yet){r}");
         return s;
@@ -305,6 +353,7 @@ mod tests {
             shares_storage: false,
             subtrees: vec![one],
             shared_store: None,
+            volume: None,
         };
         let out = render(&exact, &style::Palette::plain());
         assert!(out.contains("exact"), "{out}");
@@ -319,6 +368,48 @@ mod tests {
         assert!(
             out.contains("compresses"),
             "the note must flag compression, which no per-file measure sees: {out}"
+        );
+    }
+
+    /// On a volume the report states the image's real host cost — the number a plain per-file
+    /// tree size cannot show, since it is post-compression and post-sharing. Absent otherwise.
+    #[test]
+    fn a_volume_reports_its_images_real_host_cost() {
+        let one = SubtreeView {
+            label: "store/".into(),
+            bytes: 4096,
+            size: "4.0 KiB".into(),
+            inodes: 1,
+            purpose: None,
+        };
+        let base = StoreView {
+            data_dir: "/run/media/you/sbx-storage".into(),
+            bytes: 4096,
+            size: "4.0 KiB".into(),
+            inodes: 1,
+            shares_storage: true,
+            subtrees: vec![one],
+            shared_store: None,
+            volume: None,
+        };
+
+        // Without a volume, no such line.
+        let out = render(&base, &style::Palette::plain());
+        assert!(!out.contains("on host"), "{out}");
+
+        let on_volume = StoreView {
+            volume: Some(VolumeView {
+                image: "/home/you/.local/share/sbx-storage.btrfs".into(),
+                host_bytes: 603_979_776,
+                host_size: "576.0 MiB".into(),
+            }),
+            ..base
+        };
+        let out = render(&on_volume, &style::Palette::plain());
+        assert!(out.contains("576.0 MiB on host"), "{out}");
+        assert!(
+            out.contains("/home/you/.local/share/sbx-storage.btrfs"),
+            "the image path is named so the number is traceable: {out}"
         );
     }
 

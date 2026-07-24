@@ -33,8 +33,22 @@ The trailing line describes the shared store in its own terms: how many store pa
 and how many files nix has deduplicated into its `.links` pool (identical content sharing a single
 inode).
 
+When sbx's data lives in a [storage volume](storage.md), a line under the header reports what the
+volume's **image really costs the host** — its actual on-disk size, after btrfs compression and
+block sharing:
+
+```
+sbx store — /run/media/you/sbx-storage (2.1 GiB, 129 889 inodes)
+  btrfs volume — 1.4 GiB on host (/home/you/.local/share/sbx-storage.btrfs)
+  …
+```
+
+The header size stays *apparent* (what the tree occupies uncompressed, each hardlink counted once);
+the `btrfs volume` line is the *real* figure — the same `on host` number
+[`sbx storage status`](storage.md) reports.
+
 `--json` emits the same data as a document, with the raw `bytes` and `inodes` alongside the
-rendered size.
+rendered size; on a volume it carries a `volume` object (`image`, `host_bytes`, `host_size`).
 
 ## Why inodes are reported
 
@@ -68,3 +82,7 @@ the report says which case yours is:
   footprint is smaller still where the filesystem compresses. No per-file measurement can see
   either saving (`du` has the same blind spot), so the sizes are honest **upper bounds**: the true
   on-disk total is smaller, and can be well below what the report shows.
+
+On a [storage volume](storage.md) the report closes that gap with a real number: the `btrfs volume`
+line shows the image's actual host footprint, so you see both the apparent tree size and what it
+truly costs — the compression and block sharing an upper bound can only allude to.

@@ -1030,6 +1030,10 @@ const PAGES: &[Page] = &[
             sizes are stated as upper bounds rather than guessed at; where the filesystem shares\n\
             nothing, they are exact.\n\
             \n\
+            When sbx's data is in a storage volume, a line under the header reports the image's\n\
+            real on-host cost — after btrfs compression and sharing, the concrete number those\n\
+            upper bounds only allude to.\n\
+            \n\
             Read-only, and free: a filesystem walk, no nix, no network, no sandbox. Nothing is\n\
             reclaimed here — that is `sbx gc --all --prune` for store closures, `sbx projects rm\n\
             <id>` for a runtime tree, and `sbx app rm <name> --purge` for an app's home.",
