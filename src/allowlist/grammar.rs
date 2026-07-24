@@ -339,8 +339,9 @@ fn parse_port(s: &str) -> Result<u16, String> {
 /// explicit `:port` or the scheme default, `path` everything after the authority (the root `/`
 /// if none) **including any query string**. The host must be a hostname, an IPv4 literal, or a
 /// bracketed IPv6 literal (`https://[::1]:8080/x`). This is the *request* parser — a request is
-/// a concrete connection, so it keeps the scheme (which sets the port); the `sbx test net`
-/// tester is its only caller. Allow/deny *rules* are scheme-free and parsed by [`classify`].
+/// a concrete connection, so it keeps the scheme (which sets the port). Its callers are the
+/// `sbx test net` tester and the proxy's two absolute-form paths (`http://` cleartext and the
+/// `https://` forward). Allow/deny *rules* are scheme-free and parsed by [`classify`].
 pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), String> {
     let Some((scheme_len, default_port)) = scheme_of(url) else {
         return Err(format!("`{url}` is not an http(s) URL"));

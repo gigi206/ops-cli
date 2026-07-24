@@ -243,6 +243,12 @@ By default a rule is **inspected over TLS**: the proxy man-in-the-middles the TL
 enforces the full host / port / path / method / regex / redaction / anti-fronting
 policy. This is the right layer for HTTPS APIs, which is almost everything.
 
+A `https://` rule covers that host whichever way the tool reaches the proxy — the usual
+`CONNECT` tunnel, or the [absolute-form request some clients send
+instead](architecture.md#requests-that-arrive-without-a-connect). Both get the same
+verdict, the same guards, and a validated TLS connection to the upstream; you never
+write a second rule for the second shape.
+
 ### Cleartext HTTP (`http://`)
 
 Some tools still speak **plain HTTP** to a host that has no HTTPS endpoint. An

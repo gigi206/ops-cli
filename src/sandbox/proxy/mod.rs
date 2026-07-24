@@ -40,6 +40,27 @@
 //! inspected-over-TLS host). Its one cost versus the default path is transport confidentiality (the
 //! bytes travel unencrypted); the empty netns + allowlist boundary is unchanged.
 //!
+//! ## L7 forward (absolute-form `https://`)
+//!
+//! Some clients (a bundled proxy library, or a "secure web proxy" configuration) reach an `https://`
+//! URL by sending an **absolute-form request straight to the proxy** — `POST https://host/path
+//! HTTP/1.1`, no CONNECT — expecting the proxy to make the outbound TLS connection. Without a home
+//! this is refused `405`, stranding such a tool (observed: the Kiro IDE's OAuth token exchange).
+//! [`handle_https_forward`] serves it as the plaintext-client sibling of the MITM path: the
+//! client→proxy leg is cleartext (the cage loopback), but the verdict is the *ordinary* `https` policy
+//! ([`EgressPolicy::explain`], NOT the opt-in `http://` scheme — so a normal allow rule covers it,
+//! exactly as an equivalent `CONNECT` would, `ask` park included), the upstream leg is a **validated
+//! TLS** connection (a forged upstream is a `502`, never downgraded), and — unlike the cleartext path
+//! — a host-scoped **credential IS injected** (it rides only the encrypted upstream leg, and a
+//! reflected value is masked out of the response).
+//!
+//! The residual is *not* confidentiality on the client leg: that leg is a loopback socket inside the
+//! cage, which no cage process can read (no `CAP_NET_RAW` for a packet socket, and `ptrace` is on the
+//! seccomp denylist). It is that this transport, like the tunneled one, **does not authenticate its
+//! client** — any process in the cage can drive the injected credential to the allowlisted host. That
+//! is the already-accepted property of host-side injection, not something this path adds: the bound
+//! is the empty netns plus the allowlist plus the `to`-scoping of the credential.
+//!
 //! This module is the serve loop; the surrounding pieces live in focused submodules — the cert
 //! machinery in [`ca`], the running context and policy in [`ctx`], name resolution in [`dns`], the
 //! SSRF guard in [`ssrf`], the credential/needle types in [`inject`], and the HTTP/2 (gRPC) branch
@@ -65,9 +86,9 @@
 //! | `403` | `ip-literal`             | the CONNECT target was an IP literal on the inspected path (allow it raw with a `tcp://` rule) |
 //! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
-//! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target |
+//! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
 //! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
-//! | `405` | `method-not-allowed`     | a non-CONNECT request that is not a routable `http://` absolute-form (a bare origin-form or a non-`http` scheme has no destination) |
+//! | `405` | `method-not-allowed`     | a non-CONNECT request that is neither a routable `http://` nor `https://` absolute-form (a bare origin-form has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
 //! | `502` | `upstream-cert-rejected` | the upstream TLS certificate failed validation (never downgraded) |
@@ -249,12 +270,17 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     if method != "CONNECT" {
         // A client with `http_proxy` set sends an **absolute-form** request (`GET http://host/… HTTP/1.1`)
         // for an `http://` URL — no CONNECT. When an `http://` (cleartext L7) rule permits it, this is
-        // the inspected-cleartext path; route it there. Anything else (a bare origin-form with no host
-        // to route, an absolute-form `https://` which should have used CONNECT, or a bad method) is
-        // refused fail-closed — the method + raw target are the "what is the agent trying to do"
-        // signal, so log them (host blank, target as the path).
+        // the inspected-cleartext path; route it there. An absolute-form **`https://`** request (a
+        // client treating the proxy as a TLS-terminating forward proxy — the "secure web proxy" form,
+        // instead of CONNECT) is routed to the plaintext-client/validated-TLS-upstream forward, gated by
+        // the ordinary `https` policy. Anything else (a bare origin-form with no host to route, or a bad
+        // method) is refused fail-closed — the method + raw target are the "what is the agent trying to
+        // do" signal, so log them (host blank, target as the path).
         if target.starts_with("http://") {
             return handle_cleartext(client, &parsed, &head, &method, &target, ctx);
+        }
+        if target.starts_with("https://") {
+            return handle_https_forward(client, &parsed, &head, &method, &target, ctx);
         }
         ctx.push_log(
             super::control::Proto::Other,
@@ -269,8 +295,9 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             &mut client,
             "405 Method Not Allowed",
             "method-not-allowed",
-            "this egress proxy tunnels HTTPS (CONNECT) and forwards allowed plaintext `http://` \
-             requests; a bare or non-`http://` absolute-form request has no route",
+            "this egress proxy tunnels HTTPS (CONNECT), forwards allowed plaintext `http://` requests, \
+             and forwards an allowed absolute-form `https://` request over a validated TLS upstream; a \
+             bare origin-form request has no host to route",
         );
     }
     // 2. The CONNECT authority.
@@ -1562,6 +1589,518 @@ fn handle_cleartext(
     pump_to_eof(&mut response, &mut client)
 }
 
+/// Handle a top-level **absolute-form `https://`** request that arrives WITHOUT a CONNECT tunnel: a
+/// client (typically a bundled proxy library that treats the proxy as a TLS-terminating forward
+/// proxy — the "secure web proxy" form) sends `POST https://host/path HTTP/1.1` straight to the proxy
+/// port instead of `CONNECT host:443`. Without this path the request is refused `405
+/// method-not-allowed`, which strands a tool whose only egress transport is this form (observed live:
+/// the Kiro IDE's OAuth token exchange to `auth.desktop.kiro.dev/oauth/token`).
+///
+/// This is the plaintext-client sibling of the CONNECT MITM path. The client→proxy leg is cleartext
+/// (an `http://` proxy connection), but policy is terminated the SAME way and the proxy makes a
+/// **validated TLS** connection to the real upstream. Differences from [`handle_cleartext`] (the
+/// opt-in `http://` scheme):
+///   - the verdict uses [`EgressPolicy::explain`] — a normal `https` allow rule permits it, so this
+///     is NOT a separate opt-in (it is exactly the egress an equivalent `CONNECT` would have gotten,
+///     down to parking an `ask`-undecided host for `sbx net pending`);
+///   - the upstream leg is TLS with certificate validation (never downgraded — a forged upstream is a
+///     `502`, as on the MITM path);
+///   - a host-scoped credential IS injected: it rides the encrypted upstream leg (unlike a cleartext
+///     request, which never carries a header secret), and the response is masked if the host is an
+///     injection target.
+///
+/// One `host` value — the one [`allowlist::parse_url_target`] read from the request line — feeds the
+/// policy verdict, the upstream certificate validation, and the name resolution, so those three
+/// cannot disagree without the `Host` header. The `Host` comparison below adds the fourth party: the
+/// *upstream's* own routing. Without it a request could name an allowed host in its line (winning the
+/// verdict, the validated certificate, and any host-scoped credential) while its `Host` header sends
+/// the upstream to vhost-route it elsewhere — so the check is what keeps an injected credential on
+/// the request the policy actually approved.
+///
+/// Conscious, bounded property: request and response travel cleartext on the client→proxy leg — but
+/// that leg is a loopback socket inside the cage, unreadable by any cage process (no `CAP_NET_RAW`
+/// for a packet socket, `ptrace` on the seccomp denylist), and the injected credential is added for
+/// the upstream leg only, so it never appears on the client leg at all. What this path shares with
+/// the tunneled one is that it does not authenticate its client: any in-cage process can drive the
+/// injected credential to the allowlisted host — the accepted property of host-side injection.
+fn handle_https_forward(
+    mut client: UnixStream,
+    head: &Head,
+    head_bytes: &[u8],
+    method: &str,
+    target: &str,
+    ctx: &ProxyCtx,
+) -> io::Result<()> {
+    // 1. Parse the absolute-form `https://host[:port]/path` target into (host, port=443 default, path).
+    //    The host is canonicalized by the parser; the path is canonicalized inside `explain`.
+    let (host, port, path) = match allowlist::parse_url_target(target) {
+        Ok(t) => t,
+        Err(_) => {
+            ctx.push_log(
+                super::control::Proto::Https,
+                "",
+                0,
+                Some(method),
+                Some(target),
+                super::control::LogVerdict::Blocked,
+                "bad-request",
+            );
+            return write_refusal(
+                &mut client,
+                "400 Bad Request",
+                "bad-request",
+                "the absolute-form request target is not a valid `https://` URL",
+            );
+        }
+    };
+
+    // 2. Anti request-smuggling, fail-closed — the same guards, and the same sub-categorized
+    //    reasons, as the tunneled path. A duplicated Content-Length or Host is an unambiguous desync
+    //    vector and is refused outright; a `Transfer-Encoding` is refused UNLESS it is exactly
+    //    `chunked`, the one streaming coding the proxy de-chunks and re-frames with a synthesized
+    //    Content-Length below (so no CL/TE ambiguity reaches the upstream).
+    let chunked = match head.header("transfer-encoding").map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("chunked") => true,
+        Some(_) => {
+            ctx.push_log(
+                super::control::Proto::Https,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                super::control::LogVerdict::Blocked,
+                "bad-request:transfer-encoding",
+            );
+            return write_refusal(
+                &mut client,
+                "400 Bad Request",
+                "bad-request:transfer-encoding",
+                "the request carries a Transfer-Encoding coding other than `chunked`, which this \
+                 egress proxy does not forward",
+            );
+        }
+        None => false,
+    };
+    if head.count("content-length") > 1 || head.count("host") > 1 {
+        let (reason, detail) = if head.count("content-length") > 1 {
+            (
+                "bad-request:dup-content-length",
+                "the request carries a duplicated Content-Length header",
+            )
+        } else {
+            (
+                "bad-request:dup-host",
+                "the request carries a duplicated Host header",
+            )
+        };
+        ctx.push_log(
+            super::control::Proto::Https,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            super::control::LogVerdict::Blocked,
+            reason,
+        );
+        return write_refusal(&mut client, "400 Bad Request", reason, detail);
+    }
+    // The body length is known up-front only for a Content-Length-framed request; a `chunked`
+    // request's length is discovered by de-chunking below.
+    let body_len: u64 = if chunked {
+        0
+    } else {
+        match head.header("content-length") {
+            Some(v) => match v.trim().parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    ctx.push_log(
+                        super::control::Proto::Https,
+                        &host,
+                        port,
+                        Some(method),
+                        Some(&path),
+                        super::control::LogVerdict::Blocked,
+                        "bad-request:invalid-content-length",
+                    );
+                    return write_refusal(
+                        &mut client,
+                        "400 Bad Request",
+                        "bad-request:invalid-content-length",
+                        "the Content-Length header is not a valid number",
+                    );
+                }
+            },
+            None => 0,
+        }
+    };
+
+    // 3. Anti-fronting: the absolute-form URL host must equal the `Host` header, so a request cannot
+    //    claim one host in the line and another in the header (the URL host is what the policy checks).
+    if head
+        .header("host")
+        .map(|h| allowlist::canonical_host(&strip_port(h)) != host)
+        .unwrap_or(true)
+    {
+        ctx.outcome(
+            super::control::Proto::Https,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "host-mismatch",
+        );
+        return write_refusal(
+            &mut client,
+            "421 Misdirected Request",
+            "host-mismatch",
+            "the Host header does not match the request-line host",
+        );
+    }
+
+    // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
+    //    configured secret verbatim, scanned before sbx's own injection so it cannot self-trip.
+    if carries_secret(head_bytes, &ctx.redactions) {
+        ctx.outcome(
+            super::control::Proto::Https,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "outbound-secret",
+        );
+        return write_refusal(
+            &mut client,
+            "403 Forbidden",
+            "outbound-secret",
+            "the request carries a configured secret value (outbound credential leak refused)",
+        );
+    }
+
+    // 5. The verdict — the full `https` policy through the SAME canonicalizer `sbx test net` uses (so
+    //    enforcement cannot drift from the tester), against the effective policy (config + any live
+    //    `--session` overlay). Deny wins; the two denial shapes get distinct reasons, and an
+    //    `ask`-undecided host parks exactly as it would through a CONNECT.
+    let policy = effective_policy(ctx);
+    let deciding: Option<Rule> = match policy.explain(&host, port, &path, method) {
+        Decision::AllowedBy(rule) => Some(rule.clone()),
+        // Allow-by-default (denylist mode): no rule named this host, so there is no deciding rule; the
+        // SSRF guard below then treats it as unnamed (private addresses refused).
+        Decision::AllowedDefault => None,
+        Decision::DeniedBy(_) => {
+            ctx.outcome(
+                super::control::Proto::Https,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                StatKind::Deny,
+                "denied-by-rule",
+            );
+            return write_refusal(
+                &mut client,
+                "403 Forbidden",
+                "denied-by-rule",
+                "this request matches a deny rule in the network policy",
+            );
+        }
+        // Deny-default: nothing opened the host (or a rule matches the host but not the verb, which
+        // gets its own reason), with the copy-paste `sbx net allow` suggestion as the next step.
+        Decision::DeniedDefault => {
+            let method_denied = policy.method_denied(&host, port, &path, method);
+            let reason = if method_denied {
+                "denied-method"
+            } else {
+                "denied-default"
+            };
+            ctx.outcome(
+                super::control::Proto::Https,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                StatKind::Deny,
+                reason,
+            );
+            if method_denied {
+                return write_refusal(
+                    &mut client,
+                    "403 Forbidden",
+                    "denied-method",
+                    &format!(
+                        "the `{method}` method is not permitted to `{host}:{port}` by the \
+                         network policy"
+                    ),
+                );
+            }
+            return write_refusal(
+                &mut client,
+                "403 Forbidden",
+                "denied-default",
+                &format!(
+                    "`{host}:{port}` is not allowed by the network policy. Allow it: {}",
+                    ctx.allow_suggestion(&host)
+                ),
+            );
+        }
+        // Ask-by-default: no rule in the effective policy decided, so park and block until a
+        // host-side `sbx net pending` answers or the timeout elapses (deny — fail-closed), exactly
+        // as a CONNECT to the same host does. A fresh allow names this exact host:port as the
+        // deciding rule, so the SSRF guard admits a deliberately-approved internal target.
+        Decision::Ask => {
+            let verdict = ctx.pending.park(
+                &host,
+                port,
+                &path,
+                policy.ask_timeout(),
+                ASK_PENDING_CAP,
+                |seq| {
+                    if ctx.notices {
+                        let id = super::control::format_id(std::process::id(), seq);
+                        print_egress_notice(
+                            &format!("egress decision needed [{id}] {host}:{port}{path}"),
+                            &[
+                                ("allow", &format!("sbx net pending allow {id}")),
+                                ("deny", &format!("sbx net pending deny {id}")),
+                            ],
+                        );
+                    }
+                },
+            );
+            match verdict {
+                super::control::Verdict::Allow => Some(allowlist::host_port_rule(&host, port)),
+                super::control::Verdict::Deny => {
+                    ctx.outcome(
+                        super::control::Proto::Https,
+                        &host,
+                        port,
+                        Some(method),
+                        Some(&path),
+                        StatKind::Deny,
+                        "asked-denied",
+                    );
+                    return write_refusal(
+                        &mut client,
+                        "403 Forbidden",
+                        "asked-denied",
+                        "this request was denied by a live decision or the ask timeout elapsed",
+                    );
+                }
+            }
+        }
+    };
+
+    // 6. Resolve host-side, then the SSRF guard against the deciding rule. A resolution failure for an
+    //    allowed host is a clean 502, distinct from a refusal.
+    let ips = match (ctx.resolve)(&host) {
+        Ok(ips) => ips,
+        Err(_) => {
+            ctx.push_log(
+                super::control::Proto::Https,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                super::control::LogVerdict::Error,
+                "dns-failure",
+            );
+            return write_refusal(
+                &mut client,
+                "502 Bad Gateway",
+                "dns-failure",
+                &format!("DNS resolution failed for `{host}`"),
+            );
+        }
+    };
+    let Some(ip) = ips
+        .into_iter()
+        .find(|ip| ip_permitted(*ip, &host, deciding.as_ref()))
+    else {
+        ctx.outcome(
+            super::control::Proto::Https,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "ssrf-blocked",
+        );
+        return write_refusal(
+            &mut client,
+            "403 Forbidden",
+            "ssrf-blocked",
+            &format!(
+                "`{host}` resolved only to disallowed addresses (a private or metadata range)"
+            ),
+        );
+    };
+
+    // 7. Open a validated TLS connection to the checked address (not a re-resolve, which would reopen
+    //    the rebinding window). A forged/self-signed upstream is refused, never downgraded; the two
+    //    failure shapes get distinct reasons.
+    let mut upstream = match connect_upstream(ip, port, &host, ctx) {
+        Ok(u) => u,
+        Err(UpstreamError::Unreachable) => {
+            ctx.push_log(
+                super::control::Proto::Https,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                super::control::LogVerdict::Error,
+                "upstream-unreachable",
+            );
+            return write_refusal(
+                &mut client,
+                "502 Bad Gateway",
+                "upstream-unreachable",
+                &format!("`{host}:{port}` is allowed but could not be reached"),
+            );
+        }
+        Err(UpstreamError::CertRejected) => {
+            ctx.push_log(
+                super::control::Proto::Https,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                super::control::LogVerdict::Error,
+                "upstream-cert-rejected",
+            );
+            return write_refusal(
+                &mut client,
+                "502 Bad Gateway",
+                "upstream-cert-rejected",
+                &format!(
+                    "the TLS certificate presented by `{host}` was rejected \
+                     (upstream validation failed)"
+                ),
+            );
+        }
+    };
+
+    // The request is permitted and the upstream TLS handshake is validated — record the one `allow`.
+    let allow_seq = ctx.outcome_l7(
+        super::control::Proto::Https,
+        super::control::HttpVer::H1,
+        super::control::RpcKind::from_content_type(head.header("content-type").unwrap_or_default()),
+        &host,
+        port,
+        Some(method),
+        Some(&path),
+        StatKind::Allow,
+        "allowed",
+    );
+    let flow = ctx.register_flow(&host, port, super::control::Proto::Https);
+
+    // 8. Inject any matching host-scoped credential — after the verdict (a denied request never gets a
+    //    secret) and keyed on the verified host + decrypted path, so it reaches only its scoped
+    //    destination. Unlike the `http://` path, the upstream is TLS, so a header secret rides it
+    //    encrypted, never in the clear.
+    let injected = matching_injections(ctx, &host, port, &path);
+
+    // 9. Forward the one request in **origin-form** (`POST /path`) with the injected credential and
+    //    `Connection: close` forced (the reserializer strips hop-by-hop headers and the client's copy
+    //    of any injected header). A pipelined second request is never forwarded, so it cannot skip the
+    //    per-request check.
+    let version = head
+        .request_line
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("HTTP/1.1");
+    let origin = Head {
+        request_line: format!("{method} {path} {version}"),
+        headers: head.headers.clone(),
+    };
+    if chunked {
+        // A `Transfer-Encoding: chunked` request: de-chunk the body into a bounded buffer and forward
+        // a clean `Content-Length`-framed request (the reserializer strips the client's
+        // Transfer-Encoding when a length is forced), so no chunked framing — and no CL/TE
+        // request-smuggling ambiguity — reaches the upstream. Answer a client `Expect: 100-continue`
+        // before reading, else it withholds the body. A de-chunk failure (malformed framing, or over
+        // the cap) is fail-closed: log + refuse 400.
+        if head_expects_continue(head) {
+            let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            let _ = client.flush();
+        }
+        // The buffered reader is scoped to the de-chunk: it may read past the body's terminator (a
+        // pipelined second request), which this path never forwards anyway.
+        let read = {
+            let mut reader = BufReader::new(&client);
+            read_chunked_body(&mut reader, CHUNKED_REQUEST_CAP)
+        };
+        let body = match read {
+            Ok(b) => b,
+            Err(e) => {
+                ctx.push_log(
+                    super::control::Proto::Https,
+                    &host,
+                    port,
+                    Some(method),
+                    Some(&path),
+                    super::control::LogVerdict::Blocked,
+                    "bad-request:chunked",
+                );
+                return write_refusal(
+                    &mut client,
+                    "400 Bad Request",
+                    "bad-request:chunked",
+                    &format!("the chunked request body could not be read: {e}"),
+                );
+            }
+        };
+        let reserialized = reserialize_request(&origin, &injected, Some(body.len() as u64));
+        upstream.write_all(&reserialized)?;
+        upstream.write_all(&body)?;
+        flow.up
+            .fetch_add((reserialized.len() + body.len()) as u64, Ordering::Relaxed);
+    } else {
+        let reserialized = reserialize_request(&origin, &injected, None);
+        upstream.write_all(&reserialized)?;
+        flow.up
+            .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
+        // Answer a client `Expect: 100-continue` now (the request is permitted and the upstream is
+        // up), else `copy_exact` would block reading a body the client withholds. `Expect` is
+        // stripped from the forwarded head, so the upstream does not re-run the handshake.
+        if body_len > 0 && head_expects_continue(head) {
+            let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            let _ = client.flush();
+        }
+        copy_exact(&mut client, &mut upstream, body_len)?;
+        flow.up.fetch_add(body_len, Ordering::Relaxed);
+    }
+    upstream.flush().ok();
+
+    // The request is fully forwarded; the response may idle between bursts, so lift the read timeout.
+    begin_response_stream(&upstream.sock);
+
+    // 10. Peek the status for the live log (non-consuming — chained back), then relay the whole
+    //     response to the plaintext client and close. Mask a reflected secret only for a response from
+    //     an injection-target host (every other response streams untouched).
+    let prefix = read_status_prefix(&mut upstream);
+    if let Some(code) = parse_status_code(&prefix) {
+        if code >= 200 {
+            ctx.set_status(allow_seq, code);
+        }
+    }
+    let mut response = CountingReader::new(
+        io::Cursor::new(prefix).chain(&mut upstream),
+        flow.down.clone(),
+    );
+    let masks_reflection = !ctx.redactions.is_empty()
+        && ctx
+            .injections
+            .iter()
+            .any(|inj| names_exact_host(&host, Some(&inj.rule)));
+    if masks_reflection {
+        pump_redacting(&mut response, &mut client, &ctx.redactions)?;
+    } else {
+        pump_to_eof(&mut response, &mut client)?;
+    }
+    Ok(())
+}
+
 /// Why a connection to the validated upstream could not be opened, so the refusal can name a
 /// distinct motif: the TCP connection failed (the host is down/filtered), or the TLS handshake /
 /// certificate validation failed (a forged or otherwise untrusted upstream — never downgraded).
@@ -1708,6 +2247,8 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// drop any client `Connection`/`Proxy-Connection` (the proxy owns hop-by-hop semantics) and
 /// force `Connection: close`, so a keep-alive upstream closes after this one response — giving the
 /// proxy a prompt EOF instead of a blocked read. One request per tunnel makes this safe.
+/// `Proxy-Authorization` is dropped too: it is a credential for the *proxy hop*, and forwarding it
+/// would hand the origin server a secret addressed to sbx.
 ///
 /// Each `(header, value)` in `injections` is **strip-and-replace**d: every client-supplied copy of
 /// that header — over all spellings (case- and `_`/`-`-insensitive, see [`header_name_eq`]) — is
@@ -1725,6 +2266,8 @@ fn reserialize_request(
     for (k, v) in &head.headers {
         if k.eq_ignore_ascii_case("connection")
             || k.eq_ignore_ascii_case("proxy-connection")
+            // A credential the client addressed to the proxy hop, never to the origin server.
+            || k.eq_ignore_ascii_case("proxy-authorization")
             // `Expect: 100-continue` is answered by the proxy to the client directly; forwarding it
             // would make the upstream expect a body-handshake the proxy has already resolved.
             || k.eq_ignore_ascii_case("expect")
@@ -3497,6 +4040,427 @@ mod tests {
         assert!(
             resp.contains(" 403 ") && resp.contains("denied-by-rule"),
             "a deny rule must win over an http:// allow: {resp:?}"
+        );
+    }
+
+    /// A top-level **absolute-form `https://`** request (no CONNECT) to an allowed host is forwarded
+    /// over a *validated TLS* upstream, and the upstream receives it in **origin-form** with a forced
+    /// `Connection: close` — the "secure web proxy" transport the Kiro IDE's token exchange uses,
+    /// which without this path is refused `405`.
+    #[test]
+    fn an_absolute_form_https_request_is_forwarded_over_a_validated_tls_upstream() {
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let request = format!(
+            "POST https://host.test:{}/oauth/token HTTP/1.1\r\nHost: host.test\r\n\
+             Content-Length: 5\r\n\r\nhello",
+            addr.port()
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(
+            resp.contains("200"),
+            "the upstream response is relayed to the plaintext client: {resp:?}"
+        );
+        let upstream_head = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the upstream received the forwarded request");
+        assert!(
+            upstream_head.starts_with("POST /oauth/token HTTP/1.1"),
+            "the request must reach the upstream in origin-form, not absolute-form: {upstream_head:?}"
+        );
+        assert!(
+            upstream_head
+                .to_ascii_lowercase()
+                .contains("connection: close"),
+            "the proxy must force Connection: close upstream: {upstream_head:?}"
+        );
+    }
+
+    /// An absolute-form `https://` forward to a host with no allow rule is refused `403 denied-default`
+    /// (the same allowlist verdict a `CONNECT` to that host would get), and never reaches an upstream.
+    #[test]
+    fn an_absolute_form_https_forward_to_a_denied_host_is_refused() {
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["allowed.test:*"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"POST https://evil.test/oauth/token HTTP/1.1\r\nHost: evil.test\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains(" 403 ") && resp.contains("denied-default"),
+            "a host not on the allowlist must be refused: {resp:?}"
+        );
+    }
+
+    /// On the https-forward path, a forged/untrusted upstream certificate is refused `502
+    /// upstream-cert-rejected` — never downgraded, the same upstream validation the MITM path applies.
+    #[test]
+    fn a_forged_upstream_on_the_https_forward_path_is_refused_with_502() {
+        let (addr, _upstream_ca, _up) = spawn_upstream(
+            "host.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // No `.with_upstream(...)` — the default webpki-roots config rejects the ephemeral upstream cert.
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let request = format!(
+            "POST https://host.test:{}/oauth/token HTTP/1.1\r\nHost: host.test\r\n\
+             Content-Length: 0\r\n\r\n",
+            addr.port()
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(
+            resp.contains("502") && resp.contains("upstream-cert-rejected"),
+            "an untrusted upstream must be refused, not downgraded: {resp:?}"
+        );
+    }
+
+    /// The https-forward path injects a host-scoped credential into the upstream request — unlike the
+    /// cleartext `http://` path, which never sends a header secret — because its upstream leg is
+    /// encrypted. sbx's injected header reaches the upstream, replacing any client-supplied copy.
+    #[test]
+    fn an_absolute_form_https_forward_injects_the_scoped_credential() {
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+                .with_injections(vec![injection(
+                    "host.test:*",
+                    "Authorization",
+                    "Bearer sbx-secret-value",
+                )]),
+        );
+        // the client sends its OWN Authorization — it must be stripped and replaced by sbx's.
+        let request = format!(
+            "POST https://host.test:{}/oauth/token HTTP/1.1\r\nHost: host.test\r\n\
+             Authorization: Bearer attacker\r\nContent-Length: 0\r\n\r\n",
+            addr.port()
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(resp.contains("200"), "the response flows back: {resp:?}");
+        let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        assert!(
+            head.contains("Authorization: Bearer sbx-secret-value"),
+            "sbx's credential must reach the upstream over the encrypted leg: {head:?}"
+        );
+        assert!(
+            !head.contains("attacker"),
+            "the client's own copy of the injected header must be stripped: {head:?}"
+        );
+    }
+
+    /// The SSRF guard holds on the https-forward path — the canonical proxy attack: an in-cage agent
+    /// sending an absolute-form `https://` request to a host that resolves into a private / cloud-
+    /// metadata range must be blocked. A wildcard-matched host that resolves to loopback is an SSRF
+    /// wildcard; a metadata address is refused even for an exact host. This discriminates that the
+    /// deciding rule is threaded into `ip_permitted` the same way the MITM path threads it.
+    #[test]
+    fn the_https_forward_path_blocks_ssrf_to_private_and_metadata_addresses() {
+        // wildcard match (no exact-named host) → loopback → blocked
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["*.corp.test:*"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"POST https://internal.corp.test/oauth/token HTTP/1.1\r\n\
+              Host: internal.corp.test\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("ssrf-blocked"),
+            "a wildcard-matched private target is an SSRF wildcard and must be blocked: {resp:?}"
+        );
+
+        // exact host, but the address is cloud metadata → blocked even though explicit
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["meta.test:*"]))
+                .unwrap()
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"POST https://meta.test/oauth/token HTTP/1.1\r\n\
+              Host: meta.test\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("ssrf-blocked"),
+            "the cloud-metadata address must be blocked even for an exact host: {resp:?}"
+        );
+    }
+
+    /// The outbound-secret tripwire holds on the https-forward path — and it matters more here because
+    /// the client leg is cleartext: a request re-sending a configured secret verbatim in its head is
+    /// refused (block, never strip).
+    #[test]
+    fn an_outbound_secret_on_the_https_forward_path_is_refused() {
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+                .with_redactions(vec![SecretNeedle::new(b"s3cret-reflected-value".to_vec())]),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"POST https://host.test/oauth/token HTTP/1.1\r\nHost: host.test\r\n\
+              X-Leak: s3cret-reflected-value\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("403") && resp.contains("outbound-secret"),
+            "a secret re-sent in an outbound header must be refused: {resp:?}"
+        );
+    }
+
+    /// Under the `ask` posture an undecided host on the https-forward path **parks** — exactly as the
+    /// same host would through a CONNECT — and an out-of-band `allow` lets it proceed to the validated
+    /// upstream. The teeth are in the deciding rule the allow synthesizes: it names this exact
+    /// host:port, which is the only reason the loopback upstream passes the SSRF guard. A park that
+    /// returned no deciding rule would be refused `ssrf-blocked` here.
+    #[test]
+    fn an_ask_undecided_host_on_the_https_forward_path_parks_and_proceeds_when_allowed() {
+        use crate::allowlist::DefaultAction;
+        use crate::sandbox::control::{PendingState, Verdict};
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let state = Arc::new(PendingState::new());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                EgressPolicy::default().with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            .with_pending_silent(state.clone()),
+        );
+        let answerer = {
+            let state = state.clone();
+            thread::spawn(move || answer_when_parked(&state, Verdict::Allow))
+        };
+        let request = format!(
+            "POST https://undecided.test:{}/oauth/token HTTP/1.1\r\nHost: undecided.test\r\n\
+             Content-Length: 0\r\n\r\n",
+            addr.port()
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert_eq!(
+            answerer.join().unwrap().as_deref(),
+            Some("undecided.test"),
+            "the request must reach the pending queue, not be denied outright"
+        );
+        assert!(
+            resp.contains("200"),
+            "an allowed ask must reach the upstream: {resp:?}"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap_or_default()
+                .starts_with("POST /oauth/token HTTP/1.1"),
+            "the parked-then-allowed request must be forwarded in origin-form"
+        );
+    }
+
+    /// The other half of the park: an out-of-band `deny` refuses the parked https-forward request
+    /// with `asked-denied`, and the upstream is never contacted (the resolver panics if reached).
+    #[test]
+    fn an_ask_undecided_host_on_the_https_forward_path_is_refused_when_denied() {
+        use crate::allowlist::DefaultAction;
+        use crate::sandbox::control::{PendingState, Verdict};
+        let state = Arc::new(PendingState::new());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                EgressPolicy::default().with_default(DefaultAction::Ask),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| {
+                panic!("a denied ask must never resolve the host")
+            }))
+            .with_pending_silent(state.clone()),
+        );
+        let answerer = {
+            let state = state.clone();
+            thread::spawn(move || answer_when_parked(&state, Verdict::Deny))
+        };
+        let resp = through_cleartext(
+            ctx,
+            b"POST https://undecided.test/oauth/token HTTP/1.1\r\n\
+              Host: undecided.test\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(answerer.join().unwrap().as_deref(), Some("undecided.test"));
+        assert!(
+            resp.contains("403") && resp.contains("asked-denied"),
+            "a denied ask must refuse with asked-denied: {resp:?}"
+        );
+    }
+
+    /// The forwarded origin-form target keeps the **query string, percent-escapes included**,
+    /// verbatim — while a *path-scoped* rule still decides it. `parse_url_target` returns
+    /// path-including-query and `explain` canonicalizes internally (decoding `%2F`, resolving `..`),
+    /// so the two must stay separate: the canonical path is what the rule matches, the raw one is
+    /// what the upstream receives. Routing the *forwarded* path through the canonicalizer would
+    /// silently break every OAuth callback (`?code=…&state=…`), and no other test would notice.
+    #[test]
+    fn an_absolute_form_https_forward_preserves_the_query_string() {
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        // A path-scoped rule, so the verdict runs through `explain`'s canonicalizer too.
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["host.test:*/oauth/*"]),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let request = format!(
+            "GET https://host.test:{}/oauth/callback?code=abc%2Fdef&state=xyz HTTP/1.1\r\n\
+             Host: host.test\r\n\r\n",
+            addr.port()
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(resp.contains("200"), "the response flows back: {resp:?}");
+        let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        assert!(
+            head.starts_with("GET /oauth/callback?code=abc%2Fdef&state=xyz HTTP/1.1"),
+            "the query string must reach the upstream verbatim: {head:?}"
+        );
+    }
+
+    /// A `Transfer-Encoding: chunked` request on the https-forward path is de-chunked and re-framed
+    /// with a synthesized `Content-Length` — the same treatment the tunneled path gives it — so a
+    /// client that streams its body (no up-front length) is served rather than refused `400`, and no
+    /// CL/TE framing ambiguity reaches the upstream.
+    #[test]
+    fn a_chunked_absolute_form_https_forward_is_de_chunked_and_re_framed() {
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        // "grant_type=x" split over two 6-byte chunks (12 bytes total).
+        let request = format!(
+            "POST https://host.test:{}/oauth/token HTTP/1.1\r\nHost: host.test\r\n\
+             Transfer-Encoding: chunked\r\n\r\n6\r\ngrant_\r\n6\r\ntype=x\r\n0\r\n\r\n",
+            addr.port()
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(resp.contains("200"), "the response flows back: {resp:?}");
+        let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        let lower = head.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-length: 12"),
+            "the de-chunked body must be re-framed with its length: {head:?}"
+        );
+        assert!(
+            !lower.contains("transfer-encoding"),
+            "the client's chunked framing must not reach the upstream: {head:?}"
+        );
+    }
+
+    /// `Proxy-Authorization` is a credential the client addressed to the **proxy hop**; it must never
+    /// be forwarded to the origin server. This path is where a cage tool genuinely speaks the proxy
+    /// protocol to sbx, so it is where the header actually shows up.
+    #[test]
+    fn a_proxy_authorization_header_is_never_forwarded_upstream() {
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let request = format!(
+            "GET https://host.test:{}/ HTTP/1.1\r\nHost: host.test\r\n\
+             Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+            addr.port()
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(resp.contains("200"), "the response flows back: {resp:?}");
+        let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        assert!(
+            !head.to_ascii_lowercase().contains("proxy-authorization"),
+            "the proxy-hop credential must be stripped: {head:?}"
         );
     }
 

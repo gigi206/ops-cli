@@ -84,23 +84,22 @@
 # likely the same upstream bug that stalls it outside sbx. (The `kiro-cli` profile — which works now —
 # is the reliable way to use Kiro in the meantime, including its device-flow login.)
 #
-# FIRST LOGIN — run it once under `--net shared` (host network, no allowlist whack-a-mole while you
-# discover which SSO hosts the flow touches), let the session persist in the isolated home, then run
-# filtered:
-#     sbx app run kiro-desktop --net shared    # first run: complete the sign-in, watch `sbx net logs -a kiro-desktop`
-#     sbx app run kiro-desktop                 # later runs: filtered by the allowlist below
+# FIRST LOGIN — run it filtered and watch what the flow touches:
+#     sbx app run kiro-desktop
+#     sbx net logs -a kiro-desktop             # in another terminal: what was allowed, what was refused
+# A named deny is an allowlist gap — add the host to `allow` below. If you would rather not play
+# allowlist whack-a-mole while discovering the SSO hosts, do the first sign-in under `--net shared`
+# (host network, no filtering), let the token persist in the isolated home, then run filtered after.
 #
-# ⚠ KNOWN FILTERED-LOGIN LIMITATION (diagnosed live via `sbx net logs`). The browser half of the
-# sign-in works fully under the allowlist (Google/GitHub → app.kiro.dev → the localhost callback), but
-# the IDE's BACKEND then exchanges the code at `POST https://prod.us-east-1.auth.desktop.kiro.dev/
-# oauth/token` using an HTTP client that does NOT open a CONNECT tunnel — it sends the request in
-# absolute-form (`POST https://…`) as if to an old forward proxy. sbx's MITM proxy only tunnels HTTPS
-# via CONNECT, so it refuses that with `405 method-not-allowed` and the login ends with "There was an
-# error signing you in." The host IS allowed — this is a TRANSPORT mismatch, not an allowlist gap (it
-# is the same reason cognito-identity shows `bad-request`). So complete the LOGIN under `--net shared`
-# (no proxy → the token exchange goes direct), let the token persist in the isolated home, then use
-# the IDE filtered. Whether the daily model traffic uses the same non-CONNECT client (and so also
-# needs `--net shared`) is the next thing to confirm with `sbx net logs -a kiro-desktop`.
+# TRANSPORT NOTE (diagnosed live via `sbx net logs`). The browser half of the sign-in works under the
+# allowlist (Google/GitHub → app.kiro.dev → the localhost callback), and the IDE's BACKEND then
+# exchanges the code at `POST https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token` with an HTTP
+# client that does NOT open a CONNECT tunnel — it sends the request in absolute-form (`POST
+# https://…`) as if to an old forward proxy. That used to be refused `405 method-not-allowed`; sbx's
+# proxy now serves it under the ordinary `https` policy (same verdict, same guards, a validated TLS
+# connection to the upstream), so the exchange no longer needs `--net shared`. What is still UNVERIFIED
+# with a real account is whether the login then COMPLETES — see the upstream gate above, which is a
+# separate, upstream bug.
 #
 # EGRESS AND HTTP/2 (gRPC). sbx's MITM proxy speaks HTTP/1.1 by default; a host listed in `[network]
 # http2` is instead man-in-the-middled as HTTP/2 (ALPN h2) for gRPC, every stream still inspected +

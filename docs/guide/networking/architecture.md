@@ -134,6 +134,35 @@ A [`tcp://` L4 rule](rules.md#l7-vs-l4-tcp) opts out of this: the proxy splices 
 raw byte stream without terminating TLS, for non-HTTP protocols. That is why a raw
 splice has no path/method controls and bypasses the credential machinery.
 
+### Requests that arrive without a CONNECT
+
+Not every client tunnels. With a proxy configured, some send the whole request to the
+proxy in **absolute form** — `POST https://host/path HTTP/1.1` — and expect the proxy
+to make the outbound TLS connection itself (the "secure web proxy" shape some bundled
+proxy libraries use). The proxy serves that too, under the **ordinary `https` policy**:
+no separate opt-in, no new rule syntax — an `allow` that covers the host covers this
+request exactly as it would cover the equivalent `CONNECT`, `ask` parking included.
+Everything below applies unchanged (host identity, SSRF guard, upstream validation,
+credential injection and redaction), and the connection sbx opens to the real upstream
+is still a **validated TLS** one.
+
+What differs is only the *client* leg: that request — and the response — travel in
+cleartext between the tool and the proxy. That leg is a loopback socket **inside the
+cage**, which no process in the cage can read (there is no `CAP_NET_RAW` for a packet
+socket, and `ptrace` is on the [seccomp denylist](../concepts/enforcement.md)), and an
+injected credential is added by the proxy for the upstream leg only — it never appears
+on the client leg at all. Nothing leaves the cage unencrypted on this path.
+
+Under [`ask`](ask.md) such a request parks like any other, answerable with `sbx net
+pending`. Worth knowing: a client that reached the proxy this way is usually a library
+with its own request timeout, so it may give up before you answer — set
+[`ask_timeout`](ask.md#tuning-ask-table-fields) to bound the wait, or pre-allow the
+host.
+
+An absolute-form **`http://`** request is a different thing: that one is genuine
+cleartext all the way to the origin server, and stays [strictly
+opt-in](rules.md#cleartext-http-http) behind an explicit `http://` rule.
+
 ### CONNECT authority == SNI == decrypted Host (anti-domain-fronting)
 
 Domain fronting is connecting to one host at the TCP/TLS layer while addressing a
