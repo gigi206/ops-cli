@@ -1,0 +1,329 @@
+# Kiro — the Kiro agentic IDE (desktop, Electron / Code-OSS fork), sandboxed by sbx.
+#
+#   sbx app import profiles/kiro-desktop.toml
+#   sbx app run kiro-desktop
+#
+# This is the Kiro **desktop IDE** (the full GUI editor from kiro.dev, by AWS — a Code-OSS / VS Code
+# fork). For the headless terminal agent, use `profiles/kiro.toml` instead (`kiro-cli`, a native Rust
+# CLI that fits Mode-B far more cleanly). Confined by sbx, the editor sees only the cage filesystem
+# (the project you launch it from + its own persistent isolated home), reaches only the hosts you
+# allow, and its powers stop at the sandbox boundary (bubblewrap + seccomp + an empty netns + the
+# egress allowlist).
+#
+# THE `tarball:` BACKEND (official vendor, prebuilt). Kiro ships a Linux `.tar.gz` "Universal" build
+# (and a `.deb`) from `prod.download.desktop.kiro.dev` (AWS's own signed release host). This profile
+# uses the `.tar.gz` via sbx's `tarball:` backend — sbx fetches it, resolves it to a content hash
+# (pinned in the per-project tarball lock), and builds a generated derivation that unpacks it and
+# `autoPatchelfHook`s the Electron binaries against a curated library set. The build is HOST-SIDE
+# (extraction runs no build script, so it is safe), seeded into the store, offline-reusable after the
+# first launch. glibc 2.39+ is satisfied in-cage by nix's glibc via autoPatchelf, so a host on any
+# distro works.
+#
+# WHY tarball, NOT deb. Kiro bundles OPTIONAL native binaries with deps outside the curated Electron
+# lib set — the microsoft-authentication extension's MSAL runtime (`libwebkit2gtk-4.1`, `libsoup-3.0`;
+# used only for Microsoft/Entra sign-in, which this profile does not use — it logs in with Google /
+# Builder ID) and the kiro-agent extension's OWN bundled `bwrap` (`libcap`, irrelevant inside sbx's
+# cage). sbx's `deb:` backend is STRICT (autoPatchelf FAILS the build on any unsatisfied dep), so a
+# `.deb` build dies on those three; the `tarball:` backend ignores unsatisfied deps (they are only
+# dlopened by the unused features), so the build succeeds and the essential Electron libs are still
+# patched. The `.tar.gz` is also the format Kiro's release metadata lists natively — so it is both the
+# leaner and the more robust choice here.
+#
+# VERSION — AUTO-UPGRADE via `tarball:resolve`. Kiro's `.tar.gz` URL embeds a version with no
+# `…/latest/…` alias, so a fixed `tarball:<url>` would freeze. Instead this profile uses
+# `tarball:resolve` paired with the `[tarball.kiro]` table below: sbx runs its `resolve` command in a
+# hermetic sandbox to read Kiro's release metadata JSON and print the CURRENT signed `.tar.gz` URL
+# (the metadata's own `releases[].url`), pins it per project on first launch, and `sbx upgrade tarball`
+# re-runs it to roll forward — no manual URL bump.
+#
+# FIRST LAUNCH resolves + builds the `.deb` host-side, pulling the Electron closure (hundreds of MiB —
+# a couple of minutes, over your HOST network, NOT the cage allowlist). Later launches reuse the
+# pinned build offline.
+#
+# DISPLAY + GPU + DBUS (identical to the other Electron profiles). `gui = "wayland"` binds the host
+# Wayland compositor socket (read-only) and provisions fonts so the window maps; X11 is never offered;
+# isolation is compositor-dependent (Mutter safe; wlroots exposes screen-capture/input — see
+# docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa in sbx's
+# own store, the render node under `/dev/dri`, the minimal `/sys` DRM subtree) — without it a
+# Chromium/Electron app on Wayland often maps no window; mesa covers Intel/AMD/nouveau, NVIDIA-only
+# falls back to software. `dbus = true` gives the cage its OWN private desktop portal so Kiro's file
+# chooser (open folder / attach file) opens IN-CAGE and lists the cage filesystem, relays
+# notifications, and follows your host light/dark theme. Electron flags: `--no-sandbox` is mandatory
+# and acceptable (bubblewrap + seccomp + the empty netns IS the boundary); `--ozone-platform=wayland`
+# selects Wayland; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`; `--password-store=basic`
+# forces the file cookie/token store (no keyring in the cage) so a login survives a relaunch;
+# `--use-system-ca` tells the embedded Chromium to trust sbx's MITM CA (seeded into the cage NSS db
+# under a filtering posture, part of the GUI hole).
+#
+# CREDENTIAL POSTURE — a Kiro ACCOUNT login (NOT a header-injectable key), wired via an in-cage
+# browser. Kiro signs in exactly like `kiro-cli`: it opens the sign-in page in the EXTERNAL default
+# browser and runs its OWN local HTTP callback server, and the browser redirects to
+# `http://localhost:<port>/oauth/callback?...` (a plain http URL — NOT a `kiro://` deep-link, unlike
+# Cursor). The hermetic cage has no host browser and no `xdg-open`, so out of the box clicking "login"
+# does nothing. The `cmd` wrapper below closes the loop IN-CAGE: it routes http(s) to an in-cage
+# Chromium, and because the callback is a normal `http://localhost` URL the browser follows it right
+# back to the IDE's own in-cage callback server (same cage, same empty-netns loopback) — no scheme
+# handler needed. Two load-bearing details carried over from `kiro.toml` (both proven there):
+#   * BACKGROUND Chromium (`nohup … &`), never `exec` it — an opener that blocks (waiting for the
+#     browser to exit) stalls the login before the token exchange runs;
+#   * `--host-resolver-rules="MAP localhost 127.0.0.1"` — the cage's synthetic /etc/hosts advertises
+#     `::1` for localhost but the empty netns brings up NO IPv6 loopback, so the callback must be
+#     pinned to the IPv4 listener. The callback port is DYNAMIC (kiro picks the first free candidate —
+#     3128 under the empty netns, but 4649 and others have been seen), so the rule maps the NAME, not a
+#     port.
+# Under `dbus = true` Electron opens external URLs via `org.freedesktop.portal.OpenURI` rather than
+# calling `xdg-open`, and the portal shows "no apps available" unless a default handler is registered —
+# so the wrapper also registers itself as the http/https scheme handler (`.desktop` + `mimeapps.list`).
+#
+# ⚠ HONEST GATE — the desktop OAuth login is BUGGY UPSTREAM, and it is IDE-SPECIFIC. Multiple OPEN
+# vendor issues (kirodotdev/Kiro #10138, #3782, #3158, #7727) report the IDE's localhost callback
+# server failing to start or resetting the connection — and they REPRODUCE ON A PLAIN HOST WITH NO
+# SANDBOX. sbx can wire the transport perfectly (the CLI's login, same mechanism, works here), but
+# whether the IDE's own callback server completes the exchange is upstream's bug, not sbx's. So treat
+# this profile's login as UNVERIFIED until you try it with a real account; if it stalls, it is very
+# likely the same upstream bug that stalls it outside sbx. (The `kiro-cli` profile — which works now —
+# is the reliable way to use Kiro in the meantime, including its device-flow login.)
+#
+# FIRST LOGIN — run it once under `--net shared` (host network, no allowlist whack-a-mole while you
+# discover which SSO hosts the flow touches), let the session persist in the isolated home, then run
+# filtered:
+#     sbx app run kiro-desktop --net shared    # first run: complete the sign-in, watch `sbx net logs -a kiro-desktop`
+#     sbx app run kiro-desktop                 # later runs: filtered by the allowlist below
+#
+# ⚠ KNOWN FILTERED-LOGIN LIMITATION (diagnosed live via `sbx net logs`). The browser half of the
+# sign-in works fully under the allowlist (Google/GitHub → app.kiro.dev → the localhost callback), but
+# the IDE's BACKEND then exchanges the code at `POST https://prod.us-east-1.auth.desktop.kiro.dev/
+# oauth/token` using an HTTP client that does NOT open a CONNECT tunnel — it sends the request in
+# absolute-form (`POST https://…`) as if to an old forward proxy. sbx's MITM proxy only tunnels HTTPS
+# via CONNECT, so it refuses that with `405 method-not-allowed` and the login ends with "There was an
+# error signing you in." The host IS allowed — this is a TRANSPORT mismatch, not an allowlist gap (it
+# is the same reason cognito-identity shows `bad-request`). So complete the LOGIN under `--net shared`
+# (no proxy → the token exchange goes direct), let the token persist in the isolated home, then use
+# the IDE filtered. Whether the daily model traffic uses the same non-CONNECT client (and so also
+# needs `--net shared`) is the next thing to confirm with `sbx net logs -a kiro-desktop`.
+#
+# EGRESS AND HTTP/2 (gRPC). sbx's MITM proxy speaks HTTP/1.1 by default; a host listed in `[network]
+# http2` is instead man-in-the-middled as HTTP/2 (ALPN h2) for gRPC, every stream still inspected +
+# verdict-checked. Kiro's model-traffic transport is not documented from a primary source — if the
+# agent misbehaves under `deny`, diagnose with `sbx net logs -a kiro-desktop` (a named deny → add the
+# host to `allow`; a `bad-request`/`http2-required` → the host's `[network] http2` designation does
+# not match its transport; an `EAI_AGAIN`/0-deny → the request bypassed the proxy) and, as a last
+# resort, fall back to `network = "shared"` (you keep bubblewrap + seccomp + the isolated home + the
+# minimal /dev, and lose only egress FILTERING).
+#
+# STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly. The packaging/transport mirrors
+# the proven `cursor` desktop path (deb:resolve + autoPatchelf + gui/gpu/dbus). STILL TO VALIDATE with
+# a real Kiro account: the account LOGIN (wired below, but see the UPSTREAM GATE above) and an
+# end-to-end AI turn. If a request is blocked, the proxy names the host it refused — add it to `allow`
+# (or check ahead with `sbx test net <url>`).
+cmd = [
+    "bash",
+    "-c",
+    '''
+# IN-CAGE BROWSER LOGIN (see the CREDENTIAL POSTURE note in the header). Kiro's account sign-in opens
+# an external browser for the web auth and runs its own `http://localhost:<port>/oauth/callback`
+# server; the hermetic cage has no browser and no `xdg-open`, so wire one that routes http(s) to an
+# in-cage Chromium. Because the callback is a normal http URL, Chromium follows it straight back to
+# Kiro's in-cage callback server — no `kiro://` scheme handler needed.
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
+#!/bin/sh
+# BACKGROUND Chromium (`nohup … &`), never `exec` — a blocking opener stalls the login before the
+# token exchange (proven in kiro.toml). `--host-resolver-rules="MAP localhost 127.0.0.1"` pins the
+# dynamic-port localhost callback to the cage's IPv4 loopback (the empty netns has no IPv6 loopback).
+# `--use-system-ca` makes Chromium trust sbx's MITM CA under the allowlist. Chromium's output goes to
+# a log in the isolated home — read it host-side at the path from `sbx app show kiro-desktop`.
+case "$1" in
+  http://*|https://*)
+    nohup chromium --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
+      --use-system-ca --password-store=basic \
+      --host-resolver-rules="MAP localhost 127.0.0.1" \
+      --disable-background-timer-throttling --disable-backgrounding-occluded-windows \
+      --disable-renderer-backgrounding \
+      --no-first-run --no-default-browser-check "$@" >>"$HOME/chromium-login.log" 2>&1 </dev/null &
+    ;;
+esac
+exit 0
+WRAP
+chmod +x "$HOME/.local/bin/xdg-open"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Under `dbus = true` the cage has a real portal, so Electron opens external URLs via
+# `org.freedesktop.portal.OpenURI` instead of calling `xdg-open` — and the portal shows "no apps
+# available" unless a default handler is registered, silently breaking the sign-in link. Register the
+# wrapper as the default handler for the web schemes. The Exec path is ABSOLUTE ($HOME expanded here)
+# because the portal-launched handler does not inherit this shell's PATH.
+mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
+cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=sbx URL handler
+Exec=$HOME/.local/bin/xdg-open %U
+MimeType=x-scheme-handler/http;x-scheme-handler/https;
+NoDisplay=true
+Terminal=false
+EOF
+cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
+[Default Applications]
+x-scheme-handler/http=sbx-open-uri.desktop
+x-scheme-handler/https=sbx-open-uri.desktop
+MIMEAPPS
+
+exec kiro --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
+    --use-system-ca --password-store=basic
+''',
+]
+
+gui = "wayland"
+gpu = true
+dbus = true
+
+# Your host Kiro config/auth, mounted read-write at its real absolute path (so the caged editor
+# shares your host Kiro login/settings/extensions). `binds` is a security field, honored only because
+# this profile lives in your trusted config dir. Uncomment to share your host setup with the cage
+# instead of the app's isolated home (the default). Paths UNCONFIRMED — verify before relying.
+#binds = [
+#    { path = "~/.config/Kiro", mode = "rw" },     # settings, sign-in state
+#    { path = "~/.kiro", mode = "rw" },            # agent/CLI state
+#]
+
+[packages]
+# Kiro's prebuilt `.tar.gz`, AUTO-UPGRADED via `tarball:resolve` (see the VERSION + WHY-tarball notes
+# in the header): the `[tarball.kiro]` table below reads the current signed `.tar.gz` URL from Kiro's
+# release metadata, so `sbx upgrade tarball` rolls forward with no manual URL bump. Trusted-only, like
+# every backend; this profile is trusted by location once imported.
+kiro = "tarball:resolve"
+# In-cage Chromium for the account sign-in flow (the `cmd` wrapper opens the http(s) auth URL in it and
+# the localhost callback returns to the IDE's own server). A large closure (a couple hundred MB the
+# first launch, seeded + offline-reusable after; shared across every gui/Chromium profile).
+chromium = "nix:chromium"
+
+# The `tarball:resolve` command for `kiro` above. sbx runs it in a hermetic sandbox (base tools only —
+# `curl`/`grep`; SHARED network to reach the vendor API, sbx's own CA bundle for TLS) and pins the URL
+# it prints. Kiro's release metadata JSON lists the signed `.tar.gz` under `releases[].url`; the
+# command extracts that URL directly (no path reconstruction — it reads the vendor's own declared
+# URL). `curl -fsSL` fails closed on an HTTP error, `head -1` keeps a single URL, and sbx re-validates
+# the printed URL is an https `.tar.gz` before fetching. `sbx upgrade tarball` re-runs this and rolls
+# forward; a warm launch reuses the pin WITHOUT re-running it (offline).
+[tarball.kiro]
+resolve = ["sh", "-c", '''
+curl -fsSL "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json" | grep -oE 'https://[^"]*kiro-ide-[^"]*-linux-x64\.tar\.gz' | head -1
+''']
+
+# An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is
+# opened to all verbs with `{*}`. Hosts are from Kiro's own IDE firewall doc
+# (kiro.dev/docs/privacy-and-security/firewalls) PLUS the Google browser-login chain proven live for
+# `kiro.toml`. Kiro's firewall doc is known to mix IDE/CLI hosts and omit some (issue #6314), so treat
+# `sbx net logs -a kiro-desktop` as ground truth on the first `--net shared` run.
+[network]
+mode = "deny"
+allow = [
+    # Auth / token exchange + the sign-in page (rendered in the in-cage browser). The IDE POSTs back
+    # after the IdP, so all verbs.
+    "{*} https://app.kiro.dev",
+    "{GET} https://assets.app.kiro.dev",
+    # AWS "shortbread" cookie-consent banner assets rendered on the sign-in page (css/js). Its
+    # analytics/logging beacons stay denied+muted below; these are just the banner's static assets.
+    "{GET} https://prod.assets.shortbread.aws.dev",
+    "{*} https://prod.us-east-1.auth.desktop.kiro.dev",
+    "{*} https://prod.eu-central-1.auth.desktop.kiro.dev",
+    # Social federation (Google/GitHub sign-in). Kiro's IDE firewall doc lists cognito-identity under
+    # AUTH (unlike the CLI, where it was anonymous telemetry) — allowed here as a login dependency.
+    "{*} https://cognito-identity.us-east-1.amazonaws.com",
+    "{*} https://kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
+
+    # Inference / chat (POST completions).
+    "{*} https://runtime.us-east-1.kiro.dev",
+    "{*} https://runtime.eu-central-1.kiro.dev",
+    "{*} https://q.us-east-1.amazonaws.com",
+    "{*} https://q.eu-central-1.amazonaws.com",
+
+    # Config / management.
+    "{*} https://management.us-east-1.kiro.dev",
+    "{*} https://management.eu-central-1.kiro.dev",
+
+    # Update check / IDE assets (the editor's own self-update probe; the `.deb` itself is fetched
+    # HOST-SIDE at build time, not through the cage).
+    "{GET} https://prod.download.desktop.kiro.dev",
+
+    # Extensions — Open VSX (Kiro cannot use Microsoft's marketplace). Search/metadata + the `.vsix`
+    # asset/icon host. `{*}` because the gallery query is a CORS preflight + POST. Comment out if you
+    # do not use extensions.
+    "{*} https://open-vsx.org",
+    "{GET} https://openvsx.eclipsecontent.org",
+
+    # ── Google Sign-In ("Continue with Google") — the consent AND the cross-domain cookie step render
+    # in the in-cage Chromium (the exact chain proven live for kiro.toml). Google serves the consent
+    # and `/accounts/SetSID` from your COUNTRY domain (.com/.fr/.de/…), then bounces back via
+    # amazoncognito.com → app.kiro.dev → localhost. DENY SetSID and the OAuth chain never completes.
+    # The bounded regex covers any ccTLD, anchored so a look-alike is REFUSED. Not needed for GitHub /
+    # Builder ID sign-in (those stay on their own domains).
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{*} https://oauth2.googleapis.com",
+    "{*} https://apis.google.com",
+    "{GET} https://www.google.com",
+    "{GET} https://*.gstatic.com",
+    "{GET} https://fonts.googleapis.com",
+    "{GET} https://*.googleusercontent.com",
+
+    # Optional Kiro "Powers" / agent tool use (git operations). github.com {GET} is already covered by
+    # sbx's built-in nix-cache set; uncomment the raw host if a Power fetches from it.
+    #"{GET} https://raw.githubusercontent.com",
+]
+# HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; orthogonal to the
+# `allow` verdict — a host here must ALSO be in `allow`, every stream still verdict-checked). The
+# designation is ALPN-h2-ONLY. Kiro's model-traffic transport is unverified from a primary source, so
+# none is designated by default; if a model/agent host is refused `bad-request` (it sent the h2
+# preface), add it here, watching `sbx net logs -a kiro-desktop`.
+http2 = [
+    #"runtime.us-east-1.kiro.dev",
+]
+# Telemetry / metrics we deliberately leave DENIED. `mute` never changes the verdict (still refused,
+# still counted by `sbx net stats`); it only keeps the refusal out of the default `sbx net log` so the
+# actionable denials stay readable. See them with `sbx net log --all`, and edit from the CLI with
+# `sbx net mute|unmute <host> -a kiro-desktop`. (Kiro's telemetry can also be turned off IN the editor
+# — Settings → `telemetry.telemetryLevel: "off"`, VS Code-style — which stops these being called.)
+mute = [
+    "prod.us-east-1.telemetry.desktop.kiro.dev",
+    "prod.eu-central-1.telemetry.desktop.kiro.dev",
+    "telemetry.us-east-1.kiro.dev",
+    "telemetry.eu-central-1.kiro.dev",
+    "prod.us-east-1.telemetry-v2.kiro.dev",
+    "prod.us-east-1.telemetry.kiro.aws.dev",
+    "dataplane.rum.us-east-1.amazonaws.com",
+    "client-telemetry.us-east-1.amazonaws.com",
+    # AWS "shortbread" cookie-consent banner analytics/logging on the sign-in page (the banner assets
+    # are served from app.kiro.dev; these are its telemetry beacons). Denied, no functional impact.
+    "prod.log.shortbread.aws.dev",
+    "prod.tools.shortbread.aws.dev",
+    "prod.tools.shortbread.analytics.console.aws.a2z.com",
+    # The in-cage Chromium's OWN telemetry/component-update noise during sign-in (not Kiro traffic) —
+    # component/DRM/self updates, Safe Browsing, connectivity checks, translate, YouTube cookie sync.
+    # None is the Google SSO flow (that lives on accounts.google.<ccTLD>, allowed above).
+    "redirector.gvt1.com",
+    "update.googleapis.com",
+    "safebrowsing.googleapis.com",
+    "optimizationguide-pa.googleapis.com",
+    "translate.googleapis.com",
+    "clients2.google.com",
+    "android.clients.google.com",
+    "play.google.com",
+    "accounts.youtube.com",
+    # More in-cage Chromium features that phone Google during the sign-in, none login-critical (the
+    # Google auth completes without them): real-time signaling, form autofill, and the password
+    # leak-check (which we deliberately keep DENIED — no passwords are sent to Google's leak service).
+    "signaler-pa.googleapis.com",
+    "content-autofill.googleapis.com",
+    "passwordsleakcheck-pa.googleapis.com",
+]
+
+[env]
+# If Kiro's Node backend (the extension host / agent that makes model calls) reaches its endpoints
+# through Node's built-in fetch (undici), undici ignores http_proxy/https_proxy unless this is set,
+# and in the Model-B empty netns a bypassed fetch dies with `EAI_AGAIN` before the proxy is ever
+# consulted. NODE_USE_ENV_PROXY (Node 24+) routes fetch through the proxy so every request is subject
+# to the allowlist. Harmless if the backend uses a proxy-aware client instead.
+NODE_USE_ENV_PROXY = "1"
+
+# No [secret] block: the desktop editor logs in to a Kiro account (see the credential note in the
+# header), not a header-injectable provider key — there is nothing for sbx to inject host-side.
