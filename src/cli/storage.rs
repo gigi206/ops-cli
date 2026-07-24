@@ -164,7 +164,7 @@ fn init(args: Vec<OsString>) -> ExitCode {
     {
         eprintln!("sbx storage: note: this host cannot mount it — {blocker}");
         eprintln!(
-            "       the volume will still be created; `sbx storage up` needs those to use it."
+            "       the volume will still be created; `sbx storage use` needs those to start using it."
         );
     }
     println!(
@@ -183,7 +183,7 @@ fn init(args: Vec<OsString>) -> ExitCode {
         return fail(e);
     }
     println!(
-        "  {}created{} — mount it with `sbx storage up`",
+        "  {}created{} — start using it with `sbx storage use`",
         pal.ok, pal.reset
     );
     ExitCode::SUCCESS
@@ -638,7 +638,10 @@ struct StatusView {
     allocated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     used_bytes: Option<u64>,
-    /// Whether sbx is set to use this volume — that is, whether the pointer names it.
+    /// Whether sbx is set to follow this volume — the pointer names it — whether or not it is
+    /// mounted right now. A volume adopted before a reboot is `adopted` but not mounted.
+    adopted: bool,
+    /// Whether sbx is reading from it right now: the pointer names it *and* it is mounted.
     in_use: bool,
 }
 
@@ -659,6 +662,7 @@ fn status(args: Vec<OsString>) -> ExitCode {
     // Read from the pointer rather than from the live layout: `status` must say what sbx
     // will do next time, which stands even when the volume happens to be unmounted now.
     let adopted = default_dir().ok().and_then(|d| storage::read_pointer(&d));
+    let is_adopted = adopted.as_deref() == Some(image.as_path());
     let mut view = StatusView {
         kind: active_backing_kind(adopted.as_deref()),
         exists: !matches!(st, storage::State::Absent),
@@ -675,6 +679,7 @@ fn status(args: Vec<OsString>) -> ExitCode {
         capacity_bytes: storage::image_capacity(&image),
         allocated_bytes: None,
         used_bytes: None,
+        adopted: is_adopted,
         in_use: false,
         image: image.clone(),
     };
@@ -694,7 +699,7 @@ fn status(args: Vec<OsString>) -> ExitCode {
                     .split(',')
                     .find_map(|o| o.strip_prefix("compress=").map(str::to_string))
             });
-            view.in_use = adopted.as_deref() == Some(image.as_path());
+            view.in_use = is_adopted;
             if let Ok(sp) = storage::space(mount_point) {
                 view.allocated_bytes = Some(sp.allocated);
                 view.used_bytes = Some(sp.used);
@@ -712,6 +717,30 @@ fn status(args: Vec<OsString>) -> ExitCode {
     }
     render(&view);
     ExitCode::SUCCESS
+}
+
+/// Which one-line next-step `status` prints, from whether the volume is mounted and whether sbx
+/// is set to follow it. Kept pure so the mapping is unit-tested: the point of the choice is that
+/// every branch names `use` (mount *and* adopt) as the way to start using the volume, never `up`
+/// (mount only), which is what makes a freshly `init`ed volume look like it was ignored.
+enum StatusHint {
+    /// Mounted and adopted — sbx reads from it now; nothing to do.
+    InUse,
+    /// Mounted but not adopted — `sbx storage use` adopts it (or `SBX_DATA_DIR` for a one-off).
+    MountedNotAdopted,
+    /// Adopted but unmounted, typically after a reboot — sbx re-mounts it on its own.
+    AdoptedUnmounted,
+    /// Created but neither mounted nor adopted (the state right after `init`) — `use` starts it.
+    StartUse,
+}
+
+fn status_next_step(mounted: bool, adopted: bool) -> StatusHint {
+    match (mounted, adopted) {
+        (true, true) => StatusHint::InUse,
+        (true, false) => StatusHint::MountedNotAdopted,
+        (false, true) => StatusHint::AdoptedUnmounted,
+        (false, false) => StatusHint::StartUse,
+    }
 }
 
 fn render(v: &StatusView) {
@@ -747,16 +776,32 @@ fn render(v: &StatusView) {
                 sandbox::human_bytes(a)
             );
         }
-        if v.in_use {
+    }
+
+    // The next step always names `use` — the verb that makes sbx *use* the volume (mount and
+    // adopt) — never `up`, which only mounts and leaves sbx still reading its old directory.
+    match status_next_step(v.mount_point.is_some(), v.adopted) {
+        StatusHint::InUse => {
             println!("\n  {}sbx is reading its data from this volume.{r}", pal.ok);
-        } else {
+        }
+        StatusHint::MountedNotAdopted => {
+            println!("\n  {dim}mounted but not in use — start using it with{r} `sbx storage use`");
+            if let Some(mp) = &v.mount_point {
+                println!(
+                    "    {dim}(or, for a one-off, export SBX_DATA_DIR={}){r}",
+                    mp.display()
+                );
+            }
+        }
+        StatusHint::AdoptedUnmounted => {
             println!(
-                "\n  {dim}not in use — point sbx at it with:{r}\n    export SBX_DATA_DIR={}",
-                mp.display()
+                "\nadopted — sbx mounts it automatically next command; \
+                 `sbx storage up` mounts it now."
             );
         }
-    } else {
-        println!("\nmount it with `sbx storage up`.");
+        StatusHint::StartUse => {
+            println!("\nstart using it with `sbx storage use`.");
+        }
     }
 
     // Deleting files does not shrink the image at once: the kernel hands freed extents back
@@ -867,11 +912,13 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
     }
 
     // An empty data directory is the true first launch: adopting is instant and cannot fail on a
-    // copy, so this is the one place the blocking question is cheap and safe. Default is no.
+    // copy, so this is the one place the blocking question is cheap and safe. The default stays
+    // *no* — the safe answer for an unattended Enter — but the proposal only fires on a host where
+    // a volume is genuinely worth it, so `y` is the recommended answer and the prompt says so.
     eprint!(
         "{}sbx:{} first launch on {fs}. sbx can keep its data in a compressed btrfs volume it \
          mounts itself — one host inode instead of thousands, about half the disk.\n     \
-         Adopt one now? [y/N] ",
+         Adopt one now? [y/N]  (recommended: y — N changes nothing) ",
         pal.head, pal.reset
     );
     let _ = std::io::stderr().flush();
@@ -879,7 +926,10 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
     // Recorded whatever the answer, so the question is asked exactly once.
     storage::mark_offered(default_dir);
     if !yes {
-        eprintln!("sbx: keeping the plain data directory — `sbx storage init` adopts one later.");
+        eprintln!(
+            "sbx: keeping the plain data directory — adopt one later with `sbx storage init` \
+             then `sbx storage use`."
+        );
         return;
     }
     match adopt_empty(default_dir) {
@@ -943,6 +993,28 @@ fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_next_step_always_points_at_use_never_up() {
+        // The state right after `init`: created, not mounted, not adopted. The user must be sent
+        // to `use` (mount and adopt), not `up` (mount only) — the confusion this fix removes.
+        assert!(matches!(
+            status_next_step(false, false),
+            StatusHint::StartUse
+        ));
+        // Adopted before a reboot: unmounted now, but sbx re-mounts it on its own.
+        assert!(matches!(
+            status_next_step(false, true),
+            StatusHint::AdoptedUnmounted
+        ));
+        // Mounted by `up` but never adopted: adoption is still the missing step.
+        assert!(matches!(
+            status_next_step(true, false),
+            StatusHint::MountedNotAdopted
+        ));
+        // Mounted and adopted: in use, nothing to do.
+        assert!(matches!(status_next_step(true, true), StatusHint::InUse));
+    }
 
     #[test]
     fn parse_opts_reads_the_shared_options_and_refuses_unknown_ones() {

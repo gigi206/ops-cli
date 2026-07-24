@@ -97,7 +97,7 @@ You can also adopt one deliberately, at any time. Two commands, once:
 ```console
 $ sbx storage init
 creating /home/you/.local/share/sbx-storage.btrfs (200.0 GiB logical, sparse — it occupies only what is written)
-  created — mount it with `sbx storage up`
+  created — start using it with `sbx storage use`
 
 $ sbx storage use
 sbx now uses /run/media/you/sbx-storage
@@ -218,3 +218,11 @@ to stop using it for good.
 Freed space returns to the host **in the background** rather than the instant a file is
 deleted, so the `on host` figure can lag a deletion by a moment — and after a large
 [`sbx gc`](gc.md), by considerably more. It is not lost; it is being handed back.
+
+That hand-back is automatic: the volume is mounted `discard=async`, so btrfs hands freed blocks
+back to the host by itself, usually within a moment. Forcing it *immediately* needs root —
+`sudo fstrim <mount-point>` (the `FITRIM` ioctl behind it, like a direct `blkdiscard`, requires
+privilege, and `udisks` exposes no trim). Without root you can only nudge it: `btrfs filesystem
+sync <mount-point>` commits pending frees so the background worker discards them sooner. Neither
+is usually worth it — waiting reclaims the same space with no privilege. `sbx storage status`
+names the mount point.
