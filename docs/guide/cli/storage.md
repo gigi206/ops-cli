@@ -130,6 +130,39 @@ The image is created **beside** the data directory (`<xdg-data>/sbx-storage.btrf
 inside it — the volume is what that directory becomes. `--image <path>` puts it elsewhere, on
 another disk for instance.
 
+## Choosing the size
+
+`--size` is **optional** — `init` defaults to **200 GiB**. Whatever you pass, it is a *logical
+ceiling, not a reservation*: the image is sparse, so it occupies only the bytes actually written.
+A fresh 200 GiB volume is a few megabytes on the host and grows as the store does. Set it
+generously and forget it — the number costs nothing until you fill it.
+
+```console
+$ sbx storage init --size 500G     # or 1T, or a plain byte count
+```
+
+You rarely need to change it afterwards, and that is fortunate, because **growing a volume in
+place requires root**. Everything else sbx does is unprivileged, but a resize is the exception:
+its two steps — telling the kernel the backing file has grown, and telling btrfs to use the new
+room — are both privileged, and `udisks` grants neither unattended. A spike confirmed this on a
+real volume: `losetup --set-capacity` and `btrfs filesystem resize` each returned *Operation not
+permitted* for an ordinary user.
+
+So the size is really settled **once, at `init`** — pick it high the first time. If you
+genuinely must grow an existing volume and you have root (and the host carries `util-linux` and
+`btrfs-progs`), [`status`](#status) names the device and the mount point, and the manual
+procedure is:
+
+```console
+$ truncate -s 500G /home/you/.local/share/sbx-storage.btrfs   # unprivileged: enlarge the file
+$ sudo losetup --set-capacity /dev/loop7                      # root: let the loop see the new size
+$ sudo btrfs filesystem resize max /run/media/you/sbx-storage # root: grow the filesystem onto it
+```
+
+sbx supplies `btrfs-progs` for its own use but cannot supply the privilege, so this stays a
+manual escape hatch it never runs for you. Not every host even carries `losetup` or a host
+`btrfs` binary — one more reason to size the volume right at `init` instead.
+
 ## Mounting is automatic
 
 `udisks` mounts under `/run`, which is cleared on reboot — so a volume is unmounted every time
