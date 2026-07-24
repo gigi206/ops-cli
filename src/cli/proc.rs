@@ -346,7 +346,9 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
         return ExitCode::from(2);
     }
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
@@ -396,7 +398,9 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return ExitCode::FAILURE;
     };
     let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), pid);
@@ -471,7 +475,9 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
@@ -590,7 +596,9 @@ fn proc_live(args: &[OsString]) -> ExitCode {
         return ExitCode::from(2);
     }
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
@@ -689,7 +697,9 @@ fn proc_logs(args: &[OsString]) -> ExitCode {
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {

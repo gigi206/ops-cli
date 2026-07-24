@@ -43,6 +43,7 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 | [`sbx proc`](proc.md) | observe a running session's process tree |
 | [`sbx fs`](fs.md) | observe the files a running session writes in its project |
 | [`sbx projects`](projects.md) | list and remove per-project runtime trees |
+| [`sbx storage`](storage.md) | manage a compressed, self-growing volume for the data directory |
 | [`sbx store`](store.md) | report what sbx occupies on disk, subtree by subtree |
 | [`sbx gc`](gc.md) | reclaim nix store space |
 | [`sbx upgrade`](upgrade.md) | roll managed toolchains forward |

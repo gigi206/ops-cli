@@ -19,6 +19,7 @@ mod plugins;
 mod proc_policy;
 mod sandbox;
 mod session;
+mod storage;
 mod store;
 mod style;
 #[cfg(test)]
@@ -382,7 +383,10 @@ fn net_mode_word(default_action: config::view::NetDefaultView) -> &'static str {
 fn egress_data_dir() -> Result<PathBuf, String> {
     store::Layout::from_env()
         .map(|l| l.data_dir().to_path_buf())
-        .ok_or_else(|| "cannot locate the data directory (set $HOME or $XDG_DATA_HOME)".to_string())
+        .ok_or_else(|| {
+            "cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+                .to_string()
+        })
 }
 
 /// The human context of the ask-mode control sockets, cross-referenced from the session registry:

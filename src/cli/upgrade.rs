@@ -46,7 +46,9 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return ExitCode::FAILURE;
     };
     let Some(nix) = store::resolve_nix(Some(&layout)) else {

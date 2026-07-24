@@ -46,6 +46,48 @@ requires an absolute base), and `sbx` falls back to `$HOME`.
 | `XDG_STATE_HOME` | the trust store (`sbx/trusted/`) | `$HOME/.local/state` |
 | `XDG_RUNTIME_DIR` | the Wayland socket (for `gui = "wayland"`) and the systemd user session | — |
 
+### `SBX_DATA_DIR`
+
+| Variable | Selects | Fallback |
+|---|---|---|
+| `SBX_DATA_DIR` | the data directory itself | a volume adopted with [`sbx storage use`](../cli/storage.md), else `$XDG_DATA_HOME/sbx` |
+
+The data directory is the one sbx tree that grows without bound — the shared nix store,
+the per-project runtime trees and the app homes all live there, and it is routinely tens
+of gigabytes across hundreds of thousands of inodes ([`sbx store`](../cli/store.md)
+reports both). `SBX_DATA_DIR` puts it on a filesystem of your choosing.
+
+It differs from `XDG_DATA_HOME` in two ways, because it is sbx's own variable rather than
+a base shared with every application:
+
+- It names the directory **itself** — nothing is appended. `SBX_DATA_DIR=/vol/sbx` uses
+  `/vol/sbx`, where `XDG_DATA_HOME=/vol` would use `/vol/sbx`.
+- A **relative** value is **refused**, not ignored: sbx reports the error and stops. A
+  relative path would resolve against whatever directory sbx was launched from, so falling
+  back quietly would put your projects and apps somewhere you never look. Unset or empty
+  reads as absent, so clearing the variable restores the default.
+
+It also has a **length limit — 74 bytes**, and a longer path is refused with that figure in
+the message. Egress filtering, the D-Bus filter, port forwarding and exec enforcement each
+bind a Unix-domain socket *under* the data directory, and the kernel caps a socket path at
+108 bytes. Without the check those features would fail at launch, reporting a socket
+problem rather than the directory that caused it.
+
+The **same limit applies to the directory sbx derives** when you set no `SBX_DATA_DIR` — a very
+long `$HOME` or `$XDG_DATA_HOME` can push `$HOME/.local/share/sbx` past it. sbx then stops with
+the same message: set `SBX_DATA_DIR` to a shorter path, or adopt a [storage volume](../cli/storage.md)
+— its mount point under `/run` is short, so it clears the limit on its own. `sbx storage` keeps
+working while the plain directory is over the limit, so the volume remedy is always reachable.
+
+It also **overrides an adopted volume**, so it stays the way to run one-off against another
+data directory. To move sbx's data permanently, [`sbx storage use`](../cli/storage.md) is the
+better route: it needs no variable at all and mounts the volume by itself.
+
+Pointing it at a filesystem that shares storage between files (copy-on-write) is worth
+knowing about: sbx seeds each per-project store from the shared one by cloning, which on
+such a filesystem shares blocks instead of copying them, and compression — where the
+filesystem offers it — applies on top. `sbx store` reports which case your filesystem is.
+
 See [Directory layout](../concepts/directory-layout.md).
 
 ## Editor variables (host)

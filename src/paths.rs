@@ -280,7 +280,7 @@ fn view_with_roots(
     let bases = [
         (
             "data",
-            "$XDG_DATA_HOME/sbx (else ~/.local/share/sbx)",
+            "$SBX_DATA_DIR, else $XDG_DATA_HOME/sbx (else ~/.local/share/sbx)",
             DATA_ENTRIES,
             data_root,
         ),

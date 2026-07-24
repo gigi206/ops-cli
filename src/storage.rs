@@ -1,0 +1,1705 @@
+//! A self-managed, compressed volume for sbx's data directory.
+//!
+//! sbx's data directory is the one tree that grows without bound — the shared nix store, a
+//! runtime tree per project and a home per app. It is inode-heavy by nature (a store is a
+//! multitude of small files), so on a filesystem whose inode table is fixed at creation it
+//! can crowd the host long before the disk is full.
+//!
+//! This module lets sbx own a filesystem instead of borrowing the host's: a sparse image
+//! file carrying a btrfs filesystem, mounted with compression. The whole tree then costs the
+//! host **one inode**, occupies only what is actually written, and — because the filesystem
+//! shares blocks between files — the per-project store seeding sbx already performs stops
+//! being a physical copy.
+//!
+//! # Why it needs no privilege
+//!
+//! Creating a filesystem, attaching a loop device and mounting are privileged operations, yet
+//! the whole chain runs as an ordinary user:
+//!
+//! - `mkfs.btrfs --rootdir <dir>` builds the image from a seed directory and gives the
+//!   filesystem root **that directory's ownership** — without it the root belongs to `root`
+//!   and the invoking user cannot write a byte into their own volume.
+//! - `udisks` performs the loop attach and the mount over D-Bus, and ships polkit rules
+//!   granting both to a **locally active** session without authentication.
+//!
+//! That last point bounds where this works: a remote, headless or inactive session falls
+//! under a rule requiring administrator authentication, so it cannot mount unattended. The
+//! feature is therefore opt-in and never a prerequisite — sbx without a volume behaves
+//! exactly as before.
+//!
+//! # What is deliberately not shelled out
+//!
+//! Compression is set through the `btrfs.compression` extended attribute rather than
+//! `btrfs property set`, and space accounting through an ioctl rather than
+//! `btrfs filesystem usage`. Both work unprivileged, so `btrfs-progs` is needed only to
+//! *create* a volume, never to use one.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The filesystem label, which is also the last component of the directory `udisks` mounts
+/// at. Kept short: the mount point becomes sbx's data directory, and sockets bound under it
+/// must fit a Unix socket path.
+pub(crate) const DEFAULT_LABEL: &str = "sbx-storage";
+
+/// The default image location — a *sibling* of the default data directory, never inside it,
+/// since the volume is what that directory becomes.
+pub(crate) const DEFAULT_IMAGE_NAME: &str = "sbx-storage.btrfs";
+
+/// The logical size of a volume created without an explicit one. The image is sparse, so this
+/// is a ceiling rather than an allocation: a fresh volume occupies a few megabytes.
+pub(crate) const DEFAULT_SIZE_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+
+/// The smallest volume worth creating. Below this btrfs itself struggles, and a store needs
+/// far more anyway.
+const MIN_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Where a volume is in its lifecycle. Distinguishing "attached but not mounted" from
+/// "absent" matters: they need different repairs, and conflating them would let a half-set-up
+/// volume look like no volume at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum State {
+    /// No image file.
+    Absent,
+    /// The image exists but no loop device is backed by it.
+    Detached,
+    /// A loop device is attached, but nothing is mounted from it.
+    Attached { loop_dev: String },
+    /// Mounted and usable. `mount_point` is what `SBX_DATA_DIR` should name.
+    Mounted {
+        loop_dev: String,
+        mount_point: PathBuf,
+        options: String,
+    },
+}
+
+impl State {
+    /// The mount point, when there is one.
+    pub(crate) fn mount_point(&self) -> Option<&Path> {
+        match self {
+            State::Mounted { mount_point, .. } => Some(mount_point.as_path()),
+            _ => None,
+        }
+    }
+}
+
+/// The default image path for a given XDG data base — `<base>/sbx-storage.btrfs`, beside the
+/// `<base>/sbx/` directory it stands in for.
+pub(crate) fn default_image(xdg_data_base: &Path) -> PathBuf {
+    xdg_data_base.join(DEFAULT_IMAGE_NAME)
+}
+
+/// The file, in the *default* data directory, recording that sbx's data has moved into a
+/// volume. Its presence is what makes every later command mount and follow that volume, so
+/// adopting one is a single deliberate act rather than a variable each shell must carry.
+pub(crate) const POINTER: &str = "storage.toml";
+
+/// Read the image a pointer names, if the default data directory carries one.
+///
+/// Deliberately hand-parsed rather than deserialized: this runs before anything else sbx
+/// does, on a file it wrote itself, and a whole parser in that position is a dependency the
+/// resolution path does not need.
+pub(crate) fn read_pointer(default_data_dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(default_data_dir.join(POINTER)).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("image") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        if !value.is_empty() {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+/// Record that sbx's data lives in the volume backed by `image`.
+pub(crate) fn write_pointer(default_data_dir: &Path, image: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(default_data_dir)?;
+    let path = default_data_dir.join(POINTER);
+    let tmp = default_data_dir.join(format!(".{POINTER}.tmp"));
+    // The image path is sbx's own and validated absolute, so it carries nothing needing
+    // escaping; quoting it keeps the file valid TOML for anyone who reads it as such.
+    std::fs::write(
+        &tmp,
+        format!(
+            "# sbx's data lives in this volume. Remove this file (or run `sbx storage unuse`)\n\
+             # to go back to using this directory directly.\n\
+             image = \"{}\"\n",
+            image.display()
+        ),
+    )?;
+    // Renamed into place so a reader sees the old file or the new one, never a partial.
+    std::fs::rename(&tmp, &path)
+}
+
+/// Stop following a volume. The volume and its contents are untouched.
+pub(crate) fn clear_pointer(default_data_dir: &Path) -> io::Result<()> {
+    match std::fs::remove_file(default_data_dir.join(POINTER)) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// The file recording that the one-time offer to adopt a volume has been shown. Its presence is
+/// what makes the offer happen exactly once — whatever the answer was — so a declined suggestion
+/// never becomes a nag. Kept beside the pointer in the *default* data directory, so it survives
+/// whether or not a volume is adopted.
+pub(crate) const OFFERED_MARKER: &str = ".storage-offered";
+
+/// Whether the one-time volume offer has already been shown.
+pub(crate) fn has_been_offered(default_data_dir: &Path) -> bool {
+    default_data_dir.join(OFFERED_MARKER).exists()
+}
+
+/// Record that the one-time volume offer has been shown. Best-effort: the worst a failed write
+/// costs is the offer appearing once more, never a broken launch, so it is never fatal.
+pub(crate) fn mark_offered(default_data_dir: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(default_data_dir);
+    let _ = std::fs::write(default_data_dir.join(OFFERED_MARKER), b"");
+}
+
+/// Make sure the volume is mounted, and return where. Idempotent, and cheap when it already
+/// is: the check reads two kernel tables and starts no process.
+pub(crate) fn ensure_mounted(image: &Path) -> Result<PathBuf, String> {
+    if let Ok(State::Mounted { mount_point, .. }) = state(image) {
+        return Ok(mount_point);
+    }
+    up(image)
+}
+
+/// Whether a label is safe to become both a filesystem label and a path component. Refuses
+/// anything that could traverse or confuse a mount point.
+pub(crate) fn is_valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 32
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Parse a human size such as `200G` into bytes. Suffixes are binary (`G` = 2^30), because
+/// that is what every filesystem tool reports back. A bare number is bytes.
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (digits, mult) = match s.as_bytes().last() {
+        Some(b'G' | b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some(b'T' | b't') => (&s[..s.len() - 1], 1024_u64.pow(4)),
+        Some(b'M' | b'm') => (&s[..s.len() - 1], 1024 * 1024),
+        _ => (s, 1),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("not a size: {s} (try 200G)"))?;
+    let bytes = n
+        .checked_mul(mult)
+        .ok_or_else(|| format!("size too large: {s}"))?;
+    if bytes < MIN_SIZE_BYTES {
+        return Err(format!(
+            "size too small: {s} (at least {}G)",
+            MIN_SIZE_BYTES / (1024 * 1024 * 1024)
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Extract the loop device from `udisksctl loop-setup` output, which reads
+/// `Mapped file <path> as /dev/loop3.`
+pub(crate) fn parse_loop_setup(out: &str) -> Option<String> {
+    let (_, tail) = out.rsplit_once(" as ")?;
+    Some(tail.trim().trim_end_matches('.').to_string())
+}
+
+/// Extract the mount point from `udisksctl mount` output, which reads
+/// `Mounted /dev/loop3 at /run/media/you/sbx-storage`.
+///
+/// The path is read back rather than constructed: `udisks` decides it, and it varies with the
+/// version (`/run/media` or `/media`) and disambiguates a label collision by appending a digit.
+pub(crate) fn parse_mount(out: &str) -> Option<PathBuf> {
+    let (_, tail) = out.rsplit_once(" at ")?;
+    let p = tail.trim().trim_end_matches('.');
+    (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
+/// Find where a device is mounted, and with which options, by reading a `mountinfo` table.
+/// Pure over the table's text so it is testable without a mount.
+///
+/// The format is `id parent maj:min root mountpoint options ... - fstype source superopts`;
+/// the source after the separator is what names the device.
+pub(crate) fn mount_of(device: &str, mountinfo: &str) -> Option<(PathBuf, String)> {
+    for line in mountinfo.lines() {
+        // A line that does not parse is skipped, never fatal: the table is the kernel's and
+        // carries whatever else is mounted, so one unexpected line must not end the search
+        // before the device we are looking for is reached.
+        let Some((head, tail)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut fields = head.split(' ');
+        let (Some(mount_point), Some(options)) = (fields.nth(4), fields.next()) else {
+            continue;
+        };
+        let Some(source) = tail.split(' ').nth(1) else {
+            continue;
+        };
+        if source == device {
+            return Some((PathBuf::from(unescape_mountinfo(mount_point)), {
+                let super_opts = tail.split(' ').nth(2).unwrap_or("");
+                if super_opts.is_empty() {
+                    options.to_string()
+                } else {
+                    format!("{options},{super_opts}")
+                }
+            }));
+        }
+    }
+    None
+}
+
+/// Whether a comma-separated mount-option string carries the exact `noexec` flag.
+///
+/// Exact token, not substring: an option that merely contains those letters (`noexecfoo`) is a
+/// different flag, and matching it would refuse a perfectly runnable volume. The flag sbx does
+/// forbid is precisely the one that stops a store's binaries from running. Fed the same option
+/// string [`mount_of`] returns.
+fn mount_is_noexec(options: &str) -> bool {
+    options.split(',').any(|o| o == "noexec")
+}
+
+/// `mountinfo` escapes space, tab, newline and backslash as octal. Only a path containing one
+/// of those is affected, but a data directory may well sit under such a path.
+fn unescape_mountinfo(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            if let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
+                .ok()
+                .and_then(|o| u8::from_str_radix(o, 8).ok())
+            {
+                out.push(c as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// The loop device currently backed by `image`, if any.
+///
+/// Discovering an existing attachment is what keeps `up` idempotent. Without it, two launches
+/// racing on the same image would each attach their own loop device to the same bytes — two
+/// writable views of one filesystem, which corrupts it.
+pub(crate) fn loop_for(image: &Path, sys_block: &Path) -> io::Result<Option<String>> {
+    let Ok(entries) = std::fs::read_dir(sys_block) else {
+        return Ok(None);
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !name.as_encoded_bytes().starts_with(b"loop") {
+            continue;
+        }
+        let backing = e.path().join("loop/backing_file");
+        let Ok(target) = std::fs::read_to_string(&backing) else {
+            continue;
+        };
+        // The kernel may mark a deleted backing file; compare the path itself.
+        let target = target.trim_end_matches('\n').trim_end_matches(" (deleted)");
+        if Path::new(target) == image {
+            return Ok(Some(format!("/dev/{}", name.to_string_lossy())));
+        }
+    }
+    Ok(None)
+}
+
+/// Report where the volume stands, without changing anything.
+pub(crate) fn state(image: &Path) -> io::Result<State> {
+    if !image.is_file() {
+        return Ok(State::Absent);
+    }
+    let Some(loop_dev) = loop_for(image, Path::new("/sys/block"))? else {
+        return Ok(State::Detached);
+    };
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    match mount_of(&loop_dev, &mountinfo) {
+        Some((mount_point, options)) => Ok(State::Mounted {
+            loop_dev,
+            mount_point,
+            options,
+        }),
+        None => Ok(State::Attached { loop_dev }),
+    }
+}
+
+/// Ask the filesystem to compress everything written under `dir` from now on.
+///
+/// Set as an extended attribute, which the kernel honours per directory and children inherit,
+/// rather than as a mount option: `udisks` filters the options it accepts, and which ones made
+/// its list varies by version, so a mount option would work on one host and be refused on
+/// another. The attribute needs no privilege and no `btrfs` binary.
+pub(crate) fn set_compression(dir: &Path, algorithm: &str) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("path contains an interior NUL"))?;
+    let name = c"btrfs.compression";
+    // SAFETY: all four arguments are valid for the call — two NUL-terminated C strings that
+    // outlive it, and a length matching the value's bytes. The call only sets an attribute.
+    let rc = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            algorithm.as_ptr() as *const libc::c_void,
+            algorithm.len(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The compression in force under `dir`, if any.
+///
+/// Read from the extended attribute rather than inferred from the mount options, because that
+/// is where [`set_compression`] puts it: a volume can be compressed with no `compress` among
+/// its mount options at all. A mount option remains a valid second source, so a caller that
+/// has the options should fall back to them.
+pub(crate) fn compression(dir: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let name = c"btrfs.compression";
+    let mut buf = [0u8; 32];
+    // SAFETY: both C strings outlive the call, and the length passed matches the buffer, so
+    // the kernel writes at most that many bytes into it. The call only reads an attribute.
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    String::from_utf8(buf[..n as usize].to_vec()).ok()
+}
+
+/// How much of the volume the filesystem has claimed, and how much of that holds data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Space {
+    /// Bytes the filesystem has reserved into block groups.
+    pub(crate) allocated: u64,
+    /// Bytes of that reservation actually in use.
+    pub(crate) used: u64,
+}
+
+/// Read the volume's own space accounting.
+///
+/// Reported because deleting files does not shrink the image immediately: the kernel returns
+/// freed extents to the host in the background, and a reservation it has not yet released
+/// still counts. Showing both figures makes that gap visible instead of implying it is zero.
+pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
+    use std::os::unix::io::AsRawFd;
+
+    // _IOWR(0x94, 20, struct btrfs_ioctl_space_args), whose two u64 fields make it 16 bytes.
+    const BTRFS_IOC_SPACE_INFO: libc::c_ulong = (3 << 30) | (16 << 16) | (0x94 << 8) | 20;
+    // Each returned entry is three u64s: flags, total_bytes, used_bytes.
+    const ENTRY: usize = 24;
+    const HEADER: usize = 16;
+
+    let dir = std::fs::File::open(mount_point)?;
+    let fd = dir.as_raw_fd();
+
+    // First call: ask how many spaces there are, by offering room for none.
+    let mut header = [0u8; HEADER];
+    // SAFETY: the buffer is at least the 16 bytes the ioctl reads and writes, and the fd is a
+    // valid open directory. A non-btrfs filesystem fails the call rather than writing.
+    if unsafe { libc::ioctl(fd, BTRFS_IOC_SPACE_INFO as libc::Ioctl, header.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let count = u64::from_ne_bytes(header[8..16].try_into().unwrap()) as usize;
+
+    // Second call: room for every space, requested by writing the slot count back.
+    let mut buf = vec![0u8; HEADER + count * ENTRY];
+    buf[0..8].copy_from_slice(&(count as u64).to_ne_bytes());
+    // SAFETY: the buffer is sized from the count the kernel just reported, so the ioctl writes
+    // within it; the fd is unchanged and still valid.
+    if unsafe { libc::ioctl(fd, BTRFS_IOC_SPACE_INFO as libc::Ioctl, buf.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let got = u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as usize;
+
+    let mut space = Space::default();
+    for i in 0..got.min(count) {
+        let at = HEADER + i * ENTRY;
+        space.allocated += u64::from_ne_bytes(buf[at + 8..at + 16].try_into().unwrap());
+        space.used += u64::from_ne_bytes(buf[at + 16..at + 24].try_into().unwrap());
+    }
+    Ok(space)
+}
+
+/// Bytes available to this user on the filesystem holding `path`.
+///
+/// Read from the filesystem rather than from the volume's own accounting, because that is the
+/// figure a copy will actually run out of.
+pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid NUL-terminated path and a zeroed struct the call fills in.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// A tally of a tree's shape, taken on both sides of a copy so the result can be checked
+/// against the original before anything is committed to it.
+///
+/// Counting *distinct inodes* rather than names is what makes it meaningful here: a nix store
+/// deduplicates identical content into hardlinks, so a copy that silently expanded them would
+/// match on every other count while occupying twice the space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Census {
+    pub(crate) dirs: u64,
+    pub(crate) files: u64,
+    pub(crate) symlinks: u64,
+    /// Distinct file inodes — fewer than `files` wherever hardlinks are in play.
+    pub(crate) inodes: u64,
+    /// Apparent bytes of regular files, each inode counted once.
+    pub(crate) bytes: u64,
+    /// Entries that are neither a directory, a symlink nor a regular file — the Unix sockets
+    /// a launch leaves under the data directory, and anything else of that kind. Counted so
+    /// the two sides still tally, and reported so their absence is stated rather than hidden.
+    pub(crate) special: u64,
+}
+
+/// Walk a tree and tally it. Entries named in `skip` are ignored at the top level only.
+pub(crate) fn census(root: &Path, skip: &[&str]) -> io::Result<Census> {
+    use std::os::unix::fs::MetadataExt;
+    let mut c = Census::default();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut first = true;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if first && skip.contains(&entry.file_name().to_string_lossy().as_ref()) {
+                continue;
+            }
+            let path = entry.path();
+            let meta = entry.metadata()?;
+            if meta.is_symlink() {
+                c.symlinks += 1;
+            } else if meta.is_dir() {
+                c.dirs += 1;
+                stack.push(path);
+            } else if meta.is_file() {
+                c.files += 1;
+                if meta.nlink() == 1 || seen.insert((meta.dev(), meta.ino())) {
+                    c.inodes += 1;
+                    c.bytes += meta.len();
+                }
+            } else {
+                c.special += 1;
+            }
+        }
+        first = false;
+    }
+    Ok(c)
+}
+
+/// Copy a tree, preserving what a nix store depends on: hardlinks, symlinks, permissions and
+/// modification times. Entries named in `skip` are left behind, at the top level only.
+///
+/// Two details are load-bearing, and both come from what a store looks like on disk:
+///
+/// - **Hardlinks are re-created as hardlinks.** A store deduplicates identical files into a
+///   `.links` pool — here, over 170 000 of them. Copying each name as its own file would
+///   roughly double the space and defeat the deduplication the store depends on.
+/// - **Directory permissions are applied last, deepest first.** A store's directories are
+///   read-only (`0555`); creating them with their final mode would make writing their contents
+///   impossible, so they are created writable and tightened on the way back out.
+pub(crate) fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> io::Result<Census> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut c = Census::default();
+    // Every hardlinked file's first destination, so later names link to it instead of copying.
+    let mut linked: std::collections::HashMap<(u64, u64), PathBuf> =
+        std::collections::HashMap::new();
+    // (destination, mode) for each directory, applied after everything is written.
+    let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+
+    std::fs::create_dir_all(dst)?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf(), true)];
+    while let Some((from, to, top)) = stack.pop() {
+        for entry in std::fs::read_dir(&from)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if top && skip.contains(&name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            let s = entry.path();
+            let d = to.join(&name);
+            let meta = entry.metadata()?;
+
+            if meta.is_symlink() {
+                let target = std::fs::read_link(&s)?;
+                std::os::unix::fs::symlink(target, &d)?;
+                c.symlinks += 1;
+            } else if meta.is_dir() {
+                // Writable for now: its contents still have to be written into it.
+                std::fs::create_dir_all(&d)?;
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
+                dir_modes.push((d.clone(), meta.mode() & 0o7777));
+                c.dirs += 1;
+                stack.push((s, d, false));
+            } else if !meta.is_file() {
+                // A socket or a fifo cannot be copied — `std::fs::copy` fails outright on
+                // one — and a dead launch's socket is worthless anyway. Counted, not carried.
+                c.special += 1;
+            } else {
+                let key = (meta.dev(), meta.ino());
+                if meta.nlink() > 1 {
+                    if let Some(first) = linked.get(&key) {
+                        std::fs::hard_link(first, &d)?;
+                        c.files += 1;
+                        continue;
+                    }
+                    linked.insert(key, d.clone());
+                }
+                std::fs::copy(&s, &d)?;
+                set_mtime(&d, &meta)?;
+                c.files += 1;
+                c.inodes += 1;
+                c.bytes += meta.len();
+            }
+        }
+    }
+
+    // Deepest first, so tightening a parent never blocks writing into a child.
+    dir_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (path, mode) in dir_modes {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(c)
+}
+
+/// Carry a file's modification time across, so a copied tree is indistinguishable from the
+/// original to anything that looks at timestamps.
+fn set_mtime(path: &Path, meta: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("path contains an interior NUL"))?;
+    let times = [
+        libc::timespec {
+            tv_sec: meta.atime(),
+            tv_nsec: meta.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: meta.mtime(),
+            tv_nsec: meta.mtime_nsec(),
+        },
+    ];
+    // SAFETY: a valid NUL-terminated path and a two-element timespec array, exactly what
+    // `utimensat` reads. `AT_FDCWD` applies it to the absolute path given.
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// An advisory lock over the image, held across the whole attach-and-mount sequence so two
+/// concurrent `up` calls cannot each attach a loop device to the same bytes.
+struct ImageLock(#[allow(dead_code)] std::fs::File);
+
+fn lock_image(image: &Path) -> io::Result<ImageLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let path = image.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)?;
+    // SAFETY: `flock` on a valid owned fd; it blocks until granted and returns 0 on success.
+    // The fd lives in the guard, so the lock is held until the guard drops.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ImageLock(file))
+}
+
+/// Locate a required host program, with an error naming what it belongs to.
+///
+/// `udisks` is the one piece sbx genuinely cannot ship: it is a system daemon, and the polkit
+/// privilege lives with it rather than with any binary.
+fn tool(name: &str, provided_by: &str) -> Result<PathBuf, String> {
+    crate::pathfind::find_on_path(name)
+        .ok_or_else(|| format!("{name} not found on PATH — install {provided_by}"))
+}
+
+/// How `mkfs.btrfs` will be run.
+///
+/// `btrfs-progs` is not installed on every distribution, and requiring it would make creating
+/// a volume depend on the host — which is exactly what sbx avoids elsewhere by shipping its
+/// own `nix` and `bwrap`. So the host's copy is a shortcut, not a requirement: without one,
+/// sbx provisions `btrfs-progs` into its own store.
+pub(crate) enum Mkfs {
+    /// Found on the host. Run directly.
+    Host(PathBuf),
+    /// Provisioned by sbx. A binary in a relocated store hard-codes its interpreter under
+    /// `/nix/store/…`, a path the host does not have, so it runs inside a minimal bubblewrap
+    /// with sbx's store bound there — the same way sbx already drives its own mise engine.
+    Owned {
+        bwrap: PathBuf,
+        store_nix: PathBuf,
+        bin: PathBuf,
+    },
+}
+
+impl Mkfs {
+    /// A one-line description of where this came from, for the caller to report.
+    pub(crate) fn origin(&self) -> &'static str {
+        match self {
+            Mkfs::Host(_) => "host btrfs-progs",
+            Mkfs::Owned { .. } => "sbx's own btrfs-progs",
+        }
+    }
+}
+
+/// Find `mkfs.btrfs`, provisioning it if the host has none.
+///
+/// Only ever needed to *create* a volume. Using one needs no `btrfs` binary at all —
+/// compression rides an extended attribute and space accounting an ioctl.
+pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
+    if let Some(host) = crate::pathfind::find_on_path("mkfs.btrfs") {
+        return Ok(Mkfs::Host(host));
+    }
+    let layout = crate::store::Layout::from_env()
+        .ok_or_else(|| "cannot locate sbx's data directory".to_string())?;
+    let nix = crate::store::resolve_nix(Some(&layout))
+        .ok_or_else(|| "no mkfs.btrfs on PATH, and no nix to provision one with".to_string())?;
+    let bwrap = crate::store::resolve_bwrap(Some(&layout))
+        .map(|c| c.path)
+        .ok_or("no mkfs.btrfs on PATH, and no bubblewrap to run a provisioned one")?;
+    let nixpkgs = crate::store::LockTarget::global(&layout, None)
+        .resolve(&nix, &layout)
+        .map_err(|e| format!("cannot resolve the nixpkgs channel: {e}"))?;
+    let gcroot = layout
+        .data_dir()
+        .join("gcroots/storage")
+        .join(crate::store::revision_of(&nixpkgs));
+    let logical = crate::store::provision(
+        &nix,
+        &layout,
+        &gcroot,
+        &nixpkgs,
+        "btrfs-progs",
+        "bin/mkfs.btrfs",
+    )
+    .map_err(|e| format!("cannot provision btrfs-progs: {e}"))?;
+    Ok(Mkfs::Owned {
+        bwrap,
+        store_nix: layout.store_dir().join("nix"),
+        bin: logical.join("bin/mkfs.btrfs"),
+    })
+}
+
+/// Build the command that formats `image`, taking its root's ownership from `seed`.
+fn mkfs_command(mkfs: &Mkfs, image: &Path, seed: &Path, label: &str) -> Command {
+    let args = |c: &mut Command| {
+        c.arg("-q")
+            .arg("-L")
+            .arg(label)
+            .arg("--rootdir")
+            .arg(seed)
+            .arg(image);
+    };
+    match mkfs {
+        Mkfs::Host(path) => {
+            let mut c = Command::new(path);
+            args(&mut c);
+            c
+        }
+        Mkfs::Owned {
+            bwrap,
+            store_nix,
+            bin,
+        } => {
+            let mut c = Command::new(bwrap);
+            // Every namespace unshared and every capability dropped, as everywhere else sbx
+            // runs a helper. The network included: formatting needs none.
+            for ns in [
+                "--unshare-user",
+                "--unshare-ipc",
+                "--unshare-pid",
+                "--unshare-net",
+                "--unshare-uts",
+                "--unshare-cgroup",
+            ] {
+                c.arg(ns);
+            }
+            c.arg("--clearenv").arg("--die-with-parent");
+            c.arg("--cap-drop").arg("ALL");
+            // The store backs the relocated binary; `/proc`, `/dev` and a `/tmp` tmpfs make a
+            // minimal usable root.
+            c.arg("--ro-bind").arg(store_nix).arg("/nix");
+            c.arg("--proc").arg("/proc");
+            c.arg("--dev").arg("/dev");
+            c.arg("--tmpfs").arg("/tmp");
+            // The seed is read; the image's directory is written. Each is bound at its own
+            // path so the arguments below stay valid inside.
+            c.arg("--ro-bind").arg(seed).arg(seed);
+            if let Some(parent) = image.parent() {
+                c.arg("--bind").arg(parent).arg(parent);
+            }
+            c.arg("--").arg(bin);
+            args(&mut c);
+            c
+        }
+    }
+}
+
+/// Run a command, returning its stdout, or its stderr as the error.
+fn run(cmd: &mut Command) -> Result<String, String> {
+    let out = cmd
+        .output()
+        .map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        let err = if err.is_empty() {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            err.to_string()
+        };
+        return Err(format!("{:?} failed: {err}", cmd.get_program()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Create the volume: a sparse image carrying an empty btrfs filesystem whose root belongs to
+/// the invoking user. Refuses to touch an existing image, so it can never destroy a store.
+pub(crate) fn init(image: &Path, size_bytes: u64, label: &str, mkfs: &Mkfs) -> Result<(), String> {
+    if !is_valid_label(label) {
+        return Err(format!(
+            "invalid label {label:?} — letters, digits, '-' and '_', at most 32"
+        ));
+    }
+    if image.exists() {
+        return Err(format!(
+            "{} already exists — remove it first, or pass another path",
+            image.display()
+        ));
+    }
+    if let Some(parent) = image.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+
+    // The seed directory decides the filesystem root's ownership, so it must be ours and it
+    // must be empty — every byte it held would be copied into the new volume.
+    let seed = image.with_extension("seed");
+    let _ = std::fs::remove_dir_all(&seed);
+    std::fs::create_dir(&seed).map_err(|e| format!("cannot create {}: {e}", seed.display()))?;
+
+    let made = (|| -> Result<(), String> {
+        // Sparse: the file declares its size but occupies only what gets written.
+        let f = std::fs::File::create(image).map_err(|e| format!("cannot create image: {e}"))?;
+        f.set_len(size_bytes)
+            .map_err(|e| format!("cannot size image: {e}"))?;
+        drop(f);
+        run(&mut mkfs_command(mkfs, image, &seed, label)).map(|_| ())
+    })();
+    let _ = std::fs::remove_dir_all(&seed);
+    if made.is_err() {
+        // Never leave a half-formatted image: it would look like a volume to `state`.
+        let _ = std::fs::remove_file(image);
+    }
+    made
+}
+
+/// Attach and mount the volume, and return where it landed. Idempotent: an already-mounted
+/// volume is reported, not mounted twice.
+pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
+    let _lock = lock_image(image).map_err(|e| format!("cannot lock {}: {e}", image.display()))?;
+    let udisks = tool("udisksctl", "udisks2")?;
+
+    let loop_dev = match state(image).map_err(|e| e.to_string())? {
+        State::Absent => {
+            return Err(format!(
+                "{} does not exist — create it with `sbx storage init`",
+                image.display()
+            ))
+        }
+        State::Mounted { mount_point, .. } => return Ok(mount_point),
+        State::Attached { loop_dev } => loop_dev,
+        State::Detached => {
+            let out = run(Command::new(&udisks).arg("loop-setup").arg("-f").arg(image))?;
+            parse_loop_setup(&out)
+                .ok_or_else(|| format!("cannot read the loop device from: {}", out.trim()))?
+        }
+    };
+
+    let out = run(Command::new(&udisks).arg("mount").arg("-b").arg(&loop_dev))?;
+    let mount_point = parse_mount(&out)
+        .ok_or_else(|| format!("cannot read the mount point from: {}", out.trim()))?;
+
+    // A volume mounted `noexec` would host a store whose binaries cannot run — a failure that
+    // surfaces far from its cause, so it is caught here rather than at the first launch.
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    if let Some((_, options)) = mount_of(&loop_dev, &mountinfo) {
+        if mount_is_noexec(&options) {
+            return Err(format!(
+                "{} is mounted noexec, so a store there cannot run anything \
+                 (check the udisks mount options configured on this host)",
+                mount_point.display()
+            ));
+        }
+    }
+
+    // Best-effort: an uncompressed volume is a working volume, just a larger one.
+    if let Err(e) = set_compression(&mount_point, "zstd") {
+        eprintln!(
+            "sbx: could not enable compression on {}: {e}",
+            mount_point.display()
+        );
+    }
+    Ok(mount_point)
+}
+
+/// Unmount the volume and release its loop device.
+pub(crate) fn down(image: &Path) -> Result<(), String> {
+    let _lock = lock_image(image).map_err(|e| format!("cannot lock {}: {e}", image.display()))?;
+    let udisks = tool("udisksctl", "udisks2")?;
+    match state(image).map_err(|e| e.to_string())? {
+        State::Absent => Err(format!("{} does not exist", image.display())),
+        State::Detached => Ok(()),
+        State::Attached { loop_dev } => {
+            run(Command::new(&udisks)
+                .arg("loop-delete")
+                .arg("-b")
+                .arg(&loop_dev))?;
+            Ok(())
+        }
+        State::Mounted { loop_dev, .. } => {
+            run(Command::new(&udisks)
+                .arg("unmount")
+                .arg("-b")
+                .arg(&loop_dev))?;
+            run(Command::new(&udisks)
+                .arg("loop-delete")
+                .arg("-b")
+                .arg(&loop_dev))?;
+            Ok(())
+        }
+    }
+}
+
+/// The host bytes the image actually occupies, as opposed to the size it declares.
+pub(crate) fn image_bytes(image: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(image).ok().map(|m| m.blocks() * 512)
+}
+
+/// The size the image declares to the filesystem inside it.
+pub(crate) fn image_capacity(image: &Path) -> Option<u64> {
+    std::fs::metadata(image).ok().map(|m| m.len())
+}
+
+/// The kind of filesystem a directory sits on, insofar as it bears on whether an encapsulated
+/// volume would help. The distinction that matters is copy-on-write: a volume's whole value —
+/// compression and block sharing — a copy-on-write filesystem already provides, so wrapping one
+/// inside a loop-mounted image would add a layer without adding a capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsKind {
+    /// btrfs — already copy-on-write, and what a volume itself is.
+    Btrfs,
+    /// ZFS — copy-on-write.
+    Zfs,
+    /// bcachefs — copy-on-write.
+    Bcachefs,
+    /// ext2/3/4 — a fixed inode table, the classic case a volume relieves.
+    Ext,
+    /// XFS — dynamic inodes, but no compression or block sharing.
+    Xfs,
+    /// A RAM-backed filesystem; nothing persistent lives here.
+    Tmpfs,
+    /// Anything else, kept as its magic so an unrecognized one is still named.
+    Other(u32),
+}
+
+impl FsKind {
+    /// Whether the filesystem is already copy-on-write, so an encapsulated volume would only
+    /// duplicate what it offers.
+    pub(crate) fn is_cow(self) -> bool {
+        matches!(self, FsKind::Btrfs | FsKind::Zfs | FsKind::Bcachefs)
+    }
+
+    /// A short human name.
+    pub(crate) fn name(self) -> String {
+        match self {
+            FsKind::Btrfs => "btrfs".to_string(),
+            FsKind::Zfs => "zfs".to_string(),
+            FsKind::Bcachefs => "bcachefs".to_string(),
+            FsKind::Ext => "ext4".to_string(),
+            FsKind::Xfs => "xfs".to_string(),
+            FsKind::Tmpfs => "tmpfs".to_string(),
+            FsKind::Other(m) => format!("an unrecognized filesystem (0x{m:08x})"),
+        }
+    }
+}
+
+/// Classify the filesystem holding `path` by its superblock magic. `None` when the path cannot
+/// be statted — it does not exist, or the call fails.
+pub(crate) fn fs_kind(path: &Path) -> Option<FsKind> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid NUL-terminated path and a zeroed struct the call fills in.
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // The magic is a 32-bit constant; masking to 32 bits makes the comparison identical whether
+    // `f_type` is signed (glibc) or unsigned (musl).
+    let magic = (st.f_type as u64 & 0xffff_ffff) as u32;
+    Some(match magic {
+        0x9123_683E => FsKind::Btrfs,
+        0x2FC1_2FC1 => FsKind::Zfs,
+        0xCA45_1A4E => FsKind::Bcachefs,
+        0xEF53 => FsKind::Ext,
+        0x5846_5342 => FsKind::Xfs,
+        0x0102_1994 => FsKind::Tmpfs,
+        other => FsKind::Other(other),
+    })
+}
+
+/// The filesystem holding `path`, or — if it does not exist yet — the nearest ancestor that
+/// does. The data directory may be absent on a first run, but the filesystem it will live on is
+/// already there, and that is what decides whether a volume is worth it.
+pub(crate) fn fs_kind_of_nearest(path: &Path) -> Option<FsKind> {
+    let mut p = path;
+    loop {
+        if let Some(k) = fs_kind(p) {
+            return Some(k);
+        }
+        p = p.parent()?;
+    }
+}
+
+/// Whether the running kernel can mount btrfs.
+///
+/// `/proc/filesystems` lists only what is built in or already loaded, so a host where btrfs is
+/// an unloaded module would look incapable there. The module file under the running kernel's
+/// tree is the second signal, so a desktop that simply has not mounted btrfs yet — the very
+/// audience a volume is for — is still recognized. Kept advisory rather than a hard gate: a
+/// mount autoloads the module, so a false negative costs a recommendation, never a refusal.
+fn kernel_supports_btrfs() -> bool {
+    let listed = std::fs::read_to_string("/proc/filesystems")
+        .map(|t| {
+            t.lines()
+                .any(|l| l.split_whitespace().last() == Some("btrfs"))
+        })
+        .unwrap_or(false);
+    if listed {
+        return true;
+    }
+    // A loadable module under the running kernel's release directory.
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|rel| Path::new(&format!("/lib/modules/{}/kernel/fs/btrfs", rel.trim())).exists())
+        .unwrap_or(false)
+}
+
+/// What the host offers for an encapsulated volume, probed cheaply so a caller can decide
+/// whether it can be mounted, whether it is worth recommending, or why neither.
+///
+/// The fields separate the reliably-detectable hard requirements (a loop device and the udisks
+/// daemon) from the advisory ones (kernel btrfs, which autoloads; the session kind, which only
+/// bears on whether udisks mounts without a password). That split is deliberate: the hard set
+/// gates `up`, while the advisory set only steers a recommendation.
+#[derive(Debug, Clone)]
+pub(crate) struct Preflight {
+    /// The kernel can mount btrfs (built in, loaded, or a loadable module).
+    pub(crate) kernel_btrfs: bool,
+    /// Loop devices are available (`/dev/loop-control` is present).
+    pub(crate) loop_control: bool,
+    /// `udisksctl` is on `PATH` — the daemon that performs the unprivileged loop-attach and
+    /// mount, and where the polkit privilege lives.
+    pub(crate) udisks: bool,
+    /// The filesystem the data directory sits on, or will.
+    pub(crate) host_fs: Option<FsKind>,
+    /// A remote session (`$SSH_CONNECTION`/`$SSH_TTY` set), under which udisks' polkit rule
+    /// asks for administrator authentication and so cannot mount unattended.
+    pub(crate) remote_session: bool,
+}
+
+/// Whether this is a remote session, under which udisks' polkit rule demands administrator
+/// authentication and so cannot mount a volume unattended.
+///
+/// Detected from the SSH environment, and pure over its inputs so the decision is testable
+/// without a live remote session. The mount *refusal* it feeds only manifests over a genuine
+/// SSH/inactive session and cannot be exercised from a locally active one — this predicate is
+/// the seam that is testable.
+fn is_remote_session(
+    ssh_connection: Option<&std::ffi::OsStr>,
+    ssh_tty: Option<&std::ffi::OsStr>,
+) -> bool {
+    ssh_connection.is_some() || ssh_tty.is_some()
+}
+
+impl Preflight {
+    /// Probe the host. `data_base` is where the data directory sits, or would; its filesystem
+    /// decides whether a volume relieves anything.
+    pub(crate) fn probe(data_base: &Path) -> Self {
+        Self {
+            kernel_btrfs: kernel_supports_btrfs(),
+            loop_control: Path::new("/dev/loop-control").exists(),
+            udisks: crate::pathfind::find_on_path("udisksctl").is_some(),
+            host_fs: fs_kind_of_nearest(data_base),
+            remote_session: is_remote_session(
+                std::env::var_os("SSH_CONNECTION").as_deref(),
+                std::env::var_os("SSH_TTY").as_deref(),
+            ),
+        }
+    }
+
+    /// Whether the reliably-detectable prerequisites to *mount* a volume are present. Creating
+    /// one is pointless without this.
+    ///
+    /// Kernel btrfs support is deliberately not part of it: a mount autoloads the module, so
+    /// gating on a `/proc/filesystems` reading would refuse a volume that would in fact work.
+    /// The loop device and the daemon, by contrast, are genuinely fatal when absent.
+    pub(crate) fn can_mount(&self) -> bool {
+        self.loop_control && self.udisks
+    }
+
+    /// The reason a volume cannot be mounted here, naming everything missing — so a refusal is
+    /// one clear message up front rather than the first obstacle hit deep inside `up`.
+    pub(crate) fn mount_blocker(&self) -> Option<String> {
+        let mut missing = Vec::new();
+        if !self.loop_control {
+            missing.push("loop devices are unavailable (/dev/loop-control)");
+        }
+        if !self.udisks {
+            missing.push("udisksctl is not installed (part of udisks2)");
+        }
+        (!missing.is_empty()).then(|| missing.join("; "))
+    }
+
+    /// Whether an encapsulated volume is worth *recommending*: it can be mounted, the kernel
+    /// supports btrfs, the data is not already on a copy-on-write filesystem, and the session is
+    /// local (so udisks mounts without a password). A "no" is advisory — it decides whether to
+    /// suggest one, never whether `sbx storage` works when asked.
+    pub(crate) fn recommends_volume(&self) -> bool {
+        self.can_mount()
+            && self.kernel_btrfs
+            && !self.remote_session
+            && self.host_fs.is_some_and(|k| !k.is_cow())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_size_reads_binary_suffixes_and_refuses_the_unusable() {
+        assert_eq!(parse_size("200G"), Ok(200 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("2g"), Ok(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("1T"), Ok(1024_u64.pow(4)));
+        // Too small to hold a store, and a bare number is bytes — so it is refused too.
+        assert!(parse_size("1G").is_err());
+        assert!(parse_size("200").is_err());
+        assert!(parse_size("lots").is_err());
+        // Overflow must not wrap into a plausible size.
+        assert!(parse_size("99999999999999T").is_err());
+    }
+
+    #[test]
+    fn labels_that_could_escape_a_mount_point_are_refused() {
+        assert!(is_valid_label("sbx-storage"));
+        assert!(is_valid_label("vol_1"));
+        assert!(!is_valid_label(""));
+        assert!(!is_valid_label("../etc"));
+        assert!(!is_valid_label("a/b"));
+        assert!(!is_valid_label("with space"));
+        assert!(!is_valid_label(&"x".repeat(33)));
+    }
+
+    #[test]
+    fn udisks_output_is_read_back_rather_than_guessed() {
+        assert_eq!(
+            parse_loop_setup("Mapped file /home/u/sbx-storage.btrfs as /dev/loop7.\n").as_deref(),
+            Some("/dev/loop7")
+        );
+        assert_eq!(
+            parse_mount("Mounted /dev/loop7 at /run/media/u/sbx-storage\n"),
+            Some(PathBuf::from("/run/media/u/sbx-storage"))
+        );
+        // A collision makes udisks append a digit, and older versions use /media —
+        // neither of which a constructed path would predict.
+        assert_eq!(
+            parse_mount("Mounted /dev/loop7 at /media/u/sbx-storage1\n"),
+            Some(PathBuf::from("/media/u/sbx-storage1"))
+        );
+        assert_eq!(parse_loop_setup("unexpected"), None);
+        assert_eq!(parse_mount("unexpected"), None);
+    }
+
+    #[test]
+    fn mount_of_finds_the_device_and_keeps_the_options() {
+        let table = "\
+25 30 0:22 / /proc rw,nosuid - proc proc rw
+41 30 7:60 / /run/media/u/sbx-storage rw,nosuid,nodev - btrfs /dev/loop60 rw,compress=zstd:3,discard=async
+";
+        let (mp, opts) = mount_of("/dev/loop60", table).expect("the device is in the table");
+        assert_eq!(mp, PathBuf::from("/run/media/u/sbx-storage"));
+        // Both the per-mount and the superblock options matter: `noexec` is per-mount,
+        // `compress` is a superblock option, and the check below reads the same string.
+        assert!(opts.contains("nosuid"), "{opts}");
+        assert!(opts.contains("compress=zstd:3"), "{opts}");
+        assert_eq!(mount_of("/dev/loop61", table), None);
+    }
+
+    #[test]
+    fn noexec_is_matched_as_an_exact_option_not_a_substring() {
+        // The flag that would make a store unrunnable, in the middle and alone.
+        assert!(mount_is_noexec("rw,nosuid,noexec,nodev"));
+        assert!(mount_is_noexec("noexec"));
+        // A volume with none of it runs.
+        assert!(!mount_is_noexec("rw,nodev,compress=zstd:3"));
+        // Teeth: a token that merely spells the letters is a different flag, not this one —
+        // matching it as a substring would refuse a runnable volume.
+        assert!(!mount_is_noexec("rw,noexecutable"));
+        assert!(!mount_is_noexec("rw,barnoexec"));
+    }
+
+    #[test]
+    fn an_unparseable_line_does_not_end_the_search() {
+        // The table is the kernel's and lists everything mounted on the host. A line that does
+        // not fit the shape must be stepped over, or a device listed after it becomes
+        // invisible — and `up` would then mount a second time over an existing mount.
+        let table = "\
+this line has no separator at all
+25 30 0:22 / /proc rw,nosuid - proc proc rw
+41 30 7:60 / /run/media/u/sbx-storage rw - btrfs /dev/loop60 rw,compress=zstd:3
+";
+        let (mp, _) = mount_of("/dev/loop60", table).expect("found past the bad line");
+        assert_eq!(mp, PathBuf::from("/run/media/u/sbx-storage"));
+    }
+
+    #[test]
+    fn a_mount_point_containing_a_space_is_unescaped() {
+        let table = "41 30 7:60 / /run/media/u/my\\040vol rw - btrfs /dev/loop3 rw\n";
+        let (mp, _) = mount_of("/dev/loop3", table).expect("present");
+        assert_eq!(mp, PathBuf::from("/run/media/u/my vol"));
+    }
+
+    #[test]
+    fn loop_for_matches_the_backing_file_and_ignores_others() {
+        let base = crate::testutil::TmpDir::new();
+        let sys = base.path().join("block");
+        let image = base.path().join("vol.btrfs");
+        for (name, backing) in [
+            ("loop0", "/some/other.img"),
+            ("loop9", image.to_str().unwrap()),
+            ("sda", image.to_str().unwrap()),
+        ] {
+            let d = sys.join(name).join("loop");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("backing_file"), format!("{backing}\n")).unwrap();
+        }
+        // Found by its backing file, and a non-loop block device is never considered.
+        assert_eq!(
+            loop_for(&image, &sys).unwrap().as_deref(),
+            Some("/dev/loop9")
+        );
+        assert_eq!(
+            loop_for(Path::new("/nowhere.img"), &sys).unwrap(),
+            None,
+            "an unbacked image must report no device, or `up` would mount someone else's"
+        );
+    }
+
+    #[test]
+    fn a_deleted_backing_file_still_matches_its_image() {
+        let base = crate::testutil::TmpDir::new();
+        let sys = base.path().join("block");
+        let image = base.path().join("vol.btrfs");
+        let d = sys.join("loop4").join("loop");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("backing_file"),
+            format!("{} (deleted)\n", image.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            loop_for(&image, &sys).unwrap().as_deref(),
+            Some("/dev/loop4")
+        );
+    }
+
+    #[test]
+    fn compression_reports_none_where_the_attribute_cannot_exist() {
+        // A directory on an ordinary filesystem carries no such attribute. Reporting `None`
+        // rather than failing matters: `status` runs against whatever the volume turns out to
+        // be, and must render a plain answer instead of an error.
+        let base = crate::testutil::TmpDir::new();
+        assert_eq!(compression(base.path()), None);
+        assert_eq!(compression(Path::new("/nonexistent-by-construction")), None);
+    }
+
+    #[test]
+    fn the_pointer_round_trips_and_its_absence_is_the_ordinary_case() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        let image = PathBuf::from("/vol/sbx-storage.btrfs");
+
+        // No pointer is what an ordinary installation looks like, and it must cost nothing.
+        assert_eq!(read_pointer(&dir), None);
+
+        write_pointer(&dir, &image).expect("written");
+        assert_eq!(read_pointer(&dir).as_deref(), Some(image.as_path()));
+
+        // Still valid TOML for anyone who reads it as such, comments and all.
+        let text = std::fs::read_to_string(dir.join(POINTER)).unwrap();
+        assert!(
+            text.contains("image = \"/vol/sbx-storage.btrfs\""),
+            "{text}"
+        );
+
+        clear_pointer(&dir).expect("cleared");
+        assert_eq!(read_pointer(&dir), None);
+        // Clearing what is not there is not an error: `unuse` must be safe to repeat.
+        clear_pointer(&dir).expect("idempotent");
+    }
+
+    #[test]
+    fn a_pointer_survives_being_rewritten_over_an_older_one() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        write_pointer(&dir, Path::new("/vol/one.btrfs")).unwrap();
+        write_pointer(&dir, Path::new("/vol/two.btrfs")).unwrap();
+        assert_eq!(
+            read_pointer(&dir).as_deref(),
+            Some(Path::new("/vol/two.btrfs")),
+            "the newer record must win outright, never merge with the old"
+        );
+        // The rename leaves no temp file behind for the next reader to trip over.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn the_offer_marker_makes_the_proposal_a_one_time_event() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        // Never offered on a fresh installation — the offer must be able to happen.
+        assert!(!has_been_offered(&dir));
+        // Marking it creates the directory if need be and records the offer...
+        mark_offered(&dir);
+        assert!(has_been_offered(&dir));
+        // ...and it stays recorded, so a declined suggestion never becomes a nag.
+        mark_offered(&dir);
+        assert!(has_been_offered(&dir));
+    }
+
+    #[test]
+    fn a_malformed_pointer_reads_as_no_pointer() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        std::fs::create_dir_all(&dir).unwrap();
+        for junk in ["", "# only a comment\n", "image =\n", "nothing here\n"] {
+            std::fs::write(dir.join(POINTER), junk).unwrap();
+            assert_eq!(read_pointer(&dir), None, "{junk:?}");
+        }
+    }
+
+    /// Build a tree with the two shapes a nix store actually has: files deduplicated into
+    /// hardlinks, and directories left read-only.
+    fn store_shaped_tree(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(root.join("store/pkg/bin")).unwrap();
+        std::fs::create_dir_all(root.join("store/.links")).unwrap();
+        std::fs::write(root.join("store/pkg/bin/tool"), b"payload").unwrap();
+        // The same content reachable under two names, as `.links` deduplication leaves it.
+        std::fs::hard_link(
+            root.join("store/pkg/bin/tool"),
+            root.join("store/.links/deadbeef"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("bin/tool", root.join("store/pkg/current")).unwrap();
+        std::fs::write(root.join("nixpkgs.lock"), b"rev").unwrap();
+        // A store's directories are read-only; a copy that created them that way could not
+        // then write their contents.
+        std::fs::set_permissions(
+            root.join("store/pkg/bin"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn copying_a_store_shaped_tree_keeps_its_hardlinks_and_read_only_directories() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = crate::testutil::TmpDir::new();
+        let src = base.path().join("src");
+        let dst = base.path().join("dst");
+        store_shaped_tree(&src);
+
+        let before = census(&src, &[]).unwrap();
+        let copied = copy_tree(&src, &dst, &[]).unwrap();
+        assert_eq!(copied, before, "the copy must tally with the original");
+
+        // Two names, one file — the property the whole migration hinges on. Without it the
+        // census would report 3 distinct inodes here instead of 2, and a real store would
+        // double in size.
+        assert_eq!(before.files, 3);
+        assert_eq!(before.inodes, 2, "the hardlinked pair counts once");
+        let a = std::fs::metadata(dst.join("store/pkg/bin/tool")).unwrap();
+        let b = std::fs::metadata(dst.join("store/.links/deadbeef")).unwrap();
+        assert_eq!(
+            (a.dev(), a.ino()),
+            (b.dev(), b.ino()),
+            "the copy must re-create the hardlink, not duplicate the content"
+        );
+
+        // The read-only directory is read-only again — and its contents made it in, which is
+        // what proves the mode was applied after the writes rather than before.
+        let mode = std::fs::metadata(dst.join("store/pkg/bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o555, "directory permissions must be carried across");
+        assert_eq!(
+            std::fs::read(dst.join("store/pkg/bin/tool")).unwrap(),
+            b"payload"
+        );
+
+        // Symlinks are re-created as symlinks, pointing where they did.
+        assert_eq!(
+            std::fs::read_link(dst.join("store/pkg/current")).unwrap(),
+            PathBuf::from("bin/tool")
+        );
+        assert!(std::fs::symlink_metadata(dst.join("store/pkg/current"))
+            .unwrap()
+            .is_symlink());
+    }
+
+    #[test]
+    fn a_socket_is_counted_but_not_copied() {
+        use std::os::unix::net::UnixListener;
+        let base = crate::testutil::TmpDir::new();
+        let src = base.path().join("src");
+        let dst = base.path().join("dst");
+        std::fs::create_dir_all(src.join("egress")).unwrap();
+        std::fs::write(src.join("keep"), b"real").unwrap();
+        // Exactly what a launch leaves behind. `std::fs::copy` fails outright on one, so a
+        // copy that did not classify it would abort the whole migration.
+        let _sock = UnixListener::bind(src.join("egress/proxy-1.sock")).unwrap();
+
+        let before = census(&src, &[]).unwrap();
+        assert_eq!(before.special, 1, "the socket is seen");
+        assert_eq!(before.files, 1, "and is not counted as a file");
+
+        let copied = copy_tree(&src, &dst, &[]).expect("a socket must not abort the copy");
+        assert_eq!(copied, before, "both sides tally");
+        assert!(dst.join("keep").exists());
+        assert!(
+            !dst.join("egress/proxy-1.sock").exists(),
+            "a dead socket is not carried across"
+        );
+    }
+
+    #[test]
+    fn a_skipped_top_level_entry_is_left_behind_but_a_nested_namesake_is_not() {
+        let base = crate::testutil::TmpDir::new();
+        let src = base.path().join("src");
+        let dst = base.path().join("dst");
+        std::fs::create_dir_all(src.join("store")).unwrap();
+        std::fs::write(src.join(POINTER), b"image = \"/x\"\n").unwrap();
+        // A file of the same name deeper in the tree must still be copied: the skip list
+        // names top-level entries, not a pattern.
+        std::fs::write(src.join("store").join(POINTER), b"not the pointer").unwrap();
+
+        let c = copy_tree(&src, &dst, &[POINTER]).unwrap();
+        assert!(!dst.join(POINTER).exists(), "the pointer stays behind");
+        assert!(dst.join("store").join(POINTER).exists(), "nested is copied");
+        assert_eq!(c.files, 1);
+        assert_eq!(census(&src, &[POINTER]).unwrap(), c);
+    }
+
+    #[test]
+    fn a_provisioned_mkfs_runs_hardened_with_only_what_it_needs() {
+        let args = |c: &Command| -> Vec<String> {
+            std::iter::once(c.get_program())
+                .chain(c.get_args())
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let image = Path::new("/data/vol/sbx-storage.btrfs");
+        let seed = Path::new("/data/vol/sbx-storage.seed");
+
+        let host = mkfs_command(
+            &Mkfs::Host(PathBuf::from("/usr/bin/mkfs.btrfs")),
+            image,
+            seed,
+            "l",
+        );
+        assert_eq!(
+            args(&host),
+            vec![
+                "/usr/bin/mkfs.btrfs",
+                "-q",
+                "-L",
+                "l",
+                "--rootdir",
+                "/data/vol/sbx-storage.seed",
+                "/data/vol/sbx-storage.btrfs"
+            ]
+        );
+
+        let owned = mkfs_command(
+            &Mkfs::Owned {
+                bwrap: PathBuf::from("/e/bwrap"),
+                store_nix: PathBuf::from("/d/store/nix"),
+                bin: PathBuf::from("/nix/store/x-btrfs-progs/bin/mkfs.btrfs"),
+            },
+            image,
+            seed,
+            "l",
+        );
+        let a = args(&owned);
+        assert_eq!(a[0], "/e/bwrap");
+        // Hardened like every other helper sbx runs, the network included: formatting an
+        // image reaches nothing.
+        for expected in [
+            "--unshare-user",
+            "--unshare-net",
+            "--unshare-pid",
+            "--clearenv",
+            "--die-with-parent",
+            "--cap-drop",
+        ] {
+            assert!(
+                a.contains(&expected.to_string()),
+                "{expected} missing: {a:?}"
+            );
+        }
+        // The store is read-only — it backs the binary's interpreter, nothing more.
+        let nix_at = a.iter().position(|x| x == "/d/store/nix").expect("bound");
+        assert_eq!(a[nix_at - 1], "--ro-bind");
+        assert_eq!(a[nix_at + 1], "/nix");
+        // The seed is read; only the image's own directory is writable. Binding the whole
+        // parent is what lets mkfs create the file, and it is the sole write surface.
+        let seed_at = a
+            .iter()
+            .position(|x| x == "/data/vol/sbx-storage.seed")
+            .expect("bound");
+        assert_eq!(a[seed_at - 1], "--ro-bind");
+        assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 1);
+        // The command still ends with the real invocation, arguments intact.
+        assert_eq!(
+            &a[a.len() - 6..],
+            &[
+                "-q",
+                "-L",
+                "l",
+                "--rootdir",
+                "/data/vol/sbx-storage.seed",
+                "/data/vol/sbx-storage.btrfs"
+            ]
+        );
+    }
+
+    #[test]
+    fn free_bytes_reads_the_filesystem_holding_the_path() {
+        let base = crate::testutil::TmpDir::new();
+        // A real figure, and the same for a file as for its directory — enough to know the
+        // call is answering about the filesystem rather than the entry.
+        let dir = free_bytes(base.path()).expect("a mounted filesystem reports its free space");
+        assert!(dir > 0);
+        assert_eq!(free_bytes(Path::new("/nonexistent-by-construction")), None);
+    }
+
+    #[test]
+    fn state_reports_absent_for_a_missing_image() {
+        let base = crate::testutil::TmpDir::new();
+        assert_eq!(
+            state(&base.path().join("nope.btrfs")).unwrap(),
+            State::Absent
+        );
+    }
+
+    #[test]
+    fn init_refuses_an_existing_image_so_a_store_is_never_destroyed() {
+        let base = crate::testutil::TmpDir::new();
+        let image = base.path().join("vol.btrfs");
+        std::fs::write(&image, b"a store lives here").unwrap();
+        let nowhere = Mkfs::Host(PathBuf::from("/nonexistent-by-construction"));
+        let err = init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &nowhere).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        // Untouched.
+        assert_eq!(std::fs::read(&image).unwrap(), b"a store lives here");
+    }
+
+    #[test]
+    fn init_refuses_an_unsafe_label_before_touching_the_disk() {
+        let base = crate::testutil::TmpDir::new();
+        let image = base.path().join("vol.btrfs");
+        let nowhere = Mkfs::Host(PathBuf::from("/nonexistent-by-construction"));
+        assert!(init(&image, DEFAULT_SIZE_BYTES, "../escape", &nowhere).is_err());
+        assert!(
+            !image.exists(),
+            "nothing may be created for a refused label"
+        );
+    }
+
+    #[test]
+    fn the_default_image_is_a_sibling_of_the_data_directory_not_inside_it() {
+        let img = default_image(Path::new("/home/u/.local/share"));
+        assert_eq!(img, PathBuf::from("/home/u/.local/share/sbx-storage.btrfs"));
+        // Load-bearing: the volume *becomes* `<base>/sbx`, so an image inside it would be
+        // hidden by its own mount.
+        assert!(!img.starts_with("/home/u/.local/share/sbx/"));
+    }
+
+    #[test]
+    fn a_copy_on_write_filesystem_is_recognized_as_one() {
+        assert!(FsKind::Btrfs.is_cow());
+        assert!(FsKind::Zfs.is_cow());
+        assert!(FsKind::Bcachefs.is_cow());
+        // The filesystems a volume actually helps are not copy-on-write.
+        assert!(!FsKind::Ext.is_cow());
+        assert!(!FsKind::Xfs.is_cow());
+        assert_eq!(FsKind::Ext.name(), "ext4");
+        assert!(FsKind::Other(0xdead).name().contains("0x0000dead"));
+    }
+
+    #[test]
+    fn fs_kind_reads_the_filesystem_and_walks_up_to_an_existing_ancestor() {
+        let base = crate::testutil::TmpDir::new();
+        // A real directory sits on some filesystem — whichever the test host uses.
+        assert!(fs_kind(base.path()).is_some());
+        // A path that does not exist yet has no filesystem of its own...
+        let missing = base.path().join("a/b/c");
+        assert_eq!(fs_kind(&missing), None);
+        // ...but resolves to the nearest ancestor that does — the filesystem it would be
+        // created on, which is what a first-run probe needs before the data directory exists.
+        assert_eq!(fs_kind_of_nearest(&missing), fs_kind(base.path()));
+    }
+
+    /// Build a `Preflight` with each signal set explicitly, so the derived decisions can be
+    /// exercised without a real host, a mount, or a daemon.
+    fn preflight(
+        kernel_btrfs: bool,
+        loop_control: bool,
+        udisks: bool,
+        host_fs: Option<FsKind>,
+        remote_session: bool,
+    ) -> Preflight {
+        Preflight {
+            kernel_btrfs,
+            loop_control,
+            udisks,
+            host_fs,
+            remote_session,
+        }
+    }
+
+    #[test]
+    fn preflight_separates_can_mount_from_worth_recommending() {
+        // A local ext4 desktop with everything present: mountable and worth recommending.
+        let ideal = preflight(true, true, true, Some(FsKind::Ext), false);
+        assert!(ideal.can_mount());
+        assert!(ideal.mount_blocker().is_none());
+        assert!(ideal.recommends_volume());
+
+        // Already copy-on-write: mountable, but a volume would add nothing, so not recommended.
+        let cow = preflight(true, true, true, Some(FsKind::Btrfs), false);
+        assert!(cow.can_mount());
+        assert!(
+            !cow.recommends_volume(),
+            "no point wrapping a copy-on-write filesystem in a volume"
+        );
+
+        // Remote session: udisks would ask for a password, so it is not recommended — but it is
+        // not a hard blocker either, since the mount could still be authorized.
+        let remote = preflight(true, true, true, Some(FsKind::Ext), true);
+        assert!(remote.can_mount());
+        assert!(!remote.recommends_volume());
+
+        // Kernel btrfs not detected but the hardware is there: not recommended (conservative),
+        // yet not blocked — a mount would try to autoload the module.
+        let no_kernel = preflight(false, true, true, Some(FsKind::Ext), false);
+        assert!(no_kernel.can_mount());
+        assert!(no_kernel.mount_blocker().is_none());
+        assert!(!no_kernel.recommends_volume());
+    }
+
+    #[test]
+    fn a_remote_session_is_detected_from_either_ssh_variable() {
+        use std::ffi::OsStr;
+        let set = Some(OsStr::new("x"));
+        // Either SSH variable alone marks the session remote — so a client that exports only one
+        // is still recognised, and the recommendation is withheld where udisks would need a password.
+        assert!(is_remote_session(set, None), "SSH_CONNECTION alone");
+        assert!(is_remote_session(None, set), "SSH_TTY alone");
+        assert!(is_remote_session(set, set));
+        // Neither set is the locally-active session the whole feature is built for.
+        assert!(!is_remote_session(None, None));
+    }
+
+    #[test]
+    fn a_missing_hard_requirement_is_a_named_blocker() {
+        // No udisks and no loop are the genuinely fatal cases, and the blocker names each.
+        let no_udisks = preflight(true, true, false, Some(FsKind::Ext), false);
+        assert!(!no_udisks.can_mount());
+        assert!(no_udisks.mount_blocker().unwrap().contains("udisks"));
+
+        let no_loop = preflight(true, false, true, Some(FsKind::Ext), false);
+        assert!(no_loop.mount_blocker().unwrap().contains("loop"));
+
+        // Both missing: both are named, so one message explains the whole situation.
+        let neither = preflight(true, false, false, Some(FsKind::Ext), false);
+        let msg = neither.mount_blocker().unwrap();
+        assert!(msg.contains("loop") && msg.contains("udisks"), "{msg}");
+    }
+}

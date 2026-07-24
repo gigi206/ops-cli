@@ -2569,7 +2569,9 @@ fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> St
 /// inherent residual (the command binary comes from the agent's own mount namespace).
 pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     let Some(layout) = Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return ExitCode::FAILURE;
     };
     let sessions = match session::Registry::at(layout.data_dir()).list() {
@@ -2869,7 +2871,9 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 ///   open elsewhere; stop a single agent by pid to avoid it.
 pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return ExitCode::FAILURE;
     };
     let registry = session::Registry::at(layout.data_dir());
@@ -2985,7 +2989,9 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
     // The data directory is resolved first: it is where sbx looks for (and, under the
     // bundled features, materializes) the engines it owns, so `resolve_bwrap` below needs it.
     let Some(layout) = Layout::from_env() else {
-        eprintln!("sbx: cannot resolve the data directory (no $HOME or $XDG_DATA_HOME).");
+        eprintln!(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
+        );
         return Err(ExitCode::FAILURE);
     };
     let Some(bwrap) = crate::store::resolve_bwrap(Some(&layout)).map(|c| c.path) else {

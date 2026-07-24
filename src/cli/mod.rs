@@ -14,6 +14,7 @@ pub(crate) mod proc;
 pub(crate) mod projects;
 pub(crate) mod search;
 pub(crate) mod session;
+pub(crate) mod storage;
 pub(crate) mod store;
 pub(crate) mod test;
 pub(crate) mod trust;
@@ -28,6 +29,11 @@ use std::process::ExitCode;
 /// point. The shared leading-flag helpers (`flag_name`/`take_override_flag`/`build_override`) and
 /// the standalone `path` verb live at the crate root, reached via `crate::`.
 pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
+    // A one-time, terminal-only suggestion to adopt a storage volume, on the first interactive
+    // launch of an eligible host. Silent and immediate in every other case — a non-launch verb, a
+    // non-terminal (so an agent, a pipe or CI never meets it), an override already set, a host
+    // already using a volume, one already offered, or an ineligible host.
+    storage::maybe_propose_on_launch(name, &rest);
     match name {
         // Internal: the in-cage exec-enforcement shim. Runs inside the cage (sbx is bound read-only
         // there), installs the seccomp user-notification filter, hands the listener fd to the host
@@ -46,6 +52,7 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "upgrade" => upgrade::upgrade_cmd(rest),
         "gc" => gc::run(rest),
         "projects" | "project" => projects::projects_cmd(rest),
+        "storage" => storage::storage_cmd(rest),
         "store" => store::store_cmd(rest),
         "path" => crate::path_cmd(&rest),
         "run" => {

@@ -647,7 +647,9 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     let (ok, n, warn, dim, r) = (pal.ok, pal.name, pal.warn, pal.dim, pal.reset);
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot locate sbx's data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate sbx's data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
 

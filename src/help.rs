@@ -941,6 +941,70 @@ const PAGES: &[Page] = &[
             What it occupies before and after is `sbx store`.",
     },
     Page {
+        path: &["storage"],
+        synopsis: "sbx storage <init|migrate|use|status|up|down|unuse> [--image <path>] [--size <n>]",
+        summary: "manage a compressed, self-growing volume for sbx's data directory",
+        options: &[
+            ("init", "create the volume (refuses to touch an existing one)"),
+            ("migrate", "copy the existing data directory into the volume, then use it"),
+            ("use", "make sbx keep its data there, mounting it automatically from now on"),
+            ("status", "where the volume stands, and what it costs the host"),
+            ("up", "mount it now (rarely needed: sbx mounts it when it needs it)"),
+            ("down", "unmount and detach it"),
+            ("unuse", "go back to the ordinary data directory, leaving the volume untouched"),
+            ("--force", "with `use`/`migrate`, proceed although a directory holds data"),
+            ("--image <path>", "the image file (default: beside the data directory)"),
+            ("--size <n>", "logical size at init, e.g. 200G (default 200G)"),
+            ("--label <name>", "filesystem label, which names the mount point"),
+            ("--json", "emit `status` as a JSON document"),
+        ],
+        details:
+            "sbx's data directory is the one tree that grows without bound — the shared nix store,\n\
+            a runtime tree per project, a home per app — and it is inode-heavy by nature. On a\n\
+            filesystem whose inode table is fixed when it is created, it can crowd the host long\n\
+            before the disk is full. A volume puts that tree inside a single host file: one inode\n\
+            instead of hundreds of thousands, compressed, and occupying only what is written.\n\
+            \n\
+            It also turns a copy into a share. sbx seeds each per-project store from the shared\n\
+            one, which on an ordinary filesystem is a physical copy; on the volume's filesystem\n\
+            the two share their blocks instead.\n\
+            \n\
+            The whole chain runs unprivileged: the filesystem is created from a seed directory so\n\
+            its root belongs to you, and `udisks` performs the attach and the mount over D-Bus,\n\
+            which its shipped policy grants to a locally active session without authentication.\n\
+            That bounds where this works — a remote, headless or inactive session falls under a\n\
+            rule requiring administrator authentication and cannot mount unattended. The feature\n\
+            is therefore opt-in, and sbx without a volume behaves exactly as before.\n\
+            \n\
+            Adopting a volume is one deliberate act — `sbx storage use` — and everything follows\n\
+            from it: sbx records the volume and mounts it whenever it needs it, including after a\n\
+            reboot, with no variable to carry and nothing to run by hand. `up` exists for the rare\n\
+            time you want the mount without waiting for the next command. `unuse` reverses the\n\
+            adoption and leaves the volume untouched.\n\
+            \n\
+            `use` refuses when the data directory already holds a store, projects or app homes:\n\
+            adopting a volume does not move them, it hides them. `migrate` is the command that\n\
+            does move them — it copies everything into the volume, checks the copy against the\n\
+            original, and only then switches over, setting the old directory aside under a dated\n\
+            name rather than deleting it. The original stays authoritative for the whole copy, so\n\
+            an interruption before the switch leaves the installation exactly as it was. `down` refuses while a sandbox is still\n\
+            running from the volume.\n\
+            \n\
+            If a volume sbx is set to use cannot be mounted, sbx stops rather than carrying on\n\
+            with an empty directory — the mount point exists only while mounted and lives on a\n\
+            tmpfs, so continuing would provision into RAM and report an empty store as the truth.\n\
+            `SBX_DATA_DIR` overrides all of this for a one-off.\n\
+            \n\
+            The one thing sbx cannot ship is `udisks`: it is a system daemon, and the privilege\n\
+            lives with it rather than with any binary. Everything else it provides — if the host\n\
+            has no `mkfs.btrfs`, sbx provisions `btrfs-progs` into its own store and runs it in a\n\
+            sandbox, so creating a volume depends on no distribution package. Using one needs no\n\
+            `btrfs` binary at all.\n\
+            \n\
+            Freed space returns to the host in the background rather than the instant a file is\n\
+            deleted, so the host figure `status` reports can lag a deletion by a moment.",
+    },
+    Page {
         path: &["store"],
         synopsis: "sbx store [--json]",
         summary: "report what sbx occupies on disk, subtree by subtree",

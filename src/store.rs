@@ -48,15 +48,77 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    /// Resolve the layout from the environment: `$XDG_DATA_HOME/sbx` when that
-    /// is set to an absolute path, otherwise `$HOME/.local/share/sbx`. `None`
-    /// only when neither variable yields a usable base.
+    /// Resolve the layout from the environment, highest precedence first:
+    /// `$SBX_DATA_DIR` names the data directory outright, else `$XDG_DATA_HOME/sbx`,
+    /// else `$HOME/.local/share/sbx`. `None` when nothing yields a usable base.
+    ///
+    /// A relative `$SBX_DATA_DIR` is **refused**, not ignored: it would otherwise
+    /// resolve against whatever directory sbx happens to be launched from, letting a
+    /// checked-out repository decide where the store lives — and a store is trusted by
+    /// location. Falling back silently would put the data somewhere the user did not
+    /// ask for, so the refusal yields `None` and is reported on stderr. Every command
+    /// that needs the data directory then stops; the one that merely inventories on-disk
+    /// locations reports the base as unresolved rather than inventing one. An overlong
+    /// `$SBX_DATA_DIR` is refused the same way — see [`check_data_dir_override`].
     pub(crate) fn from_env() -> Option<Self> {
+        let over = std::env::var_os("SBX_DATA_DIR");
         let data_dir = data_dir_from(
+            over.as_deref(),
             std::env::var_os("XDG_DATA_HOME").as_deref(),
             std::env::var_os("HOME").as_deref(),
-        )?;
+        );
+        if data_dir.is_none() {
+            // The decision came from `data_dir_from`; the wording comes from the same
+            // check it consulted, so the two cannot describe different refusals.
+            if let Some(over) = over.as_deref().filter(|o| !o.is_empty()) {
+                if let Err(why) = check_data_dir_override(over) {
+                    eprintln!("sbx: {why}");
+                }
+            }
+        }
+        let mut data_dir = data_dir?;
+
+        // An explicit override is the invoker's word and settles it. Otherwise a pointer in
+        // the default directory says the data has moved into a volume, and sbx follows it —
+        // mounting it if need be, so no shell has to remember to.
+        if over.as_deref().is_none_or(|o| o.is_empty()) {
+            match follow_volume(&data_dir) {
+                None => {}
+                Some(Ok(mounted)) => data_dir = mounted,
+                Some(Err(why)) => {
+                    // Fail closed. The mount point exists only while mounted, and it lives
+                    // under `/run` — a tmpfs. Carrying on with the unmounted path would
+                    // provision gigabytes into RAM and present an empty store as the truth.
+                    eprintln!("sbx: sbx's data is in a volume that could not be mounted: {why}");
+                    eprintln!("sbx: refusing to continue rather than use an empty data directory");
+                    return None;
+                }
+            }
+        }
+
+        // Guard the directory sbx will actually use — after a volume pointer may have swapped
+        // it for a short mount point. A derived `$HOME`/`$XDG_DATA_HOME` too long for the
+        // sockets sbx binds under it would otherwise fail deep at launch, talking about a socket
+        // rather than the directory; refuse here, with the remedy, at the moment it is resolved.
+        // `sbx storage` anchors to `default_data_dir`, not this path, so a volume can still be
+        // adopted to fix it.
+        if let Err(why) = check_resolved_data_dir(&data_dir) {
+            eprintln!("sbx: {why}");
+            return None;
+        }
         Some(Self { data_dir })
+    }
+
+    /// The data directory sbx would use with no volume in play — the plain XDG computation.
+    ///
+    /// This is where the volume's image and pointer live, so it must stay reachable even once
+    /// a pointer has redirected everything else.
+    pub(crate) fn default_data_dir() -> Option<PathBuf> {
+        data_dir_from(
+            None,
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )
     }
 
     /// Pure constructor: the layout rooted at a given data directory. Split out
@@ -110,10 +172,120 @@ impl Layout {
     }
 }
 
-/// Pure core of [`Layout::from_env`]: prefer an absolute `XDG_DATA_HOME`, else
-/// fall back to `HOME/.local/share`, with `sbx` appended. A relative
-/// `XDG_DATA_HOME` is ignored, as the base-directory specification requires.
-fn data_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+/// Follow a volume pointer in `default_dir`, mounting the volume if it is not already.
+/// `None` when there is no pointer — the ordinary case, and the one that must stay free.
+///
+/// Resolved once per process: the answer cannot change under us, and a single launch asks for
+/// the layout dozens of times. Only the mount is memoised, so nothing is cached before a
+/// pointer is found.
+fn follow_volume(default_dir: &Path) -> Option<Result<PathBuf, String>> {
+    static RESOLVED: std::sync::OnceLock<Option<Result<PathBuf, String>>> =
+        std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let image = crate::storage::read_pointer(default_dir)?;
+            Some(crate::storage::ensure_mounted(&image))
+        })
+        .clone()
+}
+
+/// Whether `$SBX_DATA_DIR` is what selected the data directory. Surfaced by `doctor` so a
+/// shell that carries the override is distinguishable from one that does not — otherwise a
+/// store that looks unexpectedly empty has no visible explanation.
+pub(crate) fn data_dir_overridden() -> bool {
+    std::env::var_os("SBX_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .is_some_and(|v| check_data_dir_override(&v).is_ok())
+}
+
+/// The longest path a Unix-domain socket can carry, minus its terminator: `sun_path` is a
+/// fixed 108-byte field and the kernel needs the trailing NUL.
+const SUN_PATH_MAX: usize = 107;
+
+/// The longest socket name any feature appends to the data directory. Every feature that binds
+/// an `AF_UNIX` socket under the data directory contributes one; the widest is what the cap must
+/// reserve for. With a 7-digit pid and a 5-digit port:
+///   `/egress/proxy-<pid>.sock`         (26)  egress proxy, bound into the cage
+///   `/egress/control-<pid>.sock`       (28)  egress live control
+///   `/fs/control-<pid>.sock`           (24)  exec-enforcement control
+///   `/forward/fwd-<pid>/p-<port>.sock` (33)  port forwarding — the widest, a per-launch subdir
+///                                            holding one socket per forwarded port
+/// A new feature whose host socket path is wider than this must widen the sample below, or a
+/// data directory the cap accepts would still overrun `sun_path` at that feature's first launch.
+const LONGEST_SOCKET_SUFFIX: usize = "/forward/fwd-1234567/p-65535.sock".len();
+
+/// The most a data directory may measure and still host those sockets.
+const DATA_DIR_MAX: usize = SUN_PATH_MAX - LONGEST_SOCKET_SUFFIX;
+
+/// Validate an explicit `$SBX_DATA_DIR`, returning the directory or why it was refused.
+/// One function so the decision and the diagnostic can never disagree.
+///
+/// The length bound is not cosmetic. Egress filtering, the D-Bus filter, port forwarding and
+/// exec enforcement each bind an `AF_UNIX` socket *under* the data directory, and a socket
+/// path that overruns `sun_path` fails at launch — well after the choice was made, with a
+/// message about a socket rather than about the directory. Refusing here turns a puzzling
+/// runtime failure into an answerable one, at the moment the path is chosen.
+fn check_data_dir_override(value: &OsStr) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!(
+            "SBX_DATA_DIR must be an absolute path (got {})",
+            path.display()
+        ));
+    }
+    let len = value.as_encoded_bytes().len();
+    if len > DATA_DIR_MAX {
+        return Err(format!(
+            "SBX_DATA_DIR is {len} bytes; at most {DATA_DIR_MAX} fit, because sbx binds \
+             sockets under it and a Unix socket path cannot exceed {SUN_PATH_MAX} bytes \
+             (got {})",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Refuse a *resolved* data directory whose path is too long to host sbx's sockets.
+///
+/// [`check_data_dir_override`] guards only an explicit `$SBX_DATA_DIR`; a directory sbx
+/// *derives* — `$XDG_DATA_HOME/sbx` or `$HOME/.local/share/sbx` — is not handed in and so
+/// escapes it, yet overruns `sun_path` just the same when `$HOME` is long. This runs on the
+/// **final** directory, after a volume pointer has had its say, so an adopted volume — whose
+/// mount point under `/run` is short — passes silently even when the plain derived path would
+/// not. That is deliberate: adopting a volume is one of the two remedies, and it must not be
+/// refused as a side effect of the very problem it solves. An override that reached here already
+/// passed the stricter check above, so it too passes without a second, differently-worded refusal.
+fn check_resolved_data_dir(dir: &Path) -> Result<(), String> {
+    let len = dir.as_os_str().as_encoded_bytes().len();
+    if len > DATA_DIR_MAX {
+        return Err(format!(
+            "sbx's data directory is {len} bytes ({}); at most {DATA_DIR_MAX} fit, because sbx \
+             binds sockets under it and a Unix socket path cannot exceed {SUN_PATH_MAX} bytes. \
+             Set SBX_DATA_DIR to a shorter path, or adopt a storage volume — its mount point is short.",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Pure core of [`Layout::from_env`]: an absolute `SBX_DATA_DIR` wins outright, else
+/// prefer an absolute `XDG_DATA_HOME`, else fall back to `HOME/.local/share`.
+///
+/// The two overrides differ in kind, so they differ in treatment. `XDG_DATA_HOME` is a
+/// *base* shared with every other application, so `sbx` is appended and a relative value
+/// is ignored, as the base-directory specification requires. `SBX_DATA_DIR` names sbx's
+/// own directory, so it is used verbatim — and a relative value yields `None` rather than
+/// falling through, because quietly using a different directory than the one asked for
+/// would strand the user's projects and apps somewhere they never look. An unset *or
+/// empty* value is simply absent, so clearing the variable restores the default.
+fn data_dir_from(
+    sbx: Option<&OsStr>,
+    xdg: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(sbx) = sbx.filter(|s| !s.is_empty()) {
+        return check_data_dir_override(sbx).ok();
+    }
     if let Some(xdg) = xdg {
         let p = PathBuf::from(xdg);
         if p.is_absolute() {
@@ -1387,19 +1559,107 @@ mod tests {
     #[test]
     fn data_dir_prefers_absolute_xdg_else_falls_back_to_home() {
         assert_eq!(
-            data_dir_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
+            data_dir_from(None, Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
             Some(PathBuf::from("/xdg/sbx"))
         );
         // a relative XDG_DATA_HOME is ignored; HOME is used instead
         assert_eq!(
-            data_dir_from(Some(OsStr::new("rel/xdg")), Some(OsStr::new("/home/u"))),
+            data_dir_from(
+                None,
+                Some(OsStr::new("rel/xdg")),
+                Some(OsStr::new("/home/u"))
+            ),
             Some(PathBuf::from("/home/u/.local/share/sbx"))
         );
         assert_eq!(
-            data_dir_from(None, Some(OsStr::new("/home/u"))),
+            data_dir_from(None, None, Some(OsStr::new("/home/u"))),
             Some(PathBuf::from("/home/u/.local/share/sbx"))
         );
-        assert_eq!(data_dir_from(None, None), None);
+        assert_eq!(data_dir_from(None, None, None), None);
+    }
+
+    #[test]
+    fn an_absolute_data_dir_override_wins_verbatim_and_a_relative_one_is_refused() {
+        // It outranks both lower sources, and names the directory itself: no `sbx`
+        // is appended, unlike the shared XDG base.
+        let over = data_dir_from(
+            Some(OsStr::new("/vol/data")),
+            Some(OsStr::new("/xdg")),
+            Some(OsStr::new("/home/u")),
+        );
+        assert_eq!(over, Some(PathBuf::from("/vol/data")));
+        assert_ne!(over, Some(PathBuf::from("/vol/data/sbx")));
+
+        // A relative override is refused outright — crucially it does NOT fall
+        // through to a lower source, which would silently use another directory.
+        assert_eq!(
+            data_dir_from(
+                Some(OsStr::new("rel/data")),
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home/u"))
+            ),
+            None
+        );
+
+        // Empty reads as absent, so clearing the variable restores the default.
+        assert_eq!(
+            data_dir_from(
+                Some(OsStr::new("")),
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home/u"))
+            ),
+            Some(PathBuf::from("/xdg/sbx"))
+        );
+    }
+
+    #[test]
+    fn a_data_dir_override_too_long_to_host_a_unix_socket_is_refused() {
+        // The bound is what is left of `sun_path` once the widest socket name sbx
+        // appends is accounted for, so a directory at the limit still works...
+        let at_limit = format!("/{}", "d".repeat(DATA_DIR_MAX - 1));
+        assert_eq!(at_limit.len(), DATA_DIR_MAX);
+        assert!(check_data_dir_override(OsStr::new(&at_limit)).is_ok());
+
+        // ...and one byte more does not. Teeth: the longest socket path that
+        // directory would have to carry must actually overrun the kernel's field.
+        let over = format!("/{}", "d".repeat(DATA_DIR_MAX));
+        assert_eq!(over.len(), DATA_DIR_MAX + 1);
+        assert!(over.len() + LONGEST_SOCKET_SUFFIX > SUN_PATH_MAX);
+        let why = check_data_dir_override(OsStr::new(&over)).unwrap_err();
+        assert!(why.contains("at most"), "{why}");
+
+        // And it is refused, not silently swapped for a lower source.
+        assert_eq!(
+            data_dir_from(
+                Some(OsStr::new(&over)),
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home/u"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_derived_data_dir_too_long_for_a_socket_is_caught_but_still_adoptable() {
+        // A directory at the limit passes; one byte more overruns the widest socket path.
+        let at_limit = PathBuf::from(format!("/{}", "d".repeat(DATA_DIR_MAX - 1)));
+        assert_eq!(at_limit.as_os_str().len(), DATA_DIR_MAX);
+        assert!(check_resolved_data_dir(&at_limit).is_ok());
+
+        let over = PathBuf::from(format!("/{}", "d".repeat(DATA_DIR_MAX)));
+        assert_eq!(over.as_os_str().len(), DATA_DIR_MAX + 1);
+        assert!(over.as_os_str().len() + LONGEST_SOCKET_SUFFIX > SUN_PATH_MAX);
+        let why = check_resolved_data_dir(&over).unwrap_err();
+        assert!(why.contains("at most"), "{why}");
+        assert!(why.contains("SBX_DATA_DIR"), "names the remedy: {why}");
+
+        // The derivation itself does NOT drop a long `$HOME` — `data_dir_from` still returns it,
+        // so `sbx storage` (which anchors to that path, not the guarded resolution) can create
+        // the image and adopt a volume whose short mount point then passes the guard.
+        let long_home = "/".to_string() + &"h".repeat(DATA_DIR_MAX);
+        let derived = data_dir_from(None, None, Some(OsStr::new(&long_home)))
+            .expect("a long derived home still resolves to a path storage can adopt from");
+        assert!(check_resolved_data_dir(&derived).is_err());
     }
 
     #[test]

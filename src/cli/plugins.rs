@@ -57,7 +57,9 @@ fn load_plugin_registry() -> Option<(plugins::PluginRegistry, Vec<String>)> {
 /// scheme) go to stderr. No nix, no network, no launch.
 fn plugins_list() -> ExitCode {
     let Some((registry, warnings)) = load_plugin_registry() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
 
@@ -110,7 +112,9 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
     // The rule is syntactic, not based on what exists on disk, so the command's meaning never
@@ -233,7 +237,9 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
     }
 
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
     let Some(git) = store::resolve_git() else {
@@ -375,7 +381,9 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
 /// failure on one is reported and the rest still run, with a non-zero exit if any failed.
 fn plugins_store_update(args: &[OsString]) -> ExitCode {
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
     let Some(git) = store::resolve_git() else {
@@ -452,7 +460,9 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
     match stores::install_plugin(&layout, store_name, plugin_name) {
@@ -483,7 +493,9 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
     let cfg = match stores::read_configured(&layout, name) {
@@ -539,7 +551,9 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
     match stores::remove(&layout, name) {
@@ -625,7 +639,9 @@ fn plugins_remove(name: Option<&str>) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = store::Layout::from_env() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
     match plugins::remove(&layout, name) {
@@ -654,7 +670,9 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let Some((registry, warnings)) = load_plugin_registry() else {
-        eprintln!("sbx: cannot locate the data directory (set $HOME or $XDG_DATA_HOME)");
+        eprintln!(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)"
+        );
         return ExitCode::FAILURE;
     };
     let Some(p) = registry.resolver(scheme) else {

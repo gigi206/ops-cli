@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::{
-    config, nix_version, probe_userns, read_sysctl, sandbox, short_rev, store, style, Userns,
+    config, nix_version, probe_userns, read_sysctl, sandbox, short_rev, storage, store, style,
+    Userns,
 };
 
 /// Remediation for a missing capability-bearing user namespace — the boundary
@@ -126,9 +127,19 @@ pub(crate) fn doctor() -> ExitCode {
     // path — a sandbox runs without it — so its absence is a feature gap reported for
     // context, never a boundary failure that blocks `sbx run`.
     match store::resolve_git() {
-        Some(git) => println!("  {} git               {}", tag_ok(&pal), git.display()),
+        Some(git) => {
+            println!("  {} git               {}", tag_ok(&pal), git.display());
+            // Say it plainly even when present: unlike bubblewrap and nix above, git is not a
+            // prerequisite — a sandbox launches without it. It only enables `sbx plugins store`.
+            println!(
+                "         {dim}· optional — needed only for `sbx plugins store`, not to run a \
+                 sandbox{r}",
+                dim = pal.dim
+            );
+        }
         None => println!(
-            "  {} git               not found on PATH — needed only for `sbx plugins store`",
+            "  {} git               not found on PATH — optional, needed only for \
+             `sbx plugins store`",
             tag_warn(&pal)
         ),
     }
@@ -146,8 +157,13 @@ pub(crate) fn doctor() -> ExitCode {
             } else {
                 "absent — created on first use"
             };
+            let origin = if store::data_dir_overridden() {
+                ", via $SBX_DATA_DIR"
+            } else {
+                ""
+            };
             println!(
-                "  {} store             {} ({state})",
+                "  {} store             {} ({state}{origin})",
                 tag_ok(&pal),
                 dir.display()
             );
@@ -167,7 +183,7 @@ pub(crate) fn doctor() -> ExitCode {
         }
         None => {
             println!(
-                "  {} store             unresolved (no $HOME or $XDG_DATA_HOME)",
+                "  {} store             unresolved (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
                 tag_warn(&pal)
             );
             println!(
@@ -176,6 +192,12 @@ pub(crate) fn doctor() -> ExitCode {
             );
         }
     }
+
+    // Storage is opt-in and never a prerequisite, so this line is always [ ok ]/[warn], never a
+    // failure: it reports whether the data directory lives in a volume, and — when it does not —
+    // whether one is worth adopting on this host. It is the standing discoverability anchor, so a
+    // one-time proposal declined elsewhere still leaves the path visible here.
+    report_storage(&pal);
 
     println!();
     if remediation.is_empty() {
@@ -212,6 +234,78 @@ fn report_resource_limits(pal: &style::Palette, limits: &sandbox::cgroup::Limits
         );
     } else if let Some(note) = report.note {
         println!("  {} resource limits   {note}", tag_warn(pal));
+    }
+}
+
+/// Report the storage posture: whether the data directory lives in an encapsulated volume, and
+/// when it does not, whether one is available on this host. Read-only and best-effort — it reads
+/// the pointer and probes capabilities, mounting nothing and creating nothing. Anchored to the
+/// *default* data directory (where the image and pointer live), not the possibly-followed one.
+fn report_storage(pal: &style::Palette) {
+    let Some(default_dir) = store::Layout::default_data_dir() else {
+        return;
+    };
+    let ok = tag_ok(pal);
+    let warn = tag_warn(pal);
+    let (dim, r) = (pal.dim, pal.reset);
+
+    // Set to follow a volume? Read the pointer directly, so the answer stands even when the
+    // volume happens to be unmounted right now. The type leads — `volume (<fs>)` here, `local
+    // (<fs>)` below — the one distinction that says whether sbx manages the backing or borrows
+    // the host's.
+    if let Some(image) = storage::read_pointer(&default_dir) {
+        match storage::state(&image) {
+            Ok(storage::State::Mounted { mount_point, .. }) => {
+                let fs = storage::fs_kind(&mount_point)
+                    .map(|k| k.name())
+                    .unwrap_or_else(|| "btrfs".to_string());
+                let comp = storage::compression(&mount_point).unwrap_or_else(|| "off".to_string());
+                println!(
+                    "  {ok} storage           type: volume ({fs}) at {}",
+                    mount_point.display()
+                );
+                println!(
+                    "         {dim}· compression {comp}; the data directory costs the host a \
+                     single inode{r}"
+                );
+            }
+            _ => println!(
+                "  {warn} storage           type: volume — set to use {} but it is not mounted",
+                image.display()
+            ),
+        }
+        return;
+    }
+
+    // No volume: the data directory sits directly on a host filesystem — type `local (<fs>)` —
+    // and the note says whether an encapsulated volume is worth adopting.
+    let pre = storage::Preflight::probe(&default_dir);
+    let fs = pre
+        .host_fs
+        .map(|k| k.name())
+        .unwrap_or_else(|| "unknown".to_string());
+    let ty = format!("type: local ({fs})");
+
+    if pre.host_fs.is_some_and(|k| k.is_cow()) {
+        println!("  {ok} storage           {ty} — already copy-on-write");
+        println!("         {dim}· an encapsulated volume would add little{r}");
+    } else if pre.recommends_volume() {
+        println!("  {ok} storage           {ty} — a compressed btrfs volume is available");
+        println!("         {dim}· adopt one with `sbx storage init`{r}");
+    } else if let Some(blocker) = pre.mount_blocker() {
+        println!("  {warn} storage           {ty} — no encapsulated volume here: {blocker}");
+        println!("         {dim}· $SBX_DATA_DIR can still point sbx at an existing btrfs mount{r}");
+    } else if pre.remote_session {
+        // Mountable in principle, but udisks needs a local active session to do it unattended.
+        println!("  {ok} storage           {ty} — a volume needs a local active session");
+        println!(
+            "         {dim}· udisks asks for authentication over SSH; `sbx storage init` to try{r}"
+        );
+    } else if !pre.kernel_btrfs {
+        println!("  {ok} storage           {ty} — btrfs kernel support not detected");
+        println!("         {dim}· a mount would try to autoload it; `sbx storage init` to try{r}");
+    } else {
+        println!("  {ok} storage           {ty}");
     }
 }
 
