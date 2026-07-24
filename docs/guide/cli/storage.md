@@ -215,14 +215,22 @@ there. Stop them first with [`sbx session stop --all`](session.md). While the vo
 adopted, `down` is temporary — the next sbx command mounts it again. Use `sbx storage unuse`
 to stop using it for good.
 
-Freed space returns to the host **in the background** rather than the instant a file is
-deleted, so the `on host` figure can lag a deletion by a moment — and after a large
-[`sbx gc`](gc.md), by considerably more. It is not lost; it is being handed back.
+Freed space returns to the host **in the background**, not the instant a file is deleted, so the
+`on host` figure lags — after a large [`sbx gc`](gc.md) it can sit well above what the data now
+occupies. It is not lost; it is being handed back.
 
-That hand-back is automatic: the volume is mounted `discard=async`, so btrfs hands freed blocks
-back to the host by itself, usually within a moment. Forcing it *immediately* needs root —
-`sudo fstrim <mount-point>` (the `FITRIM` ioctl behind it, like a direct `blkdiscard`, requires
-privilege, and `udisks` exposes no trim). Without root you can only nudge it: `btrfs filesystem
-sync <mount-point>` commits pending frees so the background worker discards them sooner. Neither
-is usually worth it — waiting reclaims the same space with no privilege. `sbx storage status`
-names the mount point.
+The volume mounts `discard=async` (btrfs's default), which favours write speed over prompt
+reclaim: a delete returns its blocks through a **throttled background worker**, so the image runs
+*above* the real used size between trims rather than shrinking on the spot. That suits sbx's
+workload — a nix build churns through many small writes, and `discard=sync` would make every commit
+wait on the disk's TRIM. It cannot be changed here anyway: `udisks` fixes the mount options and sbx
+holds no privilege.
+
+The gap is reclaimed for you. Most systems enable systemd's **`fstrim.timer`**, which runs `fstrim`
+weekly across every mounted filesystem — this volume included — returning whatever the async worker
+has not; check it with `systemctl status fstrim.timer`. To reclaim now rather than wait for the
+timer, `sudo fstrim <mount-point>` trims it immediately (the `FITRIM` ioctl needs root, so sbx
+cannot do it for you). A `sudo btrfs balance` is only for the long-term fragmentation of
+partly-emptied chunks, not ordinary deletes, which the timer handles. `sbx storage status` names
+the mount point, and its `on host` figure — mirrored by [`sbx store`](store.md) — is what tracks
+the real cost.
