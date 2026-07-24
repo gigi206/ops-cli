@@ -921,6 +921,7 @@ fn mise_upgrade_cmd(
 /// that cannot sandbox warns and rolls nothing rather than failing (best-effort, like the
 /// cgroup limits).
 pub(crate) fn upgrade_mise_packages(
+    cwd: &Path,
     cfg: &crate::config::Resolved,
     pal: &crate::style::Palette,
 ) -> bool {
@@ -948,11 +949,13 @@ pub(crate) fn upgrade_mise_packages(
         return true;
     }
 
-    // Only now, with groups to roll, take on the sandbox prerequisites.
-    let mut prep = match prepare() {
+    // Only now, with groups to roll, take on the sandbox prerequisites — against `cwd`, the project
+    // being upgraded, so `--project` builds the roll cage in that project's store and home rather
+    // than wherever the command was invoked.
+    let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none()) {
         Ok(p) => p,
         Err(_) => {
-            // prepare() already printed the pointed reason (missing bwrap/userns/nix).
+            // prepare_in already printed the pointed reason (missing bwrap/userns/nix).
             crate::diag::warn("mise packages: skipped — no usable sandbox; see `sbx doctor`");
             return true;
         }
@@ -3052,6 +3055,21 @@ fn prepare() -> Result<Prepared, ExitCode> {
 /// the override (env, binds, network, gui, limits, secret) is applied by the caller with
 /// [`crate::config::Resolved::apply_override`] — after any app overlay merges, so it beats that too.
 fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("sbx: cannot read the current directory: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    prepare_in(cwd, ov)
+}
+
+/// [`prepare_with`] against an explicit project directory instead of the process's current
+/// directory. The whole cage — its per-project store, home, and resolved config — is built from
+/// `cwd`, so a caller that retargets another project (`sbx upgrade --project <path>`) drives the
+/// in-cage roll against *that* project, not wherever the command happened to be invoked.
+fn prepare_in(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
     // The data directory is resolved first: it is where sbx looks for (and, under the
     // bundled features, materializes) the engines it owns, so `resolve_bwrap` below needs it.
     let Some(layout) = Layout::from_env() else {
@@ -3074,13 +3092,6 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
     };
     let Some(nix_store) = crate::store::resolve_nix_store(Some(&layout)) else {
         return Err(missing("nix-store (the store database tool)"));
-    };
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
-            return Err(ExitCode::FAILURE);
-        }
     };
     let mut cfg = crate::config::load(&cwd);
     // The override's nixpkgs channel must land before the lock target is chosen below. A set-but-

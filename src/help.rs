@@ -869,7 +869,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball]",
+        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball] [--project <path>]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             ("all", "roll every managed channel (the default)"),
@@ -885,9 +885,17 @@ const PAGES: &[Page] = &[
             ("deb", "the project's and apps' deb: packages"),
             ("appimage", "the project's and apps' appimage: packages"),
             ("tarball", "the project's and apps' tarball: packages"),
+            (
+                "--project <path>",
+                "roll another project instead of the current directory",
+            ),
         ],
         details: "Rolls managed channels forward by re-resolving and rewriting their locks, so\n\
-            versions advance only here, never on an sbx binary update.",
+            versions advance only here, never on an sbx binary update.\n\
+            \n\
+            `--project <path>` retargets every roll at another project — exactly as running the\n\
+            command from that directory would, with the same trust gate, pin, and locks. The path\n\
+            must be an existing directory.",
     },
     Page {
         path: &["gc"],

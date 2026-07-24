@@ -1,8 +1,9 @@
-//! `sbx upgrade [all|nix|mise|flake|deb|appimage|tarball]`: roll the managed channels and
-//! `[packages]` backends forward by re-resolving and rewriting their locks, so versions advance
-//! only on an explicit upgrade, never on an sbx binary update. The lock-rewriting parts need nix
-//! to resolve but not the sandbox boundary; the in-cage `mise:` roll needs the cage and degrades
-//! to a warning where it is unavailable.
+//! `sbx upgrade [all|nix|mise|flake|deb|appimage|tarball] [--project <path>]`: roll the managed
+//! channels and `[packages]` backends forward by re-resolving and rewriting their locks, so
+//! versions advance only on an explicit upgrade, never on an sbx binary update. `--project`
+//! retargets every roll at another project, exactly as running the command from that directory
+//! would. The lock-rewriting parts need nix to resolve but not the sandbox boundary; the in-cage
+//! `mise:` roll needs the cage and degrades to a warning where it is unavailable.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -11,39 +12,115 @@ use std::process::ExitCode;
 
 use crate::{config, diag, help, sandbox, short_rev, store, style, trust};
 
-/// `sbx upgrade [all|nix|mise]`: roll managed channels forward by re-resolving and
-/// rewriting their locks, so versions advance only here, never on an sbx binary update.
-/// `nix` rolls the nixpkgs channel the current directory tracks (a trusted project pin,
-/// else the global channel) — base and native `nix:` `[packages]`. `mise` rolls the mise
-/// engine (its own dedicated lock), the project's `nix:` tools, and the project's and apps'
-/// `mise:` `[packages]` (the last in-cage). `all` rolls every one. The lock-rewriting parts
-/// need nix (to resolve) but not the sandbox boundary; the in-cage `mise:` roll needs the
-/// sandbox and degrades to a warning where it is unavailable.
-pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
-    // Parse the target before touching anything, so a typo fails cleanly. `all` covers
-    // every managed channel: the nixpkgs channel (base + native `[packages]`) and the
-    // project's `nix:` mise tools.
-    // No target means `all`; a target that is present but unrecognized (including one that is not
-    // valid UTF-8) is an error, not a silent fall-through to `all`.
-    let what = match args.first() {
-        None => "all",
-        Some(arg) => match arg.to_str() {
-            Some(w @ ("all" | "nix" | "mise" | "flake" | "deb" | "appimage" | "tarball")) => w,
-            _ => {
-                diag::error(&format!(
-                    "sbx: unknown upgrade target '{}' (known: all, nix, mise, flake, deb, appimage, tarball)",
-                    arg.to_string_lossy()
-                ));
-                return ExitCode::from(2);
+/// The known upgrade targets. Kept as one list so the parser and the error message cannot drift.
+const TARGETS: &[&str] = &["all", "nix", "mise", "flake", "deb", "appimage", "tarball"];
+
+/// Map a target word to its `'static` spelling, so a parsed target outlives the borrowed argv.
+fn known_target(s: &str) -> Option<&'static str> {
+    TARGETS.iter().copied().find(|&t| t == s)
+}
+
+/// The outcome of parsing `sbx upgrade`'s arguments: show help, run with a resolved target and an
+/// optional `--project` path, or a usage error (already-formatted message, exit 2).
+#[derive(Debug, PartialEq)]
+enum ParsedArgs {
+    Help,
+    Run {
+        what: &'static str,
+        project: Option<OsString>,
+    },
+    Error(String),
+}
+
+/// Parse an optional target word and an optional `--project <path>`, in any order. Pure — no I/O —
+/// so the grammar (default target, duplicate/second-token rejection, the `--project`/`--project=`
+/// value forms) is unit-tested without invoking nix or the sandbox. A present-but-unrecognized
+/// target (including one that is not valid UTF-8) is an error, not a silent fall-through to `all`.
+fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
+    let mut what: Option<&'static str> = None;
+    let mut project: Option<OsString> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.to_str() {
+            Some("--help" | "-h") => return ParsedArgs::Help,
+            // `--project <path>`: the value is the next argument, kept as a raw `OsString` so a
+            // non-UTF-8 path survives.
+            Some("--project") => {
+                let Some(val) = args.get(i + 1) else {
+                    return ParsedArgs::Error(
+                        "sbx: upgrade: --project needs a directory path.".into(),
+                    );
+                };
+                if project.is_some() {
+                    return ParsedArgs::Error(
+                        "sbx: upgrade: --project given more than once.".into(),
+                    );
+                }
+                project = Some(val.clone());
+                i += 2;
             }
-        },
-    };
-    // Exactly one (optional) target. A trailing token — a mistyped flag or a second target —
-    // is rejected, not silently swallowed (so `sbx upgrade nix mise` does not roll only `nix`).
-    if args.len() > 1 {
-        diag::error(&format!("sbx: usage: {}", help::synopsis("upgrade")));
-        return ExitCode::from(2);
+            // `--project=<path>`: the value is inline (UTF-8 only; use the space form for a
+            // non-UTF-8 path).
+            Some(s) if s.starts_with("--project=") => {
+                let val = &s["--project=".len()..];
+                if val.is_empty() {
+                    return ParsedArgs::Error(
+                        "sbx: upgrade: --project needs a directory path.".into(),
+                    );
+                }
+                if project.is_some() {
+                    return ParsedArgs::Error(
+                        "sbx: upgrade: --project given more than once.".into(),
+                    );
+                }
+                project = Some(OsString::from(val));
+                i += 1;
+            }
+            Some(s) if known_target(s).is_some() => {
+                // A second target is rejected, not silently swallowed (so `sbx upgrade nix mise`
+                // does not roll only `nix`).
+                if what.is_some() {
+                    return ParsedArgs::Error(format!("sbx: usage: {}", help::synopsis("upgrade")));
+                }
+                what = known_target(s);
+                i += 1;
+            }
+            _ => {
+                return ParsedArgs::Error(format!(
+                    "sbx: unknown upgrade target '{}' (known: {})",
+                    arg.to_string_lossy(),
+                    TARGETS.join(", ")
+                ));
+            }
+        }
     }
+    ParsedArgs::Run {
+        what: what.unwrap_or("all"),
+        project,
+    }
+}
+
+/// `sbx upgrade [all|nix|mise] [--project <path>]`: roll managed channels forward by
+/// re-resolving and rewriting their locks, so versions advance only here, never on an sbx
+/// binary update. `nix` rolls the nixpkgs channel the target directory tracks (a trusted
+/// project pin, else the global channel) — base and native `nix:` `[packages]`. `mise` rolls
+/// the mise engine (its own dedicated lock), the project's `nix:` tools, and the project's and
+/// apps' `mise:` `[packages]` (the last in-cage). `all` rolls every one. `--project <path>`
+/// runs the whole thing against another project instead of the current directory. The
+/// lock-rewriting parts need nix (to resolve) but not the sandbox boundary; the in-cage `mise:`
+/// roll needs the sandbox and degrades to a warning where it is unavailable.
+pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
+    // Parse an optional target word and an optional `--project <path>`, in any order, before
+    // touching anything so a typo fails cleanly.
+    let (what, project_arg) = match parse_upgrade_args(&args) {
+        ParsedArgs::Help => return help::show(&["upgrade"]),
+        ParsedArgs::Run { what, project } => (what, project),
+        ParsedArgs::Error(message) => {
+            diag::error(&message);
+            return ExitCode::from(2);
+        }
+    };
 
     let Some(layout) = store::Layout::from_env() else {
         diag::error(
@@ -55,12 +132,35 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         diag::error("sbx: nix not found — cannot upgrade. See `sbx doctor`.");
         return ExitCode::FAILURE;
     };
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+    // `--project <path>` retargets the whole upgrade at another project — exactly as `cd <path>
+    // && sbx upgrade` would: the path is canonicalized (so the per-project lock derivation matches
+    // a launch from there) and every roll below reads its config and rewrites its locks. Default
+    // is the current directory.
+    let cwd = match &project_arg {
+        Some(path) => match std::fs::canonicalize(path) {
+            Ok(canon) if canon.is_dir() => canon,
+            Ok(canon) => {
+                diag::error(&format!(
+                    "sbx: upgrade: --project is not a directory: {}",
+                    canon.display()
+                ));
+                return ExitCode::from(2);
+            }
+            Err(e) => {
+                diag::error(&format!(
+                    "sbx: upgrade: --project {}: {e}",
+                    Path::new(path).display()
+                ));
+                return ExitCode::from(2);
+            }
+        },
+        None => match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                diag::error(&format!("sbx: cannot read the current directory: {e}"));
+                return ExitCode::FAILURE;
+            }
+        },
     };
 
     // Load the config so a project pin — and any reason one was dropped — is honored
@@ -88,9 +188,10 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         ok &= upgrade_mise_tools(&nix, &layout, &cwd, &cfg, &pal);
         // The project's and apps' `mise:` `[packages]` are equipped in-cage, not host-side, so
         // their roll runs `mise upgrade` inside a cage (per home) rather than rewriting a lock.
-        // Pass the already-loaded config: the groups are computed from it before any sandbox
-        // work, so a project with no `mise:` package keeps this cheap and sandbox-free.
-        ok &= sandbox::upgrade_mise_packages(&cfg, &pal);
+        // Pass the target directory and its already-loaded config: the groups are computed from the
+        // config before any sandbox work (so a project with no `mise:` package keeps this cheap and
+        // sandbox-free), and the cage is built against `cwd` so `--project` retargets it too.
+        ok &= sandbox::upgrade_mise_packages(&cwd, &cfg, &pal);
     }
     if matches!(what, "flake" | "all") {
         // The project's and apps' `flake:` `[packages]` re-resolve to a fixed revision and the
@@ -696,6 +797,96 @@ fn channel_upgrade_summary(
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parse_defaults_to_all_with_no_args() {
+        assert_eq!(
+            parse_upgrade_args(&[]),
+            ParsedArgs::Run {
+                what: "all",
+                project: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_accepts_a_bare_target() {
+        for t in TARGETS {
+            assert_eq!(
+                parse_upgrade_args(&os(&[t])),
+                ParsedArgs::Run {
+                    what: t,
+                    project: None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_reads_project_in_both_forms_and_either_order() {
+        let want = ParsedArgs::Run {
+            what: "deb",
+            project: Some(OsString::from("/some/dir")),
+        };
+        // space form, target first
+        assert_eq!(
+            parse_upgrade_args(&os(&["deb", "--project", "/some/dir"])),
+            want
+        );
+        // space form, flag first
+        assert_eq!(
+            parse_upgrade_args(&os(&["--project", "/some/dir", "deb"])),
+            want
+        );
+        // inline form
+        assert_eq!(
+            parse_upgrade_args(&os(&["deb", "--project=/some/dir"])),
+            want
+        );
+        // `--project` alone keeps the default `all` target
+        assert_eq!(
+            parse_upgrade_args(&os(&["--project", "/some/dir"])),
+            ParsedArgs::Run {
+                what: "all",
+                project: Some(OsString::from("/some/dir"))
+            }
+        );
+    }
+
+    #[test]
+    fn parse_help_wins_and_bad_input_is_an_error() {
+        assert_eq!(parse_upgrade_args(&os(&["--help"])), ParsedArgs::Help);
+        assert_eq!(parse_upgrade_args(&os(&["-h"])), ParsedArgs::Help);
+        // an unknown target
+        assert!(matches!(
+            parse_upgrade_args(&os(&["frob"])),
+            ParsedArgs::Error(_)
+        ));
+        // two targets
+        assert!(matches!(
+            parse_upgrade_args(&os(&["nix", "mise"])),
+            ParsedArgs::Error(_)
+        ));
+        // `--project` with no value
+        assert!(matches!(
+            parse_upgrade_args(&os(&["--project"])),
+            ParsedArgs::Error(_)
+        ));
+        // `--project=` empty value
+        assert!(matches!(
+            parse_upgrade_args(&os(&["--project="])),
+            ParsedArgs::Error(_)
+        ));
+        // `--project` twice
+        assert!(matches!(
+            parse_upgrade_args(&os(&["--project", "/a", "--project", "/b"])),
+            ParsedArgs::Error(_)
+        ));
+    }
 
     #[test]
     fn upgrade_summary_distinguishes_the_outcomes() {
