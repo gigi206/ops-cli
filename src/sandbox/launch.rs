@@ -3675,9 +3675,17 @@ fn build(
             return Err(ExitCode::FAILURE);
         }
     };
-    let nix_mount = binds::NixMount {
-        src: project_store.store_dir().join("nix"),
-        writable: true,
+    let nix_mount = {
+        let src = project_store.store_dir().join("nix");
+        // Probed here (host-side, real path) so assembly stays pure: a btrfs-backed
+        // store makes the in-cage nix leave the inherited `btrfs.compression`
+        // attribute in place, else its canonicalisation aborts a build.
+        let on_btrfs = crate::storage::on_btrfs(&src);
+        binds::NixMount {
+            src,
+            writable: true,
+            on_btrfs,
+        }
     };
 
     // Mise-backed tools are equipped in-cage at launch rather than host-provisioned, in two

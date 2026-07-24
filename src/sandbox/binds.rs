@@ -156,6 +156,11 @@ pub(crate) struct NixMount {
     /// Whether `/nix` is bound read-write (a per-project store) or read-only (the
     /// shared store).
     pub(crate) writable: bool,
+    /// Whether the backing tree sits on btrfs, where files can inherit the
+    /// `btrfs.compression` attribute that in-cage nix must then leave in place
+    /// (see [`mise_env`]). Probed by the launcher, carried as data so assembly
+    /// stays pure.
+    pub(crate) on_btrfs: bool,
 }
 
 /// The project's overlay onto the base sandbox: the configuration-supplied extra
@@ -532,7 +537,7 @@ fn assemble(
         ),
         ("LANG".to_string(), "C.UTF-8".to_string()),
     ];
-    env.extend(mise_env(paths.mise_project_src.is_some()));
+    env.extend(mise_env(paths.mise_project_src.is_some(), nix.on_btrfs));
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
     }
@@ -772,7 +777,14 @@ command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 ///   seccomp filter denies the mount/namespace syscalls nix's *inner* build
 ///   sandbox would use, so an in-cage build must run without it (the cage is the
 ///   boundary, not nix's inner sandbox); setting it here makes that deterministic
-///   rather than relying on nix's silent fallback. The `NIX_CONFIG` key is on the
+///   rather than relying on nix's silent fallback. A btrfs-backed store
+///   (`store_on_btrfs`, probed by the launcher off the `/nix` mount source) adds a
+///   fourth line, `extra-ignored-acls = btrfs.compression`, mirroring the
+///   host-side invocations: on a compressed btrfs volume every file created under
+///   the per-project store inherits that attribute, and nix's store
+///   canonicalisation — which strips extended attributes — fails with
+///   `Permission denied` on a file the builder already made read-only; ignoring
+///   the attribute keeps in-cage builds working there. The `NIX_CONFIG` key is on the
 ///   untrusted-only env denylist. `MISE_DATA_DIR`/`MISE_SHARED_INSTALL_DIRS` are data
 ///   paths (not code-load paths like `NIX_LD`), so — like `MISE_EXPERIMENTAL`/`MISE_YES`
 ///   — they are not denylisted: an untrusted `[env]` override only mispoints the
@@ -781,7 +793,14 @@ command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 /// `per_project_primary` selects the split: `true` for a global app (primary moves
 /// per-project, app-global installs become the read-only fallback), `false` otherwise
 /// (single app-global-home pool, the historical wiring).
-fn mise_env(per_project_primary: bool) -> Vec<(String, String)> {
+fn mise_env(per_project_primary: bool, store_on_btrfs: bool) -> Vec<(String, String)> {
+    let mut nix_config = "extra-experimental-features = nix-command flakes\n\
+                          sandbox = false\n\
+                          filter-syscalls = false"
+        .to_string();
+    if store_on_btrfs {
+        nix_config.push_str("\nextra-ignored-acls = btrfs.compression");
+    }
     let mut env = vec![
         (
             "MISE_DATA_DIR".to_string(),
@@ -793,13 +812,7 @@ fn mise_env(per_project_primary: bool) -> Vec<(String, String)> {
         ),
         ("MISE_EXPERIMENTAL".to_string(), "1".to_string()),
         ("MISE_YES".to_string(), "1".to_string()),
-        (
-            "NIX_CONFIG".to_string(),
-            "extra-experimental-features = nix-command flakes\n\
-             sandbox = false\n\
-             filter-syscalls = false"
-                .to_string(),
-        ),
+        ("NIX_CONFIG".to_string(), nix_config),
     ];
     if per_project_primary {
         env.push((
@@ -1266,6 +1279,7 @@ mod tests {
         NixMount {
             src: PathBuf::from("/data/sbx/store/nix"),
             writable: false,
+            on_btrfs: false,
         }
     }
 
@@ -2090,6 +2104,7 @@ mod tests {
         let nix = NixMount {
             src: PathBuf::from("/data/sbx/projects/abc/store/nix"),
             writable: true,
+            on_btrfs: false,
         };
         let overlay = Overlay {
             env: &[],
@@ -2240,7 +2255,7 @@ mod tests {
             env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
         };
 
-        let single = mise_env(false);
+        let single = mise_env(false, false);
         assert_eq!(
             get(&single, "MISE_DATA_DIR"),
             Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}"))
@@ -2250,7 +2265,7 @@ mod tests {
             "a single-pool cage has no shared-install fallback"
         );
 
-        let split = mise_env(true);
+        let split = mise_env(true, false);
         assert_eq!(
             get(&split, "MISE_DATA_DIR"),
             Some(MISE_PROJECT_INCAGE.to_string()),
@@ -2268,6 +2283,30 @@ mod tests {
                 get(&split, k).is_none(),
                 "{k} must stay mise's $HOME-derived default"
             );
+        }
+    }
+
+    #[test]
+    fn a_btrfs_backed_store_makes_in_cage_nix_ignore_the_compression_attribute() {
+        // On a compressed btrfs volume every file created under the per-project store
+        // inherits the `btrfs.compression` attribute, and nix's canonicalisation —
+        // which strips extended attributes — would abort a build on a read-only file.
+        // The flag adds the ignore line; elsewhere the attribute cannot exist and the
+        // line stays out.
+        let nix_config = |on_btrfs: bool| {
+            mise_env(false, on_btrfs)
+                .into_iter()
+                .find(|(k, _)| k == "NIX_CONFIG")
+                .map(|(_, v)| v)
+                .unwrap()
+        };
+        assert!(nix_config(true).contains("extra-ignored-acls = btrfs.compression"));
+        assert!(!nix_config(false).contains("extra-ignored-acls"));
+        // the three posture settings are carried either way
+        for cfg in [nix_config(true), nix_config(false)] {
+            assert!(cfg.contains("extra-experimental-features = nix-command flakes"));
+            assert!(cfg.contains("sandbox = false"));
+            assert!(cfg.contains("filter-syscalls = false"));
         }
     }
 
@@ -2588,6 +2627,7 @@ mod smoke {
         let nix_mount = NixMount {
             src: crate::store::physical_path(&layout, Path::new("/nix")),
             writable: false,
+            on_btrfs: false,
         };
         let spec = build_spec(
             data.path(),
@@ -2673,6 +2713,7 @@ mod smoke {
         let nix_mount = NixMount {
             src: crate::store::physical_path(&layout, Path::new("/nix")),
             writable: false,
+            on_btrfs: false,
         };
 
         // Realise `<flake_ref>#<attr>` and report its logical store path.
@@ -2921,6 +2962,7 @@ mod smoke {
         let nix_mount = NixMount {
             src: store.store_dir().join("nix"),
             writable: true,
+            on_btrfs: false,
         };
         let overlay = Overlay {
             env: &[],
@@ -3094,6 +3136,7 @@ mod smoke {
         let nix_mount = NixMount {
             src: store.store_dir().join("nix"),
             writable: true,
+            on_btrfs: false,
         };
         let overlay = Overlay {
             env: &[],
@@ -3262,6 +3305,7 @@ mod smoke {
         let nix_mount = NixMount {
             src: store.store_dir().join("nix"),
             writable: true,
+            on_btrfs: false,
         };
         let overlay = Overlay {
             env: &[],
@@ -3390,6 +3434,7 @@ mod smoke {
             let nix_mount = NixMount {
                 src: store.store_dir().join("nix"),
                 writable: true,
+                on_btrfs: false,
             };
             let overlay = Overlay {
                 env: &[],
@@ -3530,6 +3575,7 @@ mod smoke {
         let nix_mount = NixMount {
             src: crate::store::physical_path(&layout, Path::new("/nix")),
             writable: false,
+            on_btrfs: false,
         };
         let spec = build_spec(
             data.path(),

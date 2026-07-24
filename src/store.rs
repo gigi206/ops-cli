@@ -774,12 +774,41 @@ pub(crate) fn resolve_git() -> Option<PathBuf> {
 /// Build a daemonless nix invocation against the user-owned store: the daemon is
 /// disabled (`NIX_REMOTE` empty), so nix runs as the invoking user with no
 /// privileged helper, and `--store` points at the user-owned tree. Callers
-/// append the subcommand.
+/// append the subcommand. A store on btrfs additionally carries
+/// [`btrfs_nix_config`]'s setting, so a compressed volume stays buildable.
 pub(crate) fn nix_command(nix: &Path, layout: &Layout) -> Command {
     let mut cmd = Command::new(nix);
     cmd.env("NIX_REMOTE", "");
-    cmd.arg("--store").arg(layout.store_dir());
+    let store_dir = layout.store_dir();
+    if crate::storage::on_btrfs(&store_dir) {
+        cmd.env(
+            "NIX_CONFIG",
+            btrfs_nix_config(std::env::var("NIX_CONFIG").ok().as_deref()),
+        );
+    }
+    cmd.arg("--store").arg(store_dir);
     cmd
+}
+
+/// The nix setting a btrfs-backed store needs, appended to whatever `NIX_CONFIG`
+/// the environment already carries (never replacing it — the caller's own
+/// settings stay in force, ours only extends the list).
+///
+/// `extra-ignored-acls = btrfs.compression`: on a compressed btrfs volume the
+/// mount root carries the `btrfs.compression` attribute, which every file
+/// created beneath inherits. Nix strips extended attributes while canonicalising
+/// a store path, and removing that attribute from a file a builder already made
+/// read-only fails with `Permission denied`, aborting the build (substitutions
+/// survive only because their files are still writable at that instant).
+/// Ignoring the attribute costs nothing: compression is decided when the data is
+/// written, so the store stays compressed either way. `extra-` appends to nix's
+/// compiled default set rather than replacing it.
+fn btrfs_nix_config(inherited: Option<&str>) -> String {
+    const OURS: &str = "extra-ignored-acls = btrfs.compression";
+    match inherited {
+        Some(base) if !base.trim().is_empty() => format!("{base}\n{OURS}"),
+        _ => OURS.to_string(),
+    }
 }
 
 /// Where a `nixpkgs` source was chosen — carried so the same wording reaches the
@@ -1712,6 +1741,63 @@ mod tests {
         assert_eq!(
             args,
             vec![OsStr::new("--store"), OsStr::new("/data/sbx/store")]
+        );
+    }
+
+    /// The `NIX_CONFIG` a [`nix_command`] carries, if any.
+    fn nix_config_of(cmd: &Command) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == OsStr::new("NIX_CONFIG"))
+            .and_then(|(_, v)| v)
+            .and_then(|v| v.to_str())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn nix_command_leaves_nix_config_alone_off_btrfs() {
+        // `/proc` is never btrfs, so the nearest-ancestor filesystem probe is
+        // deterministic here: no accommodation is injected, and whatever
+        // `NIX_CONFIG` the environment carries reaches nix untouched.
+        let layout = Layout::under(Path::new("/proc/sbx-absent-by-construction"));
+        let cmd = nix_command(Path::new("/usr/bin/nix"), &layout);
+        assert_eq!(nix_config_of(&cmd), None);
+    }
+
+    #[test]
+    fn nix_command_ignores_the_compression_attribute_on_a_btrfs_store() {
+        // Needs a real btrfs mount to point the store at; skip where the host has none.
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        let Some(btrfs_mount) = mounts.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            let (_, mnt, kind) = (f.next()?, f.next()?, f.next()?);
+            (kind == "btrfs").then(|| PathBuf::from(mnt))
+        }) else {
+            eprintln!("skipping: no btrfs mount on this host");
+            return;
+        };
+        let layout = Layout::under(&btrfs_mount);
+        let cmd = nix_command(Path::new("/usr/bin/nix"), &layout);
+        let cfg = nix_config_of(&cmd).expect("a btrfs store must carry NIX_CONFIG");
+        assert!(
+            cfg.contains("extra-ignored-acls = btrfs.compression"),
+            "{cfg}"
+        );
+    }
+
+    #[test]
+    fn btrfs_nix_config_appends_to_an_inherited_value_and_stands_alone_without_one() {
+        assert_eq!(
+            btrfs_nix_config(None),
+            "extra-ignored-acls = btrfs.compression"
+        );
+        assert_eq!(
+            btrfs_nix_config(Some("")),
+            "extra-ignored-acls = btrfs.compression"
+        );
+        // the environment's own settings stay in force, first
+        assert_eq!(
+            btrfs_nix_config(Some("substituters = https://example.org")),
+            "substituters = https://example.org\nextra-ignored-acls = btrfs.compression"
         );
     }
 

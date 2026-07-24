@@ -1017,6 +1017,14 @@ pub(crate) fn fs_kind_of_nearest(path: &Path) -> Option<FsKind> {
     }
 }
 
+/// Whether `path` (or, if it does not exist yet, its nearest existing ancestor) sits on
+/// btrfs — the one filesystem where the inherited `btrfs.compression` attribute
+/// [`set_compression`] relies on can exist. Callers scope btrfs-specific accommodations
+/// (nix must leave that attribute in place) to where they can matter at all.
+pub(crate) fn on_btrfs(path: &Path) -> bool {
+    matches!(fs_kind_of_nearest(path), Some(FsKind::Btrfs))
+}
+
 /// Whether the running kernel can mount btrfs.
 ///
 /// `/proc/filesystems` lists only what is built in or already loaded, so a host where btrfs is

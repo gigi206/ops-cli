@@ -210,7 +210,9 @@ pub(crate) fn resolve_userland(
     // (`unshare`/`clone(NEWNS)`, `mount`, `pivot_root`) nix's *inner* build sandbox
     // would use: the cage is the boundary, so an in-cage build runs without that
     // redundant inner sandbox. Forcing it off makes that deterministic instead of
-    // relying on nix's silent `sandbox-fallback`.
+    // relying on nix's silent `sandbox-fallback`. (A btrfs-backed store adds a
+    // fourth setting so nix leaves the inherited compression attribute in place —
+    // see the assembler's `mise_env`.)
     let nix_pkg = realise("nix", "bin/nix", "nix")?;
     // mise, the dev-tool front-end an agent drives to self-equip a project's
     // `nix:` toolchain (`mise install nix:<pkg>`) into the project's own writable
