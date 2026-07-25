@@ -71,7 +71,7 @@ pub(crate) fn render_app_imported(
     for line in summary {
         let _ = writeln!(o, "    {line}");
     }
-    let _ = write!(o, "  {dim}launch it with: sbx app{r} {n}{name}{r}");
+    let _ = write!(o, "  {dim}launch it with: sbx app run{r} {n}{name}{r}");
     o
 }
 
@@ -289,7 +289,7 @@ mod tests {
             ),
             "imported app profile 'demo-app' -> /c/demo-app.toml\n  \
              granted posture (trusted by location — honored even on an untrusted project):\n    \
-             command: x\n    network: allowlist\n  launch it with: sbx app demo-app"
+             command: x\n    network: allowlist\n  launch it with: sbx app run demo-app"
         );
         assert_eq!(
             render_app_exported("demo-app", Path::new("/c/out.toml"), &p),
