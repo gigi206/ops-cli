@@ -96,6 +96,83 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`gui = "offscreen"` — a third posture, so a headless browser works without a display (DONE
+  2026-07-25)** (`src/config/{types,mod,schema,view,overrides}.rs` + `src/cli/config.rs` +
+  `src/sandbox/launch.rs` + `src/help.rs` + `docs/guide/configuration/{gui,overrides}.md` +
+  `docs/guide/reference/environment-variables.md` + `profiles/{hermes,hermes-web,hermes-webui,
+  hermes-desktop}.toml` + `profiles/README.md` + `tests/run.rs`; findings
+  `docs/bwrap-hermes-browser-toolset-spike-2026-07-25.md`): the user reported that the caged
+  `hermes` offers **far fewer tools than a standard install**. Traced to Hermes' own gating, not to
+  a sandbox failure: it builds its tool schema from `toolsets._HERMES_CORE_TOOLS` filtered per tool
+  by a `check_fn`, and a failing check **removes the tool from the schema silently** — the model
+  simply never sees it. Measured in a real cage: **16 of 54 tools exposed**, and exactly one group
+  is a genuine cage gap — the **12 `browser_*` tools**, gated on the `agent-browser` CLI being on
+  PATH **and** a Chromium build on disk, neither of which the flake's `#default` output ships (a
+  standard install gets them from the installer's `npm install -g agent-browser && agent-browser
+  install`; the app home was checked for residue — it never was there). Explicitly **not** cage
+  gaps, so not "fixed": `vision_analyze`/`browser_vision` need a resolvable vision provider and
+  `cronjob` needs `HERMES_INTERACTIVE` (both true in a real authenticated interactive session);
+  `web_search`/`web_extract`/`image_generate` are provider-key gated and absent on the user's
+  standard install too; `ha_*`/`kanban_*`/`computer_use`/the desktop panes are gated by design.
+  **The blocker was ours, though:** a browser engine needs two things the hermetic cage lacks, and
+  both were tied to `gui = "wayland"` — **fonts** (without them Chromium starts, can even report a
+  TLS error, but **dies the moment it renders a real page**) and **the egress MITM CA in the cage's
+  NSS db** (Chromium ignores the `CA_FILE_ENV_KEYS` sbx sets and reads its own store → every page
+  `ERR_CERT_AUTHORITY_INVALID`). Shipping `gui = "wayland"` on the CLI/web profiles to get them
+  would hand a **compositor socket** (screencopy + input injection on wlroots/sway/hyprland,
+  threat-model §5a) to agents that never draw a window — indefensible for `hermes-web`/`hermes-webui`,
+  which serve their UI to the HOST browser. So `GuiPolicy` grew a third posture **`Offscreen`**,
+  ordered by exposure **`none` < `offscreen` < `wayland`**, and one predicate **`GuiPolicy::renders()`**
+  (`Offscreen | Wayland`) now drives the three in-cage rendering prerequisites — the font layer
+  (provision **and** the `FONTCONFIG_FILE` bind, which lived **nested inside the Wayland block** and
+  had to be split out — the bug the first live run caught), the catrust CA import (still ∧ a
+  filtering allowlist), and the netns `dummy0` online signal — while everything that exposes the
+  host stays matched on `Wayland` alone (compositor socket, guidata/GTK, dbus portal, the pty
+  double-Ctrl+C force-quit for a window that ignores SIGINT). `offscreen` grants **no host access at
+  all** but rides the same trusted-only gate, so the postures stay one ordered field; `validate_gui`
+  still fail-closes an unknown string, and a one-shot `--gui`/`SBX_GUI` typo stays fatal
+  (verified live: exit refuses with `expected "none", "offscreen" or "wayland"`).
+  **Naming was the user's call** (they pushed back on the first proposal): a dedicated
+  `browser = true` field would duplicate the whole gating/merge/override/provenance machinery and
+  misreads as "sbx installs a browser"; `"headless"` was rejected as ambiguous with `"none"`.
+  **Profiles (all four, default-on — the user's call over a commented opt-in):** `nix:chromium` +
+  `mise:npm:agent-browser` + `nix:nodejs` (mise's npm backend needs a node in the cage — the flake's
+  own bundled node is only on the `hermes` wrapper's PATH) + `AGENT_BROWSER_ARGS =
+  "--no-sandbox,--disable-dev-shm-usage"` (**mandatory**: M4.1 seccomp blocks `clone(CLONE_NEWUSER)`,
+  so Chromium's SUID/userns sandbox aborts the process — acceptable because bwrap + seccomp + the
+  empty netns IS the boundary; the nixpkgs chromium wrapper does **not** honor `CHROMIUM_FLAGS`, so
+  that route does not exist) + `{GET} registry.npmjs.org` with the audit POST muted; `gui =
+  "offscreen"` on the three headless ones, `hermes-desktop` already carrying it via `wayland`.
+  **No `cmd` wrapper**: agent-browser locates Chromium on PATH by itself (verified both bare and via
+  `AGENT_BROWSER_EXECUTABLE_PATH=chromium`), so the profiles stay declarative. mise's
+  `--ignore-scripts` is not merely harmless but **wanted** — agent-browser ships prebuilt Rust
+  binaries whose JS shim self-`chmod`s them, and skipping postinstall skips the Playwright browser
+  download nixpkgs' Chromium replaces. **Everything was measured, not assumed** (spike-first): the
+  registry probe in a cage, `ls <hermes-agent-env>/bin` for the missing CLI, an A/B/C/D matrix over
+  {gui, CA, fonts} that isolated the two by-products, and the recipe proven live end-to-end.
+  **Live-proven:** with `gui = "offscreen"` alone (no compositor, no hand-rolled certutil, no host
+  font bind) a real `sbx run` gives `FONTCONFIG_FILE=/opt/sbx/fonts.conf`, `agent-browser open
+  https://example.com` → `✓ Example Domain` and `snapshot` → a real accessibility tree, through the
+  empty-netns MITM allowlist; and the same cage with the hermes flake added reports
+  `check_browser_requirements: True` with **9 `browser_*` tools back in the schema** (16 → 25 total).
+  **Tests:** 2 net-new unit (`the_offscreen_gui_posture_resolves_and_is_gated_like_wayland`,
+  `only_the_drawing_gui_postures_render`) + 1 net-new run.rs e2e
+  (`an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display` — teeth on **both** halves
+  in one launch: the DejaVu store path from `fc-list` plus the bound `/opt/sbx/fonts.conf`, and the
+  host compositor socket **absent** from the cage, so a refactor that re-couples the display to
+  `renders()` fails here; the first cut asserted `WAYLAND_DISPLAY=[]`, which the advisor caught as
+  toothless — the cage's env passthrough is `TERM`/`LANG` only, so it holds under `none` too).
+  **1315 unit + config/help integration green**, fmt/clippy `-D warnings` clean, musl static build
+  verified, **std-only** (no new dep). **Honest scope — the standing live gate:** `sbx app run
+  hermes` with the user's own provider credentials, checking `/tools` in a real session and driving
+  one `browser_navigate`, is NOT done (it needs their auth); what is proven is the registry gate
+  flipping and the browser stack working end-to-end in the cage. `browser_vision` stays absent until
+  a vision provider resolves (`check_browser_vision_requirements` = browser ∧ vision), exactly like
+  `vision_analyze` — auth-gated, not broken. **Cost, measured:** chromium-unwrapped 620 MB unpacked
+  (larger closure), nss-tools 46 MB, nodejs ~10 MB — paid per project store on the first launch.
+  **Deliberate residual:** the agent browses **only** the profile's allowlist, so a real site's
+  subresources are refused unless opened with `sbx net allow -a <app> <url>`; browsing is not opened
+  wholesale. See [[gui-offscreen-posture]], [[hermes-browser-toolset]], [[gui-netns-dummy-online]].
   **Supervised-session teardown — sweep the cage's scope cgroup, not just the ppid subtree (DONE
   2026-07-17)** (`src/session.rs`): `sbx session stop` (and every teardown) could leave a supervised
   cage's process running — an orphaned agent/`sleep` — surfacing as an **intermittent** failure of

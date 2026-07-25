@@ -92,14 +92,17 @@ pub(crate) struct RawConfig {
     /// from the global config or a trusted project, ignored from an untrusted one — an untrusted
     /// project may neither forge nor loosen the enforcement of its own agent.
     pub(crate) proc: Option<ProcField>,
-    /// The sandbox's GUI posture: `"none"` (the default — no display access) or `"wayland"`
-    /// (bind the host's Wayland compositor socket read-only so a graphical app can map a
-    /// window). A security field — honored from the global config or a trusted project,
-    /// ignored from an untrusted one: exposing a compositor socket is a confidentiality and
-    /// integrity choice (clipboard access, and on some compositors screen capture or input
-    /// injection) an untrusted project may not make. X11 is deliberately never offered — an
-    /// X client can snoop and drive every other window, which Wayland's per-client isolation
-    /// prevents on a well-behaved compositor.
+    /// The sandbox's GUI posture: `"none"` (the default — no display access), `"offscreen"`
+    /// (provision the fonts and — under a filtering egress posture — the NSS CA import a browser
+    /// engine needs to render and to trust the proxy, without exposing any display), or
+    /// `"wayland"` (all of that, plus bind the host's Wayland compositor socket read-only so a
+    /// graphical app can map a window). A security field — honored from the global config or a
+    /// trusted project, ignored from an untrusted one: exposing a compositor socket is a
+    /// confidentiality and integrity choice (clipboard access, and on some compositors screen
+    /// capture or input injection) an untrusted project may not make. `"offscreen"` grants no
+    /// host access at all, but rides the same gate so the postures stay one ordered field.
+    /// X11 is deliberately never offered — an X client can snoop and drive every other window,
+    /// which Wayland's per-client isolation prevents on a well-behaved compositor.
     pub(crate) gui: Option<String>,
     /// Whether to open hardware-accelerated GPU rendering for the cage (`gpu = true`). sbx
     /// provisions mesa's DRI drivers into its own store and points the cage's libgbm/libEGL at

@@ -1389,6 +1389,114 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
 }
 
 #[test]
+fn an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display() {
+    // `gui = "offscreen"` is the posture of a cage that renders but never maps a window (a headless
+    // browser engine): it must carry the font layer — a browser dies mid-render without it — while
+    // binding no compositor socket at all. Both halves are asserted in one launch, which is the
+    // point: the font wiring and the display wiring live in the same block of the launch path, so a
+    // regression that re-couples them fails here. Proven with the cage's network CUT
+    // (`network = "none"`): a hermetic cage carries no fonts and no `/etc/fonts`, so `fc-list` can
+    // only list the hole's seeded DejaVu by store path; and `WAYLAND_DISPLAY` must be unset, which
+    // separates this posture from `wayland` (where the same font assertion also holds). Skips
+    // (never fails) when the host cannot sandbox or the cache is unreachable.
+    let project = TmpDir::new("gui-off-proj");
+    let data = TmpDir::new("gui-off-data");
+    let state = TmpDir::new("gui-off-state");
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "gui = \"offscreen\"\nnetwork = \"none\"\n\
+         [packages]\nfontconfig = \"nix:fontconfig\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping gui-offscreen e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping gui-offscreen e2e: the binary cache is unreachable");
+        return;
+    }
+
+    // `gui` and `[packages]` are trusted-only, so trust the project before launching.
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // The display half is asserted on the BIND, not on `WAYLAND_DISPLAY`: the cage's env
+    // passthrough carries `TERM`/`LANG` only, so the host variable is absent under every posture
+    // and testing it would have no teeth. The compositor socket, when the display hole binds it,
+    // appears in the cage at its own host path — so probing that exact path distinguishes
+    // `offscreen` from `wayland`. Only meaningful on a host that has a compositor; without one
+    // there is no socket either way, and the fonts half still carries the test.
+    let socket = match (
+        std::env::var("XDG_RUNTIME_DIR").ok(),
+        std::env::var("WAYLAND_DISPLAY").ok(),
+    ) {
+        (Some(dir), Some(disp)) if !dir.is_empty() && !disp.is_empty() => {
+            Some(std::path::Path::new(&dir).join(disp).display().to_string())
+        }
+        _ => None,
+    };
+    let probe_socket = socket.clone().unwrap_or_else(|| "/nonexistent".to_string());
+    let out = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "fc-list; \
+                 [ -e /opt/sbx/fonts.conf ] && echo FONTS-CONF-BOUND; \
+                 [ -e '{probe_socket}' ] && echo DISPLAY-BOUND || echo DISPLAY-ABSENT"
+            ),
+        ],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "the offscreen probe failed in the cage: {log}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("/nix/store/") && stdout.contains("dejavu-fonts"),
+        "an offscreen cage did not get the hole's provisioned DejaVu fonts by store path: {log}"
+    );
+    // Teeth on the wiring itself, not only on its effect: the generated fontconfig is bound in.
+    assert!(
+        stdout.contains("FONTS-CONF-BOUND"),
+        "the offscreen cage has no bound fontconfig at /opt/sbx/fonts.conf: {log}"
+    );
+    // The other half: renders, but no display. A future refactor that re-couples the compositor
+    // socket to the rendering predicate fails right here.
+    if socket.is_some() {
+        assert!(
+            stdout.contains("DISPLAY-ABSENT"),
+            "an offscreen cage was handed the host compositor socket: {log}"
+        );
+    }
+}
+
+#[test]
 fn a_trusted_dbus_stands_up_an_in_cage_portal() {
     // `dbus = true` under `gui = "wayland"` stands up a *private* session bus inside the cage
     // carrying sbx's own `xdg-desktop-portal` with the GTK backend, so a Chromium/Electron app's

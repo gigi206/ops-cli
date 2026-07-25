@@ -632,13 +632,24 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         }
     }
 
-    // The GUI posture — shown only when opened (`wayland`), so a non-GUI config stays uncluttered.
-    if matches!(view.gui, GuiView::Wayland) {
-        let _ = writeln!(
-            o,
-            "  {h}gui:{r} wayland {dim}(exposure depends on your compositor){r}{}",
-            provenance_tag(view.gui_origin, pal)
-        );
+    // The GUI posture — shown only when opened, so a non-GUI config stays uncluttered. `wayland`
+    // carries the compositor caveat; `offscreen` names what it supplies, since it exposes nothing.
+    match view.gui {
+        GuiView::Wayland => {
+            let _ = writeln!(
+                o,
+                "  {h}gui:{r} wayland {dim}(exposure depends on your compositor){r}{}",
+                provenance_tag(view.gui_origin, pal)
+            );
+        }
+        GuiView::Offscreen => {
+            let _ = writeln!(
+                o,
+                "  {h}gui:{r} offscreen {dim}(fonts + proxy CA, no display){r}{}",
+                provenance_tag(view.gui_origin, pal)
+            );
+        }
+        GuiView::None => {}
     }
 
     // The GPU posture — shown only when opened, so a non-GPU config stays uncluttered.
@@ -899,6 +910,12 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                         "      {dim}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
                     );
                 }
+                Some(GuiView::Offscreen) => {
+                    let _ = writeln!(
+                        o,
+                        "      {dim}gui:{r} offscreen {dim}(fonts + proxy CA, no display){r}"
+                    );
+                }
                 Some(GuiView::None) => {
                     let _ = writeln!(o, "      {dim}gui:{r} none");
                 }
@@ -1147,6 +1164,12 @@ fn render_app_detail(
             let _ = writeln!(
                 o,
                 "  {h}gui:{r}     wayland {dim}(exposure depends on your compositor){r}{gui_tag}"
+            );
+        }
+        GuiView::Offscreen => {
+            let _ = writeln!(
+                o,
+                "  {h}gui:{r}     offscreen {dim}(fonts + proxy CA, no display){r}{gui_tag}"
             );
         }
         GuiView::None => {

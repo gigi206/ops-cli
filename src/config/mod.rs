@@ -3057,11 +3057,12 @@ fn validate_gui(
 ) -> Option<GuiPolicy> {
     match value.as_str() {
         "none" => Some(GuiPolicy::None),
+        "offscreen" => Some(GuiPolicy::Offscreen),
         "wayland" => Some(GuiPolicy::Wayland),
         other => {
             warnings.push(format!(
                 "{source_label}: ignoring unknown gui posture `{other}` \
-                 (expected \"none\" or \"wayland\")"
+                 (expected \"none\", \"offscreen\" or \"wayland\")"
             ));
             None
         }

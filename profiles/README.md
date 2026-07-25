@@ -28,7 +28,8 @@ with `sbx app export <name>`.
 | `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
 | `claude-desktop`  | `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | `api.anthropic.com` / `claude.ai` (account) |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
-| `hermes`          | `flake:…/hermes-agent#default` (built in-cage) | `openrouter.ai` (BYOK) / Nous account |
+| `hermes`          | `flake:…/hermes-agent#default` (built host-side) | `openrouter.ai` (BYOK) / Nous account |
+| `hermes-webui`    | `flake:…/nesquena/hermes-webui#default` + `…/hermes-agent#default` (community web UI + `forward`) | `openrouter.ai` (BYOK) / Nous account |
 | `vibe`            | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, `nix:chromium`, `gui = "wayland"`) | `console.mistral.ai` (Mistral account SSO, in-cage browser) / `api.mistral.ai` (BYOK) |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
 | `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
@@ -166,15 +167,35 @@ can only reach the provider you listed.
 > (unlike the native-binary `cline`/`droid`), so it needs the `nix:nodejs` runtime at run time, not
 > only to install.
 >
-> The three `hermes` profiles (`hermes` CLI, `hermes-web`, `hermes-desktop`) build the tool from its
-> **nix flake** — `flake:github:NousResearch/hermes-agent#default` for the CLI and web dashboard,
-> `#desktop` for the Electron app — so `sbx upgrade flake` rolls them. The flake output bundles the
+> The `hermes` profiles (`hermes` CLI, `hermes-web`, `hermes-desktop`, and the community
+> `hermes-webui`) build the tool from its **nix flake** — `flake:github:NousResearch/hermes-agent#default`
+> for the CLI, the web dashboard and the community UI's agent, `#desktop` for the Electron app — so
+> `sbx upgrade flake` rolls them. The flake output bundles the
 > Python agent (uv2nix), the node TUI/web front-ends, and every extra in one self-wiring package
 > (it sets `HERMES_NODE`/`HERMES_TUI_DIR`/`HERMES_WEB_DIST`, and `#desktop` wires the Python backend
-> via `HERMES_DESKTOP_HERMES`). Cost: a multi-minute, ~2 GiB in-cage `nix build` on the first launch
-> (its PyPI + npm source fetches ride each profile's allowlist), warm and offline after. **These
-> flake migrations are live-pending** — the config resolves (covered by the shipped-profiles test),
-> but the heavy in-cage build + a real dashboard/desktop run are the standing live validation.
+> via `HERMES_DESKTOP_HERMES`). Cost: a multi-minute, ~2 GiB `nix build` on the first launch. A remote
+> `flake:` ref builds **host-side** into sbx's shared store (like `nix:`) and is seeded per project, so
+> the build uses the HOST network and is *not* subject to a profile's allowlist — which governs only
+> what the running agent may reach — and the one build is shared across all four profiles. The
+> `#default` **build is proven live** (realized host-side, then run in a cage), and `hermes-webui` was
+> run end-to-end on it; **a real `hermes` CLI, dashboard, and desktop run remain the standing live
+> validation**, as does `#desktop`'s own build.
+>
+> All four also carry Hermes' **browser toolset** (its 12 `browser_*` tools). Hermes gates those on
+> the `agent-browser` CLI and a Chromium build both being present, and silently drops them from the
+> model's tool schema otherwise — which is what a standard install's
+> `npm install -g agent-browser && agent-browser install` supplies. The profiles declare both
+> (`mise:npm:agent-browser` + `nix:chromium`, plus `nix:nodejs` for mise's npm backend) and set
+> `AGENT_BROWSER_ARGS = "--no-sandbox,…"`, which is mandatory because Chromium's own userns sandbox
+> cannot start under sbx's seccomp denylist. The headless profiles additionally set
+> `gui = "offscreen"`: a browser engine needs fonts (without them Chromium dies mid-render) and the
+> egress proxy's CA in the cage's NSS store (it ignores the CA-file env vars), and that posture
+> supplies exactly those two without exposing any display — `hermes-desktop` already gets them from
+> `gui = "wayland"`. Proven live in a real cage: `check_browser_requirements: True` and 9 `browser_*`
+> tools back in the schema (`browser_vision` additionally needs a vision provider, like
+> `vision_analyze`). Chromium is heavy (~620 MB unpacked); drop those packages and the `offscreen`
+> posture if you do not want the browser tools. The agent still browses **only** what the profile's
+> allowlist allows — a page on any other host is refused, subresources included.
 >
 > `opencode-web` and `opencode-desktop` are the two **graphical** ways to run opencode under sbx,
 > both proven live. `opencode-web` runs opencode's `web` server headless in the cage and exposes it
@@ -209,7 +230,8 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `opencode-desktop` | `deb:…/releases/latest/download/opencode-desktop-linux-amd64.deb` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `claude-desktop` | `deb:apt:…/apt/stable/dists/stable/main/binary-amd64/Packages` | Anthropic's official prebuilt `.deb` (Electron), autoPatchelf'd host-side — tracks the apt index's newest version (`sbx upgrade deb`) |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
-| `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix + node front-ends), built in-cage |
+| `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix + node front-ends), built host-side |
+| `hermes-webui`| `flake:github:nesquena/hermes-webui#default` (+ `…/hermes-agent#default`) | the community WebUI's own upstream flake, plus the same agent flake it runs in-process — both built host-side |
 | `vibe`        | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`) | Mistral PyPI wheel (via uv) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
@@ -238,19 +260,21 @@ A nixpkgs attribute is still available as `nix:<attr>` (provisioned host-side, s
 offline-reusable) — use it for stable substrate tools where freshness does not matter.
 
 A third backend, **`flake:<ref>`**, packages a tool that ships **only as a nix flake** — no
-single release binary and no nixpkgs attribute (e.g. a uv2nix Python agent). sbx
-builds the flake **in-cage** with `nix build` into the project's own store; the first launch
-builds it (network + minutes — the build's own fetch hosts must be in `allow`), and later launches
-reuse the warm build **offline**. Like `mise:`, the flake reference **floats** for now —
-a `flake:` pin and an `sbx upgrade` roll-forward are planned, not yet built. Note a flake build
-runs under the cage's egress posture: a build step that fetches with its **own** client (e.g.
-`bun install`) rather than through nix's fetcher may not honour the proxy / MITM CA under an
-allowlist (for such a tool, prefer its release-binary `mise:` backend — that is exactly how
-`kilocode` is equipped here, after its `flake:` source build hit this very wall).
+single release binary and no nixpkgs attribute (e.g. a uv2nix Python agent). sbx builds a remote
+`flake:` ref **host-side** with `nix build` into its shared store (like `nix:`) and seeds it per
+project, so one build serves every project; the first launch builds it (network + minutes), and
+later launches reuse it **offline**. Because the build runs host-side it uses the **host** network:
+its fetch hosts do *not* need to be in `allow`, which governs only what the running tool may reach.
+A floating ref freezes at its first build until **`sbx upgrade flake`** re-resolves and pins it.
+That host-side build also removes an old wall: a build step fetching with its **own** client (e.g.
+`bun install`) rather than through nix's fetcher no longer has to honour the cage proxy / MITM CA.
+(`kilocode` is nonetheless equipped from its release binary via `mise:` — its upstream flake build
+was broken independently of that.)
 
 When the flake is one you author yourself, write the whole `flake.nix` **inline** in a
-`[flakes.<name>]` table instead of hosting a separate repo — same in-cage build and read-only
-staging as `flake:`, but the out-link is keyed by the source's content hash, so editing the flake
+`[flakes.<name>]` table instead of hosting a separate repo. Unlike a remote `flake:` ref, an inline
+flake builds **in-cage** (its source is local content), so that first build does run under the
+cage's egress posture; the out-link is keyed by the source's content hash, so editing the flake
 in the profile rebuilds. See [inline flakes](../docs/guide/configuration/packages.md). An inline
 flake floats, so pin its inputs inside the `flake.nix`.
 

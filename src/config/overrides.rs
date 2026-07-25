@@ -117,7 +117,7 @@ pub(crate) struct CliOverrides {
     pub(crate) env: Vec<String>,
     /// `--net <posture|allow=…|deny=…>` — the network posture (last wins).
     pub(crate) net: Vec<String>,
-    /// `--gui <none|wayland>` — the display posture (last wins).
+    /// `--gui <none|offscreen|wayland>` — the display posture (last wins).
     pub(crate) gui: Vec<String>,
     /// `--proc <off|observe|enforce|ask>` — the process/exec posture, a bare mode (last wins). The
     /// full `[proc]` table with `allow`/`deny` lists is set through a `--config` blob.

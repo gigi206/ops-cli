@@ -16,9 +16,11 @@
 # front-ends, the web dashboard assets (`web_dist`), and every optional extra (web/voice/edge-tts/
 # mcp/…), all wired by the derivation's own wrapper (it sets HERMES_WEB_DIST / HERMES_TUI_DIR /
 # HERMES_NODE) — so the dashboard's server AND its `/chat` node terminal work with no manual
-# `nix:nodejs`/`HERMES_TUI_DIR` plumbing. sbx builds the flake IN-CAGE with `nix build`: the FIRST
-# launch is a multi-minute, ~2 GiB build (its PyPI + npm source fetches ride the allowlist below,
-# through nix's fetcher); later launches reuse the warm build offline.
+# `nix:nodejs`/`HERMES_TUI_DIR` plumbing. sbx builds a remote `flake:` ref HOST-SIDE with `nix build`
+# (like `nix:`) into its shared store, then seeds it per project: the FIRST launch is a multi-minute,
+# ~2 GiB build whose PyPI + npm source fetches use the HOST network — they are NOT subject to the
+# cage's allowlist below, which governs only what the running agent may reach. Later launches reuse
+# the warm build, which is shared with the other hermes profiles.
 #
 # CREDENTIAL POSTURE — identical to the CLI profile. Hermes is BYOK and multi-provider; this
 # template keys it to OpenRouter (Hermes' default — one key, hundreds of models, OpenAI-
@@ -57,14 +59,34 @@ forward = [9119]
 # `forward`): written after a `[table]` header, TOML would fold it into that table and drop it.
 audio = true
 
+# BROWSER TOOLSET — `gui = "offscreen"` is what makes Hermes' 12 `browser_*` tools (navigate,
+# snapshot, click, type, press, scroll, back, console, get_images, vision, cdp, dialog) appear. Hermes
+# gates them on `agent-browser` being on PATH AND a Chromium build being on disk; when either is
+# missing it drops them from the model's tool schema, which is why a cage without them silently
+# offers fewer tools than a standard install (whose installer runs `npm install -g agent-browser &&
+# agent-browser install`). The two packages below supply both — but a browser engine also needs two
+# things the hermetic cage lacks, and that is this posture: fonts (without them Chromium dies the
+# moment it renders a real page) and the egress proxy's CA in the cage's NSS store (Chromium reads
+# its own store, not the CA-file env vars sbx sets, so every page would fail
+# ERR_CERT_AUTHORITY_INVALID under the allowlist). It renders OFF-SCREEN: no window, no compositor
+# socket, no host access at all. A trusted-only security field, and it must stay a TOP-LEVEL key:
+# written after a `[table]` header, TOML would fold it into that table and silently drop it. Drop
+# this line and the two packages if you do not want the browser tools.
+#
+# Note what the sandbox does NOT change: the browser reaches only what the allowlist below allows, so
+# a page on any other host is refused (and its subresources with it — a real site pulls from many
+# hosts). The proxy names what it blocked, so open a site you actually want with
+# `sbx net allow -a hermes-web <url>`. This is the deliberate posture: browsing is not opened wholesale.
+gui = "offscreen"
+
 [packages]
-# Hermes via the flake's `#default` output, built in-cage — so `sbx upgrade flake` rolls it forward.
+# Hermes via the flake's `#default` output, built host-side — so `sbx upgrade flake` rolls it forward.
 # One package supplies the interpreter, the node runtime, the web dashboard assets, the `/chat` tab's
 # embedded TUI, and every optional extra — so there is no separate `nix:uv`/`nix:python`/`nix:nodejs`
 # and no launch-time `pip install`, and the `/chat` node terminal that used to need a manual
 # `nix:nodejs` + `HERMES_TUI_DIR` sentinel now works natively (the derivation's wrapper sets both).
 # Trusted-only [packages]; this profile is trusted by location once imported. First launch builds it
-# (~2 GiB, minutes); the build's PyPI + npm source fetches ride the allowlist below.
+# (~2 GiB, minutes) over the HOST network, outside the cage's allowlist.
 #
 # The `#default` build bundles the `full` extra set (voice, edge-tts, exa, firecrawl, mcp, and the
 # chat-platform / cloud SDKs), so every dashboard feature is available — heavier than the old curated
@@ -73,6 +95,17 @@ audio = true
 # below (see the voice entries); a host the proxy refuses shows in `sbx net log -a hermes-web`, add
 # it with `sbx net allow -a hermes-web <url>`.
 hermes = "flake:github:NousResearch/hermes-agent#default"
+# The browser toolset (see `gui = "offscreen"` above). `agent-browser` is Hermes' own browser-driver
+# CLI: a self-contained Rust binary shipped in its npm tarball, so mise's `--ignore-scripts` install
+# is not merely harmless but wanted — it skips the postinstall that would otherwise download a
+# Playwright browser, which nixpkgs' Chromium replaces. `nodejs` is required because mise's npm
+# backend needs a node in the cage (the flake's own bundled node is only on the `hermes` wrapper's
+# PATH, not the cage's). Chromium is HEAVY — ~620 MB unpacked, a larger closure — and lands in the
+# project store on the first launch. agent-browser finds Chromium on PATH by itself; point it
+# elsewhere with `AGENT_BROWSER_EXECUTABLE_PATH` if you ever need to.
+nodejs = "nix:nodejs"
+chromium = "nix:chromium"
+agent-browser = "mise:npm:agent-browser"
 
 [network]
 mode = "deny"
@@ -81,8 +114,16 @@ mode = "deny"
 # proxy refuses link-local/metadata addresses by construction (SSRF guard) — the verdict is
 # unchanged, this only drops the noisy denied line from the default `sbx net log` (SELinux
 # dontaudit semantics). Still visible via `sbx net log --all`.
-mute = ["169.254.169.254"]
+mute = [
+    "169.254.169.254",
+    # npm's audit POST on every install: refused anyway, just kept out of the default log.
+    "https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
 allow = [
+    # The browser toolset's `agent-browser` CLI, fetched from npm at launch (mise's npm backend
+    # installs in-cage, unlike the host-side `flake:` build). The audit POST is noisy and
+    # non-essential, so it is muted rather than allowed.
+    "{GET} https://registry.npmjs.org",
     # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter;
     # with the NousResearch account login instead (no BYOK key set — the shipped default), the
     # model traffic goes to the account's own API: portal is the OAuth token endpoint, and
@@ -111,19 +152,15 @@ allow = [
     # and it would connect directly and fail DNS in the empty netns); and the audio hole's Python shim
     # points certifi at sbx's CA, so edge-tts (which pins certifi) trusts the MITM. Live-verified.
     "{GET,WS} https://speech.platform.bing.com",
-    # Build-time (the in-cage `nix build` of the flake): the Python wheels + index for uv2nix, and
-    # the npm registry for the node TUI/web front-ends — all fetched through nix's fetcher.
-    "{GET} https://files.pythonhosted.org",
-    "{GET} https://pypi.org",
-    "{GET} https://registry.npmjs.org",
-    # The flake build fetches the hermes-agent repo over git smart-HTTP. Its ref-discovery GET
-    # (`…/info/refs`) already rides the built-in `{GET,HEAD} github.com`; only the fetch negotiation
-    # is a POST, so open EXACTLY that one endpoint — POST-only, this repo only (never a push, never
-    # another repo, never the rest of github). If the build ever git-fetches another path the proxy
-    # names it; add it the same scoped way.
-    "{POST} https://github.com/NousResearch/hermes-agent.git/git-upload-pack",
-    # (cache.nixos.org + codeload/*.githubusercontent — the nix binary cache + tarball hosts — are
-    # already in sbx's built-in nix-cache allow-set, so they need no entry here.)
+    # (No build-time entries: a remote `flake:` ref builds HOST-SIDE, over the host network, so the
+    # build's own fetches — the PyPI wheels for uv2nix, the npm registry for the node front-ends, the
+    # git smart-HTTP fetch of the hermes-agent repo, the nix binary cache — never pass through this
+    # allowlist. Runtime residual, left closed on purpose: installing an OPTIONAL MCP or skill
+    # (`hermes mcp install …`) DOES fetch from inside the cage, and each catalog manifest picks its
+    # own mechanism — `npx -y <pkg>` hits registry.npmjs.org, a uvx/venv server hits PyPI, and a
+    # `install: {type: git}` manifest hits github.com. Those are refused by default rather than
+    # pre-opened; the proxy names the host it blocked, so open just the one you need with
+    # `sbx net allow -a hermes-web <url>`. A remote-HTTP MCP (e.g. Linear's) needs its own host too.)
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.
@@ -131,6 +168,12 @@ allow = [
 # placeholder lets Hermes start and issue the request, and the proxy substitutes the real key
 # on the wire to openrouter.ai.
 [env]
+# Flags agent-browser passes to the Chromium it launches. `--no-sandbox` is MANDATORY: Chromium's own
+# SUID/userns sandbox cannot come up in the cage (sbx's seccomp denylist blocks
+# `clone(CLONE_NEWUSER)`), so without it the browser aborts at startup and every browser tool fails.
+# Dropping Chromium's inner sandbox is acceptable here because bubblewrap + seccomp + the empty netns
+# IS the boundary. `--disable-dev-shm-usage` keeps it off the cage's small /dev/shm.
+AGENT_BROWSER_ARGS = "--no-sandbox,--disable-dev-shm-usage"
 # No HERMES_TUI_DIR needed — the flake's `#default` wrapper sets it (and HERMES_NODE / HERMES_WEB_DIST)
 # to the bundled TUI/web assets, so the `/chat` node terminal works out of the box.
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"

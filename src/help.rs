@@ -80,7 +80,7 @@ const PAGES: &[Page] = &[
                 "--net <posture>",
                 "one-shot network posture: none | shared | ask | allow=h1,h2 | deny=h1,h2",
             ),
-            ("--gui <none|wayland>", "one-shot display posture"),
+            ("--gui <none|offscreen|wayland>", "one-shot display posture"),
             (
                 "--proc <off|observe|enforce|ask>",
                 "one-shot process/exec posture (a bare mode; --config sets the allow/deny lists)",

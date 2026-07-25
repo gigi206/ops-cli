@@ -2444,7 +2444,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         crate::diag::warn(warning);
     }
 
-    let font_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+    let font_layer = if prep.cfg.gui.renders() {
         super::fonts::provision(&prep.nix, &prep.layout, &prep.nixpkgs).ok()
     } else {
         None
@@ -3554,12 +3554,12 @@ fn build(
     // project store and the cage reads the fonts through `/nix`. Best-effort, like the display
     // socket below: a font fetch that fails (no network on a first launch) warns and the app
     // runs without fonts rather than failing the launch.
-    let font_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+    let font_layer = if prep.cfg.gui.renders() {
         match super::fonts::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
             Ok(layer) => Some(layer),
             Err(e) => {
                 crate::diag::warn(&format!(
-                    "`gui = \"wayland\"` but the font set could not be provisioned \
+                    "this `gui` posture renders but the font set could not be provisioned \
                      ({e}) — text may not render"
                 ));
                 None
@@ -3666,23 +3666,25 @@ fn build(
         ))
     });
 
-    // CA trust for a Chromium/Electron GUI app under a filtering posture: Chromium ignores the
+    // CA trust for a Chromium/Electron engine under a filtering posture: Chromium ignores the
     // CA-file env vars sbx sets and reads its own NSS db, so under the egress MITM it rejects
-    // sbx's per-session CA and a graphical app's UI cannot load. When the cage is BOTH `gui =
-    // "wayland"` AND a filtering allowlist, provision `certutil` (part of the GUI hole, like the
-    // fonts) so the command wrap below can import the bound CA into the cage's NSS db. Gated to
-    // exactly those cages — a CLI tool needs nothing (its env-reading TLS already trusts the CA),
-    // and `shared`/`none` has no MITM CA. Best-effort: a provisioning failure warns and the app
-    // runs (and fails its own HTTPS) rather than blocking the launch.
-    let ca_trust = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
+    // sbx's per-session CA and every page fails to load. When the cage BOTH renders (`gui =
+    // "wayland"` for a window, `"offscreen"` for a headless browser) AND filters egress,
+    // provision `certutil` (part of the rendering hole, like the fonts) so the command wrap below
+    // can import the bound CA into the cage's NSS db. Gated to exactly those cages — a plain CLI
+    // tool needs nothing (its env-reading TLS already trusts the CA), and `shared`/`none` has no
+    // MITM CA. Best-effort: a provisioning failure warns and the app runs (and fails its own
+    // HTTPS) rather than blocking the launch.
+    let ca_trust = if prep.cfg.gui.renders()
         && matches!(prep.cfg.network, crate::config::NetworkPolicy::Allowlist(_))
     {
         match super::catrust::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
             Ok(ct) => Some(ct),
             Err(e) => {
                 crate::diag::warn(&format!(
-                    "`gui = \"wayland\"` under a network allowlist but certutil could not be \
-                     provisioned ({e}) — a Chromium/Electron app may not trust the egress proxy"
+                    "this `gui` posture renders under a network allowlist but certutil could not \
+                     be provisioned ({e}) — a Chromium/Electron engine will not trust the egress \
+                     proxy"
                 ));
                 None
             }
@@ -4015,6 +4017,38 @@ fn build(
     // bind, whose source path is set by sbx — so these keys need no denylist entry.
     let mut gui_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut gui_env: Vec<(String, String)> = Vec::new();
+
+    // Fonts: bind the generated fontconfig configuration read-only and name it to the cage's
+    // fontconfig. The font *files* were provisioned and seeded above; this points fontconfig at
+    // them so text renders rather than boxes — and a browser engine renders nothing at all
+    // without it (it dies mid-page), which is why this is wired for every posture that draws,
+    // `offscreen` included, not only for a windowed one. Independent of the compositor socket
+    // below and best-effort (a staging failure warns, the app runs without fonts).
+    // `FONTCONFIG_FILE` is fixed by sbx; a project `[env]` could override it (highest
+    // precedence), but that only re-points the agent's own in-cage fontconfig at its own config —
+    // self-sabotage, not an escape (it already controls what runs in the cage) — so the key needs
+    // no denylist entry, exactly like `WAYLAND_DISPLAY`.
+    if let Some(layer) = &font_layer {
+        let conf = super::fonts::fonts_conf_for(layer);
+        match super::fonts::stage(prep.layout.data_dir(), &conf) {
+            Ok(path) => {
+                gui_binds.push(binds::ExtraBind {
+                    src: path,
+                    dest: PathBuf::from(super::fonts::FONTS_CONF_INCAGE),
+                    writable: false,
+                });
+                gui_env.push((
+                    "FONTCONFIG_FILE".to_string(),
+                    super::fonts::FONTS_CONF_INCAGE.to_string(),
+                ));
+            }
+            Err(e) => crate::diag::warn(&format!(
+                "this `gui` posture renders but the font configuration could not be \
+                 staged ({e}) — text may not render"
+            )),
+        }
+    }
+
     if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
         let display = std::env::var("WAYLAND_DISPLAY").ok();
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
@@ -4025,7 +4059,7 @@ fn build(
                     dest: socket,
                     writable: false,
                 });
-                gui_env = env;
+                gui_env.extend(env);
             }
             Ok((socket, _)) => crate::diag::warn(&format!(
                 "`gui = \"wayland\"` but the compositor socket `{}` does not exist — \
@@ -4035,36 +4069,6 @@ fn build(
             Err(reason) => crate::diag::warn(&format!(
                 "`gui = \"wayland\"` but {reason} — running without a display"
             )),
-        }
-
-        // Fonts: bind the generated fontconfig configuration read-only and name it to the
-        // cage's fontconfig. The font *files* were provisioned and seeded above; this points
-        // fontconfig at them so text renders rather than boxes. Independent of the socket
-        // above (a missing display already warned; the fonts are harmless either way) and
-        // best-effort (a staging failure warns, the app runs without fonts). `FONTCONFIG_FILE`
-        // is fixed by sbx; a project `[env]` could override it (highest precedence), but that
-        // only re-points the agent's own in-cage fontconfig at its own config — self-sabotage,
-        // not an escape (it already controls what runs in the cage) — so the key needs no
-        // denylist entry, exactly like `WAYLAND_DISPLAY`.
-        if let Some(layer) = &font_layer {
-            let conf = super::fonts::fonts_conf_for(layer);
-            match super::fonts::stage(prep.layout.data_dir(), &conf) {
-                Ok(path) => {
-                    gui_binds.push(binds::ExtraBind {
-                        src: path,
-                        dest: PathBuf::from(super::fonts::FONTS_CONF_INCAGE),
-                        writable: false,
-                    });
-                    gui_env.push((
-                        "FONTCONFIG_FILE".to_string(),
-                        super::fonts::FONTS_CONF_INCAGE.to_string(),
-                    ));
-                }
-                Err(e) => crate::diag::warn(&format!(
-                    "`gui = \"wayland\"` but the font configuration could not be \
-                     staged ({e}) — text may not render"
-                )),
-            }
         }
 
         // GUI data: point the cage's glib/GTK at the provisioned, seeded schemas + themes via one
@@ -4287,12 +4291,12 @@ fn build(
     // so a graphical agent panel freezes on "No internet" even though proxy egress works. Route the
     // launch through the netns holder (see `super::netns`), which pre-creates the namespace with a
     // black-hole `dummy0` interface so the browser reports online — no egress is opened (the dummy
-    // has no route; all traffic still goes through the proxy on loopback). Gated to Wayland cages,
-    // the only ones running a browser engine, and only when sbx's own path is resolvable, so the
-    // launch never falls back to a cage without `--unshare-net` (which would share the host network).
-    let spec = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
-        && spec.net == NetPolicy::Isolated
-    {
+    // has no route; all traffic still goes through the proxy on loopback). Gated to the rendering
+    // postures, the only ones running a browser engine (a headless `offscreen` engine reads
+    // `navigator.onLine` the same way a windowed one does), and only when sbx's own path is
+    // resolvable, so the launch never falls back to a cage without `--unshare-net` (which would
+    // share the host network).
+    let spec = if prep.cfg.gui.renders() && spec.net == NetPolicy::Isolated {
         match std::env::current_exe() {
             Ok(exe) => spec.with_netns_dummy(super::spec::NetnsDummy {
                 uid: unsafe { libc::getuid() },

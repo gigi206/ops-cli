@@ -386,6 +386,7 @@ pub(crate) fn net_rules_view(
 #[derive(Serialize)]
 pub(crate) enum GuiView {
     None,
+    Offscreen,
     Wayland,
 }
 
@@ -712,6 +713,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     let network = network_view(&resolved.network);
     let gui = match resolved.gui {
         super::GuiPolicy::Wayland => GuiView::Wayland,
+        super::GuiPolicy::Offscreen => GuiView::Offscreen,
         super::GuiPolicy::None => GuiView::None,
     };
     let limits = limits_view(&resolved.limits, &resolved.limits_origin);
@@ -1042,6 +1044,7 @@ fn app_view(
         }),
         gui: app.gui.as_ref().map(|g| match g {
             super::GuiPolicy::Wayland => GuiView::Wayland,
+            super::GuiPolicy::Offscreen => GuiView::Offscreen,
             super::GuiPolicy::None => GuiView::None,
         }),
         gpu: app.gpu,
@@ -1130,6 +1133,7 @@ fn app_detail_view(
     let eff_gui = app.gui.unwrap_or(baseline.gui);
     let gui = match eff_gui {
         super::GuiPolicy::Wayland => GuiView::Wayland,
+        super::GuiPolicy::Offscreen => GuiView::Offscreen,
         super::GuiPolicy::None => GuiView::None,
     };
     let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin);

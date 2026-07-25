@@ -3865,6 +3865,32 @@ fn an_untrusted_project_cannot_close_a_globally_opened_gui() {
 }
 
 #[test]
+fn the_offscreen_gui_posture_resolves_and_is_gated_like_wayland() {
+    // `offscreen` is a real posture, not a typo swallowed by the fail-closed default.
+    let r = resolve_no_plugins(raw_gui("offscreen"), None);
+    assert_eq!(r.gui, GuiPolicy::Offscreen);
+    assert!(r.warnings.is_empty());
+
+    // It rides the same trust gate as every other `gui` value: an untrusted project cannot set it.
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((raw_gui("offscreen"), TrustState::Untrusted)),
+    );
+    assert_eq!(r.gui, GuiPolicy::None);
+    assert_eq!(r.warnings.len(), 1);
+    assert!(r.warnings[0].contains("gui"));
+}
+
+#[test]
+fn only_the_drawing_gui_postures_render() {
+    // The single predicate behind the in-cage rendering prerequisites (fonts, the NSS CA import,
+    // the netns dummy). `none` must never pull them in; both drawing postures must.
+    assert!(!GuiPolicy::None.renders());
+    assert!(GuiPolicy::Offscreen.renders());
+    assert!(GuiPolicy::Wayland.renders());
+}
+
+#[test]
 fn an_unknown_gui_posture_is_dropped_with_a_warning() {
     // a typo (or an X11 request, which is never offered) must not silently mis-set the posture
     let r = resolve_no_plugins(raw_gui("x11"), None);

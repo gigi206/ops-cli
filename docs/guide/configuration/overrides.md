@@ -37,7 +37,7 @@ Ergonomic shorthands for a single field, each with an `SBX_*` environment equiva
 |---|---|---|
 | `--env KEY=VALUE` | `SBX_ENV_<KEY>` | one cage environment variable |
 | `--net <posture>` | `SBX_NET` | the network posture (below) |
-| `--gui <none\|wayland>` | `SBX_GUI` | the display posture |
+| `--gui <none\|offscreen\|wayland>` | `SBX_GUI` | the display posture |
 | `--proc <off\|observe\|enforce\|ask>` | `SBX_PROC` | the [process/exec](proc.md) posture (a bare mode) |
 | `--nixpkgs <ref>` | `SBX_NIXPKGS` | the nixpkgs channel or revision |
 | `--bind <path[:ro\|:rw]>` | `SBX_BIND` | a host bind (read-only by default); repeatable |

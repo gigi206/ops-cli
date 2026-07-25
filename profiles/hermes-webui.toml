@@ -1,0 +1,299 @@
+# Hermes WebUI — the community self-hosted web interface for Hermes Agent, sandboxed by sbx.
+#
+#   sbx app import profiles/hermes-webui.toml
+#   sbx app run hermes-webui      # then open http://127.0.0.1:8787 in your host browser
+#
+# NOT the same app as the `hermes-web` profile. `hermes-web` runs `hermes dashboard`, the browser
+# dashboard shipped INSIDE NousResearch's own hermes-agent. This profile runs a SEPARATE, third-party
+# project — https://github.com/nesquena/hermes-webui — an unofficial, community-maintained web UI for
+# the same agent, with its own feature set: persistent searchable sessions (projects/tags), a
+# workspace file browser with inline preview/edit, user profiles with optional password/passkey auth,
+# and a task/cron scheduling panel (which needs the agent's gateway daemon to actually fire — this
+# profile starts one, see the `cmd` wrapper). The upstream repo calls it "Community Web UI (unofficial)".
+# The BINARY still comes from that project's own official upstream (its own nix flake), not from a
+# third-party repackager.
+#
+# HOW IT RUNS THE AGENT — the reason this profile declares TWO packages. Hermes WebUI is only a
+# front-end: it runs the Hermes agent IN-PROCESS, importing the agent's Python modules directly and
+# reading its `$HERMES_HOME` config. It does NOT talk to an external agent API server. Its own
+# dependency set is tiny (pyyaml + cryptography — its `requirements.txt` says so verbatim: "All heavy
+# ML/agent deps live in the Hermes agent venv"), so the agent must be present or the server refuses to
+# start. The nix package launches bootstrap with `--skip-agent-install`, which is what you want here:
+# without it, a missing agent would make bootstrap run `curl … install.sh | bash` from the network.
+# sbx supplies the agent declaratively instead, as the same `#default` flake output the `hermes`,
+# `hermes-web`, and `hermes-desktop` profiles use — so the (large) build is SHARED with them in the
+# store rather than duplicated.
+#
+# Both packages are remote `flake:` refs, which sbx builds HOST-SIDE into its shared store (like
+# `nix:`) and seeds per project — so the build uses the HOST network and is unaffected by the cage's
+# egress allowlist below, which governs only what the running agent may reach. The first launch is a
+# multi-GiB, multi-minute build; later launches reuse it. `sbx upgrade flake` rolls both forward.
+#
+# CREDENTIAL POSTURE — BYOK, multi-provider. Hermes WebUI exposes a provider/model picker (OpenAI,
+# Anthropic, Google, DeepSeek, OpenRouter, Nous Portal, …) and reads provider config from the agent's
+# `$HERMES_HOME/config.yaml` or its own Settings → Providers panel, both of which live in this app's
+# isolated, persistent $HOME. This template is keyed to OpenRouter, Hermes' default (one key, many
+# models, OpenAI-compatible bearer auth). BYOK is commented out below, so the profile ships with no
+# baked-in credential: uncomment the [env] placeholder and the [secret] block and provide
+# $OPENROUTER_API_KEY on the host, and the egress proxy injects the real key on the wire to
+# openrouter.ai — the plaintext never enters the cage. For another provider, change the allowlist
+# host + the [secret] block + the env var (e.g. Anthropic: api.anthropic.com, ANTHROPIC_API_KEY,
+# header "x-api-key", type "raw"). If a request is refused the proxy names the host it blocked —
+# see `sbx net log -a hermes-webui`, or check ahead with `sbx test net <url>`.
+#
+# THE `has no 'source' column (older hermes-agent?)` LOG LINE IS HANDLED — see the `cmd` wrapper.
+# It is a MISDIAGNOSIS by the WebUI, not a version mismatch: verified against this exact pairing,
+# hermes-agent 0.19.0's own schema DOES create `sessions` with a `source` column. On a fresh app home
+# that table simply does not exist yet, and the WebUI cannot tell "table missing" from "old schema".
+# The wrapper therefore has the agent initialise its own database through its own API before the
+# server starts, which removes the cause. Do NOT "fix" it by downgrading or re-pinning anything.
+#
+# The genuine upstream caveat is separate: the WebUI imports the agent's modules and reads its state
+# layout directly, so upstream states the two "should be upgraded together; running mismatched
+# versions is untested and unsupported". `sbx upgrade flake` rolls BOTH packages, which is how to
+# keep them in step.
+#
+# BROWSER-SIDE ASSETS. The page's CSP allows `cdn.jsdelivr.net` (scripts/worker), plus Google Fonts
+# for styles. Those are fetched by your HOST browser, not from inside the cage, so they need no
+# allowlist entry — but they do mean the UI reaches a third-party CDN from your machine, outside
+# sbx's egress control. Nothing to configure; just so it is not a surprise.
+#
+# NO `audio = true` here, deliberately — unlike the `hermes` / `hermes-web` profiles. This UI's voice
+# input is the browser's Web Speech API, which runs in your HOST browser, so the cage needs no
+# microphone. Server-side TTS (`edge-tts`) is an optional extra that is NOT installed by the nix
+# package, so `/api/tts` simply returns 503 with an install hint. Granting the mic hole would be an
+# unjustified trusted-only privilege.
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -e
+# Point the WebUI at an interpreter that can import BOTH its own deps and the agent module.
+#
+# Why this is derived at launch instead of written in [env]: the agent is a nix store path whose hash
+# is not knowable when authoring a profile, so the value cannot be hard-coded. And upstream's own
+# autodiscovery does NOT cover the nix layout — `_agent_dir_from_hermes_cli` recovers the agent root
+# by walking the PARENTS of paths inside the `hermes` launcher looking for `run_agent.py`, but under
+# nix that module sits in `<env>/lib/python3.x/site-packages/`, which is never a parent of `bin/`
+# (verified: the agent package exposes no `bin/python` and no top-level `run_agent.py` at all).
+#
+# What DOES work: the agent's own nix wrapper exports `HERMES_PYTHON`, the interpreter of the venv it
+# runs on — and that interpreter carries the agent's modules AND the WebUI's own deps (`yaml`,
+# `cryptography`), so one interpreter satisfies both sides. Read it out of the wrapper, then confirm
+# by RUNNING the real import rather than trusting the path shape. Setting HERMES_WEBUI_PYTHON is
+# enough on its own: bootstrap feeds it to `_agent_dir_from_python`, which resolves the agent
+# directory from that interpreter's own `run_agent` module.
+# An explicit HERMES_WEBUI_PYTHON (e.g. via `--env`) always wins, and is left untouched.
+usable() { [ -x "$1" ] && "$1" -c 'import yaml; from run_agent import AIAgent' >/dev/null 2>&1; }
+
+if [ -z "${HERMES_WEBUI_PYTHON:-}" ]; then
+    hermes_bin="$(command -v hermes || true)"
+    if [ -n "$hermes_bin" ]; then
+        launcher="$(readlink -f "$hermes_bin")"
+        candidate="$(grep -oE "HERMES_PYTHON='[^']*'" "$launcher" | head -1 | cut -d"'" -f2)"
+        # Fall back to a plain `python3` only if it, too, passes the same import gate.
+        for c in "$candidate" "$(command -v python3 || true)"; do
+            if [ -n "$c" ] && usable "$c"; then
+                export HERMES_WEBUI_PYTHON="$c"
+                break
+            fi
+        done
+    fi
+fi
+
+if [ -z "${HERMES_WEBUI_PYTHON:-}" ]; then
+    echo "hermes-webui: could not find an interpreter that imports both the WebUI deps and the" >&2
+    echo "  Hermes agent module. The server would fail at chat time with 'AIAgent not available'." >&2
+    echo "  Override it for one launch with: sbx app run hermes-webui --env HERMES_WEBUI_PYTHON=..." >&2
+    exit 1
+fi
+
+# Create the agent's state.db schema up front, so the WebUI stops logging
+#   `agent session listing skipped: state.db … has no 'source' column (older hermes-agent?)`
+# on every request. That message is a MISDIAGNOSIS: on a fresh app home the agent has only laid down
+# the one table its async-delegation subsystem needed, so `sessions` does not exist at all — the
+# WebUI probes `PRAGMA table_info(sessions)`, gets an empty column set, and cannot tell "table
+# missing" from "old schema", so it blames the agent version. (Verified: this agent's own schema DOES
+# define `sessions.source`, and it stamps schema_version 23.)
+#
+# The fix is to let the AGENT build its own schema through its own API — instantiating `SessionDB`
+# is exactly what the agent does on first use — rather than replaying SQL by hand, so the version
+# stamp and any migration logic stay upstream's business. It is idempotent (a database that is
+# already initialised is left untouched) and strictly best-effort: if upstream ever renames this
+# API, the launch proceeds and you are merely back to the harmless log line.
+"$HERMES_WEBUI_PYTHON" - <<'PYINIT' 2>/dev/null || true
+import os, pathlib
+try:
+    import hermes_state
+    home = pathlib.Path(os.environ.get("HERMES_HOME") or (pathlib.Path.home() / ".hermes"))
+    home.mkdir(parents=True, exist_ok=True)
+    hermes_state.SessionDB(home / "state.db")
+except Exception:
+    pass
+PYINIT
+
+# Cron scheduler. The WebUI's Tasks panel CREATES and lists cron jobs, but it does not fire them:
+# upstream is explicit that "scheduled cron ticks are not driven by the WebUI itself — the gateway
+# daemon ticks the scheduler every 60 seconds; without one running, scheduled jobs sit idle" (the
+# panel's "Run now" button still works, because that path runs in-process). Upstream's own answer for
+# a single-container deployment — which is exactly what a cage is — is to run `hermes gateway` inside
+# it as a long-lived background process, so that is what happens here.
+#
+# `gateway run` is the foreground mode upstream recommends for container/WSL use; the systemd-based
+# `gateway start` has no init to talk to in the cage. It starts fine with NO messaging platform
+# configured (it just logs "No messaging platforms enabled") and still ticks the cron scheduler,
+# which is the part that matters here. Backgrounded with `nohup … &` — the cage has no `setsid` —
+# and it dies with the cage, since it is just another process in the cage's PID namespace.
+#
+# Its output goes to a log file rather than the terminal: the daemon is chatty (SQLite advisories,
+# platform warnings) and would otherwise bury the WebUI's own request log. Read it with
+# `sbx session attach` + `tail -f ~/.hermes/gateway.log`, or from the host under the app's home.
+# Set HERMES_WEBUI_SBX_GATEWAY=0 (e.g. `--env HERMES_WEBUI_SBX_GATEWAY=0`) to skip it and run the UI
+# alone. Best-effort: if the daemon fails to start the server still comes up — you lose scheduled
+# ticks, not the app.
+#
+# Egress note: a firing cron job talks to your LLM provider, already in the allowlist. If you enable
+# a messaging platform (Telegram, Discord, …) its API host is NOT allowed here — add it with
+# `sbx net allow -a hermes-webui <url>`.
+if [ "${HERMES_WEBUI_SBX_GATEWAY:-1}" = "1" ]; then
+    gw_home="${HERMES_HOME:-$HOME/.hermes}"
+    mkdir -p "$gw_home"
+    nohup hermes gateway run >>"$gw_home/gateway.log" 2>&1 &
+fi
+
+exec hermes-webui
+''',
+]
+
+# The inbound hole: forward host 127.0.0.1:8787 into the cage at the same port, so your HOST browser
+# reaches the server the cage binds on its own loopback (the cage runs in an empty network namespace,
+# so without this the port is unreachable by construction). Host and cage port must be the SAME
+# number — change this together with HERMES_WEBUI_PORT in [env] below. A port already taken on the
+# host fails the launch closed. `forward` is a security field and must stay a TOP-LEVEL key: written
+# after a `[table]` header, TOML would fold it into that table (e.g. `network.forward`) and it would
+# be silently ignored.
+forward = [8787]
+
+# BROWSER TOOLSET — `gui = "offscreen"` is what makes Hermes' 12 `browser_*` tools (navigate,
+# snapshot, click, type, press, scroll, back, console, get_images, vision, cdp, dialog) appear. Hermes
+# gates them on `agent-browser` being on PATH AND a Chromium build being on disk; when either is
+# missing it drops them from the model's tool schema, which is why a cage without them silently
+# offers fewer tools than a standard install (whose installer runs `npm install -g agent-browser &&
+# agent-browser install`). The two packages below supply both — but a browser engine also needs two
+# things the hermetic cage lacks, and that is this posture: fonts (without them Chromium dies the
+# moment it renders a real page) and the egress proxy's CA in the cage's NSS store (Chromium reads
+# its own store, not the CA-file env vars sbx sets, so every page would fail
+# ERR_CERT_AUTHORITY_INVALID under the allowlist). It renders OFF-SCREEN: no window, no compositor
+# socket, no host access at all. A trusted-only security field, and it must stay a TOP-LEVEL key:
+# written after a `[table]` header, TOML would fold it into that table and silently drop it. Drop
+# this line and the two packages if you do not want the browser tools.
+#
+# Note what the sandbox does NOT change: the browser reaches only what the allowlist below allows, so
+# a page on any other host is refused (and its subresources with it — a real site pulls from many
+# hosts). The proxy names what it blocked, so open a site you actually want with
+# `sbx net allow -a hermes-webui <url>`. This is the deliberate posture: browsing is not opened wholesale.
+gui = "offscreen"
+
+# Your host Hermes config/state, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir. Uncomment to share your
+# host Hermes setup (providers, sessions, memory) with the cage instead of the app's isolated home —
+# note this is also what the agent's own persistent memory lives in.
+#binds = [
+#    { path = "~/.hermes", mode = "rw" },
+#]
+
+[packages]
+# The WebUI itself, from its own upstream flake (`bin/hermes-webui` — a wrapper that runs bootstrap
+# with `--foreground --no-browser --skip-agent-install`, and carries the WebUI's own pyyaml +
+# cryptography). Built host-side into sbx's shared store; rolled by `sbx upgrade flake`.
+hermes-webui = "flake:github:nesquena/hermes-webui#default"
+# The agent the WebUI imports and runs in-process. The SAME `#default` output as the `hermes`,
+# `hermes-web`, and `hermes-desktop` profiles, so the heavy build is shared with them rather than
+# duplicated. It supplies the `run_agent` module, its interpreter, and every provider client.
+hermes = "flake:github:NousResearch/hermes-agent#default"
+# The browser toolset (see `gui = "offscreen"` above). `agent-browser` is Hermes' own browser-driver
+# CLI: a self-contained Rust binary shipped in its npm tarball, so mise's `--ignore-scripts` install
+# is not merely harmless but wanted — it skips the postinstall that would otherwise download a
+# Playwright browser, which nixpkgs' Chromium replaces. `nodejs` is required because mise's npm
+# backend needs a node in the cage (the flake's own bundled node is only on the `hermes` wrapper's
+# PATH, not the cage's). Chromium is HEAVY — ~620 MB unpacked, a larger closure — and lands in the
+# project store on the first launch. agent-browser finds Chromium on PATH by itself; point it
+# elsewhere with `AGENT_BROWSER_EXECUTABLE_PATH` if you ever need to.
+nodejs = "nix:nodejs"
+chromium = "nix:chromium"
+agent-browser = "mise:npm:agent-browser"
+
+[network]
+mode = "deny"
+# Silence the cloud-metadata probe (169.254.169.254 / AWS IMDS) that a cloud SDK in the agent's
+# closure fires on startup to auto-discover credentials. There is nothing to discover off-cloud, and
+# the proxy refuses link-local/metadata addresses by construction (SSRF guard) — the verdict is
+# unchanged; this only drops the noisy denied line from the default `sbx net log` (SELinux dontaudit
+# semantics). Still visible via `sbx net log --all`.
+mute = [
+    "169.254.169.254",
+    # npm's audit POST on every install: refused anyway, just kept out of the default log.
+    "https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
+allow = [
+    # The browser toolset's `agent-browser` CLI, fetched from npm at launch (mise's npm backend
+    # installs in-cage, unlike the host-side `flake:` build). The audit POST is noisy and
+    # non-essential, so it is muted rather than allowed.
+    "{GET} https://registry.npmjs.org",
+    # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter; with
+    # a NousResearch account login instead (the shipped default, no BYOK key set), the model traffic
+    # goes to the account's own API: portal is the OAuth token endpoint, inference-api serves the
+    # models. The agent runs in-process, so this is the same provider egress as the `hermes` CLI.
+    "{*} https://openrouter.ai",
+    "{*} https://portal.nousresearch.com",
+    "{*} https://inference-api.nousresearch.com",
+    # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
+    "{*} https://hermes-agent.nousresearch.com",
+    "{GET} https://models.dev",
+    # Other providers the WebUI's picker offers — uncomment the one you use, and add a matching
+    # [secret] block (or set the key in Settings → Providers, which stores it in the isolated home).
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    #"{*} https://generativelanguage.googleapis.com",
+    #"{*} https://api.deepseek.com",
+    # (No build-time entries: both packages are remote `flake:` refs, built HOST-SIDE over the host
+    # network, so the nix binary cache, the PyPI wheels, the npm registry and the git source fetches
+    # never pass through this allowlist. Runtime residual, left closed on purpose: the agent runs
+    # in-process here, so installing an OPTIONAL MCP or skill (`hermes mcp install …`) fetches from
+    # inside the cage — `npx -y <pkg>` hits registry.npmjs.org, a uvx/venv server hits PyPI, a
+    # `install: {type: git}` manifest hits github.com, and a remote-HTTP MCP needs its own host.
+    # Refused by default rather than pre-opened; the proxy names what it blocked, so open just that
+    # one with `sbx net allow -a hermes-webui <url>`.)
+]
+
+[env]
+# Flags agent-browser passes to the Chromium it launches. `--no-sandbox` is MANDATORY: Chromium's own
+# SUID/userns sandbox cannot come up in the cage (sbx's seccomp denylist blocks
+# `clone(CLONE_NEWUSER)`), so without it the browser aborts at startup and every browser tool fails.
+# Dropping Chromium's inner sandbox is acceptable here because bubblewrap + seccomp + the empty netns
+# IS the boundary. `--disable-dev-shm-usage` keeps it off the cage's small /dev/shm.
+AGENT_BROWSER_ARGS = "--no-sandbox,--disable-dev-shm-usage"
+# Bind address + port INSIDE the cage. 127.0.0.1 is the upstream default and the right value: the
+# forwarder above bridges the host's loopback to the cage's, so there is no reason to expose the
+# server on 0.0.0.0 (which would publish it to your LAN if the netns were ever shared). Keep this
+# port and the `forward` entry above in sync.
+HERMES_WEBUI_HOST = "127.0.0.1"
+HERMES_WEBUI_PORT = "8787"
+# Optional: require a login on the web UI. Recommended if you ever reach it from another machine
+# (upstream suggests an SSH tunnel or Tailscale for that); optional for a single-user loopback. Note
+# the server prints a startup tip when it is unset — with no password, anything that can reach the
+# forwarded port can read sessions and memory through the local API.
+#HERMES_WEBUI_PASSWORD = "change-me"
+# The workspace the UI's file browser opens. It defaults to `~/workspace` INSIDE the cage — i.e. the
+# app's isolated home, not the directory you launched from. Point it at the project mount if you want
+# the browser to show your code (the project is bind-mounted at its real host path in the cage).
+#HERMES_WEBUI_DEFAULT_WORKSPACE = "/path/to/your/project"
+# The real API key is read on the HOST and injected by the egress proxy — never in the cage. The
+# in-cage placeholder lets the agent start and issue its request; the proxy strips it and substitutes
+# the real key on the wire to openrouter.ai. Uncomment together with the [secret] block below.
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

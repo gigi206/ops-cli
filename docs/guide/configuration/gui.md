@@ -1,17 +1,19 @@
 # `gui` — the display posture
 
-The sandbox's GUI posture: whether a graphical app inside the cage can reach a
-display.
+The sandbox's GUI posture: what a cage that draws is given. The three postures are
+ordered by host exposure — `none` < `offscreen` < `wayland`.
 
 ```toml
-gui = "none"      # the default — no display access
-# gui = "wayland" # bind the host's Wayland compositor socket read-only
+gui = "none"        # the default — no display access
+# gui = "offscreen" # fonts + the proxy CA for a headless browser; no display
+# gui = "wayland"   # all of the above, plus the host's compositor socket (read-only)
 ```
 
 `gui` is a **security field** — honored from the global config or a trusted project,
 ignored from an untrusted one — because exposing a compositor socket is a
 confidentiality and integrity choice (clipboard access, and on some compositors screen
-capture or input injection).
+capture or input injection). `offscreen` grants no host access at all, but rides the same
+gate so the postures stay one ordered field.
 
 See also: [Security model](../concepts/security-model.md) · [`[app.<name>]`](apps.md) · design doc [`bwrap-gui-wayland-spike-2026-06-22.md`](../../bwrap-gui-wayland-spike-2026-06-22.md).
 
@@ -19,6 +21,34 @@ See also: [Security model](../concepts/security-model.md) · [`[app.<name>]`](ap
 
 No display access. The cage cannot connect to any compositor. This is the right
 posture for a headless agent or a CLI tool.
+
+## `offscreen`
+
+For a cage that runs a **browser engine but never maps a window** — a headless Chromium
+driving page automation, as an agent's browser toolset does. It exposes **nothing** of the
+host; it provisions, inside the cage, the two things such an engine cannot work without:
+
+- **fonts + a fontconfig**, without which the engine starts but dies the moment it renders
+  a real page;
+- under a [filtering egress posture](../networking/modes.md), the **egress proxy's CA
+  imported into the cage's NSS database** — Chromium ignores the CA-file environment
+  variables `sbx` sets and reads its own store, so without this every page fails with
+  `ERR_CERT_AUTHORITY_INVALID`.
+
+It also gives the cage's network namespace a black-hole `dummy0` interface, so the engine
+reports itself online (Chromium decides `navigator.onLine` from a non-loopback interface
+being present, not from real reachability). No egress is opened: the dummy has no route,
+and all traffic still goes through the proxy on loopback.
+
+Use it for a terminal agent whose tools browse the web. It is strictly less exposure than
+`wayland` for the same capability, so prefer it whenever nothing needs a real window.
+
+```toml
+gui = "offscreen"
+
+[packages]
+chromium = "nix:chromium"
+```
 
 ## `wayland`
 
@@ -48,7 +78,9 @@ boundary. These are the app's command arguments (in a profile's `cmd`), not part
 ## Best-effort
 
 If `gui = "wayland"` but no compositor socket is present, the cage runs **without** the
-display (fail-closed by not binding), with a warning.
+display (fail-closed by not binding), with a warning. The same holds for the rendering
+prerequisites under either posture: a font set or a `certutil` that cannot be provisioned
+warns and the app runs without them, rather than failing the launch.
 
 ## Compositor caveats
 
@@ -79,5 +111,5 @@ sbx run --gui wayland -- some-electron-app
 SBX_GUI=none sbx run
 ```
 
-`--gui` takes `none | wayland`. The command line beats the environment, and both beat
+`--gui` takes `none | offscreen | wayland`. The command line beats the environment, and both beat
 the config file. See [One-shot overrides](overrides.md).

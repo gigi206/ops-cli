@@ -14,7 +14,7 @@ beats the environment; a security field set from the environment prints a stderr
 | `SBX_CONFIG` | `--config` | a whole-schema TOML overlay |
 | `SBX_ENV_<KEY>` | `--env KEY=…` | one cage environment variable |
 | `SBX_NET` | `--net` | the network posture (`none`/`shared`/`ask`/`allow=…`/`deny=…`) |
-| `SBX_GUI` | `--gui` | the display posture (`none`/`wayland`) |
+| `SBX_GUI` | `--gui` | the display posture (`none`/`offscreen`/`wayland`) |
 | `SBX_NIXPKGS` | `--nixpkgs` | the nixpkgs channel or revision |
 | `SBX_BIND` | `--bind` | a host bind (`/path[:ro\|:rw]`) |
 | `SBX_LIMIT_<key>` | `--limit key=…` | a cgroup limit (`SBX_LIMIT_tasks_max=…`) |

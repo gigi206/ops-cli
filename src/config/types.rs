@@ -207,16 +207,37 @@ pub(crate) enum NetworkPolicy {
 /// The sandbox's resolved GUI posture. A security choice, gated exactly like
 /// [`NetworkPolicy`]: honored from the global config (trusted by location) or a trusted
 /// project, ignored from an untrusted one. The default exposes no display — a graphical app
-/// cannot reach the host's compositor. `Wayland` binds the compositor socket read-only so a
-/// window can map; X11 is deliberately never offered (an X client could snoop and drive every
-/// other window, which Wayland's per-client isolation prevents on a well-behaved compositor).
+/// cannot reach the host's compositor. X11 is deliberately never offered (an X client could snoop
+/// and drive every other window, which Wayland's per-client isolation prevents on a well-behaved
+/// compositor).
+///
+/// The postures are ordered by host exposure: `None` < `Offscreen` < `Wayland`. `Offscreen` is
+/// the posture of a browser engine that renders but never maps a window (a headless Chromium
+/// driving page automation): it supplies what such an engine needs *in* the cage and grants no
+/// host access at all, while `Wayland` additionally binds the compositor socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum GuiPolicy {
     /// No display access (the default): a graphical app cannot reach a compositor.
     #[default]
     None,
+    /// Render off-screen: provision fonts and — under a filtering egress posture — import the
+    /// proxy's CA into the cage's NSS database, without exposing any display. A headless browser
+    /// needs both (it dies mid-render without fonts, and rejects every page without the CA, since
+    /// it reads its own NSS store rather than the CA-file environment variables).
+    Offscreen,
     /// Bind the host's Wayland compositor socket read-only so a graphical app can map a window.
+    /// Carries everything `Offscreen` provides.
     Wayland,
+}
+
+impl GuiPolicy {
+    /// Whether the cage hosts something that draws — a window under `Wayland`, or a page under
+    /// `Offscreen`. The single predicate behind the in-cage rendering prerequisites (fonts, the
+    /// NSS CA import, the network-namespace dummy interface), so they cannot drift apart as the
+    /// postures grow.
+    pub(crate) fn renders(self) -> bool {
+        matches!(self, Self::Offscreen | Self::Wayland)
+    }
 }
 
 /// A credential the egress proxy injects into matching outbound requests as an HTTP
