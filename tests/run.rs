@@ -4610,8 +4610,12 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
     // The clean report names the baseline group in its own aligned status line (the `project`
     // column), without leaking mise's raw install/progress chatter — that is captured and surfaced
     // only on failure.
+    // Read the label in its column (name, then the dot leader), not anywhere in the output: the
+    // bare word is common enough to appear in any path the report might print.
     assert!(
-        report.contains("project"),
+        report
+            .lines()
+            .any(|l| l.trim_start().starts_with("project .")),
         "the report must name the baseline (project) mise: package group: {log}"
     );
     assert!(
