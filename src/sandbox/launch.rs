@@ -3658,13 +3658,13 @@ fn build(
     } else {
         None
     };
-    // The host light/dark preference, read host-side (best-effort) to seed the cage theme.
-    let portal_scheme = portal.as_ref().and_then(|p| {
-        super::portal::read_host_color_scheme(&crate::store::physical_path(
-            &prep.layout,
-            &p.dbus_send,
-        ))
-    });
+    // The host light/dark preference, read host-side (best-effort) to seed the cage theme. Read
+    // over the session bus directly rather than by running a provisioned `dbus-send`: a binary in
+    // sbx's relocated store names an interpreter under a `/nix` the host does not have, so it
+    // could not be executed here at all.
+    let portal_scheme = portal
+        .as_ref()
+        .and_then(|_| super::theme_relay::read_host_color_scheme());
 
     // CA trust for a Chromium/Electron engine under a filtering posture: Chromium ignores the
     // CA-file env vars sbx sets and reads its own NSS db, so under the egress MITM it rejects

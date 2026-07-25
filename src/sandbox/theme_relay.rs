@@ -37,6 +37,10 @@ use zbus::zvariant::Value;
     default_path = "/org/freedesktop/portal/desktop"
 )]
 trait HostSettings {
+    /// The current value of one setting. Used for the at-launch read; the signal below carries
+    /// every later change.
+    fn read(&self, namespace: &str, key: &str) -> zbus::Result<zbus::zvariant::OwnedValue>;
+
     #[zbus(signal)]
     fn setting_changed(
         &self,
@@ -44,6 +48,42 @@ trait HostSettings {
         key: String,
         value: zbus::zvariant::OwnedValue,
     ) -> zbus::Result<()>;
+}
+
+/// How long the at-launch read waits on the host portal before giving up. It runs on the launch
+/// path, so an unresponsive portal must cost a bounded pause and not the D-Bus default (tens of
+/// seconds) — the price of giving up is the app opening in its default theme, not a failed launch.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read the host's current light/dark preference, for seeding the cage's theme at launch. Returns
+/// the GSettings keyfile value (`prefer-dark`/`prefer-light`/`default`), or `None` when there is no
+/// session bus, no desktop portal, or the reply carries no `uint32` — in which case the app opens
+/// in its default theme.
+///
+/// Deliberately the same D-Bus client, proxy and value unwrapping the relay uses for the change
+/// signal: the value read once at launch and the values mirrored afterwards must be the same
+/// setting read the same way, or the app would open on one interpretation and switch to another.
+pub(crate) fn read_host_color_scheme() -> Option<String> {
+    async_io::block_on(async {
+        futures_util::select! {
+            scheme = current_color_scheme().fuse() => scheme,
+            // `Timer` is both a `Future` and a `Stream`, so name the trait rather than let
+            // `.fuse()` resolve to the stream one.
+            _ = FutureExt::fuse(async_io::Timer::after(READ_TIMEOUT)) => None,
+        }
+    })
+}
+
+/// The read itself: connect to the host session bus, ask its portal for the appearance
+/// `color-scheme`, and map the `uint32` to its keyfile value. Every failure is `None` (best-effort).
+async fn current_color_scheme() -> Option<String> {
+    let conn = zbus::Connection::session().await.ok()?;
+    let settings = HostSettingsProxy::new(&conn).await.ok()?;
+    let value = settings
+        .read("org.freedesktop.appearance", "color-scheme")
+        .await
+        .ok()?;
+    extract_u32(&value).map(|n| super::portal::color_scheme_name(n).to_string())
 }
 
 /// A running theme relay: the shutdown channel signalling its thread to stop, and the thread handle.
@@ -148,6 +188,47 @@ fn write_keyfile(keyfile: &Path, scheme: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether this host runs a desktop portal, decided *without* the code under test: ask the bus
+    /// daemon who owns the portal's name. So a host with no portal skips, while a host that has one
+    /// must produce a scheme — the two cases cannot be confused, which is the whole point (a read
+    /// that silently answers `None` everywhere would otherwise look like "no portal here").
+    fn host_portal_present() -> bool {
+        async_io::block_on(async {
+            let Ok(conn) = zbus::Connection::session().await else {
+                return false;
+            };
+            let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
+                return false;
+            };
+            matches!(
+                dbus.name_has_owner("org.freedesktop.portal.Desktop".try_into().unwrap())
+                    .await,
+                Ok(true)
+            )
+        })
+    }
+
+    #[test]
+    fn the_at_launch_read_returns_the_hosts_scheme_when_a_portal_is_present() {
+        // The value seeded into the cage at launch, so the app opens in the host's light/dark
+        // scheme instead of its default. Reading it must not depend on executing anything from
+        // sbx's store: those binaries name an interpreter under a `/nix` the host need not have, so
+        // a read that shells out to one fails on an ordinary host and every launch silently loses
+        // the theme.
+        if !host_portal_present() {
+            eprintln!("skipping host theme read: no desktop portal on the session bus");
+            return;
+        }
+        let scheme = read_host_color_scheme();
+        assert!(
+            matches!(
+                scheme.as_deref(),
+                Some("prefer-dark" | "prefer-light" | "default")
+            ),
+            "a host with a desktop portal must yield a scheme, got {scheme:?}"
+        );
+    }
 
     #[test]
     fn extract_u32_reads_a_bare_or_nested_variant() {

@@ -46,11 +46,9 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The packages the in-cage portal needs, each `(nixpkgs attribute, the marker its output must
-/// carry, gcroot name)`. `dbus` supplies the session-bus daemon (and `dbus-send`, used host-side to
-/// read the theme); `xdg-desktop-portal` is the portal front-end; `xdg-desktop-portal-gtk` is the
+/// carry, gcroot name)`. `dbus` supplies the session-bus daemon; `xdg-desktop-portal` is the portal front-end; `xdg-desktop-portal-gtk` is the
 /// GTK backend that renders the file dialog; `desktop-file-utils` supplies `update-desktop-database`,
 /// which builds the desktop-database index the portal's `OpenURI` needs to resolve a custom-scheme
 /// deep-link handler an app registers (a `.desktop` with a `MimeType=x-scheme-handler/<scheme>`) — the
@@ -142,8 +140,6 @@ pub(crate) struct Provision {
     pub(crate) roots: Vec<PathBuf>,
     /// Logical path of `dbus-daemon` (run inside the cage).
     pub(crate) dbus_daemon: PathBuf,
-    /// Logical path of `dbus-send` (its *physical* form is run host-side to read the theme).
-    pub(crate) dbus_send: PathBuf,
     /// Logical root of `xdg-desktop-portal` (its `share/dbus-1/services` is a bus servicedir).
     pub(crate) xdp_root: PathBuf,
     /// Logical root of `xdg-desktop-portal-gtk` (its servicedir plus the `gtk.portal` descriptor).
@@ -173,7 +169,6 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
     let dbus_root = &resolved[0];
     Ok(Provision {
         dbus_daemon: dbus_root.join("bin/dbus-daemon"),
-        dbus_send: dbus_root.join("bin/dbus-send"),
         xdp_root: resolved[1].clone(),
         gtk_root: resolved[2].clone(),
         update_desktop_db: resolved[3].join("bin/update-desktop-database"),
@@ -331,39 +326,6 @@ pub(crate) fn wrap_command(
     super::egress::wrap_background(bash, &preamble, "sbx-incage-portal", cmd)
 }
 
-/// Read the host's light/dark preference, best-effort, by running the provisioned `dbus-send`
-/// host-side against the real session bus (`org.freedesktop.appearance color-scheme`). Returns the
-/// GSettings keyfile value (`prefer-dark`/`prefer-light`/`default`), or `None` when there is no
-/// session bus, the binary cannot run host-side (its interpreter lives under a store `/nix` this
-/// host may not have), or the reply cannot be parsed — in which case the app simply opens in its
-/// default theme. `dbus_send` is the **physical** host path of the provisioned binary.
-pub(crate) fn read_host_color_scheme(dbus_send: &Path) -> Option<String> {
-    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
-        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
-    {
-        return None;
-    }
-    let out = Command::new(dbus_send)
-        .args([
-            "--session",
-            "--print-reply",
-            // Fail fast: this is a best-effort read at launch, so a host with the portal present but
-            // unresponsive must not stall every launch on `dbus-send`'s ~25s default timeout.
-            "--reply-timeout=1000",
-            "--dest=org.freedesktop.portal.Desktop",
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.Settings.Read",
-            "string:org.freedesktop.appearance",
-            "string:color-scheme",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_color_scheme(&String::from_utf8_lossy(&out.stdout))
-}
-
 /// The GSettings keyfile value for a freedesktop `appearance color-scheme` `uint32`: `1` =
 /// prefer-dark, `2` = prefer-light, anything else (`0`/no-preference) = default. Shared by the
 /// launch-time read and the live theme relay so the two cannot map the same value differently.
@@ -373,18 +335,6 @@ pub(crate) fn color_scheme_name(n: u32) -> &'static str {
         2 => "prefer-light",
         _ => "default",
     }
-}
-
-/// Parse the `org.freedesktop.appearance color-scheme` reply into its GSettings keyfile value. The
-/// value is a nested variant carrying a `uint32`. `None` when no `uint32` is present. Pure.
-fn parse_color_scheme(reply: &str) -> Option<String> {
-    let n: u32 = reply
-        .split_whitespace()
-        .skip_while(|t| *t != "uint32")
-        .nth(1)?
-        .parse()
-        .ok()?;
-    Some(color_scheme_name(n).to_string())
 }
 
 #[cfg(test)]
@@ -537,22 +487,5 @@ mod tests {
         }
         // dropped → removed
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn parse_color_scheme_maps_the_variant_uint() {
-        // a real reply nests the uint in two variants
-        let dark = "   variant       variant          uint32 1\n";
-        assert_eq!(parse_color_scheme(dark).as_deref(), Some("prefer-dark"));
-        assert_eq!(
-            parse_color_scheme("variant variant uint32 2").as_deref(),
-            Some("prefer-light")
-        );
-        assert_eq!(
-            parse_color_scheme("variant variant uint32 0").as_deref(),
-            Some("default")
-        );
-        // no uint present → cannot read
-        assert_eq!(parse_color_scheme("method return\n"), None);
     }
 }
