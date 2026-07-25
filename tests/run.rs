@@ -1368,7 +1368,13 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
         project.path(),
         data.path(),
         state.path(),
-        &["run", "--", "fc-list"],
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo \"FONTCONFIG_FILE=[$FONTCONFIG_FILE]\"; fc-list",
+        ],
     );
     let log = format!(
         "{}{}",
@@ -1377,14 +1383,26 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
     );
     assert!(
         out.status.success(),
-        "fc-list failed in the cage (gui = \"wayland\"): {log}"
+        "the font probe failed in the cage (gui = \"wayland\"): {log}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // The DejaVu store path is the proof: it appears only because the generated config's `<dir>`
-    // names the seeded font directory and `FONTCONFIG_FILE` points fontconfig at it.
+    // Teeth on the wiring: the display hole and the font hole both contribute to the cage's
+    // environment, so a launch that builds the display variables must *add* to the font ones
+    // rather than replace them. Assert the variable itself — a cage where the generated config is
+    // bound but never named renders no text at all (a browser engine dies mid-page), and the bind
+    // alone cannot tell the two apart.
     assert!(
-        stdout.contains("/nix/store/") && stdout.contains("dejavu-fonts"),
-        "fc-list did not list the hole's provisioned DejaVu fonts by store path: {log}"
+        stdout.contains("FONTCONFIG_FILE=[/opt/sbx/fonts.conf]"),
+        "the cage does not name the generated fontconfig in FONTCONFIG_FILE: {log}"
+    );
+    // Teeth on the effect: the emoji face the hole provisions. Deliberately *not* the DejaVu
+    // family alone — fontconfig is built with a compiled-in default font path (a `dejavu-fonts-
+    // minimal` in its own closure), so a cage with no working configuration still lists a DejaVu
+    // store path and a family-level assertion cannot distinguish the hole working from the hole
+    // being absent. Nothing but the hole supplies the emoji face.
+    assert!(
+        stdout.contains("/nix/store/") && stdout.contains("noto-fonts-color-emoji"),
+        "fc-list did not list the hole's provisioned font set by store path: {log}"
     );
 }
 
@@ -1477,9 +1495,13 @@ fn an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display() {
         "the offscreen probe failed in the cage: {log}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // The emoji face, deliberately, rather than the DejaVu family: fontconfig carries a
+    // compiled-in default font path (a `dejavu-fonts-minimal` in its own closure), so a cage with
+    // no working configuration still lists a DejaVu store path. Nothing but the hole supplies the
+    // emoji face, so this distinguishes the hole working from the hole being absent.
     assert!(
-        stdout.contains("/nix/store/") && stdout.contains("dejavu-fonts"),
-        "an offscreen cage did not get the hole's provisioned DejaVu fonts by store path: {log}"
+        stdout.contains("/nix/store/") && stdout.contains("noto-fonts-color-emoji"),
+        "an offscreen cage did not get the hole's provisioned font set by store path: {log}"
     );
     // Teeth on the wiring itself, not only on its effect: the generated fontconfig is bound in.
     assert!(
@@ -3262,7 +3284,7 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
     // below) rather than aborting the script early.
     let script = "\
         wayland-info 2>&1 | grep -q wl_compositor && echo COMPOSE-WL\n\
-        fc-list | grep -q dejavu-fonts && echo COMPOSE-FONT\n\
+        fc-list | grep -q noto-fonts-color-emoji && echo COMPOSE-FONT\n\
         nix-prefetch-url --type sha256 https://cache.nixos.org/nix-cache-info 2>/dev/null \
             | grep -q 15sqg1j6gq6081nk0v5c6npadlswb9238l336wb2g9bmmrry779c && echo COMPOSE-ALLOW\n\
         nix-prefetch-url --type sha256 https://example.com/nix-cache-info 2>&1 \
@@ -3281,10 +3303,12 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
         stdout.contains("COMPOSE-WL"),
         "wayland-info did not enumerate the compositor with the allowlist also open: {log}"
     );
-    // The font layer, with the allowlist also open.
+    // The font layer, with the allowlist also open. Keyed on the emoji face, which only the hole
+    // supplies — fontconfig's compiled-in default font path would satisfy a DejaVu-family check
+    // even in a cage whose configuration never took effect.
     assert!(
         stdout.contains("COMPOSE-FONT"),
-        "fc-list did not list the seeded DejaVu fonts with the allowlist also open: {log}"
+        "fc-list did not list the hole's seeded font set with the allowlist also open: {log}"
     );
     // Egress works through the proxy, with the display hole also open.
     assert!(
