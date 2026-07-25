@@ -25,12 +25,17 @@ use std::path::{Path, PathBuf};
 /// must contain, gcroot name)`. DejaVu covers the Latin sans/serif/monospace families a
 /// general UI needs; Noto Color Emoji covers the emoji codepoints a modern chat/GUI renders
 /// (without it, a `👋` in a message shows as a tofu box — the hermetic cage has no emoji font).
-/// Broader script coverage (CJK, Arabic, …) is a per-need extension, not a default (font
-/// closures are large). The marker is a directory (`share/fonts`), since a font package has
-/// no binary to key on.
+/// Adwaita Sans/Mono is the family a GTK4/libadwaita or Electron app styled for a modern GNOME
+/// desktop asks for *by name*: fontconfig cannot alias its way to a face that is absent, so
+/// such an app falls back to a default that is not the one it was designed against. It is a
+/// single 7 MiB store path with no dependencies, so carrying it costs about a third of the
+/// emoji face and spares every such app the fallback. Broader script coverage (CJK, Arabic, …)
+/// is a per-need extension, not a default (those closures are large). The marker is a directory
+/// (`share/fonts`), since a font package has no binary to key on.
 const GUI_FONTS: &[(&str, &str, &str)] = &[
     ("dejavu_fonts", "share/fonts", "dejavu"),
     ("noto-fonts-color-emoji", "share/fonts", "noto-emoji"),
+    ("adwaita-fonts", "share/fonts", "adwaita"),
 ];
 
 /// Where the cage's fontconfig keeps its on-disk cache: a path on the cage's private tmpfs
@@ -92,6 +97,11 @@ pub(crate) fn fonts_conf(dirs: &[PathBuf], cache_dir: &str) -> String {
     // resolves to a real font. With a single provisioned family these aliases are not
     // *functionally* distinguishable from fontconfig's own fallback (it would pick the only
     // font anyway); they earn their keep once more than one family is provisioned.
+    //
+    // Adwaita is deliberately absent from this mapping: it is provisioned so an app that names
+    // it gets it, not to restyle every cage. Preferring it for `sans-serif` would change how a
+    // page that asked for nothing in particular renders, which is the user's business, not the
+    // sandbox's — the generic families stay on the neutral face.
     for (generic, concrete) in [
         ("sans-serif", "DejaVu Sans"),
         ("serif", "DejaVu Serif"),

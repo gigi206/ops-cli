@@ -164,8 +164,9 @@ The hole, when opened:
   mispoint a client at a nonexistent socket (self-DoS), never redirect the bound socket.
 - **Best-effort** — with no compositor socket found, ops warns and runs without the bind (the app
   fails on its own); *not* binding is the fail-closed direction for a display hole.
-- **Fonts** — a fontless cage renders boxes, so the hole provisions a base font set (DejaVu)
-  host-side into ops's store, **seeds it into the project store** (the cage reads it through `/nix`),
+- **Fonts** — a fontless cage renders boxes, so the hole provisions a base font set (DejaVu for the
+  Latin families, Noto Color Emoji for emoji codepoints, and Adwaita Sans/Mono for the apps that ask
+  for it by name) host-side into ops's store, **seeds it into the project store** (the cage reads it through `/nix`),
   and binds a generated, self-contained fontconfig configuration read-only at `/opt/ops/fonts.conf`,
   named to the cage's fontconfig via `FONTCONFIG_FILE`. A font package has no `bin/`, so it **cannot**
   ride the user-facing `[packages]` field (which selects a bin-bearing output) — the hole provisions
@@ -197,7 +198,8 @@ carries black glyph pixels (darkest pixel `0`, non-zero variance); with `gui = "
 font and the *same* render is perfectly blank (darkest pixel `1`, zero variance). The only difference
 between the two is the font hole, so the hole's fonts are what turn an empty page into rendered **Latin**
 text — the spike's HarfBuzz `glyph_count: 0` failure, now closed. (Proven *text-vs-nothing*, not
-*text-vs-boxes*: DejaVu covers Latin, so CJK/emoji would still box — broader script coverage is a
+*text-vs-boxes*: the set proven here was DejaVu, which covers Latin, so anything outside it would
+still box — the emoji face joined the set later, and broader script coverage (CJK, Arabic, …) stays a
 per-need extension. This is a heavy live proof — Chromium's closure makes a per-run committed test
 impractical, like the in-cage flake build — so it is documented as proven-live, **not** a committed e2e.)
 

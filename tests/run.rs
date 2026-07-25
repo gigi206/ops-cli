@@ -1373,7 +1373,9 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
             "--",
             "sh",
             "-c",
-            "echo \"FONTCONFIG_FILE=[$FONTCONFIG_FILE]\"; fc-list",
+            "echo \"FONTCONFIG_FILE=[$FONTCONFIG_FILE]\"; \
+             echo \"named-match=$(fc-match -f '%{file}' 'Adwaita Sans')\"; \
+             fc-list",
         ],
     );
     let log = format!(
@@ -1403,6 +1405,23 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
     assert!(
         stdout.contains("/nix/store/") && stdout.contains("noto-fonts-color-emoji"),
         "fc-list did not list the hole's provisioned font set by store path: {log}"
+    );
+    // A face resolved by *name*, not by generic family: an app styled for a modern desktop asks
+    // for `Adwaita Sans` explicitly, and fontconfig cannot alias its way to a face that is
+    // absent — it silently answers with whatever else it has. So assert the match is the
+    // provisioned Adwaita, which is exactly the difference between the app rendering as designed
+    // and rendering in a substitute face.
+    // Read the match off its own line: asserting the two substrings against the whole output
+    // would let the `fc-list` listing satisfy the family check while `fc-match` actually answered
+    // with a different face — the assertion has to pin what the *match* returned.
+    let named = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("named-match="))
+        .unwrap_or_default();
+    assert!(
+        named.contains("/nix/store/") && named.contains("adwaita-fonts"),
+        "a request for the `Adwaita Sans` family resolved to `{named}`, not the provisioned \
+         face: {log}"
     );
 }
 
