@@ -96,6 +96,85 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **The host light/dark theme is read over the bus, not by running a store binary (DONE 2026-07-25)**
+  (`src/sandbox/theme_relay.rs` + `portal.rs` + `launch.rs`): the user reported that
+  `hermes-desktop` **does not follow the host light/dark theme**. Traced, not guessed: the at-launch
+  seed obtained the host preference by executing the **provisioned `dbus-send`** host-side, and that
+  binary **can never run on the host** — its ELF interpreter is `/nix/store/…glibc-2.42-67/…
+  ld-linux-x86-64.so.2`, a path that exists **only in sbx's relocated store** (measured live:
+  `ls` sees the file, exec fails "no such file or directory", the interpreter `ABSENT on host`,
+  `present in sbx store`). So the read failed on **every** host, `color_scheme` was always `None`,
+  **no seed was emitted**, and the cage's GSettings keyfile was never written — verified absent both
+  in the app home and through the running cage's mount ns. The app therefore opened in its default
+  (light) theme whatever the desktop was set to. **The live relay was NOT the bug** — it only mirrors
+  *changes*, so it never supplied the initial value; proven working in both directions during the
+  diagnosis, with the user watching: host portal emits `SettingChanged appearance color-scheme
+  <uint32 0>` → sbx rewrites the keyfile to `default`/`Adwaita` (17:08:55), then `<uint32 1>` →
+  `prefer-dark`/`Adwaita-dark` (17:09:45), and the **user confirmed the window went dark**. **Fix:**
+  the initial `Read` now rides the **zbus client already in the tree** — `theme_relay` held a proxy
+  onto exactly this portal interface for the signal, so the read is placed **beside it**, and the
+  value seeded once at launch and the values mirrored afterwards are the same setting read the same
+  way (they cannot drift). Bounded by a **2 s timeout** (an unresponsive portal costs a pause, never
+  a stalled launch); every failure still degrades to the default theme. This **removes the last
+  host-side execution of a store binary** (`physical_path`'s other uses are bind *sources*, checked)
+  and the `dbus_send` field with it (no other consumer). **Proven live end-to-end on a fresh cage:**
+  at launch, untouched, the keyfile carries `color-scheme='prefer-dark'` / `gtk-theme='Adwaita-dark'`
+  — the host's exact state; before, no keyfile at all. **Test placed in-crate on purpose:** only
+  there can it ask the **bus daemon** who owns the portal name and so separate "this host has no
+  portal" (skip) from "the read is broken" (fail); confirmed non-skipping here by temporarily
+  pinning it to the host's real `prefer-dark`. **Honest asymmetry:** unlike the font fix there is no
+  before/after test run (the signature changed, so the new test cannot compile against the old code)
+  — the *cause* is proven by the absent interpreter, the *fix* by the seed landing. 1315 unit +
+  gui/dbus e2e green, fmt/clippy `-D warnings` clean, **no new dep** (zbus/async-io already present).
+  **Instrument caution earned the hard way:** the first diagnosis pass reported a `gsettings`-vs-portal
+  disagreement that did not exist — the linuxbrew `gsettings` cannot load the dconf backend and was
+  returning *schema defaults*. Verify the instrument before trusting a mismatch it reports. See
+  [[dbus-hole]], [[gui-offscreen-posture]].
+  **Adwaita Sans provisioned by the GUI hole (DONE 2026-07-25)** (`src/sandbox/fonts.rs` +
+  `docs/bwrap-threat-model-and-binds.md` + `tests/run.rs`): a GTK4/libadwaita or Electron app styled
+  for a modern GNOME desktop asks for **`Adwaita Sans` by name**, and fontconfig **cannot alias its
+  way to a face that is absent** — hermes-desktop logged `Could not find any font: Adwaita Sans,
+  sans` every launch and rendered in a substitute. A font package carries **no `bin/`**, so it cannot
+  ride `[packages]` (which selects a bin-bearing output — the failure is a hard error, recorded in
+  the 2026-06-22 GUI spike) and a **profile has no way to supply one**; the hole is where it belongs.
+  Measured before adding, against the pinned rev: **7.3 MiB, 1 store path, no dependencies**
+  (vs DejaVu 9.1 MiB and the emoji face 11 MiB), layout `share/fonts` — the marker the hole already
+  uses, so it is one `GUI_FONTS` line. **Deliberately left out of the generic-family aliases**
+  (the user's call): provisioning it lets an app that *names* it get it, while a page that asked for
+  nothing in particular keeps rendering in the neutral face — restyling every cage is the user's
+  business, not the sandbox's. Reaches **both** rendering postures (`wayland` and `offscreen`).
+  **Cost:** every GUI cage pays the 7 MiB, including those that never request it; the per-profile
+  alternative (a trusted-only `[fonts]` config field) was weighed and **deferred** as a full
+  increment (schema + gating + merge_app + view + override + docs + tests). See
+  [[gui-offscreen-posture]].
+  **The font layer was silently unwired for `gui = "wayland"` — a regression the offscreen increment
+  introduced, plus the blunt assertion that hid it (DONE 2026-07-25)** (`src/sandbox/launch.rs` +
+  `tests/run.rs`): the user reported hermes-desktop **rendering wrongly**; its log ended in
+  `Fontconfig error: Cannot load default config file` and a **FATAL**
+  `SkFontMgr_FontConfigInterface … Not implemented` — a Chromium renderer dying because it found
+  **zero fonts**. Diagnosed on the **running cage**, not by reading code: its bwrap argv carried the
+  `--ro-bind …/fonts.conf /opt/sbx/fonts.conf` but **no `--setenv FONTCONFIG_FILE`** among its 40
+  keys. Root cause: splitting the font block **out** of the Wayland block (so `offscreen` would get
+  it) moved it **above** `gui_env = env;` — an **assignment**, not an `extend` — so the display
+  wiring **overwrote** the entry the font block had just pushed. The bind survived (it goes to
+  `gui_binds`), the variable naming it did not: a configuration mounted but never named. One-line
+  fix (`gui_env.extend(env)`), and the four sibling sites were already `extend`. **The fix landed
+  inside commit `7fa7b05`** (the user committed while it was being edited), so `git log` does not
+  show it as a separate change. **The second, larger finding — the test that should have caught it
+  passed:** `a_gui_wayland_launch_provisions_fonts_the_cage_can_find` asserted the substring
+  `dejavu-fonts`, which **`dejavu-fonts-minimal` satisfies** — the font path compiled into nixpkgs'
+  fontconfig (`--with-default-fonts`), which `fc-list` reports **even in a cage whose generated
+  configuration never takes effect**. So all three font assertions (wayland, offscreen, compose)
+  passed in a cage with **no working fontconfig at all**. Re-keyed on **`noto-fonts-color-emoji`**
+  (nothing but the hole supplies an emoji face) plus, on the wayland site, an assertion on
+  **`FONTCONFIG_FILE` itself** — a bind alone cannot tell a named configuration from an unnamed one.
+  **Proven in both directions:** with the overwrite restored the wayland e2e fails
+  (`FONTCONFIG_FILE=[]`, only `dejavu-fonts-minimal` listed); it passes once merged. **Standing
+  lesson, three occurrences in one session** (the `dejavu-fonts` substring, a replacement assertion
+  that matched the `fc-list` listing instead of the `fc-match` answer, and a `gsettings` that read
+  schema defaults): *verify that the assertion and the instrument measure what they claim*. A sweep
+  of `tests/run.rs` for assertions matching a **superstring** of what they pin is tracked separately.
+  See [[gui-offscreen-posture]].
   **`gui = "offscreen"` — a third posture, so a headless browser works without a display (DONE
   2026-07-25)** (`src/config/{types,mod,schema,view,overrides}.rs` + `src/cli/config.rs` +
   `src/sandbox/launch.rs` + `src/help.rs` + `docs/guide/configuration/{gui,overrides}.md` +
@@ -480,9 +559,11 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   Wayland/cache). 993 unit + 97 config + run e2e green, fmt/clippy `-D warnings` clean, **std-only** (no
   new dep — `portal.rs` reuses `store::provision`/`egress::wrap_background`). **Honest scope:** the real
   claude-desktop end-to-end (login + a click on "browse folder") is the pending live-user validation, as
-  for every GUI increment; the host-side theme read needs a host `/nix` with compatible paths
-  (best-effort — a host without it opens the app in the default theme). See [[dbus-hole]], [[gpu-hole]],
-  [[electron-gui-profiles]].
+  for every GUI increment. *(The once-recorded caveat "the host-side theme read needs a host `/nix`
+  with compatible paths" is **superseded and was wrong in both directions** — it was never a
+  host-without-`/nix` problem but a read that could not run **anywhere**, and it no longer applies at
+  all: the read now goes over the session bus. See the theme-read entry at the top.)* See
+  [[dbus-hole]], [[gpu-hole]], [[electron-gui-profiles]].
   **`dbus = true` — a filtered D-Bus session bus in the cage (DONE 2026-07-09)**
   (`src/sandbox/dbus.rs` [new] + `mod.rs` + `config/{schema,mod,view}.rs` + `src/{main}.rs` +
   `sandbox/launch.rs` + `profiles/opencode-desktop.toml` + `docs/guide/configuration/{dbus,README}.md`
