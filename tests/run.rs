@@ -1306,7 +1306,8 @@ fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
         ],
     );
     assert!(
-        !denied.status.success() && String::from_utf8_lossy(&denied.stderr).contains("403"),
+        !denied.status.success()
+            && String::from_utf8_lossy(&denied.stderr).contains("HTTP error 403"),
         "the dummy interface must not open egress — a non-allowlisted host must still get 403: {}",
         String::from_utf8_lossy(&denied.stderr)
     );
@@ -2004,7 +2005,7 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
         String::from_utf8_lossy(&denied.stdout)
     );
     assert!(
-        String::from_utf8_lossy(&denied.stderr).contains("403"),
+        String::from_utf8_lossy(&denied.stderr).contains("HTTP error 403"),
         "denied egress must be refused with a 403 at the proxy: {}",
         String::from_utf8_lossy(&denied.stderr)
     );
@@ -3229,7 +3230,7 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
         String::from_utf8_lossy(&denied.stdout)
     );
     assert!(
-        String::from_utf8_lossy(&denied.stderr).contains("403"),
+        String::from_utf8_lossy(&denied.stderr).contains("HTTP error 403"),
         "the deny carve-out must be refused with a 403 at the proxy: {}",
         String::from_utf8_lossy(&denied.stderr)
     );
@@ -4056,9 +4057,19 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
         String::from_utf8_lossy(&installed.stderr),
         String::from_utf8_lossy(&installed.stdout)
     );
+    // Teeth on mise's own artifact, not on its wording: `jq` is in the command itself and is echoed
+    // either way, and "installed" is matched by "not installed" and "uninstalled" too — so the log
+    // could not tell a real install from its opposite. The install pool in the project home can:
+    // only this install writes there.
     assert!(
-        log.contains("jq") && log.to_lowercase().contains("installed"),
-        "mise did not report installing jq through the allowlist: {log}"
+        project_home_mise_installed(data.path(), "nix-jq"),
+        "mise did not install jq into the project home's pool through the allowlist: {log}"
+    );
+    // Control: a tool that was never asked for must not be reported as installed, so the check
+    // above is discriminating rather than something that answers yes to anything.
+    assert!(
+        !project_home_mise_installed(data.path(), "nix-ripgrep"),
+        "the install check answers for a tool that was never installed — it proves nothing"
     );
 }
 
@@ -5052,6 +5063,36 @@ fn project_store_dir(data: &Path) -> Option<PathBuf> {
         .map(|e| e.path().join("store"))
         .find(|p| p.exists())
 }
+/// Whether mise installed `tool` (its backend-munged directory name, e.g. `nix-jq`) into the
+/// project home's own pool, with at least one concrete version directory rather than a bare
+/// placeholder. The filesystem answer to "did the self-equip actually install", which no wording in
+/// a tool's own log can give: mise says "installed" in messages that mean the opposite, and the
+/// project store is no witness either — a tool that is *also* in the base userland (jq is) sits
+/// there whether or not mise ever ran.
+fn project_home_mise_installed(data: &Path, tool: &str) -> bool {
+    let projects = data.join("sbx").join("projects");
+    for entry in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+        let installs = entry
+            .path()
+            .join("home/.local/share/mise/installs")
+            .join(tool);
+        let versioned = std::fs::read_dir(&installs)
+            .map(|es| {
+                es.flatten().any(|e| {
+                    e.path().is_dir()
+                        && e.file_name()
+                            .to_string_lossy()
+                            .starts_with(|c: char| c.is_ascii_digit())
+                })
+            })
+            .unwrap_or(false);
+        if versioned {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `path` (a logical `/nix/store/<hash>-name`) is physically present in `store_dir`.
 fn in_store(store_dir: &Path, path: &Path) -> bool {
     store_dir
@@ -5621,7 +5662,7 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
         String::from_utf8_lossy(&exfil.stdout)
     );
     assert!(
-        String::from_utf8_lossy(&exfil.stderr).contains("403"),
+        String::from_utf8_lossy(&exfil.stderr).contains("HTTP error 403"),
         "an outbound secret must be refused with a 403 at the proxy: {}",
         String::from_utf8_lossy(&exfil.stderr)
     );
