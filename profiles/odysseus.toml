@@ -1,0 +1,322 @@
+# Odysseus — a self-hosted AI workspace (chat, agents, research, docs, email,
+# notes, calendar, local-model workflows), served as a web UI by sbx.
+#
+#   sbx app import profiles/odysseus.toml
+#   sbx app run odysseus
+#   # then open http://127.0.0.1:7000 in your host browser
+#
+# Odysseus is a Docker-compose stack upstream (app + ChromaDB + SearXNG + ntfy),
+# but the cage cannot run Docker. This profile uses the UPSTREAM NATIVE path instead:
+# a plain Python/uvicorn server. The `cmd` clones the repo into the app's isolated
+# $HOME on first launch, builds a venv, installs requirements, and runs uvicorn on
+# 127.0.0.1:7000. `forward = [7000]` bridges that loopback port into the cage so
+# your host browser reaches the workspace — the exact headless-serve pattern of
+# `opencode-web` / `hermes-web` (no Electron, no in-cage browser, no `gui` hole).
+#
+# UPGRADE — explicit, never automatic. Odysseus publishes no release artifact and is
+# not a pip-installable package, so it rides no `[packages]` backend and `sbx upgrade`
+# has nothing to roll: the checkout would stay pinned to whatever `main` was on the
+# first launch. Refresh it for ONE launch with
+#     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
+# which fetches `main`, hard-resets the checkout, and re-installs the dependencies
+# (the install is keyed on the commit, so it re-runs exactly when the source moved).
+# Your data lives outside the checkout and is untouched.
+#
+# FIRST LAUNCH IS HEAVY — it clones the repo and installs `requirements.txt`
+# (a few hundred MiB of wheels over the allowlist below, minutes on first run). The
+# clone + venv persist in the app's isolated home, and the install is stamped with the
+# commit it was built for, so later launches skip straight to uvicorn without touching
+# the network. The first admin password is printed to the terminal logs on first boot
+# (the compose prints it to `docker compose logs`; the native server prints it to
+# stdout) — read it from the `sbx app run odysseus` output, then change it in Settings.
+#
+# CREDENTIAL POSTURE — Odysseus is BYOK/multi-provider, configured INSIDE the
+# Settings UI, but it also reads provider keys from the environment (see the
+# docker-compose `environment:` block: OPENAI_API_KEY, ANTHROPIC_API_KEY,
+# GOOGLE_API_KEY, OLLAMA_BASE_URL, …). The commented [env] + [secret] blocks below
+# let the egress proxy inject your real keys on the wire (the plaintext never enters
+# the cage) for the two most common providers; uncomment and provide the host env var
+# to enable. For any other provider, configure it in the Settings UI — the proxy will
+# name the host it blocked, and you open just that one with `sbx net allow -a odysseus
+# <url>` (watch `sbx net log -a odysseus` on first use).
+#
+# DEGRADED SERVICES (vs the full Docker stack). The compose bundles ChromaDB
+# (vector memory), SearXNG (web search), and ntfy (notifications) as separate
+# containers. This native profile runs ONLY the app server, so:
+#   - Vector memory falls back to an in-process MemoryVectorStore (the server logs
+#     "DEGRADED" / "MemoryVectorStore" — functional, not persisted across recreates
+#     the way a ChromaDB volume is).
+#   - Web search needs a provider: configure a Google/Brave/Tavily API key in
+#     Settings, or point SEARXNG_INSTANCE at your own SearXNG. Without one, the
+#     Deep Research / web-search tools cannot reach the internet through the allowlist.
+#   - Notifications (ntfy) are simply absent.
+# To get the full stack, run the Docker compose on the HOST (outside sbx) and point
+# Odysseus' Settings at those host-side services.
+#
+# LOCAL MODELS. Cookbook can serve downloaded models via llama.cpp/vLLM, but that is
+# the heavy part and needs the model weights + a serve runtime fetched at use time —
+# open those hosts with `sbx net allow` as the proxy names them. An Ollama already
+# running on the HOST is NOT reachable: the cage is in an empty netns, so the host's
+# 127.0.0.1 is a different loopback — use a hosted OpenAI-compatible endpoint
+# instead, or run Ollama on a reachable host and set OLLAMA_BASE_URL accordingly.
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -e
+cd "$HOME"
+# Clone the curated `main` branch (Odysseus' own README marks `dev` as
+# possibly-unstable and recommends `main`); reuse the persistent app home
+# on later launches. A bare `git clone` follows the repo default, which
+# upstream really does set to `dev`, so pin the branch explicitly.
+if [ ! -d odysseus ]; then
+  git clone -b main --depth 1 https://github.com/odysseus-dev/odysseus.git
+fi
+cd odysseus
+
+# UPGRADE. Odysseus publishes no release artifact and is not a pip-installable
+# package, so it rides no sbx `[packages]` backend and `sbx upgrade` cannot roll
+# it forward — the checkout would otherwise stay frozen at whatever `main` was on
+# the first launch, forever. Refresh it deliberately, one launch at a time:
+#     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
+# `--env` is an authoritative one-shot override read on the HOST, so this moves
+# the version only when you ask — the same "versions move only on an explicit
+# upgrade" contract `sbx upgrade` gives the managed backends. `reset --hard`
+# discards the local patch below (it is re-applied right after) and any other
+# in-tree edit; app DATA lives outside the checkout, so nothing you own is lost.
+if [ -n "$ODYSSEUS_SBX_UPDATE" ]; then
+  echo "sbx: refreshing the Odysseus checkout (ODYSSEUS_SBX_UPDATE is set) …" >&2
+  git fetch --depth 1 origin main
+  git reset --hard FETCH_HEAD
+fi
+
+# WORKAROUND (upstream bug, both `main` and `dev`): `src/agent_loop.py` uses
+# `Any` in annotations (e.g. `dict[str, Any]` at the `_resolved_tool_event_name`
+# def) but never imports it — line 15 is `from typing import AsyncGenerator, List,
+# Dict, Optional, Set` with no `Any`. Importing the module raises
+# `NameError: name 'Any' is not defined`, so the app never starts. Patch it
+# idempotently in this clone (not in the profile logic): add `Any` to that import
+# when it is missing. The `0,/…/` address bounds the substitution to the FIRST
+# matching line, so a file that grows a second `from typing import` is not
+# rewritten twice. Runs after every refresh, so it survives an update; drop this
+# block once upstream merges a fix (the guard already makes it a no-op then).
+if ! grep -q 'from typing import.*\bAny\b' src/agent_loop.py; then
+  sed -i '0,/^from typing import /s/^from typing import \(.*\)$/from typing import \1, Any/' src/agent_loop.py
+fi
+
+# Venv + install, keyed on the CHECKED-OUT COMMIT. `uv pip install` re-resolves
+# against PyPI on every call, so running it unconditionally would make each
+# launch depend on the network (and cost seconds) even with nothing to do. The
+# stamp records the commit the venv was built for, so a warm launch really does
+# go straight to the server — and a refresh above, which moves the commit,
+# re-installs by construction (a bare marker file would not).
+[ -d .venv ] || python -m venv .venv
+. .venv/bin/activate
+rev="$(git rev-parse HEAD)"
+stamp="$HOME/.odysseus-installed-rev"
+if [ "$(cat "$stamp" 2>/dev/null)" != "$rev" ]; then
+  echo "sbx: installing Odysseus dependencies for $rev (first launch or after an update) …" >&2
+  uv pip install -r requirements.txt
+  # ChromaDB vector store (Odysseus' document RAG + memory). It is a native
+  # server (no Docker in the cage); installed here so the profile is self-contained
+  # even if Odysseus' requirements.txt ever drops it. Idempotent if already present.
+  uv pip install chromadb
+  printf '%s\n' "$rev" > "$stamp"
+fi
+# Odysseus' own setup step (creates the db / directories it expects). Left
+# UNGUARDED on purpose: it is idempotent and needs no network, and guarding it
+# would skip the re-create if you ever wipe the app's data.
+python setup.py
+# Expose the C++ runtime the provisioned `nix:libstdc++` carries. manylinux wheels
+# (numpy, …) link libstdc++.so.6, which is absent from the cage's glibc — without
+# this, importing Odysseus dies at `import numpy` with
+# `libstdc++.so.6: cannot open shared object file`. The store path is hash-addressed,
+# so discover it under /nix/store at launch (pure glob, no `find` needed) rather than
+# hardcoding the hash. The provisioned package is `gcc.cc` (see [packages]); its
+# store path is `…-gcc-<ver>-lib/lib`, so glob that. The second/third globs
+# are harmless legacy aliases in case a pin names it differently. Extend the glob
+# list if another scientific wheel needs more (libgfortran/libgomp/…): add its
+# `nix:` package and a matching `*pkg*/lib` here.
+for d in /nix/store/*gcc-*-lib/lib /nix/store/*libstdcxx*/lib /nix/store/*libstdc++*/lib; do
+  [ -e "$d/libstdc++.so.6" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+done
+# Point Odysseus' built-in Browser MCP at sbx's provisioned Chromium. Odysses reads
+# ODYSSEUS_BROWSER_EXECUTABLE and passes `--executable-path` to @playwright/mcp,
+# so Playwright uses this binary instead of downloading its own. Odysses adds
+# `--no-sandbox` itself (see [env]); wrap the binary to also pass the flags its env
+# surface cannot express: --disable-dev-shm-usage (cage /dev/shm is small) and
+# --disable-gpu (headless). The store path is hash-addressed, so resolve it via glob.
+for c in /nix/store/*chromium*/bin/chromium; do
+  [ -x "$c" ] || continue
+  cat > "$HOME/chromium-wrap.sh" <<WRAP
+#!/bin/sh
+exec "$c" --no-sandbox --disable-dev-shm-usage --disable-gpu "\$@"
+WRAP
+  chmod +x "$HOME/chromium-wrap.sh"
+  export ODYSSEUS_BROWSER_EXECUTABLE="$HOME/chromium-wrap.sh"
+  break
+done
+# Vector memory (ChromaDB) — Odysseus expects it beside the app on :8100 and
+# degrades (warns, retries) if it is absent. sbx can't run Docker, so launch
+# ChromaDB natively in the cage. It persists to $HOME/chroma-data so the
+# vector store survives restarts. Odysseus connects via CHROMADB_HOST/PORT
+# (default localhost:8100). We bind the server on 0.0.0.0 (all cage
+# interfaces) and set CHROMADB_HOST=127.0.0.1 explicitly (see [env]) so Odysses
+# reaches the literal IPv4 loopback — this avoids a localhost->::1 (IPv6)
+# resolution in the cage that would silently refuse the connection while the
+# server is up on 127.0.0.1. nohup + `&` keeps it alive after `exec uvicorn`
+# replaces this shell.
+# NOTE: modern chromadb (1.x, what Odysseus' `chromadb-client` resolves to)
+# installs its server binary as `chroma` (entry point `chroma = chromadb.cli.cli:app`),
+# NOT `chromadb` — `chromadb run` is a command-not-found that silently kills the
+# background server. The full `chromadb` package (installed via `uv pip install
+# chromadb` above) provides the `chroma` binary; Odysseus' own `chromadb-client`
+# pin is client-only and does not ship the server.
+mkdir -p "$HOME/chroma-data"
+nohup chroma run --host 0.0.0.0 --port 8100 --path "$HOME/chroma-data" > "$HOME/chroma.log" 2>&1 &
+# Give ChromaDB a moment to bind :8100 (Odysseus retries anyway, this just
+# avoids the startup "not reachable" warning). Wait up to ~15s for the port.
+# The probe must NOT trip `set -e`: run it inside `if` so a closed port (the
+# normal case on first launch, before ChromaDB binds) doesn't abort the script
+# before `exec uvicorn`.
+for _ in $(seq 1 30); do
+  if python - <<'PY' >/dev/null 2>&1
+import socket; socket.create_connection(("127.0.0.1", 8100), timeout=1)
+PY
+  then break; fi
+  sleep 0.5
+done
+# Serve on the cage loopback; `forward` below bridges host 127.0.0.1:7000 -> cage.
+exec uvicorn app:app --host 127.0.0.1 --port 7000
+''',
+]
+
+# The inbound hole: forward host 127.0.0.1:7000 into the cage at the same port
+# (TOP-LEVEL, not under [network] — there it would be silently ignored). The host
+# port and the cage port must match the `--port` in `cmd` above. A security field,
+# honored because this profile lives in your trusted config dir.
+forward = [7000]
+
+# Your host Odysseus data, mounted read-write at its real absolute path, so the cage
+# shares your existing workspace (db, uploads, settings) instead of the app's isolated
+# home. `binds` is a security field, honored only because this profile is trusted by
+# location. Uncomment and point it at your clone's ./data (or wherever you keep it);
+# without it, data lives under the app's isolated home (the default). Mutually
+# exclusive with the in-cage clone above — if you bind a host checkout, drop the
+# `git clone` from `cmd` and run from that path instead.
+#binds = [
+#    { path = "~/odysseus-data", mode = "rw" },
+#]
+
+[packages]
+# Build/runtime substrate for the native server, provisioned host-side into sbx's
+# store (seeded, offline-reusable). Trusted-only [packages]; this profile is trusted
+# by location once imported.
+git     = "nix:git"        # clones the repo on first launch
+python  = "nix:python312"  # the venv interpreter (Python 3.11+ required by Odysseus)
+uv      = "nix:uv"         # `uv pip install` — fast wheel resolver for requirements.txt
+# The C++ runtime manylinux wheels (numpy, and most scientific wheels Odysseus'
+# requirements pull) link at import. The cage's glibc (via sbx's nix-ld shim)
+# carries no libstdc++.so.6, so a bare import of numpy dies with
+# `libstdc++.so.6: cannot open shared object file`. This provisions the library
+# into sbx's store; the `cmd` below exposes its `lib/` on LD_LIBRARY_PATH so
+# the interpreter's native extensions find it. Trusted-only [packages].
+# NOTE: the nixpkgs attribute is `gcc.cc` — the C++ runtime is the `cc` output of
+# the `gcc` package (the store path is `…-gcc-<ver>-lib/lib/libstdc++.so.6`). It is
+# NOT `libstdc++` (Nix's `++` is the string-concat operator — an unquoted attr
+# path `nix:libstdc++` fails the build with `unexpected end of file`) and NOT
+# `libstdcxx` (that attribute does not exist in nixpkgs; the suggestion
+# `libsigcxx` is an unrelated library). `gcc.cc` is the same GNU libstdc++
+# that provides libstdc++.so.6.
+libstdc = "nix:gcc.cc"
+# The Browser MCP server (a built-in) runs `@playwright/mcp` via `npx`, so the
+# cage needs a Node toolchain on PATH. `nix:nodejs` ships node + npm + npx.
+# Trusted-only [packages].
+node    = "nix:nodejs"
+# The Browser MCP needs a Chromium binary; point Odysseus' `ODYSSEUS_BROWSER_EXECUTABLE`
+# env at sbx's provisioned Chromium (resolved in `cmd` below, hash-addressed).
+# Odysses adds `--no-sandbox` itself (ODYSSEUS_BROWSER_NO_SANDBOX defaults to 1) —
+# mandatory: sbx's seccomp denylist blocks clone(CLONE_NEWUSER), so Chromium's own
+# userns sandbox cannot come up. The `cmd` wrapper also adds --disable-dev-shm-usage
+# and --disable-gpu, which Odysses' env surface cannot express. Heavy (~620 MB).
+chromium = "nix:chromium"
+
+[network]
+mode = "deny"
+allow = [
+    # First-launch clone, and the opt-in refresh (git smart-HTTP). The ref
+    # advertisement is a `GET /info/refs`, which sbx's BUILT-IN github lane already
+    # covers; the negotiation that follows is a `POST …/git-upload-pack`, and that
+    # built-in lane is deliberately `{GET,HEAD}`-only, so the POST needs this
+    # explicit entry — without it `git clone` is refused and the app never installs.
+    # Scoped to the one endpoint on the one repo rather than opening github to POST.
+    "{POST} https://github.com/odysseus-dev/odysseus.git/git-upload-pack",
+    # First-launch install — the Python wheels + the package index.
+    "{GET} https://pypi.org",
+    "{GET} https://files.pythonhosted.org",
+    # First-launch Browser MCP: `npx -y @playwright/mcp` installs the package from
+    # npm (like hermes-web's agent-browser). The audit POST is noisy and non-essential,
+    # so it is muted rather than allowed (see `mute` below).
+    "{GET} https://registry.npmjs.org",
+    # ChromaDB's default embedding model (all-MiniLM-L6-v2) is fetched from
+    # Hugging Face on first start if Odysseus uses Chroma's built-in embeddings.
+    # Harmless under --net shared; needed in deny+allow mode. The APEX alone is not
+    # enough: a bare host rule is EXACT (only `*.domain` covers subdomains), and a
+    # weights download redirects off-apex to the LFS CDN (`cdn-lfs*.huggingface.co`),
+    # which an exact `huggingface.co` rule refuses. The wildcard covers the apex, the
+    # LFS CDN and the resolve endpoints in one; `*.xethub.hf.co` (a DIFFERENT apex)
+    # covers the newer Xet storage path and still needs its own entry.
+    "{GET,HEAD} https://*.huggingface.co",
+    "{GET,HEAD} https://*.xethub.hf.co",
+    # (cache.nixos.org — the nix binary cache for git/python/uv — is already in
+    # sbx's built-in nix-cache allow-set, so it needs no entry here.)
+
+    # --- Optional BYOK providers (uncomment the [env]/[secret] blocks below too) ---
+    # OpenAI-compatible endpoints (OpenAI, and most OpenAI-compatible hosts).
+    #"{*} https://api.openai.com",
+    # Anthropic.
+    #"{*} https://api.anthropic.com",
+    # Google Generative Language API.
+    #"{*} https://generativelanguage.googleapis.com",
+    # Ollama on a REACHABLE host (not the host loopback — see the note above).
+    # An `http://` rule selects the inspected-CLEARTEXT path and is strictly opt-in;
+    # name the host and port, since a scheme with no host is not a rule.
+    #"{*} http://ollama.example.lan:11434",
+    # Any other provider you configure in Settings: the proxy names the blocked host,
+    # open it with `sbx net allow -a odysseus <url>`.
+]
+# npm's audit POST on every install: refused anyway, just kept out of the default log.
+mute = [
+    "https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
+
+# The real API key is read on the HOST and injected by the egress proxy — never in
+# the cage. Uncomment a pair (the [env] placeholder + the [secret] block) and
+# provide the host env var; the in-cage placeholder lets Odysseus start and issue the
+# request, and the proxy substitutes the real key on the wire. For providers not
+# listed, set the key in the Settings UI instead and open their host with
+# `sbx net allow`.
+[env]
+# Chromium under a seccomp-caged sbx: Odysses already adds `--no-sandbox` itself
+# (ODYSSEUS_BROWSER_NO_SANDBOX defaults to 1, because clone(CLONE_NEWUSER) is
+# blocked by sbx's seccomp denylist). Set it explicitly for clarity. The remaining
+# flags Odysses' env surface cannot express are added by the $HOME/chromium-wrap.sh
+# wrapper the `cmd` below generates (--disable-dev-shm-usage, --disable-gpu).
+ODYSSEUS_BROWSER_NO_SANDBOX = "1"
+# Vector memory: point Odysses at the literal IPv4 loopback (not `localhost`,
+# which the cage may resolve to ::1 / IPv6 first and silently refuse). The
+# ChromaDB server is launched on 0.0.0.0:8100 by `cmd` below.
+CHROMADB_HOST = "127.0.0.1"
+CHROMADB_PORT = "8100"
+#OPENAI_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+#ANTHROPIC_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"

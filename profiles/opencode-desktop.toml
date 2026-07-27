@@ -8,21 +8,28 @@
 # Electron; on Linux upstream distributes it only as a `.deb`/`.rpm`, neither of which installs in
 # the hermetic cage. sbx packages it with the `deb:` backend.
 #
-# THE `deb:` BACKEND (no third party, tracks upstream). sbx fetches opencode's **prebuilt `.deb`**
-# directly from its GitHub releases, resolves it to a content hash, and builds a generated
-# derivation that `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the Electron binaries against a
-# curated library set — no bun, no from-source build (opencode's own flake builds from source and
-# needs a bun newer than nixpkgs ships, which fails; a `.deb` sidesteps that entirely). The build is
-# HOST-SIDE (like `nix:`), not in-cage: a `.deb` runs no build script, so evaluating it host-side is
-# safe, and the result is seeded into the store and offline-reusable. The `…/releases/latest/…` URL
-# means the first launch tracks upstream, and `sbx upgrade deb` re-resolves it forward — no
-# dependency on any community flake.
+# THE `deb:github:` BACKEND (no third party, tracks upstream automatically). This profile names the
+# GitHub repo — `deb:github:anomalyco/opencode` — and sbx queries the repo's LATEST release, selects
+# its linux-amd64 `.deb` asset, resolves it to a content hash (asset URL and hash both pinned in the
+# per-project deb lock), and builds a generated derivation that `dpkg-deb -x`-unpacks it and
+# `autoPatchelfHook`s the Electron binaries against a curated library set — no bun, no from-source
+# build (opencode's own flake builds from source and needs a bun newer than nixpkgs ships, which
+# fails; a `.deb` sidesteps that entirely). The build is HOST-SIDE (like `nix:`), not in-cage: a
+# `.deb` runs no build script, so evaluating it host-side is safe, and the result is seeded into the
+# store and offline-reusable — no dependency on any community flake.
 #
-# FIRST LAUNCH resolves the `.deb` (pinning its hash in the per-project deb lock) and builds it
-# host-side, pulling the Electron closure (hundreds of MiB) — a couple of minutes, over your host
-# network (the build does NOT use the cage allowlist). Later launches reuse the pinned build
-# offline. `sbx upgrade deb` re-resolves the latest `.deb` and rewrites the lock (the new build
-# lands at the next launch).
+# Naming the REPO rather than upstream's `…/releases/latest/download/…` alias is what makes a warm
+# launch stable: the pin records the release's VERSION-STAMPED asset URL, which never changes
+# content, so a new upstream release leaves your pinned build working (you stay on it until an
+# explicit upgrade). Pinning the moving `latest` alias instead makes every upstream release break
+# the next launch with a fixed-output hash mismatch, since the pinned hash no longer matches what
+# that URL now serves.
+#
+# FIRST LAUNCH resolves the release asset (pinning URL + hash in the per-project deb lock) and builds
+# it host-side, pulling the Electron closure (hundreds of MiB) — a couple of minutes, over your host
+# network (the build does NOT use the cage allowlist). Later launches reuse the pinned build offline
+# and never query GitHub. `sbx upgrade deb` re-queries the repo and rolls the pin forward to the
+# newest release (the rebuilt app lands at the next launch). No manual version bump.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
@@ -75,7 +82,9 @@ dbus = true
 #]
 
 [packages]
-opencode-desktop = "deb:https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-linux-amd64.deb"
+# Track the latest GitHub release's linux-amd64 `.deb` automatically (see "THE `deb:github:`
+# BACKEND" above) — the pin is the release's version-stamped asset, rolled by `sbx upgrade deb`.
+opencode-desktop = "deb:github:anomalyco/opencode"
 
 [network]
 mode = "deny"

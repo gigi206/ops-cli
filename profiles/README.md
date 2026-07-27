@@ -28,6 +28,7 @@ with `sbx app export <name>`.
 | `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
 | `claude-desktop`  | `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | `api.anthropic.com` / `claude.ai` (account) |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
+| `qwen-code`       | `mise:npm:@qwen-code/qwen-code` (+ `nix:nodejs`) | `dashscope.aliyuncs.com` (Dashscope / Alibaba BYOK; OpenRouter/Anthropic/OpenAI/Gemini documented) |
 | `hermes`          | `flake:…/hermes-agent#default` (built host-side) | `openrouter.ai` (BYOK) / Nous account |
 | `hermes-webui`    | `flake:…/nesquena/hermes-webui#default` + `…/hermes-agent#default` (community web UI + `forward`) | `openrouter.ai` (BYOK) / Nous account |
 | `vibe`            | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, `nix:chromium`, `gui = "wayland"`) | `console.mistral.ai` (Mistral account SSO, in-cage browser) / `api.mistral.ai` (BYOK) |
@@ -44,6 +45,9 @@ with `sbx app export <name>`.
 | `openfox`         | `mise:npm:openfox` (+ `nix:nodejs`) — a local-LLM web coding agent (browser UI) | **`network = "shared"`** (host-local LLM, see note ‡) |
 | `goose`           | `mise:aqua:block/goose` (Rust release binary, no runtime deps) | provider-dependent (BYOK: OpenRouter / Anthropic / OpenAI — examples in profile) |
 | `goose-desktop`   | `deb:` prebuilt `.deb` (Electron GUI, `gui`/`gpu`/`dbus`) — the same agent with a desktop UI | provider-dependent (GUI login or BYOK — examples in profile) |
+| `pool`            | bootstrap `curl downloads.poolside.ai/pool/install.sh` (CLI tarball — no clean backend) | `*.poolside.ai` (Poolside API token, see note) |
+| `open-design`     | in-cage source checkout (`nexu-io/open-design`, pnpm workspace) — a design studio served to your host browser, driving OpenCode as its engine | `registry.npmjs.org` + your OpenCode provider |
+| `odysseus`        | in-cage source checkout (`odysseus-dev/odysseus`, Python/uvicorn) — a self-hosted AI workspace served to your host browser | `pypi.org` + `*.huggingface.co` + your provider (BYOK, in Settings) |
 
 Each gets its own persistent, isolated `$HOME` (config, login, history), shared
 across projects by default (`home_scope`).
@@ -227,7 +231,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `kiro`        | `nix:kiro-cli`                               | nixpkgs' derivation of AWS's official Kiro CLI `.tar.gz` (native binary, `unfree`) |
 | `opencode`    | `mise:opencode`                              | opencode's standalone release  |
 | `opencode-web`| `mise:opencode`                              | opencode's standalone release (`opencode web`) |
-| `opencode-desktop` | `deb:…/releases/latest/download/opencode-desktop-linux-amd64.deb` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
+| `opencode-desktop` | `deb:github:anomalyco/opencode` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side — tracks the repo's newest release (`sbx upgrade deb`) |
 | `claude-desktop` | `deb:apt:…/apt/stable/dists/stable/main/binary-amd64/Packages` | Anthropic's official prebuilt `.deb` (Electron), autoPatchelf'd host-side — tracks the apt index's newest version (`sbx upgrade deb`) |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
 | `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix + node front-ends), built host-side |
@@ -237,14 +241,18 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
 | `cline`       | `mise:npm:cline` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
+| `qwen-code`   | `mise:npm:@qwen-code/qwen-code` (+ `nix:nodejs`)| QwenLM npm package (pure-node CLI, node at runtime) |
 | `agy`         | `mise:aqua:google-antigravity/antigravity-cli`  | Antigravity's GitHub release binary (native) |
 | `antigravity-ide` | `tarball:resolve` (+ `[tarball.antigravity-ide]`) | Google's official IDE `.tar.gz` from `edgedl.me.gvt1.com` (Electron / VS Code fork), autoPatchelf'd host-side — auto-upgraded via a sandboxed resolve command over Google's version API (`sbx upgrade tarball`) |
 | `auggie`      | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | Augment Code npm package (pure-node CLI, node at runtime) |
-| `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package |
+| `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package — refresh with `--env CURSOR_AGENT_SBX_UPDATE=1` |
 | `cursor`      | `deb:…/cursor_<ver>_amd64.deb` (version-pinned)  | Cursor's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `openfox`     | `mise:npm:openfox` (+ `nix:nodejs`) | OpenFox npm package (pure-node web agent, node at runtime) |
 | `goose`       | `mise:aqua:block/goose`                | Block's GitHub release binary (Rust, self-contained, GitHub artifact attestations verified via Sigstore) |
-| `goose-desktop` | `deb:…/releases/download/v1.43.0/goose_1.43.0_amd64.deb` | Block's prebuilt `.deb` (Electron + embedded Rust CLI), autoPatchelf'd host-side — hand-pinned (versioned filename, no `latest` alias) |
+| `goose-desktop` | `deb:github:aaif-goose/goose` | Goose's prebuilt `.deb` (Electron + embedded Rust CLI), autoPatchelf'd host-side — tracks the repo's newest release (`sbx upgrade deb`). Same upstream as the `goose` CLI row above: the project now lives in the `aaif-goose` org, and aqua's `block/goose` is an alias of it |
+| `pool`          | bootstrap installer (`curl downloads.poolside.ai/pool/install.sh`) | Poolside's own tarball (`downloads.poolside.ai`), no npm/nixpkgs/GitHub package — refresh with `--env POOL_SBX_UPDATE=1` |
+| `open-design`   | in-cage `git clone` + pnpm workspace (no `[packages]` backend) | `nexu-io/open-design` source — upstream ships **no Linux release asset**; refresh with `--env OPEN_DESIGN_SBX_UPDATE=1`. Its OpenCode engine (`mise:aqua:sst/opencode`, an alias of `anomalyco/opencode`) does roll with `sbx upgrade mise` |
+| `odysseus`      | in-cage `git clone` + venv (no `[packages]` backend) | `odysseus-dev/odysseus` source — upstream publishes **no release and no installable package**; refresh with `--env ODYSSEUS_SBX_UPDATE=1` |
 
 The `mise:` prefix means the tool is equipped **in-cage** from **upstream directly**
 (mise's `aqua`/`github`/registry backends pull the real release binary, its `pipx` backend a
@@ -252,12 +260,34 @@ PyPI wheel via uv), so the version is the
 **latest upstream** — not whatever nixpkgs has packaged. This sidesteps both the nixpkgs
 lag and, for `claude-code`, the nixpkgs **unfree** gate (the standalone binary carries no
 such restriction). The tool is equipped at the latest upstream version on the **first
-launch in a project**; advancing an already-installed `mise:` version is **not yet
-automated** by `sbx upgrade` (a roll-forward for `[packages] mise:` is a planned increment)
-— so a long-lived project store keeps its first-installed version until then.
+launch in a project**; advancing an already-installed `mise:` version is what
+**`sbx upgrade mise`** does — it runs `mise upgrade` in each app's own home (and rolls the
+mise engine and the project's `nix:` tools in the same pass). Until you run it, a
+long-lived project store keeps its first-installed version: that is the contract, not a
+gap — versions move only on an explicit upgrade, never on an sbx binary update.
 
 A nixpkgs attribute is still available as `nix:<attr>` (provisioned host-side, seeded,
 offline-reusable) — use it for stable substrate tools where freshness does not matter.
+
+**How a profile upgrades — three classes.** A tool declared through a `[packages]` backend
+is rolled by `sbx upgrade <backend>` (`nix` / `mise` / `flake` / `deb` / `appimage` /
+`tarball`), which re-resolves the source and rewrites the lock; `sbx upgrade` with no
+argument rolls them all. A few profiles install their tool from inside the cage instead —
+because upstream ships no artifact any backend can consume (a vendor `curl … | sh`
+bootstrap, or a source checkout). Those have no lock to roll, so they would otherwise stay
+frozen at whatever the first launch fetched; each exposes an explicit, one-launch refresh
+through a one-shot env override instead:
+
+| Profile | Refresh |
+| ------- | ------- |
+| `cursor-agent` | `sbx app run cursor-agent --env CURSOR_AGENT_SBX_UPDATE=1` |
+| `pool` | `sbx app run pool --env POOL_SBX_UPDATE=1` |
+| `open-design` | `sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1` |
+| `odysseus` | `sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1` |
+
+`--env` is authoritative and read on the host, so these keep the same contract as
+`sbx upgrade`: **the version moves only when you ask**, never on a launch and never on an
+sbx binary update.
 
 A third backend, **`flake:<ref>`**, packages a tool that ships **only as a nix flake** — no
 single release binary and no nixpkgs attribute (e.g. a uv2nix Python agent). sbx builds a remote
@@ -284,9 +314,14 @@ whose from-source build is broken). sbx fetches the `.deb`, resolves it to a con
 in a per-project `deb-packages.lock`), and builds a generated derivation that `dpkg-deb -x`-unpacks
 it and `autoPatchelfHook`s the Electron binaries against a curated library set — **host-side**
 (like `nix:`, seeded and offline-reusable), because a `.deb` runs no build script so evaluating it
-host-side is safe. A `…/releases/latest/download/…` URL tracks upstream and `sbx upgrade deb`
-re-resolves it forward. `opencode-desktop` ships this way. (Its build needs your host network at
-first launch, not the cage allowlist; only the app's *runtime* egress is filtered.)
+host-side is safe. The locator is either a direct `.deb` URL, a `deb:github:<owner>/<repo>` (sbx
+picks the repo's newest release asset for this architecture), or a `deb:apt:<Packages-index-url>`
+(the index's highest version) — the last two tracking upstream automatically, rolled by
+`sbx upgrade deb`. Prefer them, or a version-stamped URL, over a moving `…/releases/latest/download/…`
+alias: a pin is a content hash, so a *moving* URL breaks the next launch with a fixed-output hash
+mismatch the moment upstream releases, whereas an immutable asset keeps the pinned build working
+until you upgrade. `opencode-desktop` ships this way. (Its build needs your host network at first
+launch, not the cage allowlist; only the app's *runtime* egress is filtered.)
 
 **npm/node CLIs** are also supported: declare a `node` runtime (`nix:nodejs`) and the
 tool via mise's npm backend (`mise:npm:<pkg>`). The cage synthesises `/usr/bin/env`, so

@@ -25,11 +25,11 @@
 # cannot set the bit), which is why the app MUST run with `--no-sandbox` below (bubblewrap +
 # seccomp + the empty netns IS the boundary, replacing Chromium's own redundant sandbox).
 #
-# VERSIONS — hand-pinned. Goose's `.deb` filename embeds the version (`goose_1.43.0_amd64.deb`),
-# so unlike opencode-desktop there is NO `releases/latest/download/<stable-name>` alias — the URL
-# is pinned to v1.43.0 below. `sbx upgrade deb` re-resolves this URL, but since it is version-
-# stamped the re-resolve yields the SAME `.deb` (no roll-forward): bump the URL by hand to move to
-# a newer Goose release (the build lands at the next launch).
+# VERSIONS — automatic. Goose's `.deb` filename embeds the version (`goose_<v>_amd64.deb`), so there
+# is no stable URL to hard-code; this profile names the REPO instead (`deb:github:aaif-goose/goose`,
+# below) and sbx pins the newest release's version-stamped asset. A warm launch reuses that pin
+# offline; `sbx upgrade deb` re-queries GitHub and rolls it forward (the rebuilt app lands at the
+# next launch). No manual version bump.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
@@ -53,9 +53,16 @@
 # a trusted-only cost not worth it for notification blips (parity with the opencode/droid
 # decision). Set `audio = true` if a future release adds voice input.
 #
+# BEFORE THE FIRST LAUNCH — open your provider's host. Egress is deny-by-default and this
+# profile ships with EVERY provider host commented out (the same posture as the `goose` CLI
+# profile): picking your provider is your call, not the profile's. Until you uncomment one in
+# `[network] allow` below, the app starts and renders but every model request — and the GUI's own
+# login step, which talks to the provider — is refused at the proxy. So: uncomment the ONE host
+# you use, then launch. `sbx net log -a goose-desktop` names anything else it wanted.
+#
 # CREDENTIAL POSTURE — GUI login OR BYOK. The desktop shares its config/secrets with the `goose`
-# CLI under `~/.config/goose` in the app's persistent isolated home. On first launch the GUI
-# walks you through a provider (OpenRouter browser login, or a manual API key for Anthropic /
+# CLI under `~/.config/goose` in the app's persistent isolated home. Once the host is open, the
+# GUI walks you through a provider (OpenRouter browser login, or a manual API key for Anthropic /
 # OpenAI / Google / etc.); with `GOOSE_DISABLE_KEYRING=1` the key falls back to a file in the
 # isolated home (the cage's private portal exposes no host keyring). This profile ships with NO
 # baked-in provider — log in via the GUI, OR uncomment a provider example below (env var +

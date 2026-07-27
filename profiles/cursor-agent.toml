@@ -81,7 +81,16 @@ set -eo pipefail
 # First launch only: run Cursor's official installer into the isolated home (contained by the
 # sandbox + the egress allowlist). Later launches reuse the installed binary. `pipefail` makes a
 # failed `curl … | bash` surface here (a clean install error), not later as `cursor-agent: not found`.
-if [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
+#
+# UPGRADE. A bootstrap install rides no sbx `[packages]` backend, so `sbx upgrade` has nothing to
+# roll and the binary would stay at whatever version the first launch fetched. The installer
+# carries no update logic of its own — it always downloads and overwrites with the version
+# `cursor.com/install` currently serves — so re-running it IS the upgrade. Do it for ONE launch:
+#     sbx app run cursor-agent --env CURSOR_AGENT_SBX_UPDATE=1
+# `--env` is an authoritative one-shot override read on the HOST, so the version moves only when
+# you ask, matching the "versions move only on an explicit upgrade" contract. Your login lives
+# elsewhere in the app home and is untouched.
+if [ ! -x "$HOME/.local/bin/cursor-agent" ] || [ -n "$CURSOR_AGENT_SBX_UPDATE" ]; then
   curl https://cursor.com/install -fsS | bash
 fi
 export PATH="$HOME/.local/bin:$PATH"
