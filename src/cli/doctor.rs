@@ -292,7 +292,18 @@ fn report_storage(pal: &style::Palette) {
         .unwrap_or_else(|| "unknown".to_string());
     let ty = format!("type: local ({fs})");
 
-    if pre.host_fs.is_some_and(|k| k.is_cow()) {
+    if pre.host_fs.is_some_and(|k| k.is_ephemeral()) {
+        // Checked before anything about volumes: that the data directory is in RAM outranks
+        // whether one could be mounted, and a volume would not make it survive a reboot either.
+        println!("  {warn} storage           {ty} — nothing here survives a reboot");
+        println!(
+            "         {}",
+            style::dim_prose(
+                "· $SBX_DATA_DIR can point sbx at a directory that persists",
+                pal
+            )
+        );
+    } else if pre.host_fs.is_some_and(|k| k.is_cow()) {
         println!("  {ok} storage           {ty} — already copy-on-write");
         println!("         {dim}· an encapsulated volume would add little{r}");
     } else if pre.recommends_volume() {

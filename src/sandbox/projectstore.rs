@@ -427,18 +427,30 @@ fn reflink(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// Whether `dir`'s filesystem supports reflinks, probed with a throwaway clone (both
-/// files on the same filesystem as the seed's destination). The probe names are
-/// unique per call (pid + counter) so a concurrent same-project seed never collides
-/// on them. The probe files are removed before returning.
+/// files on the same filesystem as the seed's destination). A probe that could not be
+/// carried out counts as "no", which is what a caller about to copy needs: it cannot
+/// reflink into a directory it cannot write to either. A caller that must tell the two
+/// apart wants [`reflink_verdict`].
 pub(crate) fn supports_reflink(dir: &Path) -> bool {
+    reflink_verdict(dir) == Some(true)
+}
+
+/// Whether `dir`'s filesystem supports reflinks, or `None` when the probe could not be
+/// carried out at all — the directory is not writable, so nothing was learned about the
+/// filesystem. The probe names are unique per call (pid + counter) so a concurrent
+/// same-project seed never collides on them, and the probe files are removed before
+/// returning.
+pub(crate) fn reflink_verdict(dir: &Path) -> Option<bool> {
     let src = dir.join(format!(".reflink-probe-src-{}", unique()));
     let dst = dir.join(format!(".reflink-probe-dst-{}", unique()));
-    let ok = fs::write(&src, b"probe")
-        .and_then(|()| reflink(&src, &dst))
-        .is_ok();
+    // Only the write's failure is inconclusive: once the source exists, the clone's outcome
+    // is the filesystem's answer.
+    let verdict = fs::write(&src, b"probe")
+        .ok()
+        .map(|()| reflink(&src, &dst).is_ok());
     let _ = fs::remove_file(&src);
     let _ = fs::remove_file(&dst);
-    ok
+    verdict
 }
 
 /// A token unique to this process and call, for temporary names that must not
@@ -652,6 +664,23 @@ mod tests {
     fn ino(path: &Path) -> (u64, u64) {
         let m = std::fs::symlink_metadata(path).unwrap();
         (m.dev(), m.ino())
+    }
+
+    #[test]
+    fn a_probe_that_could_not_run_is_not_an_answer_about_the_filesystem() {
+        let base = TmpDir::new();
+        // A writable directory yields a verdict either way — which one depends on the host.
+        assert!(reflink_verdict(base.path()).is_some());
+
+        // An unwritable one yields none: nothing was learned, and a caller deciding on the
+        // filesystem's capabilities must not read the failure as "it cannot".
+        let closed = base.path().join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(reflink_verdict(&closed), None);
+        // The seeding caller, about to copy into it, is right to read it as "no" all the same.
+        assert!(!supports_reflink(&closed));
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

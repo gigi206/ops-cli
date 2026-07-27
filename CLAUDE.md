@@ -96,6 +96,31 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **The three residuals the storage increment named, closed (DONE 2026-07-27)**
+  (`src/storage.rs` + `src/sandbox/{projectstore,mod}.rs` + `src/cli/doctor.rs` +
+  `docs/guide/cli/doctor.md`): each of the three was named honestly rather than fixed, and each is
+  now fixed. **(a) The XFS reflink claim is verified, not inferred.** The earlier attempt failed as
+  a **false negative** — udisks mounts an image with a root-owned root, so the write never reached
+  FICLONE. The way through was `mkfs.xfs -p <protofile>`, whose entries carry **uid/gid**, so the
+  filesystem is created with a directory owned by the invoking user: `cp --reflink=always` on a real
+  mounted XFS then **succeeds**, with the write itself proving the permission path was sound this
+  time. So XFS shares blocks; the recommendation there rests on the missing *compression*, as
+  documented. **(b) `supports_reflink` no longer conflates "cannot write" with "cannot share".** It
+  gained a sibling `reflink_verdict -> Option<bool>` where only the *write*'s failure is
+  inconclusive — once the source exists, the clone's outcome is the filesystem's answer.
+  `supports_reflink` is `== Some(true)`, which keeps the seeding caller's reading exactly as it was
+  (it is about to copy into that directory, so it cannot reflink there either), while
+  `Preflight::probe` takes the `Option` and leaves an unmeasurable directory as **no answer** rather
+  than a false "does not". **(c) `doctor` on a tmpfs says why.** It fell through to a bare
+  `type: local (tmpfs)` line; a new `FsKind::is_ephemeral` — a separate axis from `is_cow`, checked
+  **first** because a data directory in RAM outranks any question about volumes — gives it
+  `nothing here survives a reboot` plus the `$SBX_DATA_DIR` pointer. **Proven live in both
+  directions, and the first control had to be thrown away:** `/tmp` is itself a tmpfs on this host,
+  so the "persistent" control reported tmpfs too — re-run under `$HOME` it reads
+  `type: local (ext4) — a compressed btrfs volume is available`. **Tests:** 1 net-new unit (a probe
+  that could not run is not an answer, with the seeding caller's reading pinned beside it) +
+  `is_ephemeral` folded into the FsKind case. **1323 unit + 6 doctor green**, fmt/clippy
+  `-D warnings` clean, musl release rebuilt.
   **Storage status tells you what is being returned, and the volume is offered by measurement
   rather than by a table of filesystem names (DONE 2026-07-27)** (`src/storage.rs` +
   `src/cli/storage.rs` + `src/help.rs` + `docs/guide/cli/storage.md`): the follow-up to the gc

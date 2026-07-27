@@ -985,8 +985,8 @@ pub(crate) enum FsKind {
     Bcachefs,
     /// ext2/3/4 — a fixed inode table, the classic case a volume relieves.
     Ext,
-    /// XFS — dynamic inodes and, since `reflink=1` became the `mkfs.xfs` default, block sharing
-    /// too; but no compression.
+    /// XFS — dynamic inodes and, with `reflink=1` (the `mkfs.xfs` default), block sharing too;
+    /// but no compression, which is what a volume adds there.
     Xfs,
     /// A RAM-backed filesystem; nothing persistent lives here.
     Tmpfs,
@@ -999,6 +999,12 @@ impl FsKind {
     /// duplicate what it offers.
     pub(crate) fn is_cow(self) -> bool {
         matches!(self, FsKind::Btrfs | FsKind::Zfs | FsKind::Bcachefs)
+    }
+
+    /// Whether nothing stored here survives a reboot — a data directory's real problem, and one
+    /// no volume addresses.
+    pub(crate) fn is_ephemeral(self) -> bool {
+        matches!(self, FsKind::Tmpfs)
     }
 
     /// A short human name.
@@ -1146,11 +1152,11 @@ impl Preflight {
             udisks: crate::pathfind::find_on_path("udisksctl").is_some(),
             host_fs,
             // Measured only for a filesystem this does not recognize, where there is no table to
-            // consult — so the ordinary case writes nothing. A directory that cannot be written to
-            // reads as "does not share blocks", which errs towards offering a volume: the same
-            // answer this branch gave before it measured anything.
+            // consult — so the ordinary case writes nothing. A probe that could not be carried out
+            // stays `None`: an unwritable directory says nothing about its filesystem, and this
+            // decision must not read it as an answer.
             shares_blocks: matches!(host_fs, Some(FsKind::Other(_)))
-                .then(|| base.map(crate::sandbox::supports_reflink))
+                .then(|| base.and_then(crate::sandbox::reflink_verdict))
                 .flatten(),
             remote_session: is_remote_session(
                 std::env::var_os("SSH_CONNECTION").as_deref(),
@@ -1791,6 +1797,11 @@ this line has no separator at all
         // The filesystems a volume actually helps are not copy-on-write.
         assert!(!FsKind::Ext.is_cow());
         assert!(!FsKind::Xfs.is_cow());
+        // Ephemeral is a separate axis from copy-on-write, and the reason a volume is pointless
+        // on a tmpfs — where the data directory's problem is that it will not be there at all.
+        assert!(FsKind::Tmpfs.is_ephemeral());
+        assert!(!FsKind::Btrfs.is_ephemeral());
+        assert!(!FsKind::Ext.is_ephemeral());
         assert_eq!(FsKind::Ext.name(), "ext4");
         assert!(FsKind::Other(0xdead).name().contains("0x0000dead"));
     }
