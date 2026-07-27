@@ -90,9 +90,24 @@ What it offers depends on what is already there:
   the command you actually ran.
 
 The offer appears only where a volume is genuinely worth it: a mountable host (btrfs, loop devices
-and udisks2 present) with a **local active session**, whose data is **not already** on a
-copy-on-write filesystem. Set [`SBX_DATA_DIR`](../reference/environment-variables.md#sbx_data_dir)
-and it is skipped entirely — that is the invoker's explicit choice.
+and udisks2 present), a **local active session**, and a filesystem that does not already give sbx
+what a volume would. A volume brings two things — it **shares blocks** between files, so seeding a
+per-project store from the shared one costs almost nothing, and it **compresses** — so the question
+is whether either is missing:
+
+| Data directory on | shares blocks | compresses | offered? |
+|---|---|---|---|
+| btrfs, ZFS, bcachefs | yes | yes | no — and nesting one copy-on-write filesystem in another only compounds fragmentation |
+| XFS | yes (`reflink=1`) | no | yes, for the compression |
+| ext2/3/4 | no | no | yes — and it relieves the fixed inode table too |
+| tmpfs | — | — | no: nothing here survives a reboot |
+| anything else | measured | unknown | only if it turns out not to share blocks |
+
+For a filesystem sbx does not recognize there is no table to consult, so it **measures** block
+sharing by attempting one in the data directory — and offers a volume only on a definite "cannot",
+rather than guessing about compression. Set
+[`SBX_DATA_DIR`](../reference/environment-variables.md#sbx_data_dir) and the offer is skipped
+entirely — that is the invoker's explicit choice.
 
 ## Adopting a volume
 
@@ -196,6 +211,7 @@ sbx storage — /home/you/.local/share/sbx-storage.btrfs
   mounted at  /run/media/you/sbx-storage
   compression zstd
   inside      2.4 GiB used of 3.3 GiB the filesystem has claimed
+  reclaiming  1.3 GiB being returned to the host
 
   sbx is reading its data from this volume.
 ```
@@ -204,6 +220,10 @@ sbx storage — /home/you/.local/share/sbx-storage.btrfs
 encapsulated volume, or `local (<fs>)` when it sits directly on a host filesystem (the same line
 [`sbx doctor`](doctor.md) leads with). **on host** is what the volume actually costs — compare it
 with **inside**, which is what the filesystem holds, to see compression and block sharing at work.
+
+**reclaiming** appears only when there is something to wait for: space the filesystem has freed
+and is handing back to the host, which `on host` is still counting. It is the difference between
+the two figures made explicit, and it needs no action — see [below](#releasing-it).
 
 `--json` emits the same data as a document.
 
@@ -221,20 +241,24 @@ to stop using it for good.
 
 Freed space returns to the host **in the background**, not the instant a file is deleted, so the
 `on host` figure lags — after a large [`sbx gc`](gc.md) it can sit well above what the data now
-occupies. It is not lost; it is being handed back.
+occupies. It is not lost; it is being handed back, and `status` says how much:
+[**reclaiming**](#status) is exactly that queue.
 
 The volume mounts `discard=async` (btrfs's default), which favours write speed over prompt
 reclaim: a delete returns its blocks through a **throttled background worker**, so the image runs
-*above* the real used size between trims rather than shrinking on the spot. That suits sbx's
+*above* the real used size for a few minutes rather than shrinking on the spot. That suits sbx's
 workload — a nix build churns through many small writes, and `discard=sync` would make every commit
 wait on the disk's TRIM. It cannot be changed here anyway: `udisks` fixes the mount options and sbx
 holds no privilege.
 
-The gap is reclaimed for you. Most systems enable systemd's **`fstrim.timer`**, which runs `fstrim`
-weekly across every mounted filesystem — this volume included — returning whatever the async worker
-has not; check it with `systemctl status fstrim.timer`. To reclaim now rather than wait for the
-timer, `sudo fstrim <mount-point>` trims it immediately (the `FITRIM` ioctl needs root, so sbx
-cannot do it for you). A `sudo btrfs balance` is only for the long-term fragmentation of
-partly-emptied chunks, not ordinary deletes, which the timer handles. `sbx storage status` names
-the mount point, and its `on host` figure — mirrored by [`sbx store`](store.md) — is what tracks
-the real cost.
+**Wait rather than act.** The worker is throttled, not partial: the `reclaiming` figure drains to
+nothing and `on host` comes back down on its own. How long that takes is not fixed — it depends on
+how much is queued and on the rate limits the kernel applies to the worker — so watch
+`sbx storage status` rather than expect a particular delay. There is nothing to run.
+
+If you would rather not wait, `sudo fstrim <mount-point>` returns it at once — the `FITRIM` ioctl
+needs root, so sbx cannot do it for you, and the same is true of the timer some distributions
+enable to sweep every mounted filesystem periodically (`systemctl status fstrim.timer` says whether
+yours does). A `sudo btrfs balance` is a different matter again: it addresses the long-term
+fragmentation of partly-emptied chunks, not ordinary deletes. `sbx storage status` names the mount
+point, and its `on host` figure — mirrored by [`sbx store`](store.md) — is what tracks the real cost.

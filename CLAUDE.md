@@ -96,6 +96,68 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **Storage status tells you what is being returned, and the volume is offered by measurement
+  rather than by a table of filesystem names (DONE 2026-07-27)** (`src/storage.rs` +
+  `src/cli/storage.rs` + `src/help.rs` + `docs/guide/cli/storage.md`): the follow-up to the gc
+  investigation, three slices. **(a) A `reclaiming` line in `sbx storage status`.** Deleting inside
+  the volume does not shrink the image at once — with `discard=async` the freed extents queue and a
+  **throttled** worker punches them out over the following minutes — so `on host` sits above the
+  truth in between, and nothing said by how much. `reclaiming_bytes` reads the kernel's own queue,
+  `/sys/fs/btrfs/<uuid>/discard/discardable_bytes`, finding the right filesystem among a host's
+  several by the **loop device** the volume is attached to (`devices/<name>`, no UUID parsing, no
+  ioctl). Rendered **only when non-zero** — an always-present `0 B` would read as a figure to act
+  on, where the whole point is that this one resolves itself — and mirrored in `--json` by the same
+  rule, so the two cannot disagree. Read as **signed**: the counter is maintained incrementally and
+  can sit just below zero, which is a queue of nothing, not a figure. **Proven live end-to-end, the
+  full curve:** line absent (counter 0, host 13.6 GiB) → write and delete 800 MiB of incompressible
+  data → `reclaiming 1.3 GiB`, host 14.4 GiB → at **t+135 s** the line is gone and host is back to
+  **13.6 GiB**, the exact starting figure. **This is also what retired the alternative that was
+  written first and reverted:** a "reclaimable" figure computed by subtraction, pushing the user at
+  `sudo fstrim`. It was accurate to the MiB — and answering the wrong question, because the gap is
+  **transitory**; the original note (`freed space returns to the host in the background…`) had been
+  right all along, and the diagnosis that contradicted it came from a measurement taken at **20 s**,
+  before the throttled worker had started. The docs are corrected in the same direction: **wait
+  rather than act**, `sudo fstrim` demoted to "if you would rather not wait", and the claim that
+  *most* distributions enable `fstrim.timer` replaced by how to check your own. **(b) The volume is
+  offered by what it would add, not by whether the filesystem is copy-on-write.** `recommends_volume`
+  tested `!FsKind::is_cow()` — a hand-written table of superblock magics — which said **yes on
+  tmpfs**: sbx would propose a 200 GiB compressed volume in RAM. The new pure
+  `volume_adds_anything(host_fs, shares_blocks)` asks whether **either** of the volume's two
+  capabilities is missing, which is the load-bearing distinction: it brings block sharing *and*
+  compression, so block sharing alone cannot settle it. btrfs/zfs/bcachefs → no (both present, and
+  nesting one copy-on-write filesystem in another compounds the fragmentation); tmpfs → no (nothing
+  here survives a reboot); ext → yes (neither, plus the fixed inode table); **XFS → yes, for the
+  compression** — it *does* share blocks. **A straight substitution of the FICLONE probe for the
+  table was considered and rejected**: it changes no recognized filesystem's answer (XFS is
+  recommended either way) and would **regress ZFS below OpenZFS 2.2**, which has no block cloning
+  yet compresses. So the probe is placed where the table has nothing to say — an **unrecognized**
+  filesystem, where `Preflight::probe` measures block sharing with the existing
+  `sandbox::supports_reflink` and a volume is offered only on a definite "cannot", never on a guess
+  about compression. Measured **only** in that branch, so every recognized filesystem still costs
+  zero I/O. `is_cow` is **kept** — `doctor`'s "already copy-on-write" line is an accurate use of it.
+  **One regression caught in review and closed:** the kind is read by `fs_kind_of_nearest`, which
+  walks **up** to an existing ancestor, while the first cut probed `data_base` itself — so on a
+  first run, where the data directory does not exist yet, the two signals described **different
+  filesystems** and an unrecognized one silently lost its offer. `nearest_existing` is now the one
+  directory both use, pinned by an assertion in the walk-up test. **(c) The XFS comment was
+  factually wrong** ("no compression or block sharing") — **verified, not corrected from memory**:
+  `mkfs.xfs` 7.1.1 reports `reflink=1` among its defaults. The live half of that check
+  (a real `cp --reflink` on a mounted XFS) **failed as a false negative** and is recorded as such —
+  udisks mounts the image with a **root-owned root**, so the write never reached FICLONE at all;
+  the instrument, not the filesystem. That is precisely why the code now **measures the actual data
+  directory** instead of asserting a filesystem's capabilities in a comment. **Tests:** 3 net-new
+  unit — the queue is read from the volume's *own* filesystem (two fake sysfs trees, so taking the
+  first would fail), every way of having nothing pending reports nothing (zero, negative, empty,
+  garbage, no `discard/` directory, no sysfs tree), and the recommendation matrix including the
+  tmpfs case and all three measured-unknown outcomes. **Teeth proven in both directions on each
+  rule** by temporarily restoring the faulty code: neutering the positive-only guard fails on `"0"`,
+  taking the first filesystem fails on the wrong device, `Tmpfs => true` and `Other(_) => true` each
+  fail their own assertion. **1322 unit + 6 doctor + 13 help green** (doctor being the one
+  integration suite that reads `host_fs`/`recommends_volume`), fmt/clippy `-D warnings` clean,
+  **std-only** (no new dep — `reclaiming_bytes` is two `std::fs` reads, the probe already existed),
+  musl release rebuilt and the line re-proven on the **shipped** binary (absent at rest, `reclaiming
+  1.3 GiB` after a 900 MiB delete, `reclaiming_bytes` in `--json`).
+  See [[storage-btrfs-volume]], [[storage-reclaim-and-reflink-probe]], [[gc-recreates-nixpkgs-source]].
   **`sbx gc` was undoing its own collection, and provisioning to discover it had nothing to do
   (DONE 2026-07-27)** (`src/sandbox/launch.rs` + `src/store.rs` + `src/sandbox/fhs.rs` +
   `docs/guide/housekeeping/gc.md` + `tests/projects.rs`): the user asked whether the per-project

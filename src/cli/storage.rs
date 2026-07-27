@@ -656,6 +656,10 @@ struct StatusView {
     allocated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     used_bytes: Option<u64>,
+    /// Bytes the volume has freed and is still returning to the host. Present only when there
+    /// are some, so that a figure appearing at all means there is something to wait for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reclaiming_bytes: Option<u64>,
     /// Whether sbx is set to follow this volume — the pointer names it — whether or not it is
     /// mounted right now. A volume adopted before a reboot is `adopted` but not mounted.
     adopted: bool,
@@ -697,6 +701,7 @@ fn status(args: Vec<OsString>) -> ExitCode {
         capacity_bytes: storage::image_capacity(&image),
         allocated_bytes: None,
         used_bytes: None,
+        reclaiming_bytes: None,
         adopted: is_adopted,
         in_use: false,
         image: image.clone(),
@@ -722,6 +727,7 @@ fn status(args: Vec<OsString>) -> ExitCode {
                 view.allocated_bytes = Some(sp.allocated);
                 view.used_bytes = Some(sp.used);
             }
+            view.reclaiming_bytes = storage::reclaiming_bytes(loop_dev);
         }
         _ => {}
     }
@@ -795,6 +801,14 @@ fn render(v: &StatusView) {
                 "  inside      {} used {dim}of {} the filesystem has claimed{r}",
                 sandbox::human_bytes(u),
                 sandbox::human_bytes(a)
+            );
+        }
+        // Only when there is a queue: an always-present `0 B` would read as a figure to act on,
+        // where the whole point is that this one resolves itself.
+        if let Some(pending) = v.reclaiming_bytes {
+            println!(
+                "  reclaiming  {} {dim}being returned to the host{r}",
+                sandbox::human_bytes(pending)
             );
         }
     }

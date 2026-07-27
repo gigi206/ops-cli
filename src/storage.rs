@@ -457,6 +457,40 @@ pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
     Ok(space)
 }
 
+/// Bytes the volume has freed and is still handing back to the host.
+///
+/// Deleting inside the volume does not shrink the image at once. With `discard=async` the kernel
+/// queues the freed extents and a deliberately throttled worker punches them out of the image;
+/// until it gets to them the host still carries them. This counter is that queue — the space the
+/// host figure is about to stop counting, with nothing to do but wait. How long the wait is
+/// depends on the queue and on the rate limits the kernel applies to the worker, so it is reported
+/// rather than predicted.
+///
+/// `None` where the kernel keeps no such queue (mounted without async discard, or an older
+/// kernel) and where there is nothing pending, which are reported alike: both mean there is no
+/// pending figure worth showing.
+pub(crate) fn reclaiming_bytes(loop_dev: &str) -> Option<u64> {
+    reclaiming_bytes_under(Path::new("/sys/fs/btrfs"), loop_dev)
+}
+
+/// [`reclaiming_bytes`] against a given sysfs root, so the lookup is exercised without one.
+fn reclaiming_bytes_under(sysfs: &Path, loop_dev: &str) -> Option<u64> {
+    // Every mounted btrfs filesystem has a sysfs directory keyed by its UUID, listing the block
+    // devices that back it. A host can have several, so the loop device the volume is attached to
+    // is what says which directory is this volume's.
+    let device = Path::new(loop_dev).file_name()?;
+    let fs = std::fs::read_dir(sysfs)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|fs| fs.join("devices").join(device).symlink_metadata().is_ok())?;
+    let raw = std::fs::read_to_string(fs.join("discard/discardable_bytes")).ok()?;
+    // Read as signed: the counter is maintained incrementally and can sit slightly below zero,
+    // which is a queue of nothing rather than a figure to report.
+    let pending = raw.trim().parse::<i64>().ok()?;
+    (pending > 0).then_some(pending as u64)
+}
+
 /// Bytes available to this user on the filesystem holding `path`.
 ///
 /// Read from the filesystem rather than from the volume's own accounting, because that is the
@@ -951,7 +985,8 @@ pub(crate) enum FsKind {
     Bcachefs,
     /// ext2/3/4 — a fixed inode table, the classic case a volume relieves.
     Ext,
-    /// XFS — dynamic inodes, but no compression or block sharing.
+    /// XFS — dynamic inodes and, since `reflink=1` became the `mkfs.xfs` default, block sharing
+    /// too; but no compression.
     Xfs,
     /// A RAM-backed filesystem; nothing persistent lives here.
     Tmpfs,
@@ -1008,10 +1043,17 @@ pub(crate) fn fs_kind(path: &Path) -> Option<FsKind> {
 /// does. The data directory may be absent on a first run, but the filesystem it will live on is
 /// already there, and that is what decides whether a volume is worth it.
 pub(crate) fn fs_kind_of_nearest(path: &Path) -> Option<FsKind> {
+    nearest_existing(path).and_then(fs_kind)
+}
+
+/// The nearest ancestor of `path` that can be statted — `path` itself when it exists. Exposed
+/// alongside [`fs_kind_of_nearest`] so a caller that also wants to *measure* something about that
+/// filesystem measures it on the very directory whose kind was read, never on a different one.
+fn nearest_existing(path: &Path) -> Option<&Path> {
     let mut p = path;
     loop {
-        if let Some(k) = fs_kind(p) {
-            return Some(k);
+        if fs_kind(p).is_some() {
+            return Some(p);
         }
         p = p.parent()?;
     }
@@ -1067,6 +1109,10 @@ pub(crate) struct Preflight {
     pub(crate) udisks: bool,
     /// The filesystem the data directory sits on, or will.
     pub(crate) host_fs: Option<FsKind>,
+    /// Whether that filesystem shares blocks between files, *measured* by attempting one —
+    /// consulted only where [`FsKind`] does not settle the question, so the recognized
+    /// filesystems cost no I/O and carry `None` here.
+    pub(crate) shares_blocks: Option<bool>,
     /// A remote session (`$SSH_CONNECTION`/`$SSH_TTY` set), under which udisks' polkit rule
     /// asks for administrator authentication and so cannot mount unattended.
     pub(crate) remote_session: bool,
@@ -1090,11 +1136,22 @@ impl Preflight {
     /// Probe the host. `data_base` is where the data directory sits, or would; its filesystem
     /// decides whether a volume relieves anything.
     pub(crate) fn probe(data_base: &Path) -> Self {
+        // The same directory throughout: on a first run the data directory does not exist yet, so
+        // both the kind and the measurement must describe the filesystem it will land on.
+        let base = nearest_existing(data_base);
+        let host_fs = base.and_then(fs_kind);
         Self {
             kernel_btrfs: kernel_supports_btrfs(),
             loop_control: Path::new("/dev/loop-control").exists(),
             udisks: crate::pathfind::find_on_path("udisksctl").is_some(),
-            host_fs: fs_kind_of_nearest(data_base),
+            host_fs,
+            // Measured only for a filesystem this does not recognize, where there is no table to
+            // consult — so the ordinary case writes nothing. A directory that cannot be written to
+            // reads as "does not share blocks", which errs towards offering a volume: the same
+            // answer this branch gave before it measured anything.
+            shares_blocks: matches!(host_fs, Some(FsKind::Other(_)))
+                .then(|| base.map(crate::sandbox::supports_reflink))
+                .flatten(),
             remote_session: is_remote_session(
                 std::env::var_os("SSH_CONNECTION").as_deref(),
                 std::env::var_os("SSH_TTY").as_deref(),
@@ -1126,14 +1183,41 @@ impl Preflight {
     }
 
     /// Whether an encapsulated volume is worth *recommending*: it can be mounted, the kernel
-    /// supports btrfs, the data is not already on a copy-on-write filesystem, and the session is
-    /// local (so udisks mounts without a password). A "no" is advisory — it decides whether to
-    /// suggest one, never whether `sbx storage` works when asked.
+    /// supports btrfs, the session is local (so udisks mounts without a password), and the volume
+    /// would actually add something. A "no" is advisory — it decides whether to suggest one,
+    /// never whether `sbx storage` works when asked.
     pub(crate) fn recommends_volume(&self) -> bool {
         self.can_mount()
             && self.kernel_btrfs
             && !self.remote_session
-            && self.host_fs.is_some_and(|k| !k.is_cow())
+            && volume_adds_anything(self.host_fs, self.shares_blocks)
+    }
+}
+
+/// Whether an encapsulated volume would give the data directory something its filesystem does not
+/// already provide. Kept pure over its two inputs, so every filesystem's case is exercised without
+/// one being present.
+///
+/// A volume brings two distinct things — it shares blocks between files (so seeding a per-project
+/// store from the shared one costs almost nothing) and it compresses — and the question is whether
+/// *either* is missing here. That is why block sharing alone does not settle it: XFS shares blocks
+/// and still gains compression from a volume.
+fn volume_adds_anything(host_fs: Option<FsKind>, shares_blocks: Option<bool>) -> bool {
+    match host_fs {
+        // Both already present, so a volume would only duplicate them — and nesting one
+        // copy-on-write filesystem inside another compounds the fragmentation both are prone to.
+        Some(FsKind::Btrfs | FsKind::Zfs | FsKind::Bcachefs) => false,
+        // Nothing here survives a reboot, so there is no long-lived data directory to house.
+        Some(FsKind::Tmpfs) => false,
+        // ext has neither, and a fixed inode table besides. XFS does share blocks, but does not
+        // compress, which is what a volume adds there.
+        Some(FsKind::Ext | FsKind::Xfs) => true,
+        // No table covers it, so fall back to the one thing that can be measured. A filesystem
+        // that cannot share blocks pays a full copy per project — the clearest thing a volume
+        // fixes. One that can is left alone rather than guessed at, since whether it also
+        // compresses is exactly what is unknown.
+        Some(FsKind::Other(_)) => shares_blocks == Some(false),
+        None => false,
     }
 }
 
@@ -1286,6 +1370,64 @@ this line has no separator at all
         let base = crate::testutil::TmpDir::new();
         assert_eq!(compression(base.path()), None);
         assert_eq!(compression(Path::new("/nonexistent-by-construction")), None);
+    }
+
+    /// Build a stand-in for one filesystem's sysfs directory: the device it is backed by, and
+    /// the discard counter's contents.
+    fn fake_btrfs_sysfs(sysfs: &Path, uuid: &str, device: &str, counter: Option<&str>) {
+        let fs = sysfs.join(uuid);
+        std::fs::create_dir_all(fs.join("devices")).unwrap();
+        std::fs::write(fs.join("devices").join(device), b"").unwrap();
+        if let Some(c) = counter {
+            std::fs::create_dir_all(fs.join("discard")).unwrap();
+            std::fs::write(fs.join("discard/discardable_bytes"), c).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_reclaiming_queue_is_read_from_the_volumes_own_filesystem() {
+        // A host can run several btrfs filesystems, so reading "the" counter is not enough: the
+        // one reported must be the one backed by the loop device this volume is attached to.
+        let base = crate::testutil::TmpDir::new();
+        let sysfs = base.path();
+        fake_btrfs_sysfs(sysfs, "1111-aaaa", "sda2", Some("999999999\n"));
+        fake_btrfs_sysfs(sysfs, "2222-bbbb", "loop7", Some("1178599424\n"));
+
+        assert_eq!(
+            reclaiming_bytes_under(sysfs, "/dev/loop7"),
+            Some(1_178_599_424)
+        );
+        // A device no filesystem here is backed by has no queue to report.
+        assert_eq!(reclaiming_bytes_under(sysfs, "/dev/loop9"), None);
+    }
+
+    #[test]
+    fn a_queue_of_nothing_is_reported_as_nothing_to_wait_for() {
+        // `status` shows the line only when there is something pending, so every way of having
+        // nothing pending must arrive as `None` rather than as a figure to render. The negative
+        // case is real: the counter is maintained incrementally and can sit just below zero.
+        let base = crate::testutil::TmpDir::new();
+        let sysfs = base.path();
+        for (i, raw) in ["0", "0\n", "-25165824\n", "", "not-a-number\n"]
+            .iter()
+            .enumerate()
+        {
+            let uuid = format!("fs-{i}");
+            fake_btrfs_sysfs(sysfs, &uuid, &format!("loop{i}"), Some(raw));
+            assert_eq!(
+                reclaiming_bytes_under(sysfs, &format!("/dev/loop{i}")),
+                None,
+                "counter {raw:?} should report nothing pending"
+            );
+        }
+        // A kernel that keeps no such counter at all: the directory is simply absent.
+        fake_btrfs_sysfs(sysfs, "fs-none", "loop90", None);
+        assert_eq!(reclaiming_bytes_under(sysfs, "/dev/loop90"), None);
+        // And a host with no btrfs sysfs tree whatsoever.
+        assert_eq!(
+            reclaiming_bytes_under(Path::new("/nonexistent-by-construction"), "/dev/loop0"),
+            None
+        );
     }
 
     #[test]
@@ -1610,6 +1752,38 @@ this line has no separator at all
     }
 
     #[test]
+    fn a_volume_is_recommended_only_where_it_adds_something() {
+        // The two things a volume brings are block sharing and compression, so the question is
+        // whether either is missing — not whether the filesystem is copy-on-write.
+        for cow in [FsKind::Btrfs, FsKind::Zfs, FsKind::Bcachefs] {
+            assert!(
+                !volume_adds_anything(Some(cow), None),
+                "{} already has both",
+                cow.name()
+            );
+        }
+        // Nothing persistent lives on a tmpfs, so housing a data directory in a volume there is
+        // beside the point — however un-copy-on-write it is.
+        assert!(!volume_adds_anything(Some(FsKind::Tmpfs), None));
+        // ext lacks both; XFS shares blocks but does not compress, which the volume still adds.
+        assert!(volume_adds_anything(Some(FsKind::Ext), None));
+        assert!(volume_adds_anything(Some(FsKind::Xfs), None));
+
+        // An unrecognized filesystem has no table to consult, so the measurement decides — and
+        // only a definite "it cannot share blocks" is enough to recommend one.
+        let unknown = Some(FsKind::Other(0xdead));
+        assert!(volume_adds_anything(unknown, Some(false)));
+        assert!(!volume_adds_anything(unknown, Some(true)));
+        assert!(
+            !volume_adds_anything(unknown, None),
+            "an unmeasurable unknown filesystem is not a recommendation"
+        );
+
+        // And a filesystem that could not be identified at all is never a recommendation.
+        assert!(!volume_adds_anything(None, Some(false)));
+    }
+
+    #[test]
     fn a_copy_on_write_filesystem_is_recognized_as_one() {
         assert!(FsKind::Btrfs.is_cow());
         assert!(FsKind::Zfs.is_cow());
@@ -1632,6 +1806,11 @@ this line has no separator at all
         // ...but resolves to the nearest ancestor that does — the filesystem it would be
         // created on, which is what a first-run probe needs before the data directory exists.
         assert_eq!(fs_kind_of_nearest(&missing), fs_kind(base.path()));
+        // And that ancestor is reachable as a path, not only as a kind: a probe that measures
+        // something about the filesystem must measure it on the very directory whose kind was
+        // read, or the two signals would describe different filesystems on a first run.
+        assert_eq!(nearest_existing(&missing), Some(base.path()));
+        assert_eq!(nearest_existing(base.path()), Some(base.path()));
     }
 
     /// Build a `Preflight` with each signal set explicitly, so the derived decisions can be
@@ -1648,6 +1827,8 @@ this line has no separator at all
             loop_control,
             udisks,
             host_fs,
+            // Only an unrecognized filesystem is ever measured, and these cases name theirs.
+            shares_blocks: None,
             remote_session,
         }
     }

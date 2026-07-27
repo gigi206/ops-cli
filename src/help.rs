@@ -1010,7 +1010,9 @@ const PAGES: &[Page] = &[
             `btrfs` binary at all.\n\
             \n\
             Freed space returns to the host in the background rather than the instant a file is\n\
-            deleted, so the host figure `status` reports can lag a deletion by a moment.",
+            deleted, so the host figure `status` reports can lag a deletion by a moment. `status`\n\
+            reports that queue as `reclaiming` while it lasts; it drains on its own, and there is\n\
+            nothing to run.",
     },
     Page {
         path: &["store"],
