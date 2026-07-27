@@ -48,6 +48,10 @@ immediately. See [Deduplication](../cli/gc.md#deduplication).
   costs a re-provision on the next launch.
 - `--all` collects the shared nix store — the closures no live project or locked channel
   revision still roots — under an exclusive lock so a concurrent launch cannot race it.
+  A channel revision roots its **own package-set source** as well as the tools built from it:
+  resolving the channel materializes that source (a few hundred MiB), so collecting it would only
+  mean rewriting it on the next command that resolves the channel. It is reclaimed with the rest of
+  its revision once no project pins that channel any more.
 - `--all` also sweeps the **per-launch runtime files** — the egress MITM CA and its
   proxy/control sockets, the inbound forwarder's and in-cage portal's runtime directories, the
   process-observation sockets. A clean exit unlinks them, but a cage normally ends on a signal

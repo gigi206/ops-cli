@@ -1341,6 +1341,98 @@ fn provision_licensed(
     select_marked_output(layout, &stdout, attr, marker)
 }
 
+/// The out-link rooting the pinned channel's own flake **source**, placed beside the base
+/// userland's out-links (see [`root_channel_source`]).
+const CHANNEL_SOURCE_ROOT: &str = "channel-source";
+
+/// Root the pinned channel's flake **source** against the shared store's collector.
+///
+/// Evaluating `<flake_ref>#<attr>` materializes nixpkgs' own source tree — a few hundred MiB — in
+/// the store, and nothing rooted it: the out-links [`provision`] leaves point at build *outputs*,
+/// never at the source they were evaluated from. So every shared-store collection reclaimed it and
+/// the very next command that resolved the channel wrote it straight back: the collection reported
+/// bytes it never durably freed, and a data directory that only grows paid the rewrite each time
+/// (short of the filesystem's own trim, freed blocks are not returned to the host).
+///
+/// The root goes beside the base userland's, in the same `gcroots/base/<rev>/` directory, because
+/// the source belongs to exactly that revision: the revision's own lifecycle then keeps it while
+/// the channel is in use and prunes it when the channel moves on — no new root family for the
+/// collector to learn, and no source outliving its revision.
+///
+/// **Cheap when warm, and best-effort.** A link that still resolves short-circuits before any nix
+/// runs, so `nix flake metadata` is paid once per revision rather than once per launch. Every
+/// failure path leaves the source unrooted — precisely the previous behaviour — and never fails a
+/// launch: this reclaims churn, it is not a correctness control.
+pub(crate) fn root_channel_source(nix: &Path, layout: &Layout, roots: &Path, flake_ref: &str) {
+    let link = roots.join(CHANNEL_SOURCE_ROOT);
+    // The link points at the *logical* `/nix/store/...` path, which does not exist on the host, so
+    // its target is probed through `physical_path` — never followed — exactly as the marked-output
+    // reuse does. A dangling link (its revision collected) falls through and is re-rooted.
+    if let Ok(logical) = std::fs::read_link(&link) {
+        if physical_path(layout, &logical).symlink_metadata().is_ok() {
+            return;
+        }
+    }
+
+    let Some(source) = channel_source_path(nix, layout, flake_ref) else {
+        return;
+    };
+    let Some(nix_store) = resolve_nix_store(Some(layout)) else {
+        return;
+    };
+    if let Some(parent) = link.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    // `--indirect` registers the link in the store's own `gcroots/auto/`, which is what makes it a
+    // root the collector honours; `--realise` is how `nix-store` names the path to root.
+    let _ = Command::new(nix_store)
+        .env("NIX_REMOTE", "")
+        .arg("--store")
+        .arg(layout.store_dir())
+        .arg("--add-root")
+        .arg(&link)
+        .arg("--indirect")
+        .arg("--realise")
+        .arg(&source)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// The store path of `flake_ref`'s source tree, read from `nix flake metadata`. `None` when nix
+/// fails or reports no usable path — the caller then simply leaves the source unrooted.
+fn channel_source_path(nix: &Path, layout: &Layout, flake_ref: &str) -> Option<PathBuf> {
+    let out = nix_command(nix, layout)
+        .env("NO_COLOR", "1")
+        .args(["--extra-experimental-features", "nix-command flakes"])
+        .args(["flake", "metadata", flake_ref])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| source_path_from_metadata(&String::from_utf8_lossy(&out.stdout)))?
+}
+
+/// Extract the source path from `nix flake metadata` text output: the first token on its `Path:`
+/// line that is a logical store path. Scanning by token (not a prefix strip) tolerates the ANSI
+/// codes nix wraps the label in, mirroring [`revision_from_metadata`]. Requiring the `/nix/store/`
+/// prefix is what keeps a surprising line from turning into an arbitrary path in a command. Pure,
+/// so it is testable without invoking nix.
+fn source_path_from_metadata(stdout: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .filter(|l| l.contains("Path:"))
+        .flat_map(str::split_whitespace)
+        .find(|t| {
+            t.strip_prefix("/nix/store/")
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        })
+        .map(PathBuf::from)
+}
+
 /// Provision a `flake:` package from a full flake build *target* into the user-owned store,
 /// gcrooted at `gcroot` — the same store setup, sandboxed build, and marked-output selection as
 /// [`provision`], only the target is passed verbatim rather than assembled from `<flake_ref>#<attr>`.
@@ -1942,6 +2034,38 @@ mod tests {
             Some("9ae611a455b90cf061d8f332b977e387bda8e1ca")
         );
         assert_eq!(revision_from_metadata("no revision here\n"), None);
+    }
+
+    /// The channel source is what the collector kept reclaiming and the next command kept writing
+    /// back, so reading its path out of the metadata is what makes rooting it possible at all.
+    #[test]
+    fn source_path_parsing_takes_the_metadata_path_line() {
+        // The real shape, ANSI-bold labels included: `Path:` is not the only line, and `Locked URL`
+        // sits right above it.
+        let meta = "\u{1b}[1mResolved URL:\u{1b}[0m  github:NixOS/nixpkgs/nixos-unstable\n\
+                    \u{1b}[1mLocked URL:\u{1b}[0m    github:NixOS/nixpkgs/9ae611a4?narHash=sha256-x\n\
+                    \u{1b}[1mPath:\u{1b}[0m          /nix/store/llgwlxshmy0ifvxh7f8wq53vk5x7vd13-source\n\
+                    \u{1b}[1mRevision:\u{1b}[0m      9ae611a455b90cf061d8f332b977e387bda8e1ca\n";
+        assert_eq!(
+            source_path_from_metadata(meta),
+            Some(PathBuf::from(
+                "/nix/store/llgwlxshmy0ifvxh7f8wq53vk5x7vd13-source"
+            ))
+        );
+
+        // No `Path:` line at all — the caller then leaves the source unrooted rather than guessing.
+        assert_eq!(source_path_from_metadata("Revision: abc\n"), None);
+
+        // The prefix requirement is a guard, not decoration: only a logical store path may reach
+        // the command that roots it, so a `Path:` naming anything else yields nothing.
+        assert_eq!(source_path_from_metadata("Path:  /etc/passwd\n"), None);
+        assert_eq!(source_path_from_metadata("Path:  relative/thing\n"), None);
+        // A *sub*-path is not a store path either: rooting `…-source/pkgs` would root nothing.
+        assert_eq!(
+            source_path_from_metadata("Path:  /nix/store/abc-source/pkgs\n"),
+            None
+        );
+        assert_eq!(source_path_from_metadata("Path:  /nix/store/\n"), None);
     }
 
     #[test]

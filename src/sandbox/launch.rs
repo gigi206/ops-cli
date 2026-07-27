@@ -1114,12 +1114,23 @@ pub(crate) fn upgrade_mise_packages(
 /// By default it sweeps the **current** project's store (see [`sweep_current`]). With `--all` it
 /// also, across all projects: reaps whole runtime trees whose project directory is gone (see
 /// [`reap_dead_trees`]), then garbage-collects the **shared** store — the channel revisions left
-/// behind by `sbx upgrade` and the tools of reaped projects (see [`shared_store_gc`]). The
-/// cross-project passes run **first** and are independent of the sandbox/nix prerequisites the
-/// current-project sweep needs — so `sbx gc --all` reclaims even from a directory that is not a
-/// project, or on a host that has lost its sandbox capability. A dry run by default; `--prune` is
-/// the destructive form.
+/// behind by `sbx upgrade` and the tools of reaped projects (see [`shared_store_gc`]). A dry run
+/// by default; `--prune` is the destructive form.
+///
+/// **The current-project sweep runs first, and the shared collection last.** The sweep provisions
+/// this project's declared tools to re-root them, and that provisioning re-materializes the pinned
+/// channel's flake source in the shared store. Collecting the shared store *before* the sweep
+/// therefore measured a state the same command went on to invalidate: the sweep put back the source
+/// the collection had just taken, so the run left an orphan behind and the next `sbx gc --all`
+/// reported the very same reclaimable bytes — it took two passes to converge. Sweeping first means
+/// the shared collection sees the final state.
+///
+/// The cross-project passes stay independent of the sandbox/nix prerequisites the sweep needs, so
+/// they run **whatever the sweep did** — `sbx gc --all` still reclaims from a directory that is not
+/// a project, or on a host that has lost its sandbox capability.
 pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Palette) -> ExitCode {
+    let swept = sweep_current(prune, optimise, pal);
+
     if all {
         match crate::store::Layout::from_env() {
             Some(layout) => {
@@ -1135,12 +1146,13 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
             ),
         }
     }
-    match sweep_current(prune, optimise, pal) {
+
+    match swept {
         Ok(()) => ExitCode::SUCCESS,
-        // Under `--all` the shared-store collection above already ran, so a current-project sweep
-        // that could not run (the host cannot sandbox, nix is unavailable) — or that hit an error —
-        // must not fail the whole command. Its own message is already printed above; only the exit
-        // code is flattened.
+        // Under `--all` the shared-store collection ran regardless, so a current-project sweep that
+        // could not run (the host cannot sandbox, nix is unavailable) — or that hit an error — must
+        // not fail the whole command. Its own message is already printed above; only the exit code
+        // is flattened.
         Err(_) if all => {
             crate::diag::error(
                 "sbx gc: the current project's store was not swept (see above); the shared-store collection ran."
@@ -2072,6 +2084,29 @@ fn report_optimise(
 /// supported self-equip paths all root by store path, so they survive.
 fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Result<(), ExitCode> {
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+
+    // A project that was never launched has no store to reclaim — and finding that out must not
+    // cost anything, so the check runs **before** `prepare()`. Preparing provisions the base
+    // userland, so on a cold data directory it downloads an entire toolchain only to then report
+    // that there is nothing to reclaim. Its two inputs are exactly the ones `prepare` derives (the
+    // process's directory and the data-directory layout), so the identity is the same either way;
+    // where either is unavailable the check is skipped and `prepare` below reports that failure in
+    // its own words rather than this path second-guessing it. This is also what makes `sbx gc
+    // --all` safe to run from any directory: a non-project cwd is skipped, never provisioned.
+    let early = std::env::current_dir()
+        .ok()
+        .zip(Layout::from_env())
+        .and_then(|(cwd, layout)| Some((layout, binds::project_identity(&cwd).ok()?)));
+    if let Some((layout, (id, project))) = &early {
+        if !super::projectstore::store_exists(layout, id) {
+            println!(
+                "{h}sbx gc{r} — {n}{}{r}: {dim}no per-project store yet, nothing to reclaim.{r}",
+                project.display()
+            );
+            return Ok(());
+        }
+    }
+
     let prep = prepare()?;
 
     let (id, project) = match binds::project_identity(&prep.cwd) {
@@ -2081,17 +2116,6 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
             return Err(ExitCode::FAILURE);
         }
     };
-
-    // A project that was never launched has no store to reclaim. Seeding one here — just to gc it —
-    // would be a heavy, possibly networked side effect, so skip instead. This is what makes
-    // `sbx gc --all` safe to run from any directory: a non-project cwd is skipped, never seeded.
-    if !super::projectstore::store_exists(&prep.layout, &id) {
-        println!(
-            "{h}sbx gc{r} — {n}{}{r}: {dim}no per-project store yet, nothing to reclaim.{r}",
-            project.display()
-        );
-        return Ok(());
-    }
 
     // Refuse if a live sandbox holds this project: collecting a store a running cage reads and
     // writes could drop a path it still needs. The registry list prunes dead records as it goes.

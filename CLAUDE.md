@@ -96,6 +96,69 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`sbx gc` was undoing its own collection, and provisioning to discover it had nothing to do
+  (DONE 2026-07-27)** (`src/sandbox/launch.rs` + `src/store.rs` + `src/sandbox/fhs.rs` +
+  `docs/guide/housekeeping/gc.md` + `tests/projects.rs`): the user asked whether the per-project
+  store could have a *shared* mode, to stop it consuming space. **The measurement turned the premise
+  over** and is the first deliverable: on a reflink-capable volume a project's store costs its
+  `Exclusive` extents, **~160 MiB**, not the ~11 GiB `du`/`sbx projects list` report (both measure
+  logical bytes, which `sbx store` already flags as an upper bound); the real footprint sat in
+  `apps/` (**6.99 GiB exclusive** vs `projects/` 1.02 GiB), where each app home re-downloads the same
+  tools — codex ×2, claude-code ×2, agent-browser ×4. So a shared `/nix` mode was **not built**: the
+  `NixMount.writable` field can already express it but no production site constructs `false`, it
+  contradicts a standing invariant (*"which store backs the cage is sbx's decision, never a
+  configurable field"*), and it would trade the in-cage self-equip for a gain the filesystem already
+  provides. **What the investigation did find were three real defects**, each proven by measurement
+  and each fixed with teeth demonstrated in both directions (the faulty code restored, the test
+  fails). **(a) The collection undid itself.** `gc()` collected the shared store and *then* swept the
+  current project; the sweep provisions to re-root, and provisioning re-materializes the channel's
+  own flake source. So the shared pass measured a state the same command invalidated: the source
+  came back, every run left an orphan, and it took **two** `sbx gc --all --prune` for the store to
+  end up clean. Proven in a closed loop before touching anything — path ABSENT → `sbx gc --all` (a
+  **dry run**) → PRÉSENTE, `Used` +150 MiB; `--prune` reporting `freed 201.2 MiB` with the path still
+  present *and still registered*; `nix-store --gc` **direct** deleting it, which is what proved the
+  report was accurate at the instant it printed and invalidated afterwards, not false. Fixed by
+  sweeping first and collecting last, with the `--all` block now running **whatever the sweep did**
+  so the documented robustness (reclaim from a non-project cwd, or a host that lost its sandbox
+  capability) is preserved — verified live with bwrap unreachable. **(b) Nothing rooted the channel
+  source.** The out-links `provision` leaves point at build *outputs*, never at the source they were
+  evaluated from, so a ~328 MiB tree was collected and rewritten on every cycle — pure churn on a
+  data directory that only grows (nothing short of the filesystem's own trim returns freed blocks to
+  the host: `fstrim` and `btrfs balance` both need root, which is the *structural* reason the volume
+  never shrank — 16 126 MiB for 13.58 GiB of data, and a user-run `sudo fstrim` returned 2 GiB).
+  `root_channel_source` now roots it as a plain out-link **inside `gcroots/base/<rev>/`**, beside the
+  base userland's: the source belongs to that revision, so the revision's own lifecycle keeps and
+  prunes it and **the collector needed no change at all** (`project_keep_roots` reads the whole
+  directory, `prune_rev_dirs` prunes the family). The path is read from `nix flake metadata`'s
+  `Path:` line by a pure parser mirroring `revision_from_metadata`, requiring the `/nix/store/`
+  prefix so a surprising line cannot become an arbitrary path in a command; a resolvable link
+  short-circuits before any nix runs, so the metadata call is paid **once per revision**, and every
+  failure path leaves the source unrooted — the previous behaviour — since this reclaims churn and is
+  not a correctness control. **Cost, stated correctly: ~328 MiB per live channel revision**, not a
+  flat figure — a project pinned to another `nixpkgs` roots its own. **Measured after:** shared gc
+  `collected 0` (was 201.2 MiB), the dry run reporting **`0 orphaned path(s) (0 B)`** — convergence —
+  and **+1 MiB across two runs** where each had cost +150 MiB. Verified, not assumed, that the newly
+  rooted source is **not** seeded into per-project stores (the keep-set is not the copy-set:
+  `collect_roots` feeds the seed). **(c) A dry run that downloaded a toolchain.** `sweep_current`
+  called `prepare()` — which provisions the base userland — *before* testing whether the project had
+  a store at all, so on a cold data directory `sbx gc` fetched glibc/gcc/bash and then printed
+  "nothing to reclaim". The intent was already written in the code's own comment; only the order
+  defeated it. The test now runs first, from the same two inputs `prepare` derives, falling through
+  to `prepare`'s own diagnostics when either is unavailable. **Measured: 0.20 s instead of minutes**
+  on a cold data directory, and `tests/projects.rs` went from **31.3 s to 0.35 s** — the suite had
+  been paying the same provisioning. **One observable delta, deliberate:** a bare `sbx gc` in a
+  directory with no project store now exits **0** ("nothing to reclaim" is not an error) where it
+  previously exited non-zero on a host that cannot sandbox, because the check returns before
+  `prepare()` is reached. **Tests:** 2 net-new integration
+  (`the_current_project_sweep_runs_before_the_shared_collection` — keyed on the two passes' own
+  stdout ordering, the only thing that observes it — and
+  `gc_provisions_nothing_for_a_project_that_has_no_store`, keyed on the base gcroot directory
+  provisioning alone creates) + 1 net-new unit (`source_path_parsing_takes_the_metadata_path_line`,
+  covering the prefix guard and a sub-path). **1319 unit + 22 projects + 99 config + 13 help + 6
+  doctor + 3 upgrade + 4 path green, plus the three `run.rs` gc e2e**, fmt/clippy `-D warnings`
+  clean, **std-only** (no new dep), musl release rebuilt and the whole chain re-proven on the
+  **shipped** binary. See [[gc-recreates-nixpkgs-source]], [[m5-gc]], [[storage-btrfs-volume]],
+  [[tree-size-hardlink-bug]].
   **`systemd-run` was substituting variables into the cage's own command line — found through an app
   that could not start (DONE 2026-07-25)** (`src/sandbox/cgroup.rs` + `profiles/aionui.toml` +
   `tests/run.rs`): the user reported `sbx app run aionui` opening on a modal **"AionUi installation is

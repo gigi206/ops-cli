@@ -282,6 +282,12 @@ pub(crate) fn resolve_userland(
         .map(|(attr, marker, name)| realise(attr, marker, name))
         .collect::<io::Result<Vec<_>>>()?;
 
+    // Root the channel's own flake source, which every provision above materialized but none
+    // rooted — otherwise the shared-store collector reclaims it and the next command that resolves
+    // the channel writes it straight back. Placed here, after the provisions, so the source it
+    // roots is the one they evaluated. Best-effort and a no-op once warm; see the function.
+    crate::store::root_channel_source(nix, layout, &roots, nixpkgs);
+
     // The logical roots whose closures a project's own store must carry to run the base —
     // surfaced from the very provisions above, so none is forgotten. The nix-ld root is
     // included even though its shim is bound separately: its own closure (its glibc) must be

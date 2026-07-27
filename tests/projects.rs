@@ -607,6 +607,84 @@ fn gc_sweeps_dead_launch_runtime_files_but_never_on_a_dry_run() {
     );
 }
 
+/// `sbx gc --all` sweeps the **current project first** and collects the **shared store last**.
+///
+/// The order is load-bearing, not cosmetic. The sweep provisions this project's declared tools in
+/// order to re-root them, and that provisioning re-materializes the pinned channel's flake source
+/// — a ~300 MiB tree no gc root holds — in the shared store. Collecting the shared store first
+/// therefore measured a state the same command went on to invalidate: the sweep put back the source
+/// the collection had just taken, so every run left an orphan behind and the next `sbx gc --all`
+/// reported the very same reclaimable bytes. It took two passes to converge.
+///
+/// Pinned on the two passes' own output, since nothing else observes which ran first. Only
+/// **stdout** is read: `text()` concatenates stderr after stdout, which would not be chronological,
+/// while both of these lines are `println!`s on the one stream.
+#[test]
+fn the_current_project_sweep_runs_before_the_shared_collection() {
+    let fx = Fixture::new();
+    let out = fx.sbx(&["gc", "--all"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    // The sweep's own line, not the shared pass's: both are prefixed `sbx gc`, so key on the
+    // sweep-only wording. The cwd is a bare fixture directory, so the sweep finds no store here.
+    let Some(sweep) = stdout.find("no per-project store yet") else {
+        // The sweep could not run at all (no nix, no sandbox capability): there is no order left to
+        // observe. Skip rather than fail — but the shared pass must still have run, which is the
+        // robustness half of the same property.
+        assert!(
+            stdout.contains("shared store") || text(&out).contains("cannot locate"),
+            "with the sweep unable to run, the shared pass must still run:\n{}",
+            text(&out)
+        );
+        return;
+    };
+    let Some(shared) = stdout.find("shared store") else {
+        panic!(
+            "the shared-store collection should report itself:\n{}",
+            text(&out)
+        );
+    };
+    assert!(
+        sweep < shared,
+        "the sweep must run before the shared collection, else it re-materializes what the \
+         collection just took:\n{}",
+        text(&out)
+    );
+}
+
+/// `sbx gc` does not provision in order to discover it has nothing to reclaim.
+///
+/// The sweep needs a provisioned, re-rooted store to report truthfully — but only when there *is* a
+/// store. For a project never launched there is nothing to reclaim, and the check that says so used
+/// to run after the preparation that provisions the base userland: on a cold data directory, `sbx
+/// gc` downloaded an entire toolchain and then printed "nothing to reclaim".
+///
+/// Keyed on the base userland's gcroot directory, which provisioning creates and nothing else does.
+#[test]
+fn gc_provisions_nothing_for_a_project_that_has_no_store() {
+    let fx = Fixture::new();
+    let out = fx.sbx(&["gc", "--all"]);
+    assert!(
+        text(&out).contains("no per-project store yet"),
+        "a project with no store should report exactly that:\n{}",
+        text(&out)
+    );
+    // Having nothing to reclaim is not an error. Pinned because the check now returns before the
+    // preparation runs, so this no longer inherits the exit code of a host that cannot sandbox.
+    assert!(
+        out.status.success(),
+        "nothing to reclaim should exit 0:\n{}",
+        text(&out)
+    );
+    let base_roots = fx.data_home.path().join("sbx/gcroots/base");
+    assert!(
+        !base_roots.exists(),
+        "gc provisioned the base userland ({}) only to report there was nothing to reclaim:\n{}",
+        base_roots.display(),
+        text(&out)
+    );
+}
+
 #[test]
 fn gc_is_inert_on_a_dry_run() {
     let fx = Fixture::new();
