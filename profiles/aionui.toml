@@ -66,6 +66,24 @@
 # `--password-store=basic` forces the file cookie store (no keyring in the cage) so the OAuth session
 # survives a relaunch. If you only ever use API keys, drop this wrapper + the chromium package for a
 # bare `aionui` argv.
+#
+# MANAGED NODE RUNTIME (why the wrapper stages it). AionUi's backend, AionCore, ships a bundled Node
+# runtime under `resources/bundled-aioncore/…/managed-resources/node/` and, at first start, copies it
+# into its own data dir — preserving the source's file modes — then REWRITES two files in that copy
+# (`blank_user_npmrc`, `blank_global_npmrc`, which it uses to neutralise any ambient npm config).
+# Everything in a nix store path is canonicalised READ-ONLY (0444/0555), so the copy lands read-only
+# and that rewrite fails with EACCES. AionCore reports `bundled Node runtime failed validation …
+# Permission denied (os error 13)` and the app opens on "AionUi installation is incomplete — the
+# managed Node runtime cannot start". Nothing is missing: it is a permission mode, not a missing file,
+# and no derivation can fix it (nix strips write bits after the install phase). So the wrapper stages
+# the runtime itself — a mode-preserving copy plus `u+w` — which makes AionCore's pre-install check
+# succeed, so it skips its own copy and uses the staged tree. Copies ~140 MB into the app home on the
+# first launch (a reflink where the filesystem supports it) and is a no-op afterwards; AionCore then
+# installs into that tree itself, which measured ~210 MB once settled.
+# RESIDUAL: the bundled CLIs beside it (`managed-resources/cli/`, ~590 MB — claude, codex) are
+# installed ON DEMAND, only when you pick one as the agent, and may hit the same read-only-rewrite
+# failure. That path was not exercised, so it is not staged here; the co-worked CLIs below come from
+# [packages] instead and are unaffected.
 cmd = [
     "bash",
     "-c",
@@ -103,6 +121,25 @@ cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
 x-scheme-handler/http=sbx-open-uri.desktop
 x-scheme-handler/https=sbx-open-uri.desktop
 MIMEAPPS
+
+# AionCore's bundled Node runtime, staged WRITABLE out of the read-only store (see the note above).
+# The app root is derived from the launcher on PATH, never hard-coded: the `.deb` is rebuilt at a new
+# content-addressed path on every `sbx upgrade deb`.
+APPROOT=$(dirname "$(dirname "$(command -v aionui)")")
+NODESRC="$APPROOT/opt/AionUi/resources/bundled-aioncore/linux-x64/managed-resources/node"
+NODEDEST="$HOME/.config/AionUi/aionui/runtime/node"
+for v in "$NODESRC"/*/; do
+    [ -d "$v" ] || continue
+    n=$(basename "$v")
+    # Keyed by the runtime directory name (which carries the Node version), so an upgrade that brings
+    # a new Node stages the new one instead of trusting a marker. `-x` catches a tree staged without
+    # its exec bits (AionCore starts the runtime to validate it); `-w` catches one staged read-only.
+    [ -x "$NODEDEST/$n/bin/node" ] && [ -w "$NODEDEST/$n/bin/node" ] && continue
+    echo "sbx: staging the bundled Node runtime ($n) into the app home — first launch only" >&2
+    mkdir -p "$NODEDEST"
+    rm -rf "$NODEDEST/$n"
+    cp -r --reflink=auto "$NODESRC/$n" "$NODEDEST/" && chmod -R u+w "$NODEDEST/$n"
+done
 
 exec aionui --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
     --use-system-ca --password-store=basic

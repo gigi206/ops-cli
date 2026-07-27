@@ -467,6 +467,68 @@ fn a_one_shot_env_override_reaches_the_cage_and_the_cli_beats_the_environment() 
 }
 
 #[test]
+fn a_cage_environment_value_is_never_substituted_from_the_host() {
+    // A cage argument must reach the cage byte for byte. The launch runs the cage inside a systemd
+    // scope, and systemd substitutes variable references in the command line it is handed, against
+    // the *host* environment — so without the escaping applied when that scope is used, a `${VAR}`
+    // in a cage environment value would be replaced by the host's value (carrying a host
+    // environment value INTO the cage, which the deliberately narrow passthrough exists to prevent)
+    // and a shell expansion systemd cannot read as a name would collapse to an empty string. Both
+    // are asserted through a real launch, read back with `printenv`. Skips (never fails) when the
+    // host cannot sandbox.
+    //
+    // The teeth are host-conditional: only a launch that actually takes the scope path has anything
+    // in a position to substitute. Where no user manager can create one, the cage is launched
+    // directly, the property holds trivially, and a green run proves nothing — so that case is
+    // reported rather than left to look like coverage.
+    let project = TmpDir::new("nosub-proj");
+    let data = TmpDir::new("nosub-data");
+    let scoped = std::process::Command::new("systemd-run")
+        .arg("--version")
+        .output()
+        .is_ok()
+        && std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|dir| std::path::Path::new(&dir).join("bus").exists())
+            .unwrap_or(false);
+    if !scoped {
+        eprintln!("note: no systemd user scope on this host — the assertions below hold vacuously");
+    }
+
+    // capability probe
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping substitution e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // The value is read back from inside the cage; the host carries a variable of the same name so
+    // a substitution would be visible rather than silently empty.
+    let read = |value: &str| -> String {
+        let out = sbx()
+            .arg("run")
+            .args(["--env", &format!("NOSUB={value}")])
+            .args(["--", "printenv", "NOSUB"])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("SBX_HOST_ONLY_PROBE", "host-side-value")
+            .output()
+            .expect("spawn sbx run");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // A braced reference to a variable that exists on the host: the cage must see the reference,
+    // never the host's value.
+    assert_eq!(read("${SBX_HOST_ONLY_PROBE}"), "${SBX_HOST_ONLY_PROBE}");
+    // A bare reference opening the value — the form systemd substitutes at the start of an argument.
+    assert_eq!(read("$SBX_HOST_ONLY_PROBE"), "$SBX_HOST_ONLY_PROBE");
+    // A shell expansion, which is not a variable name at all: it must survive, not become empty.
+    assert_eq!(read("${dir%/}"), "${dir%/}");
+}
+
+#[test]
 fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     // The headline of the ro/rw bind choice, with teeth on both sides. Two host directories are
     // bound into a trusted project — one `mode = "rw"`, one read-only (the default). A cage that

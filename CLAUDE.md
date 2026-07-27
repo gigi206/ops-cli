@@ -96,6 +96,95 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`systemd-run` was substituting variables into the cage's own command line — found through an app
+  that could not start (DONE 2026-07-25)** (`src/sandbox/cgroup.rs` + `profiles/aionui.toml` +
+  `tests/run.rs`): the user reported `sbx app run aionui` opening on a modal **"AionUi installation is
+  incomplete — the managed Node runtime cannot start"**. Two distinct defects came out of it, the
+  second far larger than the app it surfaced through.
+  **(a) The app's failure — a read-only store path an app expects to rewrite.** Diagnosed from
+  AionCore's own log (`bundled Node runtime failed validation … Permission denied (os error 13)`) and
+  then pinned **at the syscall**, not inferred: `strace` inside a cage (`sbx run --package
+  strace=nix:strace --seccomp ptrace` — the one-shot typed overrides doing exactly the job they exist
+  for) shows AionCore copying its bundled Node runtime out of
+  `resources/bundled-aioncore/…/managed-resources/node/` **preserving the source modes** (`openat`
+  0444 + `chmod` 0444), then **rewriting** two files in that copy (`blank_user_npmrc`,
+  `blank_global_npmrc`, which neutralise any ambient npm config) with `File::create` → `openat(…,
+  O_WRONLY|O_CREAT|O_TRUNC, 0666)` → **EACCES**. Nothing was missing: every file in a nix store path
+  is canonicalised **read-only** (0444/0555), so the mode-preserving copy lands read-only and the
+  rewrite cannot succeed — from a `.deb` install those files are 0644, so the app breaks **only**
+  under sbx. **No derivation-level fix exists** (nix strips write bits *after* `installPhase`), so the
+  fix lives in the profile's `cmd` wrapper: stage the runtime into the app home with a
+  **mode-preserving `cp -r --reflink=auto` plus `chmod -R u+w`**, which makes AionCore's pre-install
+  validation pass so it skips its own copy. **The obvious shortcut is a trap and cost a full cycle:**
+  a `cp --no-preserve=mode` copy is writable but loses the **exec bit**, and AionCore *starts* the
+  runtime to validate it → `node failed to start: Permission denied`. The guard is keyed by the
+  **runtime directory name** (it carries the Node version) rather than a marker, so an `sbx upgrade
+  deb` bringing a new Node stages the new one, and it probes both `-x` **and** `-w` (each catches one
+  of the two ways a previous staging can be wrong); the app root is derived from `command -v aionui`,
+  never a hard-coded store path (the `.deb` is rebuilt content-addressed on every upgrade). Measured:
+  **~140 MB copied**, ~210 MB once AionCore has installed into the tree, once per app home.
+  **Residual, named not fixed:** the bundled CLIs beside it (`managed-resources/cli/`, ~590 MB)
+  install **on demand** and may fail the same way — that path was never exercised, so it is not
+  staged. The `www.aionui.com:443 GET / deny` the user reported alongside was a **symptom** (the error
+  dialog's own link), gone with the fix.
+  **(b) The real finding — the launcher was rewriting the cage's argv.** The first staging attempt
+  failed with `cp: cannot stat ''`: the loop's `"${v%/}"` had become an **empty string** before bash
+  ever saw it. Hunted, not guessed (my shell, the harness, RTK, mise, bash and sbx's own code each
+  ruled out) until `strace` on `sbx` itself showed the value entering sbx **literally** and leaving,
+  in bwrap's argv, as `/home/gigi`. The cage is launched through **`systemd-run --user --scope`** (the
+  M4.2 limits wrapper), and systemd **substitutes variable references in the command line it is
+  handed, against its own — the host's — environment**. The exact rule was **measured, not
+  reasoned** (a matrix against a real `systemd-run`): a braced `${…}` is parsed **anywhere** in an
+  argument *once it opens with a character that can start a name*, so a shell expansion that is not a
+  valid variable name (`${v%/}`, `${VAR:-default}`) collapses to **empty** with a warning easily lost
+  in a GUI app's launch noise, while a bare `$VAR` is substituted only when it **opens** an argument
+  — which is why a `$HOME` deep inside a `bash -c` script has always worked, and why this sat
+  unnoticed. **That measurement also cleared sbx's own in-cage wrappers** rather than assuming them
+  safe: the mise-equip script's `"${@:1:N}"` is left **verbatim** (`@` cannot open a name — checked
+  live), so no core-generated script was ever mangled, and `compose` is the **only** place a scope
+  argv carries cage arguments (`doctor`'s probe runs `-- true`). The affected surface was exactly the
+  configuration a user writes: a profile's `cmd` script, and any `[env]` value or bind path.
+  **It is a confidentiality leak, not merely a corruption:** it carries a **host** environment value
+  **into** the cage — the
+  exact direction the deliberately narrow `TERM`/`LANG` passthrough exists to prevent — and it is
+  reachable from `[env]`, a **free** config field any project may set (demonstrated: `sbx run --env
+  'LEAK=${HOME}'` put `/home/gigi` inside a cage whose own `$HOME` is `/home/sandbox`). **Fix:**
+  `escape_dollars` doubles every `$` (systemd's literal-dollar escape), applied in `compose` **on the
+  wrapped branch only, and only to bwrap's *arguments*** — two asymmetries that are **measured, not
+  assumed**: systemd unescapes `$$` in arguments but does **neither substitution nor unescaping on the
+  program**, so escaping the bwrap path makes it unfindable (`Failed to find executable …`, verified
+  live in both directions), and the **degraded** branch (no usable systemd) execs bwrap directly, with
+  nothing in between to interpret a dollar, so escaping there would deliver literal `$$` into the
+  cage. The escape is **byte-wise** (`OsStrExt`/`OsStringExt`) because a bind path or an environment
+  value need not be valid UTF-8 and `$` is ASCII, so it can never be a continuation byte. The `-p`
+  property values and `--unit=` are deliberately **not** escaped, and the reason is named in the code
+  so it cannot rot: they are built from charsets that **cannot contain a `$`** (`cage_slug` sanitizes
+  to `[a-z0-9-]`; a limit value has passed `is_valid_memory_value` / `is_valid_tasks_value`), so
+  loosening either charset would open a substitution site before the `--`. **Consequence for the
+  profiles:** a sweep of every shipped profile found the same latent form in `hermes-desktop` /
+  `hermes-webui` (`${HERMES_HOME:-$HOME/.hermes}`, `${HERMES_WEBUI_PYTHON:-}` — each would have
+  collapsed to empty) and they were **left as authored**, the core fix making them correct, verified
+  live in-cage as `/home/sandbox/.hermes`; the two `${…}` in `droid` are in comments and never
+  reached an argv. **Tests:** 3 net-new
+  unit + one extended (the degraded-branch identity test now carries a `${HOME}` argument, so a future
+  "escape everywhere" refactor fails there), including a **live** one that drives a real throwaway
+  scope and asserts four dollar-carrying arguments arrive verbatim (skip-not-fail off a session), plus
+  a net-new run.rs e2e `a_cage_environment_value_is_never_substituted_from_the_host` (three forms
+  through the real `sbx run --env`; **ran 26s, not skipped**) — whose teeth are **host-conditional**
+  and say so at runtime: only a launch that takes the scope path has anything in a position to
+  substitute, so on a host with no user manager the assertions hold vacuously and the test prints
+  that rather than letting green imply coverage. **Teeth proven in both directions** by
+  temporarily neutering the escape: the unit test then reads `["", "/home/gigi", "a$b", "plain"]` and
+  the e2e reads the **host's** value where the literal was expected. **1318 unit green**, fmt/clippy
+  `-D warnings` clean, **std-only** (no new dep), musl release rebuilt and the whole chain re-proven on
+  the **shipped** binary (a literal `${…}` reaching the cage; aionui launching with zero systemd
+  warnings, `preparation completed`, `node runtime selected source=managed`).
+  **Test-environment note (pre-existing, unrelated to this change):** three integration tests fail on
+  this host — two because sbx's data-dir path budget (74 bytes, the `sun_path` limit) is exceeded by
+  `target/test-tmp` paths, one a contention flake that passes in isolation; all three pass under
+  `SBX_TEST_TMPDIR=…`, and one of the two never launches a cage at all. See
+  [[systemd-run-expands-cage-cmd]], [[aionui-managed-node-runtime]], [[m4-cgroup-resource-limits]],
+  [[electron-gui-profiles]].
   **The host light/dark theme is read over the bus, not by running a store binary (DONE 2026-07-25)**
   (`src/sandbox/theme_relay.rs` + `portal.rs` + `launch.rs`): the user reported that
   `hermes-desktop` **does not follow the host light/dark theme**. Traced, not guessed: the at-launch
