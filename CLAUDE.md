@@ -123,9 +123,13 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   volume was at its tidiest**. So the shortfall is now read against the host filesystem, via a new
   `FsKind::may_compress` (deliberately **not** `is_cow`, which answers the unrelated
   offer-a-volume question, and where `Other(_)` counts as *may* so an unknown falls through to no
-  answer): one that cannot compress → the counters crossed → **`Some(0)`**, rendered `0 B —
+  answer): one that cannot compress → the counters crossed → **`Some(0)`**, rendered `0 B
   nothing the image can give back`; one that can → the image is structurally smaller than its
-  contents → **`None`**, no line, the `reflink_verdict` precedent. A `sudo fstrim`
+  contents → **`None`**, no line, the `reflink_verdict` precedent. The crossing branch is
+  **bounded**: a shortfall past a **thousandth** of the volume (the measured one is 0.04%) is not
+  two counters rounding differently but something wrong — a miscount, a truncated image — and gets
+  no answer rather than a confident "nothing to reclaim". Relative, not a byte count, so it holds
+  at any volume size. A `sudo fstrim`
   hint appears only past **1 GiB** — the figure is never zero, and nagging for 62 MiB teaches the
   reader to skip the line. **(c) The kernel's queue is a signal, not an amount — a second
   correction, forced by measurement mid-implementation.** The approved design had it as
@@ -391,10 +395,13 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   non-filtering-posture case the first cut did not cover). **1334 unit + 103 config + 13 help + 11 app
   green**, fmt/clippy `-D warnings` clean, **std-only** (no new dep), musl rebuilt and the chain
   re-proven on the shipped binary. **Honest residual:** 11 of the 16 bundles have no consumer yet (they
-  publish an agent's requirement statement); `examples/app/opencode.toml` still justifies
-  `registry.npmjs.org` as "equipping opencode via mise", which `mise registry opencode` disproves
-  (`aqua:anomalyco/opencode`, a GitHub release) — the host is still wanted for opencode's runtime plugin
-  fetch, but the reason is wrong. See [[bundle-tool-composition]], [[net-egress-groups]],
+  publish an agent's requirement statement); no shipped bundle carries a `[secret]` (every profile's is
+  commented out), so that path is covered by tests but unexercised by an artefact. A false justification
+  found while instrumenting and corrected in the same pass: `examples/app/opencode.toml` said
+  `registry.npmjs.org` was "equipping opencode via mise", which `mise registry opencode` disproves
+  (`aqua:anomalyco/opencode`, a GitHub release the built-in allow-set already covers) — the host is
+  kept, but for opencode's plugin loader (`@opencode-ai/plugin`, observed live in the
+  `opencode-desktop` egress log). See [[bundle-tool-composition]], [[net-egress-groups]],
   [[ops-app-framework]], [[toml-field-placement-silent-drop]].
   **`systemd-run` was substituting variables into the cage's own command line — found through an app
   that could not start (DONE 2026-07-25)** (`src/sandbox/cgroup.rs` + `examples/app/aionui.toml` +

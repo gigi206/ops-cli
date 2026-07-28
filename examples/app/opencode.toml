@@ -33,8 +33,14 @@ mode = "deny"
 # the config/theme schemas — opened to every verb with `{*}` (an app is read-by-default, and the CLI
 # POSTs completions through the gateway). For a DIRECT provider instead of the gateway, add its host
 # here (`{*} https://api.anthropic.com` for Anthropic, `{*} https://api.openai.com` for OpenAI) and
-# fill the [secret] block below. models.dev: the model catalogue, a read-only fetch. registry.npmjs.org:
-# equipping opencode via mise.
+# fill the [secret] block below. models.dev: the model catalogue, a read-only fetch.
+#
+# registry.npmjs.org is NOT the install path, despite `mise:` looking like it would be: mise's
+# registry resolves the bare name `opencode` to `aqua:anomalyco/opencode`, a GitHub release asset,
+# and sbx's built-in allow-set already covers github — so equipping needs nothing here. What was
+# observed reaching npm is opencode's PLUGIN loader (`@opencode-ai/plugin`, seen live in the egress
+# log of the `opencode-desktop` profile, the same tool). Keep it if you use plugins; a setup that
+# loads none can drop this line and lose nothing.
 allow = [
   "{GET} https://models.dev",
   "{GET} https://registry.npmjs.org",
