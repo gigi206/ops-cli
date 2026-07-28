@@ -143,12 +143,23 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   GitHub repo of that name is an **issue-tracker-only mirror** that names neither the package nor a
   site — nothing ties an *unscoped* npm name (claimable by anyone) to the vendor. **`corust-agent-release`**:
   a release-only repo with no README, no license and no published credential mechanism — nothing to
-  ground, and this directory does not guess values. **`cortex-code`**: filed as *pending a
-  measurement* rather than refused — its installer, release checksums and auth
-  (`CORTEX_API_KEY` → `api.cortex.foundation`) are all groundable, but the release ships **both**
-  `cortex-cli-linux-x64.tar.gz` and a `-static` variant and the extracted binary is named `Cortex`,
-  so which asset mise's `github` backend picks and what the command is cannot be settled without a
-  live install. All three are recorded in `examples/README.md`'s "Not here yet" section, whose
+  ground, and this directory does not guess values. **`cortex-code`**: blocked on packaging, and
+  **the user then had both candidate paths run for real, which settled it** *(measured after this
+  increment shipped; the README entry carries the result)*. `mise:github:CortexLM/cortex-code`
+  **installs** — mise even verifies the release's GitHub artifact attestations and SLSA provenance —
+  and puts **`Cortex`** (capital C) on PATH, but mise picks `cortex-cli-linux-x64.tar.gz`, the
+  **dynamic** asset, which **cannot run in a hermetic cage**: `error while loading shared libraries:
+  libasound.so.2`. A `mise:` token cannot express an asset preference (the token validator forbids
+  `=`, so mise's per-tool options are unreachable), and the only ways to supply that library are
+  disproportionate — `audio = true` would open the microphone and every monitor source to satisfy a
+  linker dependency. The release's `-static` asset **is** a true `static-pie` binary (9.8 MB, zero
+  dynamic deps, verified with `readelf`/`ldd`), but `tarball:` **refuses** it: that backend's install
+  phase is `prebuilt::electron_wrap`, which locates a desktop bundle by `resources/app.asar` and
+  fail-closes otherwise — live: `cortex: no Electron resources/app(.asar) found`, build exit 1,
+  provisioning refused. **So the gap is a layout, not a tool: the bare-binary tarball.** The fix is a
+  fallback in the prebuilt install phase (no `app.asar` → wrap the single top-level executable),
+  an sbx change that would unlock every vendor shipping a plain binary in a `.tar.gz` — named here,
+  not built. All three are recorded in `examples/README.md`'s "Not here yet" section, whose
   **"not a runnable agent"** class (added last increment for `harn` and the ACP bridges) now sits
   beside a **"provenance not established"** one.
   **Verified rather than asserted**, through a real import of all four and `sbx test net -a <app>`:

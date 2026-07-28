@@ -475,13 +475,25 @@ do not guess the values, so each waits on a real fact or on a named feature:
   nothing to ground a profile on, and this directory does not guess values. Both would ship the day
   upstream publishes the missing link.
 
-- **A candidate with one unresolved packaging question** — **`CortexLM/cortex-code`** has an
-  official installer and a GitHub release with checksums, and its auth is groundable
-  (`CORTEX_API_KEY` → `api.cortex.foundation`, or `OPENAI_API_KEY`). What is not settled is which
-  asset mise's `github` backend would pick: the release ships both `cortex-cli-linux-x64.tar.gz` and
-  a `-static` variant, and the extracted binary is named `Cortex`, not `cortex` — two details a
-  profile would have to state exactly, and neither is verifiable without a live install. Filed as
-  *pending a measurement*, not refused.
+- **A layout no backend covers yet: the bare-binary tarball** — **`CortexLM/cortex-code`** has an
+  official installer, a GitHub release with checksums, and groundable auth (`CORTEX_API_KEY` →
+  `api.cortex.foundation`, or `OPENAI_API_KEY`). It is blocked on packaging, and **both candidate
+  paths were run for real** rather than reasoned about:
+  - `mise:github:CortexLM/cortex-code` **installs** (mise even verifies the release's GitHub artifact
+    attestations and SLSA provenance) and puts **`Cortex`** — capital C — on PATH. But mise picks
+    `cortex-cli-linux-x64.tar.gz`, the **dynamic** asset, and it does not run in a hermetic cage:
+    `error while loading shared libraries: libasound.so.2`. A `mise:` token cannot express an asset
+    preference, and the only ways to supply that library are disproportionate (`audio = true` opens
+    the microphone and every monitor source to satisfy a linker dependency).
+  - The release's `-static` asset **is** a true `static-pie` binary (9.8 MB, zero dynamic deps) that
+    would run anywhere — but `tarball:` refuses it: that backend's install phase locates a desktop
+    bundle by its `resources/app.asar` and fail-closes otherwise, which is exactly what happened
+    (`cortex: no Electron resources/app(.asar) found`, build exit 1).
+
+  So the missing piece is a **bare-binary fallback in the prebuilt install phase**: when no
+  `resources/app(.asar)` is found, wrap the single top-level executable instead of failing. That is
+  an sbx change, not a profile one, and it would unlock every vendor that ships a plain binary in a
+  `.tar.gz` rather than a desktop bundle.
 
 - **OAuth-only credential** — **`agy`** (Antigravity CLI, Google) authenticates with **Google
   Sign-In**, not a header-injectable key, so it ships as an **account** profile (above), not a
