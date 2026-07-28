@@ -427,7 +427,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     // The `.deb` binary lives under its own prefix and finds its sibling `.so`s via RUNPATH, so the
     // wrapper's `LD_LIBRARY_PATH` is just the buildInputs closure — no bundle-root prefix (unlike an
     // AppImage, whose Chromium `.so`s sit loose beside the launcher).
-    let wrap = prebuilt::electron_wrap(name, "${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}");
+    let wrap = prebuilt::launcher_wrap(name, "${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}");
     TEMPLATE
         .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)

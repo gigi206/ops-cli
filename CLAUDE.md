@@ -96,6 +96,62 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **The prebuilt install phase learned the bare-binary shape, and `cortex` ships (DONE 2026-07-28)**
+  (`src/sandbox/prebuilt.rs` + `{tarball,appimage,deb}.rs` + `docs/guide/configuration/packages.md`
+  + `examples/app/cortex.toml` [new] + `examples/README.md` + `docs/guide/apps/catalog.md`): the
+  user asked to settle `cortex-code`'s packaging **by running both candidate paths for real**, and
+  then to build the fallback the measurement named. Two independent deliverables — the second is
+  what the user chose after both were priced, since the fallback is on the `tarball:` path and does
+  nothing for the `mise:` one.
+  **(a) The fallback.** `prebuilt::ELECTRON_WRAP`/`electron_wrap` — shared by `deb:`, `appimage:`
+  **and** `tarball:` — located a desktop bundle by its `resources/app.asar` and **failed closed**
+  otherwise, so an archive holding one plain binary could not be packaged at all (measured before
+  touching anything: `cortex: no Electron resources/app(.asar) found`, build exit 1, provisioning
+  refused). It is now `LAUNCHER_WRAP`/`launcher_wrap` — the rename is the honest part, the constant
+  no longer wraps only Electron — with the bundle probe **unchanged and still first**, and a
+  bare-binary arm reached only when there is no bundle, so every backend that works today takes the
+  identical path. **The fallback's own rules are where the traps are:** it applies the *same*
+  exclusions as the bundle arm (an AppImage root carries `AppRun` beside the real binary, so
+  inheriting `sort | head -1` would wrap the launcher script), and it requires **exactly one**
+  candidate — two executables at the root is an ambiguity, not a pick-the-first situation, and the
+  refusal prints what it found. The search is deliberately `-maxdepth 1`: an archive that unpacks
+  into a versioned sub-directory fails with a message rather than being reached into (a named
+  residual — `stripRoot` is the obvious extension, not built). The wrapper keeps its name from the
+  `[packages]` **key**, which is already the derivation's `meta.mainProgram`, so a profile's `cmd`
+  is that key whatever the vendor called the file — the `qoder` key-mismatch lesson, applied by
+  construction.
+  **Proven live on the exact case that failed**, through the shipped musl binary: the same
+  `tarball:` declaration now builds, wraps the lone top-level `Cortex` as `$out/bin/cortex`, and
+  **runs** — `cortex 0.0.7 (ac6398e 2026-02-05)`.
+  **(b) `cortex` ships via `mise:github:`, the user's call between two measured options.** The
+  deciding fact is a security property, not convenience: **mise verifies the release's GitHub
+  artifact attestations and SLSA provenance** before installing (observed live), which `tarball:`
+  cannot — it pins a content hash, which is immutability, not provenance. The cost is that mise
+  picks the **dynamic** asset of the two upstream publishes (a `mise:` token cannot express an asset
+  preference — the validator forbids `=`, so mise's per-tool options are unreachable), and that
+  binary needs exactly **one** library the cage lacks: `libasound.so.2`. Measured with `readelf -d`,
+  not guessed — everything else it needs (libgcc_s/libm/libc, the loader) the base userland already
+  serves through nix-ld. So the profile declares `nix:alsa-lib` and a `cmd` wrapper puts its `lib/`
+  on `LD_LIBRARY_PATH`, derived from the `aserver` binary that same package puts on PATH (a store
+  path is content-addressed, so it cannot be written literally). **`audio = true` would also supply
+  the library and is deliberately refused**: that hole binds the host PulseAudio socket, exposing
+  the microphone *and* every `.monitor` source — an indefensible grant to satisfy a linker
+  dependency in a tool that neither records nor plays. Checked first, not assumed: `alsa-lib`
+  carries a `bin/aserver`, so it is declarable at all (`[packages]` selects a bin-bearing output —
+  the font-package precedent). The command is **`Cortex`**, capital C, as upstream names it.
+  **Proven live end-to-end:** `sbx app run cortex -- --version` → mise install with both
+  verifications → the wrapper → `cortex 0.0.7`. **No bundle**, and for the `amp`/`junie` reason
+  restated: the step that makes the binary start lives in `cmd`, which a bundle cannot carry.
+  **Tests:** 1 net-new unit (`launcher_wrap_falls_back_to_a_lone_top_level_binary_only_when_there_is_no_bundle`
+  — pins the ordering by string position, the shared exclusions, the exactly-one guard, the
+  *absence* of `head -1` in that arm, and that both refusals name the package) + the existing wrap
+  test renamed. **1335 unit + 103 config + 13 help green**, fmt/clippy `-D warnings` clean, **musl
+  rebuilt** and both live proofs run on the shipped binary. **Honest residuals:** the fallback is
+  `-maxdepth 1` only (a single-top-directory archive still fails, by design); `cortex` is **v0.0.7
+  and unlicensed** upstream, stated in its header; its `Authorization: Bearer` shape carries the
+  confirm-against-`sbx net logs` caveat; and the live auth awaits the user's own key.
+  See [[ubi-backend-deprecated]], [[tarball-backend-and-agnostic-sweep]], [[appimage-backend]],
+  [[ops-app-framework]].
   **The AionUi sweep closed — `stakpak`, `snow`, `qoder`, `sigit`, and the three that could not be
   grounded (DONE 2026-07-28)** (`examples/app/{stakpak,snow,qoder,sigit}.toml` [new] +
   `examples/bundle/{stakpak,snow,qoder,sigit}.toml` [new] + `examples/README.md` +

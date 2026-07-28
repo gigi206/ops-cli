@@ -1,0 +1,112 @@
+# Cortex Code — a coding agent focused on performance-oriented code, sandboxed by sbx.
+#
+#   sbx app import examples/app/cortex.toml
+#   sbx app run cortex
+#
+# Cortex ships as a Rust release binary on its own GitHub releases (`CortexLM/cortex-code`). sbx
+# equips it fresh from upstream via mise's `github` backend — which here does more than download:
+# it verifies the release's **GitHub artifact attestations and SLSA provenance** before installing,
+# the same supply-chain check `goose` gets. Advance it with `sbx upgrade mise`, not the binary's own
+# updater. Note the version: **v0.0.7**, early and moving, and the repository carries **no license**
+# — neither is a blocker for a profile that only points at the vendor's official artifact, but you
+# should know both before wiring it into anything.
+#
+# WHY `cmd` IS A WRAPPER, AND WHY `alsa-lib` IS A PACKAGE. Upstream publishes two Linux assets — a
+# dynamic build and a `-static` one — and mise picks the **dynamic** one; a `mise:` token has no way
+# to express an asset preference. That binary needs exactly one library the hermetic cage does not
+# carry: `libasound.so.2` (measured with `readelf -d` — everything else it needs, libgcc_s/libm/libc
+# and the loader, the cage's base userland already provides through its nix-ld shim). Without it the
+# CLI does not start at all: `error while loading shared libraries: libasound.so.2`.
+#
+# The proportionate fix is the one below: declare `nix:alsa-lib` — host-provisioned, seeded, offline
+# — and let the wrapper put its `lib/` on the loader path, derived from the `aserver` binary that
+# same package puts on PATH (a store path is content-addressed, so it cannot be written literally).
+# **`audio = true` would also supply the library and is deliberately NOT used**: that hole binds the
+# host PulseAudio socket, which exposes the microphone *and* every `.monitor` source — an
+# indefensible grant to satisfy a linker dependency in a tool that never plays or records anything.
+#
+# The command the wrapper execs is **`Cortex`**, capital C — that is what upstream names the file
+# inside the archive, and mise puts it on PATH under that name.
+#
+# CREDENTIAL POSTURE — a Cortex account key, or BYOK. `CORTEX_API_KEY` authenticates to
+# `api.cortex.foundation`; the CLI also reads `OPENAI_API_KEY`, so you can point it at your own
+# provider instead and leave the vendor host out entirely. Either way the real key is read on the
+# HOST and injected by the egress proxy on the wire — never in the cage.
+#
+# UNVERIFIED (like every profile until run with a real key): the live authentication and the model
+# traffic through sbx's MITM; the `Authorization: Bearer` shape below is the standard one for this
+# API — confirm it against `sbx net logs -a cortex` on your first real run. Grounded here: the
+# packaging (the install was run for real — mise's asset choice, its attestation/SLSA step, and the
+# `Cortex` command name are all observed, not assumed), the missing library (`readelf -d` on the
+# published asset), and the endpoints and `CORTEX_*` keys (read out of the shipped binary).
+cmd = [
+    "bash",
+    "-c",
+    """
+set -eu
+alsa="$(dirname "$(dirname "$(readlink -f "$(command -v aserver)")")")/lib"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$alsa"
+exec Cortex "$@"
+""",
+    "cortex",
+]
+
+# Your host Cortex config, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# CLI read and write these host files. Uncomment to share your host Cortex setup with the cage
+# instead of the app's isolated home (the default), where `$CORTEX_HOME` lives.
+#binds = [
+#    { path = "~/.cortex", mode = "rw" },
+#]
+
+[packages]
+# Upstream's own release binary, attestation- and SLSA-verified by mise at install time.
+cortex = "mise:github:CortexLM/cortex-code"
+# The one library that binary needs and the cage lacks (see the header). Declared as a package so it
+# is host-provisioned and seeded — its `bin/aserver` is also what lets the wrapper find its `lib/`.
+alsa-lib = "nix:alsa-lib"
+
+# An app is read-by-default ({GET,HEAD}); a completions endpoint is a POST, so the model host is
+# opened to all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # The vendor's own service — model traffic and account. The install itself needs no entry: the
+    # GitHub release download and its attestation check ride sbx's built-in read-only allow-set.
+    "{*} https://api.cortex.foundation",
+    # BYOK instead: uncomment this and supply an OpenAI key below rather than a Cortex one.
+    #"{*} https://api.openai.com",
+    # Its search / hosted-MCP tools, if you want them.
+    #"{*} https://duckduckgo.com",
+    #"{*} https://mcp.exa.ai",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the vendor's installer and
+# docs hosts — sbx owns updates here (`sbx upgrade mise`), so the self-update channel is refused on
+# purpose — and the tool backends left denied just above. A `mute` never changes the verdict (they
+# stay refused) and never hides a count (`sbx net stats` still tallies them). See everything with
+# `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a cortex`.
+mute = [
+    "software.cortex.foundation",
+    "docs.cortex.foundation",
+    "registry.cortex.foundation",
+    "duckduckgo.com",
+    "mcp.exa.ai",
+]
+
+# --- Provider key (commented) — uncomment the placeholder and the matching [secret] block. The
+# in-cage placeholder lets the CLI start and issue its request; the proxy strips it and substitutes
+# the real key, read on the HOST (as the named variable, or via a resolver such as
+# sops://secrets.yaml#cortex), on the wire. ---
+[env]
+#CORTEX_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.cortex.foundation"]
+#from = "env://CORTEX_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

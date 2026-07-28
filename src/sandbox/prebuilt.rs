@@ -61,34 +61,56 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
     "libxshmfence",
 ];
 
-/// The generic Electron install phase (a shell snippet), embedded by each backend's generated
-/// derivation into its `installPhase` after the bundle has been copied into `$out`. It locates the
-/// app directory by its `resources/` signature — either a packed `resources/app.asar` file or, for an
-/// asar-less build (some modern VS Code forks ship the app as a loose `resources/app/`
-/// directory), the `resources/app` directory itself; both resolve to the same bundle root — and wraps
-/// the launcher, the executable beside it that is not a `.so`, a Chromium helper, or the AppImage
+/// The generic install phase (a shell snippet), embedded by each backend's generated derivation into
+/// its `installPhase` after the archive has been copied into `$out`. It finds the program to wrap in
+/// two passes, and the order matters: the **bundle** shape first, the **bare-binary** shape only when
+/// there is no bundle.
+///
+/// A bundle is located by its `resources/` signature — either a packed `resources/app.asar` file or,
+/// for an asar-less build (some modern VS Code forks ship the app as a loose `resources/app/`
+/// directory), the `resources/app` directory itself; both resolve to the same bundle root. The
+/// launcher is then the executable beside it that is not a `.so`, a Chromium helper, or the AppImage
 /// `AppRun` script. Excluding `AppRun` is load-bearing for an AppImage (its squashfs carries an
 /// `AppRun` launcher that sorts *before* the real binary) and harmless for a `.deb` (which has no
-/// `AppRun`), so one snippet serves both. Two placeholders: `@NAME@` (the wrapped launcher name) and
-/// `@LDPREFIX@` (the `LD_LIBRARY_PATH` prefix value — a backend chooses whether to prepend the bundle
-/// root for sibling `.so`s).
-pub(crate) const ELECTRON_WRAP: &str = r#"    app=$(find $out -type f -path '*/resources/app.asar' | sort | head -1)
+/// `AppRun`), so one snippet serves both.
+///
+/// The fallback covers the plainest shape a vendor ships: an archive whose root holds one executable
+/// and nothing else to choose from — a self-contained CLI rather than a desktop bundle. It applies
+/// the *same* exclusions, and requires **exactly one** candidate: two would be an ambiguity, and
+/// picking the first of them is how a build silently wraps the wrong program. The search is
+/// deliberately `-maxdepth 1`, so an archive that unpacks into a versioned sub-directory fails here
+/// with a message naming what it found rather than reaching in and guessing.
+///
+/// Two placeholders: `@NAME@` (the wrapped launcher name — the `[packages]` key, which is also the
+/// derivation's `meta.mainProgram`, so the command a profile writes is that key) and `@LDPREFIX@`
+/// (the `LD_LIBRARY_PATH` prefix value — a backend chooses whether to prepend the bundle root for
+/// sibling `.so`s).
+pub(crate) const LAUNCHER_WRAP: &str = r#"    app=$(find $out -type f -path '*/resources/app.asar' | sort | head -1)
     [ -n "$app" ] || app=$(find $out -type d -path '*/resources/app' | sort | head -1)
-    [ -n "$app" ] || { echo "@NAME@: no Electron resources/app(.asar) found" >&2; exit 1; }
-    appdir=$(dirname "$(dirname "$app")")
-    main=$(find "$appdir" -maxdepth 1 -type f -executable \
-      ! -name 'AppRun' ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
-      ! -name '*.so' ! -name '*.so.*' | sort | head -1)
-    [ -n "$main" ] || { echo "@NAME@: no launcher binary found in $appdir" >&2; exit 1; }
+    if [ -n "$app" ]; then
+      appdir=$(dirname "$(dirname "$app")")
+      main=$(find "$appdir" -maxdepth 1 -type f -executable \
+        ! -name 'AppRun' ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
+        ! -name '*.so' ! -name '*.so.*' | sort | head -1)
+      [ -n "$main" ] || { echo "@NAME@: no launcher binary found in $appdir" >&2; exit 1; }
+    else
+      cands=$(find $out -maxdepth 1 -type f -executable \
+        ! -name 'AppRun' ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
+        ! -name '*.so' ! -name '*.so.*' | sort)
+      [ -n "$cands" ] || { echo "@NAME@: no Electron resources/app(.asar), and no executable at the archive root" >&2; exit 1; }
+      count=$(printf '%s\n' "$cands" | wc -l)
+      [ "$count" -eq 1 ] || { echo "@NAME@: no Electron resources/app(.asar), and $count executables at the archive root (need exactly 1):" >&2; printf '%s\n' "$cands" >&2; exit 1; }
+      main=$cands
+    fi
     mkdir -p $out/bin
     makeWrapper "$main" "$out/bin/@NAME@" \
       --prefix LD_LIBRARY_PATH : "@LDPREFIX@""#;
 
-/// Fill [`ELECTRON_WRAP`]'s two placeholders. `ld_prefix` is the `LD_LIBRARY_PATH` prefix value: a
+/// Fill [`LAUNCHER_WRAP`]'s two placeholders. `ld_prefix` is the `LD_LIBRARY_PATH` prefix value: a
 /// `.deb` passes just the `makeLibraryPath` of its `buildInputs`; an AppImage prepends `$out` (its
 /// bundle root holds the Chromium sibling `.so`s — `libEGL.so`, `libffmpeg.so`, …).
-pub(crate) fn electron_wrap(name: &str, ld_prefix: &str) -> String {
-    ELECTRON_WRAP
+pub(crate) fn launcher_wrap(name: &str, ld_prefix: &str) -> String {
+    LAUNCHER_WRAP
         .replace("@NAME@", name)
         .replace("@LDPREFIX@", ld_prefix)
 }
@@ -293,8 +315,8 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
     }
 
     #[test]
-    fn electron_wrap_fills_both_placeholders_and_excludes_apprun() {
-        let wrap = electron_wrap("demo-app", "$out:/lib");
+    fn launcher_wrap_fills_both_placeholders_and_excludes_apprun() {
+        let wrap = launcher_wrap("demo-app", "$out:/lib");
         assert!(wrap.contains("$out/bin/demo-app"));
         assert!(wrap.contains("--prefix LD_LIBRARY_PATH : \"$out:/lib\""));
         // AppRun exclusion is what makes one snippet serve both backends.
@@ -304,6 +326,44 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         assert!(wrap.contains("resources/app.asar"));
         assert!(wrap.contains("-type d -path '*/resources/app'"));
         assert!(!wrap.contains('@'), "unfilled placeholder in:\n{wrap}");
+    }
+
+    #[test]
+    fn launcher_wrap_falls_back_to_a_lone_top_level_binary_only_when_there_is_no_bundle() {
+        let wrap = launcher_wrap("demo-cli", "/lib");
+        // The bundle probe still runs FIRST and unchanged: a backend that works today must take the
+        // identical path. The fallback lives in the `else` arm, so it is unreachable for a bundle.
+        let bundle_probe = wrap.find("resources/app.asar").expect("bundle probe");
+        let fallback = wrap.find("cands=").expect("bare-binary fallback");
+        assert!(
+            bundle_probe < fallback,
+            "the bare-binary fallback must come after the bundle probe:\n{wrap}"
+        );
+        assert!(wrap.contains("if [ -n \"$app\" ]; then"));
+
+        // Same exclusions as the bundle arm — an AppImage root carries `AppRun` beside the real
+        // binary, so taking the first of them would wrap the launcher script instead.
+        let arm = &wrap[fallback..];
+        for excluded in [
+            "! -name 'AppRun'",
+            "! -name 'chrome-sandbox'",
+            "! -name '*.so'",
+        ] {
+            assert!(arm.contains(excluded), "fallback drops {excluded}:\n{arm}");
+        }
+
+        // Exactly one candidate, or the build fails: two executables at the root is an ambiguity,
+        // and `sort | head -1` on it is how the wrong program gets wrapped silently.
+        assert!(arm.contains("[ \"$count\" -eq 1 ]"));
+        assert!(
+            !arm.contains("head -1"),
+            "the fallback must not pick a first candidate:\n{arm}"
+        );
+        // Both refusals name the package, so a build log says which one failed and why.
+        assert_eq!(wrap.matches("demo-cli: no Electron").count(), 2);
+        // The wrapper is named after the `[packages]` key, which is the derivation's mainProgram —
+        // so a profile's `cmd` is that key, whatever the vendor called the file inside the archive.
+        assert!(wrap.contains("$out/bin/demo-cli"));
     }
 
     #[test]

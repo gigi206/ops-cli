@@ -46,11 +46,11 @@ of the same name in [`app/`](app/), and a test pins the two together so they can
 drift apart. See [`[bundle.<name>]`](../docs/guide/configuration/bundles.md).
 
 Not every agent has one: `cursor-agent` is a bootstrap download rather than a
-package, so there is nothing for a bundle to carry. `amp` and `junie` have none for a
-different reason — their npm package is inert until a vendor **postinstall** step runs
-(which mise's `--ignore-scripts` skips), so the step lives in the profile's `cmd`
-wrapper, and a bundle cannot carry a `cmd`. A bundle of the package alone would hand a
-consuming app a binary that refuses to start.
+package, so there is nothing for a bundle to carry. `amp`, `junie` and `cortex` have none for a
+different reason — each needs a step that only a `cmd` wrapper can carry, and a bundle cannot carry
+a `cmd`: for the first two a vendor **postinstall** that mise's `--ignore-scripts` skips, for
+`cortex` the `LD_LIBRARY_PATH` its binary needs to start at all. A bundle of the packages alone
+would hand a consuming app a binary that refuses to start.
 
 The discriminator is not "is a postinstall skipped" but "can the tool still find what
 that postinstall would have placed". `dirac` is the near miss that shows it: the same
@@ -93,6 +93,7 @@ step is skipped for its `@vscode/ripgrep` dependency, yet it needs no wrapper �
 | `snow`            | `mise:npm:snow-ai` (+ `nix:nodejs`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / any OpenAI-compatible) |
 | `qoder`           | `mise:npm:@qoder-ai/qodercli` (+ `nix:nodejs`, `nix:ripgrep`) — the vendor's own npm scope; command is `qodercli` | `*.qoder.sh` GLOBAL / `*.qoder.com.cn` CN (Qoder account: browser login or `QODER_PERSONAL_ACCESS_TOKEN`) |
 | `sigit`           | `mise:npm:@smbcloud/sigit` (+ `nix:nodejs`) — a JS shim over a ~78 MB prebuilt binary | **none** — the model runs in-cage (a Qwen3 GGUF pulled from Hugging Face on first launch) |
+| `cortex`          | `mise:github:CortexLM/cortex-code` (+ `nix:alsa-lib`) — mise verifies GitHub attestations + SLSA; the `cmd` wrapper supplies the one library the binary needs, see its header | `api.cortex.foundation` (`CORTEX_API_KEY`) or BYOK (`OPENAI_API_KEY`) |
 | `cursor-agent`    | bootstrap `curl cursor.com/install` (CLI tarball — no clean backend; **not** the npm `cursor-agent`) | `*.cursor.sh` (Cursor account) |
 | `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
 | `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
@@ -321,6 +322,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `snow`        | `mise:npm:snow-ai` (+ `nix:nodejs`)             | the author's own npm package (node CLI). Its postinstall only geolocates you to print a mirror tip, so `--ignore-scripts` skipping it costs nothing and avoids the lookup |
 | `qoder`       | `mise:npm:@qoder-ai/qodercli` (+ `nix:nodejs`)  | the **vendor's own npm scope** — a parallel channel to their documented shell installer (which fetches a binary from their Alibaba OSS bucket); its `repository` field points at a repo that does not exist, stale metadata rather than a different publisher. A Gemini-CLI fork, like `qwen-code`; `ripgrep` from nixpkgs, resolved PATH-first |
 | `sigit`       | `mise:npm:@smbcloud/sigit` (+ `nix:nodejs`)     | upstream's documented npm package: a JS shim dispatching to a ~78 MB prebuilt platform package (a plain optional dep, no install script). The model itself is a GGUF fetched from Hugging Face at first launch |
+| `cortex`      | `mise:github:CortexLM/cortex-code`              | upstream's own release binary — mise verifies the release's **GitHub artifact attestations and SLSA provenance** before installing (like `goose`). Upstream ships two Linux assets and mise picks the **dynamic** one, which needs `libasound.so.2`; `nix:alsa-lib` plus a `cmd` wrapper supplies it (`audio = true` would too, but that hole opens the microphone — see the profile) |
 | `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package — refresh with `--env CURSOR_AGENT_SBX_UPDATE=1` |
 | `cursor`      | `deb:…/cursor_<ver>_amd64.deb` (version-pinned)  | Cursor's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `openfox`     | `mise:npm:openfox` (+ `nix:nodejs`) | OpenFox npm package (pure-node web agent, node at runtime) |
@@ -475,25 +477,9 @@ do not guess the values, so each waits on a real fact or on a named feature:
   nothing to ground a profile on, and this directory does not guess values. Both would ship the day
   upstream publishes the missing link.
 
-- **A layout no backend covers yet: the bare-binary tarball** — **`CortexLM/cortex-code`** has an
-  official installer, a GitHub release with checksums, and groundable auth (`CORTEX_API_KEY` →
-  `api.cortex.foundation`, or `OPENAI_API_KEY`). It is blocked on packaging, and **both candidate
-  paths were run for real** rather than reasoned about:
-  - `mise:github:CortexLM/cortex-code` **installs** (mise even verifies the release's GitHub artifact
-    attestations and SLSA provenance) and puts **`Cortex`** — capital C — on PATH. But mise picks
-    `cortex-cli-linux-x64.tar.gz`, the **dynamic** asset, and it does not run in a hermetic cage:
-    `error while loading shared libraries: libasound.so.2`. A `mise:` token cannot express an asset
-    preference, and the only ways to supply that library are disproportionate (`audio = true` opens
-    the microphone and every monitor source to satisfy a linker dependency).
-  - The release's `-static` asset **is** a true `static-pie` binary (9.8 MB, zero dynamic deps) that
-    would run anywhere — but `tarball:` refuses it: that backend's install phase locates a desktop
-    bundle by its `resources/app.asar` and fail-closes otherwise, which is exactly what happened
-    (`cortex: no Electron resources/app(.asar) found`, build exit 1).
-
-  So the missing piece is a **bare-binary fallback in the prebuilt install phase**: when no
-  `resources/app(.asar)` is found, wrap the single top-level executable instead of failing. That is
-  an sbx change, not a profile one, and it would unlock every vendor that ships a plain binary in a
-  `.tar.gz` rather than a desktop bundle.
+*(The `cortex-code` entry that stood here is resolved: it ships as `cortex` above. Both candidate
+paths were run for real; what they measured, and why the shipped one carries a wrapper, is in the
+profile's header.)*
 
 - **OAuth-only credential** — **`agy`** (Antigravity CLI, Google) authenticates with **Google
   Sign-In**, not a header-injectable key, so it ships as an **account** profile (above), not a

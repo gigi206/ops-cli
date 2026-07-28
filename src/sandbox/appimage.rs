@@ -265,7 +265,7 @@ fn select_appimage_asset(json: &serde_json::Value, system: &str) -> Option<Strin
 /// The generated nix expression building one `appimage:` package: fetch the pinned `.AppImage`,
 /// extract its squashfs with `appimageTools.extractType2`, copy it into `$out`, and autoPatchelf it
 /// against [`ELECTRON_LIBS`] from the pinned `nixpkgs`. The launcher-locating install phase is shared
-/// with `deb:` ([`prebuilt::electron_wrap`], which excludes the AppImage `AppRun` script so the real
+/// with `deb:` ([`prebuilt::launcher_wrap`], which excludes the AppImage `AppRun` script so the real
 /// binary is wrapped). Every interpolated value is sbx-controlled and charset-validated (`name`,
 /// `url`, `hash`, the pinned `nixpkgs`, `system`), so the expression carries nothing to escape;
 /// placeholders keep nix's `${…}`/`{…}` out of Rust's formatter.
@@ -296,7 +296,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     // The AppImage's Chromium `.so`s (`libEGL.so`, `libffmpeg.so`, …) sit loose in the bundle root,
     // so the wrapper prepends `$out` to `LD_LIBRARY_PATH` (beside the buildInputs closure) — unlike a
     // `.deb`, whose binary finds its siblings via RUNPATH.
-    let wrap = prebuilt::electron_wrap(
+    let wrap = prebuilt::launcher_wrap(
         name,
         "$out:${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}",
     );

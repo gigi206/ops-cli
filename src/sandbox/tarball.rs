@@ -286,7 +286,7 @@ pub(crate) fn provision_resolve_pinned(
 
 /// The generated nix expression building one `tarball:` package: fetch the pinned `.tar.gz`, extract
 /// it, and autoPatchelf it against [`ELECTRON_LIBS`] from the pinned `nixpkgs`. The install phase is
-/// generic for an Electron layout — [`prebuilt::electron_wrap`] locates the app directory by its
+/// generic for an Electron layout — [`prebuilt::launcher_wrap`] locates the app directory by its
 /// `resources/` signature (a packed `resources/app.asar` or, for an asar-less VS Code fork, the
 /// `resources/app/` directory) and wraps the app's own launcher, so no
 /// per-app path is hardcoded. Every interpolated value is sbx-controlled and charset-validated
@@ -331,7 +331,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     // The bundled binary lives under its own prefix and finds its sibling `.so`s via RUNPATH, so the
     // wrapper's `LD_LIBRARY_PATH` is just the buildInputs closure — no bundle-root prefix (unlike an
     // AppImage, whose Chromium `.so`s sit loose beside the launcher).
-    let wrap = prebuilt::electron_wrap(name, "${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}");
+    let wrap = prebuilt::launcher_wrap(name, "${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}");
     TEMPLATE
         .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)

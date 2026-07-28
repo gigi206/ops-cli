@@ -39,6 +39,7 @@ notes) lives in [`examples/README.md`](../../../examples/README.md).
 | `snow` | `mise:npm:snow-ai` (+ `nix:nodejs`) | provider-dependent (BYOK) |
 | `qoder` | `mise:npm:@qoder-ai/qodercli` (+ `nix:nodejs`, `nix:ripgrep`) | `*.qoder.sh` (Qoder account / `QODER_PERSONAL_ACCESS_TOKEN`) |
 | `sigit` | `mise:npm:@smbcloud/sigit` (+ `nix:nodejs`) | **none** — the model runs in-cage |
+| `cortex` | `mise:github:CortexLM/cortex-code` (+ `nix:alsa-lib`) | `api.cortex.foundation` (`CORTEX_API_KEY`) or BYOK |
 
 Each gets its own persistent, isolated [`$HOME`](home.md), shared across projects by
 default (`home_scope = "global"`).

@@ -251,13 +251,27 @@ from a trusted source** and **never run for an untrusted layer**.
 demo-app = "tarball:https://host/path/App.tar.gz"
 ```
 
-The sibling of `deb:`/`appimage:`, for a GUI/desktop app distributed **only as a plain `.tar.gz`**
-(no `.deb`, no `.AppImage`, no nixpkgs attribute, no official flake). sbx resolves the URL to a
+The sibling of `deb:`/`appimage:`, for an app distributed **only as a plain `.tar.gz`** (no `.deb`,
+no `.AppImage`, no nixpkgs attribute, no official flake). sbx resolves the URL to a
 content hash (pinned in a per-project `tarball-packages.lock`) and
 builds a generated derivation that **`tar -xz`-extracts it at build time** and `autoPatchelfHook`s
-its Electron/Chromium binaries against the same curated library set — **host-side**, seeded and
+its binaries against the same curated library set — **host-side**, seeded and
 offline-reusable. Pairs with [`gui = "wayland"`](gui.md), [`gpu = true`](gpu.md), and
 [`dbus = true`](dbus.md) exactly like a `.deb` desktop app.
+
+**Two archive shapes are understood**, and the first that matches wins:
+
+- a **desktop bundle** — located by its `resources/app.asar` (or a loose `resources/app/`), whose
+  launcher is then wrapped. This is the Electron/VS Code-fork shape the three prebuilt backends were
+  built for;
+- a **bare binary** — an archive whose root holds exactly one executable and nothing else to choose
+  from, the shape a self-contained CLI ships in. It is wrapped under the `[packages]` **key**, so
+  the `cmd` a profile writes is that key whatever the vendor named the file inside the archive.
+
+Anything else fails the build with a message naming what it found: two executables at the root is an
+ambiguity, not a pick-the-first situation, and an archive that unpacks into a versioned
+sub-directory is not reached into. The same two shapes apply to `deb:` and `appimage:`, which share
+this install phase.
 
 Two forms:
 
