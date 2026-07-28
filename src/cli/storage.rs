@@ -656,10 +656,17 @@ struct StatusView {
     allocated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     used_bytes: Option<u64>,
-    /// Bytes the volume has freed and is still returning to the host. Present only when there
-    /// are some, so that a figure appearing at all means there is something to wait for.
+    /// Bytes the image carries on the host beyond the data alive inside it — what a discard has
+    /// yet to return. Absent where the two figures it is derived from are not comparable.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reclaiming_bytes: Option<u64>,
+    reclaimable_bytes: Option<u64>,
+    /// Whether the kernel has discard work queued, so the figure above can fall on its own.
+    ///
+    /// A flag rather than the kernel's byte count, which was measured to overstate what the image
+    /// would give back — it tracks free space *eligible* for discard, including regions already
+    /// punched out of the image, as the sibling `discard_bytes_saved` counter records. Live: a
+    /// queue of 1 178 042 368 preceded a return of 838 860 800.
+    discard_queued: bool,
     /// Whether sbx is set to follow this volume — the pointer names it — whether or not it is
     /// mounted right now. A volume adopted before a reboot is `adopted` but not mounted.
     adopted: bool,
@@ -701,7 +708,8 @@ fn status(args: Vec<OsString>) -> ExitCode {
         capacity_bytes: storage::image_capacity(&image),
         allocated_bytes: None,
         used_bytes: None,
-        reclaiming_bytes: None,
+        reclaimable_bytes: None,
+        discard_queued: false,
         adopted: is_adopted,
         in_use: false,
         image: image.clone(),
@@ -726,8 +734,21 @@ fn status(args: Vec<OsString>) -> ExitCode {
             if let Ok(sp) = storage::space(mount_point) {
                 view.allocated_bytes = Some(sp.allocated);
                 view.used_bytes = Some(sp.used);
+                // Read on the directory holding the image, since that is the filesystem whose
+                // block accounting `host_bytes` came from — and a file's blocks are always on its
+                // own directory's filesystem, so the two cannot name different ones. The walk-up
+                // inside `fs_kind_of_nearest` never fires here: `host_bytes` is `Some` only for an
+                // image that exists, and an existing file has an existing parent. Unstattable
+                // counts as compressing, which yields no answer rather than a figure on a guess.
+                let may_compress = image
+                    .parent()
+                    .and_then(storage::fs_kind_of_nearest)
+                    .is_none_or(storage::FsKind::may_compress);
+                view.reclaimable_bytes = view
+                    .host_bytes
+                    .and_then(|host| storage::reclaimable_bytes(host, sp.used, may_compress));
             }
-            view.reclaiming_bytes = storage::reclaiming_bytes(loop_dev);
+            view.discard_queued = storage::discard_queue(loop_dev).is_some();
         }
         _ => {}
     }
@@ -803,13 +824,24 @@ fn render(v: &StatusView) {
                 sandbox::human_bytes(a)
             );
         }
-        // Only when there is a queue: an always-present `0 B` would read as a figure to act on,
-        // where the whole point is that this one resolves itself.
-        if let Some(pending) = v.reclaiming_bytes {
-            println!(
-                "  reclaiming  {} {dim}being returned to the host{r}",
-                sandbox::human_bytes(pending)
-            );
+        // Written so the arithmetic can be checked on screen: this is `on host` minus what
+        // `inside` says is alive, which is why all three are counted the same way.
+        if let Some(gap) = v.reclaimable_bytes {
+            // Zero is a state worth reading as a sentence — it is what a volume looks like right
+            // after a trim, and "0 B the image carries beyond live data" reads as a fragment.
+            let note = if gap == 0 {
+                "nothing the image can give back"
+            } else {
+                "the image carries beyond live data"
+            };
+            println!("  reclaimable {} {dim}{note}{r}", sandbox::human_bytes(gap));
+            // Deliberately unquantified: the kernel's queue counts free space it *may* discard,
+            // which measurably exceeds what the image would give back — much of it has already
+            // been punched out, as its own `discard_bytes_saved` counter records. So the queue
+            // says only that the figure above can fall without being asked, never how far.
+            if v.discard_queued {
+                println!("              {dim}some of it queued for automatic return{r}");
+            }
         }
     }
 
@@ -852,12 +884,22 @@ fn render(v: &StatusView) {
         }
     }
 
-    // Deleting files does not shrink the image at once: the kernel hands freed extents back
-    // to the host in the background. Saying so beats implying the host figure is exact.
-    if v.mount_point.is_some() {
+    // Only worth a root command past a certain size. A tool that suggests one for a few
+    // megabytes every single run teaches the reader to skip the line — and the kernel's own
+    // queue covers the small change without being asked.
+    const WORTH_TRIMMING: u64 = 1 << 30;
+    let worth_trimming = v.reclaimable_bytes.is_some_and(|gap| gap >= WORTH_TRIMMING);
+    if let Some(mp) = v.mount_point.as_ref().filter(|_| worth_trimming) {
         println!(
-            "\n{dim}freed space returns to the host in the background, so the host figure \
-             can lag deletions by a moment.{r}"
+            "\n{}",
+            style::dim_prose(
+                &format!(
+                    "return it now with `sudo fstrim {}`; left alone, only the part already \
+                     on the way back goes home.",
+                    mp.display()
+                ),
+                &pal
+            )
         );
     }
 }

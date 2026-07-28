@@ -403,13 +403,112 @@ pub(crate) fn compression(dir: &Path) -> Option<String> {
     String::from_utf8(buf[..n as usize].to_vec()).ok()
 }
 
-/// How much of the volume the filesystem has claimed, and how much of that holds data.
+/// How much of the volume the filesystem has claimed, and how much of that holds data — both
+/// counted as they occupy the device.
+///
+/// btrfs keeps its accounting in *logical* bytes: a block group whose profile writes two copies
+/// of everything — `DUP`, the default for metadata on a single device — reports one. That answers
+/// "how much information did I store", where every question asked here is about blocks: what the
+/// image costs on the host, and what a discard would return. So each block group is counted as
+/// its profile writes it, which makes both figures directly comparable with the image's size on
+/// the host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Space {
-    /// Bytes the filesystem has reserved into block groups.
+    /// Device bytes the filesystem has reserved into block groups.
     pub(crate) allocated: u64,
-    /// Bytes of that reservation actually in use.
+    /// Device bytes of that reservation actually in use.
     pub(crate) used: u64,
+}
+
+/// Each block group the space ioctl reports is three `u64`s: profile flags, total, used.
+const ENTRY: usize = 24;
+
+/// Copies of every byte a block group's profile writes to the device.
+///
+/// Read off the flags the kernel already returns beside each figure, and checked against its own
+/// device-side counters: a metadata block group holding 972 308 480 logical bytes reports
+/// 1 944 616 960 in `/sys/fs/btrfs/<uuid>/allocation/metadata/disk_used`.
+///
+/// The parity profiles are missing on purpose. `RAID5`/`RAID6` spread a stripe across several
+/// devices, so their cost cannot be derived from one block group's flags at all — and neither
+/// they nor the multi-device mirrors can arise here, where the filesystem is created over a
+/// single loop image. An unrecognised profile is therefore counted once, which under-states the
+/// figure rather than inventing one.
+fn device_factor(flags: u64) -> u64 {
+    const RAID1: u64 = 1 << 4;
+    const DUP: u64 = 1 << 5;
+    const RAID10: u64 = 1 << 6;
+    const RAID1C3: u64 = 1 << 9;
+    const RAID1C4: u64 = 1 << 10;
+
+    if flags & RAID1C4 != 0 {
+        4
+    } else if flags & RAID1C3 != 0 {
+        3
+    } else if flags & (DUP | RAID1 | RAID10) != 0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Sum the block groups the kernel reported, as they occupy the device.
+///
+/// `entries` is the ioctl's payload with its header already stripped. A trailing partial entry
+/// cannot occur — the buffer is sized from the kernel's own count — and is dropped rather than
+/// read out of a half-written slot.
+fn tally(entries: &[u8]) -> Space {
+    // A reservation btrfs holds back *within* the metadata it has already claimed, reported
+    // alongside the block groups rather than as one. Adding it would count those bytes twice.
+    const GLOBAL_RSV: u64 = 1 << 49;
+
+    let mut space = Space::default();
+    for e in entries.chunks_exact(ENTRY) {
+        let flags = u64::from_ne_bytes(e[0..8].try_into().unwrap());
+        if flags & GLOBAL_RSV != 0 {
+            continue;
+        }
+        let factor = device_factor(flags);
+        space.allocated += u64::from_ne_bytes(e[8..16].try_into().unwrap()) * factor;
+        space.used += u64::from_ne_bytes(e[16..24].try_into().unwrap()) * factor;
+    }
+    space
+}
+
+/// Bytes the image carries on the host beyond the data alive inside it.
+///
+/// The image is sparse: a block appears in it the first time it is written and leaves only when
+/// the filesystem discards it, which punches it back out. What the image costs above what it now
+/// holds is therefore what a discard has yet to return — the space `fstrim` acts on, and which
+/// the kernel's own queue ([`discard_queue`]) has listed a part of.
+///
+/// The two counters are independent and agree only to within a few megabytes — btrfs's own
+/// per-block-group totals against the host's block accounting for the image — so the image can
+/// read *smaller* than the data inside it. Measured right after a successful `fstrim`: 5.3 MiB
+/// under, stably. What that shortfall means depends on the host filesystem, which is why it is
+/// passed in:
+///
+/// - one that cannot compress: the counters simply crossed, and the honest reading is that there
+///   is nothing left to reclaim — `Some(0)`, not a vanished line at the very moment the volume is
+///   in its best state;
+/// - one that can: the image is structurally smaller than its contents and the subtraction
+///   measures nothing at all, so there is no figure to report.
+pub(crate) fn reclaimable_bytes(
+    host_bytes: u64,
+    used_on_device: u64,
+    host_may_compress: bool,
+) -> Option<u64> {
+    match host_bytes.checked_sub(used_on_device) {
+        Some(gap) => Some(gap),
+        None if host_may_compress => None,
+        // A crossing is two accountings of the same thing disagreeing at rounding scale — the
+        // measured one was 0.04% of the volume. Past a thousandth, the shortfall is not skew but
+        // something wrong (a miscount, a truncated image), and answering "nothing to reclaim"
+        // with confidence would be worse than answering nothing. Relative rather than a byte
+        // count, so the rule holds for a volume of any size.
+        None if used_on_device - host_bytes <= used_on_device / 1000 => Some(0),
+        None => None,
+    }
 }
 
 /// Read the volume's own space accounting.
@@ -422,8 +521,6 @@ pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
 
     // _IOWR(0x94, 20, struct btrfs_ioctl_space_args), whose two u64 fields make it 16 bytes.
     const BTRFS_IOC_SPACE_INFO: libc::c_ulong = (3 << 30) | (16 << 16) | (0x94 << 8) | 20;
-    // Each returned entry is three u64s: flags, total_bytes, used_bytes.
-    const ENTRY: usize = 24;
     const HEADER: usize = 16;
 
     let dir = std::fs::File::open(mount_point)?;
@@ -448,33 +545,29 @@ pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
     }
     let got = u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as usize;
 
-    let mut space = Space::default();
-    for i in 0..got.min(count) {
-        let at = HEADER + i * ENTRY;
-        space.allocated += u64::from_ne_bytes(buf[at + 8..at + 16].try_into().unwrap());
-        space.used += u64::from_ne_bytes(buf[at + 16..at + 24].try_into().unwrap());
-    }
-    Ok(space)
+    Ok(tally(&buf[HEADER..HEADER + got.min(count) * ENTRY]))
 }
 
-/// Bytes the volume has freed and is still handing back to the host.
+/// Whether the kernel has discard work queued for the volume, and how much it has listed.
 ///
-/// Deleting inside the volume does not shrink the image at once. With `discard=async` the kernel
-/// queues the freed extents and a deliberately throttled worker punches them out of the image;
-/// until it gets to them the host still carries them. This counter is that queue — the space the
-/// host figure is about to stop counting, with nothing to do but wait. How long the wait is
-/// depends on the queue and on the rate limits the kernel applies to the worker, so it is reported
-/// rather than predicted.
+/// With `discard=async` a delete does not shrink the image at once: the kernel lists the freed
+/// space and a deliberately throttled worker punches it out later. This counter is that list.
 ///
-/// `None` where the kernel keeps no such queue (mounted without async discard, or an older
-/// kernel) and where there is nothing pending, which are reported alike: both mean there is no
-/// pending figure worth showing.
-pub(crate) fn reclaiming_bytes(loop_dev: &str) -> Option<u64> {
-    reclaiming_bytes_under(Path::new("/sys/fs/btrfs"), loop_dev)
+/// **Its figure is not what the host will get back**, which is why callers take it as a signal
+/// rather than an amount. It counts free space *eligible* for discard, including regions already
+/// punched out of the image — the kernel keeps the running total of those skipped in the sibling
+/// `discard_bytes_saved`. Measured live on a volume where 800 MiB had just been deleted: the queue
+/// read 1 178 042 368 and the host got 838 860 800 back. [`reclaimable_bytes`] is the figure that
+/// tracks the return.
+///
+/// `None` where the kernel keeps no such list (mounted without async discard, or an older kernel)
+/// and where there is nothing queued, which are reported alike: both mean nothing is pending.
+pub(crate) fn discard_queue(loop_dev: &str) -> Option<u64> {
+    discard_queue_under(Path::new("/sys/fs/btrfs"), loop_dev)
 }
 
-/// [`reclaiming_bytes`] against a given sysfs root, so the lookup is exercised without one.
-fn reclaiming_bytes_under(sysfs: &Path, loop_dev: &str) -> Option<u64> {
+/// [`discard_queue`] against a given sysfs root, so the lookup is exercised without one.
+fn discard_queue_under(sysfs: &Path, loop_dev: &str) -> Option<u64> {
     // Every mounted btrfs filesystem has a sysfs directory keyed by its UUID, listing the block
     // devices that back it. A host can have several, so the loop device the volume is attached to
     // is what says which directory is this volume's.
@@ -1007,6 +1100,20 @@ impl FsKind {
         matches!(self, FsKind::Tmpfs)
     }
 
+    /// Whether a file here can occupy fewer blocks than it contains, which decides how to read an
+    /// image that appears smaller than the data inside it (see [`reclaimable_bytes`]).
+    ///
+    /// An unrecognised filesystem counts as one that might, so an unknown case falls through to
+    /// "no answer" rather than to a confident figure. Kept apart from [`FsKind::is_cow`] on
+    /// purpose: that one decides whether to *offer a volume*, and the two questions would only
+    /// coincide by accident.
+    pub(crate) fn may_compress(self) -> bool {
+        match self {
+            FsKind::Btrfs | FsKind::Zfs | FsKind::Bcachefs | FsKind::Other(_) => true,
+            FsKind::Ext | FsKind::Xfs | FsKind::Tmpfs => false,
+        }
+    }
+
     /// A short human name.
     pub(crate) fn name(self) -> String {
         match self {
@@ -1390,6 +1497,110 @@ this line has no separator at all
         }
     }
 
+    /// One block group as the space ioctl lays it out: profile flags, logical total, logical used.
+    fn block_group(flags: u64, total: u64, used: u64) -> Vec<u8> {
+        let mut e = Vec::with_capacity(ENTRY);
+        for v in [flags, total, used] {
+            e.extend_from_slice(&v.to_ne_bytes());
+        }
+        e
+    }
+
+    #[test]
+    fn a_mirrored_block_group_is_counted_as_it_occupies_the_device() {
+        // The figures are compared against the image's size on the host, so they must be counted
+        // the way the host carries them. btrfs reports logical bytes: metadata written twice
+        // reports once. The values are a real volume's, whose device-side counters read
+        // 1 944 616 960 for that same metadata group.
+        const DATA: u64 = 1 << 0;
+        const SYSTEM: u64 = 1 << 1;
+        const METADATA: u64 = 1 << 2;
+        const DUP: u64 = 1 << 5;
+        const GLOBAL_RSV: u64 = 1 << 49;
+
+        let mut entries = block_group(DATA, 17_179_869_184, 12_645_679_104);
+        entries.extend(block_group(METADATA | DUP, 2_147_483_648, 972_308_480));
+        entries.extend(block_group(SYSTEM | DUP, 8_388_608, 16_384));
+        // Reported beside the block groups, but held back inside metadata already claimed above.
+        entries.extend(block_group(GLOBAL_RSV, 51_953_664, 0));
+
+        let space = tally(&entries);
+        assert_eq!(space.used, 12_645_679_104 + 1_944_616_960 + 32_768);
+        assert_eq!(space.allocated, 17_179_869_184 + 4_294_967_296 + 16_777_216);
+        // The logical sums, which counting a mirror once (or adding the reservation) would give.
+        assert_ne!(space.used, 13_618_003_968);
+        assert_ne!(space.allocated, 19_387_695_104);
+    }
+
+    #[test]
+    fn a_profile_that_cannot_arise_here_is_counted_once_rather_than_guessed() {
+        // Every mirror is a whole number of copies and is derived from the flags. The parity
+        // profiles are not: their cost depends on the device count, which one block group does
+        // not carry — and neither they nor the multi-device mirrors can occur on a single loop
+        // image. Counting them once under-states the figure instead of inventing one.
+        assert_eq!(device_factor(1 << 0), 1, "single data");
+        assert_eq!(device_factor(1 << 5), 2, "DUP");
+        assert_eq!(device_factor(1 << 4), 2, "RAID1");
+        assert_eq!(device_factor(1 << 6), 2, "RAID10");
+        assert_eq!(device_factor(1 << 9), 3, "RAID1C3");
+        assert_eq!(device_factor(1 << 10), 4, "RAID1C4");
+        assert_eq!(device_factor(1 << 7), 1, "RAID5");
+        assert_eq!(device_factor(1 << 8), 1, "RAID6");
+    }
+
+    #[test]
+    fn a_gap_that_cannot_be_measured_is_told_apart_from_one_that_is_simply_empty() {
+        // The figure is what the image carries above the data alive inside it.
+        assert_eq!(
+            reclaimable_bytes(14_655_836_160, 14_590_328_832, false),
+            Some(65_507_328)
+        );
+        assert_eq!(reclaimable_bytes(4096, 4096, false), Some(0));
+        // The real values right after a successful trim: the image reads 5.3 MiB *under* the data
+        // btrfs says is alive, because the two counters are independent. On a host filesystem that
+        // cannot compress, that is the counters crossing and the answer is that there is nothing
+        // left — the line must not vanish exactly when the volume is at its tidiest.
+        assert_eq!(
+            reclaimable_bytes(14_584_774_656, 14_590_328_832, false),
+            Some(0)
+        );
+        // Where the host filesystem compresses, the same shortfall is structural: the image really
+        // does hold more than it occupies, and the subtraction measures nothing.
+        // A shortfall past a thousandth of the volume is not two counters rounding differently.
+        // Whatever it is — a miscount, a truncated image — "nothing to reclaim" would be a
+        // confident falsehood, so it gets no answer even where nothing can compress.
+        assert_eq!(
+            reclaimable_bytes(14_000_000_000, 14_590_328_832, false),
+            None
+        );
+        assert_eq!(
+            reclaimable_bytes(14_590_328_832 - 14_590_328, 14_590_328_832, false),
+            Some(0),
+            "exactly a thousandth is still the crossing"
+        );
+        assert_eq!(
+            reclaimable_bytes(14_584_774_656, 14_590_328_832, true),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_host_filesystem_is_assumed_to_compress() {
+        // The predicate decides whether an image smaller than its contents is a crossing or a
+        // real saving. Guessing "cannot compress" for an unknown filesystem would turn that into
+        // a confident `0`; assuming it might yields no answer instead.
+        assert!(FsKind::Other(0x1234).may_compress());
+        assert!(FsKind::Btrfs.may_compress());
+        assert!(FsKind::Zfs.may_compress());
+        assert!(FsKind::Bcachefs.may_compress());
+        assert!(!FsKind::Ext.may_compress());
+        assert!(!FsKind::Xfs.may_compress());
+        assert!(!FsKind::Tmpfs.may_compress());
+        // Separate from the volume-recommendation axis: XFS shares blocks and is not offered a
+        // volume for that reason, yet cannot compress. The two questions must not be conflated.
+        assert!(!FsKind::Xfs.is_cow() && !FsKind::Xfs.may_compress());
+    }
+
     #[test]
     fn the_reclaiming_queue_is_read_from_the_volumes_own_filesystem() {
         // A host can run several btrfs filesystems, so reading "the" counter is not enough: the
@@ -1400,11 +1611,11 @@ this line has no separator at all
         fake_btrfs_sysfs(sysfs, "2222-bbbb", "loop7", Some("1178599424\n"));
 
         assert_eq!(
-            reclaiming_bytes_under(sysfs, "/dev/loop7"),
+            discard_queue_under(sysfs, "/dev/loop7"),
             Some(1_178_599_424)
         );
         // A device no filesystem here is backed by has no queue to report.
-        assert_eq!(reclaiming_bytes_under(sysfs, "/dev/loop9"), None);
+        assert_eq!(discard_queue_under(sysfs, "/dev/loop9"), None);
     }
 
     #[test]
@@ -1421,17 +1632,17 @@ this line has no separator at all
             let uuid = format!("fs-{i}");
             fake_btrfs_sysfs(sysfs, &uuid, &format!("loop{i}"), Some(raw));
             assert_eq!(
-                reclaiming_bytes_under(sysfs, &format!("/dev/loop{i}")),
+                discard_queue_under(sysfs, &format!("/dev/loop{i}")),
                 None,
                 "counter {raw:?} should report nothing pending"
             );
         }
         // A kernel that keeps no such counter at all: the directory is simply absent.
         fake_btrfs_sysfs(sysfs, "fs-none", "loop90", None);
-        assert_eq!(reclaiming_bytes_under(sysfs, "/dev/loop90"), None);
+        assert_eq!(discard_queue_under(sysfs, "/dev/loop90"), None);
         // And a host with no btrfs sysfs tree whatsoever.
         assert_eq!(
-            reclaiming_bytes_under(Path::new("/nonexistent-by-construction"), "/dev/loop0"),
+            discard_queue_under(Path::new("/nonexistent-by-construction"), "/dev/loop0"),
             None
         );
     }

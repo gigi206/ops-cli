@@ -206,24 +206,53 @@ $ sbx storage status
 sbx storage — /home/you/.local/share/sbx-storage.btrfs
   type        volume (btrfs)
   state       mounted
-  on host     957.0 MiB of 200.0 GiB logical
+  on host     3.1 GiB of 200.0 GiB logical
   device      /dev/loop7
   mounted at  /run/media/you/sbx-storage
   compression zstd
-  inside      2.4 GiB used of 3.3 GiB the filesystem has claimed
-  reclaiming  1.3 GiB being returned to the host
+  inside      2.9 GiB used of 4.0 GiB the filesystem has claimed
+  reclaimable 204.8 MiB the image carries beyond live data
+              some of it queued for automatic return
 
   sbx is reading its data from this volume.
 ```
 
 **type** says what the data directory is backed by right now: `volume (<fs>)` for an sbx-managed
 encapsulated volume, or `local (<fs>)` when it sits directly on a host filesystem (the same line
-[`sbx doctor`](doctor.md) leads with). **on host** is what the volume actually costs — compare it
-with **inside**, which is what the filesystem holds, to see compression and block sharing at work.
+[`sbx doctor`](doctor.md) leads with).
 
-**reclaiming** appears only when there is something to wait for: space the filesystem has freed
-and is handing back to the host, which `on host` is still counting. It is the difference between
-the two figures made explicit, and it needs no action — see [below](#releasing-it).
+**on host** is what the volume costs, against the logical ceiling it was created with. **inside**
+is the filesystem's own view: what its data occupies, and how much of the ceiling it has carved
+into block groups to hold it. The two are counted **the same way — as blocks on the device** — so
+the subtraction between them is the third line, and whenever there is something to reclaim you can
+check it yourself.
+
+That last point is worth spelling out, because btrfs itself counts differently. It writes every
+metadata block twice — the `DUP` profile, its default on a single device, so a block that goes bad
+is repaired from its twin instead of taking a part of the filesystem with it — and reports the pair
+as one. `inside` counts them as they are written, which is why it can exceed what you think you
+stored. A nix store's metadata runs on the order of 8% of its data, so expect that much overhead
+and no surprise in it. **Compression is not visible here** — `used` is
+already the compressed size. To see what compression and block sharing win you, compare `on host`
+with the logical total [`sbx store`](store.md) reports.
+
+**reclaimable** is what the image still carries beyond the data alive inside it: blocks written
+once, since freed, and not yet handed back. That is the space a discard returns — see
+[below](#releasing-it). Past a gigabyte, `status` also names the command that returns it.
+
+The indented line appears when the kernel has discard work queued, which means the figure above
+can fall without you doing anything. It carries **no number on purpose**: the kernel's queue counts
+free space it *may* discard, including regions already punched out of the image, so it runs above
+what the host would actually get back — on a volume where 800 MiB had just been deleted, the queue
+read 1.1 GiB and 800 MiB came back. Only `reclaimable` tracks the return.
+
+Right after a trim the line reads `reclaimable 0 B nothing the image can give back`. Do not expect
+the two figures it comes from to meet exactly: they are independent counters, btrfs's own against
+the host's accounting for the image file, and they cross by a few megabytes routinely. On an
+ordinary host filesystem that crossing simply means zero.
+
+Where the host filesystem itself compresses, the image genuinely holds more than it occupies, the
+subtraction measures nothing, and the line is **absent** rather than shown as a confident zero.
 
 `--json` emits the same data as a document.
 
@@ -239,10 +268,9 @@ there. Stop them first with [`sbx session stop --all`](session.md). While the vo
 adopted, `down` is temporary — the next sbx command mounts it again. Use `sbx storage unuse`
 to stop using it for good.
 
-Freed space returns to the host **in the background**, not the instant a file is deleted, so the
-`on host` figure lags — after a large [`sbx gc`](gc.md) it can sit well above what the data now
-occupies. It is not lost; it is being handed back, and `status` says how much:
-[**reclaiming**](#status) is exactly that queue.
+Freed space does not leave the image the instant a file is deleted, so the `on host` figure sits
+above what the data now occupies — after a large [`sbx gc`](gc.md), well above. It is not lost, and
+[**reclaimable**](#status) says exactly how much of it is in that state.
 
 The volume mounts `discard=async` (btrfs's default), which favours write speed over prompt
 reclaim: a delete returns its blocks through a **throttled background worker**, so the image runs
@@ -251,14 +279,24 @@ workload — a nix build churns through many small writes, and `discard=sync` wo
 wait on the disk's TRIM. It cannot be changed here anyway: `udisks` fixes the mount options and sbx
 holds no privilege.
 
-**Wait rather than act.** The worker is throttled, not partial: the `reclaiming` figure drains to
-nothing and `on host` comes back down on its own. How long that takes is not fixed — it depends on
-how much is queued and on the rate limits the kernel applies to the worker — so watch
-`sbx storage status` rather than expect a particular delay. There is nothing to run.
+**Part of it comes back on its own; the rest waits for you.** The worker only knows about space
+freed while the filesystem is mounted this way — that is what the indented line under
+`reclaimable` announces, and it needs no help. Do not expect it to trickle down, though: it
+arrives in one step, whenever the worker gets to it. Measured on a fresh 800 MiB delete, the
+figure did not move for a minute and a half and then dropped all at once.
 
-If you would rather not wait, `sudo fstrim <mount-point>` returns it at once — the `FITRIM` ioctl
-needs root, so sbx cannot do it for you, and the same is true of the timer some distributions
-enable to sweep every mounted filesystem periodically (`systemctl status fstrim.timer` says whether
-yours does). A `sudo btrfs balance` is a different matter again: it addresses the long-term
-fragmentation of partly-emptied chunks, not ordinary deletes. `sbx storage status` names the mount
-point, and its `on host` figure — mirrored by [`sbx store`](store.md) — is what tracks the real cost.
+Everything *else* in the `reclaimable` figure — space freed during an earlier mount, which no
+queue survived — stays in the image indefinitely. That is the part watching `status` will not make
+go away, and it is why the figure rarely sits at zero.
+
+To return it: `sudo fstrim <mount-point>`. The `FITRIM` ioctl needs root, so sbx cannot do it for
+you — which is also why `status` suggests it only once the figure passes a gigabyte, rather than
+sending you to a root command for a few megabytes. Some distributions run a timer that sweeps every
+mounted filesystem periodically (`systemctl status fstrim.timer` says whether yours does), which
+makes this happen without asking.
+
+Do not judge the result by what `fstrim -v` prints: it reports the range it walked as free,
+including parts already punched out of the image, so its total over-states the gain. The honest
+measure is `on host` before and after — or `du --block-size=1` on the image. A `sudo btrfs balance`
+is a different matter again: it addresses the long-term fragmentation of partly-emptied chunks, not
+ordinary deletes.
