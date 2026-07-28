@@ -1,0 +1,82 @@
+# Snow — an agentic coding CLI compatible with OpenAI, Anthropic, Gemini and DeepSeek, sandboxed by
+# sbx.
+#
+#   sbx app import examples/app/snow.toml
+#   sbx app run snow
+#
+# Snow ships on npm as `snow-ai`, published from the author's own repository (`MayDay-wpf/snow-cli`,
+# which the package's `repository` and `homepage` both point at). It is a node CLI, so the cage gets
+# a node runtime alongside it; `sbx upgrade mise` rolls it forward.
+#
+# NO `cmd` WRAPPER IS NEEDED, and the skipped install script is a small win here. mise's npm backend
+# installs with `--ignore-scripts=true`; Snow's `postinstall` places nothing — it geolocates you via
+# `ipapi.co` in order to print a mirror tip for users in China. Skipping it costs the tip and avoids
+# the lookup. Its native optional dependencies (`@napi-rs/canvas`, `sharp`) are prebuilt
+# platform packages with no install script of their own, so they survive intact.
+#
+# BYOK, MULTI-PROVIDER — no vendor account. Snow's first run walks you through a provider: OpenAI,
+# Anthropic, Gemini, or any OpenAI-compatible endpoint (which is how it reaches DeepSeek and the
+# rest). Pick ONE below: uncomment its allowlist host, its `[env]` placeholder and its `[secret]`
+# block. The real key is read on the HOST and injected by the egress proxy on the wire — never in
+# the cage. An unedited launch installs and starts but reaches no model until you make that choice.
+#
+# ITS WEB-SEARCH TOOL IS A SEPARATE GRANT. Snow can search the web through Jina
+# (`api.jina.ai`), which is its own key and its own host — left commented below, so the agent has no
+# outbound reach you did not ask for.
+#
+# UNVERIFIED (like every profile until run with a real key): the live authentication and the model
+# traffic through sbx's MITM. Grounded here: the packaging and the postinstall's behaviour (read out
+# of the published package), and the provider endpoints (read out of the shipped bundle).
+cmd = "snow"
+
+# Your host Snow config, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# `snow` read and write these host files. Uncomment to share your host Snow setup with the cage
+# instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.snow", mode = "rw" },
+#]
+
+[packages]
+# A node runtime — Snow is a node CLI.
+nodejs = "nix:nodejs"
+snow = "mise:npm:snow-ai"
+
+# An app is read-by-default ({GET,HEAD}); a completions endpoint is a POST, so a provider host is
+# opened to all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarball.
+    "{GET} https://registry.npmjs.org",
+    # Runtime: uncomment the ONE provider you configured (and its key below). A DeepSeek or other
+    # OpenAI-compatible endpoint goes here too, as its own host.
+    #"{*} https://api.openai.com",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://generativelanguage.googleapis.com",
+    # Its web-search tool, if you enable it (needs a Jina key of its own).
+    #"{*} https://api.jina.ai",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint. A
+# `mute` never changes the verdict (it stays refused) and never hides a count. See everything with
+# `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a snow`.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
+
+# --- Provider key (commented) — uncomment the placeholder and the matching [secret] block. The
+# in-cage placeholder lets Snow start and issue its request; the proxy strips it and substitutes the
+# real key, read on the HOST, on the wire to the provider. ---
+[env]
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"

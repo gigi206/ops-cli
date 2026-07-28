@@ -1,0 +1,96 @@
+# Qoder CLI — the terminal agent of the Qoder brand, sandboxed by sbx.
+#
+#   sbx app import examples/app/qoder.toml
+#   sbx app run qoder
+#
+# Qoder publishes the CLI on npm in its own scope, `@qoder-ai/qodercli` (the command it installs is
+# `qodercli`). It is a node CLI, so the cage gets a node runtime alongside it; `sbx upgrade mise`
+# rolls it forward. Two facts about the packaging are worth stating rather than glossing:
+#   - The vendor's *documented* installer is a shell script that fetches a platform binary from
+#     their own Alibaba OSS bucket. The npm package is a parallel, equivalent distribution in the
+#     **vendor's own npm scope** — a scope only they can publish to, which is what makes it upstream.
+#   - Its `repository` field points at a GitHub repo that does not exist. Stale metadata on a
+#     closed-source bundle, not a different publisher — but you should know it before trusting the
+#     link. Everything grounded below comes from the shipped bundle and the vendor's own pages.
+# Like `qwen-code`, this CLI is a fork of Google's Gemini CLI (its own install script still carries
+# the Google copyright header), which is why parts of it will look familiar.
+#
+# WHY `ripgrep` IS A PACKAGE HERE. Qoder's search shells out to `rg`, shipped as a platform optional
+# dependency plus a `postinstall` that only *warns* when it is missing. mise's npm backend installs
+# with `--ignore-scripts=true`, so that check never runs — harmless, because the resolution is
+# **PATH-first** (`which rg`, then the packaged path), read out of the shipped bundle. A plain
+# `nix:ripgrep` therefore satisfies it, host-provisioned and available offline.
+#
+# CREDENTIAL POSTURE — a Qoder account, with a headless token.
+#   - **Browser login** (`qodercli login`): the hermetic cage has no browser, so complete the flow
+#     on your host, or run it in-cage with a Chromium as `examples/app/vibe.toml` shows.
+#   - **Personal Access Token** (recommended here): create one at `qoder.com/account/integrations`
+#     and supply it as `QODER_PERSONAL_ACCESS_TOKEN` — uncomment the `[env]` placeholder and the
+#     `[secret]` block so the real value is injected host-side and never enters the cage.
+#
+# CHINA EDITION. The CLI serves two sites, selected by `QODER_SITE`: the default `GLOBAL` (the
+# `*.qoder.sh` hosts allowed below) and `CN` (`*.qoder.com.cn`, commented out). Set one, not both.
+#
+# UNVERIFIED (like every profile until run with a real account): the live authentication and the
+# model traffic through sbx's MITM; the `Authorization: Bearer` shape below is the standard one —
+# confirm it against `sbx net logs -a qoder` on your first real run, and switch the `[secret]` block
+# if it differs. Grounded here: the packaging and the ripgrep resolution order (read out of the
+# published package), the site/host map and the `QODER_*` keys (read out of the shipped bundle), and
+# the two auth paths (the package's own documentation).
+cmd = "qodercli"
+
+# Your host Qoder config, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# CLI read and write these host files (login, settings). Uncomment to share your host Qoder setup
+# with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.qoder", mode = "rw" },
+#]
+
+[packages]
+# A node runtime — the CLI is a JS bundle.
+nodejs = "nix:nodejs"
+# The key matches the command the package installs (`qodercli`); for a `mise:` backend the
+# binary name comes from the package's own `bin` map, not from this key.
+qodercli = "mise:npm:@qoder-ai/qodercli"
+# The content search it shells out to, resolved from PATH (see the header).
+ripgrep = "nix:ripgrep"
+
+# An app is read-by-default ({GET,HEAD}); the API endpoints carry POSTs, so they are opened to all
+# verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarball.
+    "{GET} https://registry.npmjs.org",
+    # Runtime, GLOBAL site (the default): the model gateway, the OpenAPI surface, and the account
+    # centre the login flow talks to.
+    "{*} https://api2.qoder.sh",
+    "{*} https://openapi.qoder.sh",
+    "{*} https://center.qoder.sh",
+    # CN site instead (`QODER_SITE=CN`) — uncomment these and comment the three above.
+    #"{*} https://gateway.qoder.com.cn",
+    #"{*} https://openapi.qoder.com.cn",
+    #"{GET} https://static.qoder.com.cn",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint, and
+# the vendor's download host, which serves the shell-installer channel sbx deliberately does not use
+# (`sbx upgrade mise` owns updates here). A `mute` never changes the verdict (they stay refused) and
+# never hides a count. See everything with `sbx net log --all`; edit with
+# `sbx net mute|unmute <rule> -a qoder`.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "download.qoder.com",
+]
+
+# --- Personal Access Token (commented). The in-cage placeholder lets the CLI start and issue its
+# request; the proxy strips it and substitutes the real token, read on the HOST (as
+# $QODER_PERSONAL_ACCESS_TOKEN, or via a resolver such as sops://secrets.yaml#qoder), on the wire. ---
+[env]
+#QODER_PERSONAL_ACCESS_TOKEN = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api2.qoder.sh"]
+#from = "env://QODER_PERSONAL_ACCESS_TOKEN"
+#header = "Authorization"
+#type = "bearer"

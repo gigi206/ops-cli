@@ -1,0 +1,36 @@
+# `sigit` — siGit Code: what it needs to be installed and to fetch its local model.
+#
+#   sbx bundle import examples/bundle/sigit.toml
+#   # then in an app profile:   use = ["sigit"]
+#
+# Derived from `examples/app/sigit.toml`, which stays the self-contained way to run this agent on its
+# own (`sbx app import`, one step, nothing else needed). This bundle is for an app that EMBEDS the
+# agent — an orchestrator spawning it as a subprocess — so that app states the requirement ONCE
+# instead of copying it. A test pins the two artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# NO PROVIDER HOST AND NO CREDENTIAL — not an omission. siGit Code runs the model in-process; the
+# two Hugging Face lanes below are how it fetches the GGUF on first launch, read-only, and once that
+# is on disk it needs no model host at all. A consuming app inherits exactly that: an agent it can
+# run with no key to supply and nothing to leak.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a `[table]`
+# header as belonging to that table, so an `allow` written below `[…packages]` would silently become
+# `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.sigit]
+allow = [
+    "{GET} https://registry.npmjs.org",
+    "{GET} https://huggingface.co",
+    "{GET} https://*.hf.co",
+]
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "html.duckduckgo.com",
+]
+
+[bundle.sigit.packages]
+nodejs = "nix:nodejs"                # the npm entry point is a JS shim
+sigit = "mise:npm:@smbcloud/sigit"   # upstream's documented npm package

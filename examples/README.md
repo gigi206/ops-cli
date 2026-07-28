@@ -89,6 +89,10 @@ step is skipped for its `@vscode/ripgrep` dependency, yet it needs no wrapper �
 | `vtcode`          | `mise:github:vinhnx/VTCode` (Rust release binary) + `nix:ripgrep` + `nix:ast-grep` | provider-dependent (BYOK; upstream's default is OpenRouter) |
 | `dirac`           | `mise:npm:dirac-cli` (+ `nix:nodejs`) + `nix:ripgrep` (the search binary its npm dependency's skipped postinstall would have fetched — resolved from PATH) | provider-dependent (BYOK, no vendor account; `dirac.run` is telemetry only and stays denied) |
 | `nova`            | `mise:npm:@compass-ai/nova` (+ `nix:nodejs`) — the scoped name matters: mise's bare `nova` is an unrelated Kubernetes tool | `api.compassap.ai` (Compass key `COMPASS_API_KEY`, injected host-side) or BYOK |
+| `stakpak`         | `mise:github:stakpak/agent` (static Rust release binary — no runtime deps, not even nix-ld) — a **DevOps** agent, see its header on what a cage does and does not give it | `apiv2.stakpak.dev` (`STAKPAK_API_KEY`) or BYOK; `--tool-mode local` needs no key |
+| `snow`            | `mise:npm:snow-ai` (+ `nix:nodejs`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / any OpenAI-compatible) |
+| `qoder`           | `mise:npm:@qoder-ai/qodercli` (+ `nix:nodejs`, `nix:ripgrep`) — the vendor's own npm scope; command is `qodercli` | `*.qoder.sh` GLOBAL / `*.qoder.com.cn` CN (Qoder account: browser login or `QODER_PERSONAL_ACCESS_TOKEN`) |
+| `sigit`           | `mise:npm:@smbcloud/sigit` (+ `nix:nodejs`) — a JS shim over a ~78 MB prebuilt binary | **none** — the model runs in-cage (a Qwen3 GGUF pulled from Hugging Face on first launch) |
 | `cursor-agent`    | bootstrap `curl cursor.com/install` (CLI tarball — no clean backend; **not** the npm `cursor-agent`) | `*.cursor.sh` (Cursor account) |
 | `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
 | `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
@@ -115,6 +119,14 @@ across projects by default (`home_scope`).
 > profile header and the status note below). `auggie` has a cleaner headless path: pass a
 > host-minted session token for one launch with `--env AUGMENT_SESSION_AUTH=…` (never baked into
 > the profile), sidestepping the in-cage OAuth loopback-callback that the empty netns would break.
+>
+> A vendor account is not automatically the second kind: `stakpak` and `qoder` are accounts whose
+> token *is* a header value, so they take the injected path like a BYOK key (a Stakpak API key; a
+> Qoder personal access token) and the secret still never enters the cage.
+>
+> **And one profile has no credential at all** — `sigit` runs the model in-cage (a GGUF fetched
+> from Hugging Face on first launch), so there is no key to inject, no account to log into, and
+> nothing to leak. The code it reads reaches no model host once the download is done.
 
 ## Credentials — the key never enters the cage
 
@@ -305,6 +317,10 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `vtcode`      | `mise:github:vinhnx/VTCode`                     | upstream's own Rust release binary; `ripgrep`/`ast-grep` come from nixpkgs rather than upstream's installer |
 | `dirac`       | `mise:npm:dirac-cli` (+ `nix:nodejs`)           | the vendor's own npm scope (node CLI, node at runtime). Its `@vscode/ripgrep` dependency downloads `rg` in a postinstall `--ignore-scripts` skips — but Dirac resolves that binary **PATH-first**, so `nix:ripgrep` cures it with no `cmd` wrapper (read out of the shipped bundle) |
 | `nova`        | `mise:npm:@compass-ai/nova` (+ `nix:nodejs`)    | Compass AI's own npm scope (node CLI, node at runtime). Its native pieces are prebuilt platform optional-deps with no install script, so `--ignore-scripts` costs nothing; the bare registry name `nova` resolves to an unrelated Kubernetes tool, hence the scoped token |
+| `stakpak`     | `mise:github:stakpak/agent`                     | upstream's own release binary, inspected: a **static-pie** ELF, so it needs no runtime libraries and not even the cage's nix-ld shim |
+| `snow`        | `mise:npm:snow-ai` (+ `nix:nodejs`)             | the author's own npm package (node CLI). Its postinstall only geolocates you to print a mirror tip, so `--ignore-scripts` skipping it costs nothing and avoids the lookup |
+| `qoder`       | `mise:npm:@qoder-ai/qodercli` (+ `nix:nodejs`)  | the **vendor's own npm scope** — a parallel channel to their documented shell installer (which fetches a binary from their Alibaba OSS bucket); its `repository` field points at a repo that does not exist, stale metadata rather than a different publisher. A Gemini-CLI fork, like `qwen-code`; `ripgrep` from nixpkgs, resolved PATH-first |
+| `sigit`       | `mise:npm:@smbcloud/sigit` (+ `nix:nodejs`)     | upstream's documented npm package: a JS shim dispatching to a ~78 MB prebuilt platform package (a plain optional dep, no install script). The model itself is a GGUF fetched from Hugging Face at first launch |
 | `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package — refresh with `--env CURSOR_AGENT_SBX_UPDATE=1` |
 | `cursor`      | `deb:…/cursor_<ver>_amd64.deb` (version-pinned)  | Cursor's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `openfox`     | `mise:npm:openfox` (+ `nix:nodejs`) | OpenFox npm package (pure-node web agent, node at runtime) |
@@ -449,6 +465,23 @@ do not guess the values, so each waits on a real fact or on a named feature:
   not a new agent. (And npm's `nanobot` is an unrelated package — nanobot.ai is
   `obot-platform/nanobot`, an MCP host.) None of these is refused on quality; each simply is not the
   kind of thing `sbx app run <name>` can launch.
+
+- **Provenance not established** — the rule for `[packages]` is that a binary comes from **official
+  upstream**, and for two candidates that could not be shown. **`dimcode`** (npm, unscoped) declares
+  no `repository`, no `homepage` and no `author`, and the GitHub repo of that name is an
+  issue-tracker-only mirror that names neither the package nor a site — so nothing ties the npm name
+  to the vendor, and an unscoped name is claimable by anyone. **`Corust-ai/corust-agent-release`** is
+  a release-only repo with no README, no license and no published credential mechanism: there is
+  nothing to ground a profile on, and this directory does not guess values. Both would ship the day
+  upstream publishes the missing link.
+
+- **A candidate with one unresolved packaging question** — **`CortexLM/cortex-code`** has an
+  official installer and a GitHub release with checksums, and its auth is groundable
+  (`CORTEX_API_KEY` → `api.cortex.foundation`, or `OPENAI_API_KEY`). What is not settled is which
+  asset mise's `github` backend would pick: the release ships both `cortex-cli-linux-x64.tar.gz` and
+  a `-static` variant, and the extracted binary is named `Cortex`, not `cortex` — two details a
+  profile would have to state exactly, and neither is verifiable without a live install. Filed as
+  *pending a measurement*, not refused.
 
 - **OAuth-only credential** — **`agy`** (Antigravity CLI, Google) authenticates with **Google
   Sign-In**, not a header-injectable key, so it ships as an **account** profile (above), not a

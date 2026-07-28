@@ -35,6 +35,10 @@ notes) lives in [`examples/README.md`](../../../examples/README.md).
 | `vtcode` | `mise:github:vinhnx/VTCode` | provider-dependent (BYOK, default OpenRouter) |
 | `dirac` | `mise:npm:dirac-cli` (+ `nix:nodejs`, `nix:ripgrep`) | provider-dependent (BYOK, no vendor account) |
 | `nova` | `mise:npm:@compass-ai/nova` (+ `nix:nodejs`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
+| `stakpak` | `mise:github:stakpak/agent` (static binary) | `apiv2.stakpak.dev` (`STAKPAK_API_KEY`) or BYOK — a DevOps agent |
+| `snow` | `mise:npm:snow-ai` (+ `nix:nodejs`) | provider-dependent (BYOK) |
+| `qoder` | `mise:npm:@qoder-ai/qodercli` (+ `nix:nodejs`, `nix:ripgrep`) | `*.qoder.sh` (Qoder account / `QODER_PERSONAL_ACCESS_TOKEN`) |
+| `sigit` | `mise:npm:@smbcloud/sigit` (+ `nix:nodejs`) | **none** — the model runs in-cage |
 
 Each gets its own persistent, isolated [`$HOME`](home.md), shared across projects by
 default (`home_scope = "global"`).
@@ -57,7 +61,13 @@ default (`home_scope = "global"`).
 
 - **Account** (`freebuff`, `droid`, `copilot`, `codebuddy`, `amp`, `junie`) — the tool logs in to a service account and the
   token persists in the app's **isolated** `$HOME` (so it lives in the — isolated —
-  cage, never in the project shell).
+  cage, never in the project shell). An account whose token *is* a header value takes the injected
+  path instead, so the secret still never enters the cage: `stakpak` (a Stakpak API key), `qoder`
+  (a personal access token), `nova` (a Compass key).
+
+There is also a third case, currently one profile: **no credential at all**. `sigit` runs the model
+in-cage (a GGUF fetched from Hugging Face on first launch), so there is nothing to inject and
+nothing to log into.
 
 Both stay bounded by the [egress allowlist](../networking/modes.md).
 

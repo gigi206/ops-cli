@@ -1,0 +1,73 @@
+# siGit Code — a local-LLM-first coding agent: the model runs in the cage, sandboxed by sbx.
+#
+#   sbx app import examples/app/sigit.toml
+#   sbx app run sigit
+#
+# **The profile with no credential at all.** Every other agent here talks to somebody's API; siGit
+# Code runs the model itself — it downloads a Qwen3 GGUF from Hugging Face on first launch (roughly
+# 1–2 GB, into the app's persistent isolated home) and infers in-process. So there is no account, no
+# BYOK key, no `[secret]` block, and nothing for the egress proxy to inject: after the model is on
+# disk, the agent works with **no model host reachable at all**.
+#
+# That also makes it the profile the cage fits best. A local model means the code you point it at
+# never leaves your machine — and here it additionally cannot leave the cage, since the only hosts
+# it can reach are the two model-download ones below.
+#
+# PACKAGING. Upstream documents `npm install -g @smbcloud/sigit` alongside cargo/brew/pip; the npm
+# package is a small shim that dispatches to a prebuilt platform package (`@smbcloud/sigit-linux-x64`,
+# ~78 MB) — a plain optional dependency with **no install script**, so mise's `--ignore-scripts`
+# costs nothing. The binary is dynamically linked and runs through the cage's nix-ld shim, the same
+# path `cursor-agent`'s bootstrap binary takes. `sbx upgrade mise` rolls it forward.
+#
+# COST AND SPEED, stated plainly: the first launch pays a 1–2 GB download, and inference runs on
+# **your CPU** unless you have GPU offload configured (`gpu = true` opens the render node — see
+# `docs/guide/configuration/gpu.md` — but whether this build uses it is unproven here). A 4B model on
+# CPU is usable for focused edits, not for large refactors. Upstream also offers a hosted option at
+# `code.sigit.si` for people who would rather not run a model locally; that is a different posture
+# (a service account), not what this profile does.
+#
+# UNVERIFIED (like every profile until run for real): the model download and the first inference in
+# the cage. The two rules below were measured against the shapes Hugging Face redirects to — both
+# `cdn-lfs-us-1.hf.co` and `cas-bridge.xethub.hf.co` are covered — but whether a real download stays
+# inside them is not proven; if a fetch is refused, `sbx net log -a sigit` names the host it wanted.
+# Grounded here: the packaging (read out of the published packages), the model provider and the
+# absence of any credential (read out of the shipped binary and upstream's README).
+cmd = "sigit"
+
+# Your host siGit model cache, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir. Uncomment to reuse a
+# model you have already downloaded on the host instead of paying for a second copy in the app's
+# isolated home (the default) — check upstream's cache location for your platform first.
+#binds = [
+#    { path = "~/.cache/sigit", mode = "rw" },
+#]
+
+[packages]
+# A node runtime — the npm entry point is a JS shim over the platform binary.
+nodejs = "nix:nodejs"
+sigit = "mise:npm:@smbcloud/sigit"
+
+# An app is read-by-default ({GET,HEAD}) — which is all a model download needs, so nothing here is
+# opened to writes.
+[network]
+mode = "deny"
+allow = [
+    # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarballs
+    # (the shim plus its ~78 MB platform package).
+    "{GET} https://registry.npmjs.org",
+    # The model itself: the repository metadata, and the LFS/CAS content hosts it redirects to.
+    "{GET} https://huggingface.co",
+    "{GET} https://*.hf.co",
+    # Its web-search tool's backend — refused on purpose, since a local-model agent that reaches no
+    # network at all is the point of this profile. Uncomment to let that tool work; the `mute` below
+    # then has nothing to suppress (a mute only ever hides a *refusal*), so you can leave it.
+    #"{*} https://html.duckduckgo.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint, and
+# the web-search backend left denied just above. A `mute` never changes the verdict and never hides
+# a count. See everything with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a sigit`.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "html.duckduckgo.com",
+]

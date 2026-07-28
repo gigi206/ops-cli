@@ -96,6 +96,85 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **The AionUi sweep closed — `stakpak`, `snow`, `qoder`, `sigit`, and the three that could not be
+  grounded (DONE 2026-07-28)** (`examples/app/{stakpak,snow,qoder,sigit}.toml` [new] +
+  `examples/bundle/{stakpak,snow,qoder,sigit}.toml` [new] + `examples/README.md` +
+  `docs/guide/apps/catalog.md`): the last screen of the catalogue (Poolside→VT Code). Four of its
+  eight rows already shipped (`pool`, `qwen-code`, `vibe`, `vtcode`); the four that did not are now
+  profiles. **With them the 38-entry catalogue — the one derived from AionCore's own migrations in
+  the first sweep, not from the screenshots — is fully triaged: every entry is shipped, excluded
+  with a stated reason, or blocked on a named unknown.**
+  **`sigit` is the most interesting one, and it is a first: a profile with NO credential at all.**
+  siGit Code runs the model **in the cage** — it pulls a Qwen3 GGUF from Hugging Face on first
+  launch (~1–2 GB into the isolated home) and infers in-process — so there is no account, no BYOK
+  key, no `[secret]`, and nothing for the proxy to inject; once the model is on disk the agent works
+  with **no model host reachable**. That is the cage's best-fitting case (a local model means the
+  code never leaves the machine; here it additionally cannot leave the cage), and it made the docs'
+  "two credential postures" a **three-way** split. Its npm entry point is a 12 KB shim over a ~78 MB
+  prebuilt platform package with **no install script**, so `--ignore-scripts` costs nothing. The
+  earlier survey had filed it as *local-LLM → needs `network = "shared"`* — **wrong, and reading the
+  README is what corrected it**: the inference is in-process, not a host-local server, so the empty
+  netns is no obstacle at all.
+  **`stakpak` is the first agent here that is not a code editor** — a DevOps agent built to run on
+  your machines 24/7 (`stakpak autopilot up`). Caging it is a deliberate contradiction worth
+  stating: it reasons about the repository's infrastructure code while holding none of your cloud
+  credentials, and `--tool-mode local` makes no remote call at all. Its release binary is
+  **`static-pie`** (inspected, not assumed), so it needs no runtime libraries and **not even the
+  cage's nix-ld shim** — the cleanest packaging in the whole directory. **The advisor caught a real
+  over-reach in its `mute`**: Slack/Discord/Telegram are muted, but they are also documented
+  *integration* surfaces (`STAKPAK_BOT_TOKEN`/`STAKPAK_CHAT_ID`/`STAKPAK_DISCORD_TOKEN` are in the
+  binary), so a user enabling one would get a **silent** refusal — the copilot lesson inverted. The
+  header now says exactly that: enable one → allow its host *and* drop its mute line.
+  **`qoder` — where "official upstream" needed real work.** Qoder's *documented* installer fetches a
+  platform binary from the vendor's Alibaba OSS bucket, and the npm package's `repository` field
+  points at a GitHub repo that **404s** — the two facts that would normally condemn a package under
+  the official-sources-only rule. What settles it is that `@qoder-ai` is the **vendor's own npm
+  scope** (they publish their SDK there), and only the org can publish into a scope; the bundle
+  carries the vendor's own endpoints and account page. So it ships, with both facts stated in the
+  header rather than smoothed over. It is a **Gemini-CLI fork** (its install script still carries
+  Google's copyright header) like `qwen-code` — and, like `dirac`, its ripgrep resolution is
+  **PATH-first**, so `nix:ripgrep` cures the skipped postinstall with no wrapper. Its host map is
+  site-scoped (`QODER_SITE`): `api2`/`openapi`/`center.qoder.sh` for GLOBAL, `*.qoder.com.cn`
+  commented for CN. **`snow` is the plain one** (1113★, the author's own repo and npm package, BYOK
+  multi-provider) with one nicety: its postinstall places nothing — it geolocates you via `ipapi.co`
+  to print a China mirror tip — so `--ignore-scripts` skipping it *avoids* a lookup.
+  **Three entries could not be grounded, and saying so is the deliverable for them.**
+  **`dimcode`**: the npm package declares no `repository`, no `homepage` and no `author`, and the
+  GitHub repo of that name is an **issue-tracker-only mirror** that names neither the package nor a
+  site — nothing ties an *unscoped* npm name (claimable by anyone) to the vendor. **`corust-agent-release`**:
+  a release-only repo with no README, no license and no published credential mechanism — nothing to
+  ground, and this directory does not guess values. **`cortex-code`**: filed as *pending a
+  measurement* rather than refused — its installer, release checksums and auth
+  (`CORTEX_API_KEY` → `api.cortex.foundation`) are all groundable, but the release ships **both**
+  `cortex-cli-linux-x64.tar.gz` and a `-static` variant and the extracted binary is named `Cortex`,
+  so which asset mise's `github` backend picks and what the command is cannot be settled without a
+  live install. All three are recorded in `examples/README.md`'s "Not here yet" section, whose
+  **"not a runnable agent"** class (added last increment for `harn` and the ACP bridges) now sits
+  beside a **"provenance not established"** one.
+  **Verified rather than asserted**, through a real import of all four and `sbx test net -a <app>`:
+  `apiv2.stakpak.dev` POST ALLOWED while `discord.com` and a BYOK provider are DENIED; the npm
+  packument ALLOWED for snow; `api2.qoder.sh` ALLOWED while the CN gateway and `download.qoder.com`
+  are DENIED (proving the site split is real, not decorative); and — the one rule with a genuine
+  unknown — **both** Hugging Face redirect shapes, `cdn-lfs-us-1.hf.co` **and**
+  `cas-bridge.xethub.hf.co`, covered by the single `{GET} https://*.hf.co` lane. The commented
+  `[secret]` blocks were uncommented and measured too (`Authorization` from `STAKPAK_API_KEY` /
+  `QODER_PERSONAL_ACCESS_TOKEN`), so the path a user enables first is proven, not plausible-looking
+  TOML. **One inconsistency the review caught and closed:** `qoder`'s `[packages]` key was `qoder`
+  while its command is `qodercli` — harmless (for a `mise:` backend only the *token* is consumed;
+  the key is a label, checked in `packages::mise_packages`) but the only such mismatch in the
+  directory, so it was renamed to match, with the reason in a comment so nobody "fixes" it back.
+  **Tests: no net-new test needed and none written** — both guards are data-driven over the
+  directories. **1334 unit + 103 config + 13 help green.** **No musl rebuild: nothing under `src/`
+  changed.** **Honest residuals:** `snow` and `stakpak`'s BYOK lanes are commented, so an unedited
+  launch of either installs but reaches no model until the user picks one; `sigit`'s first launch
+  pays a 1–2 GB download and infers on **CPU** (GPU offload unproven), and whether a real HF
+  download stays inside the two allowed hosts is measured only against the redirect *shapes*;
+  `qoder`'s `Authorization: Bearer` is the standard shape but its bundle is minified past the point
+  where the PAT's header could be tied to a call site, so the `[secret]` block carries the
+  confirm-against-`sbx net logs` caveat `junie` set the precedent for; and, as always, the live auth
+  and the model traffic through the MITM await the user's own accounts.
+  See [[ops-app-framework]], [[bundle-tool-composition]], [[profile-official-sources-only]],
+  [[mise-npm-native-addons-ignore-scripts]].
   **Two more profiles from AionUi's catalogue — `dirac`, `nova` — and why `harn` is not one
   (DONE 2026-07-28)** (`examples/app/{dirac,nova}.toml` [new] + `examples/bundle/{dirac,nova}.toml`
   [new] + `examples/README.md` + `docs/guide/apps/catalog.md`): the user pointed at the next screen

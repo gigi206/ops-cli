@@ -1,0 +1,85 @@
+# Stakpak — an open-source DevOps agent ("ship your code, on autopilot"), sandboxed by sbx.
+#
+#   sbx app import examples/app/stakpak.toml
+#   sbx app run stakpak
+#
+# Stakpak ships as a **static** Rust release binary on its own GitHub releases
+# (`stakpak-linux-x86_64.tar.gz`, Apache-2.0) — checked here: it is a `static-pie` ELF, so it needs
+# no runtime libraries and not even the cage's nix-ld shim. sbx equips it fresh from upstream via
+# mise's `github` backend, the same clean path `kilocode`/`vtcode` use; advance it with
+# `sbx upgrade mise` rather than the binary's own updater, which would replace the pinned install.
+#
+# READ THIS BEFORE YOU EXPECT IT TO MANAGE YOUR INFRASTRUCTURE. Stakpak is not a code-editing agent
+# like the rest of this directory: it is built to run **on your machines**, inspect your stack and
+# drive deployments — `stakpak autopilot up` starts a long-running background agent. Inside a cage
+# that is a deliberate, and useful, contradiction: it sees the project directory and **only** the
+# hosts you list below, so it can reason about your repository's infrastructure code without holding
+# your cloud credentials. Anything that needs the host's Docker socket, your kubeconfig, or a cloud
+# provider's API will simply not be there. Grant those on purpose — a `[binds]` entry for a config
+# directory, an `allow` line for a provider's API — or run its read-only mode:
+# `stakpak --tool-mode local` needs no key and makes no remote call at all.
+#
+# CREDENTIAL POSTURE — a Stakpak key, or BYOK.
+#   - **Stakpak** (`STAKPAK_API_KEY`): the agent's own service at `apiv2.stakpak.dev`, which also
+#     serves its rulebook/MCP endpoints. `stakpak auth login --api-key …` stores it in the app's
+#     isolated home; the `[env]` + `[secret]` blocks below inject it host-side instead, so the key
+#     never enters the cage. The key-creation flow redirects to a **localhost** port, which the cage
+#     cannot serve — mint the key on your host (or in the web UI) and inject it.
+#   - **BYOK**: point it at your own Anthropic/OpenAI key, or a custom OpenAI-compatible endpoint,
+#     and uncomment that host instead.
+#
+# UNVERIFIED (like every profile until run with a real key): the live authentication and the model
+# traffic through sbx's MITM; the `Authorization: Bearer` shape below is the standard one for this
+# API — confirm it against `sbx net logs -a stakpak` on your first real run. Grounded here: the
+# packaging (upstream's own GitHub release, tarball layout and binary type inspected), the endpoint
+# and the `STAKPAK_*` environment keys (read out of the shipped binary), and the auth options
+# (upstream's README).
+cmd = "stakpak"
+
+# Your host Stakpak config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `stakpak` read and write these host files. Uncomment to share your host Stakpak setup with
+# the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.stakpak", mode = "rw" },
+#]
+
+[packages]
+# Upstream's own static release binary — no node, no runtime deps.
+stakpak = "mise:github:stakpak/agent"
+
+# An app is read-by-default ({GET,HEAD}); the agent's API carries POSTs, so its host is opened to
+# all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Stakpak's own service: model traffic, rulebooks, its MCP endpoints, and the version check.
+    "{*} https://apiv2.stakpak.dev",
+    # BYOK instead: uncomment the ONE provider you use (and supply its key as `cline.toml` shows).
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the chat integrations the
+# binary can post to (Slack, Discord, Telegram — it reads `STAKPAK_BOT_TOKEN`, `STAKPAK_CHAT_ID`,
+# `STAKPAK_DISCORD_TOKEN` for them). They are muted because **this profile does not wire any of
+# them**; if you enable one, add its host to `allow` above AND drop its line here, or the refusal
+# will be silent and the integration will look broken for no visible reason. A `mute` never changes
+# the verdict (they stay refused) and never hides a count (`sbx net stats` still tallies them). See
+# everything with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a stakpak`.
+mute = [
+    "discord.com",
+    "api.slack.com",
+    "api.telegram.org",
+]
+
+# --- Stakpak key (commented). The in-cage placeholder lets the CLI start and issue its request; the
+# proxy strips it and substitutes the real key, read on the HOST (as $STAKPAK_API_KEY, or via a
+# resolver such as sops://secrets.yaml#stakpak), on the wire to the service. ---
+[env]
+#STAKPAK_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."apiv2.stakpak.dev"]
+#from = "env://STAKPAK_API_KEY"
+#header = "Authorization"
+#type = "bearer"
