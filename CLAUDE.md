@@ -96,6 +96,81 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **Two more profiles from AionUi's catalogue — `dirac`, `nova` — and why `harn` is not one
+  (DONE 2026-07-28)** (`examples/app/{dirac,nova}.toml` [new] + `examples/bundle/{dirac,nova}.toml`
+  [new] + `examples/README.md` + `docs/guide/apps/catalog.md`): the user pointed at the next screen
+  of the same catalogue. Of its 15 rows, **10 already ship** (droid, goose, grok, hermes, junie,
+  kilocode, kiro, openclaw, opencode, pi), **Gemini CLI stays the deliberate exclusion** (deprecated
+  upstream in favour of Antigravity, which ships as `agy`), **GLM Agent is a provider, not an agent**
+  (`glm-acp-agent` bridges Zhipu GLM, which opencode/goose/cline already reach by BYOK), and three
+  were genuinely missing: Dirac, Nova, Harn.
+  **`harn` is NOT a profile, and saying so is part of the deliverable.** `burin-labs/harn` is — its
+  own README's first line — *"a programming language and runtime for building AI agents"*, whose ACP
+  entry point is `harn serve acp agent.harn`: it needs a `.harn` program the user has not written, so
+  a bare `sbx app run harn` yields a language toolchain, not an agent. That is the **mirror of the
+  exclusion shipped last increment** (a bridge is useless in a cage without the primary CLI; a
+  runtime is useless in a cage without a program) — the discriminating question for `examples/app/`
+  being whether one `sbx app run <name>` gives the user an agent. Secondary, none load-bearing alone:
+  pre-1.0 with a documented-unstable CLI, absent from both the mise and aqua registries (so a
+  `mise:github:` asset selection would be unverified), and a 70 MB dynamically-linked ELF whose
+  nix-ld path is unproven — three unknowns stacked on a profile whose bare launch does nothing.
+  **The load-bearing finding: the postinstall trap has a DISCRIMINATOR, and `dirac` is the near miss
+  that names it.** Dirac depends on `@vscode/ripgrep`, whose postinstall downloads the `rg` binary —
+  skipped by mise's `--ignore-scripts`, the exact shape that forced `cmd` wrappers onto `amp` and
+  `junie`. **No wrapper is needed here, and that was read out of the shipped bundle rather than
+  assumed**: the resolver runs **`which rg` first** and only falls back to the package's
+  (never-downloaded) path, so a plain `nix:ripgrep` cures it outright — and `which` is already in the
+  cage's curated base toolset. So the rule is not *"is a postinstall skipped"* but *"can the tool
+  still find what that postinstall would have placed"*; `dirac` therefore **keeps its bundle** where
+  amp/junie cannot have one, and `examples/README.md` now states the discriminator beside the case.
+  **`dirac.run` is telemetry, not an API host — found by reading, and it inverts the obvious rule.**
+  The only requests to it are `https://dirac.run/v1/event`, a **PostHog reverse-proxy**
+  (`uiHost: us.i.posthog.com` sits beside it in the same config object); the domain otherwise appears
+  as a docs link and as the `HTTP-Referer` value OpenRouter wants — neither a request. So the
+  **vendor's own domain is denied and muted**, together with the two PostHog hosts the client falls
+  back to, the opposite of what "allow the vendor host" would have produced. **Measured, not
+  asserted** — the copilot-class check, where a muted host turned out to ride the built-in
+  `{GET,HEAD} *.githubusercontent.com` lane: here all three are DENIED for **GET and POST** alike, so
+  the comment holds as written. Upstream ships **no updater-off environment key**, so none was
+  invented; Dirac's self-update is a `GET` on its own npm packument, already covered by the install
+  rule.
+  **`nova` — the name is the trap.** `mise registry nova` resolves the bare name to
+  **`aqua:FairwindsOps/nova`**, an unrelated Kubernetes helm-chart checker, so the profile pins the
+  fully-qualified `mise:npm:@compass-ai/nova` and both artifacts say why. Its native pieces
+  (`@napi-rs/keyring`, `@napi-rs/canvas`) are **prebuilt platform optional-dependencies with no
+  install script at all** — checked against the registry rather than inferred from "it has native
+  code", which is precisely the distinction the previous increment was about — so `--ignore-scripts`
+  costs nothing and no wrapper is needed. Auth is `COMPASS_API_KEY` sent as **`x-api-key`** (read out
+  of the shipped bundle) to `api.compassap.ai`, plus `k-mcp.compassap.ai`, a hosted MCP server the
+  CLI **enables by default**; BYOK against your own provider is the documented alternative. **Two
+  residuals named rather than hidden:** the opt-in live-observability dashboard publishes through a
+  Cloudflare quick tunnel whose `cloudflared` binary the skipped postinstall never downloads (the CLI
+  still starts — only that feature cannot come up), and the hermetic cage has no system keyring,
+  which Nova probes, catches, and falls back from to a file under `~/.compass` in the isolated home.
+  **Verified rather than asserted**, through a real import and `sbx test net -a <app>` (the same
+  `explain` the proxy uses): npm packument **and** tarball ALLOWED; `dirac.run/v1/event` +
+  `us.i.posthog.com` + `us.posthog.com` DENIED on both verbs; `api.anthropic.com` DENIED (the BYOK
+  host the user chooses); both Compass hosts ALLOWED for POST; `api.openai.com` and
+  `*.trycloudflare.com` DENIED. **The commented lines were measured too, which is the half a shipped
+  profile normally leaves untested** — uncommenting one provider opens exactly that lane
+  (`openrouter.ai` POST ALLOWED, `api.anthropic.com` still DENIED), and uncommenting each `[secret]`
+  block yields the injection note with the header actually read out of the tool
+  (`Authorization` from `OPENROUTER_API_KEY`; `x-api-key` from `COMPASS_API_KEY`), so the path a
+  user enables first is proven rather than merely plausible-looking TOML.
+  **Tests: no net-new test needed and none written** — both guards are data-driven over the
+  directories, so the two profiles and two bundles are covered the moment they land
+  (`the_shipped_profiles_import_and_resolve`; `every_shipped_bundle_matches_the_agent_profile_it_was_derived_from`,
+  containment). **1334 unit + 103 config + 13 help green.** **No musl rebuild: nothing under `src/`
+  changed** — artifacts and docs only. **Honest residuals:** `dirac` reaches no model until the user
+  uncomments one provider (the `vtcode` convention, though its install lane *is* active, so it is not
+  inert like vtcode); Dirac's **browser capability** — it downloads a chrome-for-testing build on
+  demand — is deliberately **not wired**, since a headless browser in the cage needs
+  `gui = "offscreen"` plus a chromium package (the `hermes` shape); `nova` is closed-source (a
+  private Azure DevOps repo, minified but readable), so its endpoints and header shape come from the
+  shipped bundle rather than public documentation; and, as for every profile, the live auth and the
+  model traffic through the MITM await the user's own accounts.
+  See [[ops-app-framework]], [[bundle-tool-composition]], [[mise-npm-native-addons-ignore-scripts]],
+  [[profile-official-sources-only]].
   **Six agent profiles from AionUi's catalogue — `copilot`, `grok`, `amp`, `codebuddy`, `junie`,
   `vtcode` (DONE 2026-07-28)** (`examples/app/{copilot,grok,amp,codebuddy,junie,vtcode}.toml` [new]
   + `examples/bundle/{copilot,grok,codebuddy,vtcode}.toml` [new] + `examples/README.md` +

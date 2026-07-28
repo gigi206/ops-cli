@@ -33,6 +33,8 @@ notes) lives in [`examples/README.md`](../../../examples/README.md).
 | `codebuddy` | `mise:npm:@tencent-ai/codebuddy-code` (+ `nix:nodejs`) | `*.codebuddy.ai` (account) |
 | `junie` | `mise:npm:@jetbrains/junie` (+ `nix:nodejs`) | `api.jetbrains.ai` (JetBrains account / `JUNIE_API_KEY` / BYOK) |
 | `vtcode` | `mise:github:vinhnx/VTCode` | provider-dependent (BYOK, default OpenRouter) |
+| `dirac` | `mise:npm:dirac-cli` (+ `nix:nodejs`, `nix:ripgrep`) | provider-dependent (BYOK, no vendor account) |
+| `nova` | `mise:npm:@compass-ai/nova` (+ `nix:nodejs`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
 
 Each gets its own persistent, isolated [`$HOME`](home.md), shared across projects by
 default (`home_scope = "global"`).

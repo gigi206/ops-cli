@@ -52,6 +52,11 @@ different reason — their npm package is inert until a vendor **postinstall** s
 wrapper, and a bundle cannot carry a `cmd`. A bundle of the package alone would hand a
 consuming app a binary that refuses to start.
 
+The discriminator is not "is a postinstall skipped" but "can the tool still find what
+that postinstall would have placed". `dirac` is the near miss that shows it: the same
+step is skipped for its `@vscode/ripgrep` dependency, yet it needs no wrapper — it looks
+`rg` up on `PATH` first, so a `nix:ripgrep` package cures it, and it keeps its bundle.
+
 ### What's in `app/`
 
 | Profile           | Tool (fresh, upstream)               | Provider / egress       |
@@ -82,6 +87,8 @@ consuming app a binary that refuses to start.
 | `codebuddy`       | `mise:npm:@tencent-ai/codebuddy-code` (+ `nix:nodejs`) | `*.codebuddy.ai` (CodeBuddy account; China edition on `*.codebuddy.cn`) |
 | `junie`           | `mise:npm:@jetbrains/junie` (+ `nix:nodejs`) — a shim whose postinstall downloads the JVM build, run from the `cmd` wrapper | `api.jetbrains.ai` + `junie.jetbrains.com` (JetBrains account, `JUNIE_API_KEY`, or BYOK) |
 | `vtcode`          | `mise:github:vinhnx/VTCode` (Rust release binary) + `nix:ripgrep` + `nix:ast-grep` | provider-dependent (BYOK; upstream's default is OpenRouter) |
+| `dirac`           | `mise:npm:dirac-cli` (+ `nix:nodejs`) + `nix:ripgrep` (the search binary its npm dependency's skipped postinstall would have fetched — resolved from PATH) | provider-dependent (BYOK, no vendor account; `dirac.run` is telemetry only and stays denied) |
+| `nova`            | `mise:npm:@compass-ai/nova` (+ `nix:nodejs`) — the scoped name matters: mise's bare `nova` is an unrelated Kubernetes tool | `api.compassap.ai` (Compass key `COMPASS_API_KEY`, injected host-side) or BYOK |
 | `cursor-agent`    | bootstrap `curl cursor.com/install` (CLI tarball — no clean backend; **not** the npm `cursor-agent`) | `*.cursor.sh` (Cursor account) |
 | `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
 | `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
@@ -296,6 +303,8 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `codebuddy`   | `mise:npm:@tencent-ai/codebuddy-code` (+ `nix:nodejs`) | Tencent's own npm scope (node CLI, node at runtime; native pieces ship prebuilt, so no `npm rebuild` needed) |
 | `junie`       | `mise:npm:@jetbrains/junie` (+ `nix:nodejs`)    | JetBrains' npm **shim**, whose postinstall downloads the ~260 MB JVM build from `github.com/JetBrains/junie/releases` — mise's `--ignore-scripts` skips it, so the profile's `cmd` runs it once; the downloaded launcher runs under the cage's nix-ld shim (unproven) |
 | `vtcode`      | `mise:github:vinhnx/VTCode`                     | upstream's own Rust release binary; `ripgrep`/`ast-grep` come from nixpkgs rather than upstream's installer |
+| `dirac`       | `mise:npm:dirac-cli` (+ `nix:nodejs`)           | the vendor's own npm scope (node CLI, node at runtime). Its `@vscode/ripgrep` dependency downloads `rg` in a postinstall `--ignore-scripts` skips — but Dirac resolves that binary **PATH-first**, so `nix:ripgrep` cures it with no `cmd` wrapper (read out of the shipped bundle) |
+| `nova`        | `mise:npm:@compass-ai/nova` (+ `nix:nodejs`)    | Compass AI's own npm scope (node CLI, node at runtime). Its native pieces are prebuilt platform optional-deps with no install script, so `--ignore-scripts` costs nothing; the bare registry name `nova` resolves to an unrelated Kubernetes tool, hence the scoped token |
 | `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package — refresh with `--env CURSOR_AGENT_SBX_UPDATE=1` |
 | `cursor`      | `deb:…/cursor_<ver>_amd64.deb` (version-pinned)  | Cursor's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `openfox`     | `mise:npm:openfox` (+ `nix:nodejs`) | OpenFox npm package (pure-node web agent, node at runtime) |
@@ -428,6 +437,18 @@ endpoint (**OpenRouter** is the universal one: one key, hundreds of models, `Aut
 Bearer`). An OAuth/account login or a query-param key has no header for sbx's `[secret]`
 broker to strip-and-replace. The tools below were each researched against primary sources; we
 do not guess the values, so each waits on a real fact or on a named feature:
+
+- **Not a runnable agent** (the first requirement above) — some entries in an agent catalogue are
+  a *component*, and a component is useless in a cage without the thing it plugs into. **`harn`**
+  (`burin-labs/harn`) is a **programming language and runtime for building agents**: its own ACP
+  entry point is `harn serve acp agent.harn`, so it needs a `.harn` program you have written — a
+  bare launch gives a toolchain, not an agent. **`@autohandai/autohand-acp`** and **`deepagents-acp`**
+  publish only an **ACP bridge** (npm's own words: *"ACP adapter for the Autohand CLI"*), which is
+  inert without the primary CLI it adapts — a separate packaging question. **`glm-acp-agent`** is a
+  bridge onto Zhipu GLM, i.e. a **provider** that `opencode`/`goose`/`cline` already reach by BYOK,
+  not a new agent. (And npm's `nanobot` is an unrelated package — nanobot.ai is
+  `obot-platform/nanobot`, an MCP host.) None of these is refused on quality; each simply is not the
+  kind of thing `sbx app run <name>` can launch.
 
 - **OAuth-only credential** — **`agy`** (Antigravity CLI, Google) authenticates with **Google
   Sign-In**, not a header-injectable key, so it ships as an **account** profile (above), not a

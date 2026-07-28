@@ -1,0 +1,39 @@
+# `nova` — the Compass AI Nova CLI: what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/nova.toml
+#   # then in an app profile:   use = ["nova"]
+#
+# Derived from `examples/app/nova.toml`, which stays the self-contained way to run this agent on its
+# own (`sbx app import`, one step, nothing else needed). This bundle is for an app that EMBEDS the
+# agent — an orchestrator spawning it as a subprocess — so that app states the requirement ONCE
+# instead of copying it. A test pins the two artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# THE PACKAGE NAME IS NOT `nova`: mise's registry resolves the bare name to `aqua:FairwindsOps/nova`,
+# an unrelated Kubernetes tool. The fully-qualified npm token below is what pins this to the right
+# product.
+#
+# The egress here is the Compass platform path (model resolution, prompt traffic, and the hosted MCP
+# server the CLI enables by default). An app that runs Nova BYOK against its own provider does not
+# need those two hosts, and opens its provider host itself.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a `[table]`
+# header as belonging to that table, so an `allow` written below `[…packages]` would silently become
+# `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.nova]
+allow = [
+    "{GET} https://registry.npmjs.org",
+    "{*} https://api.compassap.ai",
+    "{*} https://k-mcp.compassap.ai",
+]
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "*.trycloudflare.com",
+]
+
+[bundle.nova.packages]
+nodejs = "nix:nodejs"               # Nova is a node CLI
+nova = "mise:npm:@compass-ai/nova"  # the vendor's own npm scope (NOT the bare `nova` registry name)

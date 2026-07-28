@@ -1,0 +1,106 @@
+# Dirac — an open-source coding agent built around context curation, sandboxed by sbx.
+#
+#   sbx app import examples/app/dirac.toml
+#   sbx app run dirac
+#
+# Dirac ships on npm as `dirac-cli` from its own vendor scope (`dirac-run/dirac`, Apache-2.0). It is
+# a node CLI, so the cage gets a node runtime alongside it; `sbx upgrade mise` rolls it forward.
+# Upstream supports Node 22.13 through 24.x — nixpkgs' `nodejs` is in that range.
+#
+# WHY `ripgrep` IS A PACKAGE HERE, AND WHY NO `cmd` WRAPPER IS NEEDED. Dirac's search stack shells
+# out to ripgrep, and it declares `@vscode/ripgrep` as a dependency — a package whose **postinstall**
+# downloads the actual `rg` binary. mise's npm backend installs with `--ignore-scripts=true` (a
+# deliberate security default: it will not run arbitrary package scripts), so that download never
+# happens. Unlike `amp`/`junie`, this needs no vendor-script wrapper: Dirac resolves the binary
+# **PATH-first** — it runs `which rg` and only falls back to the (never-downloaded) package path —
+# so a plain `nix:ripgrep` cures it outright, host-provisioned and available offline. Read out of the
+# shipped bundle rather than assumed; the cage's curated base toolset already carries `which`.
+#
+# BYOK, MULTI-PROVIDER — no vendor account. `dirac auth` configures the provider of your choice:
+# Anthropic, OpenAI (API key or the Codex OAuth flow), OpenRouter, Google Gemini / Vertex, Cerebras,
+# DashScope, or AWS Bedrock. Pick ONE below: uncomment its allowlist host, its `[env]` placeholder
+# and its `[secret]` block. The real key is read on the HOST and injected by the egress proxy on the
+# wire — never in the cage. So an unedited launch installs and starts, but reaches no model until you
+# make that choice; that is deliberate for a BYOK agent with no default provider.
+#
+# WHAT IS DELIBERATELY LEFT DENIED. `dirac.run` is not an API host: the only requests to it are
+# telemetry — it fronts PostHog at `/v1/event`, with `us.i.posthog.com` as the client's direct
+# fallback. All three are refused and `mute`d below (the domain also appears in the binary as a
+# docs link and as the `HTTP-Referer` header value OpenRouter wants, neither of which is a request
+# to it). Dirac's self-update check is a plain `GET` on its own npm packument, already covered by the
+# install rule; upstream ships no environment key to switch that check off, so none is invented here.
+#
+# A NAMED RESIDUAL: Dirac can drive a browser (it downloads a chrome-for-testing build on demand).
+# That is not wired here — a headless browser in the cage needs `gui = "offscreen"` plus a chromium
+# package, the shape `examples/app/hermes.toml` documents. Everything else works without it.
+#
+# UNVERIFIED (like every profile until run with a real key): the live authentication and the model
+# traffic through sbx's MITM. Grounded here: the packaging and the ripgrep resolution order (read out
+# of the published package), the provider env-var names, and the telemetry endpoints (read out of the
+# shipped bundle).
+cmd = "dirac"
+
+# Your host Dirac config, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# `dirac` read and write these host files (auth, sessions). Uncomment to share your host Dirac setup
+# with the cage instead of the app's isolated home (the default), where `~/.dirac` lives.
+#binds = [
+#    { path = "~/.dirac", mode = "rw" },
+#]
+
+[packages]
+# A node runtime — Dirac is a node CLI.
+nodejs = "nix:nodejs"
+dirac = "mise:npm:dirac-cli"
+# The content search the agent shells out to, resolved from PATH (see the header).
+ripgrep = "nix:ripgrep"
+
+# An app is read-by-default ({GET,HEAD}); a completions endpoint is a POST, so a provider host is
+# opened to all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install: the packument (version resolution, also used by `sbx upgrade mise` and by Dirac's own
+    # update check) and the package tarball.
+    "{GET} https://registry.npmjs.org",
+    # Runtime: uncomment the ONE provider you configured with `dirac auth` (and its key below).
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    #"{*} https://openrouter.ai",
+    #"{*} https://generativelanguage.googleapis.com",
+    #"{*} https://api.cerebras.ai",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): Dirac's telemetry proxy
+# and the PostHog hosts behind it, plus npm's audit endpoint. A `mute` never changes the verdict
+# (they stay refused) and never hides a count (`sbx net stats` still tallies them); it only keeps the
+# lines out of the default log, so the refusals worth acting on stay visible. See everything with
+# `sbx net log --all`; edit this list with `sbx net mute|unmute <rule> -a dirac`.
+mute = [
+    "dirac.run",                                                    # PostHog reverse-proxy at /v1/event
+    "us.i.posthog.com",                                             # the client's direct fallback
+    "us.posthog.com",
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
+
+# --- Provider key (commented) — uncomment the placeholder and the matching [secret] block. The
+# in-cage placeholder lets Dirac start and issue its request; the proxy strips it and substitutes the
+# real key, read on the HOST (as the named variable, or via a resolver such as
+# sops://secrets.yaml#anthropic), on the wire to the provider. ---
+[env]
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

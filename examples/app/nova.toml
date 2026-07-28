@@ -1,0 +1,98 @@
+# Nova — Compass AI's terminal coding agent, sandboxed by sbx.
+#
+#   sbx app import examples/app/nova.toml
+#   sbx app run nova
+#
+# Nova ships on npm from the vendor's own scope, `@compass-ai/nova` (the CLI installs as both `nova`
+# and `compass`). It is a node CLI, so the cage gets a node runtime alongside it; `sbx upgrade mise`
+# rolls it forward. Upstream requires Node ≥ 22.12 — nixpkgs' `nodejs` satisfies it.
+#
+# THE PACKAGE NAME IS NOT `nova`, AND THAT MATTERS. mise's registry resolves the bare name `nova` to
+# `aqua:FairwindsOps/nova` — an unrelated Kubernetes helm-chart tool. The fully-qualified
+# `mise:npm:@compass-ai/nova` below is what pins this to the right product; a bare token would
+# silently equip the other one.
+#
+# WHY THERE IS NO `cmd` WRAPPER (checked, not assumed). mise's npm backend installs with
+# `--ignore-scripts=true` — a deliberate security default — which breaks packages whose install
+# script places their real payload (see `amp.toml` / `junie.toml`). Nova is not one of them: its
+# native pieces (`@napi-rs/keyring`, `@napi-rs/canvas`) ship as **prebuilt platform optional
+# dependencies with no install script at all**, the same shape `cline`/`droid` use, so a plain
+# install yields a working CLI.
+#
+# CREDENTIAL POSTURE — either a Compass account key or BYOK.
+#   - **Compass platform**: `COMPASS_API_KEY` (a `cmp_…` key from your account, or `nova setup`),
+#     sent as the `x-api-key` header to `api.compassap.ai`, which resolves and proxies the models.
+#     Uncomment the `[env]` placeholder + `[secret]` block below and the key is injected host-side.
+#   - **BYOK**: point Nova at your own provider instead — Anthropic, OpenAI, Gemini, Grok, DeepSeek,
+#     Z.AI, MiniMax or a custom endpoint — by uncommenting that host in `allow` and supplying its key
+#     the way `cline.toml` does. Then the Compass hosts are not needed at all.
+#
+# TWO NAMED RESIDUALS, both from features the cage does not carry rather than from a packaging bug:
+#   - The **live observability dashboard** publishes itself through a Cloudflare quick tunnel, and
+#     the `cloudflared` npm package downloads its binary in a postinstall — which `--ignore-scripts`
+#     skips. Nova starts and runs fine; only that opt-in tunnel cannot come up.
+#   - There is **no system keyring** in the hermetic cage. Nova probes for one, catches the failure
+#     and falls back to its own file storage under `~/.compass` in the app's isolated home.
+#
+# UNVERIFIED (like every profile until run with a real account): the live authentication and the
+# model traffic through sbx's MITM. Grounded here: the packaging and the absence of an install-script
+# trap (read out of the published package and its dependencies' registry metadata), and the endpoints
+# and the `x-api-key` header shape (read out of the shipped bundle).
+cmd = "nova"
+
+# Your host Nova config, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# `nova` read and write these host files (config, credentials, session data). Uncomment to share your
+# host Nova setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.compass", mode = "rw" },
+#]
+
+[packages]
+# A node runtime — Nova is a node CLI.
+nodejs = "nix:nodejs"
+nova = "mise:npm:@compass-ai/nova"
+
+# An app is read-by-default ({GET,HEAD}); the AI endpoints carry POSTs, so they are opened to all
+# verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarball.
+    "{GET} https://registry.npmjs.org",
+    # Runtime: the Compass platform — model resolution and prompt traffic.
+    "{*} https://api.compassap.ai",
+    # Compass' hosted MCP server, which the CLI enables by default (SSE + an upload endpoint). Comment
+    # it out if you run BYOK and want no vendor MCP.
+    "{*} https://k-mcp.compassap.ai",
+    # BYOK instead: uncomment the ONE provider you use (and supply its key as `cline.toml` shows).
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    #"{*} https://generativelanguage.googleapis.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint, and
+# the Cloudflare tunnel host the observability dashboard would reach (a feature the cage cannot run,
+# see the header). A `mute` never changes the verdict (they stay refused) and never hides a count.
+# See everything with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a nova`.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "*.trycloudflare.com",
+]
+
+# --- Compass platform key (commented). The in-cage placeholder lets the CLI start and issue its
+# request; the proxy strips it and substitutes the real key, read on the HOST (as $COMPASS_API_KEY,
+# or via a resolver such as sops://secrets.yaml#compass), on the wire to the Compass endpoints. The
+# same key authenticates the hosted MCP server, hence the second block. ---
+[env]
+#COMPASS_API_KEY = "cmp_sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.compassap.ai"]
+#from = "env://COMPASS_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+
+#[secret."k-mcp.compassap.ai"]
+#from = "env://COMPASS_API_KEY"
+#header = "x-api-key"
+#type = "raw"
