@@ -413,6 +413,31 @@ fn app_import(args: &[OsString]) -> ExitCode {
         "{}",
         render_app_imported(&name, &dest, &preview.summary, &pal)
     );
+    // A profile that names a bundle is NOT self-contained, and a bundle that is not declared leaves
+    // the app short of a tool and its egress — which surfaces later only as an app that quietly does
+    // nothing. Import is the moment to say so: it is when the user is holding the file and can act.
+    if !preview.uses.is_empty() {
+        let (declared, _) = config::bundles();
+        let missing: Vec<&str> = preview
+            .uses
+            .iter()
+            .filter(|b| !declared.contains_key(*b))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            diag::warn(&format!(
+                "'{name}' names {} not declared here: {} — import {} too (`sbx bundle import \
+                 <file>`), or the app launches without the tool and egress it names",
+                if missing.len() == 1 {
+                    "a bundle"
+                } else {
+                    "bundles"
+                },
+                missing.join(", "),
+                if missing.len() == 1 { "it" } else { "them" },
+            ));
+        }
+    }
     ExitCode::SUCCESS
 }
 

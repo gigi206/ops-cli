@@ -1320,6 +1320,61 @@ const PAGES: &[Page] = &[
             session(s). No launch, no nix.",
     },
     Page {
+        path: &["bundle"],
+        synopsis: "sbx bundle [<name>…] [--json] | sbx bundle export|import …",
+        summary: "list reusable tool bundles, or show one in full",
+        options: &[
+            (
+                "<name>…",
+                "show the named bundle(s) in full (with no name, list every bundle and what it contributes)",
+            ),
+            ("--json", "emit the bundles as JSON"),
+        ],
+        details:
+            "A `[bundle.<name>]` bundle is everything one tool needs to be INSTALLED and to REACH its\n\
+            own services: its `packages`, the `env` it reads, its `allow`/`deny`/`mute` egress rules,\n\
+            and its `[secret]` credential. An app names one with `use = [\"<name>\"]` and it is folded\n\
+            in before resolution — so an orchestrator that drives another agent's CLI states that\n\
+            agent's requirements once instead of copying them, and the copies cannot drift apart.\n\
+            A bundle carries NOTHING about the shape of the cage: no `cmd`, no `binds`, `forward`,\n\
+            `devices`, `seccomp` or `limits`, and none of the postures (`network` mode, `gui`, `gpu`,\n\
+            `audio`, `dbus`, `proc`, `home_scope`) — using one can add a tool, its environment, its\n\
+            egress and its credential, never widen what the cage exposes of the host. Bundles are\n\
+            global-only (like `[net.groups]`), so this command has no scope flag. Read-only (except\n\
+            `import`), no launch, no nix.",
+    },
+    Page {
+        path: &["bundle", "export"],
+        synopsis: "sbx bundle export [<name>…] [-o|--out <file>]",
+        summary: "write tool bundles as a portable [bundle.<name>] fragment",
+        options: &[
+            ("<name>…", "export only the named bundle(s) (default: every bundle)"),
+            ("-o, --out <file>", "write to <file> instead of stdout"),
+        ],
+        details:
+            "Emits the bundles as a portable `[bundle.<name>]` TOML fragment — to stdout by default\n\
+            (`sbx bundle export > bundles.toml`), or to `--out <file>`. The inverse of `import`.\n\
+            Source comments are not carried (a bundle is data). Read-only, no launch.",
+    },
+    Page {
+        path: &["bundle", "import"],
+        synopsis: "sbx bundle import <file> [-f|--force]",
+        summary: "merge a [bundle.<name>] fragment into the global config",
+        options: &[
+            ("<file>", "a `[bundle.<name>]` fragment (e.g. from `sbx bundle export`)"),
+            ("-f, --force", "overwrite a bundle whose name already exists (default: refuse)"),
+        ],
+        details:
+            "Merges the fragment's bundles into the global config, preserving every existing bundle and\n\
+            comment (`toml_edit`). Bundles are global-only, so the target is always the global config,\n\
+            which is trusted by location — the deliberate command is the consent (an agent in the cage\n\
+            cannot run it), so there is no prompt. A name that already exists is refused unless\n\
+            `--force`; the merge is all-or-nothing. A bundle that would grant egress or a credential is\n\
+            named after the import — inspect it with `sbx bundle <name>` before an app uses it. An\n\
+            imported bundle is INERT until an app names it in `use`. An app *profile* is a different\n\
+            artifact: import that with `sbx app import`.",
+    },
+    Page {
         path: &["net", "groups"],
         synopsis: "sbx net groups [<name>…] [--json] | sbx net groups export|import …",
         summary: "list reusable egress groups, or resolve one to its entries",

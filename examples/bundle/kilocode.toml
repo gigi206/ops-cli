@@ -1,0 +1,32 @@
+# `kilocode` — the Kilo Code CLI: what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/kilocode.toml
+#   # then in an app profile:   use = ["kilocode"]
+#
+# Derived from `examples/app/kilocode.toml`, which stays the self-contained way to run this
+# agent on its own (`sbx app import`, one step, nothing else needed). This bundle is for an app
+# that EMBEDS the agent — an orchestrator spawning it as a subprocess — so that app states the
+# requirement ONCE instead of copying it. A test pins the two artifacts together, so they cannot
+# drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.kilocode]
+allow = [
+    "{GET} https://models.dev",
+    "{*} https://api.kilo.ai",
+    "{*} https://supermassive-black-hole.kiloapps.io",
+]
+mute = [
+    "*.i.posthog.com",
+]
+
+[bundle.kilocode.packages]
+kilo = "mise:github:Kilo-Org/kilocode"

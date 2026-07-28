@@ -1,0 +1,160 @@
+# Goose Desktop — Block's extensible AI agent as a GRAPHICAL Electron app, sandboxed by sbx.
+#
+#   sbx app import examples/app/goose-desktop.toml
+#   sbx app run goose-desktop
+#
+# This is the GUI sibling of the `goose` CLI profile — the same multi-provider agent with a
+# desktop UI (sessions, recipe browser, extension marketplace). Upstream ships it on Linux only
+# as a versioned `.deb` (`goose_<ver>_amd64.deb`), which does not install in the hermetic cage, so
+# sbx packages it with the `deb:` backend.
+#
+# THE `deb:` BACKEND. sbx fetches the prebuilt `.deb` directly, resolves it to a content hash
+# (pinned in the per-project deb lock), and builds a generated derivation that `dpkg-deb -x`-
+# unpacks it and `autoPatchelfHook`s every ELF against a curated library set — no apt, no
+# maintainer scripts, no from-source build. The build is HOST-SIDE (like `nix:`), safe because a
+# `.deb` runs no build script; the result is seeded into the store and offline-reusable. FIRST
+# LAUNCH resolves + builds it, pulling the Electron closure (~157 MiB `.deb` plus its runtime
+# closure — a few minutes, over your host network, NOT the cage allowlist). Later launches reuse
+# the pinned build offline.
+#
+# The Goose `.deb` bundles its own goose CLI (a Rust binary under `resources/bin/`) plus node/npx/
+# uvx/jbang wrappers it uses for MCP extensions. `ldd` on that embedded CLI needs only glibc +
+# libstdc++ + libgcc_s — all in the curated lib set — so autoPatchelf satisfies it (verified, not
+# assumed); the Electron binary itself needs the standard Chromium libs (nss/atk/cups/dbus/glib),
+# also in the set. The deb's setuid `chrome-sandbox` is stripped (an unprivileged nix builder
+# cannot set the bit), which is why the app MUST run with `--no-sandbox` below (bubblewrap +
+# seccomp + the empty netns IS the boundary, replacing Chromium's own redundant sandbox).
+#
+# VERSIONS — automatic. Goose's `.deb` filename embeds the version (`goose_<v>_amd64.deb`), so there
+# is no stable URL to hard-code; this profile names the REPO instead (`deb:github:aaif-goose/goose`,
+# below) and sbx pins the newest release's version-stamped asset. A warm launch reuses that pin
+# offline; `sbx upgrade deb` re-queries GitHub and rolls it forward (the rebuilt app lands at the
+# next launch). No manual version bump.
+#
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
+# database (`~/.pki/nssdb`), so a Chromium app would otherwise fail every HTTPS with
+# `ERR_CERT_AUTHORITY_INVALID`. For a `gui = "wayland"` cage under a filtering posture, sbx seeds
+# its MITM CA into the cage's NSS db automatically (part of the GUI hole, like fonts) — no per-
+# profile shim needed. The app only has to be told to consult that store, hence `--use-system-ca`.
+#
+# DISPLAY + GPU + DBUS. `gui = "wayland"` binds the host Wayland socket (read-only) and
+# provisions fonts so the window maps (X11 is never offered; isolation is compositor-dependent —
+# Mutter/GNOME is safe, wlroots exposes screen-capture/input-injection, see
+# docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa into
+# sbx's store + `/dev/dri` + the minimal `/sys` DRM subtree); without it a Chromium/Electron app
+# on Wayland often produces no buffer and no window maps. mesa covers Intel/AMD/nouveau; an
+# NVIDIA-only machine falls back to software (still renders, slower). `dbus = true` gives the
+# cage its OWN private desktop portal so the app's FILE CHOOSER opens IN-CAGE (lists only the
+# cage FS), seeds your host light/dark theme at launch and follows it live, and relays desktop
+# notifications — the login keyring stays absent (see docs/guide/configuration/dbus.md).
+# AUDIO is deliberately NOT enabled: the Goose desktop plays only notification sounds (output),
+# and `audio = true` would also expose the microphone AND every system-audio `.monitor` source —
+# a trusted-only cost not worth it for notification blips (parity with the opencode/droid
+# decision). Set `audio = true` if a future release adds voice input.
+#
+# BEFORE THE FIRST LAUNCH — open your provider's host. Egress is deny-by-default and this
+# profile ships with EVERY provider host commented out (the same posture as the `goose` CLI
+# profile): picking your provider is your call, not the profile's. Until you uncomment one in
+# `[network] allow` below, the app starts and renders but every model request — and the GUI's own
+# login step, which talks to the provider — is refused at the proxy. So: uncomment the ONE host
+# you use, then launch. `sbx net log -a goose-desktop` names anything else it wanted.
+#
+# CREDENTIAL POSTURE — GUI login OR BYOK. The desktop shares its config/secrets with the `goose`
+# CLI under `~/.config/goose` in the app's persistent isolated home. Once the host is open, the
+# GUI walks you through a provider (OpenRouter browser login, or a manual API key for Anthropic /
+# OpenAI / Google / etc.); with `GOOSE_DISABLE_KEYRING=1` the key falls back to a file in the
+# isolated home (the cage's private portal exposes no host keyring). This profile ships with NO
+# baked-in provider — log in via the GUI, OR uncomment a provider example below (env var +
+# [secret] block + allowlist host) to inject a key host-side exactly like the `goose` CLI profile.
+# The real key is read on the HOST and substituted on the wire by the egress proxy — never in the
+# cage. The three common header-injectable providers:
+#   - OpenRouter : openrouter.ai , OPENROUTER_API_KEY , header "Authorization" type "bearer"
+#   - Anthropic  : api.anthropic.com , ANTHROPIC_API_KEY , header "x-api-key"   type "raw"
+#   - OpenAI     : api.openai.com , OPENAI_API_KEY , header "Authorization" type "bearer"
+cmd = [
+    "goose-desktop",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+]
+
+gui = "wayland"
+gpu = true
+dbus = true
+
+# Your host Goose config/login, mounted read-write at its real absolute path (so the caged app
+# shares your host login/state). `binds` is a security field, honored only because this profile
+# lives in your trusted config dir. Uncomment to share your host setup with the cage instead of the
+# app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/goose", mode = "rw" },
+#]
+
+[packages]
+# Goose's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron + embedded Rust CLI,
+# no source build). Trusted-only [packages]; this profile is trusted by location once imported.
+# The `github:` form tracks the repo's latest release and picks the native-arch `.deb`, so
+# `sbx upgrade deb` rolls it forward (no hand-pinned version). The repo ships both a plain
+# `…_amd64.deb` and a `…_amd64-vulkan.deb` GPU variant; the plain build is selected (arch token
+# terminal). On arm64 the same form selects the aarch64 build when upstream ships one.
+goose-desktop = "deb:github:aaif-goose/goose"
+
+[network]
+mode = "deny"
+# Runtime is MULTI-PROVIDER (the desktop wraps the same agent engine as the CLI). The model-
+# traffic host is whichever provider you choose in the GUI — uncomment the ONE matching it (an
+# app is read-by-default, and completions are a POST, so each is opened to all verbs with `{*}`).
+# The `.deb`'s own auto-update check (GitHub releases) and the install/build ride the built-in
+# github allow-set, so neither needs an entry here; `GOOSE_TELEMETRY_OFF=1` cuts telemetry at the
+# source. If a request is refused, the proxy names the host — watch `sbx net logs -a goose-desktop`
+# and add it here (or check ahead with `sbx test net <url>`).
+allow = [
+    #"{*} https://openrouter.ai",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+]
+
+[env]
+# Provider-neutral: disable the parts that have no business in a cage, regardless of provider.
+# The cage's private portal exposes no host keyring, so tell Goose to fall back to a file under
+# the isolated home instead of hanging on Secret Service.
+GOOSE_DISABLE_KEYRING = "1"
+# Cut Goose's non-essential traffic at the source (telemetry, update checks) so the app never
+# generates it — complementing the [network] deny-by-construction backstop. (The app's own
+# electron-updater still probes GitHub releases — allowed by the built-in github allow-set, and
+# harmless: the pinned build in the store is read-only, so an update it found could not apply;
+# sbx manages upgrades via `sbx upgrade deb`.)
+GOOSE_TELEMETRY_OFF = "1"
+
+# --- Provider example (commented) — uncomment ONE block to inject a key host-side instead of
+# entering it in the GUI. ---
+# OpenRouter (one key, hundreds of models, OpenAI-compatible bearer auth):
+#GOOSE_PROVIDER = "openrouter"
+#GOOSE_MODEL = "anthropic/claude-sonnet-4.5"   # OpenRouter addresses models as <vendor>/<model>
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+# Anthropic direct:
+#GOOSE_PROVIDER = "anthropic"
+#GOOSE_MODEL = "claude-sonnet-4-5-20250514"
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+# OpenAI direct:
+#GOOSE_PROVIDER = "openai"
+#GOOSE_MODEL = "gpt-4o"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+# --- [secret] example (commented) — uncomment the ONE matching your provider above. The real
+# key is read on the HOST (as $<PROVIDER>_API_KEY, or a resolver, e.g. sops://secrets.yaml#openrouter)
+# and substituted on the wire by the egress proxy; the in-cage value stays the placeholder. ---
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

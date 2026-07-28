@@ -1,0 +1,149 @@
+# Qwen Code — QwenLM's agentic coding CLI, sandboxed by sbx.
+#
+#   sbx app import examples/app/qwen-code.toml
+#   sbx app run qwen-code
+#
+# The tool is a pure-Node terminal CLI distributed on npm as `@qwen-code/qwen-code`
+# (bin `qwen`); it is equipped fresh from upstream via mise's npm backend — no nixpkgs
+# lag. It is equipped at the latest upstream version on the first launch in a project;
+# advancing an already-installed version is rolled forward with `sbx upgrade mise` (runs
+# `mise upgrade` in the app's own home).
+#
+# Qwen Code is MULTI-PROVIDER (OpenAI / Anthropic / Gemini / Qwen / Dashscope, plus any
+# OpenAI-compatible endpoint). This profile is wired for the native Alibaba provider by
+# default — Dashscope's OpenAI-compatible API, keyed by `DASHSCAPE_API_KEY` (sk-…) — but
+# every other protocol is a one-line change (see the [network] / [secret] / [env] notes
+# below). The egress allowlist below is scoped to whichever provider you pick; if a request
+# is blocked, the proxy reports the refused host — add it (`sbx net allow <host> -a qwen-code`)
+# or check ahead with `sbx test net <url>`.
+#
+# Two credential postures:
+#
+#  - **API key (default, header-injected)**: the real key is read on the HOST and injected
+#    by the egress proxy on the wire to dashscope.aliyuncs.com — it never enters the cage.
+#    Provide it on the host as $DASHSCOPE_API_KEY (or a resolver) and uncomment the
+#    `[secret."dashscope.aliyuncs.com"]` block. The in-cage placeholder lets the CLI start
+#    and issue the request; the proxy strips it and substitutes the real key on the wire.
+#  - **`/auth` interactive (OAuth / Coding Plan / third-party)**: run `sbx app run qwen-code`,
+#    then `/auth` inside the cage. The Coding Plan (Alibaba Cloud) and third-party providers
+#    (OpenRouter, Requesty, ModelScope, …) authenticate with a key you paste; the Qwen OAuth
+#    free tier was discontinued on 2026-04-15, so there is no browser OAuth loopback to forward.
+#    The allowlist already opens the Dashscope + Coding Plan hosts the keyed flows hit.
+cmd = "qwen"
+
+# AUDIO — Qwen Code ships an `@qwen-code/audio-capture` dependency, so it may grow a mic
+# capture path. When it does, `audio = true` provisions the PulseAudio client + the
+# ALSA→PulseAudio compatibility shim (alsa-plugins + an asound.conf routing `default` →
+# pulse), so an ALSA capture reaches the host microphone. A security field, trusted-only:
+# the PulseAudio bus exposes the microphone AND all system-audio output. Uncomment once a
+# voice mode is confirmed; leave it off until then.
+#audio = true
+
+# Your host Qwen Code config, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir;
+# `mode = "rw"` lets the caged `qwen` read and write these host files (login, settings,
+# history). Its config + credentials live under ~/.qwen in the app's isolated home by
+# default; uncomment to share your host Qwen Code setup with the cage instead.
+#binds = [
+#    { path = "~/.qwen", mode = "rw" },
+#]
+
+[packages]
+# A node runtime (the npm install needs it) plus Qwen Code itself via mise's npm backend.
+# The installed `qwen` is a Node entry point (the package's `bin`), so node is needed at
+# runtime too — both are trusted-only [packages], honored because this profile is trusted
+# by location once imported. `sbx upgrade mise` rolls the CLI forward.
+#
+# NATIVE ADDONS — why no `npm rebuild` wrapper here. mise's npm backend installs with
+# `--ignore-scripts`, which breaks any package that builds or downloads its `.node` binary
+# in a postinstall (the failure mode `openfox.toml` heals with an explicit `npm rebuild`).
+# Qwen Code's native pieces are NOT of that kind: `@lydell/node-pty` and
+# `@teddyzhu/clipboard` ship PREBUILT per-platform packages (`…-linux-x64`,
+# `…-linux-x64-gnu`) that npm selects through optionalDependencies, so the binary arrives
+# in the tarball and no install script has to run. The one unproven case is
+# `@qwen-code/audio-capture`, which lists no platform siblings — if a future release grows
+# a voice mode and it crashes on a missing `.node`, wrap `cmd` in a guarded
+# `npm rebuild @qwen-code/audio-capture` the way `openfox.toml` does.
+nodejs = "nix:nodejs"
+qwen = "mise:npm:@qwen-code/qwen-code"
+
+# Egress is denied by construction except the hosts the selected provider hits. Qwen Code
+# streams completions over HTTPS SSE (the OpenAI-compatible transport), NOT a WebSocket, so
+# the default posture needs no `{WS}` grant. (A WebSocket would only appear behind an
+# OpenAI "Responses" transport aimed at a specific host; name it with `{WS}` if you see a
+# `denied-method` refusal for a `ws` upgrade.)
+#
+# Native Alibaba provider (default):
+#   - Dashscope OpenAI-compatible API: https://dashscope.aliyuncs.com/compatible-mode/v1
+#     (the `DASHSCOPE_API_KEY` keyed flow — opened to every verb with `{*}`).
+#   - Alibaba Cloud Coding Plan: https://coding.dashscope.aliyuncs.com/v1 (cn-beijing) or
+#     https://coding-intl.dashscope.aliyuncs.com/v1 (intl) — same apex, covered by the
+#     dashscope.aliyuncs.com rule above.
+#   - registry.npmjs.org: equipping `@qwen-code/qwen-code` via mise's npm backend.
+#
+# Nothing else is opened. The list is grounded in Qwen Code's own source, not guessed: a
+# host it never contacts is not an allowance worth carrying, and if a release ever reaches
+# for one the proxy names it and `sbx net allow -a qwen-code <url>` opens exactly that.
+[network]
+mode = "deny"
+allow = [
+    # Native Alibaba / Dashscope provider (compatible-mode + Coding Plan endpoints).
+    "{*} https://dashscope.aliyuncs.com",
+    # Install: the npm packument + tarball for `@qwen-code/qwen-code`, plus the
+    # platform-specific optional dependencies npm resolves alongside it.
+    "{GET} https://registry.npmjs.org",
+    # ── Alternative providers (uncomment the host(s) you actually use) ──────────────
+    # OpenRouter (one key, hundreds of models — the universal OpenAI-compatible choice):
+    #   set OPENAI_BASE_URL=https://openrouter.ai/api/v1, OPENROUTER_API_KEY, and uncomment
+    #   the `[secret."openrouter.ai"]` block below.
+    #"{*} https://openrouter.ai",
+    # Anthropic Claude (header `x-api-key`, type `raw`; set ANTHROPIC_API_KEY + baseUrl):
+    #"{*} https://api.anthropic.com",
+    # OpenAI (header `Authorization` bearer; set OPENAI_API_KEY):
+    #"{*} https://api.openai.com",
+    # Google Gemini (set GEMINI_API_KEY; host is the Generative Language API):
+    #"{*} https://generativelanguage.googleapis.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): telemetry we
+# deliberately leave DENIED. A `mute` never changes the verdict (still refused) and never
+# hides a count (`sbx net stats` still tallies it); it only keeps the line out of the
+# default log. See it anytime with `sbx net log --all`, and edit from the CLI with
+# `sbx net mute|unmute <host> -a qwen-code`. Remove the entry here the day you allow it.
+mute = [
+    # Aliyun Real User Monitoring (RUM) beacon the CLI emits in the background. Upstream
+    # hard-codes one host (`packages/core/src/telemetry/qwen-logger/qwen-logger.ts`:
+    # `USAGE_STATS_HOSTNAME = 'gb4w8c3ygj-default-sea.rum.aliyuncs.com'`), but the project
+    # prefix is theirs to change between releases, so the apex wildcard covers it across
+    # upgrades. Denied (a mute is never a verdict); allow it in [network] above if you
+    # actually want the agent's usage statistics to leave the cage.
+    "*.rum.aliyuncs.com",
+]
+
+# BYOK (native Dashscope provider): the real key is read on the HOST and injected by the
+# egress proxy — never in the cage. Provide it on the host as $DASHSCOPE_API_KEY (or point
+# `from` at a resolver, e.g. sops://secrets.yaml#dashscope). The in-cage placeholder lets
+# the CLI start and issue the request; the proxy strips it and substitutes the real key on
+# the wire to dashscope.aliyuncs.com (OpenAI-compatible `Authorization: Bearer`).
+[env]
+#DASHSCOPE_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."dashscope.aliyuncs.com"]
+#from = "env://DASHSCOPE_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+
+# ── OpenRouter alternative (one key, hundreds of models) ──────────────────────────────
+# To use OpenRouter instead of Dashscope: uncomment the OpenRouter host in [network] allow
+# above, then ADD the two keys below to the [env] table above (do NOT open a second `[env]`
+# header — a duplicate table is invalid TOML and the whole profile would fail to parse),
+# and uncomment the [secret] block. Drop the Dashscope key and its [secret] block.
+#
+#   in [env]:
+#     OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+#     OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
+#
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

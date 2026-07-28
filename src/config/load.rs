@@ -52,7 +52,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // join the global app layer before resolution — `resolve_app`/`resolve_apps` then gate and
     // layer them exactly like an inline global app, with no special casing. They ride the global
     // layer, so a `--local` (project-only) view omits them just as it omits the global config.
-    let global = if source.includes_global() {
+    let mut global = if source.includes_global() {
         let mut global = read_global(&mut warnings);
         let profiles = read_profile_apps(&mut warnings);
         merge_profile_apps(&mut global, profiles, &mut warnings);
@@ -60,11 +60,42 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     } else {
         RawConfig::default()
     };
-    let project = if source.includes_project() {
+    let mut project = if source.includes_project() {
         read_project(cwd, &mut warnings)
     } else {
         None
     };
+
+    // Fold each app's `use = [<bundle>, …]` before resolution, so a bundle's contribution is
+    // indistinguishable downstream from an entry the app wrote itself — `resolve_app` then gates
+    // and layers it with no special casing, exactly as imported profiles ride the global app layer.
+    // Bundles are global-only (like `[net.groups]`): they are honored from the global config, which
+    // is trusted by its location.
+    let bundles = std::mem::take(&mut global.bundle);
+    // What the fold could not do is reported PER APP, not globally: `sbx config show --app <name>`
+    // renders an app's own notes, and a global warning does not appear there — which is exactly
+    // where someone whose app came up without its agent will look. Collected here, merged into the
+    // resolved apps below (after `resolve`, so no signature has to carry it through the engine).
+    let mut app_notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    expand_bundles(&mut global.app, &bundles, &mut app_notes);
+    if let Some((raw, state, _)) = project.as_mut() {
+        if !raw.bundle.is_empty() {
+            warnings.push(
+                "ignoring `[bundle.*]` in the project config: bundles are honored only from the \
+                 global config — declare it there (`sbx bundle import`) and reference it with `use`"
+                    .to_string(),
+            );
+            raw.bundle.clear();
+        }
+        // `use` is a *security* field: a bundle carries egress rules and credentials from the
+        // trusted global config, so letting an untrusted project name one would let it graft that
+        // reach onto its own app. An untrusted layer is simply not folded — the `uses` list is
+        // left intact so `resolve_app` can report the drop as a per-app note, where a user
+        // inspecting that app (`sbx config show --app <name>`) will actually see it.
+        if *state == TrustState::Trusted {
+            expand_bundles(&mut raw.app, &bundles, &mut app_notes);
+        }
+    }
 
     // Discover installed resolver plugins (trusted by location, under the data dir). With no
     // usable data directory there are simply no plugins; a malformed one warns and is dropped.
@@ -91,6 +122,13 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         &plugins,
     );
     resolved.mise = mise;
+
+    // Attach each app's bundle notes to that app, so they surface wherever its own notes do.
+    for (name, notes) in app_notes {
+        if let Some(app) = resolved.apps.get_mut(&name) {
+            app.warnings.extend(notes);
+        }
+    }
 
     // Canonicalize the (already absolute) bind sources, dropping any that cannot be
     // resolved — so `binds` is the *effective* list, identical to what the
@@ -369,6 +407,34 @@ pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     (global.net.groups, warnings)
 }
 
+/// The tool bundles declared in the global config (`[bundle.<name>]`), plus any load warnings.
+/// Global-only — matching the fold, which honors bundles only from the global config — so this
+/// lists exactly the set a `use` reference can resolve to. A read-only, network-free view for
+/// `sbx bundle`; each bundle is returned as authored, so the caller displays it as declared.
+pub(crate) fn bundles() -> (BTreeMap<String, RawBundle>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let global = read_global(&mut warnings);
+    (global.bundle, warnings)
+}
+
+/// Read a portable `[bundle.<name>]` fragment from `path` (the file `sbx bundle import` is given),
+/// returning its bundles. The file goes through the same safety gate as any config (owner-owned,
+/// non-world-writable, a plain regular file). An error names why: unsafe/unreadable, not valid
+/// TOML, or carrying no `[bundle]` table (the tell-tale of the wrong file — an app *profile*, say,
+/// which is imported with `sbx app import` instead).
+pub(crate) fn read_bundle_fragment(path: &Path) -> Result<BTreeMap<String, RawBundle>, String> {
+    let bytes = safety::read_safe_bytes(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let raw = schema::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    if raw.bundle.is_empty() {
+        return Err(format!(
+            "{} has no `[bundle.<name>]` table to import (is it an export of `sbx bundle export`? \
+             an app profile is imported with `sbx app import`)",
+            path.display()
+        ));
+    }
+    Ok(raw.bundle)
+}
+
 /// Read a portable `[net.groups]` fragment from `path` (the file `sbx net groups import` is given),
 /// returning its groups. The file goes through the same safety gate as any config (owner-owned,
 /// non-world-writable, a plain regular file). An error names why: unsafe/unreadable, not valid TOML,
@@ -550,9 +616,15 @@ pub(crate) fn profile_path(name: &str) -> Option<PathBuf> {
 /// honored even on an untrusted project, so what it grants must be visible).
 #[derive(Debug)]
 pub(crate) struct ProfilePreview {
-    /// Display lines: the command, home scope, tools, binds, network, and each credential by
-    /// destination + source *locator* (never a plaintext value — a profile carries only a locator).
+    /// Display lines: the command, the bundles it names, home scope, tools, binds, network, and each
+    /// credential by destination + source *locator* (never a plaintext value — a profile carries only
+    /// a locator).
     pub(crate) summary: Vec<String>,
+    /// The bundles the profile names in `use`. Surfaced so the importer can say which of them are
+    /// not declared yet: a profile that names a bundle is not self-contained, and a missing one
+    /// leaves the app short of a tool and its egress — a gap that would otherwise show up only as
+    /// an app that mysteriously does nothing.
+    pub(crate) uses: Vec<String>,
 }
 
 /// Validate bytes as an importable app profile: they must parse as a top-level [`schema::RawApp`]
@@ -573,6 +645,7 @@ pub(crate) fn validate_profile(bytes: &[u8]) -> Result<ProfilePreview, String> {
     }
     Ok(ProfilePreview {
         summary: describe_app_posture(&app),
+        uses: app.uses.clone(),
     })
 }
 
@@ -608,6 +681,12 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
         "home: {}",
         app.home_scope.as_deref().unwrap_or("global")
     ));
+    // The bundles this profile names belong in the *granted posture*: a bundle contributes a tool,
+    // environment, egress rules and possibly a credential, so importing a profile that names one
+    // grants all of that too. Listing it here keeps the consent report honest about what arrives.
+    if !app.uses.is_empty() {
+        lines.push(format!("uses bundles: {}", app.uses.join(", ")));
+    }
     if !app.packages.is_empty() {
         let names: Vec<&str> = app.packages.keys().map(String::as_str).collect();
         lines.push(format!("packages: {}", names.join(", ")));
@@ -758,6 +837,161 @@ fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<St
     out
 }
 
+/// Fold every `use = [<bundle>, …]` reference in `apps` into the app that names it, in place and
+/// before resolution — so downstream nothing distinguishes a bundle's package from one the app
+/// wrote itself, and the whole gating/layering machinery applies unchanged.
+///
+/// Precedence is the merge rule one level up from [`Resolved::merge_app`]: bundles apply in the
+/// order written (a later one overrides an earlier one on the same key), and the app's own entries
+/// override every bundle. So a profile can name a bundle and still pin one of its packages.
+///
+/// Two references that do not resolve are dropped with a loud warning rather than failing the load
+/// (which is infallible by design): an unknown name, and a malformed one. Both leave the app short
+/// of a tool or an egress rule, so the warning names the app *and* the bundle.
+///
+/// The egress entries need somewhere to land: they are unioned into the app's **own** `[network]`
+/// table, and an app that declares none has its bundle's `allow`/`deny`/`mute` **dropped with a
+/// warning**. Synthesizing a table for it looks tempting — a [`NetworkTable`] with no `mode`
+/// inherits the parent's — but only a filtering parent posture is inherited: under a `shared` (or
+/// `allow`, or absent) baseline a mode-less table falls back to `deny`, so inventing one would
+/// silently narrow a wide-open app into a default-deny allowlist. A bundle must never move a
+/// posture in either direction, so the gap is the safe answer and the warning names the fix.
+/// Under an app that declared `network = "shared"` or `"none"` the entries are simply redundant
+/// (that posture is already wider, or admits nothing at all), so they are dropped silently.
+fn expand_bundles(
+    apps: &mut BTreeMap<String, RawApp>,
+    bundles: &BTreeMap<String, RawBundle>,
+    app_notes: &mut BTreeMap<String, Vec<String>>,
+) {
+    for (app_name, app) in apps.iter_mut() {
+        if app.uses.is_empty() {
+            continue;
+        }
+        // Accumulate the named bundles in declaration order first (later wins), then fold the
+        // result *under* the app, so the app's own entries win over every bundle uniformly.
+        let mut acc = RawBundle::default();
+        let notes = app_notes.entry(app_name.clone()).or_default();
+        for name in &app.uses {
+            if !is_valid_bundle_name(name) {
+                notes.push(format!(
+                    "ignoring `use` entry `{name}`: a bundle name is 1–64 of [A-Za-z0-9._-]"
+                ));
+                continue;
+            }
+            let Some(bundle) = bundles.get(name) else {
+                notes.push(format!(
+                    "uses bundle `{name}`, which is not declared — its tool, environment and \
+                     egress rules are missing, so this app is short of what it named. Import it \
+                     (`sbx bundle import <file>`), or list what is available with `sbx bundle`"
+                ));
+                continue;
+            };
+            absorb_bundle(&mut acc, bundle.clone());
+        }
+        fold_bundle_into_app(app, acc, notes);
+    }
+}
+
+/// Merge `higher` onto `acc` with `higher` winning per key — the "a later `use` entry overrides an
+/// earlier one" half of the fold.
+fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle) {
+    acc.packages.extend(higher.packages);
+    acc.env.extend(higher.env);
+    acc.allow.extend(higher.allow);
+    acc.deny.extend(higher.deny);
+    acc.mute.extend(higher.mute);
+    acc.flakes.extend(higher.flakes);
+    acc.tarball.extend(higher.tarball);
+    acc.deb.extend(higher.deb);
+    acc.appimage.extend(higher.appimage);
+    if let Some(secret) = higher.secret {
+        match acc.secret.as_mut() {
+            Some(base) => {
+                if secret.defaults.is_some() {
+                    base.defaults = secret.defaults;
+                }
+                base.hosts.extend(secret.hosts);
+            }
+            None => acc.secret = Some(secret),
+        }
+    }
+}
+
+/// Fold the accumulated bundle *under* one app: every entry the app does not already declare is
+/// added, and everything the app declares itself stands.
+fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String>) {
+    for (k, v) in acc.packages {
+        app.packages.entry(k).or_insert(v);
+    }
+    for (k, v) in acc.env {
+        app.env.entry(k).or_insert(v);
+    }
+    for (k, v) in acc.flakes {
+        app.flakes.entry(k).or_insert(v);
+    }
+    for (k, v) in acc.tarball {
+        app.tarball.entry(k).or_insert(v);
+    }
+    for (k, v) in acc.deb {
+        app.deb.entry(k).or_insert(v);
+    }
+    for (k, v) in acc.appimage {
+        app.appimage.entry(k).or_insert(v);
+    }
+    if let Some(secret) = acc.secret {
+        match app.secret.as_mut() {
+            Some(own) => {
+                if own.defaults.is_none() {
+                    own.defaults = secret.defaults;
+                }
+                for (host, entry) in secret.hosts {
+                    own.hosts.entry(host).or_insert(entry);
+                }
+            }
+            None => app.secret = Some(secret),
+        }
+    }
+
+    let egress = !acc.allow.is_empty() || !acc.deny.is_empty() || !acc.mute.is_empty();
+    if !egress {
+        return;
+    }
+    match app.network.as_mut() {
+        Some(NetworkField::Table(table)) => {
+            // The app's own entries stay first; a duplicate the bundle repeats is dropped, so the
+            // rendered rule set does not grow a copy per bundle.
+            extend_deduped(&mut table.allow, acc.allow);
+            extend_deduped(&mut table.deny, acc.deny);
+            extend_deduped(&mut table.mute, acc.mute);
+        }
+        // A scalar posture is already decided: `shared` is wider than any allow entry could grant
+        // and `none` admits nothing, so the bundle's entries are redundant either way.
+        Some(NetworkField::Posture(_)) => {}
+        None => notes.push(
+            "uses a bundle with egress rules but declares no `[network]` table, so they are \
+             dropped — add one (e.g. `[network] mode = \"deny\"`) to apply them; synthesizing one \
+             here could change the app's posture, which a bundle must never do"
+                .to_string(),
+        ),
+    }
+}
+
+/// Append the entries of `add` that `into` does not already carry, preserving order.
+fn extend_deduped(into: &mut Vec<String>, add: Vec<String>) {
+    for entry in add {
+        if !into.contains(&entry) {
+            into.push(entry);
+        }
+    }
+}
+
+/// Whether a `[bundle.<name>]` name is a safe, referenceable identifier — the same rule as a
+/// `[net.groups]` name, for the same reasons: a bundle name is not a path component, so it needs
+/// only to be unambiguous in a `use` list and to render cleanly in a warning.
+pub(crate) fn is_valid_bundle_name(name: &str) -> bool {
+    is_valid_group_name(name)
+}
+
 /// Make the imported profile apps the sole source of the global app layer. A global app lives only
 /// as a profile file under `apps/<name>.toml` — an inline `[app.<name>]` in `sbx.toml` is forbidden
 /// (it used to shadow an entire imported profile: `cmd`/`packages`/`binds`/`env` and the profile's
@@ -846,6 +1080,144 @@ pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> 
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A bundle carrying one package, one env var and one allow entry, keyed by a marker so an
+    /// assertion can tell which bundle a value came from.
+    fn bundle(marker: &str) -> RawBundle {
+        RawBundle {
+            packages: [("tool".to_string(), format!("mise:{marker}"))]
+                .into_iter()
+                .collect(),
+            env: [("TOOL_HOME".to_string(), marker.to_string())]
+                .into_iter()
+                .collect(),
+            allow: vec![format!("{{*}} https://{marker}.example.com")],
+            ..RawBundle::default()
+        }
+    }
+
+    /// An app declaring a filtering `[network]` table (so a bundle's egress entries have a home)
+    /// and naming `uses`. Built through the real parse rather than a struct literal, so it stays
+    /// faithful to what a profile actually says and a new `[network]` field cannot break it.
+    fn app_using(uses: &[&str]) -> RawApp {
+        let mut app = schema::parse_app(b"cmd = \"demo\"\n[network]\nmode = \"deny\"\n")
+            .expect("the fixture profile parses");
+        app.uses = uses.iter().map(|s| s.to_string()).collect();
+        app
+    }
+
+    fn expand_one(app: RawApp, bundles: &[(&str, RawBundle)]) -> (RawApp, Vec<String>) {
+        let mut apps: BTreeMap<String, RawApp> = [("demo".to_string(), app)].into_iter().collect();
+        let map: BTreeMap<String, RawBundle> = bundles
+            .iter()
+            .map(|(n, b)| (n.to_string(), b.clone()))
+            .collect();
+        let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        expand_bundles(&mut apps, &map, &mut notes);
+        let warnings = notes.remove("demo").unwrap_or_default();
+        (apps.remove("demo").unwrap(), warnings)
+    }
+
+    #[test]
+    fn a_bundle_folds_its_tool_environment_and_egress_into_the_app() {
+        let (app, warnings) = expand_one(app_using(&["a"]), &[("a", bundle("a"))]);
+        assert_eq!(app.packages.get("tool").map(String::as_str), Some("mise:a"));
+        assert_eq!(app.env.get("TOOL_HOME").map(String::as_str), Some("a"));
+        let Some(NetworkField::Table(net)) = &app.network else {
+            panic!("the app keeps its table form: {:?}", app.network);
+        };
+        assert_eq!(net.allow, vec!["{*} https://a.example.com".to_string()]);
+        assert_eq!(
+            net.mode.as_deref(),
+            Some("deny"),
+            "the posture is untouched"
+        );
+        assert!(warnings.is_empty(), "a clean fold warns about nothing");
+    }
+
+    #[test]
+    fn the_app_overrides_a_bundle_and_a_later_bundle_overrides_an_earlier_one() {
+        // Precedence is the `merge_app` rule one level up: bundles apply left to right, and
+        // whatever the app declares itself beats every one of them. Both halves in one case, so a
+        // change that flips either direction fails here.
+        let mut own = app_using(&["a", "b"]);
+        own.env
+            .insert("TOOL_HOME".to_string(), "the-app".to_string());
+        let (app, _) = expand_one(own, &[("a", bundle("a")), ("b", bundle("b"))]);
+        assert_eq!(
+            app.packages.get("tool").map(String::as_str),
+            Some("mise:b"),
+            "the later bundle wins on a key both declare"
+        );
+        assert_eq!(
+            app.env.get("TOOL_HOME").map(String::as_str),
+            Some("the-app"),
+            "but the app's own entry beats every bundle"
+        );
+        let Some(NetworkField::Table(net)) = &app.network else {
+            unreachable!()
+        };
+        assert_eq!(
+            net.allow,
+            vec![
+                "{*} https://a.example.com".to_string(),
+                "{*} https://b.example.com".to_string()
+            ],
+            "egress entries union rather than override"
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_malformed_bundle_reference_is_dropped_loudly() {
+        let (app, warnings) = expand_one(app_using(&["missing", "no spaces"]), &[]);
+        assert!(app.packages.is_empty(), "nothing is invented");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("missing") && w.contains("not declared")),
+            "an undefined bundle is named: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("no spaces")),
+            "so is a malformed name: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_bundle_never_moves_an_apps_network_posture() {
+        // Three postures, one property: the fold adds rules to a table that exists and otherwise
+        // leaves the posture exactly as authored. The `None` case is the sharp one — synthesizing
+        // a mode-less table there would fall back to `deny` under a `shared` baseline, narrowing a
+        // wide-open app, so the entries are dropped and the warning names the fix.
+        let mut no_table = app_using(&["a"]);
+        no_table.network = None;
+        let (app, warnings) = expand_one(no_table, &[("a", bundle("a"))]);
+        assert!(app.network.is_none(), "no table is invented");
+        assert_eq!(
+            app.packages.get("tool").map(String::as_str),
+            Some("mise:a"),
+            "the tool still lands — only the egress entries had nowhere to go"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("declares no `[network]` table")),
+            "the drop is loud: {warnings:?}"
+        );
+
+        let mut shared = schema::parse_app(b"cmd = \"demo\"\nnetwork = \"shared\"\n").unwrap();
+        shared.uses = vec!["a".to_string()];
+        let (app, warnings) = expand_one(shared, &[("a", bundle("a"))]);
+        assert_eq!(
+            app.network,
+            Some(NetworkField::Posture("shared".into())),
+            "a scalar posture is left exactly as authored"
+        );
+        assert!(
+            warnings.is_empty(),
+            "and nothing is lost, so nothing is said: {warnings:?}"
+        );
+    }
 
     #[test]
     fn describe_raw_bind_marks_read_write_and_flags_malformed_entries() {

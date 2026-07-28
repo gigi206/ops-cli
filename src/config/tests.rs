@@ -77,6 +77,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
             .collect::<BTreeMap<_, _>>(),
         binds: binds.iter().map(|s| RawBind::Path(s.to_string())).collect(),
         packages: BTreeMap::new(),
+        bundle: BTreeMap::new(),
         flakes: BTreeMap::new(),
         tarball: BTreeMap::new(),
         deb: BTreeMap::new(),
@@ -577,6 +578,7 @@ fn raw_app(
                 cmd.iter().map(|s| s.to_string()).collect(),
             ))
         },
+        uses: Vec::new(),
         env: env
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -5881,5 +5883,96 @@ fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
     assert!(
         !w.contains("sbx app export"),
         "when a profile already exists, do not suggest export: {w}"
+    );
+}
+
+#[test]
+fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
+    // The shipped bundles under `examples/bundle/` restate what the agent profile of the same name
+    // under `examples/app/` declares, so an orchestrator can name the agent instead of copying it.
+    // Two artifacts describing one tool is the drift risk this whole feature exists to remove — so
+    // it is pinned here, and it is pinnable *because* both are authored in this repo for the same
+    // agent. (The general form — inferring the same obligation between two unrelated profiles — is
+    // NOT sound: a front-end legitimately exposes a smaller surface than the agent it embeds. Here
+    // the obligation is declared by construction, which is the whole difference.)
+    //
+    // Containment, not equality: a bundle may carry LESS than its profile (the profile also holds a
+    // `cmd`, postures, and any stack that only works under a `gui` posture a bundle cannot set). It
+    // must never carry something the profile does not, which is what would make it a second, drifting
+    // source of truth.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("examples/bundle");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("examples/bundle/ dir exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+
+        // Parsed with sbx's own parser, so a fragment this test accepts is one `sbx bundle import`
+        // accepts — and a field written in the wrong TOML place (an `allow` under `[…packages]`,
+        // which parses as an unknown key and vanishes) fails the containment below rather than
+        // passing unnoticed.
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+        let bundle = raw.bundle.get(&name).unwrap_or_else(|| {
+            panic!("{name}.toml must declare `[bundle.{name}]` (keyed by its file stem)")
+        });
+
+        let profile_path = root.join(format!("examples/app/{name}.toml"));
+        let profile = schema::parse_app(
+            &std::fs::read(&profile_path)
+                .unwrap_or_else(|e| panic!("bundle `{name}` has no namesake agent profile: {e}")),
+        )
+        .unwrap();
+
+        for (tool, locator) in &bundle.packages {
+            assert_eq!(
+                profile.packages.get(tool),
+                Some(locator),
+                "bundle `{name}` provisions {tool} = {locator}, which `examples/app/{name}.toml` \
+                 does not declare identically — one of the two moved"
+            );
+        }
+        for (key, value) in &bundle.env {
+            assert_eq!(
+                profile.env.get(key),
+                Some(value),
+                "bundle `{name}` sets {key}, which its profile does not set identically"
+            );
+        }
+
+        // The egress lists live in the profile's `[network]` table. A bundle carrying rules whose
+        // profile declares no table would mean the rules were invented here, not derived.
+        let (allow, deny, mute) = match &profile.network {
+            Some(schema::NetworkField::Table(t)) => (&t.allow, &t.deny, &t.mute),
+            other => {
+                assert!(
+                    bundle.allow.is_empty() && bundle.deny.is_empty() && bundle.mute.is_empty(),
+                    "bundle `{name}` carries egress rules but its profile declares no `[network]` \
+                     table (it is {other:?}) — they came from nowhere"
+                );
+                checked += 1;
+                continue;
+            }
+        };
+        for (label, from, into) in [
+            ("allow", &bundle.allow, allow),
+            ("deny", &bundle.deny, deny),
+            ("mute", &bundle.mute, mute),
+        ] {
+            for rule in from {
+                assert!(
+                    into.contains(rule),
+                    "bundle `{name}` has the {label} rule {rule:?}, absent from \
+                     `examples/app/{name}.toml` — the two have drifted apart"
+                );
+            }
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 16,
+        "expected the shipped agent bundles to be checked, saw {checked}"
     );
 }

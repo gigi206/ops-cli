@@ -1,0 +1,105 @@
+# Kimi Code — Moonshot AI's agentic coding CLI, sandboxed by sbx.
+#
+#   sbx app import examples/app/kimi.toml
+#   sbx app run kimi
+#
+# The tool is equipped fresh from upstream (mise's `npm` backend pulls the
+# `@moonshot-ai/kimi-code` npm package) — no nixpkgs lag. It is equipped at the
+# latest upstream version on the first launch in a project; advancing an
+# already-installed version is done with `sbx upgrade mise` (runs `mise upgrade`
+# in the app's own home and rolls the npm package forward).
+#
+# Two authentication paths are supported:
+#
+#  - **Kimi Code OAuth** (default): run `sbx app run kimi`, then `/login` inside the
+#    cage and choose "Kimi Code". The CLI opens the OAuth URL in your host
+#    browser; the provider redirects to a localhost callback. The resulting
+#    token persists in the app's isolated `$HOME` (`~/.kimi/credentials/`), so
+#    login is a one-time step. The allowlist below opens the OAuth runtime hosts.
+#  - **Kimi Platform API key** (header-injected): set `$KIMI_API_KEY` (or
+#    `MOONSHOT_API_KEY`) on the host and uncomment the `[secret."api.kimi.com"]`
+#    block below. The egress proxy injects the key on the wire to
+#    `api.kimi.com`; the plaintext never enters the cage. (For the global
+#    Moonshot platform, change the host to `api.moonshot.ai` and use
+#    `MOONSHOT_API_KEY`.)
+#
+# Both paths ride the same Model-B allowlist; the OAuth runtime hosts the CLI
+# talks to are confirmed at first login — a host the flow reaches that is not
+# listed returns a 403 whose body names `sbx net allow <host>`, so add any
+# missing host the proxy surfaces.
+cmd = "kimi"
+
+# AUDIO — Kimi Code may add voice features in the future. If/when it does,
+# `audio = true` will provision the PulseAudio client + the ALSA→PulseAudio
+# compatibility shim (alsa-plugins + an asound.conf routing `default` → pulse),
+# so an ALSA capture reaches the host microphone. A security field, trusted-only:
+# the PulseAudio bus exposes the microphone AND all system-audio output.
+#audio = true
+
+# Your host Kimi config, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir;
+# `mode = "rw"` lets the caged `kimi` read and write these host files (login refresh,
+# history, project state). Uncomment to share your host Kimi setup with the cage
+# instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.kimi", mode = "rw" },
+#]
+
+[packages]
+nodejs = "nix:nodejs"
+kimi = "mise:npm:@moonshot-ai/kimi-code"
+
+# Egress is denied by construction except the Kimi API, the Kimi OAuth host, and
+# the npm registry (for mise equipping the package).
+#
+# The Kimi Code managed service (OpenAI-compatible): base URL
+# `https://api.kimi.com/coding/v1` — the CLI POSTs completions here. Opened to
+# every verb with `{*}` (an app is read-by-default {GET,HEAD}; the API host the
+# agent POSTs to is opened to all verbs).
+#
+# The Kimi OAuth host: `auth.kimi.com` — device authorization + token exchange.
+# Opened to `{*}` for the OAuth flow (POST to /api/oauth/token).
+#
+# The global Moonshot Open Platform (optional alternative): `api.moonshot.ai`.
+# Commented out by default; uncomment if you use a Moonshot API key instead of
+# the Kimi Code OAuth.
+#
+# models.dev: the model catalogue, a read-only fetch.
+# registry.npmjs.org: equipping kimi via mise's npm backend.
+[network]
+mode = "deny"
+allow = [
+    "{*} https://api.kimi.com",
+    "{*} https://auth.kimi.com",
+    # "{*} https://api.moonshot.ai",
+    "{GET} https://models.dev",
+    "{GET} https://registry.npmjs.org",
+    # Kimi Code self-update / version check / binary downloads
+    "{GET} https://code.kimi.com",
+    "{GET} https://cdn.kimi.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): telemetry
+# we deliberately leave DENIED. The Kimi Code CLI posts operational logs to
+# telemetry-logs.kimi.com — a `mute` never changes the verdict (still refused) and
+# never hides a count (`sbx net stats` still tallies it); it only keeps the line out
+# of the default log. See it anytime with `sbx net log --all`, and edit from the CLI
+# with `sbx net mute|unmute <host> -a kimi`. Remove the entry here the day you
+# decide to allow the endpoint.
+mute = [
+    "telemetry-logs.kimi.com",
+]
+
+# BYOK path: the real key is read on the HOST and injected by the egress proxy —
+# never in the cage. Provide it on the host as $KIMI_API_KEY (or a resolver,
+# e.g. sops://secrets.yaml#kimi) and uncomment the [secret] block to use the
+# API-key path instead of the OAuth login. The in-cage placeholder lets the CLI
+# start and issue the request; the proxy strips it and substitutes the real key
+# on the wire to api.kimi.com.
+[env]
+# KIMI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.kimi.com"]
+#from = "env://KIMI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

@@ -1,0 +1,28 @@
+# `openfox` — the OpenFox CLI: what it needs to be installed.
+#
+#   sbx bundle import examples/bundle/openfox.toml
+#   # then in an app profile:   use = ["openfox"]
+#
+# Derived from `examples/app/openfox.toml`, which stays the self-contained way to run this
+# agent on its own (`sbx app import`, one step, nothing else needed). This bundle is for an app
+# that EMBEDS the agent — an orchestrator spawning it as a subprocess — so that app states the
+# requirement ONCE instead of copying it. A test pins the two artifacts together, so they cannot
+# drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# NO EGRESS RULES, unlike the other agent bundles — and that is faithful to the profile it comes
+# from: `examples/app/openfox.toml` runs under `network = "shared"`, so it never had an allowlist to
+# derive one from. An app that names this bundle gets the tool and must state that agent's reach
+# itself (watch `sbx net logs -a <app>` under a filtering posture, and add what it asks for).
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.openfox]
+
+[bundle.openfox.packages]
+nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
+openfox = "mise:npm:openfox"

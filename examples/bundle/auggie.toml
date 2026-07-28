@@ -1,0 +1,38 @@
+# `auggie` — Augment's Auggie CLI: what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/auggie.toml
+#   # then in an app profile:   use = ["auggie"]
+#
+# Derived from `examples/app/auggie.toml`, which stays the self-contained way to run this
+# agent on its own (`sbx app import`, one step, nothing else needed). This bundle is for an app
+# that EMBEDS the agent — an orchestrator spawning it as a subprocess — so that app states the
+# requirement ONCE instead of copying it. A test pins the two artifacts together, so they cannot
+# drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.auggie]
+allow = [
+    "{GET} https://registry.npmjs.org",
+    "{*} https://*.api.augmentcode.com",
+    "{*} https://auth.augmentcode.com",
+]
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "{POST} https://api.segment.io",
+    "{POST} https://*.ingest.us.sentry.io",
+]
+
+[bundle.auggie.packages]
+nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
+auggie = "mise:npm:@augmentcode/auggie"
+
+[bundle.auggie.env]
+NODE_USE_ENV_PROXY = "1"

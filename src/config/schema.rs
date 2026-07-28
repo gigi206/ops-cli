@@ -183,6 +183,71 @@ pub(crate) struct RawConfig {
     /// (trusted by location); a project's `[net.groups]` is ignored.
     #[serde(default)]
     pub(crate) net: RawNet,
+    /// Reusable tool bundles, `[bundle.<name>]` — everything one tool needs to be *installed* and
+    /// to *reach its own services*, declared once and folded into any app that names it in `use`.
+    /// A bundle is the map-side companion of a `[net.groups]` group: a group factors out egress
+    /// entries, which are list items a `@<name>` reference can expand into, while `packages`/`env`
+    /// are maps with no slot for such a reference. Bundles are a security-relevant input (they add
+    /// tools, environment, egress rules, and credentials), so they are honored only from the global
+    /// config (trusted by location); a project's `[bundle]` is ignored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) bundle: BTreeMap<String, RawBundle>,
+}
+
+/// A `[bundle.<name>]` table: what one tool needs to be installed and to reach its own services.
+///
+/// The field set is the whole design. A bundle carries the tool (`packages` and the resolver
+/// tables that pair with them), the configuration it reads (`env`), the egress it needs
+/// (`allow`/`deny`/`mute`), and the credential it authenticates with (`secret`) — and **nothing
+/// about the shape of the cage**. There is deliberately no `cmd` (an app's command is its own
+/// identity, and inheriting one would be an integrity hijack), no `binds`/`forward`/`devices`/
+/// `seccomp`/`limits` (host exposure and kernel surface stay declared where they are granted), and
+/// none of the posture scalars (`network.mode`, `gui`, `gpu`, `audio`, `dbus`, `proc`,
+/// `home_scope`) — a bundle that silently switched on a microphone because the tool it packages
+/// can use one is exactly the surprise this shape rules out. So using a bundle can add a tool, its
+/// environment, its egress and its credential; it can never widen what the cage exposes of the
+/// host.
+///
+/// A bundle may not name another bundle: there is no `use` field here, so nesting — and with it
+/// any cycle — is impossible by construction, the same way a `[net.groups]` entry may not be a
+/// `@other` reference. Its `allow`/`deny`/`mute` entries *may* be `@group` references, because
+/// those are reference sites like an app's own lists: the bundle is folded into the app before
+/// classification, so the group expansion still runs exactly once.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawBundle {
+    /// Tools this bundle provisions, `name = "<backend>:<locator>"` — the same backend-prefixed
+    /// form as [`RawConfig::packages`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) packages: BTreeMap<String, String>,
+    /// Environment this bundle's tool reads (its configuration, telemetry opt-outs, …).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+    /// Egress entries the tool needs, unioned onto the app's `allow` list. Same grammar as
+    /// [`NetworkTable::allow`], `@group` references included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allow: Vec<String>,
+    /// Egress entries to refuse, unioned onto the app's `deny` list (deny always wins).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) deny: Vec<String>,
+    /// Refusals to keep out of the default egress log, unioned onto the app's `mute` list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) mute: Vec<String>,
+    /// Credentials the egress proxy injects for this tool, host-side. Same shape and effect as an
+    /// app's `[secret]` section — effective only under a network allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) secret: Option<RawSecretSection>,
+    /// Inline nix flakes this bundle's packages refer to, `[bundle.<name>.flakes.<tool>]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
+    /// Auto-upgrade resolvers pairing with this bundle's `tarball:resolve` packages.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) tarball: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers pairing with this bundle's `deb:resolve` packages.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) deb: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers pairing with this bundle's `appimage:resolve` packages.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) appimage: BTreeMap<String, RawResolve>,
 }
 
 /// The `[net]` table: config under the `net` namespace that is not a per-launch posture. For now
@@ -308,6 +373,21 @@ pub(crate) struct RawApp {
     /// (the program name, no arguments) — never split on whitespace, so a path with a
     /// space is not mis-parsed and there is no shell-quoting surface.
     pub(crate) cmd: Option<RawCmd>,
+    /// Reusable tool bundles this app is built from, `use = ["<name>", …]` (see [`RawBundle`]).
+    /// Each named bundle's packages, environment, egress entries and credentials are folded into
+    /// this app before resolution, in the order written — a later bundle overrides an earlier one
+    /// on the same key, and the app's own entries override every bundle. A *security* field: a
+    /// bundle is declared in the global config, so honoring `use` from an untrusted project would
+    /// let that project graft a trusted egress set or credential onto its own app; an untrusted
+    /// layer's `use` is therefore dropped with a warning, like `network`. Grouped beside `cmd`
+    /// because both say what the app *is*, ahead of the fields that shape it.
+    ///
+    /// When writing one by hand, `use` must sit at the top level, above the first `[table]`
+    /// header: TOML reads a key after a header as belonging to that table, so a `use` written
+    /// below (say) `[packages]` parses as `packages.use`, an unknown key, and is dropped in
+    /// silence. Export never produces that shape — the serializer emits values ahead of tables.
+    #[serde(default, rename = "use", skip_serializing_if = "Vec::is_empty")]
+    pub(crate) uses: Vec<String>,
     /// Extra environment for this app, layered over the baseline (the app wins on a key
     /// collision). A free field, like the baseline `env`. Skipped when empty on serialize, so an
     /// exported profile carries no noise `[env]` table.
@@ -429,7 +509,7 @@ impl RawCmd {
 /// be built host-side). The flake floats: it has no
 /// persisted lock and no `sbx upgrade` path, so pin the inputs inside the `flake.nix` itself
 /// (e.g. `nixpkgs.url = "github:NixOS/nixpkgs/<rev>"`) for a reproducible build.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawInlineFlake {
     /// The `flake.nix` source, verbatim. A multiline TOML string (`'''…'''`) is the natural form.
     pub(crate) flake: String,
@@ -449,7 +529,7 @@ pub(crate) struct RawInlineFlake {
 /// `.deb`) and pins it. `sbx upgrade` re-runs the command and rolls the app forward. Because the
 /// command is arbitrary code, this is honored **only from a trusted source**; it never runs for an
 /// untrusted layer.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawResolve {
     /// The resolver command as an argv (`["sh", "-c", "curl -s <api> | …"]`) — never
     /// whitespace-split, like `cmd`. It prints the newest release's download URL to stdout (and
@@ -464,7 +544,7 @@ pub(crate) struct RawResolve {
 /// every other key is a concrete host whose value is one secret or, as an array of tables
 /// (`[[secret."host"]]`), several (different headers to the same host). A host can therefore not
 /// be named `defaults` — that key is reserved for the settings table.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawSecretSection {
     /// Resolver order and per-resolver bindings the terse `key` form expands through.
     pub(crate) defaults: Option<RawSecretDefaults>,
@@ -476,7 +556,7 @@ pub(crate) struct RawSecretSection {
 
 /// The secret(s) declared for one host: a single table (`[secret."host"]`) or an array of
 /// tables (`[[secret."host"]]`) for several credentials (different headers) to that host.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum RawHostSecrets {
     /// `[secret."host"]` — one secret.
@@ -488,7 +568,7 @@ pub(crate) enum RawHostSecrets {
 /// One credential bound to a host (the host is the section key, so there is no `to` field). The
 /// source is either the terse `key` (expanded through `[secret.defaults]`) or an explicit `from`
 /// resolver ref/chain — exactly one of the two. `header`/`type`/`prefix` shape what is set.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawHostSecret {
     /// The broker kind; optional, defaulting to the only kind today, `"http-header"`.
     pub(crate) kind: Option<String>,
@@ -519,7 +599,7 @@ pub(crate) struct RawHostSecret {
 /// here nor on itself is still an explicit error (no silent built-in default). The resolver order
 /// is a security setting — it selects a secret's source — so this whole table is honored from the
 /// global config or a trusted project, never an untrusted one.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawSecretDefaults {
     /// The resolver names to try, in order, for a terse key — e.g. `["env", "sops"]`. The first
     /// that resolves at launch wins; a later one is a fallback. A per-secret `key@resolver`
@@ -542,13 +622,13 @@ pub(crate) struct RawSecretDefaults {
 }
 
 /// The `sops` resolver binding: a terse key `k` expands to `sops://<file>#k`.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawSopsDefaults {
     pub(crate) file: String,
 }
 
 /// The `env` resolver binding: a terse key `k` expands to `env://<case(k)>`.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawEnvDefaults {
     /// `"upper"`, `"lower"`, or `"asis"` (the default) — how to case the key before using it as
     /// a variable name.
@@ -556,7 +636,7 @@ pub(crate) struct RawEnvDefaults {
 }
 
 /// The `file` resolver binding: a terse key `k` expands to `file://<dir>/k`.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawFileDefaults {
     pub(crate) dir: String,
 }
@@ -564,7 +644,7 @@ pub(crate) struct RawFileDefaults {
 /// The two shapes a secret's `from` accepts: a single resolver ref string, or a list of refs
 /// tried in order. An untagged enum so both TOML forms parse — `from = "env://VAR"` and
 /// `from = ["env://VAR", "file:///p"]` — keeping the single-source case a one-liner.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum SecretFrom {
     /// `from = "env://VAR"`.
@@ -924,10 +1004,16 @@ mod tests {
     fn serializing_an_app_round_trips_through_toml() {
         // `serialize_app` is the inverse of `parse_app` — what `sbx app export` writes must
         // re-import identically. Covers the fragile corners: `#[serde(flatten)]` secret hosts
-        // (with a `defaults` table and an array-of-tables host) and the untagged `cmd`/`network`/
-        // `from` enums.
+        // (with a `defaults` table and an array-of-tables host), the untagged `cmd`/`network`/
+        // `from` enums, and the `use` array. The `use` placement assertion below pins a property
+        // of the OUTPUT, not of the struct: an array is a *value*, and a value written under a
+        // `[table]` header parses as a key of that table (so a hand-written `use` in the wrong
+        // place is silently dropped) — this proves export never emits that shape. The serializer
+        // hoists values ahead of tables on its own, so field order in `RawApp` does not control
+        // it and moving `uses` there does not fail here; measured, not assumed.
         let src = br#"
             cmd = ["demo-app", "--resume"]
+            use = ["demo-bundle", "shared-egress"]
             home_scope = "global"
             gui = "wayland"
             binds = ["/opt/data"]
@@ -1000,7 +1086,20 @@ mod tests {
             .expect("the [tarball] table parses");
         assert_eq!(tb.resolve.first().map(String::as_str), Some("sh"));
         assert!(tb.resolve.iter().any(|a| a.contains("curl")));
+        // The bundle references parse in declaration order (the order the fold applies them).
+        assert_eq!(app.uses, vec!["demo-bundle", "shared-egress"]);
         let serialized = serialize_app(&app).unwrap();
+        // …and are emitted ahead of every table header, so re-parsing finds them at the top level
+        // rather than inside the last table opened. A table header is a `[` at the start of a
+        // line — not the `[` that opens the `use` array itself.
+        let line_of =
+            |pred: &dyn Fn(&str) -> bool| serialized.lines().position(pred).unwrap_or(usize::MAX);
+        let use_line = line_of(&|l: &str| l.trim_start().starts_with("use = "));
+        let first_table = line_of(&|l: &str| l.starts_with('['));
+        assert!(
+            use_line < first_table,
+            "`use` must serialize before the first table header, got:\n{serialized}"
+        );
         let reparsed = parse_app(serialized.as_bytes()).unwrap();
         // A multiline flake source may re-emit escaped through `toml::to_string`; the round-trip is
         // on the parsed value, so this proves export→import preserves the flake byte-for-byte.

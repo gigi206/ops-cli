@@ -52,6 +52,8 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[secret]` | security | [secret](secret.md) |
 | `[app.<name>]` | security overlay | [apps](apps.md) |
 | `[net.groups]` | security (global-only) | [net-groups](net-groups.md) |
+| `[bundle.<name>]` | security (global-only) | [bundles](bundles.md) |
+| `use` | security | [bundles](bundles.md) |
 
 A project's mise files (`[tools]`, `.tool-versions`) are a related input — see
 [`[tools]`](tools.md).

@@ -5,7 +5,7 @@ bundles a command with a security and tooling overlay so you can run an autonomo
 agent *on* untrusted code, safely and repeatably.
 
 ```sh
-sbx app import profiles/claude-code.toml   # a deliberate trust act
+sbx app import examples/app/claude-code.toml   # a deliberate trust act
 sbx app run claude-code                    # launch it, sandboxed
 ```
 

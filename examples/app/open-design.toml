@@ -1,0 +1,194 @@
+# Open Design — the local-first, open-source design studio, served in a host browser by sbx.
+#
+#   sbx app import examples/app/open-design.toml
+#   sbx app run open-design
+#   # then open http://127.0.0.1:17573 in your host browser
+#
+# Open Design does not currently publish a Linux desktop asset in its GitHub releases.  This
+# profile therefore runs the official source distribution: it clones nexu-io/open-design into the
+# app's persistent isolated home on first launch, installs its lockfile-pinned dependencies, and
+# starts the documented `tools-dev run web` lifecycle.  Source, pnpm cache, SQLite data and rendered
+# artifacts stay under this app's home; they never enter the project shell or another app's home.
+#
+# UPGRADE — explicit, never automatic.  With no Linux release asset there is no sbx `[packages]`
+# backend to roll, so `sbx upgrade` leaves the checkout alone and it would stay pinned to whatever
+# `main` was on the first launch.  Refresh it for ONE launch with
+#     sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1
+# which fetches `main`, hard-resets the checkout and re-installs the workspace.  (The OpenCode
+# engine below is a `mise:` package and DOES roll with `sbx upgrade mise` — the two are separate.)
+#
+# The web server listens on the cage's loopback.  `forward` is the deliberate, inbound-only bridge
+# that makes it available as http://127.0.0.1:17573 on the HOST; it does not expose the service to
+# the LAN.  The daemon remains internal on 17456 and is reached only by the web server inside the
+# cage.  Keep the web port in `cmd` and `forward` in sync if you change it.
+#
+# Open Design uses a coding agent as its rendering engine.  This profile pins OpenCode as the active
+# engine (see the `app-config.json` seed below): Open Design's OWN default engine is its first-party
+# `vela` runtime (internal id `amr`), and on a fresh app home with no engine selected the web UI boots
+# against vela and then triggers a vela login -> `vela binary not found; install vela or configure
+# VELA_BIN`.  Selecting OpenCode here avoids that entirely; the `opencode` bundle named below puts the
+# `opencode-cli` binary on PATH so the daemon's agent detection finds it.  To use another supported
+# agent instead, add its package and its narrowly scoped runtime hosts, then select it in Open Design's
+# Settings -> Execution mode (that writes the engine into app-config.json and the seed below will then
+# leave your choice alone).
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -eu
+
+ROOT="$HOME/.local/share/open-design"
+# Pin the daemon's data dir to a known path so the engine seed below and the daemon agree on where
+# app-config.json lives.  Default would be "$ROOT/.od"; set explicitly to remove the ambiguity.
+export OD_DATA_DIR="$ROOT/.od"
+
+if [ ! -d "$ROOT/.git" ]; then
+    echo "sbx: cloning Open Design into the app home (first launch only)" >&2
+    mkdir -p "$(dirname "$ROOT")"
+    git clone --depth=1 https://github.com/nexu-io/open-design.git "$ROOT"
+fi
+
+cd "$ROOT"
+
+# UPGRADE.  Open Design ships no Linux release asset, so it rides no sbx `[packages]`
+# backend and `sbx upgrade` cannot roll it forward — the checkout would stay frozen at
+# whatever `main` was on the first launch.  Refresh it deliberately, one launch at a time:
+#     sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1
+# `--env` is an authoritative one-shot override read on the HOST, so the version moves only
+# when you ask.  `reset --hard` discards in-tree edits; your designs and app-config.json live
+# under $OD_DATA_DIR, outside the checkout, and are untouched.
+if [ -n "$OPEN_DESIGN_SBX_UPDATE" ]; then
+    echo "sbx: refreshing the Open Design checkout (OPEN_DESIGN_SBX_UPDATE is set)" >&2
+    git fetch --depth=1 origin main
+    git reset --hard FETCH_HEAD
+fi
+
+# The repository pins pnpm 10.33.2 through packageManager.  Install Corepack's shims in the writable
+# app home, not next to the read-only Nix Node binary: Open Design's own `tools-dev` script invokes
+# a nested bare `pnpm`, which must also resolve on PATH.  Cheap and offline (it writes shims; the
+# pinned pnpm itself is downloaded on first use), so it is not stamped.
+mkdir -p "$HOME/.local/bin"
+corepack enable --install-directory "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Install keyed on the CHECKED-OUT COMMIT, so a warm launch starts the server instead of
+# re-walking the workspace, and the refresh above re-installs by construction (a bare marker
+# file would let new source run against stale node_modules).
+rev="$(git rev-parse HEAD)"
+stamp="$ROOT/.sbx-installed-rev"
+if [ "$(cat "$stamp" 2>/dev/null)" != "$rev" ]; then
+    echo "sbx: installing Open Design dependencies for $rev" >&2
+    pnpm install --frozen-lockfile
+    printf '%s\n' "$rev" > "$stamp"
+fi
+
+# Select OpenCode as the active rendering engine on first launch only, so a later engine switch made
+# in Open Design's Settings is never clobbered.  Without this, Open Design defaults to its vela runtime
+# and the web UI prompts for a vela login at startup (vela is not installed in this cage).
+mkdir -p "$OD_DATA_DIR"
+if [ ! -f "$OD_DATA_DIR/app-config.json" ]; then
+    printf '{"agentId":"opencode"}\n' > "$OD_DATA_DIR/app-config.json"
+fi
+
+exec pnpm tools-dev run web --daemon-port 17456 --web-port 17573
+''',
+]
+
+# The host browser reaches the in-cage web UI.  The daemon port intentionally stays private to the
+# cage.  Do not reserve OpenCode's fixed OAuth callback port here: another sbx OpenCode session may
+# already own it, and the normal API-key path below does not need a callback.
+forward = [17573]
+
+# EXPERIMENTAL — make the Home "Choisir un dossier de travail" picker work.  The web build's folder
+# picker delegates to `zenity --file-selection` inside the daemon (apps/daemon/src/server.ts), which
+# needs a display.  `gui = "wayland"` forwards a Wayland compositor into the cage so zenity can render
+# its dialog to the host.  Without this the picker fails with "zenity is not installed" / "cannot open
+# display" and the click is a silent no-op.  This is a trusted-only field, honored because the profile
+# is imported into your trusted config dir.
+#
+# KNOW WHAT IT COSTS.  Unlike the other browser-served profiles (`opencode-web`, `hermes-web`), which
+# expose no display at all, this one hands the cage your COMPOSITOR SOCKET — and isolation there is
+# compositor-dependent: Mutter/GNOME confines clients, while wlroots-based compositors (sway,
+# hyprland) expose screen-capture and input-injection to any client.  `gui = "offscreen"` is NOT an
+# alternative: zenity has to draw a real dialog on your desktop.  The picker is the ONLY feature that
+# needs it — you can type or paste a working-folder path instead.  So if your compositor is
+# wlroots-based, or you simply do not want the native chooser, comment out this line and the `zenity`
+# package below; everything else in Open Design keeps working.  See
+# docs/guide/configuration/gui.md.
+gui = "wayland"
+
+# The Open Design checkout and its state are deliberately global: downloading and compiling the
+# Node workspace once is reused when launching the same trusted app from another project.
+home_scope = "global"
+
+# --- The rendering engine -------------------------------------------------------------------------
+# Open Design uses a coding agent as its engine.  It is NAMED here rather than restated: `use` pulls
+# in that agent's package and the hosts it must reach from one declaration shared with the agent's own
+# profile, so this file cannot fall behind when the agent's requirements change.  IMPORT THE BUNDLE
+# TOO — it is not in this file:
+#     sbx bundle import examples/bundle/opencode.toml
+#     sbx app    import examples/app/open-design.toml
+# Without it the app resolves with a note saying the bundle is undeclared, and the engine is absent.
+#
+# The bundle installs the binary as `opencode`; Open Design's runtime def looks for `opencode-cli`
+# first and falls back to `opencode`, so detection finds it.  Set `OPENCODE_BIN` in [env] to point at
+# a specific path instead.  To use another supported agent, name its bundle here (and import it), then
+# select it in Open Design's Settings → Execution mode.
+use = ["opencode"]
+
+# To reuse a host OpenCode login instead of an API key, uncomment this bind: it deliberately
+# exposes only your OpenCode config directory, rather than reserving a global callback port.
+# `binds` is a security field, honored only because this profile lives in your trusted config dir.
+# It MUST stay at the TOP LEVEL — written below a `[table]` header it would parse as that table's
+# key, be dropped as unknown, and silently expose nothing.
+#binds = [
+#    { path = "~/.config/opencode", mode = "rw" },
+#]
+
+[packages]
+# Open Design's package.json declares `engines.node = "~24"` and drives pnpm through Corepack.
+# The attribute is PINNED to 24 on purpose, and both halves matter: the unversioned `nix:nodejs`
+# currently resolves to Node 26, which satisfies neither — Node stopped shipping Corepack in v25
+# (nixpkgs mirrors that: `bundlesCorepack = !lib.versionAtLeast version "25.0.0"`), so `corepack
+# enable` above would fail command-not-found and abort the launch under `set -eu`.  If you ever
+# move off 24, add `corepack = "nix:corepack"` as well.  `better-sqlite3` may build from source, so
+# Python, make and GCC provide node-gyp's toolchain; git fetches the official source checkout.
+nodejs = "nix:nodejs_24"
+git = "nix:git"
+python3 = "nix:python3"
+gnumake = "nix:gnumake"
+gcc = "nix:gcc"
+
+# The design engine comes from its BUNDLE — see `use` near the top of this file, not this table.
+
+# The web build's native folder picker (`POST /api/dialog/open-folder`) shells out to
+# `zenity --file-selection --directory`; it is absent from the hermetic cage by default, so the picker
+# fails.  Provision it so the daemon can open the chooser.  Requires `gui = "wayland"` above (zenity
+# needs a display to render its dialog).
+zenity = "nix:zenity"
+
+[network]
+mode = "deny"
+allow = [
+    # First launch: Git smart-HTTP needs this POST; GitHub's read-only source/release hosts are
+    # already covered by sbx's built-in allowlist.
+    "{POST} https://github.com/nexu-io/open-design.git/git-upload-pack",
+    # Corepack downloads the pinned pnpm release and pnpm fetches the workspace's lockfile tarballs.
+    "{GET,HEAD} https://registry.npmjs.org",
+    # The engine's OWN reach is NOT listed here — it arrives with its bundle (`use` near the top of
+    # this file) and is unioned into this list at resolution.  See what that adds with
+    # `sbx bundle opencode`, and what the launch ends up with via `sbx config show --app open-design`.
+    # A DIRECT provider, instead of routing through the engine's own gateway: add its host here (e.g.
+    # Anthropic -> api.anthropic.com, OpenAI -> api.openai.com, OpenRouter -> openrouter.ai) plus a
+    # matching [secret] block, unless you reuse a host OpenCode login (see the commented bind).
+]
+
+# To authenticate OpenCode with an API key: set the key on the host and uncomment a [secret] block
+# (adjust the host/header to your provider).  The real key is read on the host and injected into
+# the provider's outbound request by sbx's egress proxy; the plaintext never enters the cage.  This
+# needs no shared OAuth callback port.  To reuse a host OpenCode login instead, see the commented
+# `binds` block near the top of this file — it has to sit at the top level, not here.
+[env]
+# Node 24's built-in fetch (used by Corepack) ignores HTTPS_PROXY unless this opt-in is set.  Without
+# it, its DNS lookup bypasses sbx's loopback egress proxy and fails in the empty network namespace.
+NODE_USE_ENV_PROXY = "1"

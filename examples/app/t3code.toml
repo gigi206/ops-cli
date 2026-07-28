@@ -1,0 +1,198 @@
+# T3 Code — the open-source control plane for coding agents (pingdotgg/t3code), sandboxed by sbx.
+#
+#   sbx app import examples/app/t3code.toml
+#   sbx app run t3code
+#
+# T3 Code is a free, open-source Electron desktop app: ONE interface that drives OTHER coding agents
+# — Claude Code, Codex, OpenCode, Cursor — spawning each as a CLI subprocess, switching models
+# mid-conversation, and generating PRs with one-button commit/push to your GitHub. It does NOT ship
+# its own model backend and does NOT resell tokens: it orchestrates the agent CLIs you install, each
+# using ITS OWN credentials. Under sbx it runs CONFINED: it sees only the cage filesystem (the project
+# directory you launch it from, plus its own persistent isolated home and any `binds` below), reaches
+# only the hosts you allow, and its git/agent powers stop at the sandbox boundary (bubblewrap +
+# seccomp + an empty netns + the egress allowlist).
+#
+# T3 IS INERT WITHOUT A SUB-AGENT. The control plane does nothing on its own — it needs at least one
+# agent CLI installed AND authorized in the same environment (per T3's own docs: "you need Codex CLI
+# installed and authorized for T3 Code to work"). In the hermetic cage no CLI is present unless you
+# provision one, so this profile enables **claude-code by default** (below); enable/disable the others
+# in [packages]. Each agent you add ALSO needs its install + runtime + login hosts in [network].
+#
+# THE `appimage:` BACKEND (no third party, tracks upstream automatically). Upstream distributes T3
+# Code for Linux ONLY as an `.AppImage` (no `.deb`, no nixpkgs attr, no buildable flake), and the
+# release asset name embeds the version, so there is no stable `…/latest/download/…` URL to hard-code.
+# This profile names the GitHub repo — `appimage:github:pingdotgg/t3code` — and sbx queries the repo's
+# LATEST release, selects its linux-x86_64 `.AppImage`, resolves it to a content hash (both pinned in
+# the per-project appimage lock), and builds a generated derivation that EXTRACTS THE SQUASHFS AT
+# BUILD TIME and `autoPatchelfHook`s the Electron binaries. It is **never self-mounted at runtime**:
+# `appimage-run`/`wrapType2`/the raw AppImage all need a runtime FUSE/namespace mount that the cage's
+# seccomp denylist blocks, so build-time extraction is the only mechanism that runs in-cage. The build
+# is HOST-SIDE (an AppImage runs no maintainer script, so evaluating it host-side is safe), seeded into
+# the store, and offline-reusable after the first launch.
+#
+# UPGRADES — automatic, like the `deb:` apps. `sbx upgrade appimage` re-queries GitHub and rolls the
+# pin forward to the newest release (the rebuilt app lands at the next launch); the launch hot path
+# never touches GitHub. No manual version bump.
+#
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
+# database (`~/.pki/nssdb`); for a `gui = "wayland"` cage under a filtering posture, sbx seeds its MITM
+# CA into that NSS db automatically (part of the GUI hole, like fonts), so HTTPS to the allowed hosts
+# succeeds. `--use-system-ca` tells Electron to consult that store.
+#
+# DISPLAY + GPU + DBUS. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and
+# provisions fonts, so the Electron window maps. X11 is never offered. Isolation is compositor-dependent
+# — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose screen-capture/input-injection
+# to ordinary clients (see docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated
+# rendering (mesa provisioned into sbx's own store, the render node under `/dev/dri`, the minimal
+# `/sys` DRM subtree the driver needs) — without it a Chromium/Electron app on Wayland often produces
+# no buffer and no window maps, so it is on. mesa covers Intel/AMD/nouveau; an NVIDIA-only machine
+# falls back to software (renders, slower). `dbus = true` gives the cage its OWN private desktop portal
+# so T3's file picker (choosing a repo/worktree) opens IN-CAGE and lists the cage filesystem, relays
+# notifications, and follows your host light/dark theme; it also registers the http/https handler the
+# OAuth links below need. The Electron flags: `--no-sandbox` is mandatory and acceptable because
+# bubblewrap + seccomp + the empty netns IS the boundary; `--ozone-platform=wayland` selects the
+# Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
+#
+# IN-CAGE BROWSER (for the sub-agents' OAuth login). T3's agents authenticate with their OWN accounts
+# (`claude auth login`, `codex login`, `opencode auth`) — an OAuth flow that opens a URL and waits on a
+# `localhost:<port>` callback. That callback server runs INSIDE the cage (empty netns), so the whole
+# flow must close in-cage: the URL cannot be completed in your host browser (its redirect to the
+# in-cage loopback is unreachable from the host). So the command is a bash wrapper (not a bare argv)
+# that installs an `xdg-open` launching an IN-CAGE Chromium for http(s) — the provider consent page +
+# the loopback callback both resolve inside the sandbox, no host browser, no `forward`. Same pattern as
+# aionui / claude-desktop. HEAVY: it pulls the Chromium closure into the store on first launch (see
+# [packages]). Each provider's OWN login hosts must be in [network] — add them from
+# `sbx net logs -a t3code` on your first login attempt. `--password-store=basic` forces the file cookie
+# store (no keyring in the cage) so a login survives a relaunch. If every agent you use is configured
+# with an API KEY instead of OAuth (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY in its own config), you can
+# drop this wrapper + the chromium package for a bare `t3code` argv.
+cmd = [
+    "bash",
+    "-c",
+    '''
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
+#!/bin/sh
+case "$1" in
+  http://*|https://*)
+    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
+      --no-first-run --no-default-browser-check "$@" ;;
+  *)
+    exec t3code --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage "$@" ;;
+esac
+WRAP
+chmod +x "$HOME/.local/bin/xdg-open"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Under `dbus = true` Electron opens external URLs via `org.freedesktop.portal.OpenURI`, not `xdg-open`
+# directly; the portal shows "no apps available" unless a default http/https handler is registered.
+# Register the wrapper as that handler. The Exec path is ABSOLUTE ($HOME expanded here) because the
+# portal-launched handler does not inherit this shell's PATH.
+mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
+cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=sbx URL handler
+Exec=$HOME/.local/bin/xdg-open %U
+MimeType=x-scheme-handler/http;x-scheme-handler/https;
+NoDisplay=true
+Terminal=false
+EOF
+cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
+[Default Applications]
+x-scheme-handler/http=sbx-open-uri.desktop
+x-scheme-handler/https=sbx-open-uri.desktop
+MIMEAPPS
+
+# GPU note: on an NVIDIA/Optimus machine Chromium may pick the discrete card, which has no in-cage
+# driver (`pci id 10de:… driver (null)` -> "GPU process isn't usable. Goodbye."), an intermittent
+# crash. If the window crashes on GPU, add `--disable-gpu` below for software rendering (maps via
+# wl_shm; a UI control plane needs no acceleration).
+exec t3code --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
+    --use-system-ca --password-store=basic
+''',
+]
+
+gui = "wayland"
+gpu = true
+dbus = true
+
+# NETWORK = SHARED (the host network), deliberately — and this is the ONE shipped profile that does not
+# filter egress. `network = "none"`/`"deny"`/an allowlist do NOT work for t3code: its model/provider
+# calls are made by a SEPARATE Node backend process (Effect's undici HTTP client, `ELECTRON_RUN_AS_NODE`)
+# that is blind to the egress proxy, so under a filtering posture (Model-B empty netns) those calls die
+# at DNS → an empty model list + an Offline environment. Only the Chromium UI honours the proxy, and
+# every clean way to route the backend hits a hard wall (proxychains breaks Chromium's renderer; Electron
+# strips NODE_OPTIONS so a preload can't reach the backend; a cap-free transparent interceptor is an
+# sbx-sized feature, not a profile knob — full reasoning in the commented "aspirational allowlist" below
+# and in `examples/README.md`). So t3code ships `shared` so `sbx app run t3code` just works. What you KEEP
+# under shared: bubblewrap + seccomp + the isolated home + the minimal /dev — only egress FILTERING is
+# off (the app reaches any host, but still cannot see your real $HOME or other processes).
+network = "shared"
+
+# --- The coding agents T3 drives ------------------------------------------------------------------
+# T3 spawns its agents as subprocesses (it depends on node-pty). It is EXPECTED to find each one on
+# the cage PATH by its command name — so having a CLI there under its standard name (`claude`/
+# `codex`/`opencode`) should make it discoverable — but the exact discovery mechanism (PATH lookup vs
+# a config path) is unverified and is a live gate on the first launch.
+#
+# Each agent is NAMED here rather than restated: `use` pulls in its package and the environment it
+# reads from one declaration shared with that agent's own profile. IMPORT THE BUNDLE TOO — it is not
+# in this file:
+#     sbx bundle import examples/bundle/claude-code.toml
+# Without it the app resolves with a note saying the bundle is undeclared, and T3 finds no agent.
+#
+# Note for this profile specifically: `network = "shared"` above means the bundles' egress rules are
+# REDUNDANT here (nothing filters, so nothing needs allowing) and are dropped silently — no rule is
+# lost. What `use` buys T3 is the package and its environment, kept in step with the agent.
+#
+# claude-code is named by default so T3 is not inert; add more as you need. To actually USE one you
+# still need its own login (OAuth via the in-cage browser, or an API key in its config in the
+# isolated home). Cursor's `cursor-agent` has no bundle — it is a bootstrap download rather than a
+# package; see `examples/app/cursor-agent.toml` for that mechanism.
+use = ["claude-code"]
+#use = ["claude-code", "codex"]      # several at once
+#use = ["opencode"]
+
+# T3 Code operates on your git repositories (opening a repo, creating worktrees, generating PRs), so
+# it needs a real host directory to work on beyond the one you launch it from. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir. Uncomment and point at the
+# directory that holds the repos you want T3 to touch (read/write at its real absolute path).
+#binds = [
+#    { path = "~/work", mode = "rw" },
+#]
+
+[packages]
+# The T3 Code desktop app, tracked from the latest GitHub release's linux `.AppImage` automatically
+# (see "THE `appimage:` BACKEND" above). `sbx upgrade appimage` rolls it forward; no manual version.
+t3code = "appimage:github:pingdotgg/t3code"
+
+# In-cage Chromium for the sub-agents' OAuth login flow (see "IN-CAGE BROWSER" above). HEAVY — pulls a
+# large nixpkgs closure into the project store on first launch. Drop this (and the wrapper in `cmd`) if
+# every agent you use authenticates with an API key rather than OAuth.
+chromium = "nix:chromium"
+
+# The agents T3 drives come from their BUNDLES — see `use` above, not this table.
+
+# ── ASPIRATIONAL ALLOWLIST (inert — `network = "shared"` is set above; there is NO `[network]` table).
+# Kept as documentation for the day t3code CAN be filtered — i.e. when sbx grows a Chromium-safe
+# interceptor for the proxy-blind Node backend (a self-disabling LD_PRELOAD connect-shim, or a cap-free
+# loopback DNS responder + SNI-reading TLS relay tunnelling to the forwarder). Until then these lines do
+# nothing; do not uncomment them into a `[network] mode = "deny"` table expecting it to work — it won't
+# (the model list will be empty). The hosts, grounded live, would be:
+#   allow:
+#     "{*} https://api.anthropic.com"                          # Anthropic (claude-agent-sdk + Claude Code)
+#     "{*} https://clerk.t3.codes"                             # t3's own Clerk login UI
+#     "{GET} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*"
+#     "{GET} https://registry.npmjs.org"                       # mise npm/aqua fetches
+#     "{GET} https://models.dev"                               # the model catalogue
+#     "{*} https://api.openai.com" / "{*} https://openrouter.ai" / provider login hosts (per sub-agent)
+#     're:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/'  # Chromium spellcheck dictionary
+#   mute (telemetry): "*.sentry.io", "*.posthog.com", "api.axiom.co"
+#
+# AUTHENTICATION — no [secret] block. T3 does not hold model credentials itself: each sub-agent
+# authenticates with ITS OWN account/key, stored by that CLI in the app's PERSISTENT ISOLATED HOME
+# (OAuth session via the in-cage browser, or an API key you place in the CLI's own config). So there is
+# nothing for sbx to inject host-side — unlike the header-injecting CLI profiles. Keep your keys/logins
+# out of the project you launch from; they live only in this app's isolated home.

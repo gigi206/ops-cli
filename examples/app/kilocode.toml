@@ -1,0 +1,79 @@
+# Kilo Code (kilo) — a terminal AI coding agent (an opencode fork), sandboxed by sbx.
+#
+#   sbx app import examples/app/kilocode.toml
+#   sbx app run kilocode
+#
+# The tool is equipped fresh from upstream: mise's `github` backend pulls Kilo Code's
+# standalone release binary (`kilo-linux-x64.tar.gz`) — verified by GitHub artifact
+# attestation + SLSA provenance, self-contained (no node/bun runtime), no nixpkgs lag. It
+# is equipped at the latest upstream version on the first launch in a project; advancing an
+# already-installed version is not yet automated by `sbx upgrade`. The launched command is
+# `kilo` (the binary); the imported app is named `kilocode` (the product).
+#
+# (Why not the nix flake? Kilo Code also ships a `packages.kilo` flake, but its source
+# build is broken upstream — the package derivation uses nixpkgs' bun, older than the
+# version its own build script requires — and its `bun install` step does not fetch through
+# the cage's egress proxy. The release binary above sidesteps both.)
+#
+# Kilo Code is MULTI-PROVIDER (it shares opencode's model layer). This template is set up
+# for Anthropic; for another provider change the allowlist + the [secret] block + the env
+# var (e.g. OpenAI: allow "api.openai.com", header "Authorization", type "bearer", env
+# OPENAI_API_KEY; or OpenRouter: allow "openrouter.ai", header "Authorization", type
+# "bearer", env OPENROUTER_API_KEY). The real key is read on the HOST and injected by the
+# egress proxy — never in the cage. If a request is blocked, the proxy reports the host it
+# refused — add it to `allow` (or check ahead with `sbx test net <url>`).
+cmd = "kilo"
+
+# Your host Kilo Code config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `kilo` read and write these host files (login, settings). Uncomment to share your host Kilo
+# Code setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/kilo", mode = "rw" },
+#]
+
+[packages]
+kilo = "mise:github:Kilo-Org/kilocode"
+
+[network]
+mode = "deny"
+# api.anthropic.com: the provider API — opened to every verb with `{*}` (an app is read-by-default,
+# and the CLI POSTs completions). models.dev: the model catalogue — a read-only fetch, `{GET,HEAD}`.
+allow = [
+  "{GET} https://models.dev",
+  "{*} https://api.kilo.ai",
+  # Kilo's session-export / cloud-sync ingest (POST /v1/session-export/batch) — the feature that
+  # backs up/syncs your coding sessions to the cloud. Allowed so cloud sync works; the host stays
+  # out of `mute` so a sync failure stays visible in the log.
+  "{*} https://supermassive-black-hole.kiloapps.io",
+  #"{*} https://us.i.posthog.com",
+  # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
+  #"{*} https://openrouter.ai",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): hosts we deliberately
+# leave DENIED and do NOT want to hear about. Here Kilo Code's PostHog product telemetry (POST
+# /batch/), which a live run hits periodically and whose `denied-default` lines would clutter the
+# ones worth acting on. `*.i.posthog.com` is regional (apex + subdomains muted together, spoof-safe).
+# A `mute` never changes the verdict (the telemetry is still refused) and never hides a count
+# (`sbx net stats` still tallies it); it only keeps the line out of the default log. See it
+# anytime with `sbx net log --all`, and edit this list from the CLI with `sbx net mute|unmute
+# <host> -a kilocode`. Remove the entry here the day you decide to allow the endpoint.
+#
+# Not here: `supermassive-black-hole.kiloapps.io` (Kilo's session-export / cloud-sync ingest) is
+# ALLOWED in `allow` above (cloud sync enabled), so it never reaches the mute filter.
+mute = [
+    "*.i.posthog.com",                        # Kilo PostHog product telemetry (POST /batch/)
+]
+
+# The real key is read on the HOST and injected by the egress proxy — never in the cage.
+# Provide it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g.
+# sops://secrets.yaml#openrouter). The in-cage placeholder lets the CLI start and issue the
+# request; the proxy strips it and substitutes the real key on the wire to openrouter.ai.
+[env]
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

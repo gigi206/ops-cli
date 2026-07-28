@@ -1,0 +1,128 @@
+# OpenClaw — Personal AI Assistant you run on your own devices, sandboxed by sbx.
+#
+#   sbx app import examples/app/openclaw.toml
+#   sbx app run openclaw
+#
+# FIRST-RUN SETUP — OpenClaw ships with NO provider configured, so it reports
+# "no models available" until you set one up. Run its configuration wizard as the
+# app's OWN command (it needs a real controlling terminal) — NOT from inside a
+# `sbx session attach` shell alongside a running instance:
+#
+#   sbx app run openclaw -- configure
+#
+# Pick a provider (OpenAI, Anthropic, …) and an API-key / OAuth auth; the choice
+# persists in the app's isolated home (`openclaw onboard` is the fuller wizard).
+#
+# The tool is equipped fresh from upstream via mise's npm backend — no nixpkgs lag.
+# It is equipped at the latest upstream version on the first launch in a project;
+# `sbx upgrade mise` rolls the installed version forward to the newest upstream release.
+#
+# OpenClaw is MULTI-PROVIDER and MULTI-CHANNEL, so its egress depends on the model
+# provider and chat channels you configure. This template defaults to an OpenAI BYOK
+# API-key flow (uncomment the [secret] block below to inject the key on the wire to
+# api.openai.com); for another provider, change the allowlist and the [secret] block
+# (e.g. Anthropic: allow "api.anthropic.com", header "x-api-key", type "raw", env
+# ANTHROPIC_API_KEY). If a request is blocked, the proxy reports the host it refused —
+# add it to `allow` (or check ahead with `sbx test net <url>`).
+cmd = "openclaw"
+
+# OpenClaw is a MULTI-CHANNEL gateway that runs a local server (dashboard / webhook /
+# OAuth-callback listener). `forward` bridges a cage port back to the host so your HOST
+# browser can reach that in-cage server. VERIFY OpenClaw's actual listen port and set it
+# here — 18789 is a placeholder, and a wrong port just means the forward is inert. A port
+# already in use on the host fails the launch closed. Must stay a top-level key: written
+# after a `[table]` header, TOML would fold it into that table (e.g. `network.forward`)
+# and it would be silently ignored.
+forward = [18789]
+
+# Your host OpenClaw config, mounted read-write at its real absolute path.
+# `binds` is a security field, honored only because this profile lives in your
+# trusted config dir; `mode = "rw"` lets the caged `openclaw` read and write
+# these host files (gateway config, credentials, workspace). Uncomment to share
+# your host OpenClaw setup with the cage instead of the app's isolated home
+# (the default).
+#binds = [
+#    { path = "~/.openclaw", mode = "rw" },
+#]
+
+[packages]
+# Node.js is required for mise to install npm packages AND to run OpenClaw (a pure-Node
+# CLI). `nix:nodejs` is currently Node 24.x, which satisfies OpenClaw's engines
+# (>=22.22.3 || >=24.15) and enables NODE_USE_ENV_PROXY (Node 24+) below.
+nodejs = "nix:nodejs"
+# OpenClaw via npm (global install). mise equips it at launch; `sbx upgrade mise`
+# rolls the npm package forward to the newest upstream release.
+openclaw = "mise:npm:openclaw"
+
+[network]
+mode = "deny"
+allow = [
+    # OpenAI API — the primary BYOK provider (completions, embeddings, …), reached via the
+    # `openai` SDK the package bundles. Opened to all verbs (request bodies).
+    "{*} https://api.openai.com",
+    # npm registry — equipping openclaw via mise at first launch (and `sbx upgrade mise`).
+    "{GET} https://registry.npmjs.org",
+    #
+    # --- ChatGPT-account login (Codex-style OAuth) — UNVERIFIED for OpenClaw -------------
+    # Uncomment these together only if you sign in with a ChatGPT account instead of a BYOK
+    # API key; a real run will name whichever of them it actually needs.
+    #"{*} https://auth.openai.com",          # OAuth / device-flow login
+    #"{WS} https://chatgpt.com",             # ChatGPT backend (streaming, WebSocket)
+    #"{GET} https://*.oaiusercontent.com",   # generated-file download CDN
+    #
+    # --- Alternative providers — uncomment the one you use ------------------------------
+    #"{*} https://api.anthropic.com",        # Anthropic API
+    #"{*} https://console.anthropic.com",    # Anthropic console (account / connectivity)
+    #"{*} https://openrouter.ai",            # OpenRouter (BYOK multi-provider gateway)
+    #"{GET} https://models.dev",             # model catalogue (UNVERIFIED for OpenClaw)
+    #
+    # GitHub is already covered by sbx's built-in allow-set for READS. If OpenClaw clones
+    # plugins/skills over git-HTTPS and the proxy names a refused github.com POST, add a
+    # concrete path or a `re:` rule (a mid-path `*` like `github.com/*/git-upload-pack` is
+    # NOT a single-segment glob — the matcher only supports a trailing `/*` subtree).
+    #
+    # --- Chat channel webhook/callback hosts — add the ones you actually use -------------
+    #"{*} https://graph.facebook.com",       # WhatsApp (Meta): webhook verify + delivery
+    #"{*} https://api.telegram.org",         # Telegram Bot API (the package bundles grammy)
+    #"{WS} https://gateway.discord.gg",      # Discord gateway
+    #"{*} https://discord.com",              # Discord REST
+    #"{*} https://slack.com",                # Slack
+    #"{*} http://localhost:8080",            # Signal (via signald or similar)
+    #"{*} https://matrix.org",               # Matrix
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): a `mute` never
+# changes the verdict (the host is still denied) and never hides a count (`sbx net stats`
+# still tallies it); it only keeps the line out of the default log. Edit it from the CLI
+# with `sbx net mute|unmute <host> -a openclaw`, or see everything with `sbx net log --all`.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
+]
+
+# CREDENTIALS — OpenClaw keeps provider auth in its OWN config (see FIRST-RUN SETUP at
+# the top: `sbx app run openclaw -- configure`), and by default it does NOT read shell
+# environment variables (`openclaw models status` shows "Shell env: off"), so a key placed
+# only in [env] below is IGNORED. Two ways to authenticate:
+#   1. In-app (simplest): run the wizard above and paste your key — it persists in the
+#      isolated home (the key then lives in the cage, though never in your project).
+#   2. Host-side injection (real key never in the cage): first enable env passthrough with
+#      `openclaw config set env.shellEnv true`, THEN uncomment the placeholder + the
+#      [secret] block and provide $OPENAI_API_KEY on the host — the proxy substitutes the
+#      real key on the wire to api.openai.com. For another provider, change the host in
+#      [secret] + the header/type/env var.
+[env]
+# REQUIRED — OpenClaw is a pure-Node CLI that reaches its providers through Node's built-in
+# fetch (undici) and the `openai` SDK, which — unlike npm and mise — do NOT honour the
+# http_proxy/https_proxy variables sbx injects. In the Model-B cage (empty network namespace,
+# no DNS resolver) a fetch that bypasses the proxy resolves the host itself and dies with
+# `EAI_AGAIN: getaddrinfo <host>` — never even reaching the proxy (so it shows as 0 deny in
+# `sbx net stats`). NODE_USE_ENV_PROXY (Node 24+, which `nix:nodejs` provides) makes fetch
+# route through the proxy, so every runtime request is subject to the allowlist above.
+NODE_USE_ENV_PROXY = "1"
+
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

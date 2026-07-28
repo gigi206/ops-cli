@@ -50,6 +50,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`[secret]`](configuration/secret.md) — credential injection (links to [Secrets](secrets/README.md)).
 - [`[app.<name>]`](configuration/apps.md) — named launch profiles (links to [Apps](apps/README.md)).
 - [`[net.groups]`](configuration/net-groups.md) — reusable egress groups.
+- [`[bundle.<name>]`](configuration/bundles.md) — reusable tool bundles an app names with `use`.
 - [One-shot overrides](configuration/overrides.md) — `--config`/`--env`/`--net`/… and `SBX_*`.
 
 ## Command reference
@@ -64,6 +65,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 | [`mise`](cli/mise.md) | run the in-cage mise to self-equip a toolchain |
 | [`search`](cli/search.md) | discover `nix:` tools via nixhub |
 | [`test`](cli/test.md) | check whether an access would be allowed |
+| [`bundle`](cli/bundle.md) | list, export and import reusable tool bundles |
 | [`net`](cli/net.md) | inspect and manage the egress policy |
 | [`proc`](cli/proc.md) | observe a running sandbox's process tree |
 | [`fs`](cli/fs.md) | observe the files a running sandbox writes |

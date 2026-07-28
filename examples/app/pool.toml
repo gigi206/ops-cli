@@ -1,0 +1,139 @@
+# Poolside Agent CLI — Poolside's coding agent CLI (`pool`), sandboxed by sbx.
+#
+#   sbx app import examples/app/pool.toml
+#   sbx app run pool -- "<task>"            # run a task (the agent's entrypoint)
+#   sbx app run pool                        # interactive REPL / terminal
+#
+# PACKAGING — a bootstrap download, NOT a clean sbx backend. Poolside distributes
+# the CLI ONLY as a per-OS/per-arch tarball from `downloads.poolside.ai` (its own
+# `curl …/install.sh | sh` installer) — there is no nixpkgs attribute, no GitHub
+# release, and no genuine mise/aqua package for the standalone binary. So none of
+# sbx's `nix:`/`mise:`/`flake:`/`deb:` backends fit. Instead the `cmd` below runs
+# Poolside's OWN installer INSIDE the cage on the first launch, into the app's
+# isolated home — contained by bubblewrap + seccomp + the empty netns + the egress
+# allowlist. The installer extracts a `.tar.gz` with `tar -xzf`, so `[packages]`
+# provisions `tar` + `gzip` via nix (host-side, seeded, offline-reusable). The
+# downloaded `pool` binary is a foreign dynamic binary (the install page notes no
+# runtime, so it links the host loader); it runs against the cage's `nix-ld` loader
+# shim — the base userland supplies glibc, the runtime a tool dlopens. If the binary
+# fails to start for a missing shared library, the network gating is fine and you
+# need to add that lib as a `nix:` package (same pattern as `cursor-agent.toml`).
+# The download needs the network AND `downloads.poolside.ai` in `allow` on the first
+# launch of each project; later launches reuse the installed binary.
+#
+# CREDENTIAL POSTURE — a Poolside API token, NOT a header-injectable provider key.
+# The platform issues a single API key (surfaced via `POOLSIDE_API_KEY`, or saved in
+# `~/.config/poolside/credentials.json`); the default API URL is whatever the CLI
+# saved in `settings.yaml` (overridable with `POOLSIDE_API_URL`). There is no
+# documented per-provider HTTP header for sbx's `[secret]` broker to strip-and-inject,
+# so this profile ships **no `[secret]` block** (contrast the BYOK profiles like
+# `cline`/`opencode`). Two ways in:
+#
+#   1. API KEY (recommended for the cage) — set `$POOLSIDE_API_KEY` on the host and
+#      inject it for a single caged launch WITHOUT baking it into this file:
+#          sbx app run pool --env POOLSIDE_API_KEY=… -- "<task>"
+#      (`--env` is an authoritative one-shot override read on the HOST; the value
+#      reaches the cage env for that launch only, so the key never lands in the
+#      committed profile. `$SBX_ENV_POOLSIDE_API_KEY` works too.) This profile ships
+#      no `POOLSIDE_API_KEY` in `[env]` simply because a committed placeholder is
+#      noise here — NOT because it would shadow the flag: the one-shot override is
+#      applied after the app overlay and is the final word, so it beats a profile
+#      `[env]` value of the same key.
+#
+#   2. INTERACTIVE `pool login` — the CLI opens a browser (or, with NO_OPEN_BROWSER=1,
+#      prints the URL); whether it then polls Poolside's backend (which the allowlist
+#      permits → works in-cage) or waits on a `localhost` OAuth callback (which binds
+#      the CAGE's empty-netns loopback, unreachable from the host browser → does NOT
+#      complete) is UNVERIFIED. Prefer path 1. The auth hosts are covered by the
+#      `*.poolside.ai` wildcard in `allow`; run `pool whoami` to check authentication.
+#
+# When you do log in, the credential persists in the app's dedicated, persistent,
+# isolated home, never bleeding into the project shell or another app.
+#
+# EGRESS — honest scope. This profile IMPORTS and RESOLVES cleanly (covered by the
+# shipped-profiles test). The bootstrap download + the foreign-binary-under-nix-ld
+# run are modeled on the proven `cursor-agent` pattern; the RUNTIME host is a
+# `*.poolside.ai` wildcard because Poolside's API host is not documented on the
+# install page (the CLI stores it in `settings.yaml`, overridable via
+# `POOLSIDE_API_URL`). If a request is blocked, the proxy NAMES the host it refused —
+# add it to `allow` (or check ahead with `sbx test net <url>`). The download host
+# `downloads.poolside.ai` is concrete (read from the installer). If your deployment
+# uses a custom API URL, pass it with `--env POOLSIDE_API_URL=…` and add that host to
+# `allow`.
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+# First launch only: run Poolside's official installer into the isolated home
+# (contained by the sandbox + the egress allowlist). Later launches reuse the
+# installed binary. `pipefail` surfaces a failed `curl … | bash` as a clean install
+# error, not later as `pool: not found`. POOL_INSTALL_DIR pins it to ~/.local/bin;
+# POOL_INSTALL_ACCEPT_EULA=1 accepts the EULA headlessly; POOL_INSTALL_UPDATE_PATH=0
+# skips the interactive shell-config edit.
+#
+# UPGRADE. A bootstrap install rides no sbx `[packages]` backend, so `sbx upgrade` has
+# nothing to roll and the binary would stay at whatever version the first launch fetched.
+# Re-run the installer — which always resolves Poolside's current release — for ONE launch:
+#     sbx app run pool --env POOL_SBX_UPDATE=1
+# `--env` is an authoritative one-shot override read on the HOST, so the version moves only
+# when you ask, matching the "versions move only on an explicit upgrade" contract. Your
+# login/settings live elsewhere in the app home and are untouched.
+if [ ! -x "$HOME/.local/bin/pool" ] || [ -n "$POOL_SBX_UPDATE" ]; then
+  POOL_INSTALL_DIR="$HOME/.local/bin" POOL_INSTALL_ACCEPT_EULA=1 POOL_INSTALL_UPDATE_PATH=0 \
+    curl -fsSL https://downloads.poolside.ai/pool/install.sh | bash
+fi
+export PATH="$HOME/.local/bin:$PATH"
+exec pool "$@"
+    ''',
+    # `$0` placeholder: `sbx app run pool -- <args>` appends <args> to this cmd array,
+    # so they arrive as `$1 $2 …` and reach the agent verbatim via `exec … "$@"`.
+    "pool",
+]
+
+# Your host Poolside config, mounted read-write at its real absolute path. `binds` is
+# a security field, honored only because this profile lives in your trusted config
+# dir; `mode = "rw"` lets the caged `pool` read and write these host files (settings,
+# credentials, history). Uncomment to share your host Poolside setup with the cage
+# instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/poolside", mode = "rw" },
+#]
+
+[packages]
+# The Poolside installer extracts a `.tar.gz` with `tar -xzf`, so the cage needs
+# `tar` + `gzip` (the base toolset has `curl` but not these). Both are trusted-only
+# `nix:` packages — provisioned host-side, seeded, offline-reusable — and this
+# profile is trusted by location once imported.
+gnutar = "nix:gnutar"
+gzip = "nix:gzip"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing tasks /
+# context, reading completions) is opened to all verbs with a `{*}` prefix. The
+# download host is a plain `{GET}`.
+[network]
+mode = "deny"
+allow = [
+    # Bootstrap (first launch, and an explicit POOL_SBX_UPDATE re-run): Poolside's
+    # installer script, its `pool-latest-version.txt` version file, and the CLI tarball
+    # + checksums it downloads — all on this one host. `{GET}` — plain downloads.
+    # NOTE: this entry documents intent more than it enforces it, because the runtime
+    # wildcard below is `{*} *.poolside.ai` and a subdomain wildcard covers this host
+    # too, at every verb. Narrow the wildcard to your deployment's concrete API host
+    # once you know it (`sbx net log -a pool` names what it actually reaches) and this
+    # entry becomes the real, least-privilege bound on the download lane.
+    "{GET} https://downloads.poolside.ai",
+    # Runtime: Poolside's API / platform / auth backend. The exact hostname is not
+    # documented on the install page (the CLI stores it in `~/.config/poolside/
+    # settings.yaml`, overridable with `POOLSIDE_API_URL`); the `*.poolside.ai`
+    # wildcard covers api / platform / app / the auth hosts. Opened to all verbs
+    # because the agent POSTs tasks and reads completions. If your deployment uses a
+    # custom API URL, pass it with `--env POOLSIDE_API_URL=…` and add that host here.
+    "{*} https://*.poolside.ai",
+]
+
+[env]
+# Do NOT add `POOLSIDE_API_KEY` here — see the credential note in the header; a
+# placeholder in `[env]` would blank the `--env` key. sbx injects its MITM CA into
+# the cage automatically under a filtering posture via NODE_EXTRA_CA_CERTS /
+# SSL_CERT_FILE, which `pool` honours for outbound TLS.

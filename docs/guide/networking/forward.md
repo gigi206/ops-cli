@@ -79,7 +79,7 @@ SBX_FORWARD=1455,8080 sbx run -- ./dev-server
 
 ## The first consumer: codex's ChatGPT login
 
-`profiles/codex.toml` declares `forward = [1455]` and opens the OAuth runtime hosts in its
+`examples/app/codex.toml` declares `forward = [1455]` and opens the OAuth runtime hosts in its
 allowlist, so `sbx app run codex` → `codex login` completes end-to-end: codex opens the auth URL
 in your browser, you authenticate, the provider redirects to `localhost:1455`, the forwarder
 bridges it into the cage, codex receives the code, exchanges it (egress, allowlisted), and the

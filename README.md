@@ -93,8 +93,8 @@ apply from any project; security fields (`binds`, `network`, `secret`,
 A `[app.<name>]` table — or a standalone profile file under
 `<config>/sbx/apps/<name>.toml` — defines a named, reusable agent launcher with
 its own isolated `$HOME`, package set, network allowlist, and host-side credential
-injection. The [`profiles/`](profiles/) directory ships importable starter
-profiles (`sbx app import <file>`); see [`profiles/README.md`](profiles/README.md).
+injection. The [`examples/app/`](examples/app/) directory ships importable starter
+profiles (`sbx app import <file>`); see [`examples/README.md`](examples/README.md).
 
 ## Development
 

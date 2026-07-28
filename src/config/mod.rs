@@ -26,10 +26,12 @@ pub(crate) mod view;
 pub(crate) use types::*;
 
 pub(crate) use load::{
-    control_plane_pins, export_profile, load, load_scoped, net_groups, profile_path, profiles_dir,
-    read_net_groups_fragment, validate_profile, Source,
+    bundles, control_plane_pins, export_profile, is_valid_bundle_name, load, load_scoped,
+    net_groups, profile_path, profiles_dir, read_bundle_fragment, read_net_groups_fragment,
+    validate_profile, Source,
 };
 pub(crate) use overrides::{CliOverrides, Override};
+pub(crate) use schema::RawBundle;
 // Consumed by the resolution engine that stays in this file (and `global_path` by `manage`).
 use load::{canonicalize_binds, global_path, read_global, sbx_control_plane_roots};
 // The secret source/validation machinery the resolution engine folds into the resolved set.
@@ -556,14 +558,17 @@ impl Resolved {
             seccomp,
             devices,
             proc,
-            // The channel is applied earlier (before the lock is chosen); groups/apps are not
-            // launch-shaping and were noticed and dropped at collection time. An override's inline
+            // The channel is applied earlier (before the lock is chosen); groups/apps/bundles are
+            // not launch-shaping and were noticed and dropped at collection time (a bundle is only
+            // ever reached through an app's `use`, and an override declares no app). An override's
+            // inline
             // `[flakes]`, `[tarball]`, `[deb]`, and `[appimage]` tables are dropped (fail-closed): a
             // one-shot `--config` blob is no place for a multiline `flake.nix` or an auto-upgrade
             // resolver command, so all are declared in a profile or project config.
             nixpkgs: _,
             net: _,
             app: _,
+            bundle: _,
             flakes: _,
             tarball: _,
             deb: _,
@@ -2072,6 +2077,21 @@ fn resolve_app(
     if let Some((app, state)) = project {
         let trusted = state == TrustState::Trusted;
         let source = app_source(PROJECT_CONFIG, name);
+        // A trusted layer's `use` was already folded into the fields above, before resolution, so
+        // the references are only reported here — as the per-app note the untrusted case owes the
+        // user, in the same place and shape as the `network` one below. Without it, the drop would
+        // show only as an app mysteriously short of a tool and an egress rule.
+        if !app.uses.is_empty() && !trusted {
+            warnings.push(format!(
+                "{source}: ignoring `use` of bundle(s) {} ({})",
+                app.uses
+                    .iter()
+                    .map(|b| format!("`{b}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                untrusted_reason(state)
+            ));
+        }
         apply_env(&mut env, None, &mut warnings, &source, app.env, !trusted);
         if !app.binds.is_empty() {
             if trusted {

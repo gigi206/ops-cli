@@ -61,6 +61,10 @@ pub(crate) enum ManageError {
     /// An egress-group import named one or more groups that already exist and `--force` was not
     /// given — nothing was written, so the user can decide (overwrite with `--force`, or rename).
     GroupCollision(Vec<String>),
+    /// The same, for a bundle import. A distinct variant rather than a shared one carrying a noun:
+    /// the message names what the user actually typed, and a misnamed collision is exactly the kind
+    /// of small lie that makes an error message useless.
+    BundleCollision(Vec<String>),
     /// An `allow` proc rule was added but the `[proc]` mode is not `ask` — an allow rule only takes
     /// effect under `ask` (under `enforce` everything not denied already runs, so the rule would be
     /// inert). Refuse rather than write a rule that does nothing.
@@ -166,6 +170,12 @@ impl std::fmt::Display for ManageError {
                 f,
                 "{} already defined: {} — re-run with --force to overwrite",
                 if names.len() == 1 { "group" } else { "groups" },
+                names.join(", ")
+            ),
+            ManageError::BundleCollision(names) => write!(
+                f,
+                "{} already defined: {} — re-run with --force to overwrite",
+                if names.len() == 1 { "bundle" } else { "bundles" },
                 names.join(", ")
             ),
             ManageError::ProcAllowNeedsPosture => write!(
@@ -843,9 +853,82 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
 /// The result of [`import_net_groups`]: the group names newly added and those overwritten (only
 /// possible under `force`).
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ImportGroupsOutcome {
+pub(crate) struct ImportOutcome {
     pub(crate) added: Vec<String>,
     pub(crate) overwritten: Vec<String>,
+}
+
+/// Serialize a set of tool bundles as a portable `[bundle.<name>]` TOML fragment — what
+/// `sbx bundle export` writes. Fresh formatting (source comments are not carried); empty fields
+/// are omitted, so a bundle that carries only packages exports as one table. The inverse merge is
+/// [`import_bundles`], and the fragment round-trips through [`super::read_bundle_fragment`].
+///
+/// Serialized through `serde` rather than assembled with `toml_edit`: a bundle is a nested shape
+/// (four maps, three arrays, and the flattened `[secret]` hosts), and re-deriving that structure by
+/// hand would be a second, drift-prone description of a type that already knows how to write
+/// itself.
+pub(crate) fn export_bundles(
+    bundles: &std::collections::BTreeMap<String, super::RawBundle>,
+) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct Fragment<'a> {
+        bundle: &'a std::collections::BTreeMap<String, super::RawBundle>,
+    }
+    toml::to_string(&Fragment { bundle: bundles }).map_err(|e| e.to_string())
+}
+
+/// Merge bundle definitions into the config at `path` (the global config), preserving every
+/// existing bundle, comment and formatting via `toml_edit`. A bundle whose name already exists is
+/// overwritten only when `force` is set; otherwise the collisions are returned and **nothing is
+/// written**, so the merge is all-or-nothing. Written atomically.
+///
+/// Each incoming bundle is rendered by `serde` and re-parsed into an item, for the same reason
+/// [`export_bundles`] serializes: the nested shape is the type's business, not this function's.
+/// Only the *target* document is edited in place, so the user's own comments survive.
+pub(crate) fn import_bundles(
+    path: &Path,
+    bundles: &std::collections::BTreeMap<String, super::RawBundle>,
+    force: bool,
+) -> Result<ImportOutcome, ManageError> {
+    let mut doc = read_or_empty(path)?;
+    let table = doc
+        .as_table_mut()
+        .entry("bundle")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ManageError::NotScalar("bundle".to_string()))?;
+    // Implicit so only the `[bundle.<name>]` headers are emitted, never a bare `[bundle]`.
+    table.set_implicit(true);
+
+    // Collision check first, so a refused import writes nothing (all-or-nothing).
+    if !force {
+        let collisions: Vec<String> = bundles
+            .keys()
+            .filter(|n| table.contains_key(n))
+            .cloned()
+            .collect();
+        if !collisions.is_empty() {
+            return Err(ManageError::BundleCollision(collisions));
+        }
+    }
+
+    let mut added = Vec::new();
+    let mut overwritten = Vec::new();
+    for (name, bundle) in bundles {
+        let rendered =
+            toml::to_string(bundle).map_err(|e| ManageError::NotScalar(e.to_string()))?;
+        let parsed: DocumentMut = rendered
+            .parse()
+            .map_err(|e: toml_edit::TomlError| ManageError::NotScalar(e.to_string()))?;
+        if table.contains_key(name) {
+            overwritten.push(name.clone());
+        } else {
+            added.push(name.clone());
+        }
+        table.insert(name, Item::Table(parsed.as_table().clone()));
+    }
+    write_doc(path, &doc)?;
+    Ok(ImportOutcome { added, overwritten })
 }
 
 /// Serialize a set of egress groups as a portable `[net.groups]` TOML fragment — the value
@@ -880,7 +963,7 @@ pub(crate) fn import_net_groups(
     path: &Path,
     groups: &std::collections::BTreeMap<String, Vec<String>>,
     force: bool,
-) -> Result<ImportGroupsOutcome, ManageError> {
+) -> Result<ImportOutcome, ManageError> {
     let mut doc = read_or_empty(path)?;
     // Navigate to (creating if absent) the `[net.groups]` table, keeping `[net]` implicit.
     let net = doc
@@ -923,7 +1006,7 @@ pub(crate) fn import_net_groups(
         groups_tbl.insert(name, value(arr));
     }
     write_doc(path, &doc)?;
-    Ok(ImportGroupsOutcome { added, overwritten })
+    Ok(ImportOutcome { added, overwritten })
 }
 
 #[cfg(test)]

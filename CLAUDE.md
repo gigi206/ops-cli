@@ -96,6 +96,68 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`sbx storage status` reports the space that can be RECLAIMED, on one axis — correcting a
+  figure that was wrong twice over (DONE 2026-07-28)** (`src/storage.rs` + `src/cli/storage.rs` +
+  `docs/guide/cli/storage.md`): the user asked for the **reclaimable** space; the increment below
+  shipped `reclaiming` — *what leaves on its own* — and dismissed the reclaimable figure as
+  answering the wrong question. It did not. **(a) The two figures on screen were not on the same
+  axis.** `BTRFS_IOC_SPACE_INFO` returns **logical** bytes (`block_group->length`/`->used`), so a
+  `DUP` metadata group — the mkfs default on a single device, and sbx passes no `-m` — reports one
+  copy where the image carries two. `inside` was therefore **not comparable** with `on host`, and
+  the subtraction anyone would do on screen was wrong by the second copy: **986 MiB claimed where
+  62.5 MiB was true**, a 16× error I made in this very session before measuring. `Space` is now
+  counted **as the device carries it**, from the per-entry `flags` the parser previously **skipped**
+  — verified live, not from a header (`DUP` = `1<<5`, `GLOBAL_RSV` = `1<<49`), and cross-checked
+  against the kernel's own `disk_used`: `972 308 480 × 2 = 1 944 616 960`, exact. The global
+  reservation is now **excluded** (it is held *within* metadata already claimed — counting it made
+  `claimed` read 18.1 GiB instead of 20.0 GiB). Parity profiles are deliberately absent from the
+  factor table and count once: their cost cannot be derived from one block group's flags, and
+  neither they nor the multi-device mirrors can arise on a single loop image. **(b) The new line.**
+  `reclaimable = on host − inside used`, rendered so **the arithmetic can be checked on screen**,
+  which is the actual guard against repeating the error. **The user's `fstrim` run then found the
+  one case a pure subtraction gets wrong, and it is the best-case state:** the two counters are
+  independent — btrfs's per-block-group totals against the host's block accounting for the image —
+  and they *cross*. Measured immediately after the trim: host **14 584 774 656** against a live
+  **14 590 328 832**, the image reading **5.3 MiB under** the data inside it, **stably** (unchanged
+  across repeated reads and a `sync`). A `checked_sub` made the line **vanish exactly when the
+  volume was at its tidiest**. So the shortfall is now read against the host filesystem, via a new
+  `FsKind::may_compress` (deliberately **not** `is_cow`, which answers the unrelated
+  offer-a-volume question, and where `Other(_)` counts as *may* so an unknown falls through to no
+  answer): one that cannot compress → the counters crossed → **`Some(0)`**, rendered `0 B —
+  nothing the image can give back`; one that can → the image is structurally smaller than its
+  contents → **`None`**, no line, the `reflink_verdict` precedent. A `sudo fstrim`
+  hint appears only past **1 GiB** — the figure is never zero, and nagging for 62 MiB teaches the
+  reader to skip the line. **(c) The kernel's queue is a signal, not an amount — a second
+  correction, forced by measurement mid-implementation.** The approved design had it as
+  `N of it already on the way back`; live, the queue read **1 178 042 368 against a 908 242 944
+  gap** — larger than the whole it claimed to be part of. `discardable_bytes` counts free space
+  *eligible* for discard, including regions already punched out of the image (the kernel keeps the
+  skipped total in the sibling **`discard_bytes_saved`**, 3.1 GiB here). So it is now an
+  **unquantified** line, `some of it queued for automatic return`, and `reclaiming_bytes` was
+  renamed `discard_queue` with its doc corrected — the previous doc ("the space the host figure is
+  about to stop counting") asserted exactly what the counter does not measure. **The semantics are
+  proven without root**, which the fstrim path could not be: writing and deleting 800 MiB took the
+  figure to 908 MiB, it sat flat for **96 s**, then the worker returned the blocks in one step and
+  it fell to **69 MiB** — the figure tracks the return, and the queue over-stated it by ~250 MiB.
+  **The `sudo fstrim` claim is now verified, by the user:** 14 667 313 152 → 14 584 774 656, a
+  **78.7 MiB** drop against a predicted ~73 MiB (the gap is churn between the two measurements), so
+  the residue no queue covers *is* trimmable and the rewritten prose holds. It also confirmed the
+  doc's warning about the instrument: `fstrim -v` reported **6.2 GiB trimmed** for 78.7 MiB actually
+  returned — 79× over, because it counts ranges already punched out. **Tests:** 4 net-new unit (the
+  mirrored tally; the factor table with the parity profiles pinned; the crossing-vs-unmeasurable
+  split, keyed on the real post-trim values; `may_compress` incl. the `Other(_)` fall-through and an
+  assertion that it does not track `is_cow`), **teeth proven in both directions** by restoring the
+  faulty accounting — both tally tests fail. **1334 unit green** (the one full-suite failure,
+  `a_mise_used_tool_is_activated_on_path_in_a_later_launch`, is a network smoke under parallel
+  contention: **passes alone in 101.78 s**, and touches nothing here), fmt/clippy `-D warnings`
+  clean, **std-only**, musl rebuilt and **all three states proven on the shipped binary** (at rest
+  no sub-line + `discard_queued: false`; queued sub-line + `true`; past 1 GiB the fstrim hint), with
+  `--json` agreeing with the render by the same rule. **Scope, verified rather than asserted:**
+  `storage::space` has exactly **one** consumer, so `doctor` and `store` read none of the figures
+  whose axis changed; `sbx store`'s own `btrfs volume — N on host` comes from `image_bytes` (the
+  same device figure) and its tree sizes are already documented as logical upper bounds, so the two
+  screens do not contradict.
+  See [[storage-reclaim-and-reflink-probe]], [[storage-btrfs-volume]].
   **The three residuals the storage increment named, closed (DONE 2026-07-27)**
   (`src/storage.rs` + `src/sandbox/{projectstore,mod}.rs` + `src/cli/doctor.rs` +
   `docs/guide/cli/doctor.md`): each of the three was named honestly rather than fixed, and each is
@@ -136,14 +198,19 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   can sit just below zero, which is a queue of nothing, not a figure. **Proven live end-to-end, the
   full curve:** line absent (counter 0, host 13.6 GiB) → write and delete 800 MiB of incompressible
   data → `reclaiming 1.3 GiB`, host 14.4 GiB → at **t+135 s** the line is gone and host is back to
-  **13.6 GiB**, the exact starting figure. **This is also what retired the alternative that was
-  written first and reverted:** a "reclaimable" figure computed by subtraction, pushing the user at
-  `sudo fstrim`. It was accurate to the MiB — and answering the wrong question, because the gap is
-  **transitory**; the original note (`freed space returns to the host in the background…`) had been
-  right all along, and the diagnosis that contradicted it came from a measurement taken at **20 s**,
-  before the throttled worker had started. The docs are corrected in the same direction: **wait
-  rather than act**, `sudo fstrim` demoted to "if you would rather not wait", and the claim that
-  *most* distributions enable `fstrim.timer` replaced by how to check your own. **(b) The volume is
+  **13.6 GiB**, the exact starting figure. **[REVISED 2026-07-28 — the conclusion drawn from that
+  curve was wrong; see the reclaimable-line entry at the top.]** The curve was used to retire an
+  alternative written first: a "reclaimable" figure computed by subtraction, pushing the user at
+  `sudo fstrim`, dismissed as answering the wrong question because the gap is **transitory**. What
+  the curve actually proved is that the *queued* part is transitory. The residue the queue never
+  covers — extents freed under an **earlier** mount, which async discard only queues for the mount
+  that frees them — does not resolve itself, measured live at **62.5 MiB of gap against a 2.9 MiB
+  queue**. Nor was the retired figure "accurate to the MiB": it subtracted the ioctl's **logical**
+  bytes from the image's **device** bytes, over-stating the gap by the second copy of every DUP
+  metadata block (986 MiB where 62.5 MiB was true). The docs' **wait rather than act** framing,
+  and the demotion of `sudo fstrim` to "if you would rather not wait", followed from the same
+  mistake and are rewritten with it; the claim that *most* distributions enable `fstrim.timer` was
+  separately replaced by how to check your own, which stands. **(b) The volume is
   offered by what it would add, not by whether the filesystem is copy-on-write.** `recommends_volume`
   tested `!FsKind::is_cow()` — a hand-written table of superblock magics — which said **yes on
   tmpfs**: sbx would propose a 200 GiB compressed volume in RAM. The new pure
@@ -246,8 +313,91 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   clean, **std-only** (no new dep), musl release rebuilt and the whole chain re-proven on the
   **shipped** binary. See [[gc-recreates-nixpkgs-source]], [[m5-gc]], [[storage-btrfs-volume]],
   [[tree-size-hardlink-bug]].
+  **`[bundle.<name>]` + `use` — reusable tool bundles, and `profiles/` becomes `examples/{app,bundle}/`
+  (DONE 2026-07-28)** (`src/config/{schema,load,mod,manage,overrides,tests}.rs` + `src/cli/bundle.rs`
+  [new] + `src/cli/{app,mod}.rs` + `src/help.rs` + `docs/guide/configuration/bundles.md` [new] +
+  `docs/guide/cli/bundle.md` [new] + `examples/**` + `tests/{config,help}.rs`): the user asked whether a
+  profile could have a section including other apps — useful for the orchestrators (aionui, t3code,
+  open-design) that drive ANOTHER agent's CLI and hand-copy its requirements. **The duplication was not
+  merely verbose, it was already wrong, proven by diff**: aionui's copy of Claude Code's allow-set was
+  missing `platform.claude.com` (which `claude-code.toml` itself documents the CLI contacting at EVERY
+  startup — "Unable to connect to Anthropic services"), plus `console`/`mcp-proxy`/`downloads`; and
+  open-design carried NONE of opencode's 6 runtime hosts (its own comment admitted it). Both fixed
+  first, justified host by host — only the unconditional ones, with the rest named in a comment
+  pointing at `sbx net logs`.
+  **A drift GUARD was built, measured, and abandoned — that measurement is the increment's real
+  finding.** Every candidate invariant infers an obligation from a shared artefact, and each is
+  defeated by a legitimate intent difference: 5 candidate hits, 5 explained — `kiro-desktop` is a
+  DIFFERENT product (`nix:kiro-cli` vs `tarball:resolve`) whose `*.gstatic.com` covers 4 of its
+  "missing" hosts; `hermes-webui` is a third-party UI with a smaller feature surface; and the one hit
+  of the narrowest rule tried (don't narrow verbs on a shared host) was aionui rightly omitting `{WS}`,
+  since with no `audio = true` there is no microphone and `/voice` is unusable. **Sharing an artefact
+  does not imply sharing the reach — the obligation must be DECLARED, not inferred**, which is exactly
+  the argument for a bundle. No guard shipped; a waiver mechanism to rescue one was refused.
+  **The mechanism.** A bundle carries what ONE tool needs to be installed and to reach its own
+  services — `packages`, `env`, `allow`/`deny`/`mute`, `secret`, and the resolver tables that pair with
+  a package — and **nothing about the shape of the cage**: no `cmd` (an app's command is its identity;
+  inheriting one is an integrity hijack), no `binds`/`forward`/`devices`/`seccomp`/`limits`, no posture
+  scalar. So using one can never widen host exposure, nor silently switch on a microphone because the
+  packaged tool can use one. **Why a bundle and not the symmetric `env.groups`/`packages.groups`** (the
+  user's first instinct, measured then set aside): `@name` works for `allow` because it is a
+  `Vec<String>`; `packages`/`env` are `BTreeMap`s with no slot for a reference, and `[net.groups]` only
+  works because `net` is a struct DISTINCT from `network` — `[env]`/`[packages]` *are* the maps. The
+  transposition would need 2 new top-level namespaces + 2 reserved keys + flatten refactors on 4 sites,
+  and a bundle referencing a group would reopen the nesting `[net.groups]` banned by construction. A
+  bundle has no `use` field, so nesting (and any cycle) is impossible; its `allow` entries may still be
+  `@group` refs — reference sites, folded before classification, so expansion still runs once.
+  **Seam:** folded on the **raw** `RawApp` in `load_scoped`, before `resolve`, so the whole
+  gating/layering machinery applies unchanged (the same way imported profiles ride the global app
+  layer). Precedence is `merge_app`'s rule one level up: bundles left-to-right, the app beats all.
+  `use` is a **security field** — a bundle carries egress and credentials from the trusted global
+  config, so an untrusted project naming one would choose which trusted reach to graft onto an app it
+  controls; not folded, and reported as a per-app note. **Egress with no `[network]` table on the app
+  is dropped + noted, not synthesized:** a mode-less `NetworkTable` inherits only a *filtering* parent,
+  so under a `shared`/`allow`/absent baseline it falls back to `deny` — inventing one would narrow a
+  wide-open app. Verified, not assumed. **Every fold message is a per-app note, not a global warning**
+  — a global one does NOT appear on `sbx config show --app`, exactly where someone whose app came up
+  agent-less looks (found by checking, then fixed; the same gap was then found and fixed on
+  `sbx app import`, which was silent about a missing bundle while its posture report read
+  `packages: aionui, chromium`). `use` now also appears in the **granted posture** at import, because a
+  bundle grants egress and possibly a credential.
+  **CLI** `sbx bundle [<name>…] [--json] | export | import` mirrors `sbx net groups` (merge into the
+  global config via `toml_edit` preserving comments, collision refused without `--force`,
+  all-or-nothing), with a dedicated `BundleCollision` error so the message names a bundle rather than a
+  group, and an import-time warning naming any bundle that would grant egress or a credential.
+  **Layout:** `profiles/` → `examples/app/` + `examples/bundle/`, named after the command that imports
+  each — 99 textual references rewritten, **zero runtime coupling** (`profiles_dir()` is
+  `<config>/sbx/apps/`; one hardcoded test path). The dated design docs under `docs/bwrap-*.md` were
+  deliberately left verbatim (they are snapshots); path references inside this file's append-only log
+  WERE updated for internal consistency — paths only, no claim touched.
+  **16 agent bundles ship**, derived mechanically from their namesake profile. `cursor-agent` has none
+  (a bootstrap download, no package); `chromium`/`agent-browser` are left out of the hermes bundle (only
+  useful under a `gui` posture a bundle cannot set, and a large closure). **`nodejs` is NOT plumbing**
+  for a `mise:npm:` agent — mise's npm backend needs a node in the cage, so it belongs to the bundle.
+  **Trap caught by parse-verifying rather than reasoning after the fact:** the generator first emitted
+  `allow` AFTER `[…packages]`, so TOML folded it into that table and it vanished; every bundle now
+  carries a FIELD-ORDER note and the 16 are parse-checked.
+  **The self-contained split:** standalone agent profiles stay **one-step imports** (they do NOT use
+  their own bundle) — only the 3 orchestrators name one, because theirs is the copying proven to drift.
+  The bundle↔profile duplication is pinned by `every_shipped_bundle_matches_the_agent_profile_it_was_derived_from`
+  — **containment, not equality** — and that test IS sound where the cross-profile guard was not: both
+  artefacts are authored here for the same agent, so the obligation is declared by construction. Teeth
+  demonstrated in both failure modes (an invented rule; an orphan bundle with no namesake profile).
+  **Tests:** 4 net-new `load.rs` unit (fold, precedence both directions, unknown/malformed reference,
+  and "a bundle never moves a posture" over three postures) + 2 `cli/bundle.rs` unit (the listing
+  summary, the export→import round-trip through the real fragment reader) + the extended app round-trip
+  (the `use` array's emitted position) + the bundle↔profile guard + 4 config integration (fold with
+  app-wins, the flagship untrusted-`use` drop, the CLI round-trip, and the credential-under-a-
+  non-filtering-posture case the first cut did not cover). **1334 unit + 103 config + 13 help + 11 app
+  green**, fmt/clippy `-D warnings` clean, **std-only** (no new dep), musl rebuilt and the chain
+  re-proven on the shipped binary. **Honest residual:** 11 of the 16 bundles have no consumer yet (they
+  publish an agent's requirement statement); `examples/app/opencode.toml` still justifies
+  `registry.npmjs.org` as "equipping opencode via mise", which `mise registry opencode` disproves
+  (`aqua:anomalyco/opencode`, a GitHub release) — the host is still wanted for opencode's runtime plugin
+  fetch, but the reason is wrong. See [[bundle-tool-composition]], [[net-egress-groups]],
+  [[ops-app-framework]], [[toml-field-placement-silent-drop]].
   **`systemd-run` was substituting variables into the cage's own command line — found through an app
-  that could not start (DONE 2026-07-25)** (`src/sandbox/cgroup.rs` + `profiles/aionui.toml` +
+  that could not start (DONE 2026-07-25)** (`src/sandbox/cgroup.rs` + `examples/app/aionui.toml` +
   `tests/run.rs`): the user reported `sbx app run aionui` opening on a modal **"AionUi installation is
   incomplete — the managed Node runtime cannot start"**. Two distinct defects came out of it, the
   second far larger than the app it surfaced through.
@@ -417,8 +567,8 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   **`gui = "offscreen"` — a third posture, so a headless browser works without a display (DONE
   2026-07-25)** (`src/config/{types,mod,schema,view,overrides}.rs` + `src/cli/config.rs` +
   `src/sandbox/launch.rs` + `src/help.rs` + `docs/guide/configuration/{gui,overrides}.md` +
-  `docs/guide/reference/environment-variables.md` + `profiles/{hermes,hermes-web,hermes-webui,
-  hermes-desktop}.toml` + `profiles/README.md` + `tests/run.rs`; findings
+  `docs/guide/reference/environment-variables.md` + `examples/app/{hermes,hermes-web,hermes-webui,
+  hermes-desktop}.toml` + `examples/README.md` + `tests/run.rs`; findings
   `docs/bwrap-hermes-browser-toolset-spike-2026-07-25.md`): the user reported that the caged
   `hermes` offers **far fewer tools than a standard install**. Traced to Hermes' own gating, not to
   a sandbox failure: it builds its tool schema from `toolsets._HERMES_CORE_TOOLS` filtered per tool
@@ -525,7 +675,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   **`sbx run`/`sbx shell` merged — one docker-style verb (BREAKING, DONE 2026-07-17)**
   (`src/sandbox/{launch,mod}.rs` + `src/{main,help}.rs` + `src/session.rs` + comment sweeps across
   `config/{mod,schema}.rs` + `sandbox/{binds,egress,forward,spec,attach}.rs` + `docs/guide/**` (incl.
-  `cli/shell.md` DELETED, folded into `cli/run.md`) + `README.md` + `profiles/README.md` +
+  `cli/shell.md` DELETED, folded into `cli/run.md`) + `README.md` + `examples/README.md` +
   `tests/{help,shell}.rs`): `sbx shell` is **removed** and folded into `sbx run` (one verb, like
   `docker run`). **Dispatch** (`sandbox::run`): `interactive = !detach && isatty(0)`. With **no
   command** → the project shell: a tty opens the interactive pty shell (the old `sbx shell` body —
@@ -618,7 +768,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   [[global-apps-are-profile-files]], [[app-rm-purge]].
   **`audio = true` — microphone + playback in the cage via PulseAudio (DONE 2026-07-13)**
   (`src/sandbox/audio.rs` [new] + `mod.rs` + `config/{schema,mod,view,overrides}.rs` + `src/{main,help}.rs`
-  + `sandbox/launch.rs` + `profiles/claude-desktop.toml` + `docs/guide/configuration/{audio,README}.md`
+  + `sandbox/launch.rs` + `examples/app/claude-desktop.toml` + `docs/guide/configuration/{audio,README}.md`
   + `docs/guide/README.md` + `tests/{config,run}.rs`): a **trusted-only security field `audio = true`**
   (a boolean, mirroring `gpu` **exactly** across schema/resolve/gating/merge_app/view/`--audio`+`OPS_AUDIO`
   /`equip_for_gc`/the flagship) that opens **microphone + playback** for a graphical app. Born from the
@@ -653,7 +803,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (`is_reserved_env_key` matches `LD_*`). **Scope v1 = PulseAudio** (covers mic + playback); the
   PipeWire-native `pipewire-0` socket is deferred. **Live-proven end-to-end:** the real mic in
   `claude-desktop` records (user confirmed "le micro fonctionne") via the one-shot override with the full
-  stack on (gui + gpu + dbus=incage); then codified, and `profiles/claude-desktop.toml` migrated to
+  stack on (gui + gpu + dbus=incage); then codified, and `examples/app/claude-desktop.toml` migrated to
   `audio = true`. **Tests:** 3 audio.rs unit (`host_socket`, `env`, `asound_conf`) + 2 config integration
   (untrusted-drop, the flagship untrusted-override) + 1 run.rs e2e
   `a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage`
@@ -662,7 +812,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   socket / sandbox). fmt/clippy `-D warnings` clean, **std-only** (`audio.rs` reuses `store::provision`).
   See [[audio-hole]], [[gpu-hole]], [[dbus-hole]], [[electron-gui-profiles]].
   **`audio = true` — v2: the ALSA→PulseAudio shim, for CLI voice tools (DONE 2026-07-13)** (`src/sandbox/
-  audio.rs` + `launch.rs` + `profiles/{codex,hermes,claude-code}.toml` + `docs/guide/configuration/audio.md`
+  audio.rs` + `launch.rs` + `examples/app/{codex,hermes,claude-code}.toml` + `docs/guide/configuration/audio.md`
   + `tests/run.rs`): the user asked *which profiles need audio*, and a source-verified research pass found
   it is **not only the GUI apps** — the terminal CLIs **claude-code** (`/voice`), **codex**
   (voice_transcription, `cpal`), and **hermes** (voice mode Ctrl+B, `sounddevice`) all have in-process voice
@@ -805,7 +955,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   [[dbus-hole]], [[gpu-hole]], [[electron-gui-profiles]].
   **`dbus = true` — a filtered D-Bus session bus in the cage (DONE 2026-07-09)**
   (`src/sandbox/dbus.rs` [new] + `mod.rs` + `config/{schema,mod,view}.rs` + `src/{main}.rs` +
-  `sandbox/launch.rs` + `profiles/opencode-desktop.toml` + `docs/guide/configuration/{dbus,README}.md`
+  `sandbox/launch.rs` + `examples/app/opencode-desktop.toml` + `docs/guide/configuration/{dbus,README}.md`
   + `docs/guide/README.md` + `tests/{config,run}.rs`): a **trusted-only security field `dbus = true`**
   (a boolean, mirroring `gpu`) that opens a **filtered** D-Bus session bus so a graphical app can
   **follow the host light/dark theme** (the desktop `appearance` portal) and **raise notifications**.
@@ -871,7 +1021,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   GSettings). **Roadmap:** NVIDIA GPU (opt-in slice), then a custom `[dbus]` interface allowlist.
   **`gpu = true` — hardware-accelerated GPU rendering in the cage (DONE 2026-07-09)**
   (`src/sandbox/gpu.rs` [new] + `mod.rs` + `config/{schema,mod,view}.rs` + `src/{main}.rs` +
-  `sandbox/launch.rs` + `profiles/opencode-desktop.toml` + `docs/guide/configuration/{gpu,README}.md`
+  `sandbox/launch.rs` + `examples/app/opencode-desktop.toml` + `docs/guide/configuration/{gpu,README}.md`
   + `docs/guide/README.md` + `tests/{config,run}.rs`): a **trusted-only security field `gpu = true`**
   (a boolean, mirroring `gui`) that opens hardware-accelerated GPU rendering. Born from live-debugging
   why **`opencode-desktop`'s Electron window never mapped**: on Wayland a Chromium/Electron app with no
@@ -940,7 +1090,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   **Roadmap:** NVIDIA (opt-in slice, host-lib bind + PRIME), then a filtered dbus proxy.
   **`deb:` package backend — a prebuilt `.deb` provisioned host-side (DONE 2026-07-09)**
   (`src/sandbox/deb.rs` [new] + `mod.rs` + `config/{mod,view}.rs` + `packages.rs` + `launch.rs` +
-  `main.rs` + `help.rs` + `profiles/opencode-desktop.toml` + `profiles/README.md` + `docs/guide/
+  `main.rs` + `help.rs` + `examples/app/opencode-desktop.toml` + `examples/README.md` + `docs/guide/
   {configuration/packages,cli/upgrade,housekeeping/upgrade}.md`): a **fourth `[packages]` backend**,
   `deb:<url>`, so opencode-desktop stops depending on the third-party `tomsch/opencode-desktop-nix`
   flake (a single-maintainer repo, deemed unreliable by the user). A GUI/desktop app shipped **only
@@ -1024,7 +1174,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   argv); a **dbus session bus** for GUI apps is still absent (no notifications/tray/system-keyring —
   benign for editing/chat; a keyring login falls back to a file in the isolated home).
   **opencode GUI profiles — `opencode-web` + `opencode-desktop` (DONE 2026-07-08)**
-  (`profiles/opencode-web.toml` [new] + `profiles/opencode-desktop.toml` [new] + `profiles/
+  (`examples/app/opencode-web.toml` [new] + `examples/app/opencode-desktop.toml` [new] + `examples/app/
   README.md`; no ops code change): two graphical ways to run opencode under ops, both live-proven.
   **`opencode-web`** runs opencode's `web` server headless in the cage and reaches the host browser
   via the inbound **`forward = [4096]`** hole (a TOP-LEVEL field): `mise:opencode` (no build),
@@ -1059,7 +1209,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   **`[network] mute` — SELinux-`dontaudit` egress-log suppression (DONE 2026-07-08)**
   (`src/allowlist.rs` + `config/{schema,mod,view,manage}.rs` + `sandbox/{control,proxy,egress,
   netlearn}.rs` + `{main,help}.rs` + `docs/guide/networking/{observability,rules}.md` +
-  `configuration/network.md` + `cli/net.md` + `profiles/agy.toml` + `tests/{config,net}.rs`):
+  `configuration/network.md` + `cli/net.md` + `examples/app/agy.toml` + `tests/{config,net}.rs`):
   bringing up the **Antigravity CLI (`agy`)** surfaced the recurring pain that a busy agent hammers
   hosts a user has **deliberately left denied** (telemetry, feature flags, an optional Playwright
   CDN), and those refusals drown the *actionable* denials in `ops net log`. A **`mute` list** (the
@@ -1094,7 +1244,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   **Residual pass:** a live mute now lists in `ops net rules --source session` (a 3-state
   `ManualKind` allow/deny/**mute** replacing the binary `is_allow`; `RULES` emits `manual mute`,
   `query_manual` parses it, `net_rules_manual` maps it), and `unmute` of the last entry drops the
-  key (no `mute = []` residue, table + inline forms). **Profile:** `profiles/agy.toml` carries a
+  key (no `mute = []` residue, table + inline forms). **Profile:** `examples/app/agy.toml` carries a
   `mute` block (`play.googleapis.com` telemetry, `antigravity-unleash.goog` feature flags, the three
   `playwright*.azureedge.net` driver mirrors) so `ops net log -a agy` reads clean by default.
   **Tests (net-new):** allowlist `muted`/method-scope (2), config classify+group (1), proxy
@@ -1103,7 +1253,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   mute/unmute round-trip + `--session` no-op + posture/refusal (2). **std-only, no new dep.** The
   `--session` overlay path reuses the proactive `ops net allow|deny --session` machinery.
   **Synthetic `/etc/hosts` — `localhost` resolves in the cage (DONE 2026-07-08)** (`src/sandbox/
-  binds.rs` + `tests/run.rs` + `profiles/agy.toml` [new] + `profiles/README.md`): bringing up the
+  binds.rs` + `tests/run.rs` + `examples/app/agy.toml` [new] + `examples/README.md`): bringing up the
   **Antigravity CLI (`agy`)** profile surfaced a real cage gap. `agy` starts an internal language
   server that binds `localhost`; the hermetic cage carried **no `/etc/hosts`**, so resolving the
   *name* `localhost` fell through the file lookup to DNS — which the Model-B empty netns has no
@@ -1998,8 +2148,8 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   clean, **musl static build verified**, advisor-reviewed (plan AND impl — the spike was its call; it
   flagged the export-vs-load precedence divergence, now documented). Export/import is **complete**;
   the **signed-store distribution** of profiles stays deferred. **Starter app profiles — first three
-  SHIPPED (user, 2026-06-21)** (`profiles/{claude-code,codex,opencode}.toml` + `profiles/README.md` +
-  a `the_shipped_profiles_import_and_resolve` test): importable `profiles/*.toml` artifacts in the repo
+  SHIPPED (user, 2026-06-21)** (`examples/app/{claude-code,codex,opencode}.toml` + `examples/README.md` +
+  a `the_shipped_profiles_import_and_resolve` test): importable `examples/app/*.toml` artifacts in the repo
   (NOT built-in — imported deliberately). Each = `cmd` + `[packages]` (the tool from nixpkgs) +
   `[network] allowlist` (the provider host) + `[secret]` (the API key injected **host-side** by the
   egress proxy, never in the cage; an in-cage placeholder lets the CLI start, the proxy strips +
@@ -2064,7 +2214,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   committed headline proof).
   **`[packages]` backend prefix + fresh app profiles — DONE (2026-06-21)** (`src/config/schema.rs`
   + `config/mod.rs` + `src/sandbox/packages.rs` + `launch.rs` + `main.rs` + `search.rs` +
-  `profiles/*.toml`; plan `docs/bwrap-packages-backend-prefix-plan.md`): the slice that makes the
+  `examples/app/*.toml`; plan `docs/bwrap-packages-backend-prefix-plan.md`): the slice that makes the
   shipped profiles **fresh** (measured before: nixpkgs lagged — claude-code 2.1.170 vs upstream
   2.1.185, and was additionally **unfree** in nixpkgs). Every `[packages]` value now carries a
   **mandatory backend prefix** — `nix:<attr>` (host-side nixpkgs, durable/seeded/offline) or
@@ -2157,8 +2307,8 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   the e2e). **v1 floats** (no pin); a `flake:` pin (`nix flake metadata` → a lock) + `ops upgrade`
   for flakes is **named, not built**. The backend packages a tool; it does **not** solve a tool's
   **auth** (a flake-packaged agent still needs a header-injectable credential to be profile-able).
-  Also this thread, **starter profiles + a live flake-build validation (2026-06-22):** `profiles/pi.toml`
-  (`pi`, multi-provider/Anthropic-default, `mise:aqua:earendil-works/pi`) and **`profiles/hermes.toml`**
+  Also this thread, **starter profiles + a live flake-build validation (2026-06-22):** `examples/app/pi.toml`
+  (`pi`, multi-provider/Anthropic-default, `mise:aqua:earendil-works/pi`) and **`examples/app/hermes.toml`**
   (`hermes`, `flake:github:NousResearch/hermes-agent#default`, keyed OpenRouter) ship and import+resolve
   (`the_shipped_profiles_import_and_resolve`). **hermes's in-cage flake build was PROVEN live** — the
   headline proof that `flake:` equips a flake-only tool: `hermes` lands on PATH after a real in-cage
@@ -2181,9 +2331,9 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   such builders to honour the proxy or route them through nix's fetcher. Live-auth (the proxy-injected
   key) stays the flagship pending-real-key step for every profile. Triage of the rest (cline/droid →
   `/usr/bin/env` shim; agy/freebuff → OAuth not header; opencode-desktop/t3 → Wayland; aionui →
-  Electron-in-cage deferred) in `profiles/README.md`. See [[ubi-backend-deprecated]], [[ops-app-framework]].
+  Electron-in-cage deferred) in `examples/README.md`. See [[ubi-backend-deprecated]], [[ops-app-framework]].
   **`/usr/bin/env` FHS facade + the first npm/node CLI profile (freebuff) — DONE (2026-06-22)**
-  (`src/sandbox/binds.rs` + `fhs.rs` + `launch.rs` + `tests/run.rs` + `profiles/freebuff.toml`):
+  (`src/sandbox/binds.rs` + `fhs.rs` + `launch.rs` + `tests/run.rs` + `examples/app/freebuff.toml`):
   the design answer to *"is nix even the right approach?"* (the user's question, after the
   `/usr/bin/env` friction): **yes — keep nix, complete the FHS-interop facade.** The cage already
   synthesises the only two FHS paths nix's own ecosystem standardises — `/bin/sh` and, now,
@@ -2203,7 +2353,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   (`a_usr_bin_env_shebang_resolves_in_the_cage`): a `#!/usr/bin/env node` script (with `nix:nodejs`)
   executed *by its own path* → `ENV-SHEBANG-OK v24.15.0` (teeth: a bare `node <script>` would prove
   node, not the shebang path). **This unblocks the `npm:` backend** (the documented gap is closed),
-  shipped as **`profiles/freebuff.toml`** — the **first npm/node-runtime CLI profile**: `cmd =
+  shipped as **`examples/app/freebuff.toml`** — the **first npm/node-runtime CLI profile**: `cmd =
   "freebuff"`, `[packages] nodejs = "nix:nodejs"` + `freebuff = "mise:npm:freebuff"`,
   `[network] allow = ["registry.npmjs.org", "codebuff.com", "www.codebuff.com"]`. **A different
   credential posture (user-accepted, not header-BYOK):** freebuff's npm package is a thin launcher
@@ -2224,7 +2374,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   headlessly — URL-paste vs a browser — is unverified; the user's account). `cline` + `droid` (the
   next non-desktop CLIs this facade unblocked) **then SHIPPED** — see the next block. See
   [[ops-app-framework]], [[ubi-backend-deprecated]].
-  **`cline` + `droid` profiles — DONE (2026-06-22)** (`profiles/{cline,droid}.toml`; the
+  **`cline` + `droid` profiles — DONE (2026-06-22)** (`examples/app/{cline,droid}.toml`; the
   data-driven `the_shipped_profiles_import_and_resolve` now covers **9** profiles): the two npm/node
   CLIs the `/usr/bin/env` facade unblocked, both equipped `nix:nodejs` + `mise:npm:<tool>`.
   **Grounded from primary sources first** (two parallel research agents, every value URL-cited or

@@ -26,6 +26,7 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 
 | Command | Purpose |
 |---|---|
+| [`sbx bundle`](bundle.md) | list, export and import reusable tool bundles |
 | [`sbx net`](net.md) | inspect the egress policy, its rules, and parked `ask` requests |
 | [`sbx test net`](test.md) | test one URL against the resolved policy |
 

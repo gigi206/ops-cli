@@ -1,0 +1,326 @@
+# Claude Desktop — Anthropic's official desktop app (Chat + Cowork + Code), sandboxed by sbx.
+#
+#   sbx app import examples/app/claude-desktop.toml
+#   sbx app run claude-desktop
+#
+# This is the GRAPHICAL app whose **Code** tab runs the same Claude Code engine as the
+# `claude-code` CLI profile (its terminal sibling), plus the Chat and Cowork tabs, parallel
+# sessions, visual diff review, and an integrated terminal + editor. Anthropic ships an official
+# **Linux beta** (Ubuntu 22.04+/Debian 12+, x86_64/arm64) as a `.deb`; the docs live on the Claude
+# Code docs site (code.claude.com/docs/en/desktop-linux). Neither a `.deb` nor the apt repo installs
+# in the hermetic cage, so sbx packages it with the `deb:` backend.
+#
+# THE `deb:` BACKEND. sbx fetches Anthropic's prebuilt `.deb` directly, resolves it to a content
+# hash (pinned in the per-project deb lock), and builds a generated derivation that `dpkg-deb -x`-
+# unpacks it and `autoPatchelfHook`s the Electron binaries against a curated library set — no apt,
+# no maintainer scripts, no from-source build. The build is HOST-SIDE (like `nix:`), safe because a
+# `.deb` runs no build script; the result is seeded into the store and offline-reusable. FIRST
+# LAUNCH resolves + builds it, pulling the Electron closure (~145 MiB `.deb` plus its runtime
+# closure — a couple of minutes, over your host network, NOT the cage allowlist). Later launches
+# reuse the pinned build offline.
+#
+# VERSIONS — tracked automatically. Anthropic's apt pool has **no "latest" URL** (each `.deb` is
+# version-stamped `claude-desktop_<ver>_amd64.deb`), so instead of hand-pinning one version this
+# profile uses the `deb:apt:` backend pointed at the pool's `Packages` index: sbx reads the index,
+# picks the **newest** version's `.deb`, and pins it per project on first launch. `sbx upgrade deb`
+# re-reads the index and **rolls forward** to the newest — no manual URL bump. (sbx does no GPG/
+# InRelease signature check and expects this single-application pool — the same TLS-plus-unpack trust
+# level as a direct `deb:` URL.) ARCH: the index below is `binary-amd64` (x86_64); on arm64 point it
+# at `.../binary-arm64/Packages` instead.
+#
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
+# database (`~/.pki/nssdb`), so a Chromium app would otherwise fail every HTTPS with
+# `ERR_CERT_AUTHORITY_INVALID`. For a `gui = "wayland"` cage under a filtering posture, sbx seeds
+# its MITM CA into the cage's NSS db automatically (part of the GUI hole, like fonts) — no per-
+# profile shim needed. The app only has to be told to consult that store, hence `--use-system-ca`.
+# (The bundled Claude Code engine in the Code tab is Node-based and DOES honour sbx's CA-file env
+# vars, so it needs no extra help.)
+#
+# DISPLAY + GPU + AUDIO + DBUS — `gui = "wayland"` binds the host Wayland
+# socket (read-only) and provisions fonts so the window maps (X11 is never offered; isolation is
+# compositor-dependent — Mutter/GNOME is safe, wlroots exposes screen-capture/input-injection, see
+# docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa's
+# drivers into sbx's store + the `/dev/dri` render node + the minimal `/sys` DRM subtree); without
+# it a Chromium/Electron app on Wayland often produces no buffer and no window maps. mesa covers
+# Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (still renders, slower).
+# `audio = true` provisions the PulseAudio client library (`libpulse.so.0`, absent from the app's
+# own closure, which carries only ALSA) and binds the host PulseAudio socket into the cage, so the
+# microphone and sound work (voice input). It is trusted-only because the PulseAudio bus exposes the
+# microphone AND every system-audio `.monitor` source (recording all host output), see
+# docs/guide/configuration/audio.md.
+# `dbus = true` gives the cage its OWN private desktop portal (a `dbus-daemon` +
+# `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER opens
+# IN-CAGE and lists only the cage filesystem (a host-privileged file manager over the host bus would
+# never be summonable from the cage). It also seeds your host light/dark theme at launch and follows
+# it live, and a host-side relay bridges `org.freedesktop.Notifications` so desktop notifications
+# work — while the login keyring (`org.freedesktop.secrets`) stays absent. The Electron flags: `--no-sandbox` is
+# mandatory and acceptable (bubblewrap + seccomp + the empty netns IS the boundary, replacing
+# Chromium's own redundant sandbox); `--ozone-platform=wayland` selects the Wayland backend;
+# `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
+#
+# CREDENTIAL POSTURE — account / OAuth, NOT a header-injectable API key. Claude Desktop signs in
+# with your **claude.ai subscription or your organization's SSO**; the docs are explicit that
+# "Desktop doesn't accept a Claude Console API key directly" (use the `claude-code` CLI profile for
+# API-key BYOK). There is therefore no HTTP header for sbx's `[secret]` broker to strip-and-inject,
+# and this profile ships **no `[secret]` block** (contrast the BYOK profiles). You log in ONCE inside
+# the cage; the token then persists in the app's dedicated, persistent, isolated home. The sandbox +
+# the egress allowlist still bound everything the agent can reach.
+#
+# CAVEATS (honest, learned from live runs):
+#   * LOGIN — both email and Google work. "Continue with email" (Claude emails a code you type into
+#     the window) is the simplest: it stays in the app's own webview and needs nothing extra.
+#     "Continue with Google" opens the consent in the IN-CAGE Chromium (via `shell.openExternal` ->
+#     the xdg-open wrapper below); Google then redirects to the deep-link
+#     `claude://login/google-auth?code=…&anon_id=…`, which Chromium hands to the running claude-desktop
+#     (Electron single-instance), and the app completes the login — the `anon_id` is the app's own
+#     cross-session bridge, so the browser's cookie jar is NOT the channel (a common misconception).
+#     The browser MUST be in-cage: a HOST browser's `claude://` would find no claude-desktop on the
+#     host. The `cmd` wrapper writes a Chromium managed policy so that deep-link opens with no
+#     confirmation dialog (see the wrapper). Google is the heavier path (it pulls Chromium); if you
+#     only ever use email, drop the `cmd` wrapper + the `chromium` package for a bare argv.
+#   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT) and closing the
+#     window does NOT quit (Claude Desktop is a tray/background app and the cage exposes no tray). Press
+#     **Ctrl+C twice within 2s** to force-quit the session (sbx terminates the cage), or `sbx session stop <id>`
+#     from another terminal. The launch prints the hint.
+#   * Credential persistence — the app may want the system keyring (Secret Service / dbus), which the
+#     hermetic cage does not provide, and should fall back to a file under the isolated home. Confirm
+#     the login survives a relaunch.
+#   * `deb:` build — PROVEN host-side (the `.deb` unpacks, autoPatchelfs, and wraps its launcher). Two
+#     sbx-core fixes made it work and now benefit every Electron `deb:` app: the extraction drops the
+#     setuid bit on Chromium's `chrome-sandbox` (an unprivileged nix builder cannot set setuid), and
+#     the curated lib set gained `libseccomp`/`libcap_ng` (wanted by the Cowork `virtiofsd` helper).
+#     The app RUNS the build; whether every tab (Chat/Cowork/Code) is fully functional in the cage —
+#     Cowork's VM helper in particular needs KVM the cage does not grant — is for your live session.
+#
+# If a request is refused, the proxy names the host — watch `sbx net logs -a claude-desktop` and add
+# it below (or check ahead with `sbx test net <url>`).
+# The command is a small bash wrapper (not a bare argv) so "Continue with Google" works IN the cage.
+# Why: the app opens the Google consent with Electron's `shell.openExternal` (which runs `xdg-open`),
+# and expects the OAuth result back as the deep-link `claude://login/google-auth?code=…&anon_id=…`,
+# which Electron's single-instance mechanism delivers to the already-running app. The wrapper installs
+# an `xdg-open` that (a) launches an IN-CAGE Chromium for the http(s) consent and (b) routes the
+# `claude://` deep-link back to claude-desktop — so the whole flow closes inside the sandbox. It also
+# writes a Chromium managed policy (see the wrapper's first block) so Chromium follows the `claude://`
+# redirect with no "open external app?" confirmation dialog (without it the code never reaches the app
+# and the login silently fails — the real bug behind "the browser signed in but the app didn't").
+# A HOST browser cannot do this: its `claude://` would find no claude-desktop installed on the host.
+# Chromium gets the cage flags (`--no-sandbox` since bwrap+seccomp is the boundary; Wayland; the file
+# password store), and trusts the egress MITM CA because sbx seeds it into the shared `~/.pki/nssdb`
+# (catrust). You can also just sign in with EMAIL — that stays in the app's webview and needs none of
+# this (see the header).
+#
+# `--password-store=basic` (on both the app and Chromium): Chromium normally encrypts its session
+# cookie with a key from the OS keyring (Secret Service, over dbus), which the cage's private bus does
+# not expose — so without it the cookie cannot be re-decrypted next launch and you are logged out.
+# `basic` forces the file store in the isolated $HOME (a weak fixed key — acceptable: the token already
+# lives only in the per-app isolated cage home, never the project shell).
+cmd = [
+    "bash",
+    "-c",
+    '''
+# Chromium managed policy: auto-launch the `claude://` deep-link (the Google-login callback) with no
+# confirmation dialog, else the code never reaches the app and login silently fails. /etc is a
+# writable cage tmpfs; Chromium reads /etc/chromium/policies/managed/. (Full rationale in the header.)
+mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/policies/managed/sbx-claude-protocol.json <<'POLICY'
+{"AutoLaunchProtocolsFromOrigins":[{"allowed_origins":["*"],"protocol":"claude"}]}
+POLICY
+
+# xdg-open routing by scheme: http(s) -> the in-cage Chromium (Google consent); else (the `claude://`
+# deep-link) -> claude-desktop, so the callback reaches the running app. Prepended to PATH.
+# NOTE the `--no-sandbox` on the claude-desktop branch: this invocation only hands the deep-link to
+# the already-running instance (Electron single-instance) and quits, but it still boots far enough to
+# hit Chromium's SUID sandbox — which aborts FATAL because sbx's build strips the setuid bit off
+# chrome-sandbox (an unprivileged nix builder cannot set it). Without --no-sandbox here the forwarding
+# process dies rc=133 and the Google login code never reaches the app (the real, load-bearing bug).
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
+#!/bin/sh
+case "$1" in
+  http://*|https://*)
+    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
+      --no-first-run --no-default-browser-check "$@" ;;
+  *)
+    exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage "$@" ;;
+esac
+WRAP
+chmod +x "$HOME/.local/bin/xdg-open"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Route the desktop portal's OpenURI back to the xdg-open wrapper above. Under `dbus = true` the
+# cage has a real portal, so Electron opens external URLs via `org.freedesktop.portal.OpenURI` instead
+# of calling `xdg-open` — and the portal shows "Open With… no apps available" unless a default handler
+# is registered, which silently breaks the login/re-verification links (Google consent, the device
+# re-verification page, the `claude://` OAuth callback). Register the wrapper as the default handler
+# for the web + `claude` schemes so those links route through it exactly as they did without a portal.
+# The Exec path is ABSOLUTE (`$HOME` is expanded here) because the portal-launched handler does not
+# inherit this shell's PATH. Harmless under `dbus = false` (no portal to call OpenURI).
+mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
+cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=sbx URL handler
+Exec=$HOME/.local/bin/xdg-open %U
+MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/claude;
+NoDisplay=true
+Terminal=false
+EOF
+cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
+[Default Applications]
+x-scheme-handler/http=sbx-open-uri.desktop
+x-scheme-handler/https=sbx-open-uri.desktop
+x-scheme-handler/claude=sbx-open-uri.desktop
+MIMEAPPS
+
+exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
+    --use-system-ca --password-store=basic
+''',
+]
+
+gui = "wayland"
+gpu = true
+audio = true
+dbus = true
+
+# Your host Claude Desktop config/login, mounted read-write at its real absolute path (so the caged
+# app shares your host login/state). `binds` is a security field, honored only because this profile
+# lives in your trusted config dir. Uncomment to share your host setup with the cage instead of the
+# app's isolated home (the default). The exact config paths are UNCONFIRMED for the Linux beta —
+# verify with a real run before relying on them.
+#binds = [
+#    { path = "~/.config/Claude", mode = "rw" },
+#]
+
+[packages]
+# Anthropic's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron, no source build).
+# Trusted-only [packages]; this profile is trusted by location once imported. The `deb:apt:` backend
+# points at Anthropic's apt `Packages` index (Anthropic's pool publishes versioned filenames with no
+# `latest` alias): sbx fetches the index, picks the newest version's `.deb`, and pins it per project
+# on first launch. `sbx upgrade deb` re-reads the index and rolls to the newest — so the version is
+# tracked automatically, not hand-pinned.
+claude-desktop = "deb:apt:https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages"
+# An in-cage Chromium for the Google Sign-In flow (see the `cmd` wrapper above). HEAVY — this pulls a
+# large nixpkgs closure into the project store on the first launch. If you only ever sign in with
+# EMAIL, you can delete this line and the `cmd` wrapper and go back to a bare `claude-desktop` argv.
+chromium = "nix:chromium"
+
+# The API/auth/MCP hosts carry request bodies, so each is opened to all verbs with `{*}`; a
+# pure-download host is scoped to `{GET}` (least privilege — no HEAD, the app never issues one).
+# Grounded on Anthropic's documented "Network access requirements" (code.claude.com/docs/en/network-
+# config). `raw.githubusercontent.com` (changelog / plugin marketplace) is already covered by sbx's
+# built-in nix-cache/github allow-set, so it is not repeated here.
+[network]
+mode = "deny"
+allow = [
+    # Claude API — model completions, the Code-tab engine, the WebFetch domain-safety preflight, and
+    # the voice speech-to-text WebSocket (`/api/ws/speech_to_text/voice_stream`). `{*,WS}` = all HTTP
+    # verbs AND the WebSocket: sbx requires an explicit `WS` opt-in that a plain `{*}` does NOT cover
+    # (a WS is an unredactable bidirectional channel), so without the `WS` voice STT reads `denied-method`.
+    "{*,WS} https://api.anthropic.com",
+    # Account authentication — a claude.ai subscription login — plus the real-time session channel
+    # (`claude.ai/v1/sessions/ws/<id>/subscribe`, a WebSocket). `{*,WS}` = all HTTP verbs AND the
+    # WebSocket: sbx requires an explicit `WS` opt-in that a plain `{*}` does not cover (a WS is an
+    # unredactable bidirectional channel), so without the `WS` the app reads `denied-method` on it.
+    "{*,WS} https://claude.ai",
+    # The login/marketing domain — the Google Sign-In flow ENTERS here
+    # (`claude.com/cai/login/app-google-auth`) before bouncing to Google, so an email login needs it
+    # too (live-caught denied). Distinct host from claude.ai.
+    "{*} https://claude.com",
+    # The app's web UI bundle (JS/CSS/images) — served from here, NOT from claude.ai. Without it the
+    # Electron webview loads no content and the window stays BLACK (live-caught: 75 refusals here while
+    # claude.ai itself was allowed). First-party Anthropic host; opened to all verbs since the UI both
+    # fetches assets and drives requests through it.
+    "{*} https://assets-proxy.anthropic.com",
+    # Console / SSO account authentication.
+    "{*} https://platform.claude.com",
+    "{*} https://console.anthropic.com",
+    # MCP connectors reached by the Code engine (JSON-RPC: POST/SSE/DELETE).
+    "{*} https://mcp-proxy.anthropic.com",
+    # Plugin executable downloads (read-only; the Linux app itself updates via apt, not here).
+    "{GET} https://downloads.claude.ai",
+    # The Chat tab's artifact viewer loads each artifact from a sandboxed subdomain here, and Cowork's
+    # browser bridge (`bridge.claudeusercontent.com/chrome/<id>`) opens a WebSocket over the same
+    # domain. `{*,WS}` = all HTTP verbs AND the WebSocket — sbx gates a WebSocket behind an explicit
+    # `WS` opt-in (a bidirectional channel whose frames it cannot inspect or redact), which a plain
+    # `{*}` does NOT admit, so without the `WS` Cowork's bridge reads `denied-method`. Narrow to
+    # `{GET}` if you only view static artifacts and never use Cowork.
+    "{*,WS} https://*.claudeusercontent.com",
+    # First-party Anthropic asset CDNs the desktop UI reads: settings + the subresource-integrity
+    # manifests it verifies bundle assets against (live-caught denied; read-only).
+    "{GET} https://a-cdn.anthropic.com",
+    "{GET} https://a-cdn.claude.ai",
+    #
+    # Google Sign-In ("Continue with Google") — the consent renders in the in-cage Chromium (see the
+    # `cmd` wrapper), and the OAuth result returns as the `claude://login/google-auth` deep-link the app
+    # handles, so the flow closes inside the sandbox. These are the hosts the Google login page + OAuth
+    # need; a real browser pulls more than the bare API, so this set was widened from live `sbx net logs`
+    # and may still need another host — if the Google page renders blank or the button hangs, check the
+    # log and add the refused host. (Prefer EMAIL login, which needs none of this.)
+    # Google's sign-in domain — a bounded regex so it works in ANY locale: Google serves the consent
+    # from the country domain (accounts.google.com, .fr, .de, .co.uk, …), not always .com. Anchored to
+    # `accounts.google.<tld>` so a look-alike (accounts.google.com.evil.com) is refused (verified).
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{*} https://oauth2.googleapis.com",
+    "{*} https://apis.google.com",
+    "{GET} https://www.google.com",
+    "{GET} https://ssl.gstatic.com",
+    "{GET} https://www.gstatic.com",
+    "{GET} https://fonts.gstatic.com",
+    "{GET} https://fonts.googleapis.com",
+    "{GET} https://lh3.googleusercontent.com",
+    #
+    # Enterprise routing — if your org routes Desktop to Google Vertex, Bedrock, Microsoft Foundry,
+    # or an LLM gateway, model traffic goes THERE instead of the hosts above; add that host and see
+    # the enterprise network-config docs. Left commented (the default is Anthropic-direct).
+]
+# Silence the denied telemetry so `sbx net logs` reads clean: the app POSTs crash/usage envelopes to
+# Sentry and feature-flag/analytics to Statsig, both already refused (`denied-default`). `mute` keeps
+# those refusals out of the default log (still denied, still counted in `sbx net stats`; see them with
+# `--all`). Add any other refused telemetry host you spot in the log — a `mute` never opens egress.
+mute = [
+    "*.sentry.io",
+    "*.statsig.com",
+    # Google's component/redirector CDN — Chromium probes it for optional components (a Widevine DRM
+    # module, the spellcheck dictionary), not needed for Chat/Code/Cowork. Left denied; muted.
+    "redirector.gvt1.com",
+    # Datadog RUM (real-user monitoring) — pure analytics, POSTed frequently; left denied, muted.
+    "browser-intake-us5-datadoghq.com",
+    # Intercom — the third-party in-app support-chat widget (`widget.intercom.io/widget/<id>` + its
+    # api/websocket subdomains). Not first-party Anthropic and not needed for Chat/Code/Cowork; left
+    # denied (so no third-party support tracker gets egress) and muted. Un-mute + `allow *.intercom.io`
+    # if you want the in-app support chat.
+    "*.intercom.io",
+    # Segment analytics (`a.claude.ai/isolated-segment.html`) and its loader (`s-cdn.anthropic.com/s.js`)
+    # — usage analytics, not functional; left denied, muted. Un-mute + `allow` if you ever want them.
+    "a.claude.ai",
+    "s-cdn.anthropic.com",
+    # First-party Anthropic metrics endpoints the UI POSTs to: the analytics CDN (`a-cdn.claude.ai
+    # POST /metrics/ui`, refused `denied-method` since that host is allowed read-only `{GET}`) and the
+    # metrics API (`a-api.anthropic.com POST /v1/m`). Non-functional telemetry; left denied, muted.
+    "a-cdn.claude.ai",
+    "a-api.anthropic.com",
+    # The in-cage Chromium's own background services — irrelevant to the login: clock sync, device
+    # check-in, the ML "optimization guide", the component/extension updater, Play-services logging,
+    # Safe Browsing, form autofill, and the cross-domain sign-in cookie check. Left denied, muted.
+    "clients2.google.com",
+    "android.clients.google.com",
+    "optimizationguide-pa.googleapis.com",
+    "update.googleapis.com",
+    "play.google.com",
+    "safebrowsing.googleapis.com",
+    "content-autofill.googleapis.com",
+    "accounts.youtube.com",
+    # Google account-UI infrastructure the in-cage Chromium pulls in on Google pages — push/sync
+    # signaling and the "One Google" account bar/promos. Not part of the OAuth. Denied, muted.
+    "signaler-pa.googleapis.com",
+    "ogads-pa.clients6.google.com",
+    "ogs.google.com",
+]
+
+[env]
+# Cut Claude Code's non-essential / telemetry / error-reporting traffic at the source (these apply to
+# the Code-tab engine), so the tool never even generates it. The umbrella var covers all non-essential
+# background traffic except the WebFetch host-safety check, which keeps its own opt-out.
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+DISABLE_TELEMETRY = "1"
+DISABLE_ERROR_REPORTING = "1"

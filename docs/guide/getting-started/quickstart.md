@@ -68,7 +68,7 @@ network allowlist, and host-side credential injection. The repository ships
 [importable starter profiles](../apps/catalog.md):
 
 ```sh
-sbx app import profiles/claude-code.toml
+sbx app import examples/app/claude-code.toml
 sbx app run claude-code
 ```
 

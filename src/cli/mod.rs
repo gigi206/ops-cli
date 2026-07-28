@@ -3,6 +3,7 @@
 //! parsing, orchestration, and output rendering.
 
 pub(crate) mod app;
+pub(crate) mod bundle;
 pub(crate) mod config;
 pub(crate) mod confirm;
 pub(crate) mod doctor;
@@ -108,6 +109,7 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "app" => app::app_cmd(rest),
         "search" => search::run(rest),
         "test" => test::test_cmd(rest),
+        "bundle" => bundle::bundle_cmd(&rest),
         "net" => net::net_cmd(rest),
         "proc" => proc::proc_cmd(rest),
         "fs" => fs::fs_cmd(rest),

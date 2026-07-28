@@ -1,15 +1,15 @@
 # Profile catalog
 
-The repository's [`profiles/`](../../../profiles/) directory ships importable starter
+The repository's [`examples/app/`](../../../examples/app/) directory ships importable starter
 profiles for popular coding agents. `sbx` ships **no built-in apps** — you import each
 deliberately:
 
 ```sh
-sbx app import profiles/claude-code.toml
+sbx app import examples/app/claude-code.toml
 sbx app run claude-code
 ```
 
-See also: [Portable profiles](profiles.md) · [The app framework](README.md) · [Secrets](../secrets/README.md) · the repository [`profiles/README.md`](../../../profiles/README.md).
+See also: [Portable profiles](profiles.md) · [The app framework](README.md) · [Secrets](../secrets/README.md) · the repository [`examples/README.md`](../../../examples/README.md).
 
 ## The shipped profiles
 
@@ -84,6 +84,6 @@ The profiles **import and resolve** cleanly (covered by a test), and each tool i
 **provisioned fresh and runs** under its own allowlist. The one remaining *live*
 end-to-end is the **credential step** — for BYOK profiles, the CLI authenticating
 through the proxy-injected key; for account profiles, completing the login inside the
-cage. See the repository [`profiles/README.md`](../../../profiles/README.md) for the
+cage. See the repository [`examples/README.md`](../../../examples/README.md) for the
 per-tool status and the "not here yet — and why" triage (OAuth-only tools, GUI/desktop
 agents blocked on the Wayland passthrough, etc.).

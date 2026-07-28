@@ -2943,7 +2943,7 @@ fn sbx_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_tr
 
 #[test]
 fn the_shipped_profiles_import_and_resolve() {
-    // Every profile under the repo's `profiles/` directory must import cleanly (parse, have a
+    // Every profile under the repo's `examples/app/` directory must import cleanly (parse, have a
     // command, a usable name) and resolve as a launchable app — so a shipped profile is never
     // subtly broken, and the import path is re-exercised on real artifacts.
     //
@@ -2954,9 +2954,9 @@ fn the_shipped_profiles_import_and_resolve() {
     // error). The value checks below therefore anchor on *intent*, read from the raw file text —
     // never from the parse, which is exactly what would have swallowed the field.
     let fx = Fixture::new();
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/app");
     let mut imported = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("profiles/ dir exists") {
+    for entry in std::fs::read_dir(&dir).expect("examples/app/ dir exists") {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
@@ -3062,6 +3062,270 @@ fn the_shipped_profiles_import_and_resolve() {
             "shipped profile `{name}` did not resolve as an app:\n{cfg}"
         );
     }
+}
+
+#[test]
+fn a_bundle_folds_into_a_profile_and_the_profile_still_wins() {
+    // The end-to-end shape the feature exists for: an orchestrator profile names one bundle and
+    // gets that tool, its environment and its egress without restating them — while everything it
+    // declares itself still overrides the bundle.
+    let fx = Fixture::new();
+    fx.write_global(
+        r#"
+[bundle.demo-agent]
+packages = { demo-agent = "mise:aqua:example/demo-agent", shared-lib = "nix:jq" }
+env = { DEMO_AGENT_TELEMETRY = "off" }
+allow = ["{*,WS} https://api.example.com", "{GET} https://downloads.example.com"]
+"#,
+    );
+    fx.write_profile(
+        "orchestrator",
+        r#"
+cmd = "orchestrate"
+use = ["demo-agent"]
+[packages]
+shared-lib = "nix:ripgrep"
+[network]
+mode = "deny"
+allow = ["{*} https://orchestrator.example.com"]
+"#,
+    );
+
+    let out = fx.run(&["config", "show", "--app", "orchestrator", "--json"]);
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    let pkg = |name: &str| {
+        doc["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .map(|p| {
+                format!(
+                    "{}:{}",
+                    p["backend"].as_str().unwrap(),
+                    p["locator"].as_str().unwrap()
+                )
+            })
+    };
+    assert_eq!(
+        pkg("demo-agent").as_deref(),
+        Some("mise:aqua:example/demo-agent"),
+        "the bundle's tool lands on the app:\n{doc:#}"
+    );
+    assert_eq!(
+        pkg("shared-lib").as_deref(),
+        Some("nix:ripgrep"),
+        "but the profile's own entry beats the bundle's on the same name:\n{doc:#}"
+    );
+
+    let allow: Vec<&str> = doc["network"]["Allowlist"]["allow"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        allow.contains(&"{*} https://orchestrator.example.com"),
+        "the app keeps its own rules: {allow:?}"
+    );
+    assert!(
+        allow.contains(&"{*,WS} https://api.example.com"),
+        "and gains the bundle's, verb set intact — a `{{*}}` here would silently drop WebSocket \
+         reach the bundle granted: {allow:?}"
+    );
+    assert!(
+        doc["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["key"] == "DEMO_AGENT_TELEMETRY"),
+        "the bundle's environment lands too:\n{doc:#}"
+    );
+}
+
+#[test]
+fn sbx_bundle_import_export_round_trips_and_the_imported_bundle_is_usable() {
+    // The portability loop, end to end: a fragment someone else wrote is imported into the global
+    // config, listed, re-exported, and — the point of importing it — actually applies to an app
+    // that names it. A round-trip that could not then be *used* would be a nice no-op.
+    let fx = Fixture::new();
+    let frag = fx.proj.path().join("fragment.toml");
+    std::fs::write(
+        &frag,
+        r#"
+[bundle.demo-agent]
+packages = { demo-agent = "mise:aqua:example/demo-agent" }
+allow = ["{*,WS} https://api.example.com"]
+"#,
+    )
+    .unwrap();
+
+    let imp = fx.run(&["bundle", "import", frag.to_str().unwrap()]);
+    assert!(
+        imp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&imp.stderr).contains("egress"),
+        "an import that grants egress says so: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+
+    // A second import of the same name is refused, and writes nothing.
+    let clash = fx.run(&["bundle", "import", frag.to_str().unwrap()]);
+    assert!(!clash.status.success());
+    assert!(
+        String::from_utf8_lossy(&clash.stderr).contains("bundle already defined"),
+        "the refusal names what collided: {}",
+        String::from_utf8_lossy(&clash.stderr)
+    );
+
+    let listed = fx.run(&["bundle", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(doc["bundles"][0]["name"], "demo-agent");
+
+    // Re-exporting yields a fragment that imports again — so a bundle can travel machine to machine.
+    let exported = fx.run(&["bundle", "export", "demo-agent"]);
+    assert!(exported.status.success());
+    let text = String::from_utf8_lossy(&exported.stdout).to_string();
+    assert!(text.contains("[bundle.demo-agent]"), "{text}");
+
+    // And it applies: a profile naming it gets the tool and the egress rule, verbs intact.
+    fx.write_profile(
+        "orchestrator",
+        "cmd = \"orchestrate\"\nuse = [\"demo-agent\"]\n[network]\nmode = \"deny\"\n",
+    );
+    let shown = fx.run(&["config", "show", "--app", "orchestrator", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert!(
+        doc["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "demo-agent"),
+        "the imported bundle reaches a launch:\n{doc:#}"
+    );
+    let allow: Vec<&str> = doc["network"]["Allowlist"]["allow"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        allow.contains(&"{*,WS} https://api.example.com"),
+        "{allow:?}"
+    );
+}
+
+#[test]
+fn a_bundle_credential_is_dropped_when_the_app_has_no_filtering_posture() {
+    // The one interaction where the fold and the secret-posture check meet. Under a non-filtering
+    // posture the fold already drops the bundle's egress rules silently (they are redundant), so a
+    // credential surviving into that cage would be the worst pairing available: no allowlist
+    // bounding the destination, and a key to send. It must be dropped by the posture re-check, and
+    // said out loud — the same note a directly-declared secret gets.
+    let fx = Fixture::new();
+    fx.write_global(
+        r#"
+[bundle.keyed]
+packages = { demo = "mise:aqua:example/demo" }
+allow = ["{*} https://api.example.com"]
+[bundle.keyed.secret."api.example.com"]
+from = "env://DEMO_KEY"
+header = "x-api-key"
+type = "raw"
+"#,
+    );
+    fx.write_profile(
+        "wide",
+        "cmd = \"x\"\nuse = [\"keyed\"]\nnetwork = \"shared\"\n",
+    );
+    fx.write_profile(
+        "narrow",
+        "cmd = \"x\"\nuse = [\"keyed\"]\n[network]\nmode = \"deny\"\n",
+    );
+
+    let read = |app: &str| -> serde_json::Value {
+        let out = fx.run(&["config", "show", "--app", app, "--json"]);
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let wide = read("wide");
+    assert_eq!(wide["network"], serde_json::json!("Shared"));
+    assert!(
+        wide["secrets"].as_array().unwrap().is_empty()
+            && wide["secrets_inherited"].as_u64() == Some(0),
+        "no credential reaches a cage with no allowlist to bound it:\n{wide:#}"
+    );
+    assert!(
+        format!("{}", wide["notes"]).contains("filtering network posture"),
+        "and the drop is stated, not silent: {}",
+        wide["notes"]
+    );
+
+    // The witness: the same bundle under an allowlist *does* inject — so the assertion above is
+    // pinned on the posture, not on a bundle secret being unreachable for some other reason.
+    let narrow = read("narrow");
+    assert_eq!(
+        narrow["secrets"].as_array().map(Vec::len),
+        Some(1),
+        "under a filtering posture the bundle's credential is injected:\n{narrow:#}"
+    );
+}
+
+#[test]
+fn an_untrusted_project_cannot_use_a_bundle_to_graft_trusted_egress_onto_its_app() {
+    // The flagship property, on the `use` axis: a bundle is declared in the *global* config and
+    // carries egress rules and credentials, so an untrusted project naming one would be choosing
+    // which trusted reach to graft onto an app it controls. Dropped until the project is trusted,
+    // and the drop is reported where someone inspecting that app will read it.
+    let fx = Fixture::new();
+    fx.write_global(
+        r#"
+[bundle.demo-agent]
+packages = { demo-agent = "mise:aqua:example/demo-agent" }
+allow = ["{*} https://api.example.com"]
+"#,
+    );
+    fx.write_project(
+        r#"
+[app.sneaky]
+cmd = "whatever"
+use = ["demo-agent"]
+[app.sneaky.network]
+mode = "deny"
+"#,
+    );
+
+    let untrusted = fx.run(&["config", "show", "--app", "sneaky", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&untrusted.stdout).unwrap();
+    assert!(
+        doc["packages"].as_array().unwrap().is_empty(),
+        "an untrusted project's `use` grafts no tool:\n{doc:#}"
+    );
+    let notes = format!("{}", doc["notes"]);
+    assert!(
+        notes.contains("ignoring `use`") && notes.contains("demo-agent"),
+        "and the drop is a per-app note naming the bundle, not silence: {notes}"
+    );
+
+    // Trusting the project applies exactly what was withheld — so the assertion above is pinned on
+    // the trust gate, not on the bundle being unreachable for some unrelated reason.
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    let trusted = fx.run(&["config", "show", "--app", "sneaky", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&trusted.stdout).unwrap();
+    assert!(
+        doc["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "demo-agent"),
+        "once trusted, the same `use` applies:\n{doc:#}"
+    );
 }
 
 #[test]

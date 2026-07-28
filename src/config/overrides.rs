@@ -369,6 +369,13 @@ fn push_ignored_field_notices(
             "ignoring `[app.*]` in the override — it is not a one-shot launch field".to_string(),
         );
     }
+    if !env_side.bundle.is_empty() || !cli_side.bundle.is_empty() {
+        notices.push(
+            "ignoring `[bundle.*]` in the override — it is not a one-shot launch field (a bundle \
+             is reached through an app's `use`, and an override declares no app)"
+                .to_string(),
+        );
+    }
 }
 
 /// Push a notice for each **security** field whose value the environment (either the `SBX_CONFIG`
@@ -465,6 +472,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     base.devices = union_allow_opt(base.devices, higher.devices, |d| &mut d.allow);
     base.net.groups.extend(higher.net.groups);
     base.app.extend(higher.app);
+    base.bundle.extend(higher.bundle);
     base
 }
 

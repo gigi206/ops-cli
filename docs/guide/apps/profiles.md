@@ -86,7 +86,7 @@ posture even under an untrusted project (the [flagship property](README.md#the-f
 
 ## Reproducibility
 
-The repository's [`profiles/`](catalog.md) directory holds importable starter profiles
+The repository's [`examples/app/`](catalog.md) directory holds importable starter profiles
 for popular coding agents. Each declares its tool with a
 [backend-prefixed `[packages]`](../configuration/packages.md) value, so it provisions
 fresh. See the [Profile catalog](catalog.md).

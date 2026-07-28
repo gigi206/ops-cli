@@ -132,7 +132,7 @@ whole home instead, use [`sbx app rm --purge`](#removing-an-app).
 ## Examples
 
 ```sh
-sbx app import profiles/claude-code.toml
+sbx app import examples/app/claude-code.toml
 sbx app run claude-code                # launch with its own isolated home
 sbx app run claude-code -- -c          # resume the previous session
 sbx app run claude-code --net none     # one run with no network

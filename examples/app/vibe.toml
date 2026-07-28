@@ -1,0 +1,160 @@
+# Mistral Vibe — Mistral's minimal open-source coding agent (CLI), sandboxed by sbx.
+#
+#   sbx app import examples/app/vibe.toml
+#   sbx app run vibe
+#
+# Vibe (github.com/mistralai/mistral-vibe) is a Python coding agent published to PyPI as the
+# `mistral-vibe` package (it exposes the `vibe` command; requires Python >=3.12). sbx equips it via
+# mise's pipx backend — `mise:pipx:mistral-vibe` in [packages] — so `sbx upgrade mise` rolls it
+# forward (it is a real backend-managed tool, not a one-shot install). mise's pipx backend runs
+# `uv tool install` because `nix:uv` puts uv on PATH (a supported Python comes from `nix:python312`),
+# resolving the wheels from PyPI on the first launch (a few tens of MiB, seconds) and reusing them
+# offline after. The launch `cmd` below only sets up the in-cage SSO browser, then execs `vibe`.
+#
+# AUTHENTICATION — Mistral account SSO, in an IN-CAGE browser (this profile's default).
+# On first launch (or `vibe --setup`) Vibe's onboarding offers "sign in with your Mistral account".
+# Verified against the source (vibe/setup/auth/browser_sign_in.py): this is a POLLING flow, not a
+# loopback callback — Vibe calls `webbrowser.open(sign_in_url)` on console.mistral.ai, then POLLS
+# console.mistral.ai until you complete sign-in, and exchanges the result for an API key saved in
+# the app's isolated ~/.vibe home (so it persists there, never in the project shell). Because the
+# callback is server-side polling, no `forward` is needed — a browser INSIDE the cage is enough, and
+# everything (the sign-in page + the poll) closes in the sandbox.
+#
+# The browser is a real Chromium provisioned into the cage (see [packages] + `gui`/`gpu` below).
+# Two details make it work: (1) Vibe's `webbrowser.open` BLOCKS on an unknown browser command (it
+# `wait()`s for the process), so `BROWSER` points at the `sbx-open` wrapper written by `cmd`, which
+# launches Chromium in the background with `nohup … &` (the cage ships no `setsid`) and returns
+# immediately, so the TUI never freezes; (2) under a filtering posture on a `gui = "wayland"` cage,
+# sbx seeds its per-session MITM CA into the cage's NSS db automatically (Chromium ignores the
+# CA-file env vars other tools honour), so HTTPS to console.mistral.ai succeeds — `--use-system-ca`
+# tells Chromium to consult that store, and `--password-store=basic` keeps the SSO cookies in a file
+# store (no keyring in the cage) so the session survives a relaunch. Chromium's output is logged to
+# `~/sbx-browser.log` in the isolated home, in case a launch ever fails.
+#
+# API-KEY (BYOK) is available as an alternative to the browser sign-in — see the [env]/[secret]
+# blocks at the bottom of this file.
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -e
+mkdir -p "$HOME/.local/bin"
+# vibe opens the sign-in URL via Python's webbrowser, which BLOCKS on an unknown command; this
+# wrapper backgrounds an in-cage Chromium (nohup, since the cage has no setsid) and exits 0
+# immediately, so the TUI never freezes. Chromium's output is captured for troubleshooting.
+cat > "$HOME/.local/bin/sbx-open" <<'WRAP'
+#!/bin/sh
+nohup chromium --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
+  --use-system-ca --password-store=basic --no-first-run --no-default-browser-check \
+  "$@" >"$HOME/sbx-browser.log" 2>&1 &
+exit 0
+WRAP
+chmod +x "$HOME/.local/bin/sbx-open"
+export BROWSER="$HOME/.local/bin/sbx-open"
+exec vibe "$@"
+''',
+    "vibe",
+]
+
+# DISPLAY + GPU — needed so the in-cage Chromium (the SSO sign-in window) actually maps. `gui =
+# "wayland"` binds the host Wayland compositor socket (read-only) and provisions fonts; X11 is never
+# offered. Isolation is compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway,
+# hyprland) expose screen-capture/input-injection to ordinary clients (see
+# docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa into
+# sbx's own store, the render node under /dev/dri, the minimal /sys DRM subtree the driver needs);
+# without it a Chromium window on Wayland often produces no buffer and never maps. mesa covers
+# Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (renders, slower). Both are
+# security fields, honored only because this profile lives in your trusted config dir.
+gui = "wayland"
+gpu = true
+
+# Your host Vibe config, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# `vibe` read and write these host files (config.toml, saved API key, history). Uncomment to share
+# your host Vibe setup with the cage instead of the app's isolated home (the default). Vibe stores
+# its config + credentials under ~/.vibe.
+#binds = [
+#    { path = "~/.vibe", mode = "rw" },
+#]
+
+[packages]
+# Vibe itself via mise's pipx backend, so `sbx upgrade mise` rolls it forward. mise runs
+# `uv tool install mistral-vibe` because `nix:uv` puts uv on PATH; `nix:python312` supplies a
+# supported interpreter. `chromium` is the in-cage browser for the SSO sign-in (see the
+# AUTHENTICATION note). HEAVY — it pulls a large nixpkgs closure into the project store on the first
+# launch; drop it (and the `gui`/`gpu` lines) if you authenticate with an API key instead. All are
+# trusted-only [packages]; this profile is trusted by location once imported.
+vibe     = "mise:pipx:mistral-vibe"
+uv       = "nix:uv"
+python   = "nix:python312"
+chromium = "nix:chromium"
+
+# Egress is denied by construction except the SSO host, the Mistral API, and the install-time PyPI
+# hosts. An app is read-by-default ({GET,HEAD}): the SSO + API hosts the agent POSTs to are opened
+# to all verbs with `{*}`; the pure-download PyPI hosts stay `{GET}` (least privilege).
+[network]
+mode = "deny"
+allow = [
+    # Account SSO + runtime — the browser sign-in spans several Mistral subdomains: the CLI drives
+    # the create/poll/exchange API on console.mistral.ai, then the in-cage Chromium is redirected
+    # console -> auth.mistral.ai -> v2.auth.mistral.ai for the actual login, and api.mistral.ai
+    # serves the models. Rather than chase each subdomain, allow all of Mistral's own domain —
+    # spoof-safe: `*.mistral.ai` matches the apex + subdomains only, never `mistral.ai.evil.com`.
+    # (If you use a THIRD-PARTY SSO identity provider to log into Mistral — Google/GitHub/etc. — that
+    # redirect leaves *.mistral.ai; the proxy will name the IdP host, add it here, e.g. its login host.)
+    "{*} https://*.mistral.ai",
+    # Mistral's first-party feature-flag / experiments SDK (on the .services domain, not .ai, so NOT
+    # covered by *.mistral.ai). Allowed so vibe's flags apply; deny it to run with default flags.
+    "{*} https://experiments.mistral.services",
+    # THIRD-PARTY SSO — this profile logs into Mistral via the "Sign in with Google" button, which
+    # redirects the in-cage browser to accounts.google.com (outside *.mistral.ai). After auth Google
+    # does CheckCookie then redirects to `accounts.google.<cctld>/accounts/SetSID` to set the session
+    # cookie on YOUR country domain (.com/.fr/.co.uk/…) before returning to Mistral's callback — a
+    # LOAD-BEARING step, not noise. The bounded regex covers every locale in one rule and is anchored
+    # so a look-alike (accounts.google.com.evil.com) is refused — the same pattern claude-desktop and
+    # hermes-desktop use. Assets come from gstatic, the account avatar from googleusercontent. (For
+    # email/password login these are unnecessary; for Apple/Microsoft SSO, swap in appleid.apple.com /
+    # login.microsoftonline.com.) The token exchange is server-side on Mistral, not in the cage, so no
+    # googleapis.com token endpoint is needed here. (accounts.youtube.com's CheckConnection is
+    # non-essential — it is muted below, like the desktop profiles do.)
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{GET} https://*.gstatic.com",
+    "{GET} https://*.googleusercontent.com",
+    # Install-time (mise's `uv tool install`): the Python wheels and the package index.
+    "{GET} https://files.pythonhosted.org",
+    "{GET} https://pypi.org",
+    # (cache.nixos.org + github.com — the nix binary cache for uv/Python/chromium — are already in
+    # sbx's built-in nix-cache allow-set, so they need no entry here.)
+]
+
+# Keep Chromium's own denied telemetry out of the default `sbx net log` (still denied, still counted
+# in `sbx net stats`; see them with `--all`). These are the usual Chromium background hosts; watch
+# `sbx net log -a vibe` on your first sign-in and add any other host it hammers.
+mute = [
+    "www.google.com",             # Chromium: omnibox / async requests (observed on sign-in)
+    "*.gvt1.com",                 # Chromium: spellcheck dictionary + component downloads (observed)
+    "android.clients.google.com", # Chromium: device check-in telemetry (observed)
+    "*.googleapis.com",           # Chromium update / optimization-guide / safebrowsing
+    "clients2.google.com",        # Chromium update ping
+    "clientservices.googleapis.com",
+    "*.sentry.io",                # page telemetry (Mistral console + auth pages)
+    "static.cloudflareinsights.com", # Cloudflare web-analytics beacon
+    "play.google.com",            # Google Play logging (POST /log), recurring during Google sign-in
+    "accounts.youtube.com",       # Google cross-domain CheckConnection, recurs each login (desktop profiles mute it too)
+]
+# NOT muted on purpose (refused by the allowlist, but only ONE hit — not spam, so keeping it VISIBLE in
+# `sbx net log` is more useful than hiding it): `widget.intercom.io` (Intercom support-chat widget, not
+# used from the CLI). (`experiments.mistral.services` is now ALLOWED above — Mistral's first-party flags.)
+
+# API-KEY (BYOK) alternative to the SSO sign-in above. The real key is read on the HOST and injected
+# by the egress proxy — never in the cage. Uncomment both blocks and provide $MISTRAL_API_KEY on the
+# host; the in-cage placeholder lets Vibe start and issue the request, and the proxy strips it and
+# substitutes the real key on the wire to api.mistral.ai. (With this path you can drop `chromium` +
+# the `gui`/`gpu` lines for a much lighter cage.)
+[env]
+#MISTRAL_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.mistral.ai"]
+#from = "env://MISTRAL_API_KEY"
+#header = "Authorization"
+#type = "bearer"

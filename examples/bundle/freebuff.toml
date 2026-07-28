@@ -1,0 +1,37 @@
+# `freebuff` — the Freebuff (Codebuff) CLI: what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/freebuff.toml
+#   # then in an app profile:   use = ["freebuff"]
+#
+# Derived from `examples/app/freebuff.toml`, which stays the self-contained way to run this
+# agent on its own (`sbx app import`, one step, nothing else needed). This bundle is for an app
+# that EMBEDS the agent — an orchestrator spawning it as a subprocess — so that app states the
+# requirement ONCE instead of copying it. A test pins the two artifacts together, so they cannot
+# drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.freebuff]
+allow = [
+    "{GET} https://registry.npmjs.org",
+    "{GET} https://www.codebuff.com",
+    "{GET} https://codebuff.com",
+    "{*} https://www.codebuff.com/api/*",
+    "{GET} https://freebuff.com",
+    "{POST} https://freebuff.com/api/auth/cli/code",
+]
+mute = [
+    "*.i.posthog.com",
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
+
+[bundle.freebuff.packages]
+nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage
+freebuff = "mise:npm:freebuff"
