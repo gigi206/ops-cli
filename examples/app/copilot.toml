@@ -1,0 +1,97 @@
+# GitHub Copilot CLI — the Copilot coding agent in your terminal, sandboxed by sbx.
+#
+#   sbx app import examples/app/copilot.toml
+#   sbx app run copilot
+#
+# GitHub ships the Copilot CLI as a self-contained release binary (`copilot-linux-x64.tar.gz`
+# on github/copilot-cli releases) — no node runtime, no nixpkgs attribute needed. sbx equips it
+# fresh from upstream via mise's `aqua` backend, which selects the asset through the aqua
+# registry and verifies it against the release's own `SHA256SUMS.txt` (a checksum published in
+# the same release — so, unlike `goose`, there is no external signing infrastructure to reach).
+# The binary lands in the app's persistent isolated home; it is equipped at the latest upstream
+# version on the first launch in a project, then pinned — advance it with `sbx upgrade mise`.
+#
+# CREDENTIAL POSTURE — GitHub ACCOUNT, not a header-injectable provider key. Copilot
+# authenticates to your GitHub account, so there is no per-provider HTTP header for sbx's
+# `[secret]` broker to strip-and-inject, and this profile ships no `[secret]` block (contrast
+# the BYOK profiles like `cline`/`vtcode`). Two ways in, both documented upstream:
+#
+#  - **`/login` inside the CLI** — the device flow: Copilot prints a code and a
+#    `github.com/login/device` URL. The hermetic cage has no browser, so open that URL on your
+#    host and type the code there; the CLI polls and stores the token in its own config under
+#    the app's isolated `$HOME`. One-time, and it survives relaunches.
+#  - **A fine-grained PAT** with the "Copilot Requests" permission
+#    (github.com/settings/personal-access-tokens/new), passed for ONE launch and never baked
+#    into this file:
+#        sbx app run copilot --env GH_TOKEN=github_pat_…
+#    (`GH_TOKEN` takes precedence over `GITHUB_TOKEN`, per GitHub's docs.)
+#
+# EGRESS. The hosts below come from GitHub's own Copilot allowlist reference, narrowed to what a
+# CLI session needs; the telemetry/experimentation endpoints are deliberately left DENIED and
+# `mute`d (they are refused either way — the mute only keeps their lines out of the default log).
+# If a real session is refused a host, the proxy names it: add it with
+# `sbx net allow -a copilot '{*} https://<host>'`, or check ahead with `sbx test net <url>`.
+#
+# UNVERIFIED (like every profile until run with a real account): the live login and the model
+# traffic through sbx's MITM. What is grounded here is the packaging (official GitHub release via
+# aqua), the auth mechanisms (GitHub's own README), and the host list (GitHub's allowlist doc).
+cmd = "copilot"
+
+# Your host Copilot CLI config, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
+# lets the caged `copilot` read and write these host files (login, settings). Uncomment to share
+# your host Copilot setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/copilot", mode = "rw" },
+#]
+
+[packages]
+# Copilot itself via mise's aqua backend (the official GitHub release binary, checksum-verified
+# against the release's own SHA256SUMS.txt). The download rides sbx's built-in nix-cache allow-set
+# (github.com + *.githubusercontent.com are always permitted, read-only), so the install needs no
+# entry in [network] below.
+copilot = "mise:aqua:github/copilot-cli"
+
+# An app is read-by-default ({GET,HEAD}); the endpoints below carry POSTs (the device flow, the
+# chat completions), so each is opened to all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # The OAuth device flow `/login` uses, plus the enterprise/authorization pages. Path-scoped:
+    # only the login endpoints, not all of github.com (whose read-only lane the built-in allow-set
+    # already provides).
+    "{*} https://github.com/login/*",
+    # User + Copilot entitlement lookups (`/user`, `/copilot_internal/*`). The built-in allow-set
+    # covers api.github.com read-only; the CLI also POSTs here, hence the explicit all-verbs entry.
+    "{*} https://api.github.com",
+    # The Copilot API itself — chat completions and the agent's tool traffic. GitHub routes by
+    # subscription (`*.individual.`/`*.business.`/`*.enterprise.`), and the CLI is documented to
+    # use the plain `api.githubcopilot.com` too; the subdomain wildcard covers the apex and all of
+    # them at once.
+    "{*} https://*.githubcopilot.com",
+    # The suggestion/proxy services named in GitHub's allowlist reference.
+    "{*} https://copilot-proxy.githubusercontent.com",
+    "{*} https://origin-tracker.githubusercontent.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the telemetry and
+# experimentation endpoints, which nothing above allows. A `mute` never changes the verdict and
+# never hides a count (`sbx net stats` still tallies it); it only keeps the lines out of the default
+# log, so the refusals worth acting on stay visible. See everything with `sbx net log --all`, and
+# edit this list from the CLI with `sbx net mute|unmute <host> -a copilot`.
+#
+# One nuance, measured rather than assumed: `copilot-telemetry.githubusercontent.com` sits under
+# sbx's built-in always-on `{GET,HEAD} *.githubusercontent.com` lane (the self-equip read-only
+# allowance), so its GETs are ALLOWED and only its writes — which is what a telemetry upload is —
+# are refused and muted here. The other two are refused outright.
+mute = [
+    "collector.github.com",                      # GitHub telemetry collector (refused outright)
+    "copilot-telemetry.githubusercontent.com",   # Copilot telemetry uploads (the POSTs; GETs ride the built-in read lane)
+    "default.exp-tas.com",                       # experimentation / feature flags (refused outright)
+]
+
+[env]
+# No system keyring exists in the hermetic cage; nothing here needs one — the token lands in
+# Copilot's own config file under the app's isolated home. Pass a PAT for a single launch with
+# `--env GH_TOKEN=…` rather than writing it below (a profile is a shared artifact, not a vault).
+#GH_TOKEN = "github_pat_…"

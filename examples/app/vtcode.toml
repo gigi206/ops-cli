@@ -1,0 +1,85 @@
+# VT Code — a Rust terminal coding agent with multi-provider LLM support, sandboxed by sbx.
+#
+#   sbx app import examples/app/vtcode.toml
+#   sbx app run vtcode
+#
+# VT Code ships as a self-contained Rust release binary on its own GitHub releases
+# (`vtcode-<version>-x86_64-unknown-linux-gnu.tar.gz`) — no node, no runtime deps. sbx equips it
+# fresh from upstream via mise's `github` backend (the same clean path `kilocode` uses); the binary
+# lands in the app's persistent isolated home, pinned at the version installed on the first launch
+# in a project. Advance it with `sbx upgrade mise` — do NOT use the built-in `vtcode update`, which
+# would replace the binary underneath the pinned install.
+#
+# The agent's own search tools are external programs: ripgrep for content search and ast-grep for
+# its symbol/outline maps (upstream's one-line installer pulls both). They are declared below as
+# `nix:` packages, so they are host-provisioned, seeded into the project store and available
+# offline — no second download path.
+#
+# BYOK, MULTI-PROVIDER. VT Code supports 21+ providers; its own default is OpenRouter (default
+# model `xiaomi/mimo-v2.5-pro`), which is what this profile keys — one key, many models,
+# OpenAI-compatible bearer auth. The real key is read on the HOST and injected by the egress proxy
+# on the wire to openrouter.ai — never in the cage. Provide it on the host as `$OPENROUTER_API_KEY`
+# (or point `from` at a resolver, e.g. `sops://secrets.yaml#openrouter`), then uncomment the `[env]`
+# placeholder and the `[secret]` block. To use a different provider, change the allowlist host + the
+# `[secret]` block + the env var — e.g. Anthropic (api.anthropic.com, ANTHROPIC_API_KEY, header
+# "x-api-key", type "raw") or OpenAI (api.openai.com, OPENAI_API_KEY, header "Authorization", type
+# "bearer"), and set `provider` in the project's `vtcode.toml`.
+#
+# A LOCAL MODEL INSTEAD. VT Code also drives Ollama / LM Studio / llama.cpp. Those listen on your
+# HOST loopback, which an empty-netns cage cannot reach: swap the `[network]` table for a top-level
+# `network = "shared"` (the shape `examples/app/openfox.toml` documents and justifies) — process
+# containment stays, egress filtering does not.
+#
+# UNVERIFIED (like every profile until run with a real key): the live authentication and the model
+# traffic through sbx's MITM. Grounded here: the packaging (upstream's own GitHub release), the
+# default provider and model, and the provider env-var names (upstream's provider guide).
+cmd = "vtcode"
+
+# Your host VT Code config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `vtcode` read and write these host files. Uncomment to share your host VT Code setup with
+# the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/vtcode", mode = "rw" },
+#]
+
+[packages]
+# VT Code itself from upstream's GitHub release. The download rides sbx's built-in read-only
+# allow-set (github.com + *.githubusercontent.com), so the install needs no [network] entry.
+vtcode = "mise:github:vinhnx/VTCode"
+# The two external tools the agent's search stack shells out to.
+ripgrep = "nix:ripgrep"
+ast-grep = "nix:ast-grep"
+
+# An app is read-by-default ({GET,HEAD}); a completions endpoint is a POST, so the provider host is
+# opened to all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # The default provider. Uncomment the ONE matching your choice (see the [env]/[secret] examples
+    # below); OpenRouter is VT Code's own default.
+    #"{*} https://openrouter.ai",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+]
+
+# --- Provider key (commented) — uncomment the placeholder and the matching [secret] block. The
+# in-cage placeholder lets VT Code start and issue its request; the proxy strips it and substitutes
+# the real key, read on the HOST, on the wire. ---
+[env]
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

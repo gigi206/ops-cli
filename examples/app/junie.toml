@@ -1,0 +1,115 @@
+# Junie — JetBrains' LLM-agnostic coding agent (the CLI), sandboxed by sbx.
+#
+#   sbx app import examples/app/junie.toml
+#   sbx app run junie
+#
+# JetBrains publishes Junie from its own npm scope (`@jetbrains/junie`) — but that package is only
+# a SHIM: its `postinstall` downloads the real build (a ~260 MB zip of a JVM application with a
+# bundled JetBrains Runtime) from `github.com/JetBrains/junie/releases`, installs a launcher shim
+# at `~/.local/bin/junie`, and keeps versions under `~/.local/share/junie/` — all inside the app's
+# persistent isolated home here. `sbx upgrade mise` rolls the shim package; the shim itself
+# manages its own release channels afterwards (`junie --eap`, `--nightly`, …).
+#
+# WHY `cmd` IS A WRAPPER, NOT A BARE `junie`. mise's npm backend installs with
+# `--ignore-scripts=true` — a deliberate security default: it will not run arbitrary package
+# scripts — so the vendor's postinstall never runs and a plain `junie` exits with
+# "[Junie] Shim not found at …". The wrapper below runs that same vendor script once, on the first
+# launch, then execs the CLI; the guard (the shim's existence in the persistent home) makes it
+# idempotent, and the extraction is pure JavaScript (the package bundles `yauzl`), so the cage
+# needs no `unzip`. Same shape as `amp.toml` / `openfox.toml`. (`mise where` accepts a SCOPED
+# package name and answers with the install directory, whose layout is
+# `lib/node_modules/<scope>/<name>` — both checked against a real scoped install rather than
+# assumed.)
+#
+# THE HONEST CAVEAT, and it is bigger than for the other profiles here: the build Junie downloads
+# at runtime is a JVM application that sbx never patches (unlike a `nix:`/`deb:`/`tarball:`
+# package, which is autoPatchelf'd host-side). It runs through the cage's `nix-ld` shim, the same
+# path `cursor-agent`'s bootstrap binary takes — which works there, but has NOT been proven for
+# this JBR-bundled launcher. If it fails to start, that is the first thing to look at.
+#
+# CREDENTIAL POSTURE — three ways in, per JetBrains' own docs:
+#   - a **JetBrains account** (OAuth in a browser — the hermetic cage has none, so complete it on
+#     your host, or run the flow in-cage with a Chromium as `examples/app/vibe.toml` shows);
+#   - a **Junie API key** from junie.jetbrains.com/cli, read from `JUNIE_API_KEY` — pass it per
+#     launch (`sbx app run junie --env JUNIE_API_KEY=…`) or inject it host-side (the commented
+#     `[env]` + `[secret]` blocks below);
+#   - **BYOK** against your own provider (Anthropic, OpenAI, Google, xAI, OpenRouter): add that
+#     provider's host to `allow` and its key the same way the BYOK profiles do (see `cline.toml`).
+#
+# UNVERIFIED (like every profile until run with a real account): the runtime download, the JVM
+# launch under nix-ld, the live authentication, and the model traffic through sbx's MITM.
+# Grounded here: the packaging and its postinstall trap (read out of the published package and the
+# vendor installer), the auth methods (JetBrains' README + CLI docs), and the JetBrains hosts (read
+# out of the shipped application).
+cmd = [
+    "bash",
+    "-c",
+    """
+set -eu
+j="$(mise where 'npm:@jetbrains/junie')/lib/node_modules/@jetbrains/junie"
+if [ ! -x "$HOME/.local/bin/junie" ]; then
+  echo "junie: running the vendor install step mise's --ignore-scripts skipped (downloads the release) …" >&2
+  node "$j/postinstall.js"
+fi
+exec junie "$@"
+""",
+    "junie",
+]
+
+# Your host Junie install/config, mounted read-write at its real absolute path. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
+# lets the caged `junie` read and write these host files. Uncomment to share your host Junie setup
+# with the cage instead of the app's isolated home (the default) — which also skips the download,
+# since the shim and versions already exist there.
+#binds = [
+#    { path = "~/.local/share/junie", mode = "rw" },
+#]
+
+[packages]
+# A node runtime — needed to install the shim package and to run the vendor's postinstall above.
+# The Junie build it downloads carries its own JetBrains Runtime, so node is not needed at runtime.
+nodejs = "nix:nodejs"
+junie = "mise:npm:@jetbrains/junie"
+
+# An app is read-by-default ({GET,HEAD}); the AI service carries POSTs, so it is opened to all
+# verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install: the shim package from npm. The release zip itself (github.com + the
+    # *.githubusercontent.com asset host) and the installer's update index on
+    # raw.githubusercontent.com ride sbx's built-in read-only allow-set, so they need no entry.
+    "{GET} https://registry.npmjs.org",
+    # The vendor's own distribution host: release channels, updates, and the `/cli` token page.
+    "{*} https://junie.jetbrains.com",
+    # Runtime: the JetBrains AI service the agent talks to, and its sibling cloud endpoint.
+    "{*} https://api.jetbrains.ai",
+    "{*} https://api.jetbrains.cloud",
+    # Account login (OAuth) — needed for the JetBrains-account path, not for a key or BYOK.
+    "{*} https://oauth.account.jetbrains.com",
+    # BYOK instead: uncomment the ONE provider you use (and supply its key as `cline.toml` shows).
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    #"{*} https://openrouter.ai",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint,
+# and JetBrains' issue tracker, which the app references but which no session needs. A `mute` never
+# changes the verdict (they stay refused) and never hides a count. See them with
+# `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a junie`.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "youtrack.jetbrains.com",
+]
+
+# --- Junie API key (commented) — the in-cage placeholder lets the CLI start and issue its request;
+# the proxy strips it and substitutes the real key, read on the HOST (as $JUNIE_API_KEY, or via a
+# resolver such as sops://secrets.yaml#junie), on the wire to the AI service. The bearer form is
+# the standard one for this API; confirm against `sbx net logs -a junie` on your first real run. ---
+#[env]
+#JUNIE_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.jetbrains.ai"]
+#from = "env://JUNIE_API_KEY"
+#header = "Authorization"
+#type = "bearer"

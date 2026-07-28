@@ -1,0 +1,42 @@
+# `codebuddy` — Tencent's CodeBuddy Code CLI: what it needs to be installed and to reach its own
+# services.
+#
+#   sbx bundle import examples/bundle/codebuddy.toml
+#   # then in an app profile:   use = ["codebuddy"]
+#
+# Derived from `examples/app/codebuddy.toml`, which stays the self-contained way to run this agent
+# on its own (`sbx app import`, one step, nothing else needed). This bundle is for an app that
+# EMBEDS the agent — an orchestrator spawning it as a subprocess — so that app states the
+# requirement ONCE instead of copying it. A test pins the two artifacts together, so they cannot
+# drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's OWN
+# `[network]` table — an app that declares none gets a warning instead, because inventing one could
+# move its posture.
+#
+# The runtime hosts here are the INTERNATIONAL service (`*.codebuddy.ai`). An app using the China
+# edition adds `*.codebuddy.cn` / `copilot.tencent.com` itself — the profile leaves those commented,
+# so the bundle does not carry them.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a `[table]`
+# header as belonging to that table, so an `allow` written below `[…packages]` would silently become
+# `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.codebuddy]
+allow = [
+    "{GET} https://registry.npmjs.org",
+    "{*} https://www.codebuddy.ai",
+    "{*} https://code.codebuddy.ai",
+]
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
+
+[bundle.codebuddy.env]
+DISABLE_AUTOUPDATER = "1"  # sbx owns upgrades (`sbx upgrade mise`)
+DISABLE_TELEMETRY = "1"    # cut the telemetry at the source, not only at the allowlist
+
+[bundle.codebuddy.packages]
+nodejs = "nix:nodejs"  # the CLI is a node program, and mise's npm backend needs a node runtime
+codebuddy = "mise:npm:@tencent-ai/codebuddy-code"

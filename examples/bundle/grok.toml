@@ -1,0 +1,38 @@
+# `grok` — xAI's Grok CLI: what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/grok.toml
+#   # then in an app profile:   use = ["grok"]
+#
+# Derived from `examples/app/grok.toml`, which stays the self-contained way to run this agent on its
+# own (`sbx app import`, one step, nothing else needed). This bundle is for an app that EMBEDS the
+# agent — an orchestrator spawning it as a subprocess — so that app states the requirement ONCE
+# instead of copying it. A test pins the two artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's OWN
+# `[network]` table — an app that declares none gets a warning instead, because inventing one could
+# move its posture.
+#
+# The two lines below are the INSTALL host (xAI's artifact bucket, path-scoped) and the BYOK API
+# host. The xAI-ACCOUNT path uses different hosts (`accounts.x.ai`, `cli-chat-proxy.grok.com`); the
+# profile leaves them commented, so the bundle does not carry them either — an app that signs in
+# with an account adds those two itself.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a `[table]`
+# header as belonging to that table, so an `allow` written below `[…packages]` would silently become
+# `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.grok]
+allow = [
+    "{GET} https://storage.googleapis.com/grok-build-public-artifacts/*",
+    "{*} https://api.x.ai",
+]
+mute = [
+    "api.mixpanel.com",
+]
+
+[bundle.grok.env]
+GROK_DISABLE_AUTOUPDATER = "1"  # sbx owns upgrades; the CLI must not replace its pinned install
+
+[bundle.grok.packages]
+grok = "mise:aqua:x.ai/cli/grok"  # xAI's own release binary, fetched from its artifact bucket

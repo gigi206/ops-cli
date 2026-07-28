@@ -96,6 +96,76 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **Six agent profiles from AionUi's catalogue — `copilot`, `grok`, `amp`, `codebuddy`, `junie`,
+  `vtcode` (DONE 2026-07-28)** (`examples/app/{copilot,grok,amp,codebuddy,junie,vtcode}.toml` [new]
+  + `examples/bundle/{copilot,grok,codebuddy,vtcode}.toml` [new] + `examples/README.md` +
+  `docs/guide/apps/catalog.md`): the user pointed at AionUi's agent list and asked which of it sbx
+  was missing. **The list was taken from the app's own catalogue, not from the screen** — 15 of its
+  38 entries were visible, so the rest came from AionCore's DB migrations (`001_initial_schema.sql`
+  = 19 builtins, `023` = Pi, `025_sync_and_add_acp_registry_agents.sql` = the 18 "ACP Registry"
+  agents; 19+1+18 = 38, matching the app's own `All 38`). Result: **15 covered · 22 missing · 1 n/a**
+  (`Aion CLI` is aionrs, shipped inside AionUi). **Gemini CLI is deliberately NOT added** — the
+  user's call: deprecated upstream in favour of Antigravity, which already ships here as `agy`.
+  **Three of the 22 are not profiles at all, and saying so is part of the deliverable:**
+  `@autohandai/autohand-acp` and `deepagents-acp` publish only an **ACP bridge** (npm's own
+  description: *"ACP adapter for the Autohand CLI"*) — a bridge is useless in a cage without the
+  primary CLI, a separate packaging question; `glm-acp-agent` is a bridge onto Zhipu GLM, i.e. a
+  **provider** `opencode`/`goose`/`cline` already reach by BYOK; and npm's `nanobot` is an unrelated
+  package (nanobot.ai is `obot-platform/nanobot`, an MCP host).
+  **The load-bearing finding is a packaging trap that two of the six share, found by reading the
+  published packages rather than by running them.** `@ampcode/cli` ships `bin/amp.exe` as a
+  **stub shell script** that its `postinstall` (`install.cjs`) replaces with the platform binary
+  already on disk beside it; `@jetbrains/junie` is a **shim** whose `postinstall` downloads a
+  ~260 MB JVM build and installs a launcher at `~/.local/bin/junie`. mise's npm backend installs
+  with `--ignore-scripts=true`, so a bare `mise:npm:` entry yields, respectively, *"Error: Amp
+  native binary not installed."* and *"[Junie] Shim not found at …"*. Both profiles therefore carry
+  a `cmd` wrapper that runs the **vendor's own script once**, guarded and idempotent — the
+  `openfox.toml` `npm rebuild` shape, and the reason **neither gets a bundle**: the install step
+  lives in `cmd`, which a bundle cannot carry, so a bundle of the package alone would hand a
+  consuming app a binary that refuses to start (`examples/README.md` says this beside the
+  `cursor-agent` case). Junie needs no `unzip` — the package bundles `yauzl`. **`mise where` with a
+  SCOPED package name was verified, not assumed** (it is the whole startup path for those two): the
+  query form parses, and the install layout `lib/node_modules/<scope>/<name>` was read off the real
+  `auggie` app home; a failure aborts under `set -eu` with mise's own message.
+  **The four clean ones.** `copilot` = `mise:aqua:github/copilot-cli`, GitHub's own release binary
+  verified against the release's **own `SHA256SUMS.txt`** — so, unlike `goose`, no external signing
+  infrastructure to allow. `grok` = `mise:aqua:x.ai/cli/grok`, an aqua `http` package pulling xAI's
+  static binary from its own artifact bucket (path-scoped in the allowlist, the `claude-code` GCS
+  shape); its endpoints, `XAI_API_KEY`, `GROK_DISABLE_AUTOUPDATER` and the **WebSocket** on the
+  account path were read out of the shipped binary. `codebuddy` = `mise:npm:@tencent-ai/codebuddy-code`
+  (a node CLI, so `nix:nodejs` at runtime; its native pieces ship **prebuilt**, so no `npm rebuild`),
+  with the endpoints and the `Authorization`/`X-User-Id` auth read from its `product.json` and
+  `DISABLE_AUTOUPDATER`/`DISABLE_TELEMETRY` confirmed in its bundle. `vtcode` =
+  `mise:github:vinhnx/VTCode` plus `nix:ripgrep` + `nix:ast-grep` (the tools its search stack shells
+  out to, from nixpkgs rather than upstream's installer); its default provider/model
+  (OpenRouter, `xiaomi/mimo-v2.5-pro`) comes from upstream's provider guide. Also recorded because
+  it is a live trap: **`@sourcegraph/amp` is renamed `@ampcode/cli`**.
+  **Verified rather than asserted.** The two path-scoped rules — the ones on which grok can install
+  at all and copilot can log in at all — were measured through `sbx test net` (the same `explain`
+  the proxy uses): `…/grok-build-public-artifacts/cli/grok-0.2.112-linux-x86_64` **ALLOWED** while a
+  neighbouring bucket is **DENIED**, and `github.com/login/device` + `…/login/oauth/access_token`
+  **ALLOWED**. **One comment was factually wrong and the measurement caught it:** copilot's `mute`
+  block claimed all three hosts are "deliberately left DENIED", but
+  `copilot-telemetry.githubusercontent.com` rides the built-in always-on `{GET,HEAD}
+  *.githubusercontent.com` lane — its GETs are **allowed**, and only its writes (which is what a
+  telemetry upload is) are refused and muted; reworded to say exactly that.
+  **Tests: no net-new test needed and none written** — both guards are data-driven over the
+  directories, so the six profiles and four bundles are covered the moment they land
+  (`the_shipped_profiles_import_and_resolve` re-checks intent against the raw text, incl. that every
+  `[network]` table resolves to a filtering allowlist; `every_shipped_bundle_matches_the_agent_profile_it_was_derived_from`
+  pins bundle ⊆ profile). **1334 unit + 103 config + 13 help green**, fmt/clippy `-D warnings` clean.
+  **No musl rebuild: nothing under `src/` changed** — this increment is artifacts and docs only.
+  **Honest residuals:** `vtcode` resolves to **0 allow rules**, so an unedited launch reaches no
+  model host — the `goose` "pick your provider" convention, but the first profile that is inert out
+  of the box (its header says so); `junie`'s downloaded JVM launcher runs under the cage's `nix-ld`
+  shim **unproven** (the `cursor-agent` bootstrap precedent works, this one was never exercised);
+  `codebuddy`'s headless `CODEBUDDY_API_KEY`/`CODEBUDDY_AUTH_TOKEN` path is **observed in the
+  shipped bundle, not documented publicly**; and, as for every profile, the live equip/auth and the
+  model traffic through the MITM await the user's own accounts. `docs/guide/apps/catalog.md`'s table
+  was **already stale by ~26 profiles** — the six were added and the table marked a *selection*
+  pointing at `examples/README.md`, rather than silently implying completeness.
+  See [[ops-app-framework]], [[bundle-tool-composition]], [[profile-official-sources-only]],
+  [[mise-npm-native-addons-ignore-scripts]], [[apps-must-be-upgradable]].
   **`sbx storage status` reports the space that can be RECLAIMED, on one axis — correcting a
   figure that was wrong twice over (DONE 2026-07-28)** (`src/storage.rs` + `src/cli/storage.rs` +
   `docs/guide/cli/storage.md`): the user asked for the **reclaimable** space; the increment below

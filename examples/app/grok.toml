@@ -1,0 +1,87 @@
+# Grok — xAI's terminal coding agent ("Grok Build"), sandboxed by sbx.
+#
+#   sbx app import examples/app/grok.toml
+#   sbx app run grok
+#
+# xAI publishes the CLI as a single static release binary in its own public artifact bucket
+# (`storage.googleapis.com/grok-build-public-artifacts/cli/grok-<version>-linux-x86_64`), which is
+# what mise's `aqua` backend fetches through the aqua registry entry `x.ai/cli/grok` — no node
+# runtime, no third-party mirror. It lands in the app's persistent isolated home, equipped at the
+# latest upstream version on the first launch in a project and then pinned; advance it with
+# `sbx upgrade mise`.
+#
+# TWO AUTHENTICATION PATHS, and they use DIFFERENT hosts — pick one and open only its host:
+#
+#  - **BYOK (the default here)** — an xAI API key from console.x.ai. The real key is read on the
+#    HOST and injected by the egress proxy on the wire to `api.x.ai`; the cage only ever sees the
+#    placeholder in `[env]`. Provide it on the host as `$XAI_API_KEY` (or point `from` at a
+#    resolver, e.g. `sops://secrets.yaml#xai`) and uncomment the `[env]` + `[secret]` blocks.
+#  - **An xAI account** (a Grok subscription) — `grok` signs you in through `accounts.x.ai` and
+#    then talks to `cli-chat-proxy.grok.com` instead of `api.x.ai`. The sign-in opens a browser,
+#    which the hermetic cage does not have; uncomment those two allow lines (and see the
+#    in-cage-browser recipe in `examples/app/vibe.toml` if you want the whole flow to close inside
+#    the sandbox). The session token then persists in the app's isolated home.
+#
+# The host list below was read out of the shipped binary (its embedded endpoints and `GROK_*`/
+# `XAI_*` environment keys), not guessed. Note the account path speaks **WebSocket** as well as
+# HTTPS to the chat proxy, hence the `{*,WS}` verb set on that line — sbx's proxy relays
+# WebSockets under the same verdict.
+#
+# UNVERIFIED (like every profile until run with a real key/account): the live authentication and
+# the model traffic through sbx's MITM. Grounded here: the packaging (xAI's own bucket via the
+# aqua registry), the endpoints, and the environment keys.
+cmd = "grok"
+
+# Your host Grok config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `grok` read and write these host files. Uncomment to share your host Grok setup with the
+# cage instead of the app's isolated home (the default). `GROK_HOME` overrides the location.
+#binds = [
+#    { path = "~/.grok", mode = "rw" },
+#]
+
+[packages]
+# Grok itself via mise's aqua backend. The aqua entry is an `http`-type package: it downloads the
+# raw binary straight from xAI's artifact bucket (allowed, path-scoped, in [network] below).
+grok = "mise:aqua:x.ai/cli/grok"
+
+# An app is read-by-default ({GET,HEAD}); the model endpoints carry POSTs, so each is opened to all
+# verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install + self-update: xAI's public artifact bucket, path-scoped to the Grok CLI prefix —
+    # not all of Google Cloud Storage (the same least-privilege shape `claude-code.toml` uses for
+    # Anthropic's bucket). Read-only: a download is a GET.
+    "{GET} https://storage.googleapis.com/grok-build-public-artifacts/*",
+    # BYOK model traffic — xAI's API, the default path here (pair it with the [env] + [secret]
+    # blocks below, or with a key passed per launch via `--env XAI_API_KEY=…`).
+    "{*} https://api.x.ai",
+    # Account path instead of BYOK: the sign-in host and the CLI chat proxy (HTTPS + WebSocket).
+    #"{*} https://accounts.x.ai",
+    #"{*,WS} https://cli-chat-proxy.grok.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the product-analytics
+# sink the CLI reports to, deliberately left DENIED. A `mute` never changes the verdict (it stays
+# refused) and never hides a count (`sbx net stats` still tallies it); it only keeps the line out
+# of the default log. See it with `sbx net log --all`; edit with `sbx net mute|unmute <host> -a grok`.
+mute = [
+    "api.mixpanel.com",   # product analytics
+]
+
+[env]
+# sbx owns upgrades (`sbx upgrade mise`), so tell the CLI not to replace its own binary underneath
+# the pinned install. Belt and braces: even if the value is not honored, the allowlist above admits
+# only GETs to the artifact prefix, and a warm launch reuses the pinned version offline.
+GROK_DISABLE_AUTOUPDATER = "1"
+
+# --- BYOK (commented) — uncomment together with the `{*} https://api.x.ai` allow line above. The
+# in-cage placeholder lets the CLI start and issue its request; the proxy strips it and substitutes
+# the real key, read on the HOST, on the wire. ---
+#XAI_API_KEY = "xai-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.x.ai"]
+#from = "env://XAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

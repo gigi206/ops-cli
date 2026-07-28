@@ -1,0 +1,104 @@
+# Amp — the coding agent from the Amp team (formerly Sourcegraph Amp), sandboxed by sbx.
+#
+#   sbx app import examples/app/amp.toml
+#   sbx app run amp
+#
+# Amp ships on npm as `@ampcode/cli` — a thin wrapper package whose real payload is a prebuilt
+# native binary published as a platform optional dependency (`@ampcode/cli-linux-x64`). Note the
+# rename: the older `@sourcegraph/amp` still resolves but upstream now publishes `@ampcode/cli`,
+# which is what this profile equips. sbx installs it in-cage with mise's npm backend over a node
+# runtime; `sbx upgrade mise` rolls it forward.
+#
+# WHY `cmd` IS A WRAPPER, NOT A BARE `amp`. The npm wrapper ships a small placeholder at
+# `bin/amp.exe` and replaces it with the real binary in a **postinstall** script (`install.cjs`,
+# which hardlinks the platform package's `amp` over the placeholder). mise's npm backend installs
+# with `--ignore-scripts=true` — a deliberate security default: it will not run arbitrary package
+# scripts — so a plain install leaves the placeholder in place and `amp` exits with
+# "Error: Amp native binary not installed." The wrapper below heals exactly that, and only that:
+# on the first launch (and again after `sbx upgrade mise` rolls Amp to a version whose fresh
+# install dir has a new placeholder) it runs the package's own `install.cjs`, which copies the
+# binary that is ALREADY on disk beside it — no download, no network, and nothing but the vendor's
+# own script. The guard makes it idempotent. Same shape as `openfox.toml`'s `npm rebuild` step.
+# (`mise where` accepts a SCOPED package name and answers with the install directory, whose layout
+# is `lib/node_modules/<scope>/<name>` — both checked against a real scoped install rather than
+# assumed. If the query ever fails, `set -eu` aborts the launch with mise's own message instead of
+# running a half-installed CLI.)
+#
+# CREDENTIAL POSTURE — an Amp account, with a headless key. `amp login` opens a browser (which the
+# hermetic cage does not have), so the practical path is `AMP_API_KEY`, documented in the Amp
+# Owner's Manual for non-interactive environments. Two ways to supply it:
+#   - host-side injection (the sbx way, key never in the cage): uncomment the `[env]` placeholder
+#     and the `[secret]` block below;
+#   - or pass it for a single launch: `sbx app run amp --env AMP_API_KEY=…` (never baked in here).
+# Settings live at `~/.config/amp/settings.json` inside the app's isolated home.
+#
+# UNVERIFIED (like every profile until run with a real account): the live authentication and the
+# model traffic through sbx's MITM. Grounded here: the packaging and its postinstall trap (read out
+# of the published package), the `AMP_*` environment keys and the `ampcode.com` endpoints (read out
+# of the shipped binary), and the bearer-token shape of the `Authorization` header.
+cmd = [
+    "bash",
+    "-c",
+    """
+set -eu
+amp="$(mise where 'npm:@ampcode/cli')/lib/node_modules/@ampcode/cli"
+if [ ! -e "$amp/bin/amp.exe" ] || [ "$(stat -c %s "$amp/bin/amp.exe")" -lt 4096 ]; then
+  echo "amp: placing the native binary that mise's --ignore-scripts skipped …" >&2
+  node "$amp/install.cjs"
+fi
+exec amp "$@"
+""",
+    "amp",
+]
+
+# Your host Amp settings, mounted read-write at their real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `amp` read and write these host files (settings, login). Uncomment to share your host Amp
+# setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/amp", mode = "rw" },
+#]
+
+[packages]
+# A node runtime — needed both to install the npm package and to run the vendor's `install.cjs`
+# placement step above (the executed `amp` itself is a native binary and needs no node).
+nodejs = "nix:nodejs"
+amp = "mise:npm:@ampcode/cli"
+
+# An app is read-by-default ({GET,HEAD}); Amp's API carries POSTs, so its host is opened to all
+# verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install: the packument (version resolution, also used by `sbx upgrade mise`), the wrapper
+    # tarball, and the platform binary published at its own top-level path — npm spreads these
+    # across sibling paths, so the registry host is opened read-only as a whole, like the other
+    # npm-backed profiles.
+    "{GET} https://registry.npmjs.org",
+    # Runtime: Amp's service (threads, model traffic, account) and its static asset host.
+    "{*} https://ampcode.com",
+    "{GET} https://static.ampcode.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint,
+# which the install POSTs to and which is irrelevant to whether the install succeeds. A `mute`
+# never changes the verdict (it stays refused) and never hides a count (`sbx net stats` still
+# tallies it). See it with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a amp`.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
+
+[env]
+# sbx owns upgrades (`sbx upgrade mise`), so tell Amp not to check for a newer version of itself
+# on every start — the pinned install is the one sbx equips.
+AMP_SKIP_UPDATE_CHECK = "1"
+
+# --- BYOK-style account key (commented). The in-cage placeholder lets the CLI start and issue its
+# request; the proxy strips it and substitutes the real key, read on the HOST (as $AMP_API_KEY, or
+# via a resolver such as sops://secrets.yaml#amp), on the wire to ampcode.com. ---
+#AMP_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."ampcode.com"]
+#from = "env://AMP_API_KEY"
+#header = "Authorization"
+#type = "bearer"

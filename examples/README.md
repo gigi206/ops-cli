@@ -46,7 +46,11 @@ of the same name in [`app/`](app/), and a test pins the two together so they can
 drift apart. See [`[bundle.<name>]`](../docs/guide/configuration/bundles.md).
 
 Not every agent has one: `cursor-agent` is a bootstrap download rather than a
-package, so there is nothing for a bundle to carry.
+package, so there is nothing for a bundle to carry. `amp` and `junie` have none for a
+different reason — their npm package is inert until a vendor **postinstall** step runs
+(which mise's `--ignore-scripts` skips), so the step lives in the profile's `cmd`
+wrapper, and a bundle cannot carry a `cmd`. A bundle of the package alone would hand a
+consuming app a binary that refuses to start.
 
 ### What's in `app/`
 
@@ -72,6 +76,12 @@ package, so there is nothing for a bundle to carry.
 | `agy`             | `mise:aqua:google-antigravity/antigravity-cli`  | `accounts.google.com` (Google OAuth) |
 | `antigravity-ide` | `tarball:resolve` prebuilt `.tar.gz` (Electron GUI IDE / VS Code fork, `gui`/`gpu`/`dbus`, auto-upgraded) | `cloudcode-pa.googleapis.com` (Google OAuth, in-cage browser) |
 | `auggie`          | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | `*.api.augmentcode.com` (Augment account) |
+| `copilot`         | `mise:aqua:github/copilot-cli` (GitHub's release binary, no runtime deps) | `*.githubcopilot.com` + `github.com/login/*` (GitHub account: `/login` device flow or a `GH_TOKEN` PAT) |
+| `grok`            | `mise:aqua:x.ai/cli/grok` (xAI's release binary from its own artifact bucket) | `api.x.ai` (BYOK `XAI_API_KEY`) — or `accounts.x.ai` + `cli-chat-proxy.grok.com` for an xAI account |
+| `amp`             | `mise:npm:@ampcode/cli` (+ `nix:nodejs`) — native binary placed by the vendor's postinstall, run from the `cmd` wrapper | `ampcode.com` (Amp account / `AMP_API_KEY`) |
+| `codebuddy`       | `mise:npm:@tencent-ai/codebuddy-code` (+ `nix:nodejs`) | `*.codebuddy.ai` (CodeBuddy account; China edition on `*.codebuddy.cn`) |
+| `junie`           | `mise:npm:@jetbrains/junie` (+ `nix:nodejs`) — a shim whose postinstall downloads the JVM build, run from the `cmd` wrapper | `api.jetbrains.ai` + `junie.jetbrains.com` (JetBrains account, `JUNIE_API_KEY`, or BYOK) |
+| `vtcode`          | `mise:github:vinhnx/VTCode` (Rust release binary) + `nix:ripgrep` + `nix:ast-grep` | provider-dependent (BYOK; upstream's default is OpenRouter) |
 | `cursor-agent`    | bootstrap `curl cursor.com/install` (CLI tarball — no clean backend; **not** the npm `cursor-agent`) | `*.cursor.sh` (Cursor account) |
 | `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
 | `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
@@ -87,9 +97,11 @@ across projects by default (`home_scope`).
 
 > **Two credential postures.** Most profiles are **BYOK** — your provider key is read
 > on the host and injected by the proxy, never entering the cage (see below).
-> `freebuff`, `agy`, `droid`, `auggie`, and `claude-desktop` are the other kind: they log in
+> `freebuff`, `agy`, `droid`, `auggie`, `copilot`, `codebuddy`, `amp`, `junie`, and
+> `claude-desktop` are the other kind: they log in
 > to a service **account** (a Codebuff account; a Google account; a Factory account; an Augment
-> account; an Anthropic/claude.ai account or SSO, respectively) and the token persists in the
+> account; a GitHub account; a CodeBuddy account; an Amp account; a JetBrains account; an
+> Anthropic/claude.ai account or SSO, respectively) and the token persists in the
 > app's isolated `$HOME` (so it *does* live in the — isolated — cage, never in the project
 > shell). All stay bounded by the egress allowlist. `agy` and `claude-desktop` carry an extra
 > unproven risk — they may want a **system keyring** the hermetic cage does not provide (see each
@@ -278,6 +290,12 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `agy`         | `mise:aqua:google-antigravity/antigravity-cli`  | Antigravity's GitHub release binary (native) |
 | `antigravity-ide` | `tarball:resolve` (+ `[tarball.antigravity-ide]`) | Google's official IDE `.tar.gz` from `edgedl.me.gvt1.com` (Electron / VS Code fork), autoPatchelf'd host-side — auto-upgraded via a sandboxed resolve command over Google's version API (`sbx upgrade tarball`) |
 | `auggie`      | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | Augment Code npm package (pure-node CLI, node at runtime) |
+| `copilot`     | `mise:aqua:github/copilot-cli`                  | GitHub's own release binary, verified against the release's `SHA256SUMS.txt` (no external signing infrastructure to reach) |
+| `grok`        | `mise:aqua:x.ai/cli/grok`                       | xAI's own static binary from `storage.googleapis.com/grok-build-public-artifacts` (aqua `http` package, path-scoped in the allowlist) |
+| `amp`         | `mise:npm:@ampcode/cli` (+ `nix:nodejs`)        | npm wrapper → native platform binary, **placed by the vendor's `install.cjs`** — mise's `--ignore-scripts` skips it, so the profile's `cmd` runs it once (note the upstream rename from `@sourcegraph/amp`) |
+| `codebuddy`   | `mise:npm:@tencent-ai/codebuddy-code` (+ `nix:nodejs`) | Tencent's own npm scope (node CLI, node at runtime; native pieces ship prebuilt, so no `npm rebuild` needed) |
+| `junie`       | `mise:npm:@jetbrains/junie` (+ `nix:nodejs`)    | JetBrains' npm **shim**, whose postinstall downloads the ~260 MB JVM build from `github.com/JetBrains/junie/releases` — mise's `--ignore-scripts` skips it, so the profile's `cmd` runs it once; the downloaded launcher runs under the cage's nix-ld shim (unproven) |
+| `vtcode`      | `mise:github:vinhnx/VTCode`                     | upstream's own Rust release binary; `ripgrep`/`ast-grep` come from nixpkgs rather than upstream's installer |
 | `cursor-agent`| bootstrap installer (`curl cursor.com/install`)  | Cursor's own tarball (`downloads.cursor.com`), no npm/nixpkgs/GitHub package — refresh with `--env CURSOR_AGENT_SBX_UPDATE=1` |
 | `cursor`      | `deb:…/cursor_<ver>_amd64.deb` (version-pinned)  | Cursor's prebuilt `.deb` (Electron), autoPatchelf'd host-side |
 | `openfox`     | `mise:npm:openfox` (+ `nix:nodejs`) | OpenFox npm package (pure-node web agent, node at runtime) |

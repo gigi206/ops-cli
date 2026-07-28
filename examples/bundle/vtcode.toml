@@ -1,0 +1,27 @@
+# `vtcode` — the VT Code CLI: what it needs to be installed, plus the tools it shells out to.
+#
+#   sbx bundle import examples/bundle/vtcode.toml
+#   # then in an app profile:   use = ["vtcode"]
+#
+# Derived from `examples/app/vtcode.toml`, which stays the self-contained way to run this agent on
+# its own (`sbx app import`, one step, nothing else needed). This bundle is for an app that EMBEDS
+# the agent — an orchestrator spawning it as a subprocess — so that app states the requirement ONCE
+# instead of copying it. A test pins the two artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# NO EGRESS RULES, deliberately. VT Code is BYOK against 21+ providers, so the profile leaves every
+# provider host commented for the user to choose — and a bundle may only carry what its profile
+# declares. The consuming app therefore opens its OWN provider host (and supplies the key). The
+# install itself needs nothing here: the GitHub release download rides sbx's built-in read-only
+# allow-set.
+#
+# FIELD ORDER MATTERS. An array would have to come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.vtcode.packages]
+vtcode = "mise:github:vinhnx/VTCode"  # upstream's own Rust release binary
+ripgrep = "nix:ripgrep"               # the agent's content search
+ast-grep = "nix:ast-grep"             # the agent's symbol/outline maps

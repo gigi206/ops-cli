@@ -1,0 +1,88 @@
+# CodeBuddy Code — Tencent's agentic coding CLI, sandboxed by sbx.
+#
+#   sbx app import examples/app/codebuddy.toml
+#   sbx app run codebuddy
+#
+# CodeBuddy Code ships as an npm package from Tencent's own scope (`@tencent-ai/codebuddy-code`),
+# a node CLI (`#!/usr/bin/env node`, Node ≥ 18.20.8 — the cage synthesises `/usr/bin/env`, so the
+# shebang resolves). sbx equips it in-cage with mise's npm backend over a node runtime; the first
+# launch in a project needs the network and the allowlist below, and `sbx upgrade mise` rolls it
+# forward afterwards.
+#
+# NATIVE ADDONS — why no `npm rebuild` wrapper here. The package's native pieces (`node-pty` for
+# its terminal, Tencent's `sandbox-cli` helper) ship as PREBUILT platform packages resolved through
+# optional dependencies, so mise's `--ignore-scripts=true` install leaves nothing to compile
+# (contrast `openfox.toml`, whose addons are fetched by an install script and need an explicit
+# `npm rebuild`). If a future release moves them behind a postinstall, the symptom is a missing
+# `.node` at startup and the fix is that same wrapper shape.
+#
+# CREDENTIAL POSTURE — a CodeBuddy ACCOUNT, not a header-injectable provider key. The CLI's own
+# product configuration declares an external-link login: it opens a browser at its endpoint and
+# receives a bearer token (sent afterwards as `Authorization` plus an `X-User-Id` header). The
+# hermetic cage has no browser, so either complete the login on your host and let the token land
+# in the app's isolated home, or run the whole flow inside the sandbox with an in-cage Chromium
+# (the recipe is in `examples/app/vibe.toml`). The binary also reads `CODEBUDDY_API_KEY` and
+# `CODEBUDDY_AUTH_TOKEN` — observed in the shipped bundle, NOT documented publicly, so treat the
+# headless path as unproven; if it works for you, pass it per launch with
+# `sbx app run codebuddy --env CODEBUDDY_API_KEY=…` rather than baking it into this file.
+#
+# INTERNATIONAL vs CHINA. The shipped configuration carries two service families: the
+# international endpoint `www.codebuddy.ai` (the default, allowed below) and a China edition on
+# `*.codebuddy.cn` / `copilot.tencent.com` (selected by the product's own configuration, not by
+# this profile). If you use the China edition, swap the runtime hosts accordingly — the proxy will
+# name whatever it refuses (`sbx net logs -a codebuddy`).
+#
+# UNVERIFIED (like every profile until run with a real account): the live login and the model
+# traffic through sbx's MITM. Grounded here: the packaging (Tencent's own npm scope, no
+# postinstall), the endpoints and auth headers (read out of the package's `product.json`), and the
+# environment keys (read out of the shipped bundle).
+cmd = "codebuddy"
+
+# Your host CodeBuddy config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged CLI read and write these host files (login, settings). Uncomment to share your host
+# CodeBuddy setup with the cage instead of the app's isolated home (the default). `CODEBUDDY_CONFIG_DIR`
+# overrides the location.
+#binds = [
+#    { path = "~/.codebuddy", mode = "rw" },
+#]
+
+[packages]
+# A node runtime (needed to install AND to run — the CLI is a node program, unlike the
+# native-binary npm agents), then CodeBuddy itself from Tencent's official npm scope.
+nodejs = "nix:nodejs"
+codebuddy = "mise:npm:@tencent-ai/codebuddy-code"
+
+# An app is read-by-default ({GET,HEAD}); the service endpoints carry POSTs, so they are opened to
+# all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install: the packument (version resolution, also used by `sbx upgrade mise`), the tarball,
+    # and the platform packages published at their own top-level paths — npm spreads these across
+    # sibling paths, so the registry host is opened read-only as a whole.
+    "{GET} https://registry.npmjs.org",
+    # Runtime: the international service endpoint (login, account, model traffic) and the code
+    # service host observed beside it.
+    "{*} https://www.codebuddy.ai",
+    "{*} https://code.codebuddy.ai",
+    # China edition instead — uncomment these and remove the two above if that is your account.
+    #"{*} https://www.codebuddy.cn",
+    #"{*} https://tencent.sso.codebuddy.cn",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint,
+# irrelevant to whether the install succeeds. A `mute` never changes the verdict (it stays refused)
+# and never hides a count. See it with `sbx net log --all`; edit with
+# `sbx net mute|unmute <rule> -a codebuddy`.
+mute = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]
+
+[env]
+# sbx owns upgrades (`sbx upgrade mise`), so stop the CLI replacing its own install underneath the
+# pinned one; and cut its telemetry at the source rather than relying only on the deny-by-
+# construction allowlist. Both keys are read by the shipped bundle (`DISABLE_AUTOUPDATER` accepts
+# "1"/"true"; `DISABLE_TELEMETRY` is checked for presence).
+DISABLE_AUTOUPDATER = "1"
+DISABLE_TELEMETRY = "1"

@@ -13,6 +13,9 @@ See also: [Portable profiles](profiles.md) · [The app framework](README.md) · 
 
 ## The shipped profiles
 
+A selection — the complete, always-current list (with a row per profile and the packaging
+notes) lives in [`examples/README.md`](../../../examples/README.md).
+
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
 | `claude-code` | `mise:aqua:anthropics/claude-code` | `api.anthropic.com` (BYOK) |
@@ -24,6 +27,12 @@ See also: [Portable profiles](profiles.md) · [The app framework](README.md) · 
 | `freebuff` | `mise:npm:freebuff` (+ `nix:nodejs`) | `www.codebuff.com` (account) |
 | `cline` | `mise:npm:cline` (+ `nix:nodejs`) | `openrouter.ai` (BYOK) |
 | `droid` | `mise:npm:droid` (+ `nix:nodejs`) | `*.factory.ai` (account) |
+| `copilot` | `mise:aqua:github/copilot-cli` | `*.githubcopilot.com` (GitHub account / `GH_TOKEN`) |
+| `grok` | `mise:aqua:x.ai/cli/grok` | `api.x.ai` (BYOK) or an xAI account |
+| `amp` | `mise:npm:@ampcode/cli` (+ `nix:nodejs`) | `ampcode.com` (account / `AMP_API_KEY`) |
+| `codebuddy` | `mise:npm:@tencent-ai/codebuddy-code` (+ `nix:nodejs`) | `*.codebuddy.ai` (account) |
+| `junie` | `mise:npm:@jetbrains/junie` (+ `nix:nodejs`) | `api.jetbrains.ai` (JetBrains account / `JUNIE_API_KEY` / BYOK) |
+| `vtcode` | `mise:github:vinhnx/VTCode` | provider-dependent (BYOK, default OpenRouter) |
 
 Each gets its own persistent, isolated [`$HOME`](home.md), shared across projects by
 default (`home_scope = "global"`).
@@ -44,7 +53,7 @@ default (`home_scope = "global"`).
   proxy strips it and substitutes the real key on the wire. See
   [Injection](../secrets/injection.md).
 
-- **Account** (`freebuff`, `droid`) — the tool logs in to a service account and the
+- **Account** (`freebuff`, `droid`, `copilot`, `codebuddy`, `amp`, `junie`) — the tool logs in to a service account and the
   token persists in the app's **isolated** `$HOME` (so it lives in the — isolated —
   cage, never in the project shell).
 
