@@ -119,11 +119,19 @@ pub(crate) struct Session {
     pub(crate) start_ticks: u64,
     pub(crate) kind: Kind,
     pub(crate) runtime: SessionRuntime,
+    /// Whether the session runs as a background daemon (`--detach`) rather than in the
+    /// launching terminal. It is the bit that decides where the session's output went: a
+    /// detached session's stdout/stderr is redirected to a log file, so it is the only kind
+    /// `sbx session logs` can read; a foreground one writes to the terminal that started it.
+    pub(crate) detached: bool,
 }
 
 impl Session {
     /// Describe the *current* process as a session for `project`. Reads this
     /// process's own start time so the record can later be matched against it.
+    ///
+    /// Foreground by default: the detached launch marks its own record with
+    /// [`Session::detached`], so a caller that forgets cannot claim a log that does not exist.
     pub(crate) fn current(
         project: PathBuf,
         kind: Kind,
@@ -138,7 +146,14 @@ impl Session {
             start_ticks,
             kind,
             runtime,
+            detached: false,
         })
+    }
+
+    /// Mark this record as a detached (background daemon) session.
+    pub(crate) fn detached(mut self) -> Self {
+        self.detached = true;
+        self
     }
 
     /// The record's stable file name: unique per process *incarnation*, so two
@@ -539,11 +554,12 @@ impl Drop for RecordGuard {
 /// trips exactly; the other fields are ASCII.
 fn serialize(s: &Session) -> String {
     format!(
-        "kind={}\npid={}\nstart={}\nruntime={}\nproject={}\n",
+        "kind={}\npid={}\nstart={}\nruntime={}\ndetached={}\nproject={}\n",
         s.kind.as_str(),
         s.pid,
         s.start_ticks,
         s.runtime.serialize(),
+        u8::from(s.detached),
         to_hex(s.project.as_os_str().as_bytes()),
     )
 }
@@ -555,6 +571,9 @@ fn parse_record(path: &Path) -> Option<Session> {
     let (mut kind, mut pid, mut start, mut project) = (None, None, None, None);
     // Absent in records written before the field; defaults to the project home (back-compat).
     let mut runtime = SessionRuntime::Project;
+    // Likewise absent in older records, and likewise fail-safe: an unmarked record reads as a
+    // foreground session, so a listing never promises a log file that was never written.
+    let mut detached = false;
     for line in content.lines() {
         if line.is_empty() {
             continue;
@@ -565,6 +584,7 @@ fn parse_record(path: &Path) -> Option<Session> {
             "pid" => pid = value.parse::<u32>().ok(),
             "start" => start = value.parse::<u64>().ok(),
             "runtime" => runtime = SessionRuntime::parse(value),
+            "detached" => detached = value == "1",
             "project" => project = from_hex(value).map(|b| PathBuf::from(OsString::from_vec(b))),
             _ => {}
         }
@@ -575,6 +595,7 @@ fn parse_record(path: &Path) -> Option<Session> {
         start_ticks: start?,
         kind: kind?,
         runtime,
+        detached,
     })
 }
 
@@ -720,6 +741,7 @@ mod tests {
             start_ticks: start,
             kind,
             runtime: SessionRuntime::Project,
+            detached: false,
         }
     }
 
@@ -741,6 +763,7 @@ mod tests {
             start_ticks,
             kind: Kind::Run,
             runtime: SessionRuntime::Project,
+            detached: false,
         };
         (child, session)
     }
@@ -772,6 +795,10 @@ mod tests {
             kind: Kind::Shell,
             // an app runtime must round-trip too, so attach can reproduce the app's home
             runtime: SessionRuntime::GlobalApp("demo-tool".to_string()),
+            // set, so the round-trip covers the non-default direction: a detached record that
+            // parsed back as foreground would make `sbx session ls` hide the one session whose
+            // output `sbx session logs` can actually read.
+            detached: true,
         };
         let dir = TmpDir::new();
         let path = dir.join("rec");
@@ -797,10 +824,46 @@ mod tests {
             start_ticks: 3,
             kind: Kind::Run,
             runtime: SessionRuntime::ProjectApp("agent".to_string()),
+            detached: false,
         };
         let path = dir.join("pa");
         std::fs::write(&path, serialize(&pa)).unwrap();
         assert_eq!(parse_record(&path), Some(pa));
+    }
+
+    #[test]
+    fn a_record_without_a_detached_line_reads_as_a_foreground_session() {
+        // Back-compat and fail-safe in one: a record written before the `detached` field must
+        // parse, and must read as *foreground* — the direction that promises no log file. The
+        // opposite default would make `sbx session ls` mark every pre-existing session detached
+        // and point `sbx session logs` at a file that was never written.
+        let dir = TmpDir::new();
+        let legacy = dir.join("legacy");
+        std::fs::write(
+            &legacy,
+            "kind=run\npid=7\nstart=42\nruntime=project\nproject=2f70\n",
+        )
+        .unwrap();
+        assert!(!parse_record(&legacy).unwrap().detached);
+
+        // An unparseable value is not "detached" either: only the exact `1` sets it.
+        let odd = dir.join("odd");
+        std::fs::write(
+            &odd,
+            "kind=run\npid=7\nstart=42\ndetached=yes\nproject=2f70\n",
+        )
+        .unwrap();
+        assert!(!parse_record(&odd).unwrap().detached);
+    }
+
+    #[test]
+    fn detached_marks_the_record_and_current_defaults_to_foreground() {
+        // The builder is the only way a record becomes detached, so a launch path that forgets to
+        // call it registers a foreground session rather than claiming a log it never opened.
+        let me = Session::current(PathBuf::from("/w/p"), Kind::Run, SessionRuntime::Project)
+            .expect("read this process's session identity");
+        assert!(!me.detached, "current() must default to foreground");
+        assert!(me.detached().detached, "detached() must set the flag");
     }
 
     #[test]

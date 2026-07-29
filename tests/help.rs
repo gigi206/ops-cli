@@ -38,6 +38,7 @@ const PATHS: &[&[&str]] = &[
     &["plugins"],
     &["session"],
     &["session", "ls"],
+    &["session", "logs"],
     &["session", "attach"],
     &["session", "stop"],
     &["trust"],

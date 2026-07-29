@@ -577,10 +577,10 @@ const PAGES: &[Page] = &[
         summary: "inspect and control the live sandbox sessions",
         options: &[],
         details:
-            "A session is a live sandbox cage. `sbx session ls` lists them, `sbx session attach`\n\
-            runs a shell or a command inside one, and `sbx session stop` ends them. Host-side —\n\
-            reads the on-disk session registry (daemonless), launches nothing. `sbx sessions` is\n\
-            an alias.\n\
+            "A session is a live sandbox cage. `sbx session ls` lists them, `sbx session logs`\n\
+            shows a detached one's output, `sbx session attach` runs a shell or a command inside\n\
+            one, and `sbx session stop` ends them. Host-side — reads the on-disk session registry\n\
+            (daemonless), launches nothing. `sbx sessions` is an alias.\n\
             \n\
             Run one of the subcommands below.",
     },
@@ -593,7 +593,41 @@ const PAGES: &[Page] = &[
             "Lists the live sandbox sessions from the on-disk registry (daemonless). Reading\n\
             the registry re-validates and prunes dead records, so the list is always\n\
             current. An app session shows its app name, so you can tell which sessions are\n\
-            agents.",
+            agents. MODE says how each was launched: `detached` for a background daemon\n\
+            (`--detach`), whose output `sbx session logs` can read, or `foreground` for one\n\
+            running in the terminal that started it.",
+    },
+    Page {
+        path: &["session", "logs"],
+        synopsis: "sbx session logs <id> [-f] [-n <N>] [--all]",
+        summary: "show a detached session's output",
+        options: &[
+            ("<id>", "the PID reported when the session was detached"),
+            ("-f, --follow", "keep streaming until the session exits"),
+            ("-n <N>", "show only the last N lines of the initial listing"),
+            (
+                "--all",
+                "show every session that wrote to this log, not just the most recent",
+            ),
+        ],
+        details:
+            "A session started with --detach has no terminal, so its output is redirected to\n\
+            `<data>/logs/<id>.log`. This reads that file back. A foreground session has no log —\n\
+            its output is on the terminal that started it — and `sbx session ls` marks which is\n\
+            which in its MODE column.\n\
+            \n\
+            The id is required and is resolved straight to the log file, never through the\n\
+            session registry: the registry drops a record as soon as the process dies, so a\n\
+            lookup would fail in exactly the case this command exists for — reading why a\n\
+            background agent stopped. It works the same on a session that exited hours ago as on\n\
+            a running one; `--follow` on an exited session prints and returns rather than waiting\n\
+            for output that will never come.\n\
+            \n\
+            The log's bytes go to stdout unchanged, so redirecting captures exactly what the\n\
+            agent wrote; the context line goes to stderr. Logs are keyed by PID and appended to,\n\
+            so a PID the kernel later reuses writes into the same file — a header line separates\n\
+            them and only the most recent session is shown unless you pass --all. Host-side:\n\
+            reads a file, launches nothing. Nothing prunes `<data>/logs` yet.",
     },
     Page {
         path: &["session", "attach"],

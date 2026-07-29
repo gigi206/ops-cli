@@ -255,7 +255,7 @@ fn launch_foreground(
         Err(code) => return code,
     };
 
-    register(prep.layout.data_dir(), &spec, kind, runtime);
+    register(prep.layout.data_dir(), &spec, kind, runtime, false);
 
     match guard {
         // The default postures with no observation: exec-replace, so the command's exit status
@@ -387,7 +387,7 @@ fn detached_child(
         // so the parent reports failure.
         Err(_) => fail_detached(write_fd),
     };
-    register(prep.layout.data_dir(), &spec, kind, runtime);
+    register(prep.layout.data_dir(), &spec, kind, runtime, true);
 
     // Open the session log before signalling ready: a daemon whose output we cannot capture is
     // not ready. Its name is keyed by this process's pid — the session id the parent reports.
@@ -467,9 +467,14 @@ fn detach_parent(
             "sbx: started `{label}` as detached session {child} (logs: {})",
             log.display()
         ));
+        // `sbx session logs` takes the id explicitly and the registry drops a session's record the
+        // moment it dies, so this line is the one place the id and the way to read its output
+        // appear together — name the log verb here or a session that fails overnight leaves the
+        // user with a path they must reconstruct by hand.
         crate::diag::hint(&format!(
-            "sbx: `sbx session ls` lists it, `sbx session attach {child}` opens a shell inside its live cage, \
-             `sbx session stop {child}` ends it."
+            "sbx: `sbx session logs {child}` shows its output (`-f` to follow), \
+             `sbx session attach {child}` opens a shell inside its live cage, \
+             `sbx session stop {child}` ends it; `sbx session ls` lists it."
         ));
         ExitCode::SUCCESS
     } else {
@@ -483,15 +488,64 @@ fn detach_parent(
 }
 
 /// The detached session's log file: `<data>/logs/<pid>.log`, keyed by the daemon's pid (the
-/// session id). Shared by the daemon (which writes it) and the parent (which reports its path).
-fn detach_log_path(data_dir: &Path, pid: u32) -> PathBuf {
+/// session id). The one derivation shared by every party: the daemon that writes it, the parent
+/// that reports its path, and `sbx session logs` that reads it — so a reader can never look
+/// somewhere the writer does not write.
+pub(crate) fn detach_log_path(data_dir: &Path, pid: u32) -> PathBuf {
     data_dir.join("logs").join(format!("{pid}.log"))
 }
 
+/// The opening and closing text of a session header line, written once per detached launch:
+/// `=== sbx session <pid> started=<epoch-seconds> ===`.
+///
+/// The log is opened in append mode, so a pid the kernel later reuses writes into the file its
+/// predecessor left behind. This line is what separates the two, letting a reader show only the
+/// current session's output by default rather than presenting a dead session's as this one's.
+const SESSION_LOG_HEADER_OPEN: &str = "=== sbx session ";
+const SESSION_LOG_HEADER_CLOSE: &str = " ===";
+
+/// One session header line, as [`open_detach_log`] writes it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SessionHeader {
+    pub(crate) pid: u32,
+    /// Wall-clock start of that session, in seconds since the epoch.
+    pub(crate) started: u64,
+}
+
+/// Parse a session header line, or `None` for any other line.
+///
+/// Deliberately placed beside the writer rather than with the reader that calls it: the two halves
+/// share one format, and splitting them across modules is how a change to the `writeln!` above
+/// silently stops matching — leaving a reader that quietly attributes an old session's output to
+/// the current one instead of failing loudly.
+///
+/// Every field must parse, so an agent line that merely resembles a header is not mistaken for
+/// one. The converse is not defended and cannot be: the log holds the agent's own output, so an
+/// agent that prints a well-formed header hides its earlier output from the default view. That is
+/// self-concealment within its own log, not a boundary — `--all` still shows the whole file.
+pub(crate) fn parse_session_header(line: &[u8]) -> Option<SessionHeader> {
+    let text = std::str::from_utf8(line).ok()?;
+    let rest = text
+        .strip_prefix(SESSION_LOG_HEADER_OPEN)?
+        .strip_suffix(SESSION_LOG_HEADER_CLOSE)?;
+    let (pid, started) = rest.split_once(" started=")?;
+    Some(SessionHeader {
+        pid: pid.parse().ok()?,
+        started: started.parse().ok()?,
+    })
+}
+
 /// Open (creating, owner-only, appending) the detached session's log, making `<data>/logs` if
-/// absent. Append so a reused pid's log is added to rather than truncating a still-relevant one.
+/// absent, and mark the start of this session's output with a header line.
+///
+/// Append rather than truncate so a reused pid's log is added to rather than destroying a
+/// still-relevant one; the header is what keeps that append unambiguous. Writing it here, in the
+/// same function that opens the file, is deliberate — a header written by a separate caller could
+/// be forgotten on a new launch path, and a log whose incarnations cannot be told apart is worse
+/// than one with no header at all (the reader would silently attribute old output to this session).
 fn open_detach_log(path: &Path) -> io::Result<File> {
     use std::fs::{DirBuilder, OpenOptions};
+    use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if let Some(parent) = path.parent() {
         DirBuilder::new()
@@ -499,11 +553,23 @@ fn open_detach_log(path: &Path) -> io::Result<File> {
             .mode(0o700)
             .create(parent)?;
     }
-    OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Best-effort: a header that cannot be written costs the reader its session split, which is a
+    // degraded listing — never a reason to refuse a session that is otherwise ready to run.
+    let _ = writeln!(
+        file,
+        "{SESSION_LOG_HEADER_OPEN}{} started={started}{SESSION_LOG_HEADER_CLOSE}",
+        std::process::id()
+    );
+    Ok(file)
 }
 
 /// Close the readiness pipe without a success byte and exit non-zero — the daemon failed to set
@@ -698,7 +764,7 @@ fn launch_foreground_learning(
 
     // A pty session unlinks its record on exit (RecordGuard); a supervised one persists it
     // (liveness-pruned), matching `launch_pty_supervised` and `launch_foreground` respectively.
-    let record = register(prep.layout.data_dir(), &spec, kind, runtime);
+    let record = register(prep.layout.data_dir(), &spec, kind, runtime, false);
     let _record = interactive.then(|| record.map(RecordGuard::new));
 
     let code = if interactive {
@@ -2561,7 +2627,8 @@ fn launch_pty_supervised(
         Err(code) => return code,
     };
 
-    let _record = register(prep.layout.data_dir(), &spec, kind, runtime).map(RecordGuard::new);
+    let _record =
+        register(prep.layout.data_dir(), &spec, kind, runtime, false).map(RecordGuard::new);
     // Hold the guard (egress proxy / forward forwarder threads) for the whole pty session.
     let _guard = guard;
     // With observation on, populate the exec ring + control socket so `sbx proc logs`/`sbx proc live`
@@ -4686,13 +4753,24 @@ fn wrap_flake_equip(
 /// on `spec.workdir` — the canonical project root, the same identity the runtime
 /// layout derives from. Returns the record's path (to hand to a [`RecordGuard`])
 /// when it was written.
+///
+/// `detached` records where this session's output went, which is the one thing a listing cannot
+/// infer from the other fields: a detached session's stdout/stderr is redirected to
+/// [`detach_log_path`], a foreground one's stays on the launching terminal. Only
+/// [`detached_child`] passes `true`.
 fn register(
     data_dir: &Path,
     spec: &SandboxSpec,
     kind: Kind,
     runtime: binds::Runtime,
+    detached: bool,
 ) -> Option<PathBuf> {
     let session = Session::current(spec.workdir.clone(), kind, session_runtime(runtime)).ok()?;
+    let session = if detached {
+        session.detached()
+    } else {
+        session
+    };
     session::Registry::at(data_dir).register(&session).ok()
 }
 
@@ -6090,10 +6168,71 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
 
     #[test]
     fn detach_log_path_is_keyed_by_pid_under_logs() {
-        // The daemon and the reporting parent must agree on the log location; both derive it from
-        // the session pid, so this is the single source of that name.
+        // The daemon, the reporting parent and `sbx session logs` must agree on the log location;
+        // all three derive it from the session pid, so this is the single source of that name.
         let path = detach_log_path(Path::new("/var/lib/sbx"), 4242);
         assert_eq!(path, PathBuf::from("/var/lib/sbx/logs/4242.log"));
+    }
+
+    #[test]
+    fn the_header_open_detach_log_writes_is_the_one_the_parser_reads() {
+        // The writer/parser seam. Both halves live in this file precisely so a change to one is
+        // caught here: a header the parser no longer recognises does not fail loudly, it makes
+        // `sbx session logs` silently replay a *previous* session's output as the current one's.
+        // So this drives the real writer and parses what actually landed on disk.
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.join("logs").join("nested.log");
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let file = open_detach_log(&path).expect("open the session log");
+        drop(file);
+
+        let bytes = std::fs::read(&path).expect("read the session log back");
+        let first = bytes.split(|&b| b == b'\n').next().expect("a first line");
+        let header = parse_session_header(first).expect("the written header must parse");
+        assert_eq!(
+            header.pid,
+            std::process::id(),
+            "the header must name the session whose output follows it"
+        );
+        assert!(
+            header.started >= before,
+            "started={} must be the wall clock at open (>= {before})",
+            header.started
+        );
+
+        // Appending a second session's header is what a reused pid does; both must parse, so the
+        // reader can tell the two apart rather than running them together.
+        let file = open_detach_log(&path).expect("reopen the session log");
+        drop(file);
+        let bytes = std::fs::read(&path).expect("read back after the second open");
+        let headers = bytes
+            .split(|&b| b == b'\n')
+            .filter_map(parse_session_header)
+            .count();
+        assert_eq!(headers, 2, "each open must mark its own session");
+    }
+
+    #[test]
+    fn a_session_header_needs_every_field_to_parse() {
+        // A line an agent prints that merely resembles a header must not be taken for one, or its
+        // output would be read as a session boundary and hide everything before it.
+        assert!(parse_session_header(b"=== sbx session 12 started=99 ===").is_some());
+        for lookalike in [
+            &b"=== sbx session 12 started=later ==="[..],
+            &b"=== sbx session twelve started=99 ==="[..],
+            &b"=== sbx session 12 ==="[..],
+            &b"=== sbx session 12 started=99"[..],
+            &b"plain agent output"[..],
+        ] {
+            assert!(
+                parse_session_header(lookalike).is_none(),
+                "must not parse: {}",
+                String::from_utf8_lossy(lookalike)
+            );
+        }
     }
 
     /// The C strings an `attach_argv` result carries, as UTF-8 for assertion.

@@ -96,6 +96,68 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
   host-installed engines; bwrap independence is *partial* (the host's path-profiled `/usr/bin/bwrap`
   is kept where `kernel.apparmor_restrict_unprivileged_userns` is set — see the entry below). The
   per-increment history below is the append-only record, kept as-is.**
+  **`sbx session logs <id>` — the detached half that had no reader, plus a `MODE` column
+  (DONE 2026-07-29)** (`src/cli/session.rs` + `src/session.rs` + `src/sandbox/{launch,mod}.rs` +
+  `src/help.rs` + `src/paths.rs` + `docs/guide/cli/session.md` + `tests/help.rs`): the user asked for
+  a detach mode for apps and a way to see the logs. **The first deliverable was correcting the
+  premise: `--detach` already shipped** for `sbx run` and `sbx app run`, already redirected the cage's
+  stdout/stderr to `<data>/logs/<pid>.log`, and already printed that path — but **nothing in the CLI
+  could read it back**, so the feature was half-usable and the user was left copying a path into
+  `tail -f`. The verb is named `logs` (alias `log`) **by precedent, not taste**: `net`, `proc` and
+  `fs` all match `Some("logs") | Some("log")` and canonicalize on `logs`.
+  **The design's load-bearing choice is what the id is NOT resolved through.** `Registry::list`
+  liveness-prunes, so a dead session has no record — and the primary use of this verb is the
+  post-mortem ("why did my background agent stop overnight?"). Mirroring `attach`/`stop` and looking
+  the id up first would make the feature fail *exactly* when it matters most. So the id resolves
+  **straight to the log file**; the registry is consulted only to enrich (running vs exited) and to
+  explain an absent log. **The user chose the strict form — id mandatory, no listing** (over a
+  no-argument listing of `<data>/logs/` or a `session ls --past`), which makes the launch message the
+  *only* place the id is reported: the `detach_parent` hint therefore became load-bearing rather than
+  cosmetic and now names `sbx session logs <id>` **first**. Named residual, stated in the docs: lose
+  that scrollback and the id is only recoverable by listing the directory.
+  **The pid-reuse wart, found in passing and fixed by the user's call.** The log is opened in
+  **append** mode (deliberately — a reused pid must not truncate a still-relevant file) with **no
+  separator**, so two incarnations concatenated silently and `-n`/`--follow` would have presented a
+  dead session's output as this one's. The fix is a **header line at open**
+  (`=== sbx session <pid> started=<epoch> ===`), only the most recent session shown, `--all` for the
+  whole file. **The parser is placed beside the writer in `launch.rs`, not with the reader** — the
+  two halves share one format, and splitting them across modules is precisely how a change to the
+  `writeln!` stops matching *silently* (the failure mode is not an error, it is a reader quietly
+  replaying an old session). **Honest, stated in the code:** the marker is in-band in a file whose
+  content is the agent's own output, so an agent that prints a well-formed header hides its earlier
+  output from the default view — self-concealment inside its own log, not a boundary, and `--all`
+  still shows everything.
+  **`sbx session ls` gained a `MODE` column** (`detached` / `foreground`) — the user's addition, and
+  it is the same question as "does this session have a log", so the column doubles as the guide to
+  which sessions the new verb applies to. It needed a new `detached` field on the session record;
+  the format was already extensible (unknown keys ignored, defaults for absent ones), and the
+  default is **foreground** — the fail-safe direction, since the opposite would mark every
+  pre-existing record detached and point the reader at a file that was never written.
+  **Two smaller correctness points:** `--follow` samples liveness **before** each drain, never after,
+  so a session that writes its last line and exits between the two does not lose it (proven live —
+  `FINAL-LINE` captured); and `--follow` on an already-exited session prints and returns instead of
+  hanging on output that will never come. Output splits streams the way `attach` does: the log's
+  bytes go to **stdout verbatim** (so redirecting captures exactly what the agent wrote), the context
+  line to stderr.
+  **A real doc bug fixed en passant:** `src/paths.rs`'s `logs/` entry read *"per-launch egress logs
+  read by `sbx net log`"* — disproven by checking rather than assumed (`net logs` reads the in-memory
+  control sockets, `cli/net.rs`), and that label is printed to the user by `sbx path`/`sbx store`.
+  **Tests: 10 net-new unit** — the writer↔parser seam (drives the **real** `open_detach_log` and
+  parses what landed on disk, incl. two opens marking two sessions), header lookalikes rejected,
+  the incarnation split (with an explicit assertion that the previous session's output does **not**
+  appear), the headerless and empty-body cases, `tail_lines` (the trailing-newline trap that would
+  make `-n 1` show nothing), the `MODE` mapping, arg parsing, and two record-format tests
+  (absent-`detached` reads foreground; `current()` defaults foreground). **Teeth demonstrated in both
+  directions** by temporarily breaking each load-bearing rule: renaming the writer's `started=` field
+  fails the seam test, and neutering the split fails two split tests. **1345 unit + 103 config + 13
+  help + 6 stop + 2 attach + 2 sessions + 1 detach + 4 path green**, fmt/clippy `-D warnings` clean,
+  **std-only** (no new dep), **musl rebuilt** and the whole chain proven on the shipped binary: a
+  detached launch → `MODE detached` in `ls` → live `-f` streaming to completion → the session gone
+  from the registry → **the same `session logs <id>` still returning its full output**, plus `-n`,
+  `--all`, a real pre-existing headerless log, and a foreground session correctly refused with its
+  own message. **Honest residual, named not built:** nothing prunes `<data>/logs` — not `sbx gc`, not
+  teardown — so a long-lived install accumulates one small file per detached launch; the docs say so.
+  See [[session-namespace]], [[m5-gc]], [[m1-session-registry]].
   **The prebuilt install phase learned the bare-binary shape, and `cortex` ships (DONE 2026-07-28)**
   (`src/sandbox/prebuilt.rs` + `{tarball,appimage,deb}.rs` + `docs/guide/configuration/packages.md`
   + `examples/app/cortex.toml` [new] + `examples/README.md` + `docs/guide/apps/catalog.md`): the

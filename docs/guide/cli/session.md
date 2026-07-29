@@ -2,12 +2,14 @@
 
 ```
 sbx session ls
+sbx session logs <id> [-f] [-n <N>] [--all]
 sbx session attach <id> [-- command [args...]]
 sbx session stop <id>...|--all [--delay <secs>]
 ```
 
 Inspect and control the **live sandbox sessions** — the running cages. `sbx session ls`
-lists them, `sbx session attach` runs a shell or a command inside one, and `sbx session stop` ends them.
+lists them, `sbx session logs` shows a detached one's output, `sbx session attach` runs a shell
+or a command inside one, and `sbx session stop` ends them.
 Host-side: reads the on-disk session registry (daemonless), launches nothing. `sbx sessions`
 is an alias.
 
@@ -31,12 +33,69 @@ liveness-validated by `(pid, start_time)` to defeat pid reuse. See
 
 ```sh
 sbx session ls
-# NAME       KIND          PID     AGE  PROJECT
-# sbx-web    app:claude    12345   2m   /home/me/web
-# sbx-web    shell         12377   1m   /home/me/web
+# NAME       KIND          MODE        PID     AGE  PROJECT
+# sbx-web    app:claude    detached    12345   2m   /home/me/web
+# sbx-web    shell         foreground  12377   1m   /home/me/web
 ```
 
-The `PID` column is the `<id>` used by `sbx session attach <id>` and `sbx session stop <id>`.
+The `PID` column is the `<id>` used by `sbx session attach <id>`, `sbx session logs <id>` and
+`sbx session stop <id>`.
+
+`MODE` says how the session was launched, which is also where its output went:
+
+| `MODE` | Launched with | Its output |
+|---|---|---|
+| `detached` | `--detach` | redirected to a log — read it with [`logs`](#logs) |
+| `foreground` | no `--detach` | on the terminal that started it |
+
+## `logs`
+
+```
+sbx session logs <id> [-f] [-n <N>] [--all]
+```
+
+Show a **detached** session's output. A session started with `--detach` has no terminal, so
+its stdout and stderr are redirected to `<data>/logs/<id>.log`; this reads that file back. A
+foreground session has no log — its output is on the terminal that started it — and the
+[`MODE` column](#ls) says which is which.
+
+| Operand / flag | Meaning |
+|---|---|
+| `<id>` | the PID reported when the session was detached (required) |
+| `-f`, `--follow` | keep streaming until the session exits |
+| `-n <N>` | show only the last N lines of the initial listing |
+| `--all` | show every session that wrote to this log, not just the most recent |
+
+The id is **required** and is resolved straight to the log file, never through the session
+registry. That is deliberate: the registry drops a record the moment its process dies, so a
+lookup would fail in exactly the case this command exists for — finding out why a background
+agent stopped. Reading an exited session works the same as reading a running one.
+
+```sh
+sbx app run claude --detach
+# sbx: started `app:claude` as detached session 12345 (logs: ~/.local/share/sbx/logs/12345.log)
+# sbx: `sbx session logs 12345` shows its output (`-f` to follow), …
+
+sbx session logs 12345 -f      # follow it live; returns when the session exits
+sbx session logs 12345 -n 50   # just the tail
+sbx session logs 12345 > run.txt   # the agent's bytes, exactly as written
+```
+
+The log's bytes go to **stdout** unchanged, so redirecting captures exactly what the agent
+wrote; the context line goes to stderr. `--follow` on a session that has already exited prints
+what is there and returns rather than waiting for output that will never come.
+
+Logs are keyed by PID and appended to, so a PID the kernel later reuses writes into the same
+file. A header line separates the sessions and only the most recent one is shown; pass `--all`
+for the whole file.
+
+> **Note.** Nothing prunes `<data>/logs` yet — neither [`sbx gc`](gc.md) nor session teardown.
+> A long-lived install accumulates one small file per detached launch; remove them by hand if
+> they add up.
+
+If you lose the id, the launch message is the only place it is reported — `sbx session ls` can
+only show sessions that are still alive. Failing that, list the directory:
+`ls ~/.local/share/sbx/logs` (or see [`sbx path`](path.md) for your data directory).
 
 ## `attach`
 

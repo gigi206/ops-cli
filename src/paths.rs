@@ -139,7 +139,7 @@ const DATA_ENTRIES: &[Entry] = &[
     Entry {
         label: "logs/",
         rel: "logs",
-        desc: "per-launch egress logs read by `sbx net log`",
+        desc: "detached sessions' output, read by `sbx session logs`",
         enumerate: Enumerate::None,
     },
     Entry {
