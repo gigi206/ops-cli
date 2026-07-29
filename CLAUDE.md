@@ -1,6 +1,6 @@
 # ops-cli — repo conventions (bwrap rewrite)
 
-> ⚠️ You are on the **`bwrap`** branch: the clean rewrite of `ops` onto a
+> ⚠️ You are on the **`ops-v2`** branch: the clean rewrite of `ops` onto a
 > **bubblewrap + daemonless nix** substrate. The old conventions (bash `ops.sh`
 > release cutting, container image builds) **no longer apply** here.
 
@@ -21,7 +21,8 @@ flox/devbox/devenv (mere env managers that isolate nothing).
 |---|---|
 | `main` | `v1.18.0` — bash/container era, frozen, pushed |
 | `container` | snapshot of the **OCI** Rust v2 (reference / cherry-pick reusable modules: config, trust, mise-nix bridge) |
-| **`bwrap`** | **working branch** — clean from `v1.18.0` + the rewrite |
+| `bwrap` | the rewrite's original branch, **superseded by `ops-v2`** — frozen 2026-07-08 and contained in it in full (nothing unique to recover) |
+| **`ops-v2`** | **working branch** — clean from `v1.18.0` + the rewrite |
 
 ## Design documents (read before coding)
 
