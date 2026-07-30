@@ -199,8 +199,13 @@ impl TaskLog {
     /// Whether an invocation with this id has already been recorded — what tells "you are too late"
     /// from "there is no such invocation" when a stop names one that is not running.
     fn recorded(&self, id: u64) -> bool {
+        self.entry(id).is_some()
+    }
+
+    /// What the ring kept about one invocation.
+    fn entry(&self, id: u64) -> Option<LogEntry> {
         let inner = self.inner.lock().expect("task log");
-        inner.entries.iter().any(|e| e.seq == id)
+        inner.entries.iter().find(|e| e.seq == id).cloned()
     }
 }
 
@@ -516,6 +521,48 @@ fn serve_run(
     }
 }
 
+/// The fields for a target that is not running: an invocation the log remembers, or an operation
+/// named directly. Both end in the same place — the declaration — because an invocation *is* its
+/// declaration plus what one run of it did.
+fn finished_fields(
+    engine: &TaskEngine,
+    log: &TaskLog,
+    target: &str,
+) -> Option<Vec<(String, String)>> {
+    if let Ok(id) = target.parse::<u64>() {
+        let entry = log.entry(id)?;
+        let mut out = vec![
+            ("id".to_string(), id.to_string()),
+            ("operation".to_string(), entry.task.clone()),
+            (
+                "state".to_string(),
+                match (&entry.refused, entry.stopped, entry.timed_out) {
+                    (Some(_), _, _) => "refused".to_string(),
+                    (_, true, _) => "stopped".to_string(),
+                    (_, _, true) => "timed out".to_string(),
+                    _ => "finished".to_string(),
+                },
+            ),
+            ("finished_at".to_string(), entry.at.to_string()),
+            ("elapsed_ms".to_string(), entry.elapsed_ms.to_string()),
+        ];
+        if entry.refused.is_none() {
+            out.push(("exit".to_string(), entry.exit.to_string()));
+        }
+        if let Some(reason) = &entry.refused {
+            out.push(("refused".to_string(), reason.clone()));
+        }
+        if entry.redacted > 0 {
+            out.push(("redacted".to_string(), entry.redacted.to_string()));
+        }
+        out.extend(engine.describe_task(&entry.task).unwrap_or_default());
+        return Some(out);
+    }
+    let mut out = vec![("operation".to_string(), target.to_string())];
+    out.extend(engine.describe_task(target)?);
+    Some(out)
+}
+
 /// A log entry for an invocation that never ran.
 fn refusal(id: u64, task: &str, reason: &str) -> LogEntry {
     LogEntry {
@@ -608,6 +655,28 @@ fn serve_host(stream: UnixStream, engine: &TaskEngine, log: &TaskLog) -> io::Res
         return writeln!(writer, "ok");
     }
 
+    if let Some(rest) = command.strip_prefix("INFO ") {
+        let target = rest.trim();
+        // A live invocation answers with its state *and* its declaration; one that is over answers
+        // with what the log kept plus the declaration it ran under, because "what was that" is the
+        // same question a minute later.
+        let fields = match target
+            .parse::<u64>()
+            .ok()
+            .and_then(|id| engine.describe(id))
+        {
+            Some(fields) => Some(fields),
+            None => finished_fields(engine, log, target),
+        };
+        let Some(fields) = fields else {
+            return writeln!(writer, "err nothing here is called `{}`", sanitize(target));
+        };
+        for (key, value) in fields {
+            writeln!(writer, "field {key}\t{}", sanitize(&value))?;
+        }
+        return writeln!(writer, "ok");
+    }
+
     if let Some(rest) = command.strip_prefix("STOP ") {
         let Ok(id) = rest.trim().parse::<u64>() else {
             return writeln!(writer, "err a stop names an invocation id");
@@ -679,6 +748,20 @@ pub(crate) fn read_status(socket: &Path) -> io::Result<Vec<StatusRow>> {
                 fields: fields.collect(),
             })
         })
+        .collect())
+}
+
+/// Everything one invocation (or one operation) has to say about itself, in reading order.
+pub(crate) fn read_info(socket: &Path, target: &str) -> io::Result<Vec<(String, String)>> {
+    let lines = ask_host(socket, &format!("INFO {target}"))?;
+    if let Some(reason) = lines.iter().find_map(|l| l.strip_prefix("err ")) {
+        return Err(io::Error::other(reason.to_string()));
+    }
+    Ok(lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("field "))
+        .filter_map(|rest| rest.split_once('\t'))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect())
 }
 
@@ -1224,6 +1307,90 @@ mod tests {
         assert!(line.contains("stopped=1"), "{line}");
         assert!(line.contains("timed_out=0"), "{line}");
         drop(data);
+    }
+
+    /// `info` answers about a live invocation, and the answer carries the command with this
+    /// invocation's parameters substituted in — but **no environment value**, which is the whole
+    /// point of a task carrying a credential the caller never holds.
+    #[test]
+    fn info_shows_what_an_invocation_runs_and_never_what_it_carries() {
+        let Some((_data, plane, _script)) = plane_with_launcher("exec sleep 20\n") else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        let cage = plane.cage_socket.clone();
+        let caller = std::thread::spawn(move || {
+            client::run(
+                &cage,
+                "probe",
+                &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+                &BTreeMap::new(),
+            )
+        });
+
+        let mut id = None;
+        for _ in 0..200 {
+            if let Some(row) = read_status(&host).expect("status").first() {
+                id = Some(row.id);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let id = id.expect("the invocation must be visible while it runs");
+
+        let fields = read_info(&host, &id.to_string()).expect("info");
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(field("id"), id.to_string());
+        assert_eq!(field("operation"), "probe");
+        assert_eq!(field("state"), "running");
+        assert!(
+            field("command").contains("caf"),
+            "the command carries this invocation's parameter: {:?}",
+            field("command")
+        );
+        assert_eq!(field("timeout_s"), "30", "the declaration travels with it");
+        assert!(
+            !fields.iter().any(|(k, _)| k == "environment" || k == "env"),
+            "an environment value has no field to arrive in: {fields:?}"
+        );
+        // One line per field, always: a value with a newline in it (this parameter has one) must not
+        // be able to forge a second field.
+        assert!(
+            !field("command").contains('\n'),
+            "a field is one line: {:?}",
+            field("command")
+        );
+
+        assert_eq!(
+            stop_invocation(&host, id).expect("stop"),
+            StopReply::Stopped
+        );
+        let _ = caller.join().expect("the caller thread");
+
+        // And it still answers once the invocation is over — the log's half, plus the declaration.
+        let after = read_info(&host, &id.to_string()).expect("info after");
+        let state = after
+            .iter()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(state, "stopped", "{after:?}");
+        assert!(
+            after.iter().any(|(k, _)| k == "timeout_s"),
+            "the declaration is what an invocation still is once it is over: {after:?}"
+        );
+
+        assert!(
+            read_info(&host, "no-such-thing").is_err(),
+            "a name nothing answers to is an error, not an empty record"
+        );
     }
 
     /// A stop that names an invocation the session never had is refused, and one that names a

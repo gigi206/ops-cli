@@ -30,7 +30,7 @@ use crate::{diag, help, sandbox, store, style};
 /// "it ran and failed"; 125 is the convention `env` and `docker` use for the same distinction.
 const REFUSED_EXIT: u8 = 125;
 
-/// `sbx task <subcommand>`: `list`, `secrets`, `run`, `status`, `stop`, or `logs`.
+/// `sbx task <subcommand>`: `list`, `secrets`, `run`, `status`, `show`, `stop`, or `logs`.
 pub(crate) fn task_cmd(args: Vec<OsString>) -> ExitCode {
     if let Some(code) = help::maybe_help("task", &args) {
         return code;
@@ -40,6 +40,7 @@ pub(crate) fn task_cmd(args: Vec<OsString>) -> ExitCode {
         Some("secrets") => task_secrets(&args[1..]),
         Some("run") => task_run(&args[1..]),
         Some("status") => task_status(&args[1..]),
+        Some("show") => task_show(&args[1..]),
         Some("stop") => task_stop(&args[1..]),
         Some("logs") | Some("log") => task_logs(&args[1..]),
         None => {
@@ -897,6 +898,80 @@ fn filter_by_operation(
             .cloned()
             .collect(),
     }
+}
+
+/// `sbx task show <invocation>|<operation> [--session <id>]`: everything about one of them.
+///
+/// The listings answer "what is there" in one line each; this answers "what is *that*" in full — the
+/// command with its parameters substituted in, the ceilings it runs under, what it may reach, and
+/// which credentials it carries. Host-only, on the same socket as `status` and `stop`.
+///
+/// **Never an environment value.** A task's credentials are resolved for one invocation and held
+/// nowhere this can reach, so their absence here is structural rather than a filter that could be
+/// forgotten; what is shown is their names, which is what a substituted value is reported as anyway.
+fn task_show(args: &[OsString]) -> ExitCode {
+    let listing = match listing_args(args, "show") {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    let Some(target) = listing.operation else {
+        diag::error("sbx: task show: name an invocation id or an operation");
+        eprint!(
+            "{}",
+            help::page_usage(&["task", "show"]).unwrap_or_default()
+        );
+        return ExitCode::from(2);
+    };
+    let planes = match planes_for(listing.session.as_deref(), "show", Side::Host) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    // Across sessions, the first that knows the target answers. An invocation id belongs to exactly
+    // one session; an operation name can be declared in several, and then `--session` is how a
+    // reader says which — so the others are named rather than silently passed over.
+    let mut found: Option<(&Plane, Vec<(String, String)>)> = None;
+    let mut also = Vec::new();
+    for plane in &planes {
+        match sandbox::task_control::read_info(&plane.socket, &target) {
+            Ok(fields) if found.is_none() => found = Some((plane, fields)),
+            Ok(_) => also.push(plane.cell()),
+            Err(_) => {}
+        }
+    }
+    let Some((plane, fields)) = found else {
+        diag::error(&format!(
+            "sbx: task show: nothing here is called `{target}`"
+        ));
+        diag::hint(
+            "       `sbx task status` lists what is running, `sbx task ls` what is declared.",
+        );
+        return ExitCode::FAILURE;
+    };
+    plane.announce();
+    // The plane sends data and this side renders it, the same split the log has: an epoch crosses
+    // the wire, a time of day reaches the reader — and a field whose label names its unit loses the
+    // unit once the value carries it.
+    let shown: Vec<(String, String)> = fields
+        .iter()
+        .map(|(key, value)| match (key.as_str(), value.parse::<u128>()) {
+            ("finished_at", Ok(secs)) => ("finished".into(), crate::format_log_time(secs * 1000)),
+            ("elapsed_ms", Ok(ms)) => ("elapsed".into(), format_elapsed(ms as u64)),
+            ("timeout_s", Ok(s)) => ("timeout".into(), format_elapsed(s as u64 * 1000)),
+            _ => (key.clone(), value.clone()),
+        })
+        .collect();
+    let width = shown.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    for (key, value) in &shown {
+        println!("{}{key:<width$}{}  {value}", pal.head, pal.reset);
+    }
+    if !also.is_empty() {
+        diag::note(&format!(
+            "`{target}` is also declared in session(s) {} — name one with `--session`",
+            also.join(", ")
+        ));
+    }
+    ExitCode::SUCCESS
 }
 
 /// A duration a person reads at a glance, at the scale an invocation actually takes: milliseconds

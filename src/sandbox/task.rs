@@ -457,6 +457,9 @@ impl TaskEngine {
             );
         }
         let argv = substitute(&task.cmd, &values).map_err(TaskError::Refused)?;
+        // Recorded here, where it is the task's own command: below it is wrapped for exec
+        // confinement and for the egress forwarder, and neither is what a reader is asking about.
+        self.note_argv(invocation, &argv);
 
         // Resolve the credentials for THIS invocation only, host-side. Nothing is cached: a
         // credential lives in this process for the duration of one command and its needles.
@@ -859,6 +862,67 @@ impl TaskEngine {
             }
         }
     }
+
+    /// Record what this invocation actually runs, once its parameters are substituted in.
+    fn note_argv(&self, id: u64, argv: &[OsString]) {
+        if let Ok(mut running) = self.running.lock() {
+            if let Some(entry) = running.get_mut(&id) {
+                entry.argv = argv
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+            }
+        }
+    }
+
+    /// Everything known about invocation `id` while it runs: its live state, what it is running, and
+    /// the declaration it runs under. Ordered, because it is read by a person rather than parsed.
+    ///
+    /// Environment values are **absent** by construction, not filtered: a task's credentials are
+    /// resolved per invocation and never held anywhere this can reach. What a reader gets is the
+    /// declaration and the command, which is the pair that answers "what is this doing".
+    pub(crate) fn describe(&self, id: u64) -> Option<Vec<(String, String)>> {
+        let (task, elapsed, argv, pid, stopping) = {
+            let running = self.running.lock().ok()?;
+            let entry = running.get(&id)?;
+            (
+                entry.task.clone(),
+                entry.started.elapsed().as_millis() as u64,
+                entry.argv.clone(),
+                entry.pid,
+                entry.stop,
+            )
+        };
+        let mut out = vec![
+            ("id".into(), id.to_string()),
+            ("operation".into(), task.clone()),
+            (
+                "state".into(),
+                match stopping {
+                    true => "stopping".into(),
+                    false => "running".to_string(),
+                },
+            ),
+            ("elapsed_ms".into(), elapsed.to_string()),
+            ("pid".into(), pid.map(|p| p.to_string()).unwrap_or_default()),
+            ("command".into(), shell_line(&argv)),
+        ];
+        let command = out.last().map(|(_, v)| v.clone()).unwrap_or_default();
+        out.extend(self.task(&task).map(declared_fields).unwrap_or_default());
+        // `declared` is the command as written, `command` is it with this invocation's parameters
+        // substituted in. An operation with no parameters makes them the same string, and printing a
+        // line that repeats the one above it is the same noise as a column that reads the same on
+        // every row — so it is kept only when it differs, which is exactly when it is informative.
+        out.retain(|(k, v)| k != "declared" || *v != command);
+        Some(out)
+    }
+
+    /// What one declared operation says about itself — the declaration alone, with no identity of
+    /// its own: it is appended to an invocation's fields, which already name it, and prefixed with
+    /// the name when a reader asks about the operation rather than a run of it.
+    pub(crate) fn describe_task(&self, name: &str) -> Option<Vec<(String, String)>> {
+        Some(declared_fields(self.task(name)?))
+    }
 }
 
 /// The in-cage `bin` directories for `task`'s declared mise tools, or `None` when it declares none.
@@ -937,6 +1001,7 @@ impl TaskEngine {
                 Running {
                     task: task.to_string(),
                     started: Instant::now(),
+                    argv: Vec::new(),
                     pid: None,
                     stop: false,
                 },
@@ -1201,6 +1266,10 @@ struct Running {
     task: String,
     /// For the elapsed time, which is what a caller looking at a live invocation actually wants.
     started: Instant,
+    /// The task's **own** command with this invocation's parameters substituted in — not the
+    /// bubblewrap argv that wraps it. A credential never appears here: credentials reach a task
+    /// through its environment, and what a parameter contributed is the caller's own value.
+    argv: Vec<String>,
     /// The cage's pid once it exists — **display only**. Stopping goes through [`Running::stop`] and
     /// the runner's own `Child`, never a signal aimed at a pid read from here: a pid can be reaped
     /// and reused between the read and the signal, and the target of that race is another process
@@ -1208,6 +1277,88 @@ struct Running {
     pid: Option<u32>,
     /// Set by [`TaskEngine::request_stop`]; read by the runner on its next poll.
     stop: bool,
+}
+
+/// Render an argv as one readable line, quoting only what needs it — this is for a person to read,
+/// not for a shell to run, so it stays close to what was written.
+fn shell_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(
+            |arg| match arg.chars().any(|c| c.is_whitespace() || c == '\'') {
+                false => arg.clone(),
+                true => format!("'{}'", arg.replace('\'', "'\\''")),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The declaration an invocation runs under, as ordered fields. Credential **names** only — a value
+/// is resolved per invocation and never kept, and the name is what a substituted value is reported
+/// as if it ever reaches the output.
+fn declared_fields(task: &TaskSpec) -> Vec<(String, String)> {
+    let list = |items: Vec<String>| items.join(", ");
+    let mut out = vec![
+        (
+            "description".to_string(),
+            task.description.clone().unwrap_or_default(),
+        ),
+        ("declared".to_string(), shell_line(&task.cmd)),
+        (
+            "parameters".to_string(),
+            list(
+                task.params
+                    .iter()
+                    .map(|p| match &p.default {
+                        Some(d) => format!("{} (default {d})", p.name),
+                        None => p.name.clone(),
+                    })
+                    .collect(),
+            ),
+        ),
+        ("timeout_s".to_string(), task.timeout.as_secs().to_string()),
+        ("max_output".to_string(), task.max_output.to_string()),
+        ("stdout".to_string(), task.stdout.as_str().to_string()),
+        ("stderr".to_string(), task.stderr.as_str().to_string()),
+        (
+            "credentials".to_string(),
+            list(
+                task.secrets
+                    .iter()
+                    .map(|s| s.var.clone())
+                    .chain(
+                        task.injections
+                            .iter()
+                            .map(|i| format!("{} → {}", i.name, i.to)),
+                    )
+                    .collect(),
+            ),
+        ),
+        (
+            "network".to_string(),
+            list(task.network.iter().map(|r| r.to_string()).collect()),
+        ),
+        (
+            "output".to_string(),
+            match task.output {
+                true => format!("{TASK_OUT_AGENT}/{}", task.name),
+                false => String::new(),
+            },
+        ),
+        ("packages".to_string(), list(task.packages.clone())),
+        (
+            "spawn".to_string(),
+            match &task.spawn {
+                Some(names) => list(names.clone()),
+                None => String::new(),
+            },
+        ),
+        ("env_allow".to_string(), list(task.env_allow.clone())),
+    ];
+    // An empty field is left out rather than shown as a blank: this is read as prose, and a page of
+    // "network:" with nothing after it says less than its absence does.
+    out.retain(|(_, v)| !v.is_empty());
+    out
 }
 
 /// What a stop request actually achieved.

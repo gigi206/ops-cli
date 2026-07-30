@@ -731,6 +731,30 @@ const PAGES: &[Page] = &[
             come from.",
     },
     Page {
+        path: &["task", "show"],
+        synopsis: "sbx task show <invocation>|<operation> [--session <id>]",
+        summary: "everything about one invocation or one operation (host-only)",
+        options: &[
+            (
+                "<invocation>|<operation>",
+                "an invocation id, running or finished, or an operation's name",
+            ),
+            ("--session <id>", "which session to ask, when several declare the same name"),
+        ],
+        details:
+            "The listings answer \"what is there\" a line at a time; this answers \"what is *that*\" in\n\
+            full: for a running invocation its state, pid and elapsed time, and the command with this\n\
+            invocation's parameters substituted in; for one that is over, what the log kept. Both\n\
+            then carry the declaration it runs under — the ceilings, the streams, what it may reach\n\
+            on the network, which tools it needs, and which credentials it carries.\n\
+            \n\
+            **Never an environment value.** A task's credentials are resolved for one invocation and\n\
+            held nowhere this can reach, so their absence is structural rather than a filter; what is\n\
+            shown is their names, which is what a substituted value is reported as anyway.\n\
+            \n\
+            A field with nothing to say is left out rather than printed blank.",
+    },
+    Page {
         path: &["task", "stop"],
         synopsis: "sbx task stop <invocation|operation> [--session <id>]",
         summary: "end one running invocation (host-only)",

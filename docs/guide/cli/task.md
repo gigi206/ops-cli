@@ -5,6 +5,7 @@ sbx task list [<operation>] [--session <id>]
 sbx task secrets [<operation>] [--session <id>]
 sbx task run <operation> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]
 sbx task status [<invocation>|<operation>] [--session <id>]
+sbx task show <invocation>|<operation> [--session <id>]
 sbx task stop <invocation>|<operation> [--session <id>]
 sbx task logs [<invocation>|<operation>] [--session <id>]
 ```
@@ -222,6 +223,47 @@ the only place a stop can come from.
 **The three verbs share one number.** The id `status` shows is the id `stop` takes, the id `logs`
 carries once the invocation is over, and the id a stopped `run` names in its report — so `sbx task
 status 7` while it runs and `sbx task logs 7` afterwards are the same invocation.
+
+## `show`
+
+```
+sbx task show <invocation>|<operation> [--session <id>]
+```
+
+Everything about **one** of them — host-only. The listings answer "what is there" a line at a time;
+this answers "what is *that*".
+
+```
+$ sbx task show 7
+session 4081336 — /home/you/work/api
+id           7
+operation    nightly-dump
+state        running
+elapsed_ms   42310
+pid          318204
+command      /nix/store/…/pg_dump --schema-only reporting
+description  Dump the reporting tables
+declared     /nix/store/…/pg_dump --schema-only {schema}
+parameters   schema
+timeout_s    3600
+max_output   65536
+stdout       show
+stderr       hide
+credentials  PGPASSWORD
+network      tcp://db.staging.internal:5432
+output       /opt/sbx/task-out/nightly-dump
+```
+
+For an invocation that is over it reports what the log kept — how it ended, when, what it cost — and
+then the same declaration, because an invocation *is* its declaration plus what one run of it did.
+Naming an operation rather than an id gives the declaration alone.
+
+**Never an environment value.** A task's credentials are resolved for one invocation and held nowhere
+this can reach, so their absence is structural rather than a filter that could be forgotten; what is
+shown is their names, which is what a substituted value is reported as anyway. The `command` line is
+the task's own, with this invocation's parameters substituted in — a credential never travels there.
+
+A field with nothing to say is left out rather than printed blank.
 
 ## `stop`
 
