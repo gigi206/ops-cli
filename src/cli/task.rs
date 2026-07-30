@@ -65,6 +65,9 @@ struct Plane {
     /// verbs that already talk to it, and the sibling of the log socket for the host-only ones,
     /// which need it to tell a misspelled operation from an empty answer.
     inventory: PathBuf,
+    /// The host-only socket, when there is one — absent in a cage, which cannot reach it. It is what
+    /// lets the inventory say which operations are running right now.
+    host: Option<PathBuf>,
     /// The session's pid and project, when one was resolved. Absent in a cage, where there is no
     /// session to resolve — the socket is the one the environment names, and it is the only one.
     session: Option<(u32, PathBuf)>,
@@ -84,45 +87,131 @@ impl Plane {
             pal.reset
         );
     }
+
+    /// This plane's session id as a table cell.
+    fn cell(&self) -> String {
+        self.session
+            .as_ref()
+            .map(|(pid, _)| pid.to_string())
+            .unwrap_or_else(|| NONE.to_string())
+    }
 }
 
-/// The task plane to talk to: a live session's, or the one the environment names outright.
+/// Which of a session's two sockets a verb speaks to.
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    /// The crossing socket: the inventory and the invocations. Reachable from a cage.
+    Cage,
+    /// The host-only socket: the log, what is running, and the stop.
+    Host,
+}
+
+/// Every plane a **listing** should read: the one named, or all of them.
+///
+/// A read-only listing across sessions is strictly better than the refusal it replaces. Ambiguity is
+/// only dangerous where it decides *what runs* — `run` and `stop` still make the caller name one,
+/// because guessing there would run a real command with a real credential, or end someone else's
+/// invocation. Reading answers no such question, and a reader with two sessions open was being told
+/// to go and pick one before being shown anything at all.
+fn planes_for(id: Option<&str>, verb: &str, side: Side) -> Result<Vec<Plane>, ExitCode> {
+    if let Some(one) = env_plane(id, verb)? {
+        return Ok(vec![one]);
+    }
+    let layout = layout_or_fail()?;
+    if let Some(id) = id {
+        return Ok(vec![one_plane(&layout, resolve_named(id, verb)?, side)]);
+    }
+    let pids = sandbox::task_control::session_pids(layout.data_dir());
+    if pids.is_empty() {
+        return Err(no_sessions(verb));
+    }
+    Ok(pids
+        .into_iter()
+        .map(|pid| one_plane(&layout, pid, side))
+        .collect())
+}
+
+/// The plane the environment names, when this sbx is talking to one rather than owning it.
+fn env_plane(id: Option<&str>, verb: &str) -> Result<Option<Plane>, ExitCode> {
+    let Some(path) = std::env::var_os(TASK_SOCKET_ENV) else {
+        return Ok(None);
+    };
+    // A cage reaches exactly one plane — its own — so `--session` names something that cannot be
+    // selected from here. Refused rather than dropped: a flag a caller believes it set must never
+    // silently become nothing, least of all one that chooses which credentials an operation runs
+    // with.
+    if id.is_some() {
+        diag::error(&format!(
+            "sbx: task {verb}: `--session` cannot be used here — a cage reaches one plane, its own"
+        ));
+        return Err(ExitCode::from(2));
+    }
+    let socket = PathBuf::from(path);
+    Ok(Some(Plane {
+        inventory: socket.clone(),
+        socket,
+        host: None,
+        session: None,
+    }))
+}
+
+fn one_plane(layout: &store::Layout, pid: u32, side: Side) -> Plane {
+    let inventory = sandbox::task_control::task_dir(layout.data_dir(), pid).join("control.sock");
+    let host = sandbox::task_control::log_socket(layout.data_dir(), pid);
+    Plane {
+        socket: match side {
+            Side::Cage => inventory.clone(),
+            Side::Host => host.clone(),
+        },
+        inventory,
+        host: Some(host),
+        session: Some((pid, session_project(layout.data_dir(), pid))),
+    }
+}
+
+fn layout_or_fail() -> Result<store::Layout, ExitCode> {
+    store::Layout::from_env().ok_or_else(|| {
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
+        );
+        ExitCode::FAILURE
+    })
+}
+
+fn resolve_named(id: &str, verb: &str) -> Result<u32, ExitCode> {
+    id.parse::<u32>().map_err(|_| {
+        diag::error(&format!("sbx: task {verb}: `{id}` is not a session id"));
+        diag::hint("       `sbx session ls` lists them; the id is the session's PID.");
+        ExitCode::from(2)
+    })
+}
+
+fn no_sessions(verb: &str) -> ExitCode {
+    diag::error(&format!(
+        "sbx: task {verb}: no session is offering declared operations"
+    ));
+    diag::hint("       a session offers them when its config declares `[task.<name>]`.");
+    ExitCode::FAILURE
+}
+
+/// The one plane a verb that **acts** must be given: exactly one, named when several exist.
 ///
 /// `$SBX_TASK_SOCKET` short-circuits the search, which is how a specific plane can be addressed
 /// without resolving a session. It is also the discovery handle the cage advertises, so a tool that
 /// wants to find the plane looks in one place whichever side it is on.
-fn plane_for(id: Option<&str>, verb: &str) -> Result<Plane, ExitCode> {
-    if let Some(path) = std::env::var_os(TASK_SOCKET_ENV) {
-        // A cage reaches exactly one plane — its own — so `--session` names something that cannot be
-        // selected from here. Refused rather than dropped: a flag a caller believes it set must never
-        // silently become nothing, least of all one that chooses which credentials an operation runs
-        // with.
-        if id.is_some() {
-            diag::error(&format!(
-                "sbx: task {verb}: `--session` cannot be used here — a cage reaches one plane, its own"
-            ));
-            return Err(ExitCode::from(2));
-        }
-        let socket = PathBuf::from(path);
-        return Ok(Plane {
-            inventory: socket.clone(),
-            socket,
-            session: None,
-        });
+fn plane_for(id: Option<&str>, verb: &str, side: Side) -> Result<Plane, ExitCode> {
+    if side == Side::Host && std::env::var_os(TASK_SOCKET_ENV).is_some() {
+        diag::error(&format!(
+            "sbx: task {verb}: this is host-side only — a cage may invoke operations, not watch them"
+        ));
+        return Err(ExitCode::from(2));
     }
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return Err(ExitCode::FAILURE);
-    };
+    if let Some(one) = env_plane(id, verb)? {
+        return Ok(one);
+    }
+    let layout = layout_or_fail()?;
     let pid = resolve_task_session(layout.data_dir(), id, verb)?;
-    let socket = sandbox::task_control::task_dir(layout.data_dir(), pid).join("control.sock");
-    Ok(Plane {
-        inventory: socket.clone(),
-        socket,
-        session: Some((pid, session_project(layout.data_dir(), pid))),
-    })
+    Ok(one_plane(&layout, pid, side))
 }
 
 /// The project a session runs in, from the session registry. A plane whose registry record is gone
@@ -146,21 +235,11 @@ fn resolve_task_session(
     verb: &str,
 ) -> Result<u32, ExitCode> {
     if let Some(id) = id {
-        return id.parse::<u32>().map_err(|_| {
-            diag::error(&format!("sbx: task {verb}: `{id}` is not a session id"));
-            diag::hint("       `sbx session ls` lists them; the id is the session's PID.");
-            ExitCode::from(2)
-        });
+        return resolve_named(id, verb);
     }
     let pids = sandbox::task_control::session_pids(data_dir);
     match pids.as_slice() {
-        [] => {
-            diag::error(&format!(
-                "sbx: task {verb}: no session is offering declared operations"
-            ));
-            diag::hint("       a session offers them when its config declares `[task.<name>]`.");
-            Err(ExitCode::FAILURE)
-        }
+        [] => Err(no_sessions(verb)),
         [one] => Ok(*one),
         many => {
             diag::error(&format!(
@@ -277,7 +356,8 @@ fn key_values(fields: &[String]) -> BTreeMap<&str, &str> {
     fields.iter().filter_map(|f| f.split_once('=')).collect()
 }
 
-/// `sbx task list [<id>]`: the operations this session offers, with their parameters and ceilings.
+/// `sbx task list [<operation>] [--session <id>]`: the operations on offer, with their parameters
+/// and ceilings — across every session that offers any, unless one is named.
 ///
 /// Only the columns that carry something are printed. Every operation shows its stream dispositions
 /// and none of them declares an output directory in the common case, so fixed columns would spend
@@ -288,32 +368,47 @@ fn task_list(args: &[OsString]) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let plane = match plane_for(listing.session.as_deref(), "list") {
+    let planes = match planes_for(listing.session.as_deref(), "list", Side::Cage) {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let all = match client::list(&plane.socket) {
+    let all = match gather(&planes, "list", |p| client::list(&p.socket)) {
         Ok(rows) => rows,
-        Err(e) => return unreachable_plane(&e),
+        Err(code) => return code,
     };
-    plane.announce();
+    for plane in &planes {
+        plane.announce();
+    }
     if all.is_empty() {
         println!("no declared operations");
         return ExitCode::SUCCESS;
     }
-    let rows: Vec<client::TaskRow> = match &listing.operation {
+    let rows: Vec<(String, client::TaskRow)> = match &listing.operation {
         None => all,
         Some(name) => {
-            let kept: Vec<_> = all.iter().filter(|r| &r.name == name).cloned().collect();
+            let kept: Vec<_> = all
+                .iter()
+                .filter(|(_, r)| &r.name == name)
+                .cloned()
+                .collect();
             if kept.is_empty() {
-                let known: Vec<String> = all.iter().map(|r| r.name.clone()).collect();
+                let known: Vec<String> = all.iter().map(|(_, r)| r.name.clone()).collect();
                 return no_match("list", name, &known);
             }
             kept
         }
     };
 
-    let table = list_table(&rows);
+    let sessions: Vec<String> = rows.iter().map(|(s, _)| s.clone()).collect();
+    let inventory: Vec<client::TaskRow> = rows.into_iter().map(|(_, r)| r).collect();
+    let mut table = list_table(&inventory, &running_now(&planes), &sessions);
+    with_session_column(
+        spans_sessions(&planes),
+        &mut table.headers,
+        &mut table.align,
+        &mut table.rows,
+        &sessions,
+    );
     print_table(&table.headers, &table.align, &table.rows);
 
     // The two columns whose meaning does not fit in a cell, said once under the table rather than
@@ -342,8 +437,37 @@ struct ListTable {
     missing: bool,
 }
 
+/// How many invocations of each `(session, operation)` are running right now.
+///
+/// The inventory is a listing of what is *declared*, but `ls` is the word this product uses for what
+/// is **live** (`sbx session ls`), so a reader typing it is often asking the other question. Answering
+/// both costs one read of the host socket and a column that only appears when something is running.
+/// A cage cannot reach that socket — it has no `host` — so there the listing stays what it always
+/// was.
+fn running_now(planes: &[Plane]) -> BTreeMap<(String, String), usize> {
+    let mut counts = BTreeMap::new();
+    for plane in planes {
+        let Some(host) = &plane.host else { continue };
+        let Ok(rows) = sandbox::task_control::read_status(host) else {
+            continue;
+        };
+        for row in rows {
+            if let Some(task) = key_values(&row.fields).get("task") {
+                *counts
+                    .entry((plane.cell(), (*task).to_string()))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
 /// Lay the inventory out, keeping only the columns that carry something.
-fn list_table(rows: &[client::TaskRow]) -> ListTable {
+fn list_table(
+    rows: &[client::TaskRow],
+    running: &BTreeMap<(String, String), usize>,
+    sessions: &[String],
+) -> ListTable {
     let parsed: Vec<(&str, BTreeMap<&str, &str>, String)> = rows
         .iter()
         .map(|row| {
@@ -363,8 +487,27 @@ fn list_table(rows: &[client::TaskRow]) -> ListTable {
     let missing = any("missing-tools", &|_| true);
     let described = parsed.iter().any(|(_, _, d)| !d.is_empty());
 
+    // How many invocations of each row are live, in the order the rows are in. Zero everywhere means
+    // no column: the listing is back to what is declared, which is all there is to say.
+    let live: Vec<usize> = parsed
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _, _))| {
+            let session = sessions.get(i).cloned().unwrap_or_default();
+            running
+                .get(&(session, (*name).to_string()))
+                .copied()
+                .unwrap_or(0)
+        })
+        .collect();
+    let any_live = live.iter().any(|n| *n > 0);
+
     let mut headers = vec!["NAME", "PARAMS", "TIMEOUT"];
     let mut align = vec![Align::Left, Align::Left, Align::Right];
+    if any_live {
+        headers.push("RUNNING");
+        align.push(Align::Right);
+    }
     for (wanted, label) in [
         (streams, "STDOUT"),
         (streams, "STDERR"),
@@ -380,12 +523,19 @@ fn list_table(rows: &[client::TaskRow]) -> ListTable {
 
     let rows = parsed
         .iter()
-        .map(|(name, f, description)| {
+        .enumerate()
+        .map(|(i, (name, f, description))| {
             let cell = |key: &str| match f.get(key).copied() {
                 None | Some("") => NONE.to_string(),
                 Some(v) => v.to_string(),
             };
             let mut row = vec![(*name).to_string(), cell("params"), cell("timeout")];
+            if any_live {
+                row.push(match live[i] {
+                    0 => NONE.to_string(),
+                    n => n.to_string(),
+                });
+            }
             if streams {
                 row.push(cell("stdout"));
                 row.push(cell("stderr"));
@@ -427,27 +577,29 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let plane = match plane_for(listing.session.as_deref(), "secrets") {
+    let planes = match planes_for(listing.session.as_deref(), "secrets", Side::Cage) {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let all = match client::secrets(&plane.socket) {
+    let all = match gather(&planes, "secrets", |p| client::secrets(&p.socket)) {
         Ok(rows) => rows,
-        Err(e) => return unreachable_plane(&e),
+        Err(code) => return code,
     };
-    plane.announce();
-    let rows: Vec<String> = match &listing.operation {
+    for plane in &planes {
+        plane.announce();
+    }
+    let rows: Vec<(String, String)> = match &listing.operation {
         None => all,
         Some(name) => all
             .iter()
-            .filter(|r| r.split('\t').any(|f| f == format!("task={name}")))
+            .filter(|(_, r)| r.split('\t').any(|f| f == format!("task={name}")))
             .cloned()
             .collect(),
     };
     if rows.is_empty() {
         return match &listing.operation {
             Some(name) => empty_or_unknown(
-                &plane,
+                &planes,
                 "secrets",
                 name,
                 &format!("`{name}` carries no credentials"),
@@ -458,6 +610,8 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
             }
         };
     }
+    let sessions: Vec<String> = rows.iter().map(|(s, _)| s.clone()).collect();
+    let rows: Vec<String> = rows.into_iter().map(|(_, r)| r).collect();
     // Two shapes cross the wire — a variable the operation's environment carries, and a value
     // injected into a request the operation never sees — and DELIVERY is where they differ. That is
     // the field a reader is actually after: whether the command holds the credential at all.
@@ -495,11 +649,17 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
             ]
         })
         .collect();
-    print_table(
-        &["NAME", "OPERATION", "DELIVERY", "DESCRIPTION"],
-        &[Align::Left; 4],
-        &table,
+    let mut table = table;
+    let mut headers = vec!["NAME", "OPERATION", "DELIVERY", "DESCRIPTION"];
+    let mut align = vec![Align::Left; 4];
+    with_session_column(
+        spans_sessions(&planes),
+        &mut headers,
+        &mut align,
+        &mut table,
+        &sessions,
     );
+    print_table(&headers, &align, &table);
     ExitCode::SUCCESS
 }
 
@@ -559,7 +719,7 @@ fn task_run(args: &[OsString]) -> ExitCode {
         eprint!("{}", help::page_usage(&["task", "run"]).unwrap_or_default());
         return ExitCode::from(2);
     };
-    let plane = match plane_for(id.as_deref(), "run") {
+    let plane = match plane_for(id.as_deref(), "run", Side::Cage) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -634,49 +794,36 @@ fn task_run(args: &[OsString]) -> ExitCode {
 /// Refuses outright when the environment says this sbx is talking to a plane rather than owning one:
 /// these verbs are host-side by construction (the socket is never bound into a cage), and the
 /// explicit refusal is what makes that a message instead of a connection error.
-fn host_plane(id: Option<&str>, verb: &str) -> Result<Plane, ExitCode> {
-    if std::env::var_os(TASK_SOCKET_ENV).is_some() {
-        diag::error(&format!(
-            "sbx: task {verb}: this is host-side only — a cage may invoke operations, not watch them"
-        ));
-        return Err(ExitCode::from(2));
-    }
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return Err(ExitCode::FAILURE);
-    };
-    let pid = resolve_task_session(layout.data_dir(), id, verb)?;
-    Ok(Plane {
-        socket: sandbox::task_control::log_socket(layout.data_dir(), pid),
-        inventory: sandbox::task_control::task_dir(layout.data_dir(), pid).join("control.sock"),
-        session: Some((pid, session_project(layout.data_dir(), pid))),
-    })
-}
-
-/// `sbx task status [<operation>] [--session <id>]`: the invocations running right now.
+/// `sbx task status [<invocation>|<operation>] [--session <id>]`: the invocations running right now,
+/// across every session offering operations unless one is named.
 fn task_status(args: &[OsString]) -> ExitCode {
     let listing = match listing_args(args, "status") {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let plane = match host_plane(listing.session.as_deref(), "status") {
+    let planes = match planes_for(listing.session.as_deref(), "status", Side::Host) {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let rows = match sandbox::task_control::read_status(&plane.socket) {
+    let all = match gather(&planes, "status", |p| {
+        sandbox::task_control::read_status(&p.socket)
+    }) {
         Ok(rows) => rows,
-        Err(e) => return unreachable_plane(&e),
+        Err(code) => return code,
     };
-    plane.announce();
-    let rows = match &listing.operation {
-        None => rows,
+    for plane in &planes {
+        plane.announce();
+    }
+    let rows: Vec<(String, sandbox::task_control::StatusRow)> = match &listing.operation {
+        None => all,
         // An id or a name, the same way `stop` takes either — the id is what a stopped invocation's
         // report names, and asking after it is the first thing a reader does with it.
         Some(target) => match target.parse::<u64>() {
-            Ok(id) => rows.into_iter().filter(|r| r.id == id).collect(),
-            Err(_) => filter_by_operation(&rows, Some(target)),
+            Ok(id) => all.into_iter().filter(|(_, r)| r.id == id).collect(),
+            Err(_) => all
+                .into_iter()
+                .filter(|(_, r)| key_values(&r.fields).get("task") == Some(&target.as_str()))
+                .collect(),
         },
     };
     if rows.is_empty() {
@@ -692,15 +839,16 @@ fn task_status(args: &[OsString]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         return empty_or_unknown(
-            &plane,
+            &planes,
             "status",
             target,
             &format!("`{target}` is not running"),
         );
     }
-    let table: Vec<Vec<String>> = rows
+    let sessions: Vec<String> = rows.iter().map(|(s, _)| s.clone()).collect();
+    let mut table: Vec<Vec<String>> = rows
         .iter()
-        .map(|row| {
+        .map(|(_, row)| {
             let f = key_values(&row.fields);
             vec![
                 row.id.to_string(),
@@ -717,17 +865,22 @@ fn task_status(args: &[OsString]) -> ExitCode {
             ]
         })
         .collect();
-    print_table(
-        &["ID", "OPERATION", "ELAPSED", "PID", "STATE"],
-        &[
-            Align::Right,
-            Align::Left,
-            Align::Right,
-            Align::Right,
-            Align::Left,
-        ],
-        &table,
+    let mut headers = vec!["ID", "OPERATION", "ELAPSED", "PID", "STATE"];
+    let mut align = vec![
+        Align::Right,
+        Align::Left,
+        Align::Right,
+        Align::Right,
+        Align::Left,
+    ];
+    with_session_column(
+        spans_sessions(&planes),
+        &mut headers,
+        &mut align,
+        &mut table,
+        &sessions,
     );
+    print_table(&headers, &align, &table);
     ExitCode::SUCCESS
 }
 
@@ -775,7 +928,7 @@ fn task_stop(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    let plane = match host_plane(listing.session.as_deref(), "stop") {
+    let plane = match plane_for(listing.session.as_deref(), "stop", Side::Host) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -846,20 +999,25 @@ fn task_logs(args: &[OsString]) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let plane = match host_plane(listing.session.as_deref(), "logs") {
+    let planes = match planes_for(listing.session.as_deref(), "logs", Side::Host) {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let lines = match sandbox::task_control::read_log(&plane.socket) {
+    let lines = match gather(&planes, "logs", |p| {
+        sandbox::task_control::read_log(&p.socket)
+    }) {
         Ok(lines) => lines,
-        Err(e) => return unreachable_plane(&e),
+        Err(code) => return code,
     };
-    plane.announce();
+    for plane in &planes {
+        plane.announce();
+    }
     let mut rows = Vec::new();
-    for line in &lines {
+    let mut sessions = Vec::new();
+    for (session, line) in &lines {
         if let Some(dropped) = line.strip_prefix("dropped=") {
             diag::warn(&format!(
-                "{dropped} older invocation(s) fell out of the session's log ring"
+                "{dropped} older invocation(s) fell out of session {session}'s log ring"
             ));
             continue;
         }
@@ -877,6 +1035,7 @@ fn task_logs(args: &[OsString]) -> ExitCode {
         };
         if keeps {
             rows.push(row);
+            sessions.push(session.clone());
         }
     }
     if rows.is_empty() {
@@ -889,24 +1048,29 @@ fn task_logs(args: &[OsString]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         return empty_or_unknown(
-            &plane,
+            &planes,
             "logs",
             target,
             &format!("no invocation of `{target}` recorded"),
         );
     }
-    print_table(
-        &["ID", "TIME", "OPERATION", "EXIT", "TOOK", "NOTE"],
-        &[
-            Align::Right,
-            Align::Left,
-            Align::Left,
-            Align::Right,
-            Align::Right,
-            Align::Left,
-        ],
-        &rows,
+    let mut headers = vec!["ID", "TIME", "OPERATION", "EXIT", "TOOK", "NOTE"];
+    let mut align = vec![
+        Align::Right,
+        Align::Left,
+        Align::Left,
+        Align::Right,
+        Align::Right,
+        Align::Left,
+    ];
+    with_session_column(
+        spans_sessions(&planes),
+        &mut headers,
+        &mut align,
+        &mut rows,
+        &sessions,
     );
+    print_table(&headers, &align, &rows);
     ExitCode::SUCCESS
 }
 
@@ -1031,16 +1195,85 @@ fn no_match(verb: &str, operation: &str, known: &[String]) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Read one listing from every plane, keeping each answer beside the plane that gave it.
+///
+/// A plane that has gone since it was listed is reported and skipped rather than taken as an empty
+/// answer: a session ending between the listing and the read is ordinary, and silently showing one
+/// session's rows as if they were all of them would be a lie about what is out there.
+fn gather<T>(
+    planes: &[Plane],
+    verb: &str,
+    read: impl Fn(&Plane) -> std::io::Result<Vec<T>>,
+) -> Result<Vec<(String, T)>, ExitCode> {
+    let mut rows = Vec::new();
+    let mut reached = 0usize;
+    let mut last: Option<std::io::Error> = None;
+    for plane in planes {
+        match read(plane) {
+            Ok(found) => {
+                reached += 1;
+                rows.extend(found.into_iter().map(|row| (plane.cell(), row)));
+            }
+            Err(e) => {
+                if planes.len() > 1 {
+                    diag::warn(&format!(
+                        "session {} did not answer ({e}) — its operations are not listed",
+                        plane.cell()
+                    ));
+                }
+                last = Some(e);
+            }
+        }
+    }
+    match (reached, last) {
+        // Nothing answered at all: that is the plane being unreachable, not an empty listing.
+        (0, Some(e)) => {
+            let _ = verb;
+            Err(unreachable_plane(&e))
+        }
+        _ => Ok(rows),
+    }
+}
+
+/// Whether a listing spans more than one session — the one condition under which the rows need to
+/// say which session each came from.
+fn spans_sessions(planes: &[Plane]) -> bool {
+    planes.len() > 1
+}
+
+/// Put the session column in front of a table when the listing spans several.
+fn with_session_column(
+    multi: bool,
+    headers: &mut Vec<&'static str>,
+    align: &mut Vec<Align>,
+    rows: &mut [Vec<String>],
+    sessions: &[String],
+) {
+    if !multi {
+        return;
+    }
+    headers.insert(0, "SESSION");
+    align.insert(0, Align::Right);
+    for (row, session) in rows.iter_mut().zip(sessions) {
+        row.insert(0, session.clone());
+    }
+}
+
 /// An empty answer to a narrowed listing, told apart from a misspelled name.
 ///
 /// The two look identical from the filter alone — nothing matched either way — and they are opposite
 /// things: one is a real result, the other is a typo that would otherwise read as one. The inventory
 /// is what separates them, so it is asked for **only** on the empty path, where the answer changes
 /// what to say.
-fn empty_or_unknown(plane: &Plane, verb: &str, operation: &str, empty: &str) -> ExitCode {
-    let known: Vec<String> = client::list(&plane.inventory)
-        .map(|rows| rows.into_iter().map(|r| r.name).collect())
-        .unwrap_or_default();
+fn empty_or_unknown(planes: &[Plane], verb: &str, operation: &str, empty: &str) -> ExitCode {
+    let mut known: Vec<String> = planes
+        .iter()
+        .filter_map(|p| client::list(&p.inventory).ok())
+        .flatten()
+        .map(|r| r.name)
+        .collect();
+    known.sort();
+    known.dedup();
     if !known.is_empty() && !known.iter().any(|n| n == operation) {
         return no_match(verb, operation, &known);
     }
@@ -1147,22 +1380,26 @@ mod tests {
     /// hidden, no output directory, every tool present — must print three columns, not seven.
     #[test]
     fn the_listing_drops_the_columns_that_say_the_same_thing_on_every_line() {
-        let table = list_table(&[
-            row(
-                "quick",
-                &["params=", "stdout=show", "stderr=show", "timeout=30s", ""],
-            ),
-            row(
-                "slow",
-                &[
-                    "params=n",
-                    "stdout=show",
-                    "stderr=show",
-                    "timeout=120s",
-                    "counts slowly",
-                ],
-            ),
-        ]);
+        let table = list_table(
+            &[
+                row(
+                    "quick",
+                    &["params=", "stdout=show", "stderr=show", "timeout=30s", ""],
+                ),
+                row(
+                    "slow",
+                    &[
+                        "params=n",
+                        "stdout=show",
+                        "stderr=show",
+                        "timeout=120s",
+                        "counts slowly",
+                    ],
+                ),
+            ],
+            &BTreeMap::new(),
+            &[],
+        );
         assert_eq!(
             table.headers,
             vec!["NAME", "PARAMS", "TIMEOUT", "DESCRIPTION"]
@@ -1179,24 +1416,28 @@ mod tests {
     /// missing tool is exactly what a reader must not have to go and ask about.
     #[test]
     fn a_listing_shows_what_one_operation_alone_makes_worth_showing() {
-        let table = list_table(&[
-            row(
-                "quiet",
-                &["params=", "stdout=hide", "stderr=show", "timeout=30s", ""],
-            ),
-            row(
-                "dump",
-                &[
-                    "params=",
-                    "stdout=show",
-                    "stderr=show",
-                    "timeout=30s",
-                    "output=/opt/sbx/task-out/dump",
-                    "missing-tools=pg_dump",
-                    "",
-                ],
-            ),
-        ]);
+        let table = list_table(
+            &[
+                row(
+                    "quiet",
+                    &["params=", "stdout=hide", "stderr=show", "timeout=30s", ""],
+                ),
+                row(
+                    "dump",
+                    &[
+                        "params=",
+                        "stdout=show",
+                        "stderr=show",
+                        "timeout=30s",
+                        "output=/opt/sbx/task-out/dump",
+                        "missing-tools=pg_dump",
+                        "",
+                    ],
+                ),
+            ],
+            &BTreeMap::new(),
+            &[],
+        );
         assert_eq!(
             table.headers,
             vec![
@@ -1256,6 +1497,39 @@ mod tests {
         );
 
         assert!(log_row("ok").is_none(), "only events are rows");
+    }
+
+    /// `ls` is the word this product uses for what is live (`sbx session ls`), so the inventory says
+    /// what is running when anything is — and stays the plain inventory when nothing is.
+    #[test]
+    fn the_inventory_says_what_is_running_only_when_something_is() {
+        let rows = [
+            row("quick", &["params=", "timeout=30s", ""]),
+            row("slow", &["params=", "timeout=120s", ""]),
+        ];
+        let sessions = ["4081336".to_string(), "4081336".to_string()];
+
+        let idle = list_table(&rows, &BTreeMap::new(), &sessions);
+        assert_eq!(idle.headers, vec!["NAME", "PARAMS", "TIMEOUT"]);
+
+        let live = BTreeMap::from([(("4081336".to_string(), "slow".to_string()), 2)]);
+        let busy = list_table(&rows, &live, &sessions);
+        assert_eq!(busy.headers, vec!["NAME", "PARAMS", "TIMEOUT", "RUNNING"]);
+        assert_eq!(busy.rows[0], vec!["quick", "-", "30s", "-"]);
+        assert_eq!(
+            busy.rows[1],
+            vec!["slow", "-", "120s", "2"],
+            "the count, not a flag: two invocations of one operation is a thing to know"
+        );
+
+        // The count is per *session*: the same operation name in another session is another row.
+        let elsewhere = ["999".to_string(), "999".to_string()];
+        let other = list_table(&rows, &live, &elsewhere);
+        assert_eq!(
+            other.headers,
+            vec!["NAME", "PARAMS", "TIMEOUT"],
+            "another session's invocation must not mark this session's operation as running"
+        );
     }
 
     /// An invocation's duration is read at the scale it happens on.

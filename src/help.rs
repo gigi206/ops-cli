@@ -646,6 +646,14 @@ const PAGES: &[Page] = &[
             only when some operation makes it worth showing — a hidden stream, an output directory,\n\
             a missing tool — because a column that reads the same on every line is not information.\n\
             \n\
+            A `RUNNING` column appears while something is running, holding **how many** invocations\n\
+            of that operation are live (several at once is ordinary; `sbx task status` shows them\n\
+            individually). Host-side only — a cage cannot reach the socket that knows.\n\
+            \n\
+            With no `--session`, every session offering operations is listed and a `SESSION` column\n\
+            says which is which. `run` and `stop` still make you name one: reading is harmless, but\n\
+            guessing which session to *run* in would use the wrong credential.\n\
+            \n\
             A `MISSING TOOLS` column marks an operation whose declared `packages` are not in the tool\n\
             pool. The pool is filled best-effort at launch, so that operation will fail at exec —\n\
             this is where it shows before you invoke it.\n\

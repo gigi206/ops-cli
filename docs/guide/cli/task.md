@@ -105,13 +105,34 @@ nightly    -           1h   show    hide    yes     Dump the reporting tables
 sbx: note: an operation marked OUTPUT writes into /opt/sbx/task-out/<operation>
 ```
 
+A `RUNNING` column joins them while something is running, holding **how many** invocations of that
+operation are live — several at once is ordinary, and [`status`](#status) shows them individually.
+It is host-side only: a cage cannot reach the socket that knows.
+
 A column that reads the same on every line is not information — it is the noise that makes a listing
 unreadable. `MISSING TOOLS` appears when an operation declares
 [`packages`](../configuration/task.md#the-task-tool-pool) the pool does not hold: that operation will
 fail at exec, and the pool is filled best-effort, so this is where you find out before invoking it.
 
+**With several sessions, all of them are listed** and a `SESSION` column says which row came from
+which:
+
+```
+$ sbx task ls
+session 4081336 — /home/you/work/api
+session 4170408 — /home/you/work/web
+SESSION  NAME        PARAMS  TIMEOUT  RUNNING  DESCRIPTION
+4081336  db-query    sql         20s        -  Read-only SQL against staging
+4081336  slow-count  -          120s        2  counts for a minute
+4170408  build       -           30s        -  another project's operation
+```
+
+`--session <id>` narrows it to one. Reading across sessions is harmless, which is why it is the
+default here — [`run`](#run) and [`stop`](#stop) still make you name one, because guessing which
+session to *run* in would use the wrong credential.
+
 Name an operation to show only that one. Inside the cage the session is implicit — a caller may only
-reach its own; on the host, `--session` names it when more than one is offering operations.
+reach its own.
 
 ## `secrets`
 
@@ -193,8 +214,9 @@ ID  OPERATION      ELAPSED      PID  STATE
 | `PID` | the cage's process, for `ps` and `systemd-cgls` |
 | `STATE` | `running`, or `stopping` once it has been asked to stop |
 
-Narrow it with an invocation id or an operation name. A caller blocked on its own `sbx task run`
-cannot see this — it is waiting for the answer. This is the view from another terminal, which is also
+Every session offering operations is shown, with a `SESSION` column when there is more than one.
+Narrow it with an invocation id, an operation name, or `--session`. A caller blocked on its own
+`sbx task run` cannot see this — it is waiting for the answer. This is the view from another terminal, which is also
 the only place a stop can come from.
 
 **The three verbs share one number.** The id `status` shows is the id `stop` takes, the id `logs`
