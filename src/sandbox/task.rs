@@ -773,10 +773,15 @@ impl TaskEngine {
                 return Ok(incage.to_string_lossy().into_owned());
             }
         }
-        Err(format!(
-            "`{entry}` is not on this task's path — a declared program must exist in the cage, or \
-             the rule naming it would match nothing"
-        ))
+        // A bare entry is a name, so a glob in one matches no file and would otherwise be reported
+        // as simply absent — blaming the lookup for what is really the form.
+        let hint = if entry.contains('*') || entry.contains('?') {
+            " — a bare entry is a program name, not a pattern; a glob has to be written as a path \
+             (`/nix/store/*/bin/tool`)"
+        } else {
+            " — a declared program must exist in the cage, or the rule naming it would match nothing"
+        };
+        Err(format!("`{entry}` is not on this task's path{hint}"))
     }
 
     /// The exec policy for one invocation: a strict allowlist of the command itself plus what the
@@ -1857,6 +1862,16 @@ mod tests {
             .resolve_spawn_entry("nosuchtool", &dirs, &task)
             .unwrap_err();
         assert!(e.contains("not on this task's path"), "{e}");
+
+        // A glob in a bare entry matches no file, so it lands in the same branch — the message must
+        // name the form rather than blame the lookup.
+        let e = engine
+            .resolve_spawn_entry("git*", &dirs, &task)
+            .unwrap_err();
+        assert!(
+            e.contains("not a pattern"),
+            "the refusal must point at the form: {e}"
+        );
     }
 
     /// The policy a declaration produces: the command is admitted because it is not optional, the

@@ -1311,6 +1311,13 @@ mod tests {
         );
         // The session's own proxy carries no suffix at all, and still reads the same.
         assert_eq!(runtime_entry_pid("ca-1234.pem", egress), Some(1234));
+
+        // A task that declares `spawn` stands up an exec supervisor of its own, whose socket lands
+        // in `<data>/proc/` with the same per-invocation suffix. The separator is what makes it
+        // sweepable, and the same regression is available in this directory as in the egress one.
+        let proc = &["control-", "notif-"];
+        assert_eq!(runtime_entry_pid("notif-1234.t3.sock", proc), Some(1234));
+        assert_eq!(runtime_entry_pid("notif-1234.sock", proc), Some(1234));
     }
 
     #[test]

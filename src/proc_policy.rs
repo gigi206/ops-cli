@@ -59,8 +59,12 @@ impl ProcMode {
         }
     }
 
-    /// The canonical string for this mode (round-trips [`parse`](ProcMode::parse)); used by
-    /// `sbx config show` and the one-shot override display.
+    /// The canonical string for this mode, used by `sbx config show` and the one-shot override
+    /// display. Every mode a config can *write* round-trips [`parse`](ProcMode::parse);
+    /// [`Confine`](ProcMode::Confine) deliberately does not, because it has no config spelling — it
+    /// is reached only by a declaration that enumerates the programs it admits. Adding it to `parse`
+    /// would offer a refuse-everything-undeclared posture to a config that cannot say what the
+    /// exceptions are.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ProcMode::Off => "off",
