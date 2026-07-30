@@ -4022,12 +4022,15 @@ fn build(
     let mut proc_enforce_guard = None;
     let mut proc_binds: Vec<binds::ExtraBind> = Vec::new();
     if prep.cfg.proc.enforcing() {
-        let sbx_exe = std::env::current_exe().map_err(|e| {
-            eprintln!("sbx: cannot locate the sbx binary for exec enforcement: {e}");
+        // The shim is sbx's own embedded binary, laid down under the data directory. Refusing when
+        // it cannot be placed is the point: the alternative would be binding some other executable
+        // into the cage, which is the exposure the dedicated shim exists to remove.
+        let shim_bin = crate::store::ensure_proc_shim(&prep.layout).map_err(|e| {
+            eprintln!("sbx: cannot place the exec-enforcement shim: {e}");
             ExitCode::FAILURE
         })?;
         let (guard, wiring) =
-            super::proc_enforce::start(prep.layout.data_dir(), &sbx_exe, prep.cfg.proc.clone())
+            super::proc_enforce::start(prep.layout.data_dir(), &shim_bin, prep.cfg.proc.clone())
                 .map_err(|e| {
                     eprintln!("sbx: cannot start exec enforcement: {e}");
                     ExitCode::FAILURE

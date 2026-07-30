@@ -231,16 +231,20 @@ Two are different:
 sbx fixes the program a task runs. It does **not** police what that program goes on to spawn —
 `allow` / `deny` keys on a task are refused rather than accepted into silence.
 
-This is a deliberate limit, not an oversight. Deciding an `execve` by path takes a seccomp
-user-notification supervisor, and the supervisor needs a shim binary bound inside the cage — which
-here is the one cage holding a plaintext credential in its environment. Putting a full sbx binary
-back in there to gain a guardrail is a bad trade: the guardrail stops a *misbehaving* command, the
-binary would help a *compromised* one.
+This is a deliberate limit, not an oversight, but it is a limit that may not stay. Deciding an
+`execve` by path takes a seccomp user-notification supervisor and a shim bound inside the cage — and
+this cage is the one holding a plaintext credential in the command's environment, so what gets bound
+there matters more than anywhere else. The machinery [`[proc]`](proc.md) uses now binds a dedicated
+binary that can do three things and nothing else, which is a far better thing to place next to a
+credential than a general-purpose one. What is left to weigh is a supervisor per invocation against a
+guardrail on a command a trusted declaration already chose.
 
-What bounds a task instead is its shape. The command is fixed by a trusted declaration, every
+What bounds a task today is its shape. The command is fixed by a trusted declaration, every
 caller-supplied value is bounded by `params`, the cage has **no network** unless `network` declares
 one (an empty netns, so a spawned child has nowhere to send anything), the project is read-only, and
-the `$HOME` is a fresh tmpfs that dies with the invocation.
+the `$HOME` is a fresh tmpfs that dies with the invocation. And where the credential is an HTTP one,
+[`inject`](#wire-injected-credentials-the-strongest-form) removes the question entirely: the plaintext never enters the cage, so
+there is nothing for a spawned child to inherit.
 
 ### The task tool pool
 

@@ -10,14 +10,20 @@
 //!
 //! bubblewrap can only load a *plain* cBPF filter (`--add-seccomp-fd`); it cannot install a
 //! `SECCOMP_FILTER_FLAG_NEW_LISTENER` filter (which returns a listener fd). So a tiny **in-cage shim**
-//! ([`run_shim`], reached as `sbx __proc-shim`) installs the notification filter on itself, hands the
-//! listener fd **out** to the host supervisor over a bind-mounted `AF_UNIX` socket (via `SCM_RIGHTS`,
-//! the same socket shape as the egress UDS), then `execvp`s the real command. The filter is inherited
-//! across `fork`+`exec`, so the whole cage process tree is covered — the agent cannot spawn an
-//! unsurveilled child. The shim is sbx itself, bound read-only into the cage; a fully-static release
-//! binary runs there by construction, and a dynamic dev binary runs under the base nix-ld loader
-//! (verified). **Fail-closed:** if the shim cannot install the filter or hand off the fd, it exits
-//! non-zero *without* executing the payload — the command never runs unobserved.
+//! installs the notification filter on itself, hands the listener fd **out** to the host supervisor
+//! over a bind-mounted `AF_UNIX` socket (via `SCM_RIGHTS`, the same socket shape as the egress UDS),
+//! then `execvp`s the real command. The filter is inherited across `fork`+`exec`, so the whole cage
+//! process tree is covered — the agent cannot spawn an unsurveilled child. **Fail-closed:** if the
+//! shim cannot install the filter or hand off the fd, it exits non-zero *without* executing the
+//! payload — the command never runs unobserved.
+//!
+//! The shim is a **separate binary** (`proc-shim/`), carried inside sbx and materialized under the
+//! data directory by [`crate::store::ensure_proc_shim`]. It has to be separate. What is bound into a
+//! cage is reachable by whatever runs there, so binding a general-purpose binary would make the
+//! sandbox's safety depend on none of that binary's state happening to be mounted — a property
+//! nothing checks, and one that stops holding the first time a bind is added. The shim links `libc`
+//! and nothing else, so what the cage holds is a program that can install a filter, pass a
+//! descriptor and exec, and cannot express anything further.
 //!
 //! ## The supervisor must be an ancestor
 //!
@@ -64,12 +70,10 @@
 //! layered on the cage's actual boundaries (confinement by absence, the read-only store, the netns).
 
 use std::collections::BTreeMap;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::OsString;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -90,10 +94,7 @@ const ASK_PENDING_CAP: usize = 256;
 /// makes progress. A live `sbx proc allow`/`deny` decides it well within this window.
 const ASK_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The hidden subcommand the wrapped command runs as, inside the cage.
-pub(crate) const SHIM_VERB: &str = "__proc-shim";
-
-/// Where sbx binds itself (the shim) read-only inside the cage, and where the notification handoff
+/// Where the exec shim is bound read-only inside the cage, and where the notification handoff
 /// socket appears. Both under `/opt/sbx`, beside the egress CA — a path the cage cannot reach outside
 /// of these binds.
 const SHIM_CAGE_PATH: &str = "/opt/sbx/proc-shim";
@@ -134,205 +135,6 @@ fn notif_id_valid_code() -> libc::c_ulong {
 }
 
 // ── the in-cage shim ──────────────────────────────────────────────────────────────────────────────
-
-/// Run the in-cage shim: install the user-notification filter on `execve`/`execveat`, hand the
-/// listener fd to the host supervisor over the bound socket, then `execvp` the payload. Reached as
-/// `sbx __proc-shim <notif-socket> -- <payload…>`.
-///
-/// **Fail-closed:** every step before the `execvp` that errors returns a non-zero [`ExitCode`] *without*
-/// running the payload — an un-enforced command must never run in a Mode-B cage. A denied first
-/// `execve` (the supervisor answered `EPERM`) surfaces as a failed `execvp`, reported the same way.
-pub(crate) fn run_shim(args: &[OsString]) -> ExitCode {
-    // args = [<notif-socket>, "--", payload0, payload1, …]
-    let sep = args.iter().position(|a| a == "--");
-    let (sock, payload) = match sep {
-        Some(i) if i >= 1 && i + 1 < args.len() => (&args[0], &args[i + 1..]),
-        _ => {
-            crate::diag::error(&format!(
-                "sbx {SHIM_VERB}: usage: {SHIM_VERB} <notif-socket> -- <command…>"
-            ));
-            return ExitCode::from(2);
-        }
-    };
-
-    let notif_fd = match install_notif_filter() {
-        Ok(fd) => fd,
-        Err(e) => {
-            crate::diag::error(&format!(
-                "sbx {SHIM_VERB}: cannot install the exec filter ({e}) — refusing to run"
-            ));
-            return ExitCode::from(97);
-        }
-    };
-    if let Err(e) = hand_off(sock, notif_fd) {
-        // SAFETY: notif_fd is our owned descriptor from install_notif_filter.
-        unsafe { libc::close(notif_fd) };
-        crate::diag::error(&format!(
-            "sbx {SHIM_VERB}: cannot reach the exec supervisor ({e}) — refusing to run"
-        ));
-        return ExitCode::from(96);
-    }
-    // The supervisor holds the only reference now; drop ours so a supervisor exit tears the filter
-    // down (matched execve then fail closed with ENOSYS) rather than lingering.
-    // SAFETY: notif_fd is our owned descriptor; closed exactly once.
-    unsafe { libc::close(notif_fd) };
-
-    exec_payload(payload)
-}
-
-/// Install a `NEW_LISTENER` seccomp filter that notifies on `execve`/`execveat` and allows everything
-/// else, returning the listener fd. Requires `no_new_privs` (bwrap already sets it; set again to be
-/// self-contained).
-fn install_notif_filter() -> io::Result<libc::c_int> {
-    // SAFETY: prctl with scalar args; no memory is shared.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // A 5-instruction cBPF program. Opcodes (asm-generic/bpf_common.h): LD|W|ABS = 0x20, JMP|JEQ|K =
-    // 0x15, RET|K = 0x06. `nr` is the first field of `seccomp_data`, at offset 0.
-    const LD_ABS_W: u16 = 0x20;
-    const JEQ_K: u16 = 0x15;
-    const RET_K: u16 = 0x06;
-    let filter = [
-        libc::sock_filter {
-            code: LD_ABS_W,
-            jt: 0,
-            jf: 0,
-            k: 0,
-        },
-        // if nr == execve   -> +2 (to the USER_NOTIF return)
-        libc::sock_filter {
-            code: JEQ_K,
-            jt: 2,
-            jf: 0,
-            k: libc::SYS_execve as u32,
-        },
-        // if nr == execveat -> +1
-        libc::sock_filter {
-            code: JEQ_K,
-            jt: 1,
-            jf: 0,
-            k: libc::SYS_execveat as u32,
-        },
-        // else allow
-        libc::sock_filter {
-            code: RET_K,
-            jt: 0,
-            jf: 0,
-            k: libc::SECCOMP_RET_ALLOW,
-        },
-        // execve/execveat -> notify the supervisor
-        libc::sock_filter {
-            code: RET_K,
-            jt: 0,
-            jf: 0,
-            k: libc::SECCOMP_RET_USER_NOTIF,
-        },
-    ];
-    let prog = libc::sock_fprog {
-        len: filter.len() as u16,
-        filter: filter.as_ptr() as *mut libc::sock_filter,
-    };
-    // SAFETY: prog points at the live `filter` array for the duration of the call.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            libc::SECCOMP_SET_MODE_FILTER,
-            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
-            &prog as *const libc::sock_fprog,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(fd as libc::c_int)
-}
-
-/// Connect to the host supervisor's socket and send it the listener fd via `SCM_RIGHTS`. Retries the
-/// connect briefly (the supervisor binds before the cage launches, so this normally succeeds at once).
-fn hand_off(sock: &OsStr, notif_fd: libc::c_int) -> io::Result<()> {
-    let mut stream = None;
-    for _ in 0..200 {
-        match UnixStream::connect(Path::new(sock)) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    let stream = stream.ok_or_else(|| io::Error::other("supervisor socket never accepted"))?;
-    send_fd(&stream, notif_fd)
-}
-
-/// Send one file descriptor over a connected Unix stream as an `SCM_RIGHTS` ancillary message.
-fn send_fd(stream: &UnixStream, fd: libc::c_int) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let mut dummy: u8 = b'x';
-    let mut iov = libc::iovec {
-        iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
-        iov_len: 1,
-    };
-    // Control buffer sized for exactly one fd.
-    let mut cbuf = [0u8; 32]; // >= CMSG_SPACE(size_of::<c_int>())
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as _;
-    // SAFETY: msg's control buffer is live and sized; we write exactly one aligned cmsg header + fd.
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
-        std::ptr::copy_nonoverlapping(
-            &fd as *const libc::c_int as *const u8,
-            libc::CMSG_DATA(cmsg),
-            std::mem::size_of::<libc::c_int>(),
-        );
-        let n = libc::sendmsg(stream.as_raw_fd(), &msg, 0);
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-/// `execvp` the payload, replacing the shim. Returns only on failure (a denied or missing command).
-fn exec_payload(payload: &[OsString]) -> ExitCode {
-    let prog = match CString::new(payload[0].as_bytes()) {
-        Ok(c) => c,
-        Err(_) => {
-            crate::diag::error(&format!("sbx {SHIM_VERB}: command contains a NUL byte"));
-            return ExitCode::from(94);
-        }
-    };
-    let args: Vec<CString> = payload
-        .iter()
-        .filter_map(|a| CString::new(a.as_bytes()).ok())
-        .collect();
-    if args.len() != payload.len() {
-        crate::diag::error(&format!("sbx {SHIM_VERB}: an argument contains a NUL byte"));
-        return ExitCode::from(94);
-    }
-    let mut ptrs: Vec<*const libc::c_char> = args.iter().map(|c| c.as_ptr()).collect();
-    ptrs.push(std::ptr::null());
-    // SAFETY: prog and ptrs live until execvp returns (which only happens on failure).
-    unsafe { libc::execvp(prog.as_ptr(), ptrs.as_ptr()) };
-    let err = io::Error::last_os_error();
-    crate::diag::error(&format!(
-        "sbx {SHIM_VERB}: cannot execute {}: {err}",
-        payload[0].to_string_lossy()
-    ));
-    // A supervisor `EPERM` (a denied command) lands here; report as a blocked run.
-    ExitCode::from(if err.raw_os_error() == Some(libc::EPERM) {
-        126
-    } else {
-        127
-    })
-}
 
 // ── the live `--session` rule overlay ────────────────────────────────────────────────────────────
 
@@ -436,11 +238,12 @@ impl Drop for ProcEnforce {
 /// connection, receives the listener fd, then decides every notified `execve` against `policy`. Returns
 /// the cage binds (the shim binary + the handoff socket) to merge into the spec.
 ///
-/// The shim binary is `sbx_exe` (this binary), bound read-only. The handoff socket appears in the cage
-/// at [`NOTIF_SOCK_CAGE_PATH`]; wrap the command with [`wrap_command`] so it runs under the shim.
+/// `shim_bin` is the materialized exec shim (see [`crate::store::ensure_proc_shim`]), bound read-only.
+/// The handoff socket appears in the cage at [`NOTIF_SOCK_CAGE_PATH`]; wrap the command with
+/// [`wrap_command`] so it runs under the shim.
 pub(crate) fn start(
     data_dir: &Path,
-    sbx_exe: &Path,
+    shim_bin: &Path,
     policy: ProcPolicy,
 ) -> io::Result<(ProcEnforce, Wiring)> {
     use std::os::unix::fs::DirBuilderExt;
@@ -496,7 +299,7 @@ pub(crate) fn start(
 
     let binds = vec![
         ExtraBind {
-            src: sbx_exe.to_path_buf(),
+            src: shim_bin.to_path_buf(),
             dest: PathBuf::from(SHIM_CAGE_PATH),
             writable: false,
         },
@@ -523,7 +326,6 @@ pub(crate) fn start(
 pub(crate) fn wrap_command(cmd: Vec<OsString>) -> Vec<OsString> {
     let mut out = Vec::with_capacity(cmd.len() + 4);
     out.push(OsString::from(SHIM_CAGE_PATH));
-    out.push(OsString::from(SHIM_VERB));
     out.push(OsString::from(NOTIF_SOCK_CAGE_PATH));
     out.push(OsString::from("--"));
     out.extend(cmd);
@@ -878,6 +680,7 @@ fn recv_fd(stream: &UnixStream) -> io::Result<libc::c_int> {
 mod tests {
     use super::*;
     use crate::proc_policy::ProcMode;
+    use crate::testutil::TmpDir;
 
     #[test]
     fn ioctl_codes_match_the_kernel_abi() {
@@ -901,7 +704,6 @@ mod tests {
             out,
             vec![
                 OsString::from(SHIM_CAGE_PATH),
-                OsString::from(SHIM_VERB),
                 OsString::from(NOTIF_SOCK_CAGE_PATH),
                 OsString::from("--"),
                 OsString::from("node"),
@@ -910,199 +712,118 @@ mod tests {
         );
     }
 
-    /// The load-bearing enforcement proof, host-side (no cage): a child installs the real
-    /// user-notification filter and hands the listener fd back over a socketpair, then attempts two
-    /// `execve`s; the parent runs the real RECV → decide → SEND path against a policy that denies one
-    /// binary. It asserts the denied `execve` returns `EPERM` (the file is never executed) and the
-    /// allowed one runs — the same path the cage uses, with the supervisor as the child's direct parent
-    /// (a YAMA ancestor, so the `/proc/<pid>/mem` read is permitted).
-    ///
-    /// The child runs between `fork` and `exec` in a multi-threaded test harness, so it does only
-    /// async-signal-safe work: raw syscalls, stack-only `send_fd`, byte-literal C strings, and a
-    /// single-byte report per step — no heap allocation (a `format!`/`CString::new` could deadlock on
-    /// the inherited malloc lock).
-    #[test]
-    fn a_denied_execve_returns_eperm_and_an_allowed_one_runs() {
-        use std::os::unix::io::FromRawFd;
-
-        let mut sv = [0 as libc::c_int; 2];
-        assert_eq!(
-            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
-            0
-        );
-        let mut pv = [0 as libc::c_int; 2];
-        assert_eq!(unsafe { libc::pipe(pv.as_mut_ptr()) }, 0);
-
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed");
-        if pid == 0 {
-            // ── child (async-signal-safe only) ──
-            unsafe {
-                libc::close(sv[0]);
-                libc::close(pv[0]);
-                let notif = match install_notif_filter() {
-                    Ok(fd) => fd,
-                    Err(_) => libc::_exit(90),
-                };
-                let sock = UnixStream::from_raw_fd(sv[1]);
-                if send_fd(&sock, notif).is_err() {
-                    libc::_exit(91);
-                }
-                libc::close(notif);
-                // Probe /bin/true (denied): one execve, traps to the parent, returns EPERM.
-                let targv = [c"/bin/true".as_ptr(), std::ptr::null()];
-                libc::execv(c"/bin/true".as_ptr(), targv.as_ptr());
-                let err = *libc::__errno_location();
-                let byte = [if err == libc::EPERM { b'D' } else { b'X' }];
-                libc::write(pv[1], byte.as_ptr() as *const libc::c_void, 1);
-                // Report "reached the allowed exec" BEFORE it replaces us.
-                libc::write(pv[1], c"R".as_ptr() as *const libc::c_void, 1);
-                // /bin/echo (allowed): CONTINUE runs it, replacing the child.
-                let eargv = [c"echo".as_ptr(), std::ptr::null()];
-                libc::execv(c"/bin/echo".as_ptr(), eargv.as_ptr());
-                libc::_exit(3); // only if /bin/echo was denied/missing
-            }
-        }
-
-        // ── parent (the supervisor) ──
-        unsafe {
-            libc::close(sv[1]);
-            libc::close(pv[1]);
-        }
-        let sock = unsafe { UnixStream::from_raw_fd(sv[0]) };
-        let notif = recv_fd(&sock).expect("parent: recv notif fd");
-
-        // Deny /bin/true, allow everything else (denylist default-allow).
-        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
-        let overlay = ProcOverlay::new();
-        let ring = Arc::new(ExecRing::new(16));
-        let pending = Arc::new(PendingExec::new());
-        for _ in 0..2 {
-            assert!(poll_readable(notif, 3000), "no notification arrived");
-            let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
-            let rc = unsafe { libc::ioctl(notif, notif_recv_code() as libc::Ioctl, &mut req) };
-            if rc < 0 {
-                break;
-            }
-            handle_notif(notif, &req, &policy, &overlay, &ring, &pending);
-        }
-
-        // Read the child's two report bytes.
-        let mut buf = [0u8; 8];
-        let n = unsafe { libc::read(pv[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        unsafe {
-            libc::close(pv[0]);
-            let mut status = 0;
-            libc::waitpid(pid, &mut status, 0);
-            libc::close(notif);
-        }
-        drop(sock);
-        let report = &buf[..n.max(0) as usize];
-        assert_eq!(
-            report.first().copied(),
-            Some(b'D'),
-            "the denied execve must return EPERM (child report byte); got {report:?}"
-        );
-        assert!(
-            report.contains(&b'R'),
-            "child reached the allowed exec; got {report:?}"
-        );
-        // The ring recorded a denied /bin/true and an allowed /bin/echo.
-        let snap = ring.snapshot(None);
-        assert!(
-            snap.events
-                .iter()
-                .any(|e| e.command.contains("/bin/true") && e.verdict == "deny"),
-            "ring must show the denied exec: {:?}",
-            snap.events
-        );
-        assert!(
-            snap.events
-                .iter()
-                .any(|e| e.command.contains("/bin/echo") && e.verdict == "allow"),
-            "ring must show the allowed exec: {:?}",
-            snap.events
-        );
+    /// Lay the embedded shim down as an executable file and return its path. The tests below run
+    /// **this** binary — the one a launch binds into a cage — so a change to the shim's protocol or
+    /// its exit codes fails here rather than in a sandbox.
+    fn materialized_shim(dir: &TmpDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("proc-shim");
+        std::fs::write(&path, crate::store::embedded_proc_shim()).expect("write the shim");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the shim executable");
+        path
     }
 
-    /// A live `--session` overlay deny reaches the real syscall handler: the same host-side fork
-    /// harness, but the config policy denies **nothing** and the deny for `/bin/true` lives only in the
-    /// [`ProcOverlay`]. The child's `execve("/bin/true")` must still return `EPERM`, sourced from the
-    /// overlay — the deterministic proof of the link the cage `--session` e2e (skipped where the host
-    /// cannot sandbox) would otherwise be the only cover for.
-    #[test]
-    fn a_session_overlay_deny_returns_eperm_at_the_syscall() {
-        use std::os::unix::io::FromRawFd;
+    /// Run the real shim against a real supervisor and return `(shim exit code, the ring)`.
+    ///
+    /// The harness is the production shape: a listening socket the shim connects back to, the shim
+    /// `execvp`ing `payload`, and the parent running the real RECV → decide → SEND path. The
+    /// supervisor is the child's direct parent, which is what makes the `/proc/<pid>/mem` read
+    /// permitted under YAMA `ptrace_scope = 1` — the same relationship a launch has to its cage.
+    fn run_under_supervisor(
+        payload: &str,
+        policy: &ProcPolicy,
+        overlay: &ProcOverlay,
+    ) -> (Option<i32>, Arc<ExecRing>) {
+        let dir = TmpDir::new();
+        let shim = materialized_shim(&dir);
+        let sock_path = dir.join("notif.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
 
-        let mut sv = [0 as libc::c_int; 2];
-        assert_eq!(
-            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
-            0
-        );
-        let mut pv = [0 as libc::c_int; 2];
-        assert_eq!(unsafe { libc::pipe(pv.as_mut_ptr()) }, 0);
+        let mut child = std::process::Command::new(&shim)
+            .arg(&sock_path)
+            .arg("--")
+            .arg(payload)
+            .spawn()
+            .expect("spawn the shim");
 
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed");
-        if pid == 0 {
-            // ── child (async-signal-safe only) ──
-            unsafe {
-                libc::close(sv[0]);
-                libc::close(pv[0]);
-                let notif = match install_notif_filter() {
-                    Ok(fd) => fd,
-                    Err(_) => libc::_exit(90),
-                };
-                let sock = UnixStream::from_raw_fd(sv[1]);
-                if send_fd(&sock, notif).is_err() {
-                    libc::_exit(91);
-                }
-                libc::close(notif);
-                let targv = [c"/bin/true".as_ptr(), std::ptr::null()];
-                libc::execv(c"/bin/true".as_ptr(), targv.as_ptr());
-                let err = *libc::__errno_location();
-                let byte = [if err == libc::EPERM { b'D' } else { b'X' }];
-                libc::write(pv[1], byte.as_ptr() as *const libc::c_void, 1);
-                libc::_exit(0);
-            }
-        }
+        let (sock, _) = listener.accept().expect("the shim never connected");
+        let notif = recv_fd(&sock).expect("receive the listener fd");
 
-        // ── parent (the supervisor) ──
-        unsafe {
-            libc::close(sv[1]);
-            libc::close(pv[1]);
-        }
-        let sock = unsafe { UnixStream::from_raw_fd(sv[0]) };
-        let notif = recv_fd(&sock).expect("parent: recv notif fd");
-
-        // The config denies nothing; the deny lives only in the live `--session` overlay.
-        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
-        let overlay = ProcOverlay::new();
-        assert!(overlay.remember(Verdict::Deny, "/bin/true"));
         let ring = Arc::new(ExecRing::new(16));
         let pending = Arc::new(PendingExec::new());
-        if poll_readable(notif, 3000) {
+        // Exactly one `execve` is notified: the shim's own exec of the payload. The shim's own
+        // launch happened before the filter existed, so it never traps.
+        if poll_readable(notif, 5000) {
             let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
             let rc = unsafe { libc::ioctl(notif, notif_recv_code() as libc::Ioctl, &mut req) };
             if rc >= 0 {
-                handle_notif(notif, &req, &policy, &overlay, &ring, &pending);
+                handle_notif(notif, &req, policy, overlay, &ring, &pending);
             }
         }
+        let status = child.wait().expect("wait for the shim");
+        // SAFETY: notif is our owned descriptor from recv_fd; closed exactly once.
+        unsafe { libc::close(notif) };
+        (status.code(), ring)
+    }
 
-        let mut buf = [0u8; 4];
-        let n = unsafe { libc::read(pv[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        unsafe {
-            libc::close(pv[0]);
-            let mut status = 0;
-            libc::waitpid(pid, &mut status, 0);
-            libc::close(notif);
-        }
-        drop(sock);
-        let report = &buf[..n.max(0) as usize];
+    /// The load-bearing enforcement proof, host-side (no cage): a `deny` verdict reaches the syscall
+    /// as `EPERM`, so the payload is **never executed** — there is no time-of-check/time-of-use
+    /// window on a refusal. The shim reports that refusal as its own exit 126.
+    #[test]
+    fn a_denied_execve_returns_eperm_and_the_payload_never_runs() {
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
+        let (code, ring) = run_under_supervisor("/bin/true", &policy, &ProcOverlay::new());
+
         assert_eq!(
-            report.first().copied(),
-            Some(b'D'),
-            "an overlay-sourced deny must return EPERM at the syscall; got {report:?}"
+            code,
+            Some(126),
+            "a denied payload must surface as the shim's refusal code, not as the payload's own exit"
+        );
+        assert!(
+            ring.snapshot(None)
+                .events
+                .iter()
+                .any(|e| e.command.contains("/bin/true") && e.verdict == "deny"),
+            "the ring must record the denied exec"
+        );
+    }
+
+    /// The other half: an allowed target is `CONTINUE`d and really runs, so the shim is replaced by
+    /// the payload and the payload's own exit code is what comes back.
+    #[test]
+    fn an_allowed_execve_runs_the_payload() {
+        // A denylist that denies something else entirely: `/bin/true` is unmatched, which under
+        // `enforce` means allowed.
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+        let (code, ring) = run_under_supervisor("/bin/true", &policy, &ProcOverlay::new());
+
+        assert_eq!(code, Some(0), "the allowed payload must have run");
+        assert!(
+            ring.snapshot(None)
+                .events
+                .iter()
+                .any(|e| e.command.contains("/bin/true") && e.verdict == "allow"),
+            "the ring must record the allowed exec"
+        );
+    }
+
+    /// A live `--session` overlay deny reaches the real syscall handler: the config policy denies
+    /// **nothing** and the deny for `/bin/true` lives only in the [`ProcOverlay`]. The deterministic
+    /// proof of the link that the cage `--session` e2e (skipped where the host cannot sandbox) would
+    /// otherwise be the only cover for.
+    #[test]
+    fn a_session_overlay_deny_returns_eperm_at_the_syscall() {
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
+        let overlay = ProcOverlay::new();
+        assert!(overlay.remember(Verdict::Deny, "/bin/true"));
+
+        let (code, ring) = run_under_supervisor("/bin/true", &policy, &overlay);
+
+        assert_eq!(
+            code,
+            Some(126),
+            "an overlay-sourced deny must refuse the payload at the syscall"
         );
         assert!(
             ring.snapshot(None)
@@ -1110,6 +831,34 @@ mod tests {
                 .iter()
                 .any(|e| e.command.contains("/bin/true") && e.verdict == "deny"),
             "the ring must show the overlay-denied exec"
+        );
+    }
+
+    /// The shim refuses to run its payload when it cannot reach a supervisor. This is the property
+    /// that makes enforcement a boundary rather than a preference: a launch whose supervisor is gone
+    /// must run nothing, not run everything.
+    #[test]
+    fn the_shim_refuses_to_run_a_payload_with_no_supervisor() {
+        let dir = TmpDir::new();
+        let shim = materialized_shim(&dir);
+        let marker = dir.join("the-payload-ran");
+
+        let status = std::process::Command::new(&shim)
+            .arg(dir.join("nothing-is-listening.sock"))
+            .arg("--")
+            .arg("/bin/touch")
+            .arg(&marker)
+            .status()
+            .expect("spawn the shim");
+
+        assert_eq!(
+            status.code(),
+            Some(96),
+            "an unreachable supervisor must be reported, not worked around"
+        );
+        assert!(
+            !marker.exists(),
+            "the payload ran unenforced — the shim must never fall back to executing it"
         );
     }
 }

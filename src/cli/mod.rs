@@ -39,10 +39,6 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
     // already using a volume, one already offered, or an ineligible host.
     storage::maybe_propose_on_launch(name, &rest);
     match name {
-        // Internal: the in-cage exec-enforcement shim. Runs inside the cage (sbx is bound read-only
-        // there), installs the seccomp user-notification filter, hands the listener fd to the host
-        // supervisor, and execs the real command. Never invoked by a user directly.
-        "__proc-shim" => crate::sandbox::proc_enforce::run_shim(&rest),
         // Internal: the network-namespace holder. Runs host-side (never in the cage), pre-creates
         // the cage's network namespace with a black-hole `dummy0` interface so an in-cage browser
         // reports itself online, then execs the real `bwrap …` command. Never invoked by a user

@@ -55,7 +55,7 @@ const DATA_ENTRIES: &[Entry] = &[
     Entry {
         label: "engine/",
         rel: "engine",
-        desc: "embedded nix + bwrap engines sbx materializes",
+        desc: "embedded engines and the exec shim sbx materializes",
         enumerate: Enumerate::None,
     },
     Entry {

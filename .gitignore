@@ -1,5 +1,7 @@
-# Rust build output
+# Rust build output. The exec shim (`proc-shim/`) is its own crate with its own target dir;
+# sbx's build script builds it under OUT_DIR, but a manual build there lands here.
 /target
+/proc-shim/target
 
 # Backup files created manually (never commit)
 *.bak

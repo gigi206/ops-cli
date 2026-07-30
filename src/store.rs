@@ -362,6 +362,55 @@ mod bundled {
     include!(concat!(env!("OUT_DIR"), "/bundled_nix.rs"));
 }
 
+/// The in-cage exec-enforcement shim sbx carries inside its own binary, built from `proc-shim/`
+/// and embedded by `build.rs`. Unconditional, unlike the engines: there is no host copy to fall
+/// back to, and no other binary may take its place inside a cage.
+mod proc_shim_blob {
+    include!(concat!(env!("OUT_DIR"), "/proc_shim.rs"));
+}
+
+/// The name the shim is materialized under, in the owned engine directory.
+const PROC_SHIM_NAME: &str = "proc-shim";
+
+/// The embedded shim's bytes, so the enforcement tests can exercise the artifact sbx actually binds
+/// rather than a stand-in that reimplements it. A stand-in would pass while the shipped shim drifted.
+#[cfg(test)]
+pub(crate) fn embedded_proc_shim() -> &'static [u8] {
+    proc_shim_blob::PROC_SHIM_BIN
+}
+
+/// Materialize the embedded exec shim into the owned engine directory and return its path.
+///
+/// Unlike the engines' best-effort placement, a failure here is returned rather than swallowed:
+/// the caller is standing up enforcement, and the honest response to "the shim is not on disk" is
+/// to refuse the launch, never to bind something else in its place.
+///
+/// Placement is atomic and idempotent on the same principle as the engines: a unique temp sibling
+/// is written, made executable and renamed over the target, and a `.proc-shim.sha256` marker is
+/// stamped **last** so an interrupted run re-materializes next time instead of trusting a
+/// half-written binary. A new sbx carrying a newer shim changes the hash and replaces it; the
+/// rename leaves a running cage's shim on its old inode.
+pub(crate) fn ensure_proc_shim(layout: &Layout) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = layout.engine_dir();
+    let shim = dir.join(PROC_SHIM_NAME);
+    let marker = dir.join(".proc-shim.sha256");
+    let sha = proc_shim_blob::PROC_SHIM_SHA256;
+    if shim.is_file() && std::fs::read_to_string(&marker).ok().as_deref() == Some(sha) {
+        return Ok(shim);
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    let tmp = dir.join(format!(".{PROC_SHIM_NAME}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, proc_shim_blob::PROC_SHIM_BIN)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, &shim)?;
+    std::fs::write(&marker, sha)?;
+    Ok(shim)
+}
+
 /// Read an engine-override env var as an **absolute** path, ignoring (with a warning) a relative
 /// value. A relative override would be resolved against the current working directory — an
 /// attacker-controlled project directory — so the host-side engine choice must not depend on it;

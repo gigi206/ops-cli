@@ -79,6 +79,24 @@ on top of them.
 The `enforce`/`ask` feed (`sbx proc logs`) shows the resolved **exec path** the agent is running (the
 thing policy matches on), not the full argv — a `curl https://…` appears as `…/bin/curl`.
 
+## What enforcement puts inside the cage
+
+Only the kernel can hand out the descriptor that lets a supervisor decide an `execve`, and only the
+process being filtered can ask for it — bubblewrap cannot. So under `enforce`/`ask` one program is
+bound read-only into the sandbox to install the filter, pass the descriptor out, and become your
+command.
+
+That program is a **dedicated binary**, not sbx. It is carried inside sbx, laid down at
+`<data>/engine/proc-shim` (see [`sbx path`](../cli/path.md)), and it links the C library and nothing
+else — it can install a filter, send a descriptor and `exec`, and cannot express anything further.
+Binding a general-purpose binary instead would make the sandbox's safety rest on none of that
+binary's state happening to be reachable from inside: true today, unchecked, and quietly false the
+first time a bind is added.
+
+It is **fail-closed** in the direction that matters. A shim that cannot install the filter, or cannot
+reach the supervisor, exits without running your command — enforcement that could not be established
+means the command does not run, never that it runs unenforced.
+
 ## Watching and deciding
 
 - [`sbx proc logs [<id>] [-f]`](../cli/proc.md#logs) — the exec feed, each line carrying its verdict

@@ -1,0 +1,32 @@
+# The in-cage exec-enforcement shim, built as a binary of its own so that what sbx binds
+# inside a sandbox is a program that can do three things and nothing else. Its own workspace
+# root: sbx's build script compiles it as a separate build, and it must never inherit sbx's
+# dependency graph — the whole point is that this binary contains none of sbx.
+[workspace]
+
+[package]
+name = "sbx-proc-shim"
+version = "0.1.0"
+edition = "2021"
+description = "sbx's in-cage exec-enforcement shim: install the notification filter, hand the listener out, exec the payload"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "sbx-proc-shim"
+path = "src/main.rs"
+
+[dependencies]
+# The only dependency, and deliberately the only one: this binary lives inside a sandbox, so
+# every crate linked into it is surface an in-cage adversary gets to read.
+libc = "0.2"
+
+# Small and self-contained: it is embedded in the sbx binary, materialized on disk, and bound
+# into a cage. `panic = "abort"` also removes the unwinding machinery, which this never uses —
+# every failure path here exits with a code.
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
