@@ -577,8 +577,14 @@ impl TaskEngine {
                 &super::naming::cage_hostname(&format!("{}-task{invocation}", self.slug)),
                 tcp,
             );
-            std::fs::write(&hosts, body)
-                .map_err(|e| format!("cannot write the task cage's hosts file: {e}"))?;
+            std::fs::write(&hosts, body).map_err(|e| {
+                format!(
+                    "cannot write {}, the hosts file this task's cage resolves names through: {e}. \
+                     The hosts its `network` declares would not resolve inside the cage, so the \
+                     task is refused rather than run against the agent's own mapping.",
+                    hosts.display()
+                )
+            })?;
             mounts.push(Mount::RoBind {
                 src: hosts,
                 dest: PathBuf::from("/etc/hosts"),
@@ -1652,6 +1658,156 @@ mod tests {
                 PathBuf::from("/nix/store/mise/bin/mise"),
             )),
         }
+    }
+
+    /// The same synthetic engine, rooted at a real data directory — what a test needs when the path
+    /// under exercise writes a per-invocation file under `<data>`.
+    fn engine_at(data: &Path, tasks: Vec<TaskSpec>) -> TaskEngine {
+        let mut engine = TaskEngine {
+            layout: crate::store::Layout::under(data),
+            pool: None,
+            ..engine_with_pool(Path::new("/nonexistent/pool"), tasks)
+        };
+        // The skeleton a task cage inherits carries the *agent's* hosts file; a networked task must
+        // land on top of it.
+        engine.base_mounts.push(Mount::RoBind {
+            src: PathBuf::from("/host/etc/hosts"),
+            dest: PathBuf::from("/etc/hosts"),
+        });
+        std::fs::create_dir_all(data.join("egress")).expect("the egress directory");
+        engine
+    }
+
+    /// A destination plan for one `tcp://` rule, built the way a launch builds it.
+    fn tcp_plan(
+        rule: &str,
+    ) -> (
+        Vec<crate::allowlist::Rule>,
+        Vec<super::super::egress::TcpDestination>,
+    ) {
+        let rules = vec![crate::allowlist::classify(rule).expect("a valid rule")];
+        let policy = crate::allowlist::EgressPolicy::new(rules.clone(), Vec::new());
+        (
+            rules,
+            super::super::egress::tcp_destinations(&policy).destinations,
+        )
+    }
+
+    /// A networked task resolves names through a hosts file of **its own**, bound over the one it
+    /// inherited. The inherited file maps the agent's destinations; a task's `network` is its own
+    /// declaration, so reading the agent's would let a task reach a name it never declared — and
+    /// miss the ones it did.
+    #[test]
+    fn a_networked_task_resolves_through_a_hosts_file_of_its_own() {
+        let data = crate::testutil::TmpDir::new();
+        let (rules, tcp) = tcp_plan("tcp://db.internal:5432");
+        let mut networked = task();
+        networked.network = rules;
+        let engine = engine_at(data.path(), vec![networked.clone()]);
+
+        let spec = engine
+            .build_spec(
+                vec![OsString::from("psql")],
+                &engine.base_env,
+                &[],
+                &networked,
+                7,
+                &tcp,
+            )
+            .expect("the spec");
+
+        let hosts_mounts: Vec<_> = spec
+            .mounts()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| mount_dest(m) == Path::new("/etc/hosts"))
+            .collect();
+        assert_eq!(
+            hosts_mounts.len(),
+            2,
+            "the task's own hosts file must be bound over the inherited one, not replace it in \
+             place: {:?}",
+            spec.mounts()
+        );
+        let (_, last) = hosts_mounts.last().expect("the winning mount");
+        let src = match last {
+            Mount::RoBind { src, .. } => src.clone(),
+            other => panic!("the hosts file must be read-only in the cage: {other:?}"),
+        };
+        assert!(
+            src.starts_with(data.join("egress")),
+            "the task's hosts file belongs with the invocation's other runtime files, so gc \
+             sweeps it: {src:?}"
+        );
+        let body = std::fs::read_to_string(&src).expect("the hosts file");
+        assert!(
+            body.contains("db.internal"),
+            "the declared destination must be mapped: {body}"
+        );
+    }
+
+    /// A task that declares no `tcp://` destination has nothing of its own to map, and keeps the
+    /// inherited file rather than being handed an emptier one.
+    #[test]
+    fn a_task_with_nothing_to_map_keeps_the_inherited_hosts_file() {
+        let data = crate::testutil::TmpDir::new();
+        let plain = task();
+        let engine = engine_at(data.path(), vec![plain.clone()]);
+        let spec = engine
+            .build_spec(
+                vec![OsString::from("psql")],
+                &engine.base_env,
+                &[],
+                &plain,
+                8,
+                &[],
+            )
+            .expect("the spec");
+        assert_eq!(
+            spec.mounts()
+                .iter()
+                .filter(|m| mount_dest(m) == Path::new("/etc/hosts"))
+                .count(),
+            1,
+            "no destination to map means no second hosts file: {:?}",
+            spec.mounts()
+        );
+    }
+
+    /// If that file cannot be written the launch is refused — never run against the inherited
+    /// mapping, under which a declared name silently resolves elsewhere or not at all. The message
+    /// names the file, so an operator can see which directory failed them.
+    #[test]
+    fn a_hosts_file_that_cannot_be_written_refuses_the_task() {
+        let data = crate::testutil::TmpDir::new();
+        let (rules, tcp) = tcp_plan("tcp://db.internal:5432");
+        let mut networked = task();
+        networked.network = rules;
+        let engine = engine_at(data.path(), vec![networked.clone()]);
+
+        // A directory where the file goes: the write then fails for any uid, root included. The
+        // invocation number is this test's alone — the pid in the name is shared with every other
+        // test in the binary.
+        let invocation = 9_000_001;
+        let planted = data
+            .join("egress")
+            .join(format!("hosts-{}.t{invocation}", std::process::id()));
+        std::fs::create_dir(&planted).expect("the planted directory");
+
+        let err = engine
+            .build_spec(
+                vec![OsString::from("psql")],
+                &engine.base_env,
+                &[],
+                &networked,
+                invocation,
+                &tcp,
+            )
+            .expect_err("a hosts file that cannot be written must refuse the launch");
+        assert!(
+            err.contains(&planted.display().to_string()),
+            "the message must name the file it could not write: {err}"
+        );
     }
 
     /// A task that declares a tool gets the pool — read-only, at the path the install used — and
