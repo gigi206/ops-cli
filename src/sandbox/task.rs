@@ -465,13 +465,18 @@ impl TaskEngine {
         // credential lives in this process for the duration of one command and its needles.
         let mut cage_env = self.base_env.clone();
         let mut needles = Vec::new();
+        // Kept apart from the rest of the environment all the way to the cage: these values must not
+        // reach bubblewrap's argument list, which is world-readable, so they travel on a descriptor
+        // instead. Everything else about them is unchanged — same resolution, same encoding, same
+        // needles for substituting them back out of the output.
+        let mut secret_env = Vec::new();
         for secret in &task.secrets {
             let plaintext = resolve_secret(secret, &self.config_root, &self.bwrap)
                 .map_err(TaskError::Credential)?;
             for bytes in secret.encode.variants(&plaintext) {
                 needles.push(SecretNeedle::named(&secret.var, bytes));
             }
-            cage_env.push((secret.var.clone(), secret.encode.render(&plaintext)));
+            secret_env.push((secret.var.clone(), secret.encode.render(&plaintext)));
         }
         for (k, v) in &task.env {
             cage_env.push((k.clone(), v.clone()));
@@ -579,6 +584,7 @@ impl TaskEngine {
                     output: output.as_ref().map(|o| o.dir.as_path()),
                 },
             )
+            .map(|spec| spec.with_secret_env(secret_env))
             .map_err(|e| TaskError::Io(io::Error::other(e)))?;
         let started = Instant::now();
         // A failure message is substituted too: it can carry the command's own diagnostics, and

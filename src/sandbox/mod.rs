@@ -11,6 +11,7 @@ mod argv;
 mod binds;
 mod fhs;
 mod launch;
+mod memfd;
 mod naming;
 mod pty;
 mod smoke;

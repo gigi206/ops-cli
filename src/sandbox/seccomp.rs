@@ -64,8 +64,8 @@ use seccompiler::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io;
+use std::os::fd::AsRawFd;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("sbx's seccomp denylist is implemented only for x86_64 and aarch64");
@@ -307,17 +307,7 @@ pub(crate) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
 }
 
 fn write_to_memfd(bytes: Vec<u8>) -> io::Result<File> {
-    // SAFETY: the name is a valid NUL-terminated C string and `flags = 0` yields a
-    // descriptor without O_CLOEXEC, so it survives the exec into bwrap.
-    let fd = unsafe { libc::memfd_create(c"sbx-seccomp".as_ptr(), 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: memfd_create returned an owned descriptor we wrap exactly once.
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    file.write_all(&bytes)?;
-    file.seek(SeekFrom::Start(0))?;
-    Ok(file)
+    super::memfd::write(c"sbx-seccomp", &bytes)
 }
 
 /// The bwrap flags that load `memfds` as additional seccomp filters, to be placed

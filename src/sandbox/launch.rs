@@ -5228,10 +5228,42 @@ fn mise_roll_recap(rolled: &[String], up_to_date: usize, skipped: usize, failed:
 /// bwrap is told to read. Seccomp is loaded on every launch path the same way the
 /// namespace hardening is emitted unconditionally by `to_argv`.
 pub(super) fn seccomp_argv(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
-    let memfds = super::seccomp::memfds(&spec.seccomp)?;
+    let mut memfds = super::seccomp::memfds(&spec.seccomp)?;
     let mut argv = super::seccomp::argv_prefix(&memfds);
     argv.extend(super::argv::to_argv(spec));
+    if let Some(secrets) = secret_args(spec)? {
+        // The placeholder becomes the descriptor's number here, and only here: this is the one place
+        // that can create it, which is what keeps [`super::argv::to_argv`] pure.
+        let fd = secrets.as_raw_fd().to_string();
+        for arg in argv.iter_mut() {
+            if arg == super::argv::SECRET_ARGS_PLACEHOLDER {
+                *arg = OsString::from(&fd);
+            }
+        }
+        memfds.push(secrets);
+    }
     Ok((argv, memfds))
+}
+
+/// The descriptor carrying the spec's out-of-argv variables, in bwrap's own `--args` encoding
+/// (NUL-separated arguments), or `None` when the spec declares none.
+///
+/// Why they are not in the argument list: a process's arguments are world-readable
+/// (`/proc/<pid>/cmdline` is mode `444`) while its environment is not. A credential passed as
+/// `--setenv VAR <value>` is therefore readable by every uid on the machine for as long as the cage
+/// runs — measured on a live invocation, not inferred.
+fn secret_args(spec: &SandboxSpec) -> io::Result<Option<File>> {
+    if spec.secret_env.is_empty() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    for (key, value) in &spec.secret_env {
+        for part in ["--setenv", key.as_str(), value.as_str()] {
+            bytes.extend_from_slice(part.as_bytes());
+            bytes.push(0);
+        }
+    }
+    super::memfd::write(c"sbx-args", &bytes).map(Some)
 }
 
 /// A process's exit code in the shell convention: its own code, or 128 + the signal that
@@ -5463,6 +5495,94 @@ mod tests {
     use std::path::PathBuf;
 
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+
+    /// A credential must never reach bubblewrap's **argument list**: `/proc/<pid>/cmdline` is mode
+    /// `444`, so every uid on the machine could read it for as long as the cage runs, while
+    /// `/proc/<pid>/environ` is `400`. Measured on a live invocation before this existed — the
+    /// sentinel was sitting there next to `--setenv`.
+    ///
+    /// This asserts on the production function, so the property holds for whatever a spec is built
+    /// from rather than for one hand-written argv.
+    #[test]
+    fn a_credential_never_reaches_the_world_readable_argument_list() {
+        use std::io::Read;
+        const SENTINEL: &str = "s3nt1nel-v4lue-xyz";
+
+        let spec = SandboxSpec::new(
+            PathBuf::from("/w"),
+            Vec::new(),
+            vec![("PATH".to_string(), "/bin".to_string())],
+            NetPolicy::Isolated,
+            vec![OsString::from("/bin/true")],
+        )
+        .expect("spec")
+        .with_secret_env(vec![("PGPASSWORD".to_string(), SENTINEL.to_string())]);
+
+        let (argv, files) = seccomp_argv(&spec).expect("argv");
+        let flat: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !flat.iter().any(|a| a.contains(SENTINEL)),
+            "the value must not be in the argument list: {flat:?}"
+        );
+        assert!(
+            !flat.iter().any(|a| a == "PGPASSWORD"),
+            "nor its name, which would say which variable to go and read: {flat:?}"
+        );
+
+        // It reaches bwrap on a descriptor instead, spliced where the placeholder was — after
+        // `--clearenv` (which would otherwise wipe it) and before the ordinary variables.
+        let at = flat.iter().position(|a| a == "--args").expect("--args");
+        let fd: i32 = flat[at + 1]
+            .parse()
+            .expect("a descriptor number, not the placeholder");
+        assert!(
+            flat.iter()
+                .position(|a| a == "--clearenv")
+                .expect("--clearenv")
+                < at,
+            "spliced before the clear, its variables would be wiped: {flat:?}"
+        );
+        assert!(
+            at < flat.iter().position(|a| a == "--setenv").expect("--setenv"),
+            "the plumbing must win a name collision, so it is applied last: {flat:?}"
+        );
+
+        let mut carried = String::new();
+        files
+            .iter()
+            .find(|f| f.as_raw_fd() == fd)
+            .expect("the descriptor the argv names is one of the files kept alive")
+            .try_clone()
+            .expect("clone")
+            .read_to_string(&mut carried)
+            .expect("read");
+        assert_eq!(
+            carried,
+            format!("--setenv\0PGPASSWORD\0{SENTINEL}\0"),
+            "bwrap reads NUL-separated arguments"
+        );
+    }
+
+    /// A spec with no credential is unchanged — no descriptor, no placeholder, nothing to explain.
+    #[test]
+    fn a_spec_with_no_credential_gains_no_descriptor() {
+        let spec = SandboxSpec::new(
+            PathBuf::from("/w"),
+            Vec::new(),
+            vec![("PATH".to_string(), "/bin".to_string())],
+            NetPolicy::Isolated,
+            vec![OsString::from("/bin/true")],
+        )
+        .expect("spec");
+        let (argv, _files) = seccomp_argv(&spec).expect("argv");
+        assert!(
+            !argv.iter().any(|a| a == "--args"),
+            "an unused mechanism must leave no trace in the argv"
+        );
+    }
 
     #[test]
     fn establish_control_plane_pins_creates_each_pin_and_preserves_its_mode() {

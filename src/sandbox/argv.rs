@@ -18,6 +18,11 @@ fn path(p: &Path) -> OsString {
     p.as_os_str().to_os_string()
 }
 
+/// What stands in for the descriptor carrying [`SandboxSpec::secret_env`] until the one impure
+/// caller can create it. Not a number, so a spec that skipped that step cannot accidentally name a
+/// descriptor this process happens to hold.
+pub(crate) const SECRET_ARGS_PLACEHOLDER: &str = "@sbx-secret-args";
+
 /// Build the bubblewrap argument list for `spec`. Pure: same Spec in, same argv
 /// out, no I/O and no globals read. The launcher feeds the result to `bwrap`.
 pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
@@ -78,6 +83,20 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     // `setsid` away from that private controlling terminal.
     if spec.terminal == TerminalPolicy::NewSession {
         a.push(lit("--new-session"));
+    }
+
+    // The variables whose values must not be readable by every uid on the machine: they arrive on a
+    // descriptor rather than here, and this is only the placeholder marking where they are spliced
+    // in. `to_argv` is pure and creating that descriptor is not, so the number is filled in by the
+    // one caller that can — a placeholder that reached bwrap would be refused as an invalid fd,
+    // loudly, rather than silently dropping a credential.
+    //
+    // Position is load-bearing twice over: after `--clearenv`, which would otherwise wipe them, and
+    // before the ordinary variables below, so a credential named after the cage's own plumbing
+    // loses to the plumbing instead of replacing it.
+    if !spec.secret_env.is_empty() {
+        a.push(lit("--args"));
+        a.push(lit(SECRET_ARGS_PLACEHOLDER));
     }
 
     // Environment: rebuilt from nothing, entry by entry in declaration order.

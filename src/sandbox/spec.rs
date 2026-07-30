@@ -117,6 +117,15 @@ pub(crate) struct SandboxSpec {
     /// order. The clear itself is unconditional, so nothing leaks in by
     /// inheritance.
     pub(super) env: Vec<(String, String)>,
+    /// Variables whose **values must not appear in bubblewrap's argument list**, because a process's
+    /// arguments are world-readable (`/proc/<pid>/cmdline` is mode `444`) while its environment is
+    /// not. They reach bwrap through `--args` on an anonymous in-memory file instead, so only a
+    /// descriptor number is ever visible to another uid.
+    ///
+    /// They are applied **before** [`SandboxSpec::env`], which is deliberate rather than incidental:
+    /// a credential that took the name of the cage's own plumbing (`PATH`, `HOME`) must lose to the
+    /// plumbing, not displace it. A name in both is refused where the two are declared.
+    pub(super) secret_env: Vec<(String, String)>,
     /// Whether the host network is shared or fully cut off.
     pub(super) net: NetPolicy,
     /// How the terminal session is established. [`SandboxSpec::new`] defaults it
@@ -186,6 +195,7 @@ impl SandboxSpec {
             workdir,
             mounts,
             env,
+            secret_env: Vec::new(),
             net,
             terminal: TerminalPolicy::NewSession,
             cmd,
@@ -207,6 +217,14 @@ impl SandboxSpec {
 
     /// Set the cage's readable name slug (see [`SandboxSpec::cage_slug`]). The launch path
     /// derives it from the app or project via [`super::naming::cage_slug`].
+    /// Set the variables whose values must stay out of the argument list — see
+    /// [`SandboxSpec::secret_env`]. Only [`super::launch::seccomp_argv`] can turn such a spec into a
+    /// runnable argv, because only it can create the descriptor they travel on.
+    pub(crate) fn with_secret_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.secret_env = env;
+        self
+    }
+
     pub(crate) fn with_cage_slug(mut self, slug: String) -> Self {
         self.cage_slug = slug;
         self
