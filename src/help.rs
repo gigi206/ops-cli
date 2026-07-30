@@ -678,7 +678,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "run"],
-        synopsis: "sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]",
+        synopsis: "sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>] [--json]",
         summary: "invoke one declared operation",
         options: &[
             ("<name>", "the operation to run, as `sbx task list` shows it"),
@@ -691,6 +691,7 @@ const PAGES: &[Page] = &[
                 "a variable the declaration's `env_allow` permits; repeatable",
             ),
             ("--session <id>", "the session to run in (host-side, when several offer operations)"),
+            ("--json", "print the whole result as one JSON document on stdout, streams included"),
         ],
         details:
             "The exit code is the command's own, so an operation composes in a script like the program\n\
@@ -703,7 +704,13 @@ const PAGES: &[Page] = &[
             boundary: it catches the dominant accident (a credential echoed into an error message)\n\
             and cannot catch a value the command itself transformed. The count of substitutions is\n\
             reported, and it is the trustworthy signal — a `${NAME}` in the text could have been\n\
-            printed by the command.",
+            printed by the command.\n\
+            \n\
+            With `--json` everything above becomes fields of one document on stdout — the two streams\n\
+            among them, so nothing interleaves with it, and the warnings printed as prose otherwise\n\
+            (`timed_out`, `stopped`, `truncated`, `redacted`, `refused`, `output`) are values rather\n\
+            than text to match. A withheld stream is `null` and an empty one is `\"\"`. A refusal is a\n\
+            document too, with `error` set and `exit` null: nothing ran.",
     },
     Page {
         path: &["task", "status"],

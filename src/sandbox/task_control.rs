@@ -33,6 +33,9 @@
 //!   env <key> <len>\n<bytes>         [nonce <hex>], [refused-exec <path>…],
 //!   run                              [output <bytes> <path>], stdout <len>\n<bytes>,
 //!                                    stderr <len>\n<bytes>, then `ok`
+//!                                  — or `id <n>` then `err <reason>`, which ends the answer. An
+//!                                    `id` there means the request was admitted and the refusal is
+//!                                    in the log under that number; no `id` means it never was.
 //! ```
 //!
 //! And on the host-only socket:
@@ -516,6 +519,11 @@ fn serve_run(
         Err(e) => {
             let reason = e.to_string();
             log.push(refusal(id, name, &reason));
+            // The id first, then the refusal: this request was admitted, so it *has* an invocation,
+            // and the log records the refusal under that number. Without it a caller could not find
+            // its own refusal in `sbx task logs`. It precedes `err` because that line ends the
+            // answer — a reader stops there.
+            writeln!(writer, "id {id}")?;
             writeln!(writer, "err {}", sanitize(&reason))
         }
     }
@@ -1955,6 +1963,22 @@ mod tests {
     fn the_run_parser_surfaces_a_refusal() {
         let parsed = client::parse_run(b"err parameter `sql` is required\n").unwrap();
         assert_eq!(parsed.error.as_deref(), Some("parameter `sql` is required"));
+    }
+
+    /// A refusal the plane *admitted* carries its invocation id, which is the number the log records
+    /// it under — so a caller can find its own refusal there. A refusal before admission carries
+    /// none, and inventing one would name an invocation that never existed.
+    #[test]
+    fn an_admitted_refusal_carries_the_id_it_is_logged_under() {
+        let admitted = client::parse_run(b"id 4\nerr parameter `sql` is required\n").unwrap();
+        assert_eq!(admitted.id, 4);
+        assert_eq!(
+            admitted.error.as_deref(),
+            Some("parameter `sql` is required")
+        );
+
+        let refused = client::parse_run(b"err this session's task quota is exhausted\n").unwrap();
+        assert_eq!(refused.id, 0);
     }
 
     // An empty stream and a withheld one are different answers, and the wire keeps them apart.

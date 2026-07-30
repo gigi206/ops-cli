@@ -162,7 +162,7 @@ the output, so keep names non-sensitive.
 ## `run`
 
 ```
-sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]
+sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>] [--json]
 ```
 
 Invoke one operation.
@@ -172,6 +172,7 @@ Invoke one operation.
 | `-p`, `--param KEY=VALUE` | a declared parameter's value; repeatable |
 | `-e`, `--env KEY=VALUE` | a variable the declaration's `env_allow` permits; repeatable |
 | `--session <id>` | which session to run in (host-side, when several offer operations) |
+| `--json` | print the whole result as one JSON document on stdout, streams included |
 
 ```
 $ sbx task run db-query --param sql="SELECT id FROM users"
@@ -191,6 +192,40 @@ value found in either is replaced by `${NAME}` first. sbx reports, on stderr, wh
 truncated at `max_output`, when the timeout fired, when [`stop`](#stop) ended it, and how many values
 were substituted — that count is host-side, which is what makes it trustworthy (a `${NAME}` in the
 text could have been printed by the command itself).
+
+**`--json`.** One document on stdout and nothing else — the streams travel *inside* it, so a command
+that writes to stdout cannot interleave with it, and everything sbx says as prose otherwise becomes a
+field:
+
+```
+$ sbx task run db-query --param sql="SELECT id FROM users" --json
+{
+  "task": "db-query",
+  "id": 7,
+  "exit": 0,
+  "stdout": "id\n1\n2\n",
+  "stderr": "",
+  "timed_out": false,
+  "stopped": false,
+  "truncated": false,
+  "elapsed_ms": 412,
+  "redacted": 0,
+  "nonce": null,
+  "refused": [],
+  "output": null,
+  "error": null
+}
+```
+
+A stream the declaration **withholds** is `null`; one that ran and printed nothing is `""`. `redacted`
+is the substitution count, `refused` lists what [`spawn`](../configuration/task.md) blocked, and `output` is
+`{"path": …, "bytes": …}` when the operation declares one. A refusal is a document too — `error` says
+why and `exit` is `null`, because nothing ran; the exit code is still 125. `id` is `null` only when
+the plane declined before admitting the request (an exhausted quota), where no invocation exists to
+name.
+
+Inside a cage the client stays as it is: it prints the same raw fields it always has, one per line.
+An agent parses that; a person reads this.
 
 ## `status`
 

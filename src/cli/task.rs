@@ -664,7 +664,7 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `sbx task run <name> [--param k=v]… [--env K=V]… [--session <id>]`: invoke one operation.
+/// `sbx task run <name> [--param k=v]… [--env K=V]… [--session <id>] [--json]`: invoke one operation.
 ///
 /// The exit code is the command's own, so a task composes in a script exactly like the program it
 /// wraps; a *refusal* (an unknown task, a value outside its bound) is exit 2, distinguishable from
@@ -674,6 +674,7 @@ fn task_run(args: &[OsString]) -> ExitCode {
     let mut id: Option<String> = None;
     let mut params = BTreeMap::new();
     let mut env = BTreeMap::new();
+    let mut json = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str() {
@@ -691,6 +692,10 @@ fn task_run(args: &[OsString]) -> ExitCode {
                 }
                 Err(code) => return code,
             },
+            Some("--json") => {
+                json = true;
+                i += 1;
+            }
             Some("--session") => match args.get(i + 1).and_then(|a| a.to_str()) {
                 Some(v) => {
                     id = Some(v.to_string());
@@ -730,6 +735,9 @@ fn task_run(args: &[OsString]) -> ExitCode {
         Ok(r) => r,
         Err(e) => return unreachable_plane(&e),
     };
+    if json {
+        return run_as_json(&name, &result);
+    }
     if let Some(error) = &result.error {
         diag::error(&format!("sbx: task run: {error}"));
         // Not 2: that is a plausible exit code for the wrapped command itself, and a caller must be
@@ -788,6 +796,97 @@ fn task_run(args: &[OsString]) -> ExitCode {
     }
     // The command's own exit code, clamped into the byte a process can return.
     ExitCode::from(result.exit.clamp(0, 255) as u8)
+}
+
+/// One invocation as a machine reads it: everything the prose path says in warnings, as fields.
+///
+/// The streams live **inside** the document rather than on the real ones. A caller that asked for
+/// JSON asked for one parseable thing on stdout, and a command that writes to stdout would otherwise
+/// interleave with it — so under `--json` stdout carries the document and nothing else.
+#[derive(serde::Serialize)]
+struct RunView<'a> {
+    /// The operation invoked, as the caller named it.
+    task: &'a str,
+    /// This invocation's id — what `sbx task show`/`stop`/`logs` take. `null` when the plane refused
+    /// before admitting the request (an exhausted quota), where no invocation exists to name.
+    id: Option<u64>,
+    /// The command's own exit status, or `null` when nothing ran (`error` says why).
+    exit: Option<i32>,
+    /// The captured streams, **after** credential substitution. `null` is a stream the declaration
+    /// withholds (`stdout = "hide"`), which is not the same as an empty one.
+    stdout: Option<&'a str>,
+    stderr: Option<&'a str>,
+    /// The command was killed at the operation's `timeout`.
+    timed_out: bool,
+    /// A person ended it with `sbx task stop`. Distinct from `timed_out`: same lever, different
+    /// event.
+    stopped: bool,
+    /// A stream reached `max_output` and what follows it is missing.
+    truncated: bool,
+    elapsed_ms: u64,
+    /// How many credential values were substituted out of the output.
+    redacted: usize,
+    /// This invocation's substitution nonce, when the operation enabled it — the out-of-band half of
+    /// an unforgeable `${NAME@nonce}` placeholder.
+    nonce: Option<&'a str>,
+    /// What `spawn` refused to let the command run. Empty unless the operation confines exec.
+    refused: &'a [String],
+    /// Where the invocation left its artifacts, when the operation declares `output`.
+    output: Option<RunOutputView<'a>>,
+    /// Why the plane refused, or `null`. Non-null means nothing was executed.
+    error: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct RunOutputView<'a> {
+    path: &'a str,
+    bytes: u64,
+}
+
+/// The document's model. Pure, so what the fields mean is pinned by a test rather than by a live
+/// invocation: every value is already substituted and redacted host-side by the time it arrives here,
+/// which is what makes encoding it safe — a credential containing a quote would survive escaping,
+/// and the needles that find it match raw bytes.
+fn run_view<'a>(name: &'a str, result: &'a client::RunResult) -> RunView<'a> {
+    RunView {
+        task: name,
+        // Drawn after admission, so a zero is the plane declining before any invocation existed.
+        id: (result.id != 0).then_some(result.id),
+        exit: result.error.is_none().then_some(result.exit),
+        stdout: result.stdout.as_deref(),
+        stderr: result.stderr.as_deref(),
+        timed_out: result.timed_out,
+        stopped: result.stopped,
+        truncated: result.truncated,
+        elapsed_ms: result.elapsed_ms,
+        redacted: result.redacted,
+        nonce: result.nonce.as_deref(),
+        refused: &result.refused,
+        output: result.output.as_ref().map(|(path, bytes)| RunOutputView {
+            path,
+            bytes: *bytes,
+        }),
+        error: result.error.as_deref(),
+    }
+}
+
+/// Print one invocation as a JSON document and return the same exit code the prose path would.
+///
+/// A refusal is a document too — a caller that parses stdout must not have to fall back to reading
+/// prose off stderr to learn that nothing ran.
+fn run_as_json(name: &str, result: &client::RunResult) -> ExitCode {
+    let view = run_view(name, result);
+    match serde_json::to_string_pretty(&view) {
+        Ok(doc) => println!("{doc}"),
+        Err(e) => {
+            diag::error(&format!("sbx: task run: failed to serialize: {e}"));
+            return ExitCode::FAILURE;
+        }
+    }
+    match result.error {
+        Some(_) => ExitCode::from(REFUSED_EXIT),
+        None => ExitCode::from(result.exit.clamp(0, 255) as u8),
+    }
 }
 
 /// The session's **host-only** socket — the log, what is running, and the stop.
@@ -1630,5 +1729,87 @@ mod tests {
         assert_eq!(fields.get("params"), Some(&"sql"));
         assert_eq!(fields.len(), 2, "the trailing text is not a field");
         assert_eq!(description, "run with LANG=C");
+    }
+
+    /// A ran invocation as a document: the streams inside it, and everything the prose path would
+    /// have said on stderr as a field beside them.
+    #[test]
+    fn a_json_result_carries_the_streams_and_every_prose_warning_as_a_field() {
+        let result = client::RunResult {
+            id: 7,
+            exit: 3,
+            stdout: Some("id\n1\n".to_string()),
+            stderr: Some(String::new()),
+            redacted: 2,
+            truncated: true,
+            timed_out: true,
+            stopped: false,
+            elapsed_ms: 412,
+            nonce: Some("a91f3c".to_string()),
+            error: None,
+            refused: vec!["/nix/store/x/bin/curl".to_string()],
+            output: Some(("/opt/sbx/task-out/dump".to_string(), 4096)),
+        };
+        let doc: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&run_view("dump", &result)).expect("encode"),
+        )
+        .expect("decode");
+        assert_eq!(doc["task"], "dump");
+        assert_eq!(doc["id"], 7);
+        assert_eq!(doc["exit"], 3);
+        assert_eq!(doc["stdout"], "id\n1\n");
+        assert_eq!(doc["elapsed_ms"], 412);
+        assert_eq!(doc["redacted"], 2);
+        assert_eq!(doc["nonce"], "a91f3c");
+        assert_eq!(doc["timed_out"], true);
+        assert_eq!(doc["truncated"], true);
+        assert_eq!(doc["stopped"], false);
+        assert_eq!(doc["refused"][0], "/nix/store/x/bin/curl");
+        assert_eq!(doc["output"]["path"], "/opt/sbx/task-out/dump");
+        assert_eq!(doc["output"]["bytes"], 4096);
+        assert!(doc["error"].is_null());
+    }
+
+    /// A withheld stream is `null` and a stream that ran and printed nothing is `""` — the whole
+    /// reason the field is nullable rather than always a string.
+    #[test]
+    fn a_withheld_stream_is_null_and_an_empty_one_is_a_string() {
+        let result = client::RunResult {
+            stdout: None,
+            stderr: Some(String::new()),
+            ..Default::default()
+        };
+        let doc = serde_json::to_value(run_view("quiet", &result)).expect("encode");
+        assert!(doc["stdout"].is_null(), "hidden is not the same as empty");
+        assert_eq!(doc["stderr"], "");
+    }
+
+    /// A refusal is a document too: `error` says why, `exit` is null because nothing ran, and the
+    /// pre-admission id (a zero on the wire) is null because no invocation stands behind it.
+    #[test]
+    fn a_refusal_is_a_document_with_a_null_exit_and_no_invocation() {
+        let result = client::RunResult {
+            id: 0,
+            error: Some("the session's invocation quota is exhausted".to_string()),
+            ..Default::default()
+        };
+        let doc = serde_json::to_value(run_view("dump", &result)).expect("encode");
+        assert_eq!(doc["error"], "the session's invocation quota is exhausted");
+        assert!(
+            doc["exit"].is_null(),
+            "nothing ran, so there is no exit code"
+        );
+        assert!(doc["id"].is_null());
+
+        // An id drawn *after* admission is a real invocation, and survives a refusal that names it.
+        let admitted = client::RunResult {
+            id: 4,
+            error: Some("`sql` does not satisfy its declared bound".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(run_view("q", &admitted)).expect("encode")["id"],
+            4
+        );
     }
 }
