@@ -15,6 +15,25 @@ These verbs work **both inside the cage** (where the agent uses them, through th
 there) **and on the host**, so an operation is testable exactly as the agent sees it. `logs` is
 host-only.
 
+## What the cage actually holds
+
+Inside the sandbox `sbx` is **not the sbx binary** — it is a small generated client that speaks the
+task plane's protocol and understands nothing else. `sbx task list`, `secrets` and `run` read
+exactly as they do here; every other word is refused:
+
+```sh
+$ sbx config show          # inside the cage
+sbx: only the task plane is exposed inside the sandbox — try `sbx task list`
+```
+
+This is deliberate. The socket has to cross into the cage — an agent that cannot reach it cannot
+invoke an operation at all — but nothing else needs to. A binary able to act on sbx's own state
+would have been safe only for as long as none of sbx's state happened to be mounted, which is a
+property nothing could check. A client that cannot express the request is a property you can read.
+
+The client is written fresh for each session, so it always matches the plane it talks to. It is
+bound read-only, and it disappears with the session.
+
 See also: [`[task]`](../configuration/task.md) · [`sbx secret list`](secret.md) ·
 [`sbx session`](session.md).
 

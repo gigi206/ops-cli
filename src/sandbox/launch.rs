@@ -1227,6 +1227,20 @@ pub(crate) fn upgrade_mise_packages(
     ok
 }
 
+/// The programs the in-cage task client is written against: the **cage's** shell, its `socat`, and
+/// coreutils' `head`.
+///
+/// All three are store paths as the cage resolves them, never the host's copies — the client runs
+/// inside, where a host path would either be absent or name a different build than the one the cage
+/// has. `head` is not carried on the userland directly; it sits beside the `env` that is.
+fn task_client_programs(userland: &binds::Userland) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        userland.shell_bin.clone(),
+        userland.socat_bin.clone(),
+        userland.env_bin.with_file_name("head"),
+    )
+}
+
 /// Roll the declared operations' tool pool forward. Returns whether anything was rolled, or the
 /// reason it could not run.
 ///
@@ -4437,11 +4451,11 @@ fn build(
     }
 
     // Declared operations: when this session has any, the task control socket crosses into the cage
-    // and sbx's own binary is bound read-only beside it, so an in-cage caller can list and invoke a
-    // task. The socket path is derived here (before the spec) and the plane is started below (before
-    // the launch), so bwrap finds the socket present. This is the ONE control plane that crosses —
-    // its surface is three commands, and the invocation log lives on a second, host-only socket that
-    // the recorded party cannot read.
+    // and a generated client is bound read-only beside it, so an in-cage caller can list and invoke
+    // a task. Both paths are derived here (before the spec) and both are created below (before the
+    // launch), so bwrap finds them present. This is the ONE control plane that crosses — its surface
+    // is three commands, and the invocation log lives on a second, host-only socket that the
+    // recorded party cannot read.
     let mut task_env: Vec<(String, String)> = Vec::new();
     let task_socket = (!prep.cfg.tasks.is_empty()).then(|| {
         let path = super::task_control::task_dir(prep.layout.data_dir(), std::process::id())
@@ -4458,17 +4472,18 @@ fn build(
             super::task_control::TASK_SOCKET_ENV.to_string(),
             super::task_control::CAGE_TASK_UDS.to_string(),
         ));
-        if let Ok(exe) = std::env::current_exe() {
-            extra_binds.push(binds::ExtraBind {
-                src: exe,
-                dest: PathBuf::from(super::task_control::TASK_SHIM_INCAGE),
-                writable: false,
-            });
-            task_env.push((
-                "SBX_TASK_CLI".to_string(),
-                super::task_control::TASK_SHIM_INCAGE.to_string(),
-            ));
-        }
+        // The client is a generated script, never sbx itself: the cage must not hold a binary able
+        // to act on sbx's own state, and "it cannot because nothing it needs is mounted" is a
+        // property no test could hold onto. See `task_shim`.
+        extra_binds.push(binds::ExtraBind {
+            src: super::task_control::shim_path(prep.layout.data_dir(), std::process::id()),
+            dest: PathBuf::from(super::task_control::TASK_SHIM_INCAGE),
+            writable: false,
+        });
+        task_env.push((
+            "SBX_TASK_CLI".to_string(),
+            super::task_control::TASK_SHIM_INCAGE.to_string(),
+        ));
         path
     });
 
@@ -4604,7 +4619,18 @@ fn build(
             if let Err(e) = engine.ensure_pool() {
                 crate::diag::warn(&format!("the task tool pool could not be prepared: {e}"));
             }
-            match super::task_control::start(prep.layout.data_dir(), std::process::id(), engine) {
+            let (bash, socat, head) = task_client_programs(&prep.userland);
+            let client = super::task_control::ClientPrograms {
+                bash: &bash,
+                socat: &socat,
+                head: &head,
+            };
+            match super::task_control::start(
+                prep.layout.data_dir(),
+                std::process::id(),
+                engine,
+                &client,
+            ) {
                 Ok(plane) => Some(plane),
                 Err(e) => {
                     eprintln!("sbx: cannot start the task control plane: {e}");
@@ -5853,6 +5879,37 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         ]);
         assert!(!out.iter().any(|(k, _)| k == "LC_ALL"));
         assert!(out.iter().any(|(k, v)| k == "LANG" && v == "C.UTF-8"));
+    }
+
+    // The in-cage task client is a script, so the programs its shebang and its body name must be the
+    // ones the CAGE resolves. Naming the host's would produce a client that cannot run where it is
+    // bound — and the tests that exercise the client run it with the host's, so this is what pins
+    // the shipped pairing.
+    #[test]
+    fn the_task_client_is_written_against_the_cages_own_programs() {
+        let userland = Userland {
+            base_roots: vec![],
+            interp_src: PathBuf::from("/store/nix-ld"),
+            interp_dest: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            ca_bundle_src: PathBuf::from("/store/cacert/etc/ssl/certs/ca-bundle.crt"),
+            base_loader: PathBuf::from("/nix/store/glibc/lib/ld"),
+            foreign_lib_paths: vec![],
+            bin_paths: vec![],
+            shell_bin: PathBuf::from("/nix/store/bash/bin/bash"),
+            env_bin: PathBuf::from("/nix/store/coreutils/bin/env"),
+            socat_bin: PathBuf::from("/nix/store/socat/bin/socat"),
+            mise_bin: PathBuf::from("/nix/store/mise/bin/mise"),
+            nix_bin: PathBuf::from("/nix/store/nix/bin/nix"),
+            locale_archive: PathBuf::from("/nix/store/locales/lib/locale/locale-archive"),
+        };
+        let (bash, socat, head) = task_client_programs(&userland);
+        assert_eq!(bash, PathBuf::from("/nix/store/bash/bin/bash"));
+        assert_eq!(socat, PathBuf::from("/nix/store/socat/bin/socat"));
+        assert_eq!(
+            head,
+            PathBuf::from("/nix/store/coreutils/bin/head"),
+            "`head` comes from the same coreutils the cage already has"
+        );
     }
 
     #[test]

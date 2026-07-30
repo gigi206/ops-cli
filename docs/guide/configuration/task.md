@@ -47,6 +47,12 @@ overwrite the very binary a task is about to run. A task cage instead gets:
 - **nothing else** — a `[binds]` path, a Wayland or D-Bus socket, a granted device, the session's
   egress socket: none of them are in a task cage.
 
+**What crosses into the agent's cage is a client, not sbx.** Declaring a task binds the plane's
+socket into the sandbox — an agent that cannot reach it cannot invoke an operation. What is bound
+beside it is a small generated script that speaks the plane's protocol and refuses every other word,
+so the sandbox never holds a program able to act on sbx's own state. See
+[what the cage actually holds](../cli/task.md#what-the-cage-actually-holds).
+
 **Every caller-supplied value is bounded.** A parameter must declare a `match` pattern or an `enum`,
 and the pattern must match the **whole** value. This is load-bearing rather than cosmetic: a value
 loose enough to embed a comparison (`… WHERE substr(:tok,1,1)='a'`) turns the exit status into an

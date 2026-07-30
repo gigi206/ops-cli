@@ -20,6 +20,7 @@ mod spec;
 // plus the control plane a caller reaches to invoke one and the host-only invocation log.
 pub(crate) mod task;
 pub(crate) mod task_control;
+pub(crate) mod task_shim;
 pub(crate) mod taskpool;
 
 // Provisioning & packaging: the nix/mise engines, the package backends, the store.

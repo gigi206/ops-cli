@@ -1,14 +1,15 @@
 //! `sbx task <subcommand>`: the declared-operation surface — list what a session offers, invoke one,
 //! and read the host-side invocation log.
 //!
-//! The same binary serves two callers, and which one it is decides where the command goes:
+//! This is the **host** side of that surface. The verbs read the same inside a cage, but nothing
+//! here runs there: what a cage holds is a generated client that speaks the same wire and can
+//! express nothing else (see [`crate::sandbox::task_shim`]). Two callers, one plane, and only one of
+//! them gets a binary.
 //!
-//! - **Inside the cage** (`$SBX_TASK_SOCKET` is set, because the launcher bound the task socket and
-//!   named it) `list`/`secrets`/`run` talk to that socket. This is the caller a task exists for.
-//! - **On the host** the same verbs resolve a live session and talk to its socket instead, so a human
-//!   can try an operation exactly as the agent would see it — the value of that is that a task is
-//!   testable without an agent. `logs` is host-only by construction: the invocation log lives on a
-//!   socket the cage never sees, because the recorded party does not get to read the record.
+//! On the host the verbs resolve a live session and talk to its socket, so a human can try an
+//! operation exactly as the agent would see it — the value of that is that a task is testable
+//! without an agent. `logs` is host-only by construction: the invocation log lives on a socket the
+//! cage never sees, because the recorded party does not get to read the record.
 //!
 //! No policy lives here. The client sends a name, bounded values, and allowed variable names; every
 //! decision — the program, the bounds, the credential, the ceilings — is the host-side engine's.
@@ -51,10 +52,11 @@ pub(crate) fn task_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// The task socket to talk to: the one this cage was given, or a live session's on the host.
+/// The task socket to talk to: a live session's, or the one named outright.
 ///
-/// In-cage the path comes from the environment the launcher set, never from a search — a caller
-/// inside the cage has no business discovering sockets, and there is exactly one it may use.
+/// `$SBX_TASK_SOCKET` short-circuits the search, which is how a specific plane can be addressed
+/// without resolving a session. It is also the discovery handle the cage advertises, so a tool that
+/// wants to find the plane looks in one place whichever side it is on.
 fn socket_for(id: Option<&str>, verb: &str) -> Result<PathBuf, ExitCode> {
     if let Some(path) = std::env::var_os(TASK_SOCKET_ENV) {
         return Ok(PathBuf::from(path));

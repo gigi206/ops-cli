@@ -54,13 +54,13 @@ pub(crate) const CAGE_TASK_UDS: &str = "/tmp/sbx-task.sock";
 /// discovery handle, like `SBX_EGRESS_CONTRACT` for the egress contract.
 pub(crate) const TASK_SOCKET_ENV: &str = "SBX_TASK_SOCKET";
 
-/// Where sbx's own binary is bound read-only inside the cage, as the task client. Under `/opt/sbx`,
-/// beside the egress contract and the mise plugin.
+/// Where the task client is bound read-only inside the cage. Under `/opt/sbx`, beside the egress
+/// contract and the mise plugin.
 ///
-/// It is the same binary, not a separate shim, so the client and the server can never drift — but
-/// nothing else about it becomes reachable: the cage never sees sbx's data directory or its config,
-/// so every other subcommand has nothing to work on. The task client's authority is the socket, and
-/// the policy stays host-side behind it.
+/// What sits there is **not** the sbx binary: it is a generated script that can express the three
+/// declared-operation verbs and nothing else (see [`super::task_shim`]). The path keeps sbx's name
+/// so an invocation reads the same inside the cage as on the host, but the surface behind it is
+/// three commands, and the policy stays host-side across the socket.
 pub(crate) const TASK_SHIM_INCAGE: &str = "/opt/sbx/bin/sbx";
 
 /// How many invocations a session retains in its log ring.
@@ -169,13 +169,24 @@ impl TaskLog {
     }
 }
 
+/// The cage-visible programs the generated client is written against. They are the cage's own store
+/// paths, not the host's — the client runs inside, where the store is mounted at `/nix`.
+pub(crate) struct ClientPrograms<'a> {
+    pub(crate) bash: &'a Path,
+    pub(crate) socat: &'a Path,
+    pub(crate) head: &'a Path,
+}
+
 /// A live task plane: the two listeners' threads and the paths they own. Dropping it removes the
-/// socket files, so a session leaves nothing behind for the next one to trip over.
+/// socket files and the generated client, so a session leaves nothing behind for the next one to
+/// trip over.
 pub(crate) struct TaskPlane {
     /// The crossing socket's host path — what the launcher binds into the cage.
     pub(crate) cage_socket: PathBuf,
     /// The host-only log socket's path.
     log_socket: PathBuf,
+    /// The generated in-cage client's host path — bound read-only at [`TASK_SHIM_INCAGE`].
+    shim: PathBuf,
     dir: PathBuf,
 }
 
@@ -183,6 +194,8 @@ impl Drop for TaskPlane {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.cage_socket);
         let _ = std::fs::remove_file(&self.log_socket);
+        let _ = std::fs::remove_file(&self.shim);
+        // Last: the directory only goes when what it held is gone.
         let _ = std::fs::remove_dir(&self.dir);
     }
 }
@@ -190,6 +203,12 @@ impl Drop for TaskPlane {
 /// The directory a session's task sockets live in, under the `0700` data dir.
 pub(crate) fn task_dir(data_dir: &Path, pid: u32) -> PathBuf {
     data_dir.join("tasks").join(pid.to_string())
+}
+
+/// The generated in-cage client's host path for a session pid. Derivable before the plane starts,
+/// so the launcher can bind it in the same pass that binds the socket.
+pub(crate) fn shim_path(data_dir: &Path, pid: u32) -> PathBuf {
+    task_dir(data_dir, pid).join("task-client")
 }
 
 /// The host-only log socket for a session pid.
@@ -201,17 +220,28 @@ pub(crate) fn log_socket(data_dir: &Path, pid: u32) -> PathBuf {
 ///
 /// The engine is shared (`Arc`) with the serve threads; each invocation runs on the connection's
 /// thread, so a long task blocks only its own caller.
-pub(crate) fn start(data_dir: &Path, pid: u32, engine: TaskEngine) -> io::Result<TaskPlane> {
+pub(crate) fn start(
+    data_dir: &Path,
+    pid: u32,
+    engine: TaskEngine,
+    client: &ClientPrograms<'_>,
+) -> io::Result<TaskPlane> {
     let dir = task_dir(data_dir, pid);
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
 
     let cage_socket = dir.join("control.sock");
     let log_path = log_socket(data_dir, pid);
+    let shim = shim_path(data_dir, pid);
     // A leftover from a crashed session would make the bind fail; the directory is per-pid and
     // owner-only, so removing a stale socket here is safe.
     let _ = std::fs::remove_file(&cage_socket);
     let _ = std::fs::remove_file(&log_path);
+
+    // The in-cage client, written before the launch so bwrap finds it present. It is generated
+    // rather than shipped, so it always matches the session it was written for and there is no
+    // build in which it is missing.
+    super::task_shim::write(&shim, client.bash, client.socat, client.head, CAGE_TASK_UDS)?;
 
     let engine = Arc::new(engine);
     let log = Arc::new(TaskLog::new());
@@ -249,6 +279,7 @@ pub(crate) fn start(data_dir: &Path, pid: u32, engine: TaskEngine) -> io::Result
     Ok(TaskPlane {
         cage_socket,
         log_socket: log_path,
+        shim,
         dir,
     })
 }
@@ -654,6 +685,357 @@ pub(crate) mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{OutputDisposition, ParamBound, TaskParam, TaskSpec};
+    use crate::testutil::TmpDir;
+    use std::process::Command;
+    use std::time::Duration;
+
+    /// A value with the two properties a line-oriented client would get wrong: an embedded newline
+    /// (which would forge a protocol line if it were not length-framed) and a multi-byte character
+    /// (which a client counting characters instead of bytes would under-announce).
+    const AWKWARD: &str = "SELECT 1\nFROM caf\u{e9}";
+
+    fn probe_task() -> TaskSpec {
+        TaskSpec {
+            name: "probe".into(),
+            description: Some("a declared operation for the wire".into()),
+            cmd: vec!["/nonexistent/program".into(), "{sql}".into()],
+            // A closed choice makes the server the oracle: it accepts the invocation only if the
+            // exact bytes arrived, so "the value crossed intact" is something the plane decides
+            // rather than something the test asserts about itself.
+            params: vec![TaskParam {
+                name: "sql".into(),
+                bound: ParamBound::Choices(vec![AWKWARD.to_string()]),
+                default: None,
+            }],
+            secrets: vec![],
+            injections: vec![],
+            env: BTreeMap::new(),
+            env_allow: vec![],
+            stdout: OutputDisposition::Show,
+            stderr: OutputDisposition::Show,
+            timeout: Duration::from_secs(30),
+            max_output: 4096,
+            exec_allow: vec![],
+            exec_deny: vec![],
+            network: vec![],
+            nonce: false,
+            packages: vec![],
+        }
+    }
+
+    /// A live plane serving `tasks`, plus a client script pointed at it.
+    ///
+    /// The server is the production one — [`start`] and [`serve_cage`], not a stand-in — and the
+    /// client is written by the production generator. Only the programs differ: the shipped client
+    /// names the cage's shell and `socat`, and here it names the host's, because that is what a test
+    /// process can execute. That the launcher passes the cage's own is a separate, static fact.
+    fn plane_and_client(tasks: Vec<TaskSpec>) -> Option<(TmpDir, TaskPlane, PathBuf)> {
+        let bash = crate::pathfind::find_on_path("bash")?;
+        let socat = crate::pathfind::find_on_path("socat")?;
+        let head = crate::pathfind::find_on_path("head")?;
+        let data = TmpDir::new();
+        let engine = super::super::task::TaskEngine::inventory_only(tasks);
+        let programs = ClientPrograms {
+            bash: &bash,
+            socat: &socat,
+            head: &head,
+        };
+        let plane = start(data.path(), std::process::id(), engine, &programs).expect("start");
+        let script = data.path().join("client");
+        super::super::task_shim::write(
+            &script,
+            &bash,
+            &socat,
+            &head,
+            plane.cage_socket.to_str().expect("a utf-8 socket path"),
+        )
+        .expect("write the client");
+        Some((data, plane, script))
+    }
+
+    /// Execute the client the way a caller does — the file itself, through its shebang.
+    ///
+    /// The retry is a multithreaded-test artifact, not a property of the client: these tests write
+    /// scripts and spawn processes concurrently in one process, so a spawn can inherit another
+    /// thread's still-open write descriptor and make the exec fail with `ETXTBSY`. Nothing in a
+    /// session does that — sbx writes the client, then bwrap binds it.
+    fn run_client(script: &Path, args: &[&str]) -> std::process::Output {
+        for _ in 0..100 {
+            match Command::new(script).args(args).output() {
+                Ok(out) => return out,
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("run the client: {e}"),
+            }
+        }
+        panic!("the client stayed busy: another thread held a write descriptor throughout");
+    }
+
+    // The listing verbs, end to end: the generated client's request is parsed by the real plane and
+    // the real answer is rendered back. A change to either side's wording breaks this rather than
+    // reaching a cage.
+    #[test]
+    fn the_client_lists_what_the_plane_serves() {
+        let Some((_data, _plane, script)) = plane_and_client(vec![probe_task()]) else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let out = run_client(&script, &["task", "list"]);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{out:?}");
+        assert!(text.starts_with("probe  "), "{text}");
+        assert!(text.contains("params=sql"), "{text}");
+        assert!(text.contains("timeout=30s"), "{text}");
+        assert!(
+            text.contains("a declared operation for the wire"),
+            "the description must survive the tab columns: {text}"
+        );
+    }
+
+    // The empty inventory has its own wording, and it must come from the client rather than from an
+    // empty screen a caller would read as a failure.
+    #[test]
+    fn the_client_names_an_empty_inventory() {
+        let Some((_data, _plane, script)) = plane_and_client(vec![]) else {
+            return;
+        };
+        let out = run_client(&script, &["task", "secrets"]);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("no credentials are carried"),
+            "{out:?}"
+        );
+    }
+
+    // The load-bearing one. A parameter carrying a newline and a multi-byte character reaches the
+    // plane byte-identical — proven by the plane itself, which admits the invocation only against
+    // its declared choice. A desynchronised stream would instead come back as a protocol complaint.
+    #[test]
+    fn an_awkward_parameter_crosses_the_wire_byte_identical() {
+        let Some((_data, _plane, script)) = plane_and_client(vec![probe_task()]) else {
+            return;
+        };
+        let out = run_client(
+            &script,
+            &["task", "run", "probe", "-p", &format!("sql={AWKWARD}")],
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        for protocol_complaint in ["malformed", "unknown request field", "truncated request"] {
+            assert!(
+                !err.contains(protocol_complaint),
+                "the request desynchronised: {err}"
+            );
+        }
+        assert!(
+            !err.contains("does not match") && !err.contains("is not one of"),
+            "the plane judged the value unequal to the one that was sent: {err}"
+        );
+        // The plane admitted the value against its declared choice and went on to launch the
+        // command, which is as far as an engine with no cage can get. That failure comes back as an
+        // ordinary outcome — so this also pins the return path: the captured stderr crossed as a
+        // length-framed stream and reached the caller's own descriptor.
+        assert!(
+            err.contains("/nonexistent/bwrap"),
+            "the command's stderr must reach the caller verbatim: {err}"
+        );
+        assert_ne!(
+            out.status.code(),
+            Some(125),
+            "the invocation ran, so this is the command's status and not a refusal: {err}"
+        );
+    }
+
+    // A value the declaration does not admit is refused by the plane, not by the client — the same
+    // bytes crossing, the opposite verdict. Together with the test above this pins that the oracle
+    // is the plane's and that the client is not quietly filtering.
+    #[test]
+    fn a_value_outside_its_bound_is_refused_by_the_plane() {
+        let Some((_data, _plane, script)) = plane_and_client(vec![probe_task()]) else {
+            return;
+        };
+        let out = run_client(&script, &["task", "run", "probe", "-p", "sql=DROP TABLE t"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(125), "{err}");
+        assert!(err.contains("sbx: task run:"), "{err}");
+    }
+
+    // The response half, against the real writer: bytes produced by `write_outcome` are what the
+    // client parses. Streams go to their own descriptors, the exit code is the command's, and a
+    // payload containing the protocol's own keywords is copied rather than re-read as headers.
+    #[test]
+    fn the_client_parses_what_write_outcome_produces() {
+        let Some(bash) = crate::pathfind::find_on_path("bash") else {
+            return;
+        };
+        let (Some(socat), Some(head)) = (
+            crate::pathfind::find_on_path("socat"),
+            crate::pathfind::find_on_path("head"),
+        ) else {
+            return;
+        };
+        let dir = TmpDir::new();
+        let socket = dir.path().join("replay.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+
+        let outcome = super::super::task::TaskOutcome {
+            exit: 3,
+            stdout: Some("exit 42\nok\nstderr 7\n".to_string()),
+            stderr: Some("caf\u{e9} warning\n".to_string()),
+            truncated: true,
+            redacted: 2,
+            timed_out: false,
+            elapsed_ms: 12,
+            nonce: Some("a91f3c".to_string()),
+        };
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                // Drain the request up to its terminator, so the client's write side never blocks.
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line.trim_end() == "run" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let mut writer = stream;
+                let _ = write_outcome(&mut writer, &outcome);
+            }
+        });
+
+        let script = dir.path().join("client");
+        super::super::task_shim::write(
+            &script,
+            &bash,
+            &socat,
+            &head,
+            socket.to_str().expect("a utf-8 socket path"),
+        )
+        .expect("write the client");
+        let out = run_client(&script, &["task", "run", "probe"]);
+
+        assert_eq!(out.status.code(), Some(3), "the command's own exit code");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "exit 42\nok\nstderr 7\n",
+            "a payload carrying the protocol's keywords is copied, never re-parsed"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("caf\u{e9} warning"), "{err}");
+        assert!(err.contains("was truncated"), "{err}");
+        assert!(err.contains("2 credential value(s)"), "{err}");
+        assert!(
+            err.contains("nonce is a91f3c"),
+            "the nonce arrives out of band and must be reported: {err}"
+        );
+    }
+
+    // A stream the declaration hides carries no payload at all — not an empty one. The client must
+    // keep the two apart, or it would consume a framing newline that was never written and read the
+    // next header as payload.
+    #[test]
+    fn a_hidden_stream_and_an_empty_one_stay_distinguishable() {
+        let Some(bash) = crate::pathfind::find_on_path("bash") else {
+            return;
+        };
+        let (Some(socat), Some(head)) = (
+            crate::pathfind::find_on_path("socat"),
+            crate::pathfind::find_on_path("head"),
+        ) else {
+            return;
+        };
+        let dir = TmpDir::new();
+        let socket = dir.path().join("replay.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let outcome = super::super::task::TaskOutcome {
+            exit: 0,
+            // Shown but empty, beside a hidden one: the pair that a mis-framed reader confuses.
+            stdout: Some(String::new()),
+            stderr: None,
+            truncated: false,
+            redacted: 0,
+            timed_out: false,
+            elapsed_ms: 1,
+            nonce: None,
+        };
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line.trim_end() == "run" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let mut writer = stream;
+                let _ = write_outcome(&mut writer, &outcome);
+            }
+        });
+        let script = dir.path().join("client");
+        super::super::task_shim::write(&script, &bash, &socat, &head, socket.to_str().unwrap())
+            .expect("write the client");
+        let out = run_client(&script, &["task", "run", "probe"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).is_empty(),
+            "a hidden stream must produce nothing at all: {out:?}"
+        );
+    }
+
+    // The reason the split exists: nothing but the task plane is expressible from inside.
+    #[test]
+    fn the_client_refuses_every_word_but_task() {
+        let Some((_data, _plane, script)) = plane_and_client(vec![probe_task()]) else {
+            return;
+        };
+        for verb in ["config", "app", "secret", "run", "gc", "trust", "doctor"] {
+            let out = run_client(&script, &[verb]);
+            assert_eq!(out.status.code(), Some(2), "`{verb}` must be refused");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("only the task plane is exposed"),
+                "`{verb}`: {out:?}"
+            );
+        }
+        // And the log stays host-only: the recorded party does not get to read the record.
+        let out = run_client(&script, &["task", "logs"]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not readable from inside the cage"));
+    }
+
+    // What the launcher binds is the client the plane wrote, pointed at the socket the cage sees.
+    #[test]
+    fn the_plane_writes_a_client_aimed_at_the_cage_socket() {
+        let Some(bash) = crate::pathfind::find_on_path("bash") else {
+            return;
+        };
+        let data = TmpDir::new();
+        let programs = ClientPrograms {
+            bash: &bash,
+            socat: Path::new("/store/socat/bin/socat"),
+            head: Path::new("/store/coreutils/bin/head"),
+        };
+        let plane = start(
+            data.path(),
+            std::process::id(),
+            super::super::task::TaskEngine::inventory_only(vec![]),
+            &programs,
+        )
+        .expect("start");
+        let path = shim_path(data.path(), std::process::id());
+        let script = std::fs::read_to_string(&path).expect("the client was written");
+        assert!(
+            script.contains(&format!("sock='{CAGE_TASK_UDS}'")),
+            "the client must name the socket as the CAGE sees it: {script}"
+        );
+        drop(plane);
+        assert!(
+            !path.exists(),
+            "the client must not outlive the session that wrote it"
+        );
+    }
 
     fn entry(task: &str, exit: i32) -> LogEntry {
         LogEntry {

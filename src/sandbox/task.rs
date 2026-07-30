@@ -769,6 +769,30 @@ fn substitute(cmd: &[String], values: &BTreeMap<String, String>) -> Result<Vec<O
     Ok(out)
 }
 
+#[cfg(test)]
+impl TaskEngine {
+    /// An engine that knows an inventory but can launch nothing.
+    ///
+    /// It is enough to serve the listing verbs and to validate an invocation's parameters — so the
+    /// wire protocol is exercisable end to end without provisioning a cage, which is what lets the
+    /// in-cage client be tested against the real plane rather than a stand-in for it.
+    pub(crate) fn inventory_only(tasks: Vec<crate::config::TaskSpec>) -> Self {
+        Self {
+            bwrap: PathBuf::from("/nonexistent/bwrap"),
+            base_mounts: Vec::new(),
+            base_env: Vec::new(),
+            project: PathBuf::from("/nonexistent"),
+            config_root: PathBuf::from("/nonexistent"),
+            tasks,
+            limits: super::cgroup::Limits::default(),
+            slug: "inventory".to_string(),
+            layout: crate::store::Layout::under(Path::new("/nonexistent")),
+            ca_bundle: None,
+            pool: None,
+        }
+    }
+}
+
 /// Read one credential host-side, trying its sources in order. The first that yields a non-empty
 /// value wins; a later one is a fallback. Reuses the session's resolver layer, so `env://`,
 /// `file://`, `sops://` and every installed resolver plugin work in a task exactly as they do for a
