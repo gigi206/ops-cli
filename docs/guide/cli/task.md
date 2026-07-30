@@ -115,6 +115,26 @@ unreadable. `MISSING TOOLS` appears when an operation declares
 [`packages`](../configuration/task.md#the-task-tool-pool) the pool does not hold: that operation will
 fail at exec, and the pool is filled best-effort, so this is where you find out before invoking it.
 
+**`ORIGIN` says which config declared each operation**, and appears by the same rule — only when they
+do not all agree. One session can be offered operations by four different places at once: your global
+`sbx.toml`, the project's `.sbx.toml`, the app profile you launched, and each
+[bundle](../configuration/bundles.md) that profile names in `use`. The name alone does not say which,
+and the answer is where you go to change it:
+
+```
+$ sbx task ls
+session 318106 — /home/you/work/api
+NAME       PARAMS  TIMEOUT  ORIGIN        DESCRIPTION
+db-query   sql         20s  project       Read-only SQL against staging
+gh-issue   repo        30s  bundle gh     List a repository's issues
+deploy     env         5m   app agent     Roll the staging deployment
+```
+
+The values are `global`, `project`, `app <name>` and `bundle <name>`. A bundle keeps its own name
+even though its entries fold into the app that names them: "which app" and "which tool the app pulled
+it in with" are different answers, and the second is the one that tells you which file to open.
+[`show`](#show) gives it whether or not the column is there.
+
 **With several sessions, all of them are listed** and a `SESSION` column says which row came from
 which:
 
@@ -278,6 +298,7 @@ elapsed_ms   42310
 pid          318204
 command      /nix/store/…/pg_dump --schema-only reporting
 description  Dump the reporting tables
+origin       project
 declared     /nix/store/…/pg_dump --schema-only {schema}
 parameters   schema
 timeout_s    3600
@@ -291,7 +312,9 @@ output       /opt/sbx/task-out/nightly-dump
 
 For an invocation that is over it reports what the log kept — how it ended, when, what it cost — and
 then the same declaration, because an invocation *is* its declaration plus what one run of it did.
-Naming an operation rather than an id gives the declaration alone.
+Naming an operation rather than an id gives the declaration alone. `origin` — which config declared
+it — is always here, unlike the [listing's column](#list), which appears only when the rows disagree:
+a reader asking about *one* operation is often asking exactly that.
 
 **Never an environment value.** A task's credentials are resolved for one invocation and held nowhere
 this can reach, so their absence is structural rather than a filter that could be forgotten; what is

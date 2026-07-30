@@ -1309,6 +1309,9 @@ fn declared_fields(task: &TaskSpec) -> Vec<(String, String)> {
             "description".to_string(),
             task.description.clone().unwrap_or_default(),
         ),
+        // Always shown here, unlike the listing, which drops it when every row says the same: a
+        // reader asking about *one* operation is often asking exactly this.
+        ("origin".to_string(), task.origin.label()),
         ("declared".to_string(), shell_line(&task.cmd)),
         (
             "parameters".to_string(),
@@ -1776,6 +1779,7 @@ mod smoke {
             packages: vec![],
             spawn: None,
             output: false,
+            origin: crate::config::TaskOrigin::Project,
         }
     }
 
@@ -1922,6 +1926,7 @@ mod smoke {
             packages: vec!["demo-tool".into()],
             spawn: None,
             output: false,
+            origin: crate::config::TaskOrigin::Project,
         };
 
         let Some((engine, _data)) = engine_with(vec![spec], project.path(), Some(&pool)) else {
@@ -2046,6 +2051,7 @@ mod tests {
             packages: vec![],
             spawn: None,
             output: false,
+            origin: crate::config::TaskOrigin::Project,
         }
     }
 

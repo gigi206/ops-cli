@@ -1150,7 +1150,10 @@ fn resolve(
         tasks::apply_task_section(
             &mut tasks,
             &mut warnings,
-            GLOBAL_CONFIG,
+            &tasks::TaskLayer {
+                source: GLOBAL_CONFIG,
+                origin: TaskOrigin::Global,
+            },
             section,
             &task_defaults,
             &secret_defaults,
@@ -1435,7 +1438,10 @@ fn resolve(
                 tasks::apply_task_section(
                     &mut tasks,
                     &mut warnings,
-                    PROJECT_CONFIG,
+                    &tasks::TaskLayer {
+                        source: PROJECT_CONFIG,
+                        origin: TaskOrigin::Project,
+                    },
                     section,
                     &task_defaults,
                     &project_secret_defaults,
@@ -2144,7 +2150,10 @@ fn resolve_app(
             tasks::apply_task_section(
                 &mut tasks,
                 &mut warnings,
-                &source,
+                &tasks::TaskLayer {
+                    source: &source,
+                    origin: TaskOrigin::App(name.to_string()),
+                },
                 section,
                 task_defaults,
                 secret_defaults,
@@ -2402,7 +2411,10 @@ fn resolve_app(
                 tasks::apply_task_section(
                     &mut tasks,
                     &mut warnings,
-                    &source,
+                    &tasks::TaskLayer {
+                        source: &source,
+                        origin: TaskOrigin::App(name.to_string()),
+                    },
                     section,
                     task_defaults,
                     project_secret_defaults,

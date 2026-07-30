@@ -487,6 +487,13 @@ fn list_table(
     let output = any("output", &|_| true);
     let missing = any("missing-tools", &|_| true);
     let described = parsed.iter().any(|(_, _, d)| !d.is_empty());
+    // Where each operation is declared, by the same rule: worth a column when the rows disagree, and
+    // noise when a project's whole set comes from one file. `sbx task show <name>` always says it.
+    let origins: Vec<&str> = parsed
+        .iter()
+        .map(|(_, f, _)| f.get("origin").copied().unwrap_or_default())
+        .collect();
+    let mixed_origins = origins.windows(2).any(|w| w[0] != w[1]);
 
     // How many invocations of each row are live, in the order the rows are in. Zero everywhere means
     // no column: the listing is back to what is declared, which is all there is to say.
@@ -510,6 +517,7 @@ fn list_table(
         align.push(Align::Right);
     }
     for (wanted, label) in [
+        (mixed_origins, "ORIGIN"),
         (streams, "STDOUT"),
         (streams, "STDERR"),
         (output, "OUTPUT"),
@@ -536,6 +544,9 @@ fn list_table(
                     0 => NONE.to_string(),
                     n => n.to_string(),
                 });
+            }
+            if mixed_origins {
+                row.push(cell("origin"));
             }
             if streams {
                 row.push(cell("stdout"));
@@ -1729,6 +1740,40 @@ mod tests {
         assert_eq!(fields.get("params"), Some(&"sql"));
         assert_eq!(fields.len(), 2, "the trailing text is not a field");
         assert_eq!(description, "run with LANG=C");
+    }
+
+    /// Where each operation is declared earns a column when the rows disagree, and only then — one
+    /// project whose whole set comes from one file gets the same table it always had, and
+    /// `sbx task show <name>` says it either way.
+    #[test]
+    fn the_listing_names_the_origin_only_when_the_rows_disagree() {
+        let same = list_table(
+            &[
+                row("a", &["params=", "timeout=30s", "origin=project", ""]),
+                row("b", &["params=", "timeout=30s", "origin=project", ""]),
+            ],
+            &BTreeMap::new(),
+            &[],
+        );
+        assert_eq!(
+            same.headers,
+            vec!["NAME", "PARAMS", "TIMEOUT"],
+            "one origin on every line says nothing a reader did not already know"
+        );
+
+        let mixed = list_table(
+            &[
+                row("a", &["params=", "timeout=30s", "origin=project", ""]),
+                row("b", &["params=", "timeout=30s", "origin=bundle psql", ""]),
+                row("c", &["params=", "timeout=30s", "origin=app agent", ""]),
+            ],
+            &BTreeMap::new(),
+            &[],
+        );
+        assert_eq!(mixed.headers, vec!["NAME", "PARAMS", "TIMEOUT", "ORIGIN"]);
+        assert_eq!(mixed.rows[0], vec!["a", "-", "30s", "project"]);
+        assert_eq!(mixed.rows[1], vec!["b", "-", "30s", "bundle psql"]);
+        assert_eq!(mixed.rows[2], vec!["c", "-", "30s", "app agent"]);
     }
 
     /// A ran invocation as a document: the streams inside it, and everything the prose path would

@@ -502,6 +502,41 @@ pub(crate) struct TaskSpec {
     /// nothing else). Entries are declaration text; the launch resolves a bare name to the absolute
     /// in-cage path it will run as.
     pub(crate) spawn: Option<Vec<String>>,
+    /// Where this operation was declared. Display-only: it answers "which of my configs put this
+    /// here?", which the name alone cannot once a project, an app and its bundles each contribute
+    /// operations to one session. It decides nothing — a task's identity is its name, which is what
+    /// the last-wins fold compares.
+    pub(crate) origin: TaskOrigin,
+}
+
+/// Which layer an operation came from, for display.
+///
+/// A bundle keeps its own identity even though the load folds a bundle into the app that names it
+/// before validation: "which app is this from" and "which tool did the app pull it in with" are
+/// different answers, and the second is the one that says where to go and edit.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum TaskOrigin {
+    /// The global config's own `[task]` section.
+    #[default]
+    Global,
+    /// The project's `.sbx.toml` `[task]` section.
+    Project,
+    /// An app profile's `[task]` section, by app name.
+    App(String),
+    /// A bundle's `[task]` section, folded into an app that names it in `use`.
+    Bundle(String),
+}
+
+impl TaskOrigin {
+    /// How the origin reads in a listing: a kind, and a name where there is one.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            TaskOrigin::Global => "global".to_string(),
+            TaskOrigin::Project => "project".to_string(),
+            TaskOrigin::App(name) => format!("app {name}"),
+            TaskOrigin::Bundle(name) => format!("bundle {name}"),
+        }
+    }
 }
 
 /// Whether a captured stream is returned to the caller. Substitution of secret values happens

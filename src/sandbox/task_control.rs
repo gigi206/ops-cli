@@ -26,7 +26,7 @@
 //! arbitrary text (SQL with newlines, a JSON body), so it is never squeezed onto a line:
 //!
 //! ```text
-//! → LIST                          ← task <name>\tparams=a,b\t<description>… then `ok`
+//! → LIST                          ← task <name>\tparams=a,b\torigin=<where>\t<description>… `ok`
 //! → SECRETS                       ← secret <name>\t<where>\t<description>… then `ok`
 //! → RUN <name>                    ← id <n>, exit <code>, redacted <n>, truncated <0|1>,
 //!   param <key> <len>\n<bytes>       timed-out <0|1>, stopped <0|1>, elapsed-ms <n>,
@@ -389,7 +389,7 @@ fn serve_cage(
             };
             writeln!(
                 writer,
-                "task {}\tparams={}\tstdout={}\tstderr={}\ttimeout={}s{}{}\t{}",
+                "task {}\tparams={}\tstdout={}\tstderr={}\ttimeout={}s{}{}\torigin={}\t{}",
                 task.name,
                 params.join(","),
                 task.stdout.as_str(),
@@ -397,6 +397,10 @@ fn serve_cage(
                 task.timeout.as_secs(),
                 missing,
                 output,
+                // Which config declared it. A session can be offered operations by the project, by
+                // its app, and by each bundle the app names, and the name alone does not say which —
+                // so a caller wondering where to go and change one is told.
+                sanitize(&task.origin.label()),
                 sanitize(task.description.as_deref().unwrap_or("")),
             )?;
         }
@@ -1065,6 +1069,7 @@ mod tests {
             packages: vec![],
             spawn: None,
             output: false,
+            origin: crate::config::TaskOrigin::Project,
         }
     }
 

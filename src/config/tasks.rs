@@ -29,18 +29,34 @@ use super::*;
 pub(super) fn apply_task_section(
     out: &mut Vec<TaskSpec>,
     warnings: &mut Vec<String>,
-    source: &str,
+    layer: &TaskLayer,
     section: RawTaskSection,
     defaults: &TaskDefaults,
     secret_defaults: &SecretDefaults,
     plugins: &PluginRegistry,
 ) {
+    let source = layer.source;
     for (name, raw) in section.tasks {
-        match validate_task(&name, raw, defaults, secret_defaults, plugins) {
+        match validate_task(
+            &name,
+            raw,
+            &layer.origin,
+            defaults,
+            secret_defaults,
+            plugins,
+        ) {
             Ok(task) => upsert_task(out, warnings, source, task),
             Err(e) => warnings.push(format!("{source}: ignoring task `{name}` — {e}")),
         }
     }
+}
+
+/// Which config layer a `[task]` section came from — the same question asked twice: `source` names
+/// it to a person reading a warning, `origin` is what each operation the layer declares is stamped
+/// with. One value, because a layer that answered the two differently would be a bug.
+pub(super) struct TaskLayer<'a> {
+    pub(super) source: &'a str,
+    pub(super) origin: TaskOrigin,
 }
 
 /// Set a task, replacing a same-named earlier one (last-wins) with a warning.
@@ -137,6 +153,7 @@ pub(super) fn parse_task_timeout(raw: &str) -> Result<std::time::Duration, Strin
 pub(super) fn validate_task(
     name: &str,
     raw: RawTask,
+    origin: &TaskOrigin,
     defaults: &TaskDefaults,
     secret_defaults: &SecretDefaults,
     plugins: &PluginRegistry,
@@ -234,6 +251,12 @@ pub(super) fn validate_task(
         packages,
         spawn,
         output: raw.output,
+        // A bundle folded into an app keeps the bundle's name: the fold made the entry look like
+        // the app's own, and the bundle is where a reader would go to change it.
+        origin: match raw.from_bundle {
+            Some(bundle) => TaskOrigin::Bundle(bundle),
+            None => origin.clone(),
+        },
     })
 }
 
@@ -769,6 +792,7 @@ mod tests {
         validate_task(
             "db-query",
             raw,
+            &TaskOrigin::Project,
             &TaskDefaults::default(),
             &SecretDefaults::default(),
             &PluginRegistry::default(),
@@ -1163,6 +1187,7 @@ mod tests {
         let e = validate_task(
             "defaults",
             raw_task(),
+            &TaskOrigin::Project,
             &TaskDefaults::default(),
             &SecretDefaults::default(),
             &PluginRegistry::default(),
@@ -1187,6 +1212,49 @@ mod tests {
         assert_eq!(out[0].description.as_deref(), Some("the later one"));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("db-query"), "{:?}", warnings);
+    }
+
+    /// The fold reports where an operation was **declared**, never the layer that merged it. The
+    /// merge names itself in the warning ("app overlay") and that string is one `origin: source`
+    /// away from erasing exactly what this field exists to carry.
+    #[test]
+    fn folding_a_task_onto_the_baseline_keeps_where_it_was_declared() {
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        let mut task = validate(raw_task()).unwrap();
+        task.origin = TaskOrigin::Bundle("psql".to_string());
+        upsert_task(&mut out, &mut warnings, "app overlay", task);
+        assert_eq!(out[0].origin, TaskOrigin::Bundle("psql".to_string()));
+        assert_eq!(out[0].origin.label(), "bundle psql");
+    }
+
+    /// Each layer stamps its own, and a bundle's stamp survives the fold that made its entry look
+    /// like the app's own.
+    #[test]
+    fn each_layer_stamps_the_operations_it_declares() {
+        let cases = [
+            (TaskOrigin::Global, None, "global"),
+            (TaskOrigin::Project, None, "project"),
+            (TaskOrigin::App("agent".into()), None, "app agent"),
+            // The app layer is what validates a bundle's entry, and the stamp still wins.
+            (TaskOrigin::App("agent".into()), Some("psql"), "bundle psql"),
+        ];
+        for (origin, from_bundle, expected) in cases {
+            let raw = RawTask {
+                from_bundle: from_bundle.map(str::to_string),
+                ..raw_task()
+            };
+            let task = validate_task(
+                "db-query",
+                raw,
+                &origin,
+                &TaskDefaults::default(),
+                &SecretDefaults::default(),
+                &PluginRegistry::default(),
+            )
+            .expect("valid");
+            assert_eq!(task.origin.label(), expected);
+        }
     }
 
     // The output cap has its own parser because the storage one means something else entirely (it

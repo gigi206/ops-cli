@@ -658,6 +658,10 @@ const PAGES: &[Page] = &[
             pool. The pool is filled best-effort at launch, so that operation will fail at exec —\n\
             this is where it shows before you invoke it.\n\
             \n\
+            An `ORIGIN` column says which config declared each operation — `project`, `global`,\n\
+            `app <name>` or `bundle <name>` — and appears only when they do not all agree, by the\n\
+            same rule as the others. `sbx task show <operation>` gives it either way.\n\
+            \n\
             Inside the cage the session is implicit (a caller may only reach its own).",
     },
     Page {

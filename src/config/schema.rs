@@ -784,6 +784,11 @@ pub(crate) struct RawTask {
     /// read-only, so its binaries are on a task's path with nothing to declare here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) packages: Vec<String>,
+    /// The bundle this entry came from, stamped when a bundle is folded into an app that names it
+    /// in `use`. Never read from or written to a config file — the fold happens before validation,
+    /// which is exactly why the bundle's name has to be carried rather than recovered afterwards.
+    #[serde(skip)]
+    pub(crate) from_bundle: Option<String>,
 }
 
 /// The shapes `spawn` accepts. A string is one program with nothing under it, a list is several,

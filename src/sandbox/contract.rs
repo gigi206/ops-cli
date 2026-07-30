@@ -292,6 +292,7 @@ mod tests {
             packages: vec![],
             spawn: None,
             output: false,
+            origin: crate::config::TaskOrigin::Project,
         }
     }
 

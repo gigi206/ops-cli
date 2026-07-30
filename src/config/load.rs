@@ -886,7 +886,16 @@ fn expand_bundles(
                 ));
                 continue;
             };
-            absorb_bundle(&mut acc, bundle.clone());
+            let mut bundle = bundle.clone();
+            // Stamp each declared operation with the bundle it came from, here — the fold below
+            // makes a bundle's entry indistinguishable from one the app wrote itself, which is the
+            // point everywhere except when a reader asks where an operation is declared.
+            if let Some(section) = bundle.task.as_mut() {
+                for task in section.tasks.values_mut() {
+                    task.from_bundle = Some(name.clone());
+                }
+            }
+            absorb_bundle(&mut acc, bundle);
         }
         fold_bundle_into_app(app, acc, notes);
     }
@@ -1160,6 +1169,38 @@ mod tests {
             "the posture is untouched"
         );
         assert!(warnings.is_empty(), "a clean fold warns about nothing");
+    }
+
+    /// The fold makes a bundle's operation indistinguishable from one the app wrote itself — which
+    /// is the point everywhere except when a reader asks where it is declared. So the bundle's name
+    /// is stamped on the way in, here, because afterwards there is nothing left to recover it from.
+    #[test]
+    fn a_bundles_operation_carries_the_bundle_it_came_from() {
+        let mut carrier = bundle("a");
+        carrier.task = Some(
+            schema::parse(b"[task.probe]\ncmd = [\"/bin/true\"]\n")
+                .expect("the fixture parses")
+                .task
+                .expect("a task section"),
+        );
+        let (app, _) = expand_one(app_using(&["a"]), &[("a", carrier)]);
+        let folded = app.task.expect("the operation folded into the app");
+        assert_eq!(
+            folded.tasks["probe"].from_bundle.as_deref(),
+            Some("a"),
+            "an operation the app did not write must still name where it came from"
+        );
+
+        // And an operation the app declares itself is stamped with nothing: it is the app's.
+        let mut own = app_using(&[]);
+        own.task = Some(
+            schema::parse(b"[task.own]\ncmd = [\"/bin/true\"]\n")
+                .expect("the fixture parses")
+                .task
+                .expect("a task section"),
+        );
+        let (app, _) = expand_one(own, &[]);
+        assert_eq!(app.task.expect("kept").tasks["own"].from_bundle, None);
     }
 
     #[test]
