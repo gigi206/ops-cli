@@ -1124,13 +1124,17 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 ///
 /// These hold a launch's live plumbing — the egress MITM CA and its proxy/control sockets, the
 /// inbound forwarder's socket dir, the in-cage portal's runtime dir, the process-observation
-/// sockets — all of which a clean exit unlinks through an RAII guard. A `Drop` does not run on a
+/// sockets, the declared-operations plane's socket dir — all of which a clean exit unlinks through
+/// an RAII guard. A `Drop` does not run on a
 /// signal, and a cage normally ends on one (Ctrl-C, `sbx session stop`'s SIGTERM→SIGKILL, a
 /// detached launch killed later), so the guard covers the minority case and the rest accumulate.
 /// [`sweep_runtime_dirs`] is the backstop: the same doctrine the session registry already applies
 /// to its records — treat what is on disk as a hint, validate it by liveness, self-heal.
 ///
-/// An empty prefix matches a bare-pid name (the portal's `<pid>/` directory). `<data>/egress`'s
+/// An empty prefix matches a bare-pid name (the portal's and the task plane's `<pid>/` directories).
+/// The task plane prunes itself more precisely — on the `(pid, start_ticks)` pair, at every launch
+/// and every read — but it is listed here too, because this is the sweep for a data directory
+/// nothing launches from and nothing reads any more, which is exactly where its own healing stops. `<data>/egress`'s
 /// `stats-<pid>-<ticks>` is deliberately **absent** from this table: its data outlives the session,
 /// so it is not swept but **folded** — see [`super::egress_stats::compact`], which the same pass
 /// runs. Deleting it would discard what `sbx net stats` aggregates (`sbx net stats --reset` remains
@@ -1144,6 +1148,7 @@ const RUNTIME_DIRS: &[(&str, &[&str])] = &[
     ("forward", &["fwd-"]),
     ("portal", &[""]),
     ("proc", &["control-", "notif-"]),
+    ("tasks", &[""]),
     ("dbus", &["proxy-"]),
 ];
 
@@ -1263,6 +1268,25 @@ mod tests {
         assert!(
             linked.bytes >= 8192,
             "the payload's blocks are counted once"
+        );
+    }
+
+    /// The declared-operations plane is swept here too.
+    ///
+    /// It prunes itself on every launch and every read, which covers a machine in use. This sweep is
+    /// for the other case — a data directory nothing launches from any more, where nothing will ever
+    /// trigger that healing — so leaving it out would mean `sbx gc` cleaning every runtime directory
+    /// except one.
+    #[test]
+    fn the_task_planes_directory_is_swept_with_the_rest() {
+        assert_eq!(
+            runtime_entry_pid("1234", &[""]),
+            Some(1234),
+            "a task plane directory is named by a bare pid, like the portal's"
+        );
+        assert!(
+            RUNTIME_DIRS.iter().any(|(dir, _)| *dir == "tasks"),
+            "the task plane must be in the sweep: {RUNTIME_DIRS:?}"
         );
     }
 
