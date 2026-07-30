@@ -66,7 +66,7 @@ oracle over the credential.
 | `cmd` | the argv list; `{param}` substitutes **inside** one element, never into extra elements |
 | `params` | the caller-supplied values, each bounded (see below) |
 | `env` | fixed environment for the command |
-| `env_allow` | the variable **names** a caller may set for one invocation (an allowlist of names) |
+| `env_allow` | the variable **names** a caller may set for one invocation — names only, [values are not bounded](#caller-set-variables) |
 | `stdout` / `stderr` | `"show"` (default) or `"hide"` |
 | `timeout` | this task's wall-clock ceiling (`"20s"`), overriding `[task.defaults]` |
 | `max_output` | this task's per-stream capture ceiling (`"64KiB"`), overriding `[task.defaults]` |
@@ -89,6 +89,44 @@ region = { match = "^[a-z]{2}-[a-z]+-[0-9]$", default = "eu-west-1" }
 A parameter with no `default` is **required**: a missing value is an error, never an empty
 substitution (`psql -c ""` is a different command than the one declared). An undeclared `{name}` in
 `cmd`, and a declared parameter no `cmd` element uses, are both refused at validation.
+
+### Caller-set variables
+
+```toml
+[task.build]
+cmd       = ["make", "release"]
+env_allow = ["MAKEFLAGS"]        # the caller may set MAKEFLAGS, and nothing else
+```
+
+`env_allow` and `params` look symmetric and are not. **`params` bounds values; `env_allow` bounds
+only names.**
+
+| | what the caller supplies | what the declaration constrains |
+|---|---|---|
+| `params` | a value for each declared name | the **value** — a `match` pattern or an `enum` is mandatory, and it must match the whole value |
+| `env_allow` | `KEY=VALUE` for a listed name | the **name** only — the value is any string |
+
+`env_allow` is empty by default, so out of the box a caller can set **nothing**. An unlisted name is
+refused outright rather than dropped: a caller that believed a variable applied would otherwise be
+reasoning about an invocation that never happened.
+
+**Which names you may list is itself bounded.** Three kinds are refused when the config is
+validated, so the declaration never loads rather than failing at invocation:
+
+| Refused | Why |
+|---|---|
+| a variable that steers how a program **loads or connects** | `LD_*`, `NIX_LD*`, `PATH`, `HOME`, `IFS`, `ENV`, `BASH_ENV`, `SHELL`, `GCONV_PATH`, `GLIBC_TUNABLES`, `LOCPATH`, `NLSPATH`, `HOSTALIASES`, `RESOLV_HOST_CONF`, `PYTHONSTARTUP`, `PYTHONPATH`, `NODE_OPTIONS`, `PERL5OPT`, `RUBYOPT`, `GIT_SSH_COMMAND`, `SSH_ASKPASS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` (case-insensitive) — the command and its trust anchors are sbx's choice, not a caller's |
+| a name also declared in [`secret`](#credentials) | one name, one source — so a caller can never supply the credential the task exists to hold on its behalf |
+| a name also fixed in `env` | the fixed value says "this is the declaration's", the allowlist says "this is the caller's"; sbx refuses rather than picks |
+
+**What is left to your judgement** is the application's own variables — `MAKEFLAGS`, `PGOPTIONS`,
+`AWS_PROFILE`. Their names pass, and their values are unconstrained, so what one is worth depends
+entirely on what the program does with it. `PGOPTIONS` reshapes every query `psql` runs; that may be
+exactly what you meant to expose, or a good deal more.
+
+Two habits follow: list a variable only when the command's own handling of it is what you mean to
+expose, and prefer a **parameter** when a value should be constrained — bounding values is what
+parameters are for.
 
 ### Credentials
 
