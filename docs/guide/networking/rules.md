@@ -306,6 +306,12 @@ the host name, so the verdict is made on what you wrote. A rule naming no single
 and a non-loopback IP literal get no listener — reported at launch, since the rule still governs the
 proxy and only the convenience is missing.
 
+`tcp://localhost:<port>` is a special case worth naming, because it is the rule a developer writes
+for a service on their own machine. The cage's `localhost` is its own loopback — a different machine
+— so the listener is placed **there**, on the port declared, and the connection it forwards goes to
+the host's `localhost`. `-h localhost -p 5432` therefore reaches the service you meant; every other
+port on the cage's loopback is untouched, and still belongs to whatever the cage itself runs.
+
 Key properties of a raw splice:
 
 - It **must name a port** (`tcp://host:22`) — a raw splice names the port it opens.

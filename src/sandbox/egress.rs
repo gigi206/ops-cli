@@ -186,6 +186,18 @@ pub(crate) struct TcpPlan {
 const FIRST_CAGE_ADDR: u32 = 0x7f00_0002; // 127.0.0.2
 const LAST_CAGE_ADDR: u32 = 0x7fff_fffe;
 
+/// Names the cage's synthetic `/etc/hosts` already maps to `127.0.0.1`. A destination called one of
+/// these cannot be given an address of its own: the built-in line comes first in the file and wins
+/// the lookup, so the listener would sit somewhere the client never dials — and it would fail
+/// silently, which is the worst way for a fence to be missing. Instead the listener goes where the
+/// name already points, which is also what the author meant: `tcp://localhost:5432` is the service
+/// on *their* loopback, reached from a cage whose own loopback is a different machine's.
+const ALREADY_LOOPBACK: &[&str] = &["localhost", "ip6-localhost", "ip6-loopback"];
+
+/// The prefix of the cage's own hostname (`sbx-<slug>`), which the synthetic hosts file also maps.
+/// A destination in that space is refused rather than quietly shadowed.
+const CAGE_HOSTNAME_PREFIX: &str = "sbx-";
+
 /// Plan a cage-side address for every `tcp://` destination in `policy`.
 ///
 /// One address **per host**, not per rule: two ports on one database are two listeners on one
@@ -235,6 +247,19 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
                 plan.skipped.push(format!(
                     "tcp://{host} is an address the cage's network namespace cannot hold — only \
                      loopback, or use a name"
+                ));
+                continue;
+            }
+            None if ALREADY_LOOPBACK.contains(&host.as_str()) => {
+                // The cage already resolves this name to its own loopback, so that is where the
+                // listener goes. No new `/etc/hosts` line: adding one would sit after the built-in
+                // and never be read.
+                (Ipv4Addr::LOCALHOST, false)
+            }
+            None if host.starts_with(CAGE_HOSTNAME_PREFIX) => {
+                plan.skipped.push(format!(
+                    "tcp://{host} — `{CAGE_HOSTNAME_PREFIX}*` is the cage's own hostname inside the \
+                     sandbox, so this name cannot be pointed anywhere else"
                 ));
                 continue;
             }
@@ -1025,6 +1050,42 @@ mod tests {
         ]));
         assert!(plan.destinations.is_empty(), "{:?}", plan.destinations);
         assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+    }
+
+    /// `localhost` is the name a developer most naturally writes for a service on their own machine,
+    /// and the cage already maps it — to a *different* machine's loopback. So the listener goes where
+    /// the name already points, rather than to an address of its own that the name would never
+    /// resolve to. Getting this wrong fails silently, which is why it is pinned here.
+    #[test]
+    fn localhost_listens_where_the_cage_already_resolves_it() {
+        let plan = tcp_destinations(&tcp_policy(&["tcp://localhost:5432"]));
+
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        let dest = &plan.destinations[0];
+        assert_eq!(
+            dest.cage_addr.to_string(),
+            "127.0.0.1",
+            "the built-in `localhost` line wins the lookup, so the listener must be there"
+        );
+        assert!(
+            !dest.map_name,
+            "a second `localhost` line would sit after the built-in one and never be read"
+        );
+    }
+
+    /// The cage's own hostname lives in `sbx-*`, which the synthetic hosts file maps. A destination
+    /// there is refused out loud rather than pointed somewhere the name will not follow.
+    #[test]
+    fn a_destination_in_the_cages_own_name_space_is_refused() {
+        let plan = tcp_destinations(&tcp_policy(&["tcp://sbx-myproject:5432"]));
+
+        assert!(plan.destinations.is_empty(), "{:?}", plan.destinations);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(
+            plan.skipped[0].contains("sbx-myproject"),
+            "{:?}",
+            plan.skipped
+        );
     }
 
     /// The preamble carries a listener per port, each speaking CONNECT for the host **as written**.

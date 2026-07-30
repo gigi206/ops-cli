@@ -246,10 +246,15 @@ policy never allowed has nothing to connect to — `-p 5433` on an allowed host 
 connection, and an undeclared host does not resolve at all (the cage's namespace has no DNS). The
 request that leaves still carries the host name, so the proxy's verdict is made on what you wrote.
 
+`tcp://localhost:<port>` works too, and means what you would expect: the cage's own loopback is a
+different machine's, so the listener goes on the cage's `localhost` at that port and forwards to the
+host's. `-h localhost -p 5432` reaches the service you meant.
+
 **What gets no listener**, and is reported at launch rather than passed over: a rule naming no single
-port (`tcp://host:*`, or a port range — sbx will not open a thousand listeners on a guess), and a
-non-loopback IP literal, which the cage's network namespace has no way to hold. Those rules still
-govern the proxy; what they lose is the convenience, and the command has to tunnel itself.
+port (`tcp://host:*`, or a port range — sbx will not open a thousand listeners on a guess), a
+non-loopback IP literal the cage's network namespace has no way to hold, and a host in the cage's own
+`sbx-*` hostname space. Those rules still govern the proxy; what they lose is the convenience, and
+the command has to tunnel itself.
 
 ## Which binaries a task may run
 

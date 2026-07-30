@@ -913,7 +913,12 @@ pub(super) fn hosts_contents(hostname: &str, tcp: &[super::egress::TcpDestinatio
         "127.0.0.1\tlocalhost {hostname}\n\
          ::1\tlocalhost ip6-localhost ip6-loopback {hostname}\n"
     );
-    for dest in tcp.iter().filter(|d| d.map_name) {
+    // `map_name` is already false for a destination this file maps itself; the hostname check is the
+    // belt to that suspenders, since a second line for a name written above would never be read.
+    for dest in tcp
+        .iter()
+        .filter(|d| d.map_name && d.host != hostname && d.host != "localhost")
+    {
         out.push_str(&format!("{}\t{}\n", dest.cage_addr, dest.host));
     }
     out
@@ -1362,6 +1367,41 @@ mod tests {
                  the bind-nesting warning will not catch a config bind that overlaps it"
             );
         }
+    }
+
+    /// A destination whose name the file already maps gets no second line: the built-in one wins the
+    /// lookup, so a later line would only mislead a reader into thinking it took effect.
+    #[test]
+    fn a_hosts_line_is_never_written_for_a_name_the_file_already_maps() {
+        use std::net::Ipv4Addr;
+        let dest = |host: &str, addr, map_name| super::super::egress::TcpDestination {
+            host: host.to_string(),
+            ports: vec![5432],
+            cage_addr: addr,
+            map_name,
+        };
+        let h = hosts_contents(
+            "sbx-agy",
+            &[
+                dest("db.internal", Ipv4Addr::new(127, 0, 0, 2), true),
+                // Both of these are already on the built-in lines.
+                dest("localhost", Ipv4Addr::LOCALHOST, true),
+                dest("sbx-agy", Ipv4Addr::new(127, 0, 0, 3), true),
+            ],
+        );
+
+        assert!(h.contains("127.0.0.2\tdb.internal\n"), "{h}");
+        assert_eq!(
+            h.lines()
+                .filter(|l| l.split_whitespace().any(|f| f == "localhost"))
+                .count(),
+            2,
+            "only the two built-in lines may name localhost: {h}"
+        );
+        assert!(
+            !h.contains("127.0.0.3"),
+            "the hostname must not be repointed: {h}"
+        );
     }
 
     #[test]
