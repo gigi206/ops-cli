@@ -42,9 +42,16 @@ its launcher pid: an entry whose pid is gone is removed, one whose pid is still 
 never touched. `sbx gc --all` runs the same sweep, for a data directory nothing launches
 from any more.
 
-**Per-session egress statistics are never swept.** They outlive their session by design —
-they are the data [`sbx net stats`](net.md) aggregates. `sbx net stats --reset` is their
-purge.
+**Per-session egress statistics are folded, never swept.** They outlive their session by
+design — they are the data [`sbx net stats`](net.md) aggregates — so removing them would
+throw away counters you still want. But one file per session, kept forever, is a directory
+that only grows, and nothing ever reads a *single* session's numbers: every consumer sums
+them.
+
+So the finished ones are added together into one file per project (and app), and the
+originals go. The totals are identical before and after; what changes is how many files
+hold them. A running session's file is left alone, since it is still being written.
+`sbx net stats --reset` remains the way to actually discard counters.
 
 ## Examples
 

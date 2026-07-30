@@ -1131,8 +1131,10 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 /// to its records — treat what is on disk as a hint, validate it by liveness, self-heal.
 ///
 /// An empty prefix matches a bare-pid name (the portal's `<pid>/` directory). `<data>/egress`'s
-/// `stats-<pid>-<ticks>` is deliberately **absent**: it outlives its session by design, as the data
-/// `sbx net stats` aggregates (`sbx net stats --reset` is its purge).
+/// `stats-<pid>-<ticks>` is deliberately **absent** from this table: its data outlives the session,
+/// so it is not swept but **folded** — see [`super::egress_stats::compact`], which the same pass
+/// runs. Deleting it would discard what `sbx net stats` aggregates (`sbx net stats --reset` remains
+/// the way to actually discard it).
 ///
 /// `dbus` is a legacy directory — the filtered host-bus proxy it belonged to was replaced by the
 /// private in-cage portal, so nothing writes there any more; sweeping it reclaims the residue an
@@ -1170,6 +1172,17 @@ fn runtime_entry_pid(name: &str, prefixes: &[&str]) -> Option<u32> {
 /// housekeeping, never a reason to fail the caller.
 pub(crate) fn sweep_runtime_dirs(data_dir: &Path, prune: bool) -> Vec<PathBuf> {
     sweep_runtime_dirs_with(data_dir, prune, &crate::session::pid_is_live)
+}
+
+/// Fold the finished sessions' egress counters into one file per project — or, in a dry run, report
+/// what would be folded. Returns the files that went away.
+///
+/// Deliberately **not** part of [`sweep_runtime_dirs`], and reported apart from it, because it is a
+/// different event: a swept file is gone with its contents, while a folded one has been added into
+/// the file that replaces it. One number for both would tell a user that counters they still have
+/// were discarded.
+pub(crate) fn fold_egress_counters(data_dir: &Path, prune: bool) -> Vec<PathBuf> {
+    super::egress_stats::compact(&data_dir.join("egress"), prune)
 }
 
 /// [`sweep_runtime_dirs`] with the liveness predicate injected, so the sweep is testable without
@@ -1251,6 +1264,29 @@ mod tests {
             linked.bytes >= 8192,
             "the payload's blocks are counted once"
         );
+    }
+
+    /// A per-invocation proxy's files are collected with the session that made them.
+    ///
+    /// A task's proxy names its artifacts `<pid>.t<n>` so that two invocations of one session do not
+    /// race for the same paths. That suffix has to stay readable *here*, because this sweep is the
+    /// only thing that removes them: a `SIGKILL`ed session runs no `Drop`, and each invocation
+    /// leaves a ~460 KB CA behind. A name this cannot parse is kept forever, so the two modules
+    /// agree on the separator, and this test is where that agreement is written down.
+    #[test]
+    fn a_per_invocation_proxys_files_are_swept_with_their_session() {
+        let egress = &["ca-", "proxy-", "control-"];
+        assert_eq!(runtime_entry_pid("ca-1234.t0.pem", egress), Some(1234));
+        assert_eq!(
+            runtime_entry_pid("control-1234.t17.sock", egress),
+            Some(1234)
+        );
+        assert_eq!(
+            runtime_entry_pid("proxy-1234.t499.sock", egress),
+            Some(1234)
+        );
+        // The session's own proxy carries no suffix at all, and still reads the same.
+        assert_eq!(runtime_entry_pid("ca-1234.pem", egress), Some(1234));
     }
 
     #[test]

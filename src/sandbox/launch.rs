@@ -1395,11 +1395,22 @@ fn session_housekeeping(
 /// is for the data directory of someone who has stopped launching; it is pure host-side filesystem
 /// work (no sandbox, no nix), and stays silent when there is nothing to reclaim.
 fn runtime_housekeeping(layout: &crate::store::Layout, prune: bool, pal: &crate::style::Palette) {
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    // Reported apart from the sweep below because it is a different event: these counters are added
+    // into the file that replaces them, not discarded. `sbx net stats` answers the same afterwards.
+    let folded = super::gc::fold_egress_counters(layout.data_dir(), prune);
+    if !folded.is_empty() {
+        let verb = if prune { "folded" } else { "would be folded" };
+        println!(
+            "{h}sbx gc:{r} egress counters — {n}{}{r} finished session file(s) {verb} into one per \
+             project; nothing is discarded (`sbx net stats --reset` is what discards).",
+            folded.len()
+        );
+    }
     let stale = super::gc::sweep_runtime_dirs(layout.data_dir(), prune);
     if stale.is_empty() {
         return;
     }
-    let (h, n, r) = (pal.head, pal.name, pal.reset);
     if prune {
         println!(
             "{h}sbx gc:{r} runtime files — removed {n}{}{r} left by launches that are gone.",
@@ -3523,6 +3534,7 @@ fn build(
     // `prepare`, which `sbx gc` also calls: a gc *dry run* must touch nothing, and sweeping from
     // there would have deleted these files while reporting them as merely reclaimable.
     super::gc::sweep_runtime_dirs(prep.layout.data_dir(), true);
+    super::gc::fold_egress_counters(prep.layout.data_dir(), true);
 
     // Provision the project's declared tools into sbx's store, against the project's
     // effective nixpkgs reference; their bin dirs are prepended to PATH below. A

@@ -54,9 +54,15 @@ const TASK_HOME: &str = "/tmp/task-home";
 ///
 /// It reaches a socket path, which the kernel caps at `SUN_LEN` (108), so its width is worth
 /// knowing rather than assuming: the per-session call quota bounds it, making the suffix five bytes
-/// (`-t499`) at its widest. Measured against a deliberately long install path
+/// (`.t499`) at its widest. Measured against a deliberately long install path
 /// (`/home/<32 chars>/.local/share/sbx`) with a seven-digit pid, the full control-socket path is 84
 /// bytes — the suffix spends five of roughly thirty spare.
+///
+/// It opens with a **dot**, not a dash, and that is load-bearing rather than cosmetic: the runtime
+/// sweep reads a launcher pid as the digits up to the first `.`, so `control-<pid>.t3.sock` is
+/// collected with the session that made it while `control-<pid>-t3.sock` would be a name the sweep
+/// cannot parse and therefore never removes. A per-invocation CA is ~460 KB; leaving those
+/// unsweepable is how a data directory grows without bound.
 static TASK_INVOCATION: AtomicU64 = AtomicU64::new(0);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -411,7 +417,7 @@ impl TaskEngine {
                 None,
                 false,
                 self.ca_bundle.as_deref(),
-                &format!("-t{invocation}"),
+                &format!(".t{invocation}"),
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;

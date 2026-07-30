@@ -21,6 +21,12 @@
 //!   stands in. The project key
 //!   is the canonical path [`super::binds::project_identity`] derives, the same on the write and
 //!   read sides, so a launch's record and a later read cannot drift apart.
+//! - **Finished sessions are folded together.** One file per session is right while a session runs
+//!   and wrong once it has ended: nothing ever reads a *single* session's counters — every consumer
+//!   sums them — so keeping one file per session forever is an unbounded directory holding data
+//!   that is only ever added up. [`compact`] folds the finished ones into a single file per
+//!   project+app, which loses nothing and bounds the count. A running session's file is never
+//!   touched, since it is still being written.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -205,6 +211,145 @@ fn parse(contents: &str) -> Option<SessionStats> {
     })
 }
 
+/// The prefix of a folded file: the summed counters of sessions that have ended, one per
+/// project+app. It reads back as an ordinary session file — every consumer parses the body, never
+/// the name — so folding changes what is on disk and nothing else.
+const ROLLUP_PREFIX: &str = "stats-rollup.";
+
+/// Whether the session that owns this file has ended, and so whether its counters may be folded.
+///
+/// A rollup is always foldable — folding again just re-sums it, which is how repeated passes stay at
+/// one file rather than accumulating one per pass. A session file carries `<pid>-<ticks>`, so the
+/// check is the exact incarnation pair rather than a bare pid: a reused pid must not make a dead
+/// session's file look live and pin it forever.
+///
+/// Anything else — a name this does not recognise — is reported as still live, which keeps it. The
+/// safe direction: a file kept costs nothing but space, while folding a file still being written
+/// would lose the counters flushed after the read.
+fn is_finished(name: &str) -> bool {
+    if name.starts_with(ROLLUP_PREFIX) {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("stats-") else {
+        return false;
+    };
+    let Some((pid, ticks)) = rest.split_once('-') else {
+        return false;
+    };
+    match (pid.parse::<u32>(), ticks.parse::<u64>()) {
+        (Ok(pid), Ok(ticks)) => crate::session::read_start_ticks(pid) != Some(ticks),
+        _ => false,
+    }
+}
+
+/// The file a project+app's folded counters live in. Named from a hash of the pair because a
+/// project key is a filesystem path — it carries separators, and it is unbounded in length.
+fn rollup_name(project: &str, app: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(project.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(app.unwrap_or("").as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{ROLLUP_PREFIX}{hex}")
+}
+
+/// The finished files of one project+app, and the counters they add up to.
+type Group = (Vec<PathBuf>, BTreeMap<String, Counts>);
+
+/// Fold the counters of every finished session into one file per project+app, and return the files
+/// that were (or, in a dry run, would be) folded away.
+///
+/// This is housekeeping with no observable effect: nothing reads a single session's counters, so a
+/// folded directory answers `sbx net stats` exactly as the unfolded one did. What it buys is a
+/// bound — a session per file, kept forever, is a directory that only grows.
+///
+/// Best-effort throughout. A file that cannot be read or parsed is left where it is, and a group
+/// whose rollup cannot be written keeps its sources: the counters are worth more than the tidiness.
+pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(egress_dir) else {
+        return Vec::new();
+    };
+    // Group the finished files by the project+app they belong to, carrying their parsed counters.
+    let mut groups: BTreeMap<(String, Option<String>), Group> = BTreeMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy().into_owned();
+        if !name.starts_with("stats-") || name.contains(".tmp.") || !is_finished(&name) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(session) = parse(&contents) else {
+            continue;
+        };
+        let slot = groups
+            .entry((session.project, session.app))
+            .or_insert_with(|| (Vec::new(), BTreeMap::new()));
+        slot.0.push(entry.path());
+        for (host, c) in session.counts {
+            let e = slot.1.entry(host).or_default();
+            e.allow += c.allow;
+            e.deny += c.deny;
+            e.blocked += c.blocked;
+        }
+    }
+
+    let mut folded = Vec::new();
+    for ((project, app), (sources, counts)) in groups {
+        let target = egress_dir.join(rollup_name(&project, app.as_deref()));
+        // A group that is already exactly its own rollup has nothing to fold; re-writing it every
+        // pass would be churn for no change.
+        if sources.len() == 1 && sources[0] == target {
+            continue;
+        }
+        let gone: Vec<PathBuf> = sources.iter().filter(|p| **p != target).cloned().collect();
+        if !prune {
+            folded.extend(gone);
+            continue;
+        }
+        if write_rollup(&target, &project, app.as_deref(), &counts).is_err() {
+            continue; // keep the sources: losing counters is worse than keeping files
+        }
+        for path in gone {
+            if std::fs::remove_file(&path).is_ok() {
+                folded.push(path);
+            }
+        }
+    }
+    folded.sort();
+    folded
+}
+
+/// Write a folded file atomically (temp + rename), so a reader never sees it half-written and an
+/// interrupted fold leaves the sources still standing.
+fn write_rollup(
+    target: &Path,
+    project: &str,
+    app: Option<&str>,
+    counts: &BTreeMap<String, Counts>,
+) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let body = serialize(project, app, counts);
+    let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
+    let write = || -> io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(body.as_bytes())
+    };
+    let result = write().and_then(|()| std::fs::rename(&tmp, target));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// The session-stat files under an egress directory (`stats-*`, excluding the `.tmp.*` flush
 /// intermediates), each parsed. A file that cannot be read or has no header is skipped.
 fn session_files(egress_dir: &Path) -> Vec<SessionStats> {
@@ -298,6 +443,137 @@ pub(crate) fn reset(egress_dir: &Path, project: &str, app: Option<&str>) -> usiz
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// Write a stats file as a session would, for a pid+incarnation of the caller's choosing.
+    fn session_file(dir: &Path, pid: u32, ticks: u64, project: &str, host: &str, allow: u64) {
+        let counts = [(
+            host.to_string(),
+            Counts {
+                allow,
+                deny: 0,
+                blocked: 0,
+            },
+        )]
+        .into_iter()
+        .collect();
+        std::fs::write(
+            dir.join(format!("stats-{pid}-{ticks}")),
+            serialize(project, None, &counts),
+        )
+        .unwrap();
+    }
+
+    /// Folding is invisible: the aggregate a caller reads is the same before and after, and what
+    /// changes is only how many files hold it.
+    #[test]
+    fn folding_finished_sessions_preserves_every_counter() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        // Three sessions of one project, all ended (pid 1 exists but not with these start times).
+        session_file(egress, 1, 11, "/p", "api.example.com", 3);
+        session_file(egress, 1, 12, "/p", "api.example.com", 4);
+        session_file(egress, 1, 13, "/p", "cdn.example.com", 5);
+        let before = aggregate(egress, "/p", None);
+
+        let folded = compact(egress, true);
+
+        assert_eq!(
+            folded.len(),
+            3,
+            "every finished file is folded away: {folded:?}"
+        );
+        assert_eq!(
+            aggregate(egress, "/p", None),
+            before,
+            "folding must not change a single counter"
+        );
+        let remaining: Vec<String> = std::fs::read_dir(egress)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "one project must end up with one file, not one per session: {remaining:?}"
+        );
+        assert!(remaining[0].starts_with(ROLLUP_PREFIX), "{remaining:?}");
+    }
+
+    /// A session still running is still writing its file, so folding it would drop whatever it
+    /// flushes next. It is left exactly where it is.
+    #[test]
+    fn a_running_sessions_file_is_never_folded() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        let me = std::process::id();
+        let ticks = crate::session::read_start_ticks(me).expect("our own start time");
+        session_file(egress, me, ticks, "/p", "api.example.com", 1);
+        session_file(egress, 1, 11, "/p", "api.example.com", 2);
+
+        let folded = compact(egress, true);
+
+        assert_eq!(folded.len(), 1, "only the finished session may be folded");
+        assert!(
+            egress.join(format!("stats-{me}-{ticks}")).exists(),
+            "the live session's file must be untouched"
+        );
+        assert_eq!(
+            aggregate(egress, "/p", None)["api.example.com"].allow,
+            3,
+            "the live file and the fold are both still counted"
+        );
+    }
+
+    /// Folding repeatedly converges: a second pass over an already-folded directory has nothing to
+    /// do, so the file count stays at one rather than growing a rollup per pass.
+    #[test]
+    fn folding_twice_leaves_one_file_and_no_churn() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        session_file(egress, 1, 11, "/p", "api.example.com", 3);
+        session_file(egress, 1, 12, "/p", "api.example.com", 4);
+        compact(egress, true);
+
+        assert!(
+            compact(egress, true).is_empty(),
+            "a folded directory has nothing left to fold"
+        );
+        assert_eq!(std::fs::read_dir(egress).unwrap().count(), 1);
+        assert_eq!(aggregate(egress, "/p", None)["api.example.com"].allow, 7);
+    }
+
+    /// A dry run reports what it would fold and touches nothing — the same contract the rest of gc
+    /// keeps, and the reason a `sbx gc` without `--prune` is safe to run anywhere.
+    #[test]
+    fn a_dry_run_folds_nothing() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        session_file(egress, 1, 11, "/p", "api.example.com", 3);
+        session_file(egress, 1, 12, "/p", "api.example.com", 4);
+
+        assert_eq!(compact(egress, false).len(), 2);
+        assert_eq!(
+            std::fs::read_dir(egress).unwrap().count(),
+            2,
+            "a dry run must leave the directory exactly as it found it"
+        );
+    }
+
+    /// Two projects do not pool their counters, however the files are folded.
+    #[test]
+    fn projects_are_folded_apart() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        session_file(egress, 1, 11, "/a", "api.example.com", 3);
+        session_file(egress, 1, 12, "/b", "api.example.com", 4);
+
+        compact(egress, true);
+
+        assert_eq!(aggregate(egress, "/a", None)["api.example.com"].allow, 3);
+        assert_eq!(aggregate(egress, "/b", None)["api.example.com"].allow, 4);
+        assert_eq!(std::fs::read_dir(egress).unwrap().count(), 2);
+    }
 
     #[test]
     fn record_flushes_each_decision_to_the_session_file() {
