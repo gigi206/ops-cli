@@ -297,6 +297,15 @@ allow = [
 ]
 ```
 
+Inside the cage, a `tcp://` rule also gets **its own loopback address and a listener on each port it
+names**, with `/etc/hosts` resolving the host to that address. That is what lets a non-HTTP client —
+which cannot speak to a `CONNECT` proxy — connect the way it always would (`psql -h db.internal -p
+5432`). Only a declared destination gets one, so an undeclared port on an allowed host is a refused
+connection and an undeclared host does not resolve at all; and the request that leaves still carries
+the host name, so the verdict is made on what you wrote. A rule naming no single port (`:*`, a range)
+and a non-loopback IP literal get no listener — reported at launch, since the rule still governs the
+proxy and only the convenience is missing.
+
 Key properties of a raw splice:
 
 - It **must name a port** (`tcp://host:22`) — a raw splice names the port it opens.

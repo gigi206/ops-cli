@@ -403,11 +403,13 @@ impl TaskEngine {
         let invocation = TASK_INVOCATION.fetch_add(1, Ordering::Relaxed);
         let mut proxy_binds = Vec::new();
         let mut proxy_env = Vec::new();
+        let mut tcp_plan = super::egress::TcpPlan::default();
         let mut argv = argv;
         let _proxy = if task.network.is_empty() {
             None
         } else {
             let policy = crate::allowlist::EgressPolicy::new(task.network.clone(), Vec::new());
+            let policy_for_cage = policy.clone();
             let (guard, wiring) = super::egress::start(
                 &self.layout,
                 policy,
@@ -422,13 +424,27 @@ impl TaskEngine {
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;
             proxy_env = wiring.env;
-            argv = self.cage_argv(argv, task);
+            tcp_plan = super::egress::tcp_destinations(&policy_for_cage);
+            for skipped in &tcp_plan.skipped {
+                crate::diag::warn(&format!(
+                    "task `{name}`: no in-cage listener for {skipped} — the rule still governs this \
+                     task's proxy, but its command will have to tunnel itself"
+                ));
+            }
+            argv = self.cage_argv(argv, task, &tcp_plan.destinations);
             Some(guard)
         };
         cage_env.extend(proxy_env);
 
         let spec = self
-            .build_spec(argv, &cage_env, &proxy_binds, task, invocation)
+            .build_spec(
+                argv,
+                &cage_env,
+                &proxy_binds,
+                task,
+                invocation,
+                &tcp_plan.destinations,
+            )
             .map_err(|e| TaskError::Io(io::Error::other(e)))?;
         let started = Instant::now();
         // A failure message is substituted too: it can carry the command's own diagnostics, and
@@ -481,11 +497,16 @@ impl TaskEngine {
     ///
     /// A task with no `network` is left exactly as declared: it has no proxy to reach, and an
     /// unnecessary shell around a credential-bearing command is surface for nothing.
-    fn cage_argv(&self, argv: Vec<OsString>, task: &TaskSpec) -> Vec<OsString> {
+    fn cage_argv(
+        &self,
+        argv: Vec<OsString>,
+        task: &TaskSpec,
+        tcp: &[super::egress::TcpDestination],
+    ) -> Vec<OsString> {
         if task.network.is_empty() {
             return argv;
         }
-        super::egress::wrap_command(&self.forwarder.socat, &self.forwarder.shell, argv)
+        super::egress::wrap_command(&self.forwarder.socat, &self.forwarder.shell, argv, tcp)
     }
 
     /// Assemble the cage for one invocation: the structural skeleton, the project read-only, a fresh
@@ -497,6 +518,7 @@ impl TaskEngine {
         proxy_binds: &[super::binds::ExtraBind],
         task: &TaskSpec,
         invocation: u64,
+        tcp: &[super::egress::TcpDestination],
     ) -> Result<SandboxSpec, String> {
         let mut mounts = self.base_mounts.clone();
         // The task tool pool, **read-only** and at the same in-cage path the install cage used —
@@ -541,6 +563,28 @@ impl TaskEngine {
                 }
             });
         }
+        // A task's `network` is its own, so its `/etc/hosts` must be too: the one inherited from the
+        // agent cage maps the *agent's* destinations. Written per invocation and bound over the
+        // inherited mount, so a task's command resolves the hosts this task declared and nothing
+        // else. Swept with the invocation's other runtime files.
+        if !tcp.is_empty() {
+            let hosts = self
+                .layout
+                .data_dir()
+                .join("egress")
+                .join(format!("hosts-{}.t{invocation}", std::process::id()));
+            let body = super::binds::hosts_contents(
+                &super::naming::cage_hostname(&format!("{}-task{invocation}", self.slug)),
+                tcp,
+            );
+            std::fs::write(&hosts, body)
+                .map_err(|e| format!("cannot write the task cage's hosts file: {e}"))?;
+            mounts.push(Mount::RoBind {
+                src: hosts,
+                dest: PathBuf::from("/etc/hosts"),
+            });
+        }
+
         // The project, read-only: a task reads the repository it operates on, and a task that could
         // write it would be a way to edit the project through a credential-bearing command. Last,
         // so it survives wherever on the filesystem it sits.
@@ -950,6 +994,7 @@ mod smoke {
             &[],
             NetPolicy::Isolated,
             "",
+            &[],
             super::super::seccomp::SeccompPolicy::default(),
             &[],
             vec![OsString::from("/bin/true")],
@@ -1558,14 +1603,14 @@ mod tests {
         let mut local = task();
         local.network = Vec::new();
         assert_eq!(
-            engine.cage_argv(bare.clone(), &local),
+            engine.cage_argv(bare.clone(), &local, &[]),
             bare,
             "a task with no egress must run exactly as declared — no shell it did not ask for"
         );
 
         let mut networked = task();
         networked.network = vec![crate::allowlist::classify("example.com").expect("a valid rule")];
-        let wrapped = engine.cage_argv(bare.clone(), &networked);
+        let wrapped = engine.cage_argv(bare.clone(), &networked, &[]);
         let script = wrapped
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1635,6 +1680,7 @@ mod tests {
                 &[],
                 &task,
                 0,
+                &[],
             )
             .unwrap();
         assert!(
@@ -1680,6 +1726,7 @@ mod tests {
                 &[],
                 &task,
                 0,
+                &[],
             )
             .unwrap();
         assert!(

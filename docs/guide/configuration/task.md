@@ -16,9 +16,9 @@ PGPASSWORD = "sops://secrets.enc.yaml#db.password"
 ```
 
 > A task cage has **no network at all** unless `network` says otherwise, so the line above is not
-> decoration — without it `psql` has nowhere to connect. And because the cage's route out is an HTTP
-> `CONNECT` proxy, a client that does not speak one needs a
-> [tunnel of its own](#reaching-a-service-that-does-not-speak-http).
+> decoration — without it `psql` has nowhere to connect. A `tcp://` rule also gives the cage
+> [somewhere to reach that host](#reaching-a-service-that-does-not-speak-http), so `-h
+> db.staging.internal` works verbatim.
 
 The agent then runs:
 
@@ -220,45 +220,36 @@ templates are full of `${…}`).
 ## Reaching a service that does not speak HTTP
 
 A task's `network` is served by a proxy of the task's own, reached inside the cage as an HTTP
-`CONNECT` proxy on `127.0.0.1:18043` — the same shape the agent cage gets, and the reason
-`http_proxy`-aware tools (`curl`, `gh`, `git`) need nothing beyond the `network` line.
+`CONNECT` proxy — which is all an `http_proxy`-aware tool (`curl`, `gh`, `git`) needs.
 
-A database client does not speak that protocol. Declaring
-[`tcp://host:port`](../networking/rules.md#raw-l4-splice-tcp) makes the proxy splice the raw stream —
-that is the policy half — but something still has to *issue* the `CONNECT`. `socat` does, so the
-declaration can open a local port that tunnels to the real one:
+A database client does not speak that protocol, so a
+[`tcp://host:port`](../networking/rules.md#raw-l4-splice-tcp) rule gets something else: **its own
+loopback address inside the cage, and a listener on the port it names**, with the cage's `/etc/hosts`
+resolving the host to that address. The declaration is then written exactly as it would be outside a
+sandbox:
 
 ```toml
 [task.db-query]
-description = "Read-only SQL against staging"
-cmd = [
-  "bash", "-c",
-  """socat TCP-LISTEN:15432,bind=127.0.0.1,fork,reuseaddr \
-        PROXY:127.0.0.1:db.staging.internal:5432,proxyport=18043 &
-     sleep 1
-     exec psql -h 127.0.0.1 -p 15432 -U reader -d appdb -Atc "$1" """,
-  "db-query", "{sql}",
-]
+cmd     = ["psql", "-h", "db.staging.internal", "-p", "5432", "-U", "reader", "-d", "appdb", "-Atc", "{sql}"]
 params  = { sql = "^SELECT [A-Za-z0-9_,.* ]{1,400}$" }
 network = ["tcp://db.staging.internal:5432"]
 
-# socat and psql come from the top-level table: a `nix:` package is built host-side into the shared
-# store, which every task cage mounts read-only, so it is on a task's PATH with nothing to declare
-# in the task itself. (A task's own `packages` field is for `mise:` tools only — see below.)
 [packages]
-socat = "nix:socat"
-psql  = "nix:postgresql"
+psql = "nix:postgresql"
 ```
 
-Two details in that shape are load-bearing:
+The name in `cmd` is the name in `network` is the name the proxy matches its allowlist on. Nothing in
+between is invented for you to look up.
 
-- the parameter is passed **positionally** (`"$1"`), never interpolated into the script text. A
-  bounded parameter that reaches a shell is where metacharacters stop being inert — this is the one
-  place a task can hand one to a shell, so do not let it become part of the command's source;
-- `socat` must be on the task's `PATH`, which means declaring it like any other tool.
+**The fence is unchanged.** Only a declared destination gets a listener, so a port or a host the
+policy never allowed has nothing to connect to — `-p 5433` on an allowed host is a refused
+connection, and an undeclared host does not resolve at all (the cage's namespace has no DNS). The
+request that leaves still carries the host name, so the proxy's verdict is made on what you wrote.
 
-`sbx` does not open that port for you. Doing so would mean deciding, on your behalf, which in-cage
-port stands for which declared destination — a mapping only the declaration knows.
+**What gets no listener**, and is reported at launch rather than passed over: a rule naming no single
+port (`tcp://host:*`, or a port range — sbx will not open a thousand listeners on a guess), and a
+non-loopback IP literal, which the cage's network namespace has no way to hold. Those rules still
+govern the proxy; what they lose is the convenience, and the command has to tunnel itself.
 
 ## Which binaries a task may run
 

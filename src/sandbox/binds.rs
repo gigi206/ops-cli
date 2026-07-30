@@ -899,14 +899,24 @@ fn group_contents(id: &Identity) -> String {
 
 /// The synthetic `/etc/hosts`: `localhost` (and the cage's own `sbx-<slug>` hostname) mapped to
 /// loopback, so a name lookup of either resolves via the file without reaching DNS — which the
-/// cage's empty netns has no resolver for. Only these loopback mappings appear; no host entry is
+/// cage's empty netns has no resolver for. Only loopback mappings appear; no host entry is
 /// leaked. The hostname is placed on the `localhost` lines so a tool that resolves its own
 /// hostname (`gethostname` → `getaddrinfo`) also gets a loopback answer instead of a DNS failure.
-fn hosts_contents(hostname: &str) -> String {
-    format!(
+///
+/// Each `tcp://` destination is added on its own loopback address, where the cage's forwarder
+/// listens for it. That is what lets a declaration name the real host (`psql -h db.internal`) and
+/// have it work: the name resolves inside the cage to somewhere the cage can actually reach, while
+/// the request that leaves still carries the name, so the egress policy matches on what the author
+/// wrote. These are still loopback addresses — nothing here reveals where the destination really is.
+pub(super) fn hosts_contents(hostname: &str, tcp: &[super::egress::TcpDestination]) -> String {
+    let mut out = format!(
         "127.0.0.1\tlocalhost {hostname}\n\
          ::1\tlocalhost ip6-localhost ip6-loopback {hostname}\n"
-    )
+    );
+    for dest in tcp.iter().filter(|d| d.map_name) {
+        out.push_str(&format!("{}\t{}\n", dest.cage_addr, dest.host));
+    }
+    out
 }
 
 /// A synthetic `/etc/machine-id` (systemd format: 32 lowercase hex digits, newline-terminated),
@@ -1114,6 +1124,7 @@ pub(crate) fn build_spec(
     extra_binds: &[ExtraBind],
     net: NetPolicy,
     egress_contract: &str,
+    tcp_destinations: &[super::egress::TcpDestination],
     seccomp: super::seccomp::SeccompPolicy,
     devices: &[PathBuf],
     cmd: Vec<OsString>,
@@ -1191,7 +1202,7 @@ pub(crate) fn build_spec(
     let hosts = rt.etc_dir.join("hosts");
     write_atomic(
         &hosts,
-        hosts_contents(&super::naming::cage_hostname(&slug)).as_bytes(),
+        hosts_contents(&super::naming::cage_hostname(&slug), tcp_destinations).as_bytes(),
     )?;
 
     // A synthetic `/etc/machine-id`, stable per app-home and unique per home, materialized beside
@@ -1377,7 +1388,7 @@ mod tests {
 
     #[test]
     fn the_synthetic_hosts_maps_localhost_and_the_cage_hostname() {
-        let h = hosts_contents("sbx-agy");
+        let h = hosts_contents("sbx-agy", &[]);
         assert!(
             h.contains("127.0.0.1\tlocalhost"),
             "localhost → IPv4 loopback: {h:?}"
@@ -2506,6 +2517,7 @@ mod tests {
             &[],
             NetPolicy::Shared,
             "",
+            &[],
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             vec![OsString::from("/bin/sh")],
@@ -2656,6 +2668,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            &[],
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,
@@ -2819,6 +2832,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            &[],
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             vec![foreign.clone().into_os_string()],
@@ -2863,6 +2877,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            &[],
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             vec![OsString::from("hello")],
@@ -3004,6 +3019,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            &[],
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,
@@ -3175,6 +3191,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            &[],
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,
@@ -3344,6 +3361,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            &[],
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,
@@ -3473,6 +3491,7 @@ mod smoke {
                 &[],
                 NetPolicy::Shared,
                 "",
+                &[],
                 crate::sandbox::seccomp::SeccompPolicy::default(),
                 &[],
                 cmd,
@@ -3604,6 +3623,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
+            &[],
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,

@@ -130,15 +130,173 @@ pub(crate) struct Wiring {
 /// nothing the agent controls is ever interpolated into the script (no shell injection,
 /// non-UTF-8 argv preserved); only sbx-owned ASCII store paths and the fixed port/socket
 /// go into the script string.
-pub(crate) fn wrap_command(socat: &Path, bash: &Path, cmd: Vec<OsString>) -> Vec<OsString> {
+pub(crate) fn wrap_command(
+    socat: &Path,
+    bash: &Path,
+    cmd: Vec<OsString>,
+    tcp: &[TcpDestination],
+) -> Vec<OsString> {
     let preamble = format!(
         "{socat} TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{uds} \
-         </dev/null >/dev/null 2>&1 & ",
+         </dev/null >/dev/null 2>&1 & {tcp_forwarders}",
         socat = socat.to_string_lossy(),
         port = CAGE_PROXY_PORT,
         uds = CAGE_UDS,
+        tcp_forwarders = tcp_forwarders(socat, tcp),
     );
     wrap_background(bash, &preamble, "sbx-egress-forward", cmd)
+}
+
+/// A `tcp://` destination given a place of its own inside the cage.
+///
+/// A raw-splice rule is only half of reaching a database: the proxy will splice the stream, but the
+/// cage's single way out is an HTTP `CONNECT` proxy, and a database client does not speak one. So
+/// each destination gets its own loopback address and a listener per declared port, and the name is
+/// resolved to that address by the cage's `/etc/hosts` — which makes the connection the declaration
+/// already describes (`-h db.internal -p 5432`) work verbatim, with no tunnel for an author to write
+/// and no in-cage port number invented by sbx for them to look up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TcpDestination {
+    /// The host exactly as the rule names it — a name, or an IP literal.
+    pub(crate) host: String,
+    /// The declared ports, each of which gets a listener.
+    pub(crate) ports: Vec<u16>,
+    /// The address the cage listens on for this destination.
+    pub(crate) cage_addr: std::net::Ipv4Addr,
+    /// Whether `/etc/hosts` must map [`host`](Self::host) to [`cage_addr`](Self::cage_addr). False
+    /// for an IP literal, which is already an address: the cage listens on the very address the
+    /// client was going to dial.
+    pub(crate) map_name: bool,
+}
+
+/// What [`tcp_destinations`] made of a policy's raw-splice rules.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct TcpPlan {
+    pub(crate) destinations: Vec<TcpDestination>,
+    /// Rules that name no single port to listen on, or an address the cage cannot hold. Returned
+    /// rather than warned about here so the caller decides how loudly to say it — and so this stays
+    /// a pure function of the policy.
+    pub(crate) skipped: Vec<String>,
+}
+
+/// Where the per-destination addresses start. `127.0.0.1` is taken — it is where the `CONNECT`
+/// proxy itself listens, and where a cage's own services bind — so allocation begins after it and
+/// walks up through `127.0.0.0/8`, which is loopback in full and usable inside the cage's own
+/// network namespace (verified, not assumed).
+const FIRST_CAGE_ADDR: u32 = 0x7f00_0002; // 127.0.0.2
+const LAST_CAGE_ADDR: u32 = 0x7fff_fffe;
+
+/// Plan a cage-side address for every `tcp://` destination in `policy`.
+///
+/// One address **per host**, not per rule: two ports on one database are two listeners on one
+/// address, which is what a name means. Order follows the policy, so the plan is deterministic and
+/// a launch is reproducible.
+///
+/// A rule is skipped when it names no single port (`:*`, or a range — sbx will not open a thousand
+/// listeners on a guess) or a non-loopback IP literal, which the cage's network namespace has no
+/// way to hold. Skipping is reported, never silent: the rule still governs the proxy's verdict, so
+/// what the author loses is the convenience, and they need to know they must tunnel themselves.
+pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPlan {
+    use crate::allowlist::{Layer, Ports, RuleKind};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let mut plan = TcpPlan::default();
+    let mut next = FIRST_CAGE_ADDR;
+    for rule in policy.allow_rules() {
+        if rule.layer != Layer::L4 {
+            continue;
+        }
+        let (host, ports, literal) = match &rule.kind {
+            RuleKind::Host(h, ports) => (h.clone(), ports, None),
+            RuleKind::Ip(ip, ports) => (ip.to_string(), ports, Some(*ip)),
+            other => {
+                plan.skipped.push(format!(
+                    "{other:?} — only an exact host or address can be given a listener"
+                ));
+                continue;
+            }
+        };
+        let ports = match ports {
+            Ports::Ranges(ranges) if ranges.iter().all(|(lo, hi)| lo == hi) => {
+                ranges.iter().map(|(p, _)| *p).collect::<Vec<u16>>()
+            }
+            _ => {
+                plan.skipped.push(format!(
+                    "tcp://{host} names no single port — a listener needs one port, not a range"
+                ));
+                continue;
+            }
+        };
+        // An IP literal is its own address: the cage listens where the client was going to dial. A
+        // loopback one it can hold; anything else would need an address the netns does not have.
+        let (addr, map_name) = match literal {
+            Some(IpAddr::V4(v4)) if v4.is_loopback() => (v4, false),
+            Some(_) => {
+                plan.skipped.push(format!(
+                    "tcp://{host} is an address the cage's network namespace cannot hold — only \
+                     loopback, or use a name"
+                ));
+                continue;
+            }
+            None => {
+                // A host already planned keeps its address; only its ports are added.
+                if let Some(existing) = plan.destinations.iter_mut().find(|d| d.host == host) {
+                    for port in ports {
+                        if !existing.ports.contains(&port) {
+                            existing.ports.push(port);
+                        }
+                    }
+                    continue;
+                }
+                if next > LAST_CAGE_ADDR {
+                    plan.skipped
+                        .push(format!("tcp://{host} — no cage address left to give it"));
+                    continue;
+                }
+                let addr = Ipv4Addr::from(next);
+                next += 1;
+                (addr, true)
+            }
+        };
+        match plan.destinations.iter_mut().find(|d| d.host == host) {
+            Some(existing) => {
+                for port in ports {
+                    if !existing.ports.contains(&port) {
+                        existing.ports.push(port);
+                    }
+                }
+            }
+            None => plan.destinations.push(TcpDestination {
+                host,
+                ports,
+                cage_addr: addr,
+                map_name,
+            }),
+        }
+    }
+    plan
+}
+
+/// The `socat` clauses that give each planned destination its listener, for the cage preamble.
+///
+/// Each listener speaks `CONNECT` to the in-cage proxy port on the destination's behalf, naming the
+/// host **as written**: socat sends the name rather than resolving it (verified), so the `/etc/hosts`
+/// entry pointing that name at the cage address cannot loop the connection back on itself.
+fn tcp_forwarders(socat: &Path, destinations: &[TcpDestination]) -> String {
+    let mut out = String::new();
+    for dest in destinations {
+        for port in &dest.ports {
+            out.push_str(&format!(
+                "{socat} TCP-LISTEN:{port},bind={addr},fork,reuseaddr \
+                 PROXY:127.0.0.1:{host}:{port},proxyport={proxy} </dev/null >/dev/null 2>&1 & ",
+                socat = socat.to_string_lossy(),
+                addr = dest.cage_addr,
+                host = dest.host,
+                proxy = CAGE_PROXY_PORT,
+            ));
+        }
+    }
+    out
 }
 
 /// Assemble the `bash -c '<preamble> exec "$@"'` forwarder wrapper shared by the egress and
@@ -641,6 +799,7 @@ mod tests {
             Path::new("/nix/store/abc-socat/bin/socat"),
             Path::new("/nix/store/def-bash/bin/bash"),
             cmd,
+            &[],
         );
         // bash -c <script> <label> jq --version
         assert_eq!(argv[0], OsString::from("/nix/store/def-bash/bin/bash"));
@@ -790,6 +949,113 @@ mod tests {
     /// request is answered — is created host-side but **never** bound into the cage. In Mode B the
     /// in-cage agent is the adversary; if it could reach this socket it could answer its own asks.
     /// Only the proxy socket and the CA cross in.
+    fn tcp_policy(entries: &[&str]) -> crate::allowlist::EgressPolicy {
+        let rules = entries
+            .iter()
+            .map(|e| crate::allowlist::classify(e).expect("a valid rule"))
+            .collect();
+        crate::allowlist::EgressPolicy::new(rules, Vec::new())
+    }
+
+    /// Each destination gets its own address, and a host declared on two ports gets one address with
+    /// two listeners — because that is what a name means. `127.0.0.1` is never handed out: the
+    /// CONNECT proxy is already there.
+    #[test]
+    fn each_tcp_host_gets_one_address_and_a_listener_per_port() {
+        let plan = tcp_destinations(&tcp_policy(&[
+            "tcp://db.internal:5432",
+            "tcp://db.internal:5433",
+            "tcp://cache.internal:6379",
+        ]));
+
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        assert_eq!(plan.destinations.len(), 2, "{:?}", plan.destinations);
+        let db = &plan.destinations[0];
+        assert_eq!(db.host, "db.internal");
+        assert_eq!(db.ports, vec![5432, 5433], "one address, both ports");
+        assert_eq!(db.cage_addr.to_string(), "127.0.0.2");
+        assert!(db.map_name, "a name has to resolve to the address");
+        let cache = &plan.destinations[1];
+        assert_eq!(
+            cache.cage_addr.to_string(),
+            "127.0.0.3",
+            "a distinct address"
+        );
+        assert_ne!(
+            db.cage_addr.to_string(),
+            "127.0.0.1",
+            "the proxy already listens there"
+        );
+    }
+
+    /// A loopback address is its own answer: the cage listens exactly where the client was going to
+    /// dial, and no name is invented for it.
+    #[test]
+    fn a_loopback_literal_is_listened_on_directly() {
+        let plan = tcp_destinations(&tcp_policy(&["tcp://127.0.0.1:55432"]));
+
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        let dest = &plan.destinations[0];
+        assert_eq!(dest.cage_addr.to_string(), "127.0.0.1");
+        assert!(!dest.map_name, "an address needs no `/etc/hosts` entry");
+    }
+
+    /// What cannot be given a listener is reported, never dropped in silence: the rule still governs
+    /// the proxy, so the author has to know the convenience is what they lost.
+    #[test]
+    fn a_rule_with_no_single_port_is_reported_rather_than_guessed() {
+        let plan = tcp_destinations(&tcp_policy(&["tcp://db.internal:*"]));
+
+        assert!(plan.destinations.is_empty());
+        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
+        assert!(
+            plan.skipped[0].contains("db.internal"),
+            "{:?}",
+            plan.skipped
+        );
+    }
+
+    /// An inspected rule is not a raw splice and gets no listener — the tools that use those speak
+    /// to the proxy directly.
+    #[test]
+    fn only_raw_splice_rules_get_a_listener() {
+        let plan = tcp_destinations(&tcp_policy(&[
+            "api.example.com",
+            "http://plain.example.com",
+        ]));
+        assert!(plan.destinations.is_empty(), "{:?}", plan.destinations);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+    }
+
+    /// The preamble carries a listener per port, each speaking CONNECT for the host **as written**.
+    /// The name matters: it is what the proxy matches its allowlist on, and socat sends it rather
+    /// than resolving it — which is the only reason pointing that name at the cage address in
+    /// `/etc/hosts` does not send the connection back to the listener itself.
+    #[test]
+    fn the_preamble_forwards_each_destination_by_name() {
+        let plan = tcp_destinations(&tcp_policy(&["tcp://db.internal:5432"]));
+        let argv = wrap_command(
+            Path::new("/nix/store/abc-socat/bin/socat"),
+            Path::new("/nix/store/def-bash/bin/bash"),
+            vec![OsString::from("psql")],
+            &plan.destinations,
+        );
+        let script = argv[2].to_string_lossy().into_owned();
+
+        assert!(
+            script.contains("TCP-LISTEN:5432,bind=127.0.0.2"),
+            "the listener must sit where the name resolves: {script}"
+        );
+        assert!(
+            script.contains("PROXY:127.0.0.1:db.internal:5432,proxyport=18043"),
+            "the CONNECT must name the host, not the cage address: {script}"
+        );
+        assert!(
+            script.contains(&format!("TCP-LISTEN:{CAGE_PROXY_PORT}")),
+            "the proxy bridge itself must still be there: {script}"
+        );
+    }
+
     #[test]
     fn the_ask_control_socket_is_created_but_never_bound_into_the_cage() {
         let data = TmpDir::new();

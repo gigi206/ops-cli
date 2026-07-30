@@ -4212,6 +4212,19 @@ fn build(
             forward_guard = Some(guard);
         }
     }
+    // Where each `tcp://` destination lives inside the cage. Computed before the launch because two
+    // things need it: the preamble's listeners, and the `/etc/hosts` entries that make the
+    // declaration's own host name resolve to them.
+    let mut tcp_plan = egress::TcpPlan::default();
+    if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
+        tcp_plan = egress::tcp_destinations(policy);
+        for skipped in &tcp_plan.skipped {
+            crate::diag::warn(&format!(
+                "no in-cage listener for {skipped} — the rule still governs the proxy, but a client \
+                 that cannot speak an HTTP CONNECT proxy will have to tunnel itself"
+            ));
+        }
+    }
     if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
         // An `sbx app <name>` launch tags its egress stats with the app, so `sbx net stats --app`
         // can scope to it; a plain `run`/`shell` records under the project with no app tag.
@@ -4237,7 +4250,12 @@ fn build(
             eprintln!("sbx: cannot start the egress filtering proxy: {e}");
             ExitCode::FAILURE
         })?;
-        cmd = egress::wrap_command(&prep.userland.socat_bin, &prep.userland.shell_bin, cmd);
+        cmd = egress::wrap_command(
+            &prep.userland.socat_bin,
+            &prep.userland.shell_bin,
+            cmd,
+            &tcp_plan.destinations,
+        );
         // For a GUI cage, import sbx's MITM CA into the cage's NSS db before the app runs, so a
         // Chromium/Electron app trusts the egress proxy (it ignores the CA-file env vars). This
         // is the outermost wrap — it runs, then execs the egress-wrapped command. Only present
@@ -4557,6 +4575,9 @@ fn build(
         &extra_binds,
         net_policy(&prep.cfg.network),
         &egress_contract,
+        // The `tcp://` destinations get `/etc/hosts` entries pointing at the addresses the preamble
+        // above listens on, so a declaration reads the same inside the cage as outside it.
+        &tcp_plan.destinations,
         // The trusted seccomp relaxation from the resolved (post-`merge_app`) config, so an app's
         // `[seccomp] allow` union is in effect for `sbx app`, exactly like its limits.
         prep.cfg.seccomp.clone(),
