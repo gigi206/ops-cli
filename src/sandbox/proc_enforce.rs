@@ -788,9 +788,22 @@ mod tests {
     /// supervisor is the child's direct parent, which is what makes the `/proc/<pid>/mem` read
     /// permitted under YAMA `ptrace_scope = 1` — the same relationship a launch has to its cage.
     fn run_under_supervisor(
-        payload: &str,
+        payload: &[&str],
         policy: &ProcPolicy,
         overlay: &ProcOverlay,
+    ) -> (Option<i32>, Arc<ExecRing>) {
+        // One notification: the shim's own exec of the payload. The shim's own launch happened
+        // before the filter existed, so it never traps.
+        run_under_supervisor_n(payload, policy, overlay, 1)
+    }
+
+    /// The same harness, serving `notifs` notifications instead of one — what a payload that goes on
+    /// to exec something itself needs.
+    fn run_under_supervisor_n(
+        payload: &[&str],
+        policy: &ProcPolicy,
+        overlay: &ProcOverlay,
+        notifs: usize,
     ) -> (Option<i32>, Arc<ExecRing>) {
         let dir = TmpDir::new();
         let shim = materialized_shim(&dir);
@@ -801,7 +814,7 @@ mod tests {
             std::process::Command::new(&shim)
                 .arg(&sock_path)
                 .arg("--")
-                .arg(payload),
+                .args(payload),
         );
 
         let (sock, _) = listener.accept().expect("the shim never connected");
@@ -809,9 +822,10 @@ mod tests {
 
         let ring = Arc::new(ExecRing::new(16));
         let pending = Arc::new(PendingExec::new());
-        // Exactly one `execve` is notified: the shim's own exec of the payload. The shim's own
-        // launch happened before the filter existed, so it never traps.
-        if poll_readable(notif, 5000) {
+        for _ in 0..notifs {
+            if !poll_readable(notif, 5000) {
+                break;
+            }
             let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
             let rc = unsafe { libc::ioctl(notif, notif_recv_code() as libc::Ioctl, &mut req) };
             if rc >= 0 {
@@ -830,7 +844,7 @@ mod tests {
     #[test]
     fn a_denied_execve_returns_eperm_and_the_payload_never_runs() {
         let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
-        let (code, ring) = run_under_supervisor("/bin/true", &policy, &ProcOverlay::new());
+        let (code, ring) = run_under_supervisor(&["/bin/true"], &policy, &ProcOverlay::new());
 
         assert_eq!(
             code,
@@ -853,7 +867,7 @@ mod tests {
         // A denylist that denies something else entirely: `/bin/true` is unmatched, which under
         // `enforce` means allowed.
         let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
-        let (code, ring) = run_under_supervisor("/bin/true", &policy, &ProcOverlay::new());
+        let (code, ring) = run_under_supervisor(&["/bin/true"], &policy, &ProcOverlay::new());
 
         assert_eq!(code, Some(0), "the allowed payload must have run");
         assert!(
@@ -862,6 +876,40 @@ mod tests {
                 .iter()
                 .any(|e| e.command.contains("/bin/true") && e.verdict == "allow"),
             "the ring must record the allowed exec"
+        );
+    }
+
+    /// The gate covers the process **tree**, not just the command it was handed. The filter the shim
+    /// installs is inherited across `fork` *and* `exec`, so a program the payload runs — and one that
+    /// program runs in turn — traps the same supervisor. That is what makes a rule mean "this may run
+    /// in this cage" rather than "the first command may run this", and it is the property the whole
+    /// enforcement posture rests on: without it, allowing one program would hand it an unwatched
+    /// tree. Measured here rather than taken from the kernel's documentation.
+    #[test]
+    fn a_grandchild_execve_traps_the_same_supervisor() {
+        // `timeout` forks and execs its argument, so the denied target is reached across both — a
+        // chain the payload's own exec could not demonstrate on its own.
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
+        let (_, ring) = run_under_supervisor_n(
+            &["/usr/bin/timeout", "5", "/bin/true"],
+            &policy,
+            &ProcOverlay::new(),
+            2,
+        );
+
+        let events = ring.snapshot(None).events;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.command.contains("/usr/bin/timeout") && e.verdict == "allow"),
+            "the payload's own exec must be allowed through: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.command.contains("/bin/true") && e.verdict == "deny"),
+            "the exec a *forked descendant* attempts must reach the supervisor too — if this is \
+             missing, the filter did not survive fork+exec: {events:?}"
         );
     }
 
@@ -875,7 +923,7 @@ mod tests {
         let overlay = ProcOverlay::new();
         assert!(overlay.remember(Verdict::Deny, "/bin/true"));
 
-        let (code, ring) = run_under_supervisor("/bin/true", &policy, &overlay);
+        let (code, ring) = run_under_supervisor(&["/bin/true"], &policy, &overlay);
 
         assert_eq!(
             code,
