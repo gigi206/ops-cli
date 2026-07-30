@@ -61,6 +61,10 @@ pub(crate) fn task_cmd(args: Vec<OsString>) -> ExitCode {
 /// answered from the rows alone.
 struct Plane {
     socket: PathBuf,
+    /// Where the operation *inventory* is served — the crossing socket. The same socket for the
+    /// verbs that already talk to it, and the sibling of the log socket for the host-only ones,
+    /// which need it to tell a misspelled operation from an empty answer.
+    inventory: PathBuf,
     /// The session's pid and project, when one was resolved. Absent in a cage, where there is no
     /// session to resolve — the socket is the one the environment names, and it is the only one.
     session: Option<(u32, PathBuf)>,
@@ -89,8 +93,20 @@ impl Plane {
 /// wants to find the plane looks in one place whichever side it is on.
 fn plane_for(id: Option<&str>, verb: &str) -> Result<Plane, ExitCode> {
     if let Some(path) = std::env::var_os(TASK_SOCKET_ENV) {
+        // A cage reaches exactly one plane — its own — so `--session` names something that cannot be
+        // selected from here. Refused rather than dropped: a flag a caller believes it set must never
+        // silently become nothing, least of all one that chooses which credentials an operation runs
+        // with.
+        if id.is_some() {
+            diag::error(&format!(
+                "sbx: task {verb}: `--session` cannot be used here — a cage reaches one plane, its own"
+            ));
+            return Err(ExitCode::from(2));
+        }
+        let socket = PathBuf::from(path);
         return Ok(Plane {
-            socket: PathBuf::from(path),
+            inventory: socket.clone(),
+            socket,
             session: None,
         });
     }
@@ -101,8 +117,10 @@ fn plane_for(id: Option<&str>, verb: &str) -> Result<Plane, ExitCode> {
         return Err(ExitCode::FAILURE);
     };
     let pid = resolve_task_session(layout.data_dir(), id, verb)?;
+    let socket = sandbox::task_control::task_dir(layout.data_dir(), pid).join("control.sock");
     Ok(Plane {
-        socket: sandbox::task_control::task_dir(layout.data_dir(), pid).join("control.sock"),
+        inventory: socket.clone(),
+        socket,
         session: Some((pid, session_project(layout.data_dir(), pid))),
     })
 }
@@ -176,7 +194,16 @@ fn print_table(headers: &[&str], align: &[Align], rows: &[Vec<String>]) {
         // reading order `sbx session ls` gives, where the eye lands on the identifier. The span is
         // the *rendered* first column, padding included, so a right-aligned id is colored where it
         // sits rather than where its digits would start.
-        let (head, rest) = line.split_at(first.min(line.len()));
+        //
+        // `first` counts **characters**, which is what the padding is measured in; the byte index is
+        // then looked up rather than assumed equal to it. An operation name with an accent in it
+        // would otherwise split the line mid-character — which does not merely misplace the color,
+        // it panics.
+        let split = line
+            .char_indices()
+            .nth(first)
+            .map_or(line.len(), |(i, _)| i);
+        let (head, rest) = line.split_at(split);
         match i {
             0 => println!("{}{line}{}", pal.head, pal.reset),
             _ => println!("{}{head}{}{rest}", pal.name, pal.reset),
@@ -418,11 +445,18 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
             .collect(),
     };
     if rows.is_empty() {
-        match &listing.operation {
-            Some(name) => println!("`{name}` carries no credentials"),
-            None => println!("no credentials are carried by the declared operations"),
-        }
-        return ExitCode::SUCCESS;
+        return match &listing.operation {
+            Some(name) => empty_or_unknown(
+                &plane,
+                "secrets",
+                name,
+                &format!("`{name}` carries no credentials"),
+            ),
+            None => {
+                println!("no credentials are carried by the declared operations");
+                ExitCode::SUCCESS
+            }
+        };
     }
     // Two shapes cross the wire — a variable the operation's environment carries, and a value
     // injected into a request the operation never sees — and DELIVERY is where they differ. That is
@@ -616,6 +650,7 @@ fn host_plane(id: Option<&str>, verb: &str) -> Result<Plane, ExitCode> {
     let pid = resolve_task_session(layout.data_dir(), id, verb)?;
     Ok(Plane {
         socket: sandbox::task_control::log_socket(layout.data_dir(), pid),
+        inventory: sandbox::task_control::task_dir(layout.data_dir(), pid).join("control.sock"),
         session: Some((pid, session_project(layout.data_dir(), pid))),
     })
 }
@@ -635,13 +670,33 @@ fn task_status(args: &[OsString]) -> ExitCode {
         Err(e) => return unreachable_plane(&e),
     };
     plane.announce();
-    let rows = filter_by_operation(&rows, listing.operation.as_deref());
+    let rows = match &listing.operation {
+        None => rows,
+        // An id or a name, the same way `stop` takes either — the id is what a stopped invocation's
+        // report names, and asking after it is the first thing a reader does with it.
+        Some(target) => match target.parse::<u64>() {
+            Ok(id) => rows.into_iter().filter(|r| r.id == id).collect(),
+            Err(_) => filter_by_operation(&rows, Some(target)),
+        },
+    };
     if rows.is_empty() {
-        match &listing.operation {
-            Some(name) => println!("`{name}` is not running"),
-            None => println!("no operation is running"),
+        let Some(target) = &listing.operation else {
+            println!("no operation is running");
+            return ExitCode::SUCCESS;
+        };
+        // An id names an invocation, which either runs or is over — there is no inventory to check
+        // it against, and where it went is a question the log answers.
+        if target.parse::<u64>().is_ok() {
+            println!("invocation {target} is not running");
+            diag::hint("       `sbx task logs` holds it if it has already finished.");
+            return ExitCode::SUCCESS;
         }
-        return ExitCode::SUCCESS;
+        return empty_or_unknown(
+            &plane,
+            "status",
+            target,
+            &format!("`{target}` is not running"),
+        );
     }
     let table: Vec<Vec<String>> = rows
         .iter()
@@ -808,20 +863,37 @@ fn task_logs(args: &[OsString]) -> ExitCode {
             ));
             continue;
         }
-        // The operation is the third cell; narrowing here rather than in the log keeps the wire one
-        // shape and the filter one place.
-        match (log_row(line), listing.operation.as_deref()) {
-            (Some(row), Some(name)) if row.get(2).map(String::as_str) != Some(name) => {}
-            (Some(row), _) => rows.push(row),
-            (None, _) => {}
+        // An id or an operation name, the same way `status` and `stop` take either — the id in a
+        // result is what a reader has in front of them, and the log is where a finished invocation
+        // went. The id is the first cell and the operation the third; narrowing here rather than in
+        // the log keeps the wire one shape and the filter one place.
+        let Some(row) = log_row(line) else { continue };
+        let keeps = match listing.operation.as_deref() {
+            None => true,
+            Some(target) => match target.parse::<u64>().is_ok() {
+                true => row.first().map(String::as_str) == Some(target),
+                false => row.get(2).map(String::as_str) == Some(target),
+            },
+        };
+        if keeps {
+            rows.push(row);
         }
     }
     if rows.is_empty() {
-        match &listing.operation {
-            Some(name) => println!("no invocation of `{name}` recorded"),
-            None => println!("no invocations recorded"),
+        let Some(target) = &listing.operation else {
+            println!("no invocations recorded");
+            return ExitCode::SUCCESS;
+        };
+        if target.parse::<u64>().is_ok() {
+            println!("no invocation {target} recorded");
+            return ExitCode::SUCCESS;
         }
-        return ExitCode::SUCCESS;
+        return empty_or_unknown(
+            &plane,
+            "logs",
+            target,
+            &format!("no invocation of `{target}` recorded"),
+        );
     }
     print_table(
         &["ID", "TIME", "OPERATION", "EXIT", "TOOK", "NOTE"],
@@ -959,6 +1031,23 @@ fn no_match(verb: &str, operation: &str, known: &[String]) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// An empty answer to a narrowed listing, told apart from a misspelled name.
+///
+/// The two look identical from the filter alone — nothing matched either way — and they are opposite
+/// things: one is a real result, the other is a typo that would otherwise read as one. The inventory
+/// is what separates them, so it is asked for **only** on the empty path, where the answer changes
+/// what to say.
+fn empty_or_unknown(plane: &Plane, verb: &str, operation: &str, empty: &str) -> ExitCode {
+    let known: Vec<String> = client::list(&plane.inventory)
+        .map(|rows| rows.into_iter().map(|r| r.name).collect())
+        .unwrap_or_default();
+    if !known.is_empty() && !known.iter().any(|n| n == operation) {
+        return no_match(verb, operation, &known);
+    }
+    println!("{empty}");
+    ExitCode::SUCCESS
+}
+
 /// Split a `KEY=VALUE` argument. A missing `=` is an error rather than an empty value: a parameter a
 /// caller believes it set must never silently become nothing.
 fn pair(arg: Option<&OsString>, flag: &str) -> Result<(String, String), ExitCode> {
@@ -1022,6 +1111,35 @@ mod tests {
         );
         for line in &lines {
             assert_eq!(line.trim_end(), line, "no line may trail spaces: {line:?}");
+        }
+    }
+
+    /// Widths are counted in characters and the color span is sliced in bytes, so a first cell that
+    /// is not ASCII must not be able to split the line mid-character — that is a panic, not a
+    /// cosmetic slip. An operation name is config text, so it can hold anything.
+    #[test]
+    fn a_non_ascii_first_cell_neither_misaligns_nor_splits_a_character() {
+        let rows = vec![
+            vec!["opération".into(), "1".into()],
+            vec!["ab".into(), "2".into()],
+        ];
+        let (lines, first) = render_table(&["NAME", "N"], &[Align::Left, Align::Left], &rows);
+        assert_eq!(
+            first,
+            "opération".chars().count(),
+            "widths count characters"
+        );
+        assert_eq!(lines, vec!["NAME       N", "opération  1", "ab         2"]);
+        for line in &lines {
+            // What `print_table` does with the width — it must land on a character boundary.
+            let split = line
+                .char_indices()
+                .nth(first)
+                .map_or(line.len(), |(i, _)| i);
+            assert!(
+                line.is_char_boundary(split),
+                "the color span must not split a character: {line:?}"
+            );
         }
     }
 

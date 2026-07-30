@@ -4,9 +4,9 @@
 sbx task list [<operation>] [--session <id>]
 sbx task secrets [<operation>] [--session <id>]
 sbx task run <operation> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]
-sbx task status [<operation>] [--session <id>]
-sbx task stop <invocation|operation> [--session <id>]
-sbx task logs [<operation>] [--session <id>]
+sbx task status [<invocation>|<operation>] [--session <id>]
+sbx task stop <invocation>|<operation> [--session <id>]
+sbx task logs [<invocation>|<operation>] [--session <id>]
 ```
 
 Use the **declared operations** a session offers — fixed commands sbx runs on a caller's behalf, in
@@ -173,7 +173,7 @@ text could have been printed by the command itself).
 ## `status`
 
 ```
-sbx task status [<operation>] [--session <id>]
+sbx task status [<invocation>|<operation>] [--session <id>]
 ```
 
 What the session is running **right now** — host-only.
@@ -193,8 +193,13 @@ ID  OPERATION      ELAPSED      PID  STATE
 | `PID` | the cage's process, for `ps` and `systemd-cgls` |
 | `STATE` | `running`, or `stopping` once it has been asked to stop |
 
-A caller blocked on its own `sbx task run` cannot see this — it is waiting for the answer. This is
-the view from another terminal, which is also the only place a stop can come from.
+Narrow it with an invocation id or an operation name. A caller blocked on its own `sbx task run`
+cannot see this — it is waiting for the answer. This is the view from another terminal, which is also
+the only place a stop can come from.
+
+**The three verbs share one number.** The id `status` shows is the id `stop` takes, the id `logs`
+carries once the invocation is over, and the id a stopped `run` names in its report — so `sbx task
+status 7` while it runs and `sbx task logs 7` afterwards are the same invocation.
 
 ## `stop`
 
@@ -233,7 +238,7 @@ as the stopped command left it: partial, and only the next invocation clears it.
 ## `logs`
 
 ```
-sbx task logs [<operation>] [--session <id>]
+sbx task logs [<invocation>|<operation>] [--session <id>]
 ```
 
 The session's invocation log — **host-only**, because the recorded party does not get to read the
@@ -262,7 +267,7 @@ overlapping invocations appear in the order they finished and their ids can read
 blank id marks a request refused before it was admitted at all — the session's quota was exhausted,
 so no invocation exists for an id to name.
 
-Name an operation to see only its invocations.
+Name an operation to see only its invocations, or an invocation id to see just that one.
 
 Neither the command nor any parameter value is recorded: the command is fixed by the declaration, and
 a value can carry a secret. The log is in-RAM, bounded (512 invocations, and it says how many older

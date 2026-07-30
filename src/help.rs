@@ -614,6 +614,11 @@ const PAGES: &[Page] = &[
             `match` pattern or an `enum`) and the variable names in `env_allow`. The program, the\n\
             environment, the credential and the ceilings are the declaration's.\n\
             \n\
+            Every verb takes the thing it is about as its argument — an operation, or an invocation\n\
+            for `stop` — and `--session <id>` names which session, for the case where more than one\n\
+            is offering operations. An **invocation id** is the number `status` shows while it runs\n\
+            and the one its line in `logs` carries afterwards; it is not a session id.\n\
+            \n\
             `list`, `secrets` and `run` work both inside the cage (where the agent uses them) and on\n\
             the host, so an operation is testable exactly as the agent sees it. `status`, `stop` and\n\
             `logs` are **host-only**, and by construction: they live on a socket that is never bound\n\
@@ -694,10 +699,13 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "status"],
-        synopsis: "sbx task status [<operation>] [--session <id>]",
+        synopsis: "sbx task status [<invocation>|<operation>] [--session <id>]",
         summary: "the operations this session is running right now (host-only)",
         options: &[
-            ("<operation>", "show only this one's invocations"),
+            (
+                "<invocation>|<operation>",
+                "narrow to one invocation id, or to one operation's invocations",
+            ),
             (
                 "--session <id>",
                 "the session to ask, when several offer operations",
@@ -741,10 +749,13 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "logs"],
-        synopsis: "sbx task logs [<operation>] [--session <id>]",
+        synopsis: "sbx task logs [<invocation>|<operation>] [--session <id>]",
         summary: "a session's invocation log (host-only)",
         options: &[
-            ("<operation>", "only this operation's invocations"),
+            (
+                "<invocation>|<operation>",
+                "only this invocation id, or only this operation's invocations",
+            ),
             ("--session <id>", "the session whose log to read"),
         ],
         details:
