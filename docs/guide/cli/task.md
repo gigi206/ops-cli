@@ -15,6 +15,39 @@ These verbs work **both inside the cage** (where the agent uses them, through th
 there) **and on the host**, so an operation is testable exactly as the agent sees it. `logs` is
 host-only.
 
+## How an agent finds them
+
+A declared operation the agent never learns about is worth exactly as much as one you never
+declared. So when a session offers any, they are written into the contract the cage already reads —
+`/opt/sbx/egress-contract.md`, named by `$SBX_EGRESS_CONTRACT` — beside the network posture:
+
+```markdown
+## Declared operations
+
+This sandbox offers fixed operations that sbx runs on your behalf, in a separate cage, with
+credentials this process never holds and cannot read. Invoke one with:
+
+    sbx task run <name> --param KEY=VALUE
+
+Prefer them over reaching for the underlying tool: the tool is usually absent here, and the
+credential is attached host-side, so an operation succeeds where a direct attempt cannot.
+
+- `db-query` — Read-only SQL against staging
+    parameter `sql`: matching `^SELECT [a-z, ]+$`, required
+    credentials: PGPASSWORD
+```
+
+It is the same file rather than a second one on purpose: another file would only be read by a
+process that already knew to look for it, which is the problem being solved.
+
+This discloses nothing new. Every line of it is what [`list`](#list) and [`secrets`](#secrets)
+already answer to anyone in the cage — names, descriptions, parameter bounds, and the **names** of
+the credentials an operation carries. Never a value, and never a source locator: a `sops://` path
+would be a disclosure the socket itself refuses to make.
+
+The listing is written at launch; `sbx task list` stays the live view (it is where a
+`missing-tools=` warning appears, since the tool pool is filled after the file is written).
+
 ## What the cage actually holds
 
 Inside the sandbox `sbx` is **not the sbx binary** — it is a small generated client that speaks the

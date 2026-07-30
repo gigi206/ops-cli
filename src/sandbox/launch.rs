@@ -4511,10 +4511,12 @@ fn build(
         binds: &prep.cfg.binds,
         bin_paths: &bin_paths,
     };
-    // Generate the in-cage egress contract from the resolved (post-`merge_app`) network
-    // posture, so a process inside the cage can see which hosts it can reach and why a
-    // direct connection or `ping` fails. Informational only; bound read-only by `build_spec`.
-    let egress_contract = super::contract::egress_contract(&prep.cfg.network);
+    // Generate the in-cage contract from the resolved (post-`merge_app`) config, so a process
+    // inside the cage can see which hosts it can reach, why a direct connection or `ping` fails,
+    // and which declared operations it may invoke. The tasks are the gated ones — the same list the
+    // task plane serves — so the file never advertises an operation the socket would refuse to run.
+    // Informational only; bound read-only by `build_spec`.
+    let egress_contract = super::contract::cage_contract(&prep.cfg.network, &prep.cfg.tasks);
     // The device grant: the resolved `[devices]` plus, under `gpu = true`, the render node
     // directory (`/dev/dri`), so the cage can reach the GPU. Both become `--dev-bind-try` mounts.
     // Deduped: a trusted `[devices] allow = ["/dev/dri"]` alongside `gpu = true` must not emit the
