@@ -28,6 +28,11 @@ traps to a host-side supervisor that decides it. A `deny` returns `EPERM` — th
 runs** (there is no time-of-check/time-of-use window on a refusal). Capture is then exact (no poll
 gap), and `sbx proc logs` shows each spawn with its verdict.
 
+The gate covers the whole process **tree**, not just the command sbx starts: the filter is inherited
+across `fork` **and** `exec`, so a program an allowed one runs — and one *that* runs in turn — traps
+the same supervisor. A rule therefore reads as *"this may run in this cage"*, at any depth, rather
+than *"the agent may run this"*.
+
 ## Rule grammar
 
 Each `allow`/`deny` entry is a shell-style glob (`*` = any run, `?` = one character):
@@ -64,7 +69,9 @@ genuinely stops `curl` from executing.
 What exec enforcement is **not** is a full containment boundary — it is a **guardrail** on the exec
 channel, for three honest reasons:
 
-- an agent can do harm **in-process** (in its own interpreter) without `execve`ing anything at all;
+- an agent can do harm **in-process** (in its own interpreter) without `execve`ing anything at all —
+  which is also why `allow`ing a shell or a language runtime concedes most of the gate: what it does
+  with its own builtins never reaches a syscall to decide;
 - `allow`/approval re-runs the real syscall, which is **TOCTOU-racy** against an adversary that swaps
   the path argument after the check — so *refusing* a path is hard, but *approving* a specific one is
   a guardrail;
