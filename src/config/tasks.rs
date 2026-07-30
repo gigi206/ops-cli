@@ -195,9 +195,9 @@ pub(super) fn validate_task(
     };
 
     // A task cannot police what its command goes on to spawn, so it must not look as though it can.
-    // Deciding an exec by path needs a seccomp user-notification supervisor, which needs a shim
-    // binary inside the cage — and that cage is the one holding a plaintext credential. Refusing is
-    // the honest answer: an ignored key here would read as a fence and be none.
+    // Deciding an exec by path needs a seccomp user-notification supervisor per invocation, to guard
+    // a command a trusted declaration already fixed. Refusing is the honest answer while that is not
+    // offered: an ignored key here would read as a fence and be none.
     for field in ["allow", "deny"] {
         let declared = if field == "allow" {
             &raw.allow
