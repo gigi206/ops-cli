@@ -627,26 +627,34 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "list"],
-        synopsis: "sbx task list [<id>]",
+        synopsis: "sbx task list [<operation>] [--session <id>]",
         summary: "the operations a session offers, with their parameters and ceilings",
-        options: &[(
-            "<id>",
-            "the PID of the session to ask; omit it when only one is offering operations",
-        )],
+        options: &[
+            ("<operation>", "show only this one; omit it for all of them"),
+            (
+                "--session <id>",
+                "the session to ask (host-side, when several offer operations)",
+            ),
+        ],
         details:
-            "One line per operation: its name, its parameter names, whether each stream is shown or\n\
-            hidden, and its timeout. Inside the cage the session is implicit (a caller may only\n\
-            reach its own).\n\
+            "One row per operation: its name, its parameter names and its timeout. A column appears\n\
+            only when some operation makes it worth showing — a hidden stream, an output directory,\n\
+            a missing tool — because a column that reads the same on every line is not information.\n\
             \n\
-            A `missing-tools=` field marks a task whose declared `packages` are not in the tool pool.\n\
-            The pool is filled best-effort at launch, so that task will fail at exec — this is where\n\
-            it shows before you invoke it.",
+            A `MISSING TOOLS` column marks an operation whose declared `packages` are not in the tool\n\
+            pool. The pool is filled best-effort at launch, so that operation will fail at exec —\n\
+            this is where it shows before you invoke it.\n\
+            \n\
+            Inside the cage the session is implicit (a caller may only reach its own).",
     },
     Page {
         path: &["task", "secrets"],
-        synopsis: "sbx task secrets [<id>]",
+        synopsis: "sbx task secrets [<operation>] [--session <id>]",
         summary: "the credentials the operations carry — names and descriptions only",
-        options: &[("<id>", "the PID of the session to ask")],
+        options: &[
+            ("<operation>", "show only what this one carries"),
+            ("--session <id>", "the session to ask"),
+        ],
         details:
             "Names, the operation each belongs to, the encoding it is rendered with, and its\n\
             description. Never a value, and never a source locator: what a caller needs to know is\n\
@@ -686,12 +694,15 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "status"],
-        synopsis: "sbx task status [<id>]",
+        synopsis: "sbx task status [<operation>] [--session <id>]",
         summary: "the operations this session is running right now (host-only)",
-        options: &[(
-            "<id>",
-            "the PID of the session to ask; omit it when only one is offering operations",
-        )],
+        options: &[
+            ("<operation>", "show only this one's invocations"),
+            (
+                "--session <id>",
+                "the session to ask, when several offer operations",
+            ),
+        ],
         details:
             "One line per invocation in flight: its id, which operation it is, how long it has been\n\
             running, the pid of its cage, and whether it has already been asked to stop.\n\
@@ -705,12 +716,12 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "stop"],
-        synopsis: "sbx task stop <invocation> [--session <id>]",
+        synopsis: "sbx task stop <invocation|operation> [--session <id>]",
         summary: "end one running invocation (host-only)",
         options: &[
             (
-                "<invocation>",
-                "the invocation id, as `sbx task status` shows it — not a session id",
+                "<invocation|operation>",
+                "the invocation id `sbx task status` shows, or the operation's name when only one of its invocations is running",
             ),
             ("--session <id>", "the session it is running in, when several offer operations"),
         ],
@@ -730,9 +741,12 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "logs"],
-        synopsis: "sbx task logs [<id>]",
+        synopsis: "sbx task logs [<operation>] [--session <id>]",
         summary: "a session's invocation log (host-only)",
-        options: &[("<id>", "the PID of the session whose log to read")],
+        options: &[
+            ("<operation>", "only this operation's invocations"),
+            ("--session <id>", "the session whose log to read"),
+        ],
         details:
             "One line per invocation: its id, when it finished, which operation, the exit code, how\n\
             many credential values were substituted out, whether the output was truncated, whether\n\

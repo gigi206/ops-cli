@@ -1,12 +1,12 @@
 # `sbx task`
 
 ```
-sbx task list [<id>]
-sbx task secrets [<id>]
-sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]
-sbx task status [<id>]
-sbx task stop <invocation> [--session <id>]
-sbx task logs [<id>]
+sbx task list [<operation>] [--session <id>]
+sbx task secrets [<operation>] [--session <id>]
+sbx task run <operation> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]
+sbx task status [<operation>] [--session <id>]
+sbx task stop <invocation|operation> [--session <id>]
+sbx task logs [<operation>] [--session <id>]
 ```
 
 Use the **declared operations** a session offers — fixed commands sbx runs on a caller's behalf, in
@@ -78,29 +78,45 @@ See also: [`[task]`](../configuration/task.md) · [`sbx secret list`](secret.md)
 ## `list`
 
 ```
-sbx task list [<id>]
+sbx task list [<operation>] [--session <id>]
 ```
 
-One line per operation: its name, its parameter names, whether each stream is shown or hidden, its
-timeout, and its description.
+One row per operation. The line above the table says which session answered and what project it runs
+in — with two sessions open, the rows alone cannot tell you.
 
 ```
 $ sbx task list
-db-query  params=sql  stdout=show  stderr=show  timeout=20s  Read-only SQL against staging
-gh-issue  params=repo  stdout=show  stderr=show  timeout=30s  List a repository's issues
+session 318106 — /home/you/work/api
+NAME      PARAMS  TIMEOUT  DESCRIPTION
+db-query  sql         20s  Read-only SQL against staging
+gh-issue  repo        30s  List a repository's issues
 ```
 
-A `missing-tools=<token>,…` field appears when a task declares
-[`packages`](../configuration/task.md#the-task-tool-pool) the pool does not hold — that task will
+**A column appears only when some operation makes it worth showing.** Above, every operation shows
+both streams and none writes a file, so those columns are absent; below, one operation hides its
+stderr and another declares an output directory, and they come back for every row:
+
+```
+$ sbx task list
+session 318106 — /home/you/work/api
+NAME       PARAMS  TIMEOUT  STDOUT  STDERR  OUTPUT  DESCRIPTION
+db-query   sql         20s  show    show    -       Read-only SQL against staging
+nightly    -           1h   show    hide    yes     Dump the reporting tables
+sbx: note: an operation marked OUTPUT writes into /opt/sbx/task-out/<operation>
+```
+
+A column that reads the same on every line is not information — it is the noise that makes a listing
+unreadable. `MISSING TOOLS` appears when an operation declares
+[`packages`](../configuration/task.md#the-task-tool-pool) the pool does not hold: that operation will
 fail at exec, and the pool is filled best-effort, so this is where you find out before invoking it.
 
-Inside the cage the session is implicit — a caller may only reach its own. On the host, name the
-session's PID when more than one is offering operations.
+Name an operation to show only that one. Inside the cage the session is implicit — a caller may only
+reach its own; on the host, `--session` names it when more than one is offering operations.
 
 ## `secrets`
 
 ```
-sbx task secrets [<id>]
+sbx task secrets [<operation>] [--session <id>]
 ```
 
 The credentials the operations carry: the variable name, the operation it belongs to, the encoding it
@@ -109,9 +125,14 @@ needs to know is which credentials an operation carries, not where they come fro
 
 ```
 $ sbx task secrets
-secret PGPASSWORD  task=db-query  encode=raw  staging database password
-secret gh_token    task=gh-issue  wire-injected for api.github.com
+session 318106 — /home/you/work/api
+NAME        OPERATION  DELIVERY               DESCRIPTION
+PGPASSWORD  db-query   env (raw)              staging database password
+gh_token    gh-issue   wire -> api.github.com
 ```
+
+`DELIVERY` is the field to read: `env (…)` means the command's own environment carries the value,
+while `wire -> <host>` means sbx attaches it to the request and the command never holds it at all.
 
 A credential's name is what a substituted value is reported as (`${PGPASSWORD}`) if it ever reaches
 the output, so keep names non-sensitive.
@@ -152,23 +173,25 @@ text could have been printed by the command itself).
 ## `status`
 
 ```
-sbx task status [<id>]
+sbx task status [<operation>] [--session <id>]
 ```
 
 What the session is running **right now** — host-only.
 
 ```
 $ sbx task status
-7 task=nightly-dump  elapsed_ms=42310  pid=318204  stopping=0
+session 318106 — /home/you/work/api
+ID  OPERATION      ELAPSED      PID  STATE
+ 7  nightly-dump     42.3s   318204  running
 ```
 
-| Field | Meaning |
+| Column | Meaning |
 |---|---|
-| the first column | the **invocation id** — what `stop` takes, and what its log line will carry |
-| `task` | which operation it is |
-| `elapsed_ms` | how long it has been running |
-| `pid` | the cage's process, for `ps` and `systemd-cgls` |
-| `stopping` | whether it has already been asked to stop |
+| `ID` | the **invocation id** — what `stop` takes, and what its log line will carry |
+| `OPERATION` | which operation it is |
+| `ELAPSED` | how long it has been running |
+| `PID` | the cage's process, for `ps` and `systemd-cgls` |
+| `STATE` | `running`, or `stopping` once it has been asked to stop |
 
 A caller blocked on its own `sbx task run` cannot see this — it is waiting for the answer. This is
 the view from another terminal, which is also the only place a stop can come from.
@@ -176,11 +199,12 @@ the view from another terminal, which is also the only place a stop can come fro
 ## `stop`
 
 ```
-sbx task stop <invocation> [--session <id>]
+sbx task stop <invocation|operation> [--session <id>]
 ```
 
-End one running invocation. The argument is an **invocation** id (as `status` shows it), not a
-session id; the session, when several offer operations, is named with `--session`.
+End one running invocation — named by the id `status` shows, or by the operation's own name when
+only one of its invocations is running. A number is read as an id first, and a name matching several
+running invocations is an error listing them rather than a guess at which to end.
 
 ```
 $ sbx task stop 7
@@ -209,7 +233,7 @@ as the stopped command left it: partial, and only the next invocation clears it.
 ## `logs`
 
 ```
-sbx task logs [<id>]
+sbx task logs [<operation>] [--session <id>]
 ```
 
 The session's invocation log — **host-only**, because the recorded party does not get to read the
@@ -217,25 +241,28 @@ record.
 
 ```
 $ sbx task logs
-event seq=1 at=1769812800 exit=0 redacted=1 truncated=0 timed_out=0 stopped=0 elapsed_ms=214 task=db-query
-event seq=2 at=1769812815 exit=-1 redacted=0 truncated=0 timed_out=0 stopped=0 elapsed_ms=0 task=db-query refused=parameter `sql` does not match its declared pattern
+session 318106 — /home/you/work/api
+ID  TIME      OPERATION  EXIT   TOOK  NOTE
+ 1  17:00:00  db-query      0  214ms  1 credential value(s) substituted
+ 2  17:00:15  db-query      -    0ms  refused: parameter `sql` does not match its declared pattern
+ 3  17:04:49  nightly       -   3.0s  stopped
 ```
 
-| Field | Meaning |
+| Column | Meaning |
 |---|---|
-| `seq` | the **invocation id** — the one `sbx task status` showed while it ran |
-| `at` | Unix seconds when the invocation finished |
-| `exit` | the command's exit code, or `-1` for a refusal |
-| `redacted` | how many credential values were substituted out |
-| `truncated` / `timed_out` / `stopped` | whether a ceiling fired, or someone ended it |
-| `elapsed_ms` | how long it took |
-| `task` | the operation's name |
-| `refused` | why it never ran (refusals are recorded too) |
+| `ID` | the **invocation id** — the one `sbx task status` showed while it ran |
+| `TIME` | local time of day when the invocation finished |
+| `OPERATION` | the operation's name |
+| `EXIT` | the command's exit code, or `-` when nothing ran |
+| `TOOK` | how long it took |
+| `NOTE` | the refusal reason, or what happened to it: stopped, timed out, output truncated, credential values substituted |
 
 The id is drawn when an invocation **starts** and its line is written when it **ends**, so two
 overlapping invocations appear in the order they finished and their ids can read out of order. A
-`seq=0` marks a request refused before it was admitted at all — the session's quota was exhausted, so
-no invocation exists for an id to name.
+blank id marks a request refused before it was admitted at all — the session's quota was exhausted,
+so no invocation exists for an id to name.
+
+Name an operation to see only its invocations.
 
 Neither the command nor any parameter value is recorded: the command is fixed by the declaration, and
 a value can carry a secret. The log is in-RAM, bounded (512 invocations, and it says how many older
