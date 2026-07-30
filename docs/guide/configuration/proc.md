@@ -3,7 +3,7 @@
 ```toml
 [proc]
 mode  = "off"            # off | observe | enforce | ask
-allow = ["git", "rg"]    # exec targets that always run
+allow = ["git", "rg"]    # exec targets that always run — only bites under `ask`
 deny  = ["curl", "ssh"]  # exec targets that are blocked
 ```
 

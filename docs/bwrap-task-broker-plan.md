@@ -261,6 +261,14 @@ there. What bounds a command:
    a rule containing `/` matches the whole path, one without matches the basename, **deny wins**.
    One grammar across the product.
 
+   This one belongs to the **free command** (§10 item 3) alone, and it is a **host-side** check on
+   the argv0 a caller supplies, decided before the cage is built. It is vacuous for a declared
+   task, whose program the trusted declaration already fixed — checking that fixed program against
+   a glob the same declaration wrote proves nothing. And it is emphatically not a bound on what the
+   command goes on to *spawn*: deciding an `execve` by path takes a user-notification supervisor,
+   whose in-cage shim would put a full sbx binary in the credential-bearing cage. A declared task
+   therefore refuses `allow`/`deny` outright rather than accepting them into silence.
+
 ### 8.2 Where metacharacters do come back
 
 When a bounded param reaches a callee that itself invokes a shell: `ssh host <cmd>`,
