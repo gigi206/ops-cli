@@ -1703,11 +1703,7 @@ mod tests {
     #[test]
     fn assemble_builds_a_hermetic_environment() {
         let spec = assembled();
-        let argv = super::super::argv::to_argv(&spec);
-        let joined = argv
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+        let joined = env_strings(&spec);
 
         let path_i = joined.iter().position(|s| s == "PATH").unwrap();
         // mise's shims dir sits between the (here empty) declared tools and the base
@@ -1897,12 +1893,22 @@ mod tests {
             .collect()
     }
 
+    /// The cage's environment as bwrap will parse it off the descriptor: the same `--setenv KEY
+    /// VALUE` triples, just not in the world-readable argument list. Its own helper, because the two
+    /// lists are genuinely different places and a test asserting on one must not read the other.
+    fn env_strings(spec: &SandboxSpec) -> Vec<String> {
+        super::super::argv::env_args(spec)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn a_config_env_value_overrides_the_structural_default() {
         // a trusted config can set PATH; its value wins, and the key is not emitted
         // twice (the structural default is replaced, not appended to).
         let spec = assemble_with(&[("PATH".to_string(), "/opt/bin".to_string())], &[], &[]);
-        let argv = argv_strings(&spec);
+        let argv = env_strings(&spec);
         let positions: Vec<usize> = argv
             .iter()
             .enumerate()
@@ -1925,7 +1931,7 @@ mod tests {
                 PathBuf::from("/nix/store/python/bin"),
             ],
         );
-        let argv = argv_strings(&spec);
+        let argv = env_strings(&spec);
         let path_i = argv.iter().position(|s| s == "PATH").unwrap();
         // declared tools first, then mise's shims, then the base userland, then the
         // synthetic `/usr/bin` (env + xdg-open, sbx-owned) so `xdg-open` resolves by name.
@@ -2118,7 +2124,8 @@ mod tests {
         // the always-on mise self-equip variables (the cage always lets an agent drive
         // mise); they come from the assembler, not the config, so an empty config still
         // adds nothing of its own.
-        let argv = argv_strings(&assemble_with(&[], &[], &[]));
+        let spec = assemble_with(&[], &[], &[]);
+        let argv = argv_strings(&spec);
         let first_ro = argv.iter().position(|s| s == "--ro-bind").unwrap();
         assert_eq!(
             argv[first_ro + 1],
@@ -2126,11 +2133,12 @@ mod tests {
             "no extra bind may precede the store"
         );
         assert_eq!(argv[first_ro + 2], "/nix", "the store binds at /nix");
-        let setenvs: Vec<&str> = argv
+        let env = env_strings(&spec);
+        let setenvs: Vec<&str> = env
             .iter()
             .enumerate()
             .filter(|(_, s)| *s == "--setenv")
-            .map(|(i, _)| argv[i + 1].as_str())
+            .map(|(i, _)| env[i + 1].as_str())
             .collect();
         assert_eq!(
             setenvs,
@@ -2715,10 +2723,7 @@ mod smoke {
         )
         .expect("build spec");
 
-        let out = Command::new(&bwrap)
-            .args(super::super::argv::to_argv(&spec))
-            .output()
-            .expect("spawn bwrap");
+        let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
@@ -2798,12 +2803,8 @@ mod smoke {
             )
             .expect("provision")
         };
-        let run = |spec: &SandboxSpec| {
-            Command::new(&bwrap)
-                .args(super::super::argv::to_argv(spec))
-                .output()
-                .expect("spawn bwrap")
-        };
+        let run =
+            |spec: &SandboxSpec| super::super::argv::run_bwrap(&bwrap, spec).expect("spawn bwrap");
 
         // --- a foreign binary is served by the shim --------------------------------
         // Forge one: take a nix `hello`, repoint its interpreter at the standard
@@ -3071,10 +3072,7 @@ mod smoke {
         let shared_paths = layout.store_dir().join("nix").join("store");
         let before = fingerprint(&shared_paths);
 
-        let out = Command::new(&bwrap)
-            .args(super::super::argv::to_argv(&spec))
-            .output()
-            .expect("spawn bwrap");
+        let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
@@ -3242,10 +3240,7 @@ mod smoke {
         let shared_paths = layout.store_dir().join("nix").join("store");
         let before = fingerprint(&shared_paths);
 
-        let out = Command::new(&bwrap)
-            .args(super::super::argv::to_argv(&spec))
-            .output()
-            .expect("spawn bwrap");
+        let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
@@ -3412,10 +3407,7 @@ mod smoke {
         let shared_paths = layout.store_dir().join("nix").join("store");
         let before = fingerprint(&shared_paths);
 
-        let out = Command::new(&bwrap)
-            .args(super::super::argv::to_argv(&spec))
-            .output()
-            .expect("spawn bwrap");
+        let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
@@ -3537,10 +3529,7 @@ mod smoke {
                 cmd,
             )
             .expect("build spec");
-            let out = Command::new(&bwrap)
-                .args(super::super::argv::to_argv(&spec))
-                .output()
-                .expect("spawn bwrap");
+            let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
             (
                 out.status.success(),
                 String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -3670,10 +3659,7 @@ mod smoke {
         )
         .expect("build spec");
 
-        let out = Command::new(&bwrap)
-            .args(super::super::argv::to_argv(&spec))
-            .output()
-            .expect("spawn bwrap");
+        let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),

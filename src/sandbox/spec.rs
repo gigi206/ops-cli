@@ -116,15 +116,16 @@ pub(crate) struct SandboxSpec {
     /// Variables to set *after* the environment is cleared, in declaration
     /// order. The clear itself is unconditional, so nothing leaks in by
     /// inheritance.
-    pub(super) env: Vec<(String, String)>,
-    /// Variables whose **values must not appear in bubblewrap's argument list**, because a process's
-    /// arguments are world-readable (`/proc/<pid>/cmdline` is mode `444`) while its environment is
-    /// not. They reach bwrap through `--args` on an anonymous in-memory file instead, so only a
-    /// descriptor number is ever visible to another uid.
     ///
-    /// They are applied **before** [`SandboxSpec::env`], which is deliberate rather than incidental:
-    /// a credential that took the name of the cage's own plumbing (`PATH`, `HOME`) must lose to the
-    /// plumbing, not displace it. A name in both is refused where the two are declared.
+    /// None of it appears in bubblewrap's argument list. A process's arguments are world-readable
+    /// (`/proc/<pid>/cmdline` is mode `444`) while its environment is not (`400`), so every variable
+    /// reaches bwrap through `--args` on an anonymous in-memory file and only a descriptor number is
+    /// ever visible to another uid.
+    pub(super) env: Vec<(String, String)>,
+    /// Credentials sbx resolved for this cage, kept apart from [`SandboxSpec::env`] for one reason:
+    /// they are applied **before** it. A credential that took the name of the cage's own plumbing
+    /// (`PATH`, `HOME`) must lose to the plumbing, not displace it — a name declared as both is
+    /// refused where the two are declared. Both travel the same way, on the same descriptor.
     pub(super) secret_env: Vec<(String, String)>,
     /// Whether the host network is shared or fully cut off.
     pub(super) net: NetPolicy,

@@ -1,13 +1,23 @@
-//! Pure translation of a [`SandboxSpec`] into a bubblewrap argv.
+//! Translation of a [`SandboxSpec`] into a bubblewrap argv.
 //!
 //! This is the security keystone's second half: [`to_argv`] adds *no* exposure
 //! of its own. Every mount, variable, and namespace it emits comes from the
 //! Spec; the only things it adds unconditionally are the mandatory hardening
 //! flags, and those only ever *remove* privilege. The returned vector is the
 //! argument list for `bwrap` — the `bwrap` program itself is not included.
+//!
+//! The cage's **environment** is the one thing that does not travel in that list. A process's
+//! arguments are world-readable (`/proc/<pid>/cmdline` is mode `444`) while its environment is not
+//! (`400`), so `--setenv VAR <value>` publishes every value to every uid on the machine for as long
+//! as the cage runs. The variables go on a descriptor instead ([`compose`]), which is where the two
+//! halves meet: [`to_argv`] stays pure and marks the place, and `compose` — the one impure step —
+//! creates the descriptor and fills its number in.
 
 use super::spec::{Mount, NetPolicy, SandboxSpec, TerminalPolicy};
 use std::ffi::OsString;
+use std::fs::File;
+use std::io;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 fn lit(s: &str) -> OsString {
@@ -18,13 +28,57 @@ fn path(p: &Path) -> OsString {
     p.as_os_str().to_os_string()
 }
 
-/// What stands in for the descriptor carrying [`SandboxSpec::secret_env`] until the one impure
-/// caller can create it. Not a number, so a spec that skipped that step cannot accidentally name a
-/// descriptor this process happens to hold.
-pub(crate) const SECRET_ARGS_PLACEHOLDER: &str = "@sbx-secret-args";
+/// What stands in for the descriptor carrying the cage's environment until [`compose`] can create
+/// it. Not a number, so a spec that skipped that step cannot accidentally name a descriptor this
+/// process happens to hold — bwrap refuses it loudly instead.
+pub(crate) const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
+
+/// The bubblewrap argument list for `spec`, ready to exec, plus the descriptor it must inherit to
+/// read the cage's environment (`None` when the cage sets no variables at all).
+///
+/// **Hold the returned file** until bwrap has read it: the descriptor is deliberately not
+/// close-on-exec, and dropping the `File` closes the number the argv points at.
+pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Option<File>)> {
+    let mut argv = to_argv(spec);
+    let Some(file) = env_fd(spec)? else {
+        return Ok((argv, None));
+    };
+    // The placeholder becomes the descriptor's number here, and only here: this is the one step that
+    // can create it, which is what keeps [`to_argv`] pure.
+    let fd = OsString::from(file.as_raw_fd().to_string());
+    for arg in argv.iter_mut() {
+        if arg == ENV_ARGS_PLACEHOLDER {
+            arg.clone_from(&fd);
+        }
+    }
+    Ok((argv, Some(file)))
+}
+
+/// The descriptor carrying the cage's environment, in bwrap's own `--args` encoding (NUL-separated
+/// arguments), or `None` when the cage sets no variables.
+///
+/// Credentials are written **first**, so a variable named after the cage's own plumbing (`PATH`,
+/// `HOME`) wins over a credential that took its name — the plumbing is what the cage needs to work,
+/// and a credential is never the right answer to `PATH`. (Declaring one name as both is already
+/// refused at load: one name, one source.)
+fn env_fd(spec: &SandboxSpec) -> io::Result<Option<File>> {
+    if spec.env.is_empty() && spec.secret_env.is_empty() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    for (key, value) in spec.secret_env.iter().chain(spec.env.iter()) {
+        for part in ["--setenv", key.as_str(), value.as_str()] {
+            bytes.extend_from_slice(part.as_bytes());
+            bytes.push(0);
+        }
+    }
+    super::memfd::write(c"sbx-args", &bytes).map(Some)
+}
 
 /// Build the bubblewrap argument list for `spec`. Pure: same Spec in, same argv
-/// out, no I/O and no globals read. The launcher feeds the result to `bwrap`.
+/// out, no I/O and no globals read. The environment is represented by the
+/// [`ENV_ARGS_PLACEHOLDER`] that [`compose`] resolves — nothing here is what
+/// bwrap is finally given.
 pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
 
@@ -85,26 +139,17 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
         a.push(lit("--new-session"));
     }
 
-    // The variables whose values must not be readable by every uid on the machine: they arrive on a
-    // descriptor rather than here, and this is only the placeholder marking where they are spliced
-    // in. `to_argv` is pure and creating that descriptor is not, so the number is filled in by the
-    // one caller that can — a placeholder that reached bwrap would be refused as an invalid fd,
-    // loudly, rather than silently dropping a credential.
+    // Environment: rebuilt from nothing, entry by entry in declaration order — but on a descriptor,
+    // never here. A value in the argument list is readable by every uid on the machine; the same
+    // value in the environment is not. This is only the placeholder marking where the descriptor's
+    // arguments are spliced in, filled in by `compose`; one that reached bwrap is refused as an
+    // invalid fd, loudly, rather than silently dropping the cage's environment.
     //
-    // Position is load-bearing twice over: after `--clearenv`, which would otherwise wipe them, and
-    // before the ordinary variables below, so a credential named after the cage's own plumbing
-    // loses to the plumbing instead of replacing it.
-    if !spec.secret_env.is_empty() {
+    // Position is load-bearing: after `--clearenv`, which would otherwise wipe everything the
+    // descriptor sets. What is *inside* it is ordered by `env_fd`.
+    if !spec.env.is_empty() || !spec.secret_env.is_empty() {
         a.push(lit("--args"));
-        a.push(lit(SECRET_ARGS_PLACEHOLDER));
-    }
-
-    // Environment: rebuilt from nothing, entry by entry in declaration order.
-    // The clear above guarantees no host variable survives.
-    for (k, v) in &spec.env {
-        a.push(lit("--setenv"));
-        a.push(lit(k));
-        a.push(lit(v));
+        a.push(lit(ENV_ARGS_PLACEHOLDER));
     }
 
     // Filesystem: the Spec's mounts, in order. A later mount shadows an earlier
@@ -162,6 +207,32 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     a.extend(spec.cmd.iter().cloned());
 
     a
+}
+
+/// Launch `spec` through the real bwrap and wait for it. The one correct way to do that from a
+/// test: the descriptor stays open across the run, which a hand-assembled `Command` would drop —
+/// bwrap then reports `Invalid fd` instead of a result.
+#[cfg(test)]
+pub(super) fn run_bwrap(bwrap: &Path, spec: &SandboxSpec) -> io::Result<std::process::Output> {
+    let (argv, _env) = compose(spec)?;
+    std::process::Command::new(bwrap).args(argv).output()
+}
+
+/// The arguments the descriptor carries, read back as bwrap will parse them — the cage's
+/// environment, which is no longer anywhere in the argv. The one way a test can ask "what variables
+/// does this cage actually get?", so no module has to reimplement the encoding to find out.
+#[cfg(test)]
+pub(super) fn env_args(spec: &SandboxSpec) -> Vec<OsString> {
+    use std::io::Read;
+    let Some(mut file) = env_fd(spec).expect("a descriptor for the cage environment") else {
+        return Vec::new();
+    };
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw).expect("read the descriptor");
+    raw.split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| OsString::from(String::from_utf8_lossy(part).into_owned()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -276,21 +347,68 @@ mod tests {
         assert_eq!(argv[gid + 1], OsString::from("4343"));
     }
 
+    /// The environment is set from nothing, and set **off the argument list**: a value there is
+    /// readable by every uid on the machine (`/proc/<pid>/cmdline` is mode `444`) while the same
+    /// value in the environment is not (`400`).
     #[test]
-    fn the_environment_is_cleared_before_anything_is_set() {
+    fn the_environment_is_cleared_and_then_set_off_the_argument_list() {
         let env = vec![
             ("HOME".to_string(), "/home/sandbox".to_string()),
             ("TERM".to_string(), "dumb".to_string()),
         ];
-        let argv = to_argv(&spec(vec![], env, NetPolicy::Shared));
+        let s = spec(vec![], env, NetPolicy::Shared);
+        let argv = to_argv(&s);
 
+        assert!(
+            index_of(&argv, "--setenv").is_none(),
+            "no variable may be an argument: {argv:?}"
+        );
         let clear = index_of(&argv, "--clearenv").expect("--clearenv present");
-        let first_set = index_of(&argv, "--setenv").expect("--setenv present");
-        assert!(clear < first_set, "clearenv must precede setenv: {argv:?}");
+        let args = index_of(&argv, "--args").expect("--args present");
+        assert!(
+            clear < args,
+            "spliced before the clear, the descriptor's variables would be wiped: {argv:?}"
+        );
+        assert_eq!(argv[args + 1], OsString::from(ENV_ARGS_PLACEHOLDER));
 
-        // each variable is emitted as the triple [--setenv, KEY, VALUE]
-        assert_eq!(argv[first_set + 1], OsString::from("HOME"));
-        assert_eq!(argv[first_set + 2], OsString::from("/home/sandbox"));
+        // On the descriptor, each variable is the same triple bwrap would have taken as arguments.
+        let carried = env_args(&s);
+        assert_eq!(
+            carried,
+            [
+                "--setenv",
+                "HOME",
+                "/home/sandbox",
+                "--setenv",
+                "TERM",
+                "dumb"
+            ]
+            .map(OsString::from)
+            .to_vec()
+        );
+    }
+
+    /// Credentials are written ahead of the plain environment, so a credential that took the name of
+    /// the cage's own plumbing loses to the plumbing rather than replacing it.
+    #[test]
+    fn a_credential_is_applied_before_the_plumbing_that_could_share_its_name() {
+        let s = spec(
+            vec![],
+            vec![("PATH".to_string(), "/bin".to_string())],
+            NetPolicy::Shared,
+        )
+        .with_secret_env(vec![("TOKEN".to_string(), "s3cret".to_string())]);
+        let carried = env_args(&s);
+        let token = carried.iter().position(|a| a == "TOKEN").expect("TOKEN");
+        let path = carried.iter().position(|a| a == "PATH").expect("PATH");
+        assert!(token < path, "{carried:?}");
+    }
+
+    /// A cage that sets nothing needs no descriptor, and says nothing about one.
+    #[test]
+    fn a_cage_with_no_environment_names_no_descriptor() {
+        let argv = to_argv(&spec(vec![], vec![], NetPolicy::Shared));
+        assert!(index_of(&argv, "--args").is_none(), "{argv:?}");
     }
 
     #[test]

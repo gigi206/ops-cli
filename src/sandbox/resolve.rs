@@ -10,7 +10,6 @@
 //! each backend supplies its own URL validator (`.tar.gz` vs `.deb`) and builds the resolved URL its
 //! own way.
 
-use super::argv::to_argv;
 use super::spec::{Mount, NetPolicy, SandboxSpec};
 use std::ffi::OsString;
 use std::io;
@@ -131,8 +130,10 @@ pub(crate) fn resolve_url(
             "cannot build the resolve sandbox for `{name}`: {e:?}"
         ))
     })?;
+    // `_env` keeps the descriptor carrying the cage's environment open until bwrap has read it.
+    let (argv, _env) = super::argv::compose(&spec)?;
     let out = Command::new(cage.bwrap)
-        .args(to_argv(&spec))
+        .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -220,7 +221,9 @@ mod tests {
         );
         let command = vec!["sh".to_string(), "-c".to_string(), "curl -s x".to_string()];
         let spec = resolve_cage_spec(&cage, &command).expect("valid spec");
-        let argv = to_argv(&spec);
+        let argv = super::super::argv::to_argv(&spec);
+        // The cage's variables travel on a descriptor, not in the world-readable argument list.
+        let env = super::super::argv::env_args(&spec);
 
         // sbx's store is bound at /nix (hermetic — never the host /usr), /bin/sh points at the base bash
         assert!(contains_pair(&argv, "--ro-bind", "/data/store/nix"));
@@ -238,16 +241,20 @@ mod tests {
             "/data/store/nix/store/def-cacert/etc/ssl/certs/ca-bundle.crt"
         ));
         assert!(contains_setenv(
-            &argv,
+            &env,
             "SSL_CERT_FILE",
             "/etc/ssl/certs/ca-bundle.crt"
         ));
         // PATH is /bin (for the sh symlink) plus the app's nix: bins (so `jq = "nix:jq"` reaches it)
         assert!(contains_setenv(
-            &argv,
+            &env,
             "PATH",
             "/bin:/nix/store/ghi-curl/bin"
         ));
+        assert!(
+            !argv.iter().any(|a| a == "--setenv"),
+            "no variable may reach the argument list: {argv:?}"
+        );
         // the command is passed verbatim as the argv after `--`
         let dashes = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(

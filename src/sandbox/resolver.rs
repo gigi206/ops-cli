@@ -24,7 +24,6 @@
 //! the unconditional hardening (all namespaces, dropped capabilities, a cleared environment, a
 //! fresh session, die-with-parent) for free; the runner only adds the manifest's grant on top.
 
-use super::argv::to_argv;
 use super::spec::{Mount, NetPolicy, SandboxSpec, SpecError};
 use crate::plugins::ResolverPlugin;
 use std::ffi::OsString;
@@ -66,8 +65,13 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
         )
     })?;
 
+    // `_env` holds the descriptor the cage's environment is read from open until bwrap has run —
+    // and the reason it is a descriptor is this cage in particular: a plugin's `allow_env` is how a
+    // resolver is handed its *own* credential (a vault token, an age key), and an argument list is
+    // world-readable.
+    let (argv, _env) = super::argv::compose(&spec)?;
     let out = Command::new(bwrap)
-        .args(to_argv(&spec))
+        .args(argv)
         // No stdin: a resolver must not read or block on sbx's stdin.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -253,7 +257,10 @@ mod tests {
             &[("GNUPGHOME".into(), "/home/u/.gnupg".into())],
         )
         .expect("valid spec");
-        let argv = to_argv(&spec);
+        let argv = super::super::argv::to_argv(&spec);
+        // The cage's variables are not in the argument list at all — a plugin's `allow_env` is how a
+        // resolver is handed its own credential, so they travel on a descriptor.
+        let env = super::super::argv::env_args(&spec);
 
         // an empty network namespace when the grant does not ask for the network
         assert!(argv.iter().any(|a| a == "--unshare-net"), "{argv:?}");
@@ -270,13 +277,18 @@ mod tests {
         assert!(contains_pair(&argv, "--ro-bind", &p.dir.to_string_lossy()));
         assert!(contains_pair(&argv, "--ro-bind-try", "/home/u/.gnupg"));
         // the pass-through env is present, and structural HOME/PATH are set
-        assert!(contains_pair(&argv, "--setenv", "GNUPGHOME"));
-        assert!(contains_setenv(&argv, "HOME", CAGE_HOME));
-        assert!(contains_setenv(&argv, "PATH", "/usr/bin:/bin"));
+        assert!(contains_pair(&env, "--setenv", "GNUPGHOME"));
+        assert!(contains_setenv(&env, "HOME", CAGE_HOME));
+        assert!(contains_setenv(&env, "PATH", "/usr/bin:/bin"));
         // structural HOME/PATH come last, so they win over any pass-through naming them
-        let gnupg = setenv_index(&argv, "GNUPGHOME").unwrap();
-        let home = setenv_index(&argv, "HOME").unwrap();
+        let gnupg = setenv_index(&env, "GNUPGHOME").unwrap();
+        let home = setenv_index(&env, "HOME").unwrap();
         assert!(home > gnupg, "structural env must follow the pass-throughs");
+        // and none of it is readable off `/proc/<pid>/cmdline`
+        assert!(
+            !argv.iter().any(|a| a == "--setenv"),
+            "no variable may reach the argument list: {argv:?}"
+        );
     }
 
     #[test]
@@ -288,7 +300,7 @@ mod tests {
             network: true,
         };
         let spec = cage_spec(&plugin_in(dir.path(), grant), "vault://x", &[]).expect("valid spec");
-        let argv = to_argv(&spec);
+        let argv = super::super::argv::to_argv(&spec);
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
             "network grant shares the net"

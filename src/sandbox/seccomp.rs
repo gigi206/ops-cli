@@ -937,12 +937,15 @@ mod tests {
         let spec = probe_spec(probe);
         let memfds = memfds(policy).expect("memfds");
         let mut argv = argv_prefix(&memfds);
-        argv.extend(super::super::argv::to_argv(&spec));
+        let (spec_argv, env) = super::super::argv::compose(&spec).expect("compose");
+        argv.extend(spec_argv);
         let out = Command::new(&bwrap)
             .args(argv)
             .output()
             .expect("launch bwrap");
-        drop(memfds); // kept alive until bwrap has read the inherited descriptors
+        // Both kinds of anonymous file stay alive until bwrap has read the inherited descriptors:
+        // the compiled filters, and the cage's environment.
+        drop((memfds, env));
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
             out.status.success(),

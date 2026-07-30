@@ -90,6 +90,25 @@ applies from an untrusted project (minus a reserved-key denylist). Trust is boun
 the file's content hash on the direnv model, so any edit re-arms the gate. See
 [The trust gate](trust.md).
 
+## The cage's environment is not readable by other users
+
+A process's argument list is world-readable: `/proc/<pid>/cmdline` is mode `444`, so
+**any** user on the machine can read every argument of every running process. Its
+environment is not — `/proc/<pid>/environ` is `400`, readable only by its owner.
+
+So a cage's variables never travel as bubblewrap arguments. `sbx` writes them to an
+anonymous in-memory file and hands bubblewrap the descriptor; only a small number
+appears in the argument list. This covers everything a cage's environment carries: a
+credential `sbx` resolved for a [declared operation](../cli/task.md), a plugin's
+`allow_env` pass-through, and a plain `[env]` value you wrote yourself — a token
+hard-coded there has exactly the same exposure as a resolved one, so it gets exactly
+the same treatment.
+
+What remains in the argument list is the mount layout and the command itself. A
+command's own text is unavoidably an argument — it is what the cage is asked to run —
+so **do not put a secret in a command line**; declare it as a credential and read it
+from the environment.
+
 ## Defense in depth
 
 Beyond the bind layout, every cage runs with an always-on [enforcement

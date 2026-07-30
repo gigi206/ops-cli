@@ -5230,40 +5230,12 @@ fn mise_roll_recap(rolled: &[String], up_to_date: usize, skipped: usize, failed:
 pub(super) fn seccomp_argv(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
     let mut memfds = super::seccomp::memfds(&spec.seccomp)?;
     let mut argv = super::seccomp::argv_prefix(&memfds);
-    argv.extend(super::argv::to_argv(spec));
-    if let Some(secrets) = secret_args(spec)? {
-        // The placeholder becomes the descriptor's number here, and only here: this is the one place
-        // that can create it, which is what keeps [`super::argv::to_argv`] pure.
-        let fd = secrets.as_raw_fd().to_string();
-        for arg in argv.iter_mut() {
-            if arg == super::argv::SECRET_ARGS_PLACEHOLDER {
-                *arg = OsString::from(&fd);
-            }
-        }
-        memfds.push(secrets);
-    }
+    let (spec_argv, env) = super::argv::compose(spec)?;
+    argv.extend(spec_argv);
+    // The environment's descriptor joins the filters' in the same vector, because they have the same
+    // lifetime requirement: bwrap must still be able to read all of them at the exec.
+    memfds.extend(env);
     Ok((argv, memfds))
-}
-
-/// The descriptor carrying the spec's out-of-argv variables, in bwrap's own `--args` encoding
-/// (NUL-separated arguments), or `None` when the spec declares none.
-///
-/// Why they are not in the argument list: a process's arguments are world-readable
-/// (`/proc/<pid>/cmdline` is mode `444`) while its environment is not. A credential passed as
-/// `--setenv VAR <value>` is therefore readable by every uid on the machine for as long as the cage
-/// runs — measured on a live invocation, not inferred.
-fn secret_args(spec: &SandboxSpec) -> io::Result<Option<File>> {
-    if spec.secret_env.is_empty() {
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    for (key, value) in &spec.secret_env {
-        for part in ["--setenv", key.as_str(), value.as_str()] {
-            bytes.extend_from_slice(part.as_bytes());
-            bytes.push(0);
-        }
-    }
-    super::memfd::write(c"sbx-args", &bytes).map(Some)
 }
 
 /// A process's exit code in the shell convention: its own code, or 128 + the signal that
@@ -5310,17 +5282,15 @@ fn supervise(
     limits: &super::cgroup::Limits,
     gui: bool,
 ) -> io::Result<i32> {
-    // The seccomp filters are loaded into anonymous files *before* the fork so the
-    // child inherits their descriptors; the parent holds `seccomp` alive through
-    // `pump` so the descriptors stay open until bwrap has read them.
-    let seccomp = super::seccomp::memfds(&spec.seccomp)?;
-
     // Build the bwrap argv (seccomp prefix + the hardened spec), then wrap it in
     // the resource-limit scope: the program may become `systemd-run` with bwrap
     // spliced in after `--`. Compose as C strings *before* forking — nothing
     // between fork and exec may allocate.
-    let mut bwrap_argv = super::seccomp::argv_prefix(&seccomp);
-    bwrap_argv.extend(super::argv::to_argv(spec));
+    //
+    // The anonymous files behind it — the seccomp filters and the cage's environment — are created
+    // here, *before* the fork, so the child inherits their descriptors; the parent holds them alive
+    // through `pump` so bwrap can still read them after the exec.
+    let (bwrap_argv, _keep_open) = seccomp_argv(spec)?;
     // Route a graphical isolated cage through the netns holder (dummy interface; see `super::netns`);
     // a no-op passthrough otherwise.
     let (holder_prog, holder_argv) =
@@ -5496,22 +5466,26 @@ mod tests {
 
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
 
-    /// A credential must never reach bubblewrap's **argument list**: `/proc/<pid>/cmdline` is mode
-    /// `444`, so every uid on the machine could read it for as long as the cage runs, while
-    /// `/proc/<pid>/environ` is `400`. Measured on a live invocation before this existed — the
-    /// sentinel was sitting there next to `--setenv`.
+    /// Nothing a cage's environment carries may reach bubblewrap's **argument list**:
+    /// `/proc/<pid>/cmdline` is mode `444`, so every uid on the machine could read it for as long as
+    /// the cage runs, while `/proc/<pid>/environ` is `400`. Measured on a live invocation before
+    /// this existed — the sentinel was sitting there next to `--setenv`.
     ///
     /// This asserts on the production function, so the property holds for whatever a spec is built
     /// from rather than for one hand-written argv.
     #[test]
-    fn a_credential_never_reaches_the_world_readable_argument_list() {
+    fn no_variable_reaches_the_world_readable_argument_list() {
         use std::io::Read;
         const SENTINEL: &str = "s3nt1nel-v4lue-xyz";
+        const WRITTEN: &str = "hardcoded-in-a-config";
 
         let spec = SandboxSpec::new(
             PathBuf::from("/w"),
             Vec::new(),
-            vec![("PATH".to_string(), "/bin".to_string())],
+            vec![
+                ("PATH".to_string(), "/bin".to_string()),
+                ("API_TOKEN".to_string(), WRITTEN.to_string()),
+            ],
             NetPolicy::Isolated,
             vec![OsString::from("/bin/true")],
         )
@@ -5523,17 +5497,25 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        for hidden in [SENTINEL, WRITTEN] {
+            assert!(
+                !flat.iter().any(|a| a.contains(hidden)),
+                "no value may be in the argument list: {flat:?}"
+            );
+        }
+        for name in ["PGPASSWORD", "API_TOKEN"] {
+            assert!(
+                !flat.iter().any(|a| a == name),
+                "nor a name, which would say which variable to go and read: {flat:?}"
+            );
+        }
         assert!(
-            !flat.iter().any(|a| a.contains(SENTINEL)),
-            "the value must not be in the argument list: {flat:?}"
-        );
-        assert!(
-            !flat.iter().any(|a| a == "PGPASSWORD"),
-            "nor its name, which would say which variable to go and read: {flat:?}"
+            !flat.iter().any(|a| a == "--setenv"),
+            "the whole environment travels on the descriptor: {flat:?}"
         );
 
         // It reaches bwrap on a descriptor instead, spliced where the placeholder was — after
-        // `--clearenv` (which would otherwise wipe it) and before the ordinary variables.
+        // `--clearenv`, which would otherwise wipe everything it sets.
         let at = flat.iter().position(|a| a == "--args").expect("--args");
         let fd: i32 = flat[at + 1]
             .parse()
@@ -5545,10 +5527,6 @@ mod tests {
                 < at,
             "spliced before the clear, its variables would be wiped: {flat:?}"
         );
-        assert!(
-            at < flat.iter().position(|a| a == "--setenv").expect("--setenv"),
-            "the plumbing must win a name collision, so it is applied last: {flat:?}"
-        );
 
         let mut carried = String::new();
         files
@@ -5559,20 +5537,22 @@ mod tests {
             .expect("clone")
             .read_to_string(&mut carried)
             .expect("read");
+        // Credentials first, so a variable named after the cage's own plumbing wins over one that
+        // took its name. bwrap reads NUL-separated arguments.
         assert_eq!(
             carried,
-            format!("--setenv\0PGPASSWORD\0{SENTINEL}\0"),
-            "bwrap reads NUL-separated arguments"
+            format!("--setenv\0PGPASSWORD\0{SENTINEL}\0--setenv\0PATH\0/bin\0--setenv\0API_TOKEN\0{WRITTEN}\0")
         );
     }
 
-    /// A spec with no credential is unchanged — no descriptor, no placeholder, nothing to explain.
+    /// A cage that sets no variables at all gains no descriptor — an unused mechanism leaves no
+    /// trace to explain.
     #[test]
-    fn a_spec_with_no_credential_gains_no_descriptor() {
+    fn a_spec_with_no_environment_gains_no_descriptor() {
         let spec = SandboxSpec::new(
             PathBuf::from("/w"),
             Vec::new(),
-            vec![("PATH".to_string(), "/bin".to_string())],
+            Vec::new(),
             NetPolicy::Isolated,
             vec![OsString::from("/bin/true")],
         )

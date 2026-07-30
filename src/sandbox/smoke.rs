@@ -15,7 +15,6 @@
 //! touches nix or the store. Its working directory is a throwaway temp dir,
 //! removed on drop, so the check leaves nothing behind on the host.
 
-use super::argv::to_argv;
 use super::spec::{Mount, NetPolicy, SandboxSpec};
 use std::ffi::OsString;
 use std::io;
@@ -69,12 +68,14 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let spec = probe_spec(work.path(), script)?;
     // Load the mandatory seccomp filters too, so `doctor` proves the real launch
     // path — hardening *and* filter — works on this host, not just the namespaces.
-    // The memfds stay alive until `output` returns (bwrap reads them at startup).
+    // The anonymous files (the filters, and the cage's environment) stay alive
+    // until `output` returns, because bwrap reads them at startup.
     let seccomp = super::seccomp::memfds(&spec.seccomp)?;
     let mut argv = super::seccomp::argv_prefix(&seccomp);
-    argv.extend(to_argv(&spec));
+    let (spec_argv, env) = super::argv::compose(&spec)?;
+    argv.extend(spec_argv);
     let out = Command::new(bwrap).args(argv).output()?;
-    drop(seccomp);
+    drop((seccomp, env));
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     Ok(SmokeReport {
