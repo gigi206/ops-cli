@@ -724,6 +724,63 @@ mod tests {
         path
     }
 
+    /// Start a freshly written executable, waiting out `ETXTBSY`.
+    ///
+    /// Writing a file and then executing it is racy in a multi-threaded process: while the write is
+    /// in flight its descriptor is inherited by whatever any *other* thread forks in that instant,
+    /// and the kernel refuses to exec a file some process holds open for writing. The descriptor is
+    /// close-on-exec, so the window shuts on its own the moment that other child execs — waiting is
+    /// the whole fix. A test binary runs many threads spawning many processes, which is what makes
+    /// this worth handling here.
+    fn spawn_shim(cmd: &mut std::process::Command) -> std::process::Child {
+        for _ in 0..100 {
+            match cmd.spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                other => return other.expect("spawn the shim"),
+            }
+        }
+        panic!("the shim stayed held open for writing");
+    }
+
+    /// The wait above is what keeps the tests below deterministic, so it is proved rather than
+    /// assumed: a descriptor held open for writing does refuse the exec, and releasing it lets the
+    /// very same spawn through.
+    #[test]
+    fn a_shim_held_open_for_writing_is_waited_out_rather_than_failed() {
+        let dir = TmpDir::new();
+        let shim = materialized_shim(&dir);
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&shim)
+            .expect("hold the shim open for writing");
+
+        assert_eq!(
+            std::process::Command::new(&shim)
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .err()
+                .and_then(|e| e.raw_os_error()),
+            Some(libc::ETXTBSY),
+            "a held-open executable must be refused, or this proves nothing"
+        );
+
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(writer);
+        });
+        let status =
+            spawn_shim(std::process::Command::new(&shim).stderr(std::process::Stdio::null()))
+                .wait()
+                .expect("wait for the shim");
+        assert_eq!(
+            status.code(),
+            Some(2),
+            "the shim ran (and reported its usage) once the writer let go"
+        );
+    }
+
     /// Run the real shim against a real supervisor and return `(shim exit code, the ring)`.
     ///
     /// The harness is the production shape: a listening socket the shim connects back to, the shim
@@ -740,12 +797,12 @@ mod tests {
         let sock_path = dir.join("notif.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
 
-        let mut child = std::process::Command::new(&shim)
-            .arg(&sock_path)
-            .arg("--")
-            .arg(payload)
-            .spawn()
-            .expect("spawn the shim");
+        let mut child = spawn_shim(
+            std::process::Command::new(&shim)
+                .arg(&sock_path)
+                .arg("--")
+                .arg(payload),
+        );
 
         let (sock, _) = listener.accept().expect("the shim never connected");
         let notif = recv_fd(&sock).expect("receive the listener fd");
@@ -843,13 +900,15 @@ mod tests {
         let shim = materialized_shim(&dir);
         let marker = dir.join("the-payload-ran");
 
-        let status = std::process::Command::new(&shim)
-            .arg(dir.join("nothing-is-listening.sock"))
-            .arg("--")
-            .arg("/bin/touch")
-            .arg(&marker)
-            .status()
-            .expect("spawn the shim");
+        let status = spawn_shim(
+            std::process::Command::new(&shim)
+                .arg(dir.join("nothing-is-listening.sock"))
+                .arg("--")
+                .arg("/bin/touch")
+                .arg(&marker),
+        )
+        .wait()
+        .expect("wait for the shim");
 
         assert_eq!(
             status.code(),
