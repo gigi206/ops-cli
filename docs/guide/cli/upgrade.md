@@ -36,6 +36,11 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
   (host-side, under a `task pool` line), leaving `nixpkgs.lock` intact.
 - `sbx upgrade flake` re-pins the project's and apps' `flake:` packages.
 
+A roll that fails with `403 rate limit exceeded` and `github auth: no` is not a
+misconfiguration: mise's `aqua:` backend reads the GitHub API, whose anonymous ceiling is
+60 requests an hour per IP, and a cage inherits no token from your shell by design. See
+[authenticating the GitHub API](../configuration/secret.md#worked-example-authenticating-the-github-api).
+
 ### Targeting another project
 
 By default a roll acts on the project in the current directory. `--project <path>` runs

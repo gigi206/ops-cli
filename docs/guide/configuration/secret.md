@@ -103,6 +103,50 @@ Because `defaults` is reserved, a host cannot be named `defaults`.
 Built-in resolvers are `env://`, `file://`, `sops://`; more come from
 [resolver plugins](../secrets/plugins.md). See [Resolvers](../secrets/resolvers.md).
 
+## Worked example: authenticating the GitHub API
+
+The one most installations end up needing. mise's `aqua:` backend reads the GitHub API to
+resolve a tool's release, and **anonymously that is 60 requests an hour per IP** — which a
+couple of [`sbx upgrade mise`](../cli/upgrade.md) runs across several apps exhausts. The
+symptom is a roll that fails mid-way:
+
+```
+mise ERROR Failed to install aqua:owner/tool@latest: HTTP status client error
+           (403 rate limit exceeded) for url (https://api.github.com/…)
+       github auth: no
+       github rate limit: 0/60 (core)
+```
+
+`github auth: no` is not a misconfiguration — a cage inherits **three** variables from the
+host (`TERM`, `LANG`, `LC_ALL`) and nothing else, so a `GITHUB_TOKEN` set in your shell is
+correctly invisible inside it. The fix is not to let it in, but to inject it on the wire:
+
+```toml
+[secret."api.github.com"]
+from   = "env://GITHUB_TOKEN"
+header = "Authorization"
+type   = "bearer"
+```
+
+`env://` is read **host-side**, from sbx's own environment — where your token already is.
+The authenticated ceiling is 5000/hour, and it is a *separate* counter from the anonymous
+one, so this takes effect immediately rather than at the next hourly reset. Verify it from
+inside a cage:
+
+```sh
+$ sbx run -- curl -sS https://api.github.com/rate_limit
+{"resources":{"core":{"limit":5000,"used":0,"remaining":5000, …
+```
+
+`"limit": 5000` means the header arrived; `60` means it did not — check that the cage is
+under a filtering `network` posture (the proxy is what injects) and that its allowlist
+reaches `api.github.com`.
+
+**Scope it deliberately.** Declared globally, every cage whose allowlist reaches that host
+has its requests authenticated *as you*. It still never sees the token, but it acts with
+your identity on that API within whatever its allowlist permits. Put the block in a single
+app profile (below) to narrow that to one tool.
+
 ## Per-app secrets
 
 An `[app.<name>.secret]` section declares credentials for that app, gated and
