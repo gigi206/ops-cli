@@ -749,6 +749,14 @@ pub(crate) struct RawTask {
     pub(crate) timeout: Option<String>,
     /// This task's captured-output ceiling, overriding `[task.defaults] max_output`.
     pub(crate) max_output: Option<String>,
+    /// Whether this task gets a writable output directory that outlives the invocation.
+    ///
+    /// A task cage is otherwise entirely ephemeral — a tmpfs `$HOME`, a tmpfs `/tmp`, a read-only
+    /// project — so a command that produces a file has nowhere to leave it. With this set, one
+    /// directory is bound writable for the invocation, `{out}` substitutes to it, and the session's
+    /// agent can read what was left there afterwards.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) output: bool,
     /// The programs this task's command may run, beside the command itself. Absent means no exec
     /// supervision at all; present — **including empty** — stands one up, and then only the command
     /// and what is listed here may `execve`. Each entry is resolved to the absolute in-cage path it

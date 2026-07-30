@@ -255,6 +255,9 @@ fn task_run(args: &[OsString]) -> ExitCode {
     if result.truncated {
         diag::warn("the output reached the operation's `max_output` and was truncated");
     }
+    if let Some((path, bytes)) = &result.output {
+        diag::note(&format!("the operation wrote {bytes} byte(s) to {path}"));
+    }
     // What `spawn` refused. Reported for the same reason as truncation: the refusal leaves no trace
     // in the result — the program that was refused decides whether to mention it, and many do not,
     // so an empty output would otherwise read as a command that simply found nothing.

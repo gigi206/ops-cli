@@ -79,6 +79,7 @@ oracle over the credential.
 | `network` | the egress this task's cage gets, as allowlist entries (empty = no network) |
 | `packages` | the `mise:` tools the command needs (see [below](#which-binaries-a-task-may-run)) |
 | `spawn` | the programs the command may run beside itself — absent means no supervision (see [below](#what-the-command-may-run-spawn)) |
+| `output` | give the invocation a writable directory whose contents outlive it (see [below](#producing-a-file-output)) |
 
 ### Parameters
 
@@ -271,6 +272,62 @@ Two are different:
   installs it into a pool of its own (below).
 - an **inline `[flakes.<name>]`** flake builds in-cage to an out-link under the agent's `$HOME`,
   which a task cage does not have. Use a remote `flake:` reference, which builds host-side.
+
+### Producing a file: `output`
+
+A task cage keeps nothing. `$HOME` and `/tmp` are fresh tmpfs that die with the invocation, the
+project is read-only, and the store is read-only — so a command that produces a file has nowhere to
+leave it, and the only way out is `stdout` (capped at `max_output`).
+
+`output = true` gives the invocation **one** writable directory whose contents survive it:
+
+```toml
+[task.dump]
+cmd     = ["pg_dump", "-h", "db.internal", "-f", "{out}/staging.sql", "appdb"]
+secret  = { PGPASSWORD = "sops://db.yaml#pg" }
+network = ["tcp://db.internal:5432"]
+spawn   = []
+output  = true
+```
+
+`{out}` substitutes to that directory, and `$SBX_TASK_OUT` names it for a command that takes its
+destination from the environment instead. **`{out}` is not a parameter** — sbx fills it — because a
+caller who could choose where a credential-bearing command writes would choose the project. A
+parameter named `out` is refused for the same reason, and `{out}` without `output = true` is refused
+at load rather than substituting from nothing.
+
+**The path is predictable, so the caller does not have to be told it.** Each task gets *its own*
+directory, readable from the session's cage at:
+
+```
+/opt/sbx/task-out/<task>/
+```
+
+The invocation reports it anyway, with the size, so "it produced something" is visible at the point
+of use:
+
+```console
+$ sbx task run dump
+sbx: the operation wrote 41231872 byte(s) to /opt/sbx/task-out/dump
+```
+
+**Read-only for the agent, writable for the task.** The inverse of the intuition, and deliberate: an
+agent that could write there would plant the input a credential-bearing command later reads back
+(`psql -f {out}/script.sql`), taking back control of what the privileged operation does.
+
+**It is emptied when the invocation claims it.** A predictable path is only honest if what sits there
+is *this* invocation's work; otherwise a caller reads the previous artifact and cannot tell. If you
+want to keep an artifact, copy it out. For the same reason, a second invocation of the same task is
+**refused** while the first still holds the directory — two would interleave in one place.
+
+**It is a real directory, never a tmpfs.** A tmpfs is RAM: a 300 MiB dump would be 300 MiB of memory,
+and the cage's own cgroup would kill it. The directory lives under the project's runtime tree, so
+`sbx gc` and `sbx projects rm` reclaim it with everything else that belongs to the project.
+
+**This channel is not redacted.** Secret substitution covers `stdout` and `stderr`; a *file* the
+command writes is not scanned. What bounds the risk is the choice of command by a trusted
+declaration — `pg_dump` does not write its environment into its dump — but that is a property of the
+program, not a guarantee sbx makes.
 
 ### What the command may run: `spawn`
 

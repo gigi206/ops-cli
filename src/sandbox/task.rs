@@ -27,12 +27,13 @@
 //! validated under) and the variable names in `env_allow`. Not the program, not the rest of the
 //! environment, not the mounts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{OutputDisposition, TaskSpec};
@@ -44,6 +45,25 @@ use super::spec::{Mount, NetPolicy, SandboxSpec};
 /// Where a task's `$HOME` and scratch space live inside its cage: a fresh tmpfs, so nothing it
 /// writes survives the invocation and nothing the agent wrote is visible to it.
 const TASK_HOME: &str = "/tmp/task-home";
+
+/// Where a task declaring `output` finds its writable directory, and the variable that names it. The
+/// one path in the cage whose contents outlive the invocation.
+///
+/// A real directory, never a tmpfs: an artifact is the case where size is the point (a database
+/// dump, an archive), and a tmpfs is RAM — it would put the whole file in memory and have the cage's
+/// own cgroup kill it.
+const TASK_OUT_INCAGE: &str = "/opt/sbx/out";
+const TASK_OUT_ENV: &str = "SBX_TASK_OUT";
+
+/// Where the same directories are readable from the **agent's** cage, and the directory under a
+/// project's runtime tree they are bound from.
+///
+/// The agent's mount is decided when its cage is built, long before any invocation, and nothing can
+/// be mounted into a live cage afterwards. So what is bound there is the **parent**: each task's
+/// directory appears inside it as it is created, because a bind mount shows the tree it is bound to
+/// rather than a copy of it.
+pub(crate) const TASK_OUT_AGENT: &str = "/opt/sbx/task-out";
+pub(crate) const TASK_OUT_TREE: &str = "task-out";
 
 /// How often the runner checks whether the command has exited while enforcing the timeout. Short
 /// enough that a fast task is not visibly delayed, long enough not to spin.
@@ -153,6 +173,11 @@ pub(crate) struct TaskEngine {
     /// only when a task declares `packages`. See [`super::taskpool`] for why the pool exists and why
     /// it is filled host-side.
     pool: Option<(PathBuf, PathBuf)>,
+    /// Which tasks are mid-invocation and hold their output directory. A task's directory is one
+    /// per *task*, not per invocation, so its path is predictable enough for a caller to know it
+    /// before running anything — and two concurrent invocations of the same task would then write
+    /// into one directory. The second is refused rather than allowed to interleave.
+    output_held: Arc<Mutex<BTreeSet<String>>>,
     /// The in-cage programs that give a networked task a route out. Not optional: any task may
     /// declare `network`, and one that does with no forwarder would find the proxy socket bound, the
     /// proxy variables set, and nothing listening on the port they name.
@@ -194,6 +219,13 @@ pub(crate) struct TaskOutcome {
     /// (here, not in the text) on purpose: that is what makes a `${NAME@nonce}` in the output
     /// unforgeable for this invocation — the command could not have predicted it.
     pub(crate) nonce: Option<String>,
+    /// Where the invocation's artifacts are, **as the agent's cage sees the path**, and how many
+    /// bytes were left there. `None` when the task declares no `output`.
+    ///
+    /// The path is predictable — one directory per task — so a caller could know it without being
+    /// told; reporting it anyway is what makes "the operation produced something" visible at the
+    /// point of use rather than something to go and check.
+    pub(crate) output: Option<(String, u64)>,
     /// The exec targets `spawn` refused during this invocation, if any.
     ///
     /// Reported for the same reason as `truncated`: the refusal is invisible in the result. The
@@ -271,6 +303,7 @@ impl TaskEngine {
             ca_bundle: ca_bundle.map(Path::to_path_buf),
             pool: None,
             forwarder,
+            output_held: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -362,8 +395,22 @@ impl TaskEngine {
         let task = self
             .task(name)
             .ok_or_else(|| TaskError::Unknown(name.into()))?;
-        let values = resolve_params(task, params).map_err(TaskError::Refused)?;
+        let mut values = resolve_params(task, params).map_err(TaskError::Refused)?;
         let caller_env = caller_env(task, env).map_err(TaskError::Refused)?;
+
+        // The writable directory, when the task asks for one. Claimed before the command is
+        // assembled, because `{out}` substitutes to it — and the claim is what a concurrent
+        // invocation of the same task is refused against.
+        let output = match task.output {
+            false => None,
+            true => Some(self.claim_output(task).map_err(TaskError::Refused)?),
+        };
+        if output.is_some() {
+            values.insert(
+                crate::config::tasks::OUT_PLACEHOLDER.to_string(),
+                TASK_OUT_INCAGE.to_string(),
+            );
+        }
         let argv = substitute(&task.cmd, &values).map_err(TaskError::Refused)?;
 
         // Resolve the credentials for THIS invocation only, host-side. Nothing is cached: a
@@ -396,6 +443,11 @@ impl TaskEngine {
         // A task is never interactive: say so, so a tool that would otherwise try to prompt fails
         // fast instead of hanging until the timeout.
         cage_env.push(("SBX_TASK".to_string(), name.to_string()));
+        // The same directory by name, for a command that takes its destination from the environment
+        // rather than from an argument.
+        if output.is_some() {
+            cage_env.push((TASK_OUT_ENV.to_string(), TASK_OUT_INCAGE.to_string()));
+        }
 
         // Egress, when the task declares any: a proxy of its **own**, for this invocation only.
         //
@@ -475,10 +527,13 @@ impl TaskEngine {
             .build_spec(
                 argv,
                 &cage_env,
-                &proxy_binds,
                 task,
-                invocation,
-                &tcp_plan.destinations,
+                &Invocation {
+                    number: invocation,
+                    proxy_binds: &proxy_binds,
+                    tcp: &tcp_plan.destinations,
+                    output: output.as_ref().map(|o| o.dir.as_path()),
+                },
             )
             .map_err(|e| TaskError::Io(io::Error::other(e)))?;
         let started = Instant::now();
@@ -519,6 +574,10 @@ impl TaskEngine {
             timed_out: raw.timed_out,
             elapsed_ms,
             refused: enforce.map(|e| e.refusals()).unwrap_or_default(),
+            output: output.map(|o| {
+                let size = o.size();
+                (format!("{TASK_OUT_AGENT}/{}", task.name), size)
+            }),
         })
     }
 
@@ -551,11 +610,15 @@ impl TaskEngine {
         &self,
         argv: Vec<OsString>,
         env: &[(String, String)],
-        proxy_binds: &[super::binds::ExtraBind],
         task: &TaskSpec,
-        invocation: u64,
-        tcp: &[super::egress::TcpDestination],
+        inv: &Invocation<'_>,
     ) -> Result<SandboxSpec, String> {
+        let Invocation {
+            number: invocation,
+            proxy_binds,
+            tcp,
+            output,
+        } = *inv;
         let mut mounts = self.base_mounts.clone();
         // The task tool pool, **read-only** and at the same in-cage path the install cage used —
         // that agreement is what keeps the absolute paths mise baked into the pool valid. Bound only
@@ -624,6 +687,16 @@ impl TaskEngine {
             mounts.push(Mount::RoBind {
                 src: hosts,
                 dest: PathBuf::from("/etc/hosts"),
+            });
+        }
+
+        // The one writable path whose contents outlive the invocation, when the task declared
+        // `output`. After the tmpfs pair, so `/tmp` cannot mount over it; a real directory under the
+        // project's runtime tree, never a tmpfs, because an artifact's size is the whole point.
+        if let Some(dir) = output {
+            mounts.push(Mount::Bind {
+                src: dir.to_path_buf(),
+                dest: PathBuf::from(TASK_OUT_INCAGE),
             });
         }
 
@@ -715,6 +788,61 @@ impl TaskEngine {
         }
         let bins = super::taskpool::bins_for(pool, &task.packages).bins;
         (!bins.is_empty()).then_some(bins)
+    }
+
+    /// The host directory holding every output-declaring task's directory for this project.
+    fn output_root(&self) -> io::Result<PathBuf> {
+        output_root_for(&self.layout, &self.project)
+    }
+
+    /// Claim `task`'s output directory for one invocation: empty it, create it, and hold the name so
+    /// a concurrent invocation of the same task is refused rather than writing into the same place.
+    ///
+    /// Emptying is what keeps a predictable path honest. The directory is one per task, so a caller
+    /// knows where to look without being told — and would otherwise find the previous invocation's
+    /// artifact sitting there, indistinguishable from the one it just asked for.
+    fn claim_output(&self, task: &TaskSpec) -> Result<OutputClaim, String> {
+        {
+            let mut held = self.output_held.lock().expect("the output registry");
+            if !held.insert(task.name.clone()) {
+                return Err(format!(
+                    "another invocation of `{}` is still writing to its output directory — a task's \
+                     directory is one per task, so two at once would interleave",
+                    task.name
+                ));
+            }
+        }
+        let dir = match self.output_root() {
+            Ok(root) => root.join(&task.name),
+            Err(e) => {
+                self.output_held
+                    .lock()
+                    .expect("the output registry")
+                    .remove(&task.name);
+                return Err(format!("no project tree for this task's output ({e})"));
+            }
+        };
+        let prepare = || -> io::Result<()> {
+            if dir.exists() {
+                super::gc::force_remove_dir_all(&dir)?;
+            }
+            std::fs::create_dir_all(&dir)
+        };
+        if let Err(e) = prepare() {
+            self.output_held
+                .lock()
+                .expect("the output registry")
+                .remove(&task.name);
+            return Err(format!(
+                "cannot prepare the output directory {}: {e}",
+                dir.display()
+            ));
+        }
+        Ok(OutputClaim {
+            dir,
+            task: task.name.clone(),
+            held: self.output_held.clone(),
+        })
     }
 
     /// Where an in-cage path lives on the host, read off the mounts this cage is built from. A path
@@ -834,6 +962,78 @@ fn prepend_path(env: &mut Vec<(String, String)>, dirs: &[PathBuf]) {
         Some(slot) if slot.1.is_empty() => slot.1 = prefix,
         Some(slot) => slot.1 = format!("{prefix}:{}", slot.1),
         None => env.push(("PATH".to_string(), prefix)),
+    }
+}
+
+/// What one **invocation** contributes to its cage, beyond what the task's own declaration fixes.
+/// Grouped rather than passed one by one: these four travel together, and a positional list of them
+/// beside the task and its argv is where a caller silently swaps two.
+struct Invocation<'a> {
+    /// This invocation's number, worn by every host-side name it stands up.
+    number: u64,
+    /// The proxy socket and CA, when the task declared egress.
+    proxy_binds: &'a [super::binds::ExtraBind],
+    /// The destinations that get an in-cage listener.
+    tcp: &'a [super::egress::TcpDestination],
+    /// The writable output directory, when the task declared one.
+    output: Option<&'a Path>,
+}
+
+/// Where a project's task output lives on the host: under the project's own runtime tree, so
+/// `sbx projects rm` and the runtime sweep reclaim an artifact with the project it belongs to
+/// instead of it needing a lifecycle of its own.
+///
+/// **One derivation, used twice** — by the engine that writes into it and by the launch that binds
+/// it read-only into the agent's cage. Two would be two chances to disagree about which directory an
+/// artifact is in, and the disagreement would show up as an empty directory rather than an error.
+/// The id comes from the *canonical* path, like every other per-project tree.
+pub(crate) fn output_root_for(
+    layout: &crate::store::Layout,
+    project: &Path,
+) -> io::Result<PathBuf> {
+    Ok(layout
+        .data_dir()
+        .join("projects")
+        .join(super::binds::project_runtime_id(project)?)
+        .join(TASK_OUT_TREE))
+}
+
+/// One invocation's hold on its task's output directory, released when the invocation ends —
+/// including when it ends by panic or early return, which is why it is a guard and not a pair of
+/// calls.
+#[derive(Debug)]
+struct OutputClaim {
+    dir: PathBuf,
+    task: String,
+    held: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl OutputClaim {
+    /// What the directory holds now, in bytes — reported so a caller learns an artifact was produced
+    /// without having to go and look.
+    fn size(&self) -> u64 {
+        fn walk(dir: &Path) -> u64 {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .map(|e| match e.file_type() {
+                    Ok(t) if t.is_dir() => walk(&e.path()),
+                    Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+                    _ => 0,
+                })
+                .sum()
+        }
+        walk(&self.dir)
+    }
+}
+
+impl Drop for OutputClaim {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.held.lock() {
+            held.remove(&self.task);
+        }
     }
 }
 
@@ -1040,6 +1240,7 @@ impl TaskEngine {
             base_env: Vec::new(),
             project: PathBuf::from("/nonexistent"),
             config_root: PathBuf::from("/nonexistent"),
+            output_held: Arc::new(Mutex::new(BTreeSet::new())),
             tasks,
             limits: super::cgroup::Limits::default(),
             slug: "inventory".to_string(),
@@ -1202,6 +1403,7 @@ mod smoke {
             nonce: false,
             packages: vec![],
             spawn: None,
+            output: false,
         }
     }
 
@@ -1345,6 +1547,7 @@ mod smoke {
             nonce: false,
             packages: vec!["demo-tool".into()],
             spawn: None,
+            output: false,
         };
 
         let Some((engine, _data)) = engine_with(vec![spec], project.path(), Some(&pool)) else {
@@ -1468,6 +1671,7 @@ mod tests {
             nonce: false,
             packages: vec![],
             spawn: None,
+            output: false,
         }
     }
 
@@ -1800,6 +2004,7 @@ mod tests {
                 pool.to_path_buf(),
                 PathBuf::from("/nix/store/mise/bin/mise"),
             )),
+            output_held: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -1947,6 +2152,127 @@ mod tests {
         );
     }
 
+    /// An engine whose project really exists on disk, since the output directory is keyed on the
+    /// project's canonical path.
+    fn engine_with_project(root: &Path, tasks: Vec<TaskSpec>) -> TaskEngine {
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("the project");
+        let mut engine = engine_at(root, tasks);
+        engine.project = project;
+        engine
+    }
+
+    /// A task declaring `output` gets exactly one writable mount, and it is the directory the claim
+    /// created — the single path in an otherwise ephemeral cage whose contents outlive the run.
+    #[test]
+    fn a_task_declaring_output_gets_one_writable_directory() {
+        let root = crate::testutil::TmpDir::new();
+        let mut task = task();
+        task.output = true;
+        let engine = engine_with_project(root.path(), vec![task.clone()]);
+
+        let claim = engine.claim_output(&task).expect("the claim");
+        let spec = engine
+            .build_spec(
+                vec![OsString::from("psql")],
+                &engine.base_env,
+                &task,
+                &Invocation {
+                    number: 3,
+                    proxy_binds: &[],
+                    tcp: &[],
+                    output: Some(claim.dir.as_path()),
+                },
+            )
+            .expect("the spec");
+
+        let writable: Vec<_> = spec
+            .mounts()
+            .iter()
+            .filter_map(|m| match m {
+                Mount::Bind { src, dest } => Some((src.clone(), dest.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            writable,
+            vec![(claim.dir.clone(), PathBuf::from(TASK_OUT_INCAGE))],
+            "the output directory must be the only writable bind: {:?}",
+            spec.mounts()
+        );
+    }
+
+    /// And a task that declares none gets no writable path at all — the property the whole task cage
+    /// rests on, which the new mount must not quietly relax.
+    #[test]
+    fn a_task_without_output_keeps_a_cage_it_cannot_write() {
+        let root = crate::testutil::TmpDir::new();
+        let task = task();
+        let engine = engine_with_project(root.path(), vec![task.clone()]);
+        let spec = engine
+            .build_spec(
+                vec![OsString::from("psql")],
+                &engine.base_env,
+                &task,
+                &Invocation {
+                    number: 4,
+                    proxy_binds: &[],
+                    tcp: &[],
+                    output: None,
+                },
+            )
+            .expect("the spec");
+        assert!(
+            !spec
+                .mounts()
+                .iter()
+                .any(|m| matches!(m, Mount::Bind { .. })),
+            "nothing writable belongs in a task cage that asked for nothing: {:?}",
+            spec.mounts()
+        );
+    }
+
+    /// The directory is emptied when it is claimed. A predictable path is only honest if what sits
+    /// there is this invocation's work — otherwise a caller reads yesterday's artifact and cannot
+    /// tell.
+    #[test]
+    fn claiming_the_directory_clears_what_a_previous_invocation_left() {
+        let root = crate::testutil::TmpDir::new();
+        let mut task = task();
+        task.output = true;
+        let engine = engine_with_project(root.path(), vec![task.clone()]);
+
+        let first = engine.claim_output(&task).expect("the first claim");
+        std::fs::write(first.dir.join("stale.sql"), b"yesterday").expect("write");
+        assert_eq!(first.size(), 9, "the size reports what is really there");
+        drop(first);
+
+        let second = engine.claim_output(&task).expect("the second claim");
+        assert!(
+            !second.dir.join("stale.sql").exists(),
+            "a claim must not hand back the previous invocation's artifact"
+        );
+        assert_eq!(second.size(), 0);
+    }
+
+    /// Two invocations of the same task would write into one directory, so the second is refused
+    /// while the first holds it — and the hold is released when the invocation ends, however it ends.
+    #[test]
+    fn a_second_invocation_of_the_same_task_is_refused_while_the_first_holds_it() {
+        let root = crate::testutil::TmpDir::new();
+        let mut task = task();
+        task.output = true;
+        let engine = engine_with_project(root.path(), vec![task.clone()]);
+
+        let held = engine.claim_output(&task).expect("the first claim");
+        let e = engine.claim_output(&task).unwrap_err();
+        assert!(e.contains("still writing"), "the refusal must say why: {e}");
+        drop(held);
+        engine
+            .claim_output(&task)
+            .expect("the hold is released with the invocation");
+    }
+
     /// A destination plan for one `tcp://` rule, built the way a launch builds it.
     fn tcp_plan(
         rule: &str,
@@ -1978,10 +2304,13 @@ mod tests {
             .build_spec(
                 vec![OsString::from("psql")],
                 &engine.base_env,
-                &[],
                 &networked,
-                7,
-                &tcp,
+                &Invocation {
+                    number: 7,
+                    proxy_binds: &[],
+                    tcp: &tcp,
+                    output: None,
+                },
             )
             .expect("the spec");
 
@@ -2026,10 +2355,13 @@ mod tests {
             .build_spec(
                 vec![OsString::from("psql")],
                 &engine.base_env,
-                &[],
                 &plain,
-                8,
-                &[],
+                &Invocation {
+                    number: 8,
+                    proxy_binds: &[],
+                    tcp: &[],
+                    output: None,
+                },
             )
             .expect("the spec");
         assert_eq!(
@@ -2067,10 +2399,13 @@ mod tests {
             .build_spec(
                 vec![OsString::from("psql")],
                 &engine.base_env,
-                &[],
                 &networked,
-                invocation,
-                &tcp,
+                &Invocation {
+                    number: invocation,
+                    proxy_binds: &[],
+                    tcp: &tcp,
+                    output: None,
+                },
             )
             .expect_err("a hosts file that cannot be written must refuse the launch");
         assert!(
@@ -2102,10 +2437,13 @@ mod tests {
             .build_spec(
                 vec![OsString::from("demo-tool")],
                 &engine.base_env,
-                &[],
                 &task,
-                0,
-                &[],
+                &Invocation {
+                    number: 0,
+                    proxy_binds: &[],
+                    tcp: &[],
+                    output: None,
+                },
             )
             .unwrap();
         assert!(
@@ -2148,10 +2486,13 @@ mod tests {
             .build_spec(
                 vec![OsString::from("psql")],
                 &engine.base_env,
-                &[],
                 &task,
-                0,
-                &[],
+                &Invocation {
+                    number: 0,
+                    proxy_binds: &[],
+                    tcp: &[],
+                    output: None,
+                },
             )
             .unwrap();
         assert!(

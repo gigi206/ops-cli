@@ -155,7 +155,7 @@ pub(super) fn validate_task(
     }
 
     let params = validate_params(raw.params)?;
-    check_placeholders_declared(&raw.cmd, &params)?;
+    check_placeholders_declared(&raw.cmd, &params, raw.output)?;
 
     let secrets = validate_task_secrets(raw.secret, secret_defaults, plugins)?;
     let injections = validate_task_injections(raw.inject, secret_defaults, plugins)?;
@@ -233,6 +233,7 @@ pub(super) fn validate_task(
         nonce: defaults.nonce,
         packages,
         spawn,
+        output: raw.output,
     })
 }
 
@@ -454,14 +455,40 @@ pub(crate) fn check_value(name: &str, value: &str, bound: &ParamBound) -> Result
     }
 }
 
-/// Every `{placeholder}` in `cmd` must name a declared parameter, and every declared parameter must
-/// be used. An undeclared placeholder would be substituted from nothing (or left literal, worse);
-/// an unused parameter is a declaration that silently does nothing.
-fn check_placeholders_declared(cmd: &[String], params: &[TaskParam]) -> Result<(), String> {
+/// The placeholder sbx fills in itself: the invocation's writable output directory. It is **not** a
+/// parameter — a caller who could choose where the command writes would choose the project — so the
+/// name is reserved, and a declaration may only use it where `output` asks for the directory.
+pub(crate) const OUT_PLACEHOLDER: &str = "out";
+
+/// Every `{placeholder}` in `cmd` must name a declared parameter (or the reserved `{out}`), and every
+/// declared parameter must be used. An undeclared placeholder would be substituted from nothing (or
+/// left literal, worse); an unused parameter is a declaration that silently does nothing.
+fn check_placeholders_declared(
+    cmd: &[String],
+    params: &[TaskParam],
+    output: bool,
+) -> Result<(), String> {
+    if let Some(clash) = params.iter().find(|p| p.name == OUT_PLACEHOLDER) {
+        return Err(format!(
+            "`{}` is reserved — it names the output directory sbx supplies, which a caller must not \
+             choose",
+            clash.name
+        ));
+    }
     let declared: BTreeSet<&str> = params.iter().map(|p| p.name.as_str()).collect();
     let mut used: BTreeSet<&str> = BTreeSet::new();
     for element in cmd {
         for name in placeholders(element) {
+            if name == OUT_PLACEHOLDER {
+                if !output {
+                    return Err(
+                        "`cmd` uses `{out}`, but this task declares no `output` — there would be \
+                         nothing to substitute, and a task cage keeps nothing it writes"
+                            .to_string(),
+                    );
+                }
+                continue;
+            }
             if !declared.contains(name) {
                 return Err(format!(
                     "`cmd` uses `{{{name}}}`, which is not a declared parameter"
@@ -965,6 +992,34 @@ mod tests {
                 "`{wildcard}` must be refused with the alternative: {e}"
             );
         }
+    }
+
+    // `{out}` is filled by sbx, not by the caller — so a parameter of that name would be a caller
+    // choosing where a credential-bearing command writes. Reserved, and said as such.
+    #[test]
+    fn a_parameter_cannot_be_named_out() {
+        let mut raw = raw_task();
+        raw.params.insert(
+            "out".to_string(),
+            crate::config::schema::RawTaskParam::Pattern("^.+$".into()),
+        );
+        raw.cmd.push("{out}".into());
+        let e = validate(raw).unwrap_err();
+        assert!(e.contains("reserved"), "{e}");
+    }
+
+    // `{out}` without `output` would substitute from nothing. Refused at load, where the author can
+    // still act on it, rather than at the invocation with an unexplainable message.
+    #[test]
+    fn the_out_placeholder_needs_the_output_declaration() {
+        let mut raw = raw_task();
+        raw.cmd.push("{out}/dump.sql".into());
+        let e = validate(raw.clone()).unwrap_err();
+        assert!(e.contains("declares no `output`"), "{e}");
+
+        raw.output = true;
+        let task = validate(raw).expect("with output declared it is fine");
+        assert!(task.output);
     }
 
     #[test]

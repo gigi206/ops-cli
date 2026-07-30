@@ -27,7 +27,7 @@
 //! → SECRETS                       ← secret <name>\t<where>\t<description>… then `ok`
 //! → RUN <name>                    ← exit <code>, redacted <n>, truncated <0|1>,
 //!   param <key> <len>\n<bytes>       timed-out <0|1>, elapsed-ms <n>, [nonce <hex>],
-//!   env <key> <len>\n<bytes>         [refused-exec <path>…],
+//!   env <key> <len>\n<bytes>         [refused-exec <path>…], [output <bytes> <path>],
 //!   run                              stdout <len>\n<bytes>, stderr <len>\n<bytes>, then `ok`
 //! ```
 //!
@@ -328,15 +328,23 @@ fn serve_cage(
             } else {
                 format!("\tmissing-tools={}", missing.join(","))
             };
+            // Where this operation's artifacts will be, when it declares `output`. Listed rather
+            // than only reported afterwards: the path is one per task, so a caller can know it
+            // before invoking anything — which is the whole reason it is not per invocation.
+            let output = match task.output {
+                false => String::new(),
+                true => format!("\toutput={}/{}", super::task::TASK_OUT_AGENT, task.name),
+            };
             writeln!(
                 writer,
-                "task {}\tparams={}\tstdout={}\tstderr={}\ttimeout={}s{}\t{}",
+                "task {}\tparams={}\tstdout={}\tstderr={}\ttimeout={}s{}{}\t{}",
                 task.name,
                 params.join(","),
                 task.stdout.as_str(),
                 task.stderr.as_str(),
                 task.timeout.as_secs(),
                 missing,
+                output,
                 sanitize(task.description.as_deref().unwrap_or("")),
             )?;
         }
@@ -489,6 +497,11 @@ fn write_outcome(writer: &mut UnixStream, outcome: &TaskOutcome) -> io::Result<(
     // the line-based framing holds.
     for target in &outcome.refused {
         writeln!(writer, "refused-exec {target}")?;
+    }
+    // Where the invocation left its artifacts, as the caller's own cage sees the path, with the size
+    // so "it produced something" is visible without going to look.
+    if let Some((path, bytes)) = &outcome.output {
+        writeln!(writer, "output {bytes} {path}")?;
     }
     for (label, stream) in [("stdout", &outcome.stdout), ("stderr", &outcome.stderr)] {
         match stream {
@@ -667,6 +680,8 @@ pub(crate) mod client {
         /// The exec targets `spawn` refused during the invocation. Carried because the refusal is
         /// invisible in the result otherwise — the refused program decides whether to mention it.
         pub(crate) refused: Vec<String>,
+        /// Where the invocation left its artifacts, and how many bytes.
+        pub(crate) output: Option<(String, u64)>,
     }
 
     /// Parse a `RUN` response. The length-prefixed streams are read by byte count, so a payload
@@ -693,6 +708,11 @@ pub(crate) mod client {
                 "elapsed-ms" => out.elapsed_ms = value.parse().unwrap_or(0),
                 "nonce" => out.nonce = Some(value.to_string()),
                 "refused-exec" => out.refused.push(value.to_string()),
+                "output" => {
+                    if let Some((bytes, path)) = value.split_once(' ') {
+                        out.output = Some((path.to_string(), bytes.parse().unwrap_or(0)));
+                    }
+                }
                 "stdout" | "stderr" => {
                     let len: i64 = value.parse().unwrap_or(-1);
                     if len < 0 {
@@ -783,6 +803,7 @@ mod tests {
             nonce: false,
             packages: vec![],
             spawn: None,
+            output: false,
         }
     }
 
@@ -1064,6 +1085,31 @@ mod tests {
         assert!(err.contains("sbx: task run:"), "{err}");
     }
 
+    // A caller must be able to know where an operation's artifacts land *before* invoking it —
+    // that is the reason the directory is one per task rather than one per invocation, and the
+    // listing is where a caller is choosing what to invoke.
+    #[test]
+    fn the_listing_says_where_an_operation_writes() {
+        let mut producing = probe_task();
+        producing.name = "dump".into();
+        producing.output = true;
+        let Some((_data, _plane, script)) = plane_and_client(vec![producing, probe_task()]) else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let out = run_client(&script, &["task", "list"]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            text.contains("output=/opt/sbx/task-out/dump"),
+            "the producing task must carry its path: {text}"
+        );
+        assert_eq!(
+            text.matches("output=").count(),
+            1,
+            "and a task that declares none must carry no such field: {text}"
+        );
+    }
+
     // The response half, against the real writer: bytes produced by `write_outcome` are what the
     // client parses. Streams go to their own descriptors, the exit code is the command's, and a
     // payload containing the protocol's own keywords is copied rather than re-read as headers.
@@ -1092,6 +1138,7 @@ mod tests {
             elapsed_ms: 12,
             nonce: Some("a91f3c".to_string()),
             refused: Vec::new(),
+            output: None,
         };
         std::thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
@@ -1169,6 +1216,7 @@ mod tests {
                 "/nix/store/demo/bin/sh".to_string(),
                 "/nix/store/demo/bin/base64".to_string(),
             ],
+            output: None,
         };
         std::thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
@@ -1239,6 +1287,7 @@ mod tests {
             elapsed_ms: 1,
             nonce: None,
             refused: Vec::new(),
+            output: None,
         };
         std::thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {

@@ -291,6 +291,7 @@ mod tests {
             nonce: false,
             packages: vec![],
             spawn: None,
+            output: false,
         }
     }
 

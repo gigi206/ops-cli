@@ -224,7 +224,7 @@ run_task() {{
         }} | "$socat" -t "$wait_for_answer" - "UNIX-CONNECT:$sock" 2>/dev/null
     )
 
-    local line complete=0 code=0 redacted=0 truncated=0 timed_out=0 elapsed=0 nonce='' refused=''
+    local line complete=0 code=0 redacted=0 truncated=0 timed_out=0 elapsed=0 nonce='' refused='' output=''
     while IFS= read -r -u 3 line; do
         case $line in
             ok) complete=1; break ;;
@@ -242,6 +242,7 @@ run_task() {{
             'nonce '*) nonce=${{line#nonce }} ;;
             'refused-exec '*) refused="$refused${{line#refused-exec }}
 " ;;
+            'output '*) output=${{line#output }} ;;
             'stdout '*) copy_stream "${{line#stdout }}" 1 ;;
             'stderr '*) copy_stream "${{line#stderr }}" 2 ;;
         esac
@@ -258,6 +259,10 @@ run_task() {{
     # What the operation was not allowed to run. Said out loud because the refusal is invisible
     # otherwise: the program that was refused decides for itself whether to mention it, and many say
     # nothing — leaving an empty result that reads like a command that simply found nothing.
+    # `output` arrives as "<bytes> <path>": where the artifacts are, and how much was written.
+    if [ -n "$output" ]; then
+        printf 'sbx: the operation wrote %s byte(s) to %s\n' "${{output%% *}}" "${{output#* }}" >&2
+    fi
     if [ -n "$refused" ]; then
         printf 'sbx: warning: the operation was not allowed to run:\n' >&2
         printf '%s' "$refused" | while IFS= read -r target; do

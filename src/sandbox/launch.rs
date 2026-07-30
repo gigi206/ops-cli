@@ -4523,6 +4523,30 @@ fn build(
             "SBX_TASK_CLI".to_string(),
             super::task_control::TASK_SHIM_INCAGE.to_string(),
         ));
+        // Where an `output`-declaring task's artifacts become readable. Bound **read-only**, and only
+        // when some task declares `output` — an agent that can write here could plant the input a
+        // credential-bearing command later reads back, which is the one thing the direction of this
+        // mount has to prevent.
+        //
+        // The *parent* is bound, because a cage's mounts are fixed when it is built and no
+        // invocation can add one afterwards: each task's directory then appears inside it as it is
+        // created, since a bind mount shows the tree rather than a copy of it.
+        if prep.cfg.tasks.iter().any(|t| t.output) {
+            let root = super::task::output_root_for(&prep.layout, &prep.cwd)
+                .and_then(|root| std::fs::create_dir_all(&root).map(|()| root));
+            if let Err(e) = &root {
+                crate::diag::warn(&format!(
+                    "cannot create this project's task output directory ({e}) — an operation \
+                     declaring `output` will refuse rather than run"
+                ));
+            } else if let Ok(root) = root {
+                extra_binds.push(binds::ExtraBind {
+                    src: root,
+                    dest: PathBuf::from(super::task::TASK_OUT_AGENT),
+                    writable: false,
+                });
+            }
+        }
         path
     });
 
