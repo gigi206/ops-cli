@@ -62,6 +62,15 @@ sock={socket}
 socat={socat}
 head={head}
 
+# How long to keep reading the answer after the request has been written. socat's default is half a
+# second: it treats "this side stopped talking" as "the exchange is nearly over" and tears the
+# connection down. An operation is a *command being run* on the other end — the default timeout is
+# thirty seconds and a declaration may raise it — so at the default this client reads a truncated
+# answer for anything but an instant operation, while the same call succeeds host-side. Waiting is
+# safe: the plane closes the connection when the operation ends, and a plane that died closes it too,
+# so this bound is only ever reached by a plane that is alive and stuck.
+wait_for_answer=86400
+
 die() {{
     printf 'sbx: %s\n' "$1" >&2
     exit "$2"
@@ -70,6 +79,14 @@ die() {{
 unreachable() {{
     printf 'sbx: task: cannot reach the task plane\n' >&2
     printf '       the session may have ended, or its config declares no `[task.<name>]`.\n' >&2
+    exit 1
+}}
+
+# The plane answered and the answer stopped early. Distinct from never reaching it: the operation may
+# well have run, so the one thing this must not do is invent an exit code for it.
+truncated_answer() {{
+    printf 'sbx: task run: the answer from the task plane stopped early\n' >&2
+    printf '       the operation may have run; its result is unknown.\n' >&2
     exit 1
 }}
 
@@ -113,7 +130,8 @@ check_inventory_args() {{
 # byte-exact streaming.
 inventory() {{
     local command=$1 prefix=$2 empty=$3 response line shown=0
-    response=$(printf '%s\n' "$command" | "$socat" - "UNIX-CONNECT:$sock" 2>/dev/null) || unreachable
+    response=$(printf '%s\n' "$command" | "$socat" -t "$wait_for_answer" - "UNIX-CONNECT:$sock" 2>/dev/null) ||
+        unreachable
     while IFS= read -r line; do
         case $line in
             ok) break ;;
@@ -203,7 +221,7 @@ run_task() {{
                 i=$((i + 1))
             done
             printf 'run\n'
-        }} | "$socat" - "UNIX-CONNECT:$sock" 2>/dev/null
+        }} | "$socat" -t "$wait_for_answer" - "UNIX-CONNECT:$sock" 2>/dev/null
     )
 
     local line complete=0 code=0 redacted=0 truncated=0 timed_out=0 elapsed=0 nonce=''
@@ -229,7 +247,7 @@ run_task() {{
     exec 3<&-
     # A response that stopped before `ok` was cut short; reporting the command's exit code from a
     # truncated answer would be inventing a result.
-    [ "$complete" = 1 ] || unreachable
+    [ "$complete" = 1 ] || truncated_answer
 
     [ "$timed_out" = 1 ] &&
         printf 'sbx: warning: the operation was killed at its timeout after %sms\n' "$elapsed" >&2

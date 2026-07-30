@@ -186,6 +186,9 @@ pub(crate) fn start(
     app: Option<&str>,
     stats_enabled: bool,
     ca_bundle: Option<&Path>,
+    // What distinguishes this proxy's host-side paths from another's in the same process. Keep it
+    // short: these become `AF_UNIX` paths, which the kernel caps at `SUN_LEN`.
+    instance: &str,
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -206,11 +209,16 @@ pub(crate) fn start(
     let dir = layout.data_dir().join("egress");
     DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
 
-    // Per-launch names (the pid keeps concurrent launches from colliding). A stale file
-    // from a crashed predecessor with a reused pid would block the bind, so clear it first.
+    // Per-**proxy** names. The pid separates concurrent launches, but one launch can stand up more
+    // than one proxy at a time — a session serving two task invocations at once does exactly that —
+    // and the pid alone would have them race for the same paths: both clear the path before either
+    // binds, so the loser either fails with `EADDRINUSE` or has its live socket unlinked out from
+    // under it. `instance` is what makes each proxy's names its own; the session's own proxy passes
+    // an empty one, so its paths are unchanged. A stale file from a crashed predecessor with a
+    // reused pid would block the bind, so clear it first.
     let pid = std::process::id();
-    let host_uds = dir.join(format!("proxy-{pid}.sock"));
-    let ca_file = dir.join(format!("ca-{pid}.pem"));
+    let host_uds = dir.join(format!("proxy-{pid}{instance}.sock"));
+    let ca_file = dir.join(format!("ca-{pid}{instance}.pem"));
     let _ = std::fs::remove_file(&host_uds);
 
     // The persisted stats file outlives its session (it is aggregated later), so it must be keyed
@@ -259,7 +267,7 @@ pub(crate) fn start(
     // clones of the same `Arc`.
     let log = Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP));
     let control_uds = {
-        let control_uds = dir.join(format!("control-{pid}.sock"));
+        let control_uds = dir.join(format!("control-{pid}{instance}.sock"));
         let _ = std::fs::remove_file(&control_uds);
         let pending = Arc::new(super::control::PendingState::new());
         let manual = Arc::new(super::control::ManualRules::new());
@@ -675,6 +683,7 @@ mod tests {
             None,
             false,
             Some(roots.as_path()),
+            "-1",
         )
         .expect("start the egress proxy");
 
@@ -797,6 +806,7 @@ mod tests {
             None,
             false,
             None,
+            "-2",
         )
         .expect("start the ask egress proxy");
 
@@ -861,6 +871,7 @@ mod tests {
             None,
             false,
             None,
+            "-3",
         )
         .expect("start with stats off");
         drop(guard);
@@ -882,6 +893,7 @@ mod tests {
             None,
             true,
             None,
+            "-4",
         )
         .expect("start with stats on");
         drop(guard);

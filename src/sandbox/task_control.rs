@@ -752,6 +752,78 @@ mod tests {
         Some((data, plane, script))
     }
 
+    /// A plane whose invocations take `seconds` to answer, plus the client that talks to it.
+    ///
+    /// The launcher is a script standing in for bubblewrap: it ignores the cage argv, waits, and
+    /// prints. That is the only way to exercise what a real operation does to the wire — take time.
+    fn slow_plane_and_client(seconds: &str) -> Option<(TmpDir, TaskPlane, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+        let bash = crate::pathfind::find_on_path("bash")?;
+        let socat = crate::pathfind::find_on_path("socat")?;
+        let head = crate::pathfind::find_on_path("head")?;
+        let data = TmpDir::new();
+
+        let launcher = data.path().join("slow-launcher");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!{}\nsleep {seconds}\nprintf 'the-answer\\n'\n",
+                bash.display()
+            ),
+        )
+        .expect("write the launcher");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("make the launcher executable");
+
+        let engine = super::super::task::TaskEngine::inventory_only(vec![probe_task()])
+            .with_launcher(launcher);
+        let programs = ClientPrograms {
+            bash: &bash,
+            socat: &socat,
+            head: &head,
+        };
+        let plane = start(data.path(), std::process::id(), engine, &programs).expect("start");
+        let script = data.path().join("client");
+        super::super::task_shim::write(
+            &script,
+            &bash,
+            &socat,
+            &head,
+            plane.cage_socket.to_str().expect("a utf-8 socket path"),
+        )
+        .expect("write the client");
+        Some((data, plane, script))
+    }
+
+    /// An operation that takes longer than an instant still answers the in-cage caller.
+    ///
+    /// The transport under the client is `socat`, which by default gives the far end half a second
+    /// after this side stops writing and then tears the connection down — so an operation that runs
+    /// for two seconds returned a truncated answer, while the very same call succeeded host-side.
+    /// A declared operation is a command being run; taking time is its normal case, not its edge.
+    #[test]
+    fn an_operation_that_takes_seconds_still_answers_the_cage() {
+        let Some((_data, _plane, script)) = slow_plane_and_client("2") else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let out = run_client(
+            &script,
+            &["task", "run", "probe", "-p", &format!("sql={AWKWARD}")],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("the-answer"),
+            "the operation's output must survive the wait: stdout={stdout} stderr={stderr}"
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "the operation's own exit code must come back: stderr={stderr}"
+        );
+    }
+
     /// Execute the client the way a caller does — the file itself, through its shebang.
     ///
     /// The retry is a multithreaded-test artifact, not a property of the client: these tests write

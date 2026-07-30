@@ -32,6 +32,7 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{OutputDisposition, TaskSpec};
@@ -46,6 +47,12 @@ const TASK_HOME: &str = "/tmp/task-home";
 
 /// How often the runner checks whether the command has exited while enforcing the timeout. Short
 /// enough that a fast task is not visibly delayed, long enough not to spin.
+/// Distinguishes one invocation's host-side artifacts from another's — its proxy sockets and its
+/// systemd scope. A session can serve two invocations at once, and both would otherwise derive
+/// those names from the launcher pid alone and collide on them. Monotonic per process, which is all
+/// it has to be: the pid already separates sessions.
+static TASK_INVOCATION: AtomicU64 = AtomicU64::new(0);
+
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The in-cage destinations a task cage keeps from the agent cage's mount set.
@@ -134,6 +141,20 @@ pub(crate) struct TaskEngine {
     /// only when a task declares `packages`. See [`super::taskpool`] for why the pool exists and why
     /// it is filled host-side.
     pool: Option<(PathBuf, PathBuf)>,
+    /// The in-cage programs that give a networked task a route out. Not optional: any task may
+    /// declare `network`, and one that does with no forwarder would find the proxy socket bound, the
+    /// proxy variables set, and nothing listening on the port they name.
+    forwarder: CageForwarder,
+}
+
+/// The two cage programs a task's egress forwarder is built from, named rather than passed as a pair
+/// of bare paths so the two cannot be handed over the wrong way round.
+#[derive(Debug, Clone)]
+pub(crate) struct CageForwarder {
+    /// `socat`, which bridges the in-cage TCP port to the bound proxy socket.
+    pub(crate) socat: PathBuf,
+    /// The shell that backgrounds it before `exec`ing the task's own command.
+    pub(crate) shell: PathBuf,
 }
 
 /// One invocation's result. Deliberately structured rather than a blob of text: the exit status is
@@ -216,6 +237,7 @@ impl TaskEngine {
         limits: super::cgroup::Limits,
         slug: &str,
         ca_bundle: Option<&Path>,
+        forwarder: CageForwarder,
     ) -> Self {
         Self {
             bwrap: bwrap.to_path_buf(),
@@ -229,6 +251,7 @@ impl TaskEngine {
             layout: layout.clone(),
             ca_bundle: ca_bundle.map(Path::to_path_buf),
             pool: None,
+            forwarder,
         }
     }
 
@@ -362,8 +385,13 @@ impl TaskEngine {
         // a task's credential in the session's injection table would let the agent trigger the
         // injection itself by aiming at that host. The socket is the only authority boundary
         // available, so a task gets its own — with its own rules and its own injections.
+        // One identity for this invocation, worn by everything it stands up. Concurrent invocations
+        // are ordinary — an agent may ask for two at once — and every name derived from the launcher
+        // pid alone would be the same name twice.
+        let invocation = TASK_INVOCATION.fetch_add(1, Ordering::Relaxed);
         let mut proxy_binds = Vec::new();
         let mut proxy_env = Vec::new();
+        let mut argv = argv;
         let _proxy = if task.network.is_empty() {
             None
         } else {
@@ -377,16 +405,18 @@ impl TaskEngine {
                 None,
                 false,
                 self.ca_bundle.as_deref(),
+                &format!("-t{invocation}"),
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;
             proxy_env = wiring.env;
+            argv = self.cage_argv(argv, task);
             Some(guard)
         };
         cage_env.extend(proxy_env);
 
         let spec = self
-            .build_spec(argv, &cage_env, &proxy_binds, task)
+            .build_spec(argv, &cage_env, &proxy_binds, task, invocation)
             .map_err(|e| TaskError::Io(io::Error::other(e)))?;
         let started = Instant::now();
         // A failure message is substituted too: it can carry the command's own diagnostics, and
@@ -428,6 +458,24 @@ impl TaskEngine {
         })
     }
 
+    /// The argv the cage actually runs: the task's own command, preceded by the egress forwarder
+    /// when — and only when — the task declared `network`.
+    ///
+    /// The proxy this task gets serves a **Unix socket** bound into the cage, while the proxy
+    /// variables handed to the command name a **TCP port**. Something has to bridge the two, and it
+    /// can only be inside: the cage's network namespace is empty, so its loopback is its own and
+    /// reachable from nowhere else. Without the bridge the socket is mounted, the variables are set,
+    /// and every connection is refused — a task that declared egress would silently have none.
+    ///
+    /// A task with no `network` is left exactly as declared: it has no proxy to reach, and an
+    /// unnecessary shell around a credential-bearing command is surface for nothing.
+    fn cage_argv(&self, argv: Vec<OsString>, task: &TaskSpec) -> Vec<OsString> {
+        if task.network.is_empty() {
+            return argv;
+        }
+        super::egress::wrap_command(&self.forwarder.socat, &self.forwarder.shell, argv)
+    }
+
     /// Assemble the cage for one invocation: the structural skeleton, the project read-only, a fresh
     /// tmpfs home, an empty network namespace.
     fn build_spec(
@@ -436,6 +484,7 @@ impl TaskEngine {
         env: &[(String, String)],
         proxy_binds: &[super::binds::ExtraBind],
         task: &TaskSpec,
+        invocation: u64,
     ) -> Result<SandboxSpec, String> {
         let mut mounts = self.base_mounts.clone();
         // The task tool pool, **read-only** and at the same in-cage path the install cage used —
@@ -494,7 +543,9 @@ impl TaskEngine {
             NetPolicy::Isolated,
             argv,
         )
-        .map(|s| s.with_cage_slug(format!("{}-task", self.slug)))
+        // The invocation number is part of the cage's name because it is part of its identity: the
+        // name becomes a systemd scope, and systemd refuses a launch outright on a live collision.
+        .map(|s| s.with_cage_slug(format!("{}-task{invocation}", self.slug)))
         .map_err(|e| format!("cannot build the task cage: {e:?}"))
     }
 
@@ -779,6 +830,10 @@ impl TaskEngine {
     pub(crate) fn inventory_only(tasks: Vec<crate::config::TaskSpec>) -> Self {
         Self {
             bwrap: PathBuf::from("/nonexistent/bwrap"),
+            forwarder: CageForwarder {
+                socat: PathBuf::from("/nonexistent/socat"),
+                shell: PathBuf::from("/nonexistent/bash"),
+            },
             base_mounts: Vec::new(),
             base_env: Vec::new(),
             project: PathBuf::from("/nonexistent"),
@@ -790,6 +845,16 @@ impl TaskEngine {
             ca_bundle: None,
             pool: None,
         }
+    }
+
+    /// Point the engine's launcher at `bwrap`, so a test can stand in a program of its own for the
+    /// cage. What that buys is timing: the real answer to an invocation is only as fast as the
+    /// command behind it, and a plane that always answers instantly cannot show whether the wire
+    /// survives an operation that takes a while.
+    #[cfg(test)]
+    pub(crate) fn with_launcher(mut self, bwrap: PathBuf) -> Self {
+        self.bwrap = bwrap;
+        self
     }
 }
 
@@ -888,6 +953,12 @@ mod smoke {
             super::super::cgroup::Limits::default(),
             "smoke",
             None,
+            CageForwarder {
+                socat: crate::pathfind::find_on_path("socat")
+                    .unwrap_or_else(|| PathBuf::from("/nonexistent/socat")),
+                shell: crate::pathfind::find_on_path("bash")
+                    .unwrap_or_else(|| PathBuf::from("/nonexistent/bash")),
+            },
         );
         Some((engine, data))
     }
@@ -1460,11 +1531,53 @@ mod tests {
         assert!(!cut);
     }
 
+    /// A task that declares `network` must carry the egress forwarder into its cage. Its proxy
+    /// serves a Unix socket while its proxy variables name a TCP port, so without the bridge the
+    /// declaration reads as "this task may reach these hosts" and the cage reaches nothing.
+    #[test]
+    fn a_networked_task_carries_the_egress_forwarder_and_a_local_one_does_not() {
+        let base = crate::testutil::TmpDir::new();
+        let engine = engine_with_pool(&base.join("task-mise"), Vec::new());
+        let bare = vec![
+            OsString::from("curl"),
+            OsString::from("https://example.com"),
+        ];
+
+        let mut local = task();
+        local.network = Vec::new();
+        assert_eq!(
+            engine.cage_argv(bare.clone(), &local),
+            bare,
+            "a task with no egress must run exactly as declared — no shell it did not ask for"
+        );
+
+        let mut networked = task();
+        networked.network = vec![crate::allowlist::classify("example.com").expect("a valid rule")];
+        let wrapped = engine.cage_argv(bare.clone(), &networked);
+        let script = wrapped
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            script.contains("TCP-LISTEN:") && script.contains("/tmp/sbx-egress.sock"),
+            "the forwarder must bridge the cage port to the bound proxy socket: {script}"
+        );
+        assert!(
+            wrapped.ends_with(&bare),
+            "the declared command must still be what runs, positionally: {wrapped:?}"
+        );
+    }
+
     /// An engine wired to `pool`, with the given tasks. Built field-wise so a mount/PATH assertion
     /// needs neither nix nor a kernel.
     fn engine_with_pool(pool: &Path, tasks: Vec<TaskSpec>) -> TaskEngine {
         TaskEngine {
             bwrap: PathBuf::from("/usr/bin/bwrap"),
+            forwarder: CageForwarder {
+                socat: PathBuf::from("/nix/store/base/bin/socat"),
+                shell: PathBuf::from("/nix/store/base/bin/bash"),
+            },
             base_mounts: vec![Mount::RoBind {
                 src: PathBuf::from("/shared/nix"),
                 dest: PathBuf::from("/nix"),
@@ -1509,6 +1622,7 @@ mod tests {
                 &engine.base_env,
                 &[],
                 &task,
+                0,
             )
             .unwrap();
         assert!(
@@ -1548,7 +1662,13 @@ mod tests {
         let task = task();
         let engine = engine_with_pool(&pool, vec![task.clone()]);
         let spec = engine
-            .build_spec(vec![OsString::from("psql")], &engine.base_env, &[], &task)
+            .build_spec(
+                vec![OsString::from("psql")],
+                &engine.base_env,
+                &[],
+                &task,
+                0,
+            )
             .unwrap();
         assert!(
             !spec

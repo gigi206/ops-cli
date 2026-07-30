@@ -1275,6 +1275,10 @@ fn roll_task_pool(
         cfg.limits.clone(),
         spec.cage_slug(),
         Some(prep.userland.ca_bundle_src.as_path()),
+        super::task::CageForwarder {
+            socat: prep.userland.socat_bin.clone(),
+            shell: prep.userland.shell_bin.clone(),
+        },
     )
     .with_pool(
         super::taskpool::pool_dir(prep.layout.data_dir(), &id),
@@ -4214,6 +4218,8 @@ fn build(
             // Pair the per-session MITM CA with the base root bundle so the injected CA file is a full,
             // ordinary bundle (a lone cert trips tools that heuristically reject a "too small" CA).
             Some(prep.userland.ca_bundle_src.as_path()),
+            // The session's own proxy: a launch stands up exactly one, so the pid already names it.
+            "",
         )
         .map_err(|e| {
             eprintln!("sbx: cannot start the egress filtering proxy: {e}");
@@ -4599,6 +4605,10 @@ fn build(
                 prep.cfg.limits.clone(),
                 spec.cage_slug(),
                 Some(prep.userland.ca_bundle_src.as_path()),
+                super::task::CageForwarder {
+                    socat: prep.userland.socat_bin.clone(),
+                    shell: prep.userland.shell_bin.clone(),
+                },
             );
             // The task tool pool, when any task declares a `mise:` tool. Filled host-side now — a
             // cold fill is minutes long, so it belongs at launch where the user is watching, not

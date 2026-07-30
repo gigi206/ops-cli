@@ -7,12 +7,18 @@ token without the value ever entering its own cage.
 ```toml
 [task.db-query]
 description = "Read-only SQL against staging"
-cmd    = ["psql", "-h", "db.staging.internal", "-c", "{sql}"]
-params = { sql = "^SELECT [A-Za-z0-9_,.*= ']{1,400}$" }
+cmd     = ["psql", "-h", "db.staging.internal", "-c", "{sql}"]
+params  = { sql = "^SELECT [A-Za-z0-9_,.*= ']{1,400}$" }
+network = ["tcp://db.staging.internal:5432"]
 
 [task.db-query.secret]
 PGPASSWORD = "sops://secrets.enc.yaml#db.password"
 ```
+
+> A task cage has **no network at all** unless `network` says otherwise, so the line above is not
+> decoration — without it `psql` has nowhere to connect. And because the cage's route out is an HTTP
+> `CONNECT` proxy, a client that does not speak one needs a
+> [tunnel of its own](#reaching-a-service-that-does-not-speak-http).
 
 The agent then runs:
 
@@ -210,6 +216,43 @@ nonce is drawn per call and reported out of band, so the command could not have 
 placeholder copied from an earlier result is detectably stale. Escaping the command's own `${…}` was
 considered and rejected — it is imitable, and it would corrupt legitimate payloads (shell, CI YAML,
 templates are full of `${…}`).
+
+## Reaching a service that does not speak HTTP
+
+A task's `network` is served by a proxy of the task's own, reached inside the cage as an HTTP
+`CONNECT` proxy on `127.0.0.1:18043` — the same shape the agent cage gets, and the reason
+`http_proxy`-aware tools (`curl`, `gh`, `git`) need nothing beyond the `network` line.
+
+A database client does not speak that protocol. Declaring
+[`tcp://host:port`](../networking/rules.md#raw-l4-splice-tcp) makes the proxy splice the raw stream —
+that is the policy half — but something still has to *issue* the `CONNECT`. `socat` does, so the
+declaration can open a local port that tunnels to the real one:
+
+```toml
+[task.db-query]
+description = "Read-only SQL against staging"
+cmd = [
+  "bash", "-c",
+  """socat TCP-LISTEN:15432,bind=127.0.0.1,fork,reuseaddr \
+        PROXY:127.0.0.1:db.staging.internal:5432,proxyport=18043 &
+     sleep 1
+     exec psql -h 127.0.0.1 -p 15432 -U reader -d appdb -Atc "$1" """,
+  "db-query", "{sql}",
+]
+params  = { sql = "^SELECT [A-Za-z0-9_,.* ]{1,400}$" }
+network = ["tcp://db.staging.internal:5432"]
+packages = ["mise:aqua:..."]   # or `[packages] socat = "nix:socat"` — socat must be on PATH
+```
+
+Two details in that shape are load-bearing:
+
+- the parameter is passed **positionally** (`"$1"`), never interpolated into the script text. A
+  bounded parameter that reaches a shell is where metacharacters stop being inert — this is the one
+  place a task can hand one to a shell, so do not let it become part of the command's source;
+- `socat` must be on the task's `PATH`, which means declaring it like any other tool.
+
+`sbx` does not open that port for you. Doing so would mean deciding, on your behalf, which in-cage
+port stands for which declared destination — a mapping only the declaration knows.
 
 ## Which binaries a task may run
 

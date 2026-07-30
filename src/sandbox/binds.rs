@@ -498,6 +498,14 @@ fn assemble(
     // name collision; `/usr/bin/env` is the same coreutils `env` already on PATH.
     path_dirs.push(PathBuf::from("/usr/bin"));
 
+    // Where the declared-operations client is bound, when the session offers any. On PATH because
+    // the contract the cage reads tells an agent to run `sbx task run <name>` — an instruction that
+    // resolves to nothing is worse than no instruction, since the agent concludes the operation is
+    // unavailable and reaches for the underlying tool instead. Absent from a session that declares
+    // no operation, and a PATH entry that does not exist costs nothing. Last, like the stub above,
+    // so it can shadow nothing a project declared.
+    path_dirs.push(PathBuf::from("/opt/sbx/bin"));
+
     // Structural environment first, then the extra (passthrough + config) entries
     // upserted over it: a trusted config's override wins, while an untrusted one —
     // already stripped of reserved keys upstream — can only add.
@@ -1653,10 +1661,12 @@ mod tests {
         let path_i = joined.iter().position(|s| s == "PATH").unwrap();
         // mise's shims dir sits between the (here empty) declared tools and the base
         // userland, so an agent-activated tool surfaces ahead of base on a name clash; the
-        // synthetic `/usr/bin` (env + xdg-open) trails so `xdg-open` resolves by name.
+        // synthetic `/usr/bin` (env + xdg-open) trails so `xdg-open` resolves by name, and
+        // `/opt/sbx/bin` trails both so the declared-operations client resolves by the name
+        // the cage's own contract tells an agent to type.
         assert_eq!(
             joined[path_i + 1],
-            "/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin"
+            "/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin:/opt/sbx/bin"
         );
         // foreign binaries reach the base glibc through the nix-ld shim, never the
         // global LD_LIBRARY_PATH (which would skew a differently-pinned nix tool)
@@ -1870,7 +1880,7 @@ mod tests {
         // synthetic `/usr/bin` (env + xdg-open, sbx-owned) so `xdg-open` resolves by name.
         assert_eq!(
             argv[path_i + 1],
-            "/nix/store/node/bin:/nix/store/python/bin:/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin"
+            "/nix/store/node/bin:/nix/store/python/bin:/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin:/opt/sbx/bin"
         );
     }
 
