@@ -224,7 +224,7 @@ run_task() {{
         }} | "$socat" -t "$wait_for_answer" - "UNIX-CONNECT:$sock" 2>/dev/null
     )
 
-    local line complete=0 code=0 redacted=0 truncated=0 timed_out=0 elapsed=0 nonce='' refused='' output=''
+    local line complete=0 code=0 redacted=0 truncated=0 timed_out=0 stopped=0 elapsed=0 nonce='' refused='' output=''
     while IFS= read -r -u 3 line; do
         case $line in
             ok) complete=1; break ;;
@@ -238,6 +238,7 @@ run_task() {{
             'redacted '*) redacted=${{line#redacted }} ;;
             'truncated '*) truncated=${{line#truncated }} ;;
             'timed-out '*) timed_out=${{line#timed-out }} ;;
+            'stopped '*) stopped=${{line#stopped }} ;;
             'elapsed-ms '*) elapsed=${{line#elapsed-ms }} ;;
             'nonce '*) nonce=${{line#nonce }} ;;
             'refused-exec '*) refused="$refused${{line#refused-exec }}
@@ -254,6 +255,10 @@ run_task() {{
 
     [ "$timed_out" = 1 ] &&
         printf 'sbx: warning: the operation was killed at its timeout after %sms\n' "$elapsed" >&2
+    # Said out loud for the same reason as the timeout: the result of a stopped operation is a
+    # partial one, and an exit code alone would read as the command's own failure.
+    [ "$stopped" = 1 ] &&
+        printf 'sbx: warning: the operation was stopped after %sms\n' "$elapsed" >&2
     [ "$truncated" = 1 ] &&
         printf 'sbx: warning: the output reached the operation'"'"'s `max_output` and was truncated\n' >&2
     # What the operation was not allowed to run. Said out loud because the refusal is invisible
@@ -318,6 +323,13 @@ case ${{1-}} in
     logs | log)
         # Host-only by construction: the recorded party does not get to read the record.
         die 'task logs: the invocation log is not readable from inside the cage' 2
+        ;;
+    status | stop)
+        # Host-only too, and for a second reason: an invocation id is per session, so a caller here
+        # could watch and end an invocation the human at the terminal started — and same-uid leaves
+        # nothing to tell the two callers apart. Named rather than left to the unknown-verb branch,
+        # because "it does not exist" would send a caller hunting for a spelling that never works.
+        die "task $1: watching and stopping operations is host-side only" 2
         ;;
     -h | --help | help | '')
         usage

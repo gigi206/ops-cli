@@ -1,14 +1,17 @@
 //! The task control plane: the per-session socket a caller **inside** the cage reaches to list and
-//! invoke declared operations, plus a second, host-only socket carrying the invocation log.
+//! invoke declared operations, plus a second, host-only socket carrying the invocation log and the
+//! live control of what is running.
 //!
 //! # Two sockets, on purpose
 //!
 //! Every other control plane in sbx (egress, `proc`, `fs`) is **never** bound into the cage, because
 //! the in-cage agent is the adversary and must not answer its own asks. This one has to cross — an
 //! agent that cannot reach it cannot invoke a task at all. So the surface that crosses is kept as
-//! small as it can be (`LIST`, `SECRETS`, `RUN`), and the **log** lives on a separate socket that
-//! stays host-only: what a session recorded is for the human, and the recorded party does not get to
-//! read (or trim) it.
+//! small as it can be (`LIST`, `SECRETS`, `RUN`), and everything else lives on a second socket that
+//! stays host-only. What a session recorded is for the human, and the recorded party does not get to
+//! read (or trim) it; what a session is *running* is for the human too, because an invocation id is
+//! per session and a cage reaching those verbs could watch and end an invocation the human started.
+//! Same-uid leaves no way to tell the two callers apart, so the socket does it.
 //!
 //! # The residual to be honest about
 //!
@@ -25,10 +28,19 @@
 //! ```text
 //! → LIST                          ← task <name>\tparams=a,b\t<description>… then `ok`
 //! → SECRETS                       ← secret <name>\t<where>\t<description>… then `ok`
-//! → RUN <name>                    ← exit <code>, redacted <n>, truncated <0|1>,
-//!   param <key> <len>\n<bytes>       timed-out <0|1>, elapsed-ms <n>, [nonce <hex>],
-//!   env <key> <len>\n<bytes>         [refused-exec <path>…], [output <bytes> <path>],
-//!   run                              stdout <len>\n<bytes>, stderr <len>\n<bytes>, then `ok`
+//! → RUN <name>                    ← id <n>, exit <code>, redacted <n>, truncated <0|1>,
+//!   param <key> <len>\n<bytes>       timed-out <0|1>, stopped <0|1>, elapsed-ms <n>,
+//!   env <key> <len>\n<bytes>         [nonce <hex>], [refused-exec <path>…],
+//!   run                              [output <bytes> <path>], stdout <len>\n<bytes>,
+//!                                    stderr <len>\n<bytes>, then `ok`
+//! ```
+//!
+//! And on the host-only socket:
+//!
+//! ```text
+//! → LOG [after=<seq>]             ← [dropped=<n>], event seq=<id> …… then `ok`
+//! → STATUS                        ← running <id>\ttask=<name>\telapsed_ms=<n>…  then `ok`
+//! → STOP <id>                     ← stopped <id> | stopping <id> | finished <id>, then `ok`
 //! ```
 //!
 //! Any refusal is a single `err <message>` line. A message never echoes a caller's value back: a
@@ -76,6 +88,11 @@ const DEFAULT_CALL_QUOTA: u64 = 500;
 /// and the point of the log is who ran what, when, and what it cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogEntry {
+    /// The **invocation's id** — the same number `sbx task status` shows while it runs and
+    /// `sbx task stop` takes, not a counter of its own. Drawn when the invocation was admitted, so
+    /// two overlapping invocations appear here in the order they *finished* and their ids can
+    /// therefore read out of order. `0` marks an entry no invocation stands behind: a request
+    /// refused before it was admitted at all.
     pub(crate) seq: u64,
     /// Unix seconds when the invocation finished.
     pub(crate) at: u64,
@@ -84,6 +101,9 @@ pub(crate) struct LogEntry {
     pub(crate) redacted: usize,
     pub(crate) truncated: bool,
     pub(crate) timed_out: bool,
+    /// Whether `sbx task stop` ended it — recorded separately from `timed_out` because they are
+    /// different events with the same effect.
+    pub(crate) stopped: bool,
     pub(crate) elapsed_ms: u64,
     /// A refusal reason, when the invocation never ran.
     pub(crate) refused: Option<String>,
@@ -94,13 +114,15 @@ impl LogEntry {
     /// **last** and taken verbatim by the reader, since it is the only free-text field.
     fn to_line(&self) -> String {
         let mut line = format!(
-            "event seq={} at={} exit={} redacted={} truncated={} timed_out={} elapsed_ms={} task={}",
+            "event seq={} at={} exit={} redacted={} truncated={} timed_out={} stopped={} \
+             elapsed_ms={} task={}",
             self.seq,
             self.at,
             self.exit,
             self.redacted,
             u8::from(self.truncated),
             u8::from(self.timed_out),
+            u8::from(self.stopped),
             self.elapsed_ms,
             sanitize(&self.task),
         );
@@ -128,7 +150,6 @@ pub(crate) struct TaskLog {
 
 #[derive(Default)]
 struct Inner {
-    next_seq: u64,
     entries: std::collections::VecDeque<LogEntry>,
     dropped: u64,
 }
@@ -139,10 +160,12 @@ impl TaskLog {
     }
 
     /// Record one invocation, evicting the oldest when the ring is full.
+    ///
+    /// The entry arrives carrying its own id — the invocation's, drawn when it was admitted. The log
+    /// stamps only the time, which is the one field it is the authority on: an invocation that ran
+    /// under a credential does not get to say when it finished.
     fn push(&self, mut entry: LogEntry) {
         let mut inner = self.inner.lock().expect("task log");
-        inner.next_seq += 1;
-        entry.seq = inner.next_seq;
         entry.at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -155,6 +178,11 @@ impl TaskLog {
     }
 
     /// The retained entries past `after`, plus how many fell out of the ring.
+    ///
+    /// `after` is a cursor over invocation ids, and an id is drawn when its invocation is *admitted*
+    /// while its entry lands when it *finishes* — so a long invocation admitted before a short one
+    /// can be recorded after it, and a reader that has already moved its cursor past the short one
+    /// will not see it. Which is why nothing follows this log: `read_log` asks for all of it.
     fn since(&self, after: u64) -> (Vec<LogEntry>, u64) {
         let inner = self.inner.lock().expect("task log");
         (
@@ -166,6 +194,13 @@ impl TaskLog {
                 .collect(),
             inner.dropped,
         )
+    }
+
+    /// Whether an invocation with this id has already been recorded — what tells "you are too late"
+    /// from "there is no such invocation" when a stop names one that is not running.
+    fn recorded(&self, id: u64) -> bool {
+        let inner = self.inner.lock().expect("task log");
+        inner.entries.iter().any(|e| e.seq == id)
     }
 }
 
@@ -216,7 +251,8 @@ pub(crate) fn shim_path(data_dir: &Path, pid: u32) -> PathBuf {
     task_dir(data_dir, pid).join("task-client")
 }
 
-/// The host-only log socket for a session pid.
+/// The host-only socket for a session pid: its invocation log, what it is running, and the stop.
+/// Never bound into a cage — that is what keeps those three host-side.
 pub(crate) fn log_socket(data_dir: &Path, pid: u32) -> PathBuf {
     task_dir(data_dir, pid).join("log.sock")
 }
@@ -285,10 +321,18 @@ pub(crate) fn start(
         });
     }
     {
+        let engine = Arc::clone(&engine);
         let log = Arc::clone(&log);
         std::thread::spawn(move || {
             for stream in log_listener.incoming().flatten() {
-                let _ = serve_log(stream, &log);
+                let engine = Arc::clone(&engine);
+                let log = Arc::clone(&log);
+                // Its own thread for the same reason the crossing socket's connections get one: a
+                // `STOP` waits for the invocation to end, and a `STATUS` behind it must not queue
+                // behind that wait.
+                std::thread::spawn(move || {
+                    let _ = serve_host(stream, &engine, &log);
+                });
             }
         });
     }
@@ -435,43 +479,54 @@ fn serve_run(
         .is_err()
     {
         let reason = "this session's task quota is exhausted".to_string();
-        log.push(refusal(name, &reason));
+        // Id `0`: nothing was admitted, so there is no invocation for an id to name. It is also what
+        // keeps the id inside the width the socket paths were sized against — the quota is the bound
+        // on how many are ever drawn.
+        log.push(refusal(0, name, &reason));
         return writeln!(writer, "err {reason}");
     }
 
-    match engine.run(name, &params, &env) {
+    // Admitted: from here the invocation has an identity, and it is the *same* number wherever it
+    // appears — in the host-side names it stands up, in the row `sbx task status` shows while it
+    // runs, in the id `sbx task stop` takes, and in the line it leaves in this log. Drawn here
+    // rather than inside the engine so a refusal the engine returns is recorded under it too.
+    let id = super::task::next_invocation();
+
+    match engine.run(name, &params, &env, id) {
         Ok(outcome) => {
             log.push(LogEntry {
-                seq: 0,
+                seq: id,
                 at: 0,
                 task: name.to_string(),
                 exit: outcome.exit,
                 redacted: outcome.redacted,
                 truncated: outcome.truncated,
                 timed_out: outcome.timed_out,
+                stopped: outcome.stopped,
                 elapsed_ms: outcome.elapsed_ms,
                 refused: None,
             });
-            write_outcome(writer, &outcome)
+            write_outcome(writer, id, &outcome)
         }
         Err(e) => {
             let reason = e.to_string();
-            log.push(refusal(name, &reason));
+            log.push(refusal(id, name, &reason));
             writeln!(writer, "err {}", sanitize(&reason))
         }
     }
 }
 
 /// A log entry for an invocation that never ran.
-fn refusal(task: &str, reason: &str) -> LogEntry {
+fn refusal(id: u64, task: &str, reason: &str) -> LogEntry {
     LogEntry {
-        seq: 0,
+        seq: id,
         at: 0,
         task: task.to_string(),
         exit: -1,
         redacted: 0,
         truncated: false,
         timed_out: false,
+        stopped: false,
         elapsed_ms: 0,
         refused: Some(reason.to_string()),
     }
@@ -479,11 +534,15 @@ fn refusal(task: &str, reason: &str) -> LogEntry {
 
 /// Write one outcome in the response shape. A withheld stream is `-1`, distinct from an empty one
 /// (`0`), so a caller can tell "the declaration hides this" from "the command printed nothing".
-fn write_outcome(writer: &mut UnixStream, outcome: &TaskOutcome) -> io::Result<()> {
+fn write_outcome(writer: &mut UnixStream, id: u64, outcome: &TaskOutcome) -> io::Result<()> {
+    // The invocation's id, so a result can be matched against the line it leaves in the session's
+    // log — one number, whichever verb you are looking at.
+    writeln!(writer, "id {id}")?;
     writeln!(writer, "exit {}", outcome.exit)?;
     writeln!(writer, "redacted {}", outcome.redacted)?;
     writeln!(writer, "truncated {}", u8::from(outcome.truncated))?;
     writeln!(writer, "timed-out {}", u8::from(outcome.timed_out))?;
+    writeln!(writer, "stopped {}", u8::from(outcome.stopped))?;
     writeln!(writer, "elapsed-ms {}", outcome.elapsed_ms)?;
     // The invocation's substitution nonce, when the section enabled it — out of band, which is the
     // whole point: a `${NAME@nonce}` in the *text* is only unforgeable because the nonce arrives
@@ -516,8 +575,16 @@ fn write_outcome(writer: &mut UnixStream, outcome: &TaskOutcome) -> io::Result<(
     writeln!(writer, "ok")
 }
 
-/// Serve one connection on the host-only log socket: `LOG` or `LOG after=<seq>`.
-fn serve_log(stream: UnixStream, log: &TaskLog) -> io::Result<()> {
+/// Serve one connection on the session's host-only socket: `LOG` (optionally `after=<seq>`),
+/// `STATUS`, or `STOP <id>`.
+///
+/// All three are here rather than on the crossing socket, and that placement *is* the access
+/// control: this socket is never bound into a cage, so the in-cage client cannot express these verbs
+/// however it is called. The reasons differ by verb and both matter. `LOG`: the recorded party does
+/// not get to read the record. `STATUS`/`STOP`: ids are per session, so an in-cage caller reaching
+/// them could see and end an invocation *another* caller started — the human at the terminal — and
+/// nothing in the cage distinguishes the two, since a task plane has no per-caller identity.
+fn serve_host(stream: UnixStream, engine: &TaskEngine, log: &TaskLog) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut command = String::new();
@@ -525,6 +592,40 @@ fn serve_log(stream: UnixStream, log: &TaskLog) -> io::Result<()> {
         return Ok(());
     }
     let command = command.trim_end();
+
+    if command == "STATUS" {
+        for row in engine.running() {
+            writeln!(
+                writer,
+                "running {}\ttask={}\telapsed_ms={}\tpid={}\tstopping={}",
+                row.id,
+                sanitize(&row.task),
+                row.elapsed_ms,
+                row.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                u8::from(row.stopping),
+            )?;
+        }
+        return writeln!(writer, "ok");
+    }
+
+    if let Some(rest) = command.strip_prefix("STOP ") {
+        let Ok(id) = rest.trim().parse::<u64>() else {
+            return writeln!(writer, "err a stop names an invocation id");
+        };
+        let line = match engine.stop(id) {
+            super::task::StopOutcome::Stopped => format!("stopped {id}"),
+            super::task::StopOutcome::Stopping => format!("stopping {id}"),
+            // Not running now — but the log says whether it ever was, and "you are too late" and
+            // "there is no such invocation" are different things to be told.
+            super::task::StopOutcome::NotRunning if log.recorded(id) => format!("finished {id}"),
+            super::task::StopOutcome::NotRunning => {
+                return writeln!(writer, "err no invocation {id}")
+            }
+        };
+        writeln!(writer, "{line}")?;
+        return writeln!(writer, "ok");
+    }
+
     let after = match command.strip_prefix("LOG") {
         None => return writeln!(writer, "err unknown command"),
         Some(rest) => rest
@@ -543,14 +644,76 @@ fn serve_log(stream: UnixStream, log: &TaskLog) -> io::Result<()> {
     writeln!(writer, "ok")
 }
 
-/// Read one session's invocation log, host-side. The counterpart of [`serve_log`]; it only reads.
-pub(crate) fn read_log(socket: &Path) -> io::Result<Vec<String>> {
+/// Ask a session's host-only socket one thing and read the whole answer.
+fn ask_host(socket: &Path, command: &str) -> io::Result<Vec<String>> {
     let mut stream = UnixStream::connect(socket)?;
-    writeln!(stream, "LOG")?;
+    writeln!(stream, "{command}")?;
     stream.flush()?;
     let mut text = String::new();
     BufReader::new(stream).read_to_string(&mut text)?;
     Ok(text.lines().map(str::to_string).collect())
+}
+
+/// Read one session's invocation log, host-side. The counterpart of [`serve_host`]; it only reads.
+pub(crate) fn read_log(socket: &Path) -> io::Result<Vec<String>> {
+    ask_host(socket, "LOG")
+}
+
+/// One invocation running right now, as the host-side verb prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusRow {
+    pub(crate) id: u64,
+    pub(crate) fields: Vec<String>,
+}
+
+/// What a session is running right now.
+pub(crate) fn read_status(socket: &Path) -> io::Result<Vec<StatusRow>> {
+    Ok(ask_host(socket, "STATUS")?
+        .iter()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("running ")?;
+            let mut fields = rest.split('\t').map(str::to_string);
+            let id = fields.next()?.parse().ok()?;
+            Some(StatusRow {
+                id,
+                fields: fields.collect(),
+            })
+        })
+        .collect())
+}
+
+/// What a stop achieved, as the plane reports it. The plane is the authority on this: it is the side
+/// that waited to see whether the invocation actually ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StopReply {
+    Stopped,
+    Stopping,
+    Finished,
+    Refused(String),
+}
+
+/// Stop one invocation by id, host-side.
+pub(crate) fn stop_invocation(socket: &Path, id: u64) -> io::Result<StopReply> {
+    let lines = ask_host(socket, &format!("STOP {id}"))?;
+    for line in &lines {
+        if let Some(reason) = line.strip_prefix("err ") {
+            return Ok(StopReply::Refused(reason.to_string()));
+        }
+        if line.starts_with("stopped ") {
+            return Ok(StopReply::Stopped);
+        }
+        if line.starts_with("stopping ") {
+            return Ok(StopReply::Stopping);
+        }
+        if line.starts_with("finished ") {
+            return Ok(StopReply::Finished);
+        }
+    }
+    // A connection that closed before saying anything is a plane that went away mid-answer; that is
+    // not a stop, and reporting one would be inventing a result.
+    Err(io::Error::other(
+        "the task plane gave no answer to the stop",
+    ))
 }
 
 /// The pids of the sessions currently offering declared operations, sorted — and, as a side effect,
@@ -665,12 +828,17 @@ pub(crate) mod client {
     /// A parsed invocation result.
     #[derive(Debug, Clone, PartialEq, Eq, Default)]
     pub(crate) struct RunResult {
+        /// The invocation's id — the number its line in `sbx task logs` carries, and the one
+        /// `sbx task stop` would have taken while it ran.
+        pub(crate) id: u64,
         pub(crate) exit: i32,
         pub(crate) stdout: Option<String>,
         pub(crate) stderr: Option<String>,
         pub(crate) redacted: usize,
         pub(crate) truncated: bool,
         pub(crate) timed_out: bool,
+        /// Whether `sbx task stop` ended it.
+        pub(crate) stopped: bool,
         pub(crate) elapsed_ms: u64,
         /// This invocation's substitution nonce, when the section enabled it — the out-of-band half
         /// of an unforgeable `${NAME@nonce}` placeholder.
@@ -701,10 +869,12 @@ pub(crate) mod client {
                 continue;
             };
             match key {
+                "id" => out.id = value.parse().unwrap_or(0),
                 "exit" => out.exit = value.parse().unwrap_or(-1),
                 "redacted" => out.redacted = value.parse().unwrap_or(0),
                 "truncated" => out.truncated = value == "1",
                 "timed-out" => out.timed_out = value == "1",
+                "stopped" => out.stopped = value == "1",
                 "elapsed-ms" => out.elapsed_ms = value.parse().unwrap_or(0),
                 "nonce" => out.nonce = Some(value.to_string()),
                 "refused-exec" => out.refused.push(value.to_string()),
@@ -912,6 +1082,11 @@ mod tests {
     /// The launcher is a script standing in for bubblewrap: it ignores the cage argv, waits, and
     /// prints. That is the only way to exercise what a real operation does to the wire — take time.
     fn slow_plane_and_client(seconds: &str) -> Option<(TmpDir, TaskPlane, PathBuf)> {
+        plane_with_launcher(&format!("sleep {seconds}\nprintf 'the-answer\\n'\n"))
+    }
+
+    /// A plane whose cage is `body` — a script standing in for bubblewrap — plus the client script.
+    fn plane_with_launcher(body: &str) -> Option<(TmpDir, TaskPlane, PathBuf)> {
         use std::os::unix::fs::PermissionsExt;
         let bash = crate::pathfind::find_on_path("bash")?;
         let socat = crate::pathfind::find_on_path("socat")?;
@@ -919,14 +1094,8 @@ mod tests {
         let data = TmpDir::new();
 
         let launcher = data.path().join("slow-launcher");
-        std::fs::write(
-            &launcher,
-            format!(
-                "#!{}\nsleep {seconds}\nprintf 'the-answer\\n'\n",
-                bash.display()
-            ),
-        )
-        .expect("write the launcher");
+        std::fs::write(&launcher, format!("#!{}\n{body}", bash.display()))
+            .expect("write the launcher");
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
             .expect("make the launcher executable");
 
@@ -976,6 +1145,128 @@ mod tests {
             out.status.code(),
             Some(0),
             "the operation's own exit code must come back: stderr={stderr}"
+        );
+    }
+
+    /// A running invocation is visible, stoppable by the id it is visible under, and the result says
+    /// it was **stopped** rather than timed out.
+    ///
+    /// The whole feature is here: `status` and `stop` are the same number as the log's, the stop
+    /// reaches a command that is genuinely mid-run, and the answer stays distinguishable from the
+    /// timeout it shares a lever with. `timed_out` staying false is the load-bearing assertion — both
+    /// paths kill the same cage the same way, and only the field tells a person which happened.
+    ///
+    /// The launcher `exec`s its sleep so that the killed process is the one holding the pipes, the
+    /// way bubblewrap is in a real cage (it is the pid-namespace init, so nothing survives it).
+    #[test]
+    fn a_running_invocation_is_stopped_by_the_id_status_shows() {
+        let Some((data, plane, _script)) = plane_with_launcher("exec sleep 20\n") else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        let cage = plane.cage_socket.clone();
+        let caller = std::thread::spawn(move || {
+            client::run(
+                &cage,
+                "probe",
+                &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+                &BTreeMap::new(),
+            )
+        });
+
+        // The id cannot be predicted — the counter is per process and these tests share one — so it
+        // is read the way a person reads it.
+        let mut id = None;
+        for _ in 0..200 {
+            if let Some(row) = read_status(&host).expect("status").first() {
+                id = Some(row.id);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let id = id.expect("the running invocation must be visible while it runs");
+
+        let reply = stop_invocation(&host, id).expect("stop");
+        assert_eq!(
+            reply,
+            StopReply::Stopped,
+            "the plane waits to see the invocation end before it reports one"
+        );
+
+        let result = caller.join().expect("the caller thread").expect("a result");
+        assert!(result.stopped, "the result must say it was stopped");
+        assert!(
+            !result.timed_out,
+            "a stop is not a timeout: {}ms",
+            result.elapsed_ms
+        );
+        assert_eq!(result.id, id, "one id, whichever verb reports it");
+        assert!(
+            result.elapsed_ms < 15_000,
+            "the stop must land well before the 30s timeout, not read as one: {}ms",
+            result.elapsed_ms
+        );
+
+        assert!(
+            read_status(&host).expect("status").is_empty(),
+            "a stopped invocation is no longer running"
+        );
+        let line = read_log(&host)
+            .expect("log")
+            .into_iter()
+            .find(|l| l.starts_with("event "))
+            .expect("the invocation is recorded");
+        assert!(
+            line.contains(&format!("seq={id} ")),
+            "the log carries the same id status showed: {line}"
+        );
+        assert!(line.contains("stopped=1"), "{line}");
+        assert!(line.contains("timed_out=0"), "{line}");
+        drop(data);
+    }
+
+    /// A stop that names an invocation the session never had is refused, and one that names a
+    /// finished invocation is told it is too late — two different things to be told.
+    #[test]
+    fn a_stop_tells_a_finished_invocation_from_an_unknown_one() {
+        let Some((_data, plane, _script)) = plane_and_client(vec![probe_task()]) else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        assert!(
+            matches!(
+                stop_invocation(&host, 4242).expect("stop"),
+                StopReply::Refused(_)
+            ),
+            "an id this session never issued is not something to report as stopped"
+        );
+
+        // One real invocation, run to completion: the launcher does not exist, so it fails at once
+        // and is recorded either way.
+        let _ = client::run(
+            &plane.cage_socket,
+            "probe",
+            &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+            &BTreeMap::new(),
+        );
+        let recorded: Vec<u64> = read_log(&host)
+            .expect("log")
+            .iter()
+            .filter_map(|l| {
+                l.strip_prefix("event seq=")?
+                    .split(' ')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        let id = *recorded.first().expect("the invocation is recorded");
+        assert_eq!(
+            stop_invocation(&host, id).expect("stop"),
+            StopReply::Finished,
+            "an id the log knows is a finished invocation, not an unknown one"
         );
     }
 
@@ -1135,6 +1426,7 @@ mod tests {
             truncated: true,
             redacted: 2,
             timed_out: false,
+            stopped: false,
             elapsed_ms: 12,
             nonce: Some("a91f3c".to_string()),
             refused: Vec::new(),
@@ -1152,7 +1444,7 @@ mod tests {
                     line.clear();
                 }
                 let mut writer = stream;
-                let _ = write_outcome(&mut writer, &outcome);
+                let _ = write_outcome(&mut writer, 7, &outcome);
             }
         });
 
@@ -1210,6 +1502,7 @@ mod tests {
             truncated: false,
             redacted: 0,
             timed_out: false,
+            stopped: false,
             elapsed_ms: 4,
             nonce: None,
             refused: vec![
@@ -1229,7 +1522,7 @@ mod tests {
                     line.clear();
                 }
                 let mut writer = stream;
-                let _ = write_outcome(&mut writer, &outcome);
+                let _ = write_outcome(&mut writer, 7, &outcome);
             }
         });
 
@@ -1284,6 +1577,7 @@ mod tests {
             truncated: false,
             redacted: 0,
             timed_out: false,
+            stopped: false,
             elapsed_ms: 1,
             nonce: None,
             refused: Vec::new(),
@@ -1300,7 +1594,7 @@ mod tests {
                     line.clear();
                 }
                 let mut writer = stream;
-                let _ = write_outcome(&mut writer, &outcome);
+                let _ = write_outcome(&mut writer, 7, &outcome);
             }
         });
         let script = dir.path().join("client");
@@ -1333,6 +1627,16 @@ mod tests {
         let out = run_client(&script, &["task", "logs"]);
         assert_eq!(out.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&out.stderr).contains("not readable from inside the cage"));
+        // So do the live verbs, for the second reason: an invocation id is per session, so reaching
+        // them from here would be reaching another caller's invocation.
+        for verb in ["status", "stop"] {
+            let out = run_client(&script, &["task", verb]);
+            assert_eq!(out.status.code(), Some(2), "`task {verb}` must be refused");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("host-side only"),
+                "`task {verb}`: {out:?}"
+            );
+        }
     }
 
     // What the launcher binds is the client the plane wrote, pointed at the socket the cage sees.
@@ -1367,37 +1671,42 @@ mod tests {
         );
     }
 
-    fn entry(task: &str, exit: i32) -> LogEntry {
+    fn entry(id: u64, task: &str, exit: i32) -> LogEntry {
         LogEntry {
-            seq: 0,
+            seq: id,
             at: 0,
             task: task.to_string(),
             exit,
             redacted: 2,
             truncated: false,
             timed_out: false,
+            stopped: false,
             elapsed_ms: 12,
             refused: None,
         }
     }
 
-    // The log is the trustworthy record: sbx assigns the sequence and the timestamp, and the
-    // substitution count is host-side — none of it is anything a caller can forge.
+    // The log is the trustworthy record: the timestamp is stamped host-side and the substitution
+    // count is host-side — none of it is anything a caller can forge. The id is the *invocation's*,
+    // carried in rather than counted here, so one number names an invocation everywhere.
     #[test]
-    fn the_log_assigns_sequence_numbers_and_retains_in_order() {
+    fn the_log_keeps_the_invocations_own_id_and_stamps_the_time() {
         let log = TaskLog::new();
-        log.push(entry("db-query", 0));
-        log.push(entry("db-query", 1));
+        log.push(entry(4, "db-query", 0));
+        log.push(entry(5, "db-query", 1));
         let (entries, dropped) = log.since(0);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].seq, 1);
-        assert_eq!(entries[1].seq, 2);
+        assert_eq!(
+            entries[0].seq, 4,
+            "the entry keeps the id the invocation was admitted under"
+        );
+        assert_eq!(entries[1].seq, 5);
         assert_eq!(dropped, 0);
         assert!(entries[0].at > 0, "the timestamp is stamped host-side");
 
-        let (tail, _) = log.since(1);
+        let (tail, _) = log.since(4);
         assert_eq!(tail.len(), 1, "a cursor returns only what is past it");
-        assert_eq!(tail[0].seq, 2);
+        assert_eq!(tail[0].seq, 5);
     }
 
     // A refusal is recorded too — a caller probing a task it may not run is exactly what a human
@@ -1405,7 +1714,7 @@ mod tests {
     #[test]
     fn a_refusal_is_recorded_with_its_reason() {
         let log = TaskLog::new();
-        log.push(refusal("db-query", "parameter `sql` does not match"));
+        log.push(refusal(1, "db-query", "parameter `sql` does not match"));
         let (entries, _) = log.since(0);
         let line = entries[0].to_line();
         assert!(line.contains("task=db-query"), "{line}");
@@ -1417,7 +1726,11 @@ mod tests {
     #[test]
     fn a_control_character_cannot_forge_a_second_log_line() {
         let log = TaskLog::new();
-        log.push(refusal("db-query", "bad\nevent seq=99 exit=0 task=forged"));
+        log.push(refusal(
+            1,
+            "db-query",
+            "bad\nevent seq=99 exit=0 task=forged",
+        ));
         let (entries, _) = log.since(0);
         let line = entries[0].to_line();
         assert_eq!(line.lines().count(), 1, "one entry is one line: {line}");
@@ -1428,7 +1741,7 @@ mod tests {
     fn the_ring_evicts_the_oldest_and_reports_the_drop() {
         let log = TaskLog::new();
         for _ in 0..LOG_CAPACITY + 3 {
-            log.push(entry("t", 0));
+            log.push(entry(1, "t", 0));
         }
         let (entries, dropped) = log.since(0);
         assert_eq!(entries.len(), LOG_CAPACITY);

@@ -614,9 +614,11 @@ const PAGES: &[Page] = &[
             `match` pattern or an `enum`) and the variable names in `env_allow`. The program, the\n\
             environment, the credential and the ceilings are the declaration's.\n\
             \n\
-            These verbs work both inside the cage (where the agent uses them) and on the host, so an\n\
-            operation is testable exactly as the agent sees it. `logs` is host-only: the invocation\n\
-            log lives on a socket the cage never reaches.\n\
+            `list`, `secrets` and `run` work both inside the cage (where the agent uses them) and on\n\
+            the host, so an operation is testable exactly as the agent sees it. `status`, `stop` and\n\
+            `logs` are **host-only**, and by construction: they live on a socket that is never bound\n\
+            into a cage. The record is not for the recorded party to read, and an invocation id is\n\
+            per session — a cage that could stop one could stop the invocation *you* started.\n\
             \n\
             A task's program must come from a tree no cage can write. Every host-side package backend\n\
             (`nix:`, a remote `flake:`, `deb:`, `appimage:`, `tarball:`, `prebuilt:`) already is one.\n\
@@ -683,14 +685,64 @@ const PAGES: &[Page] = &[
             printed by the command.",
     },
     Page {
+        path: &["task", "status"],
+        synopsis: "sbx task status [<id>]",
+        summary: "the operations this session is running right now (host-only)",
+        options: &[(
+            "<id>",
+            "the PID of the session to ask; omit it when only one is offering operations",
+        )],
+        details:
+            "One line per invocation in flight: its id, which operation it is, how long it has been\n\
+            running, the pid of its cage, and whether it has already been asked to stop.\n\
+            \n\
+            The id is the **invocation's**, and it is the same number everywhere: `sbx task stop`\n\
+            takes it, and the line the invocation leaves in `sbx task logs` carries it.\n\
+            \n\
+            A caller blocked on its own `sbx task run` cannot see it here — it is waiting for the\n\
+            answer. This is the view from another terminal, which is also the only place a stop can\n\
+            come from.",
+    },
+    Page {
+        path: &["task", "stop"],
+        synopsis: "sbx task stop <invocation> [--session <id>]",
+        summary: "end one running invocation (host-only)",
+        options: &[
+            (
+                "<invocation>",
+                "the invocation id, as `sbx task status` shows it — not a session id",
+            ),
+            ("--session <id>", "the session it is running in, when several offer operations"),
+        ],
+        details:
+            "The cage is torn down, so nothing the operation started outlives it. The caller gets its\n\
+            result with whatever the command produced up to that point, marked **stopped** — which\n\
+            stays distinct from the timeout that ends an invocation the same way, because one is the\n\
+            declaration's ceiling firing and the other is you deciding.\n\
+            \n\
+            Stopping is not instant, and the answer says which happened. A request that arrives while\n\
+            the invocation is still resolving a credential or standing up its proxy is honored once\n\
+            that step returns; until then this reports that it was asked to stop and is still\n\
+            finishing, and exits non-zero. Naming an invocation that has already ended says so.\n\
+            \n\
+            An artifact left in a `output = true` directory stays as the stopped command left it:\n\
+            partial, and only the next invocation clears it.",
+    },
+    Page {
         path: &["task", "logs"],
         synopsis: "sbx task logs [<id>]",
         summary: "a session's invocation log (host-only)",
         options: &[("<id>", "the PID of the session whose log to read")],
         details:
-            "One line per invocation: when, which operation, the exit code, how many credential\n\
-            values were substituted out, whether the output was truncated or the timeout fired, and\n\
-            how long it took. A refusal is recorded too, with its reason.\n\
+            "One line per invocation: its id, when it finished, which operation, the exit code, how\n\
+            many credential values were substituted out, whether the output was truncated, whether\n\
+            the timeout fired or a stop ended it, and how long it took. A refusal is recorded too,\n\
+            with its reason.\n\
+            \n\
+            `seq=` is the invocation's own id — the one `sbx task status` showed while it ran. It is\n\
+            drawn when the invocation starts and the line is written when it ends, so two overlapping\n\
+            invocations appear in the order they finished and their ids can read out of order. A\n\
+            `seq=0` marks a request refused before it was admitted at all.\n\
             \n\
             Neither the command nor any parameter value is recorded: the command is fixed by the\n\
             declaration, and a value can carry a secret. The log is in-RAM, bounded, and dies with\n\

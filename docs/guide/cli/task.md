@@ -4,6 +4,8 @@
 sbx task list [<id>]
 sbx task secrets [<id>]
 sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]
+sbx task status [<id>]
+sbx task stop <invocation> [--session <id>]
 sbx task logs [<id>]
 ```
 
@@ -11,9 +13,12 @@ Use the **declared operations** a session offers — fixed commands sbx runs on 
 an ephemeral sibling cage, with a credential the caller never holds. Declared as
 [`[task.<name>]`](../configuration/task.md).
 
-These verbs work **both inside the cage** (where the agent uses them, through the socket sbx binds
-there) **and on the host**, so an operation is testable exactly as the agent sees it. `logs` is
-host-only.
+`list`, `secrets` and `run` work **both inside the cage** (where the agent uses them, through the
+socket sbx binds there) **and on the host**, so an operation is testable exactly as the agent sees
+it. `status`, `stop` and `logs` are **host-only**, and by construction rather than by check: they
+live on a second socket that is never bound into a cage. The record is not for the recorded party to
+read, and an invocation id is per session — a cage able to stop one could stop the invocation *you*
+started, and same-uid leaves no way to tell the two callers apart.
 
 ## How an agent finds them
 
@@ -140,9 +145,66 @@ than 2 so it stays distinguishable from the wrapped command exiting 2 itself —
 
 **Output.** stdout and stderr come back only if the declaration shows them, and every credential
 value found in either is replaced by `${NAME}` first. sbx reports, on stderr, when the output was
-truncated at `max_output`, when the timeout fired, and how many values were substituted — that count
-is host-side, which is what makes it trustworthy (a `${NAME}` in the text could have been printed by
-the command itself).
+truncated at `max_output`, when the timeout fired, when [`stop`](#stop) ended it, and how many values
+were substituted — that count is host-side, which is what makes it trustworthy (a `${NAME}` in the
+text could have been printed by the command itself).
+
+## `status`
+
+```
+sbx task status [<id>]
+```
+
+What the session is running **right now** — host-only.
+
+```
+$ sbx task status
+7 task=nightly-dump  elapsed_ms=42310  pid=318204  stopping=0
+```
+
+| Field | Meaning |
+|---|---|
+| the first column | the **invocation id** — what `stop` takes, and what its log line will carry |
+| `task` | which operation it is |
+| `elapsed_ms` | how long it has been running |
+| `pid` | the cage's process, for `ps` and `systemd-cgls` |
+| `stopping` | whether it has already been asked to stop |
+
+A caller blocked on its own `sbx task run` cannot see this — it is waiting for the answer. This is
+the view from another terminal, which is also the only place a stop can come from.
+
+## `stop`
+
+```
+sbx task stop <invocation> [--session <id>]
+```
+
+End one running invocation. The argument is an **invocation** id (as `status` shows it), not a
+session id; the session, when several offer operations, is named with `--session`.
+
+```
+$ sbx task stop 7
+stopped invocation 7
+```
+
+The cage is torn down, so nothing the operation started outlives it. The caller gets its result with
+whatever the command produced up to that point, marked **stopped** — which stays distinct from the
+`timed_out` that ends an invocation the same way: one is the declaration's ceiling firing, the other
+is you deciding.
+
+**Stopping is not instant, and the answer says which happened.** A request that lands while the
+invocation is still resolving a credential or standing up its proxy is honored once that step
+returns:
+
+| Answer | Meaning | Exit |
+|---|---|---|
+| `stopped invocation <id>` | it ended | 0 |
+| `<id> was asked to stop and is still finishing` | accepted, not yet done | 1 |
+| `invocation <id> had already finished` | too late, and nothing to do | 0 |
+| `no invocation <id>` | this session never issued that id | 1 |
+
+An artifact in an [`output = true`](../configuration/task.md#producing-a-file-output) directory stays
+as the stopped command left it: partial, and only the next invocation clears it.
 
 ## `logs`
 
@@ -155,20 +217,25 @@ record.
 
 ```
 $ sbx task logs
-event seq=1 at=1769812800 exit=0 redacted=1 truncated=0 timed_out=0 elapsed_ms=214 task=db-query
-event seq=2 at=1769812815 exit=-1 redacted=0 truncated=0 timed_out=0 elapsed_ms=0 task=db-query refused=parameter `sql` does not match its declared pattern
+event seq=1 at=1769812800 exit=0 redacted=1 truncated=0 timed_out=0 stopped=0 elapsed_ms=214 task=db-query
+event seq=2 at=1769812815 exit=-1 redacted=0 truncated=0 timed_out=0 stopped=0 elapsed_ms=0 task=db-query refused=parameter `sql` does not match its declared pattern
 ```
 
 | Field | Meaning |
 |---|---|
-| `seq` | a per-session sequence number, assigned host-side |
+| `seq` | the **invocation id** — the one `sbx task status` showed while it ran |
 | `at` | Unix seconds when the invocation finished |
 | `exit` | the command's exit code, or `-1` for a refusal |
 | `redacted` | how many credential values were substituted out |
-| `truncated` / `timed_out` | whether a ceiling fired |
+| `truncated` / `timed_out` / `stopped` | whether a ceiling fired, or someone ended it |
 | `elapsed_ms` | how long it took |
 | `task` | the operation's name |
 | `refused` | why it never ran (refusals are recorded too) |
+
+The id is drawn when an invocation **starts** and its line is written when it **ends**, so two
+overlapping invocations appear in the order they finished and their ids can read out of order. A
+`seq=0` marks a request refused before it was admitted at all — the session's quota was exhausted, so
+no invocation exists for an id to name.
 
 Neither the command nor any parameter value is recorded: the command is fixed by the declaration, and
 a value can carry a secret. The log is in-RAM, bounded (512 invocations, and it says how many older

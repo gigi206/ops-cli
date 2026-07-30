@@ -65,27 +65,53 @@ const TASK_OUT_ENV: &str = "SBX_TASK_OUT";
 pub(crate) const TASK_OUT_AGENT: &str = "/opt/sbx/task-out";
 pub(crate) const TASK_OUT_TREE: &str = "task-out";
 
-/// How often the runner checks whether the command has exited while enforcing the timeout. Short
-/// enough that a fast task is not visibly delayed, long enough not to spin.
-/// Distinguishes one invocation's host-side artifacts from another's — its proxy sockets and its
-/// systemd scope. A session can serve two invocations at once, and both would otherwise derive
-/// those names from the launcher pid alone and collide on them. Monotonic per process, which is all
-/// it has to be: the pid already separates sessions.
+/// The **one** number that names an invocation, everywhere it is named: its host-side artifacts (its
+/// proxy sockets, its exec supervisor, its systemd scope), its line in the session's log, the row
+/// `sbx task status` shows while it runs, and the id `sbx task stop` takes. A session can serve two
+/// invocations at once, and every name derived from the launcher pid alone would be the same name
+/// twice. Monotonic per process, which is all it has to be: the pid already separates sessions.
+///
+/// It starts at **1** so that no invocation is ever id `0` — the log reserves that for an entry no
+/// invocation stands behind (a request refused before it was admitted at all).
 ///
 /// It reaches a socket path, which the kernel caps at `SUN_LEN` (108), so its width is worth
-/// knowing rather than assuming: the per-session call quota bounds it, making the suffix five bytes
-/// (`.t499`) at its widest. Measured against a deliberately long install path
+/// knowing rather than assuming: a session's call quota bounds how many are ever drawn, making the
+/// suffix five bytes (`.t500`) at its widest. Measured against a deliberately long install path
 /// (`/home/<32 chars>/.local/share/sbx`) with a seven-digit pid, the full control-socket path is 84
-/// bytes — the suffix spends five of roughly thirty spare.
+/// bytes — the suffix spends five of roughly thirty spare, so the width is not what would break
+/// first even if a process somehow drew past the quota.
 ///
 /// It opens with a **dot**, not a dash, and that is load-bearing rather than cosmetic: the runtime
 /// sweep reads a launcher pid as the digits up to the first `.`, so `control-<pid>.t3.sock` is
 /// collected with the session that made it while `control-<pid>-t3.sock` would be a name the sweep
 /// cannot parse and therefore never removes. A per-invocation CA is ~460 KB; leaving those
 /// unsweepable is how a data directory grows without bound.
-static TASK_INVOCATION: AtomicU64 = AtomicU64::new(0);
+static TASK_INVOCATION: AtomicU64 = AtomicU64::new(1);
 
+/// Draw the next invocation id. Taken by the caller that admits the invocation, not by [`TaskEngine::run`]
+/// itself, so that a request refused *after* admission still carries the id its refusal is recorded
+/// under — there is one number per admitted invocation whether or not a command ever ran.
+pub(crate) fn next_invocation() -> u64 {
+    TASK_INVOCATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// How often the runner checks whether the command has exited, whether its timeout has passed, and
+/// whether it has been asked to stop. Short enough that a fast task is not visibly delayed, long
+/// enough not to spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The exit code a stopped invocation reports. `128 + SIGKILL` is what a command killed mid-run
+/// produces anyway; a stop that lands *before* the command starts reports the same, so one event has
+/// one answer whichever side of the spawn it arrives on.
+const STOPPED_EXIT: i32 = 128 + libc::SIGKILL;
+
+/// How long [`TaskEngine::await_stop`] waits for a stop it requested to actually take effect.
+///
+/// Bounded because it cannot be unbounded honestly: a stop is a request the runner honors at its
+/// next poll, and everything before the spawn — a credential resolving through `sops`, a proxy being
+/// stood up — completes first. Long enough to cover the poll interval and a kill many times over, so
+/// "still finishing" means something is genuinely holding it rather than that the wait was stingy.
+const STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// The in-cage destinations a task cage keeps from the agent cage's mount set.
 ///
@@ -178,6 +204,11 @@ pub(crate) struct TaskEngine {
     /// before running anything — and two concurrent invocations of the same task would then write
     /// into one directory. The second is refused rather than allowed to interleave.
     output_held: Arc<Mutex<BTreeSet<String>>>,
+    /// The invocations running right now, by id — what `sbx task status` reports and what
+    /// `sbx task stop` acts on. Held by the engine rather than by the plane because only the engine
+    /// knows when a command actually starts and ends; a registry kept beside it would be a second
+    /// account of the same fact, and the two would drift.
+    running: Arc<Mutex<BTreeMap<u64, Running>>>,
     /// The in-cage programs that give a networked task a route out. Not optional: any task may
     /// declare `network`, and one that does with no forwarder would find the proxy socket bound, the
     /// proxy variables set, and nothing listening on the port they name.
@@ -213,6 +244,10 @@ pub(crate) struct TaskOutcome {
     pub(crate) redacted: usize,
     /// Whether the timeout killed the command.
     pub(crate) timed_out: bool,
+    /// Whether `sbx task stop` ended it. Distinct from `timed_out` although both end the command the
+    /// same way: one is the declaration's own ceiling firing, the other is a person deciding, and a
+    /// caller that cannot tell them apart cannot know whether to raise the ceiling or ask why.
+    pub(crate) stopped: bool,
     /// How long the invocation took, in milliseconds.
     pub(crate) elapsed_ms: u64,
     /// This invocation's substitution nonce, when the section enabled it. Reported **out of band**
@@ -304,6 +339,7 @@ impl TaskEngine {
             pool: None,
             forwarder,
             output_held: Arc::new(Mutex::new(BTreeSet::new())),
+            running: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -386,15 +422,24 @@ impl TaskEngine {
     /// Run one task: check the caller's inputs, resolve the credentials host-side, build the cage,
     /// run it under its ceilings, substitute every secret value out of the captured output, and
     /// return the structured result.
+    ///
+    /// `invocation` is drawn by the caller that admitted this run ([`next_invocation`]), not here:
+    /// it is the id the refusal would be recorded under too, and a number the engine drew privately
+    /// could not be one.
     pub(crate) fn run(
         &self,
         name: &str,
         params: &BTreeMap<String, String>,
         env: &BTreeMap<String, String>,
+        invocation: u64,
     ) -> Result<TaskOutcome, TaskError> {
         let task = self
             .task(name)
             .ok_or_else(|| TaskError::Unknown(name.into()))?;
+        // Live from here on: everything below can take real time — a credential resolves through a
+        // subprocess, a proxy is stood up — and an invocation that cannot be seen during that is one
+        // that cannot be stopped during it either.
+        let _live = self.enter(invocation, name);
         let mut values = resolve_params(task, params).map_err(TaskError::Refused)?;
         let caller_env = caller_env(task, env).map_err(TaskError::Refused)?;
 
@@ -456,10 +501,6 @@ impl TaskEngine {
         // a task's credential in the session's injection table would let the agent trigger the
         // injection itself by aiming at that host. The socket is the only authority boundary
         // available, so a task gets its own — with its own rules and its own injections.
-        // One identity for this invocation, worn by everything it stands up. Concurrent invocations
-        // are ordinary — an agent may ask for two at once — and every name derived from the launcher
-        // pid alone would be the same name twice.
-        let invocation = TASK_INVOCATION.fetch_add(1, Ordering::Relaxed);
         let mut proxy_binds = Vec::new();
         let mut proxy_env = Vec::new();
         let mut tcp_plan = super::egress::TcpPlan::default();
@@ -544,7 +585,7 @@ impl TaskEngine {
         } else {
             Placeholder::Plain
         };
-        let raw = self.exec(&spec, task).map_err(|e| {
+        let raw = self.exec(&spec, task, invocation).map_err(|e| {
             let (text, _) = super::redact::redact_string(&e.to_string(), &needles, &placeholder);
             TaskError::Io(io::Error::other(text))
         })?;
@@ -572,6 +613,7 @@ impl TaskEngine {
             truncated: raw.truncated,
             redacted: out_hits + err_hits,
             timed_out: raw.timed_out,
+            stopped: raw.stopped,
             elapsed_ms,
             refused: enforce.map(|e| e.refusals()).unwrap_or_default(),
             output: output.map(|o| {
@@ -723,9 +765,22 @@ impl TaskEngine {
     /// Run the assembled cage, capturing both streams up to the task's ceiling and killing it at the
     /// timeout. Returns the raw (unsubstituted) bytes — substitution is the caller's next step, so
     /// there is exactly one place it can be forgotten.
-    fn exec(&self, spec: &SandboxSpec, task: &TaskSpec) -> io::Result<RawOutput> {
+    fn exec(&self, spec: &SandboxSpec, task: &TaskSpec, invocation: u64) -> io::Result<RawOutput> {
         let (argv, _seccomp) = super::launch::seccomp_argv(spec)?;
         let (prog, args) = super::cgroup::wrap(&self.bwrap, argv, &self.limits, spec.cage_slug());
+        // A stop that arrived while the credentials were resolving is honored by not starting the
+        // command at all — the earliest point at which it can be, and the only one where "stopped"
+        // means nothing ran.
+        if self.stop_requested(invocation) {
+            return Ok(RawOutput {
+                exit: STOPPED_EXIT,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+                timed_out: false,
+                stopped: true,
+            });
+        }
         let mut child = Command::new(prog)
             .args(args)
             // No stdin at all: a task is non-interactive, and an inherited stdin would be a channel
@@ -734,6 +789,7 @@ impl TaskEngine {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        self.note_pid(invocation, child.id());
 
         // Read both streams on their own threads so neither can block the other by filling its pipe
         // while the runner waits on the wrong one.
@@ -745,6 +801,7 @@ impl TaskEngine {
 
         let deadline = Instant::now() + task.timeout;
         let mut timed_out = false;
+        let mut stopped = false;
         let status = loop {
             match child.try_wait()? {
                 Some(status) => break status,
@@ -752,6 +809,14 @@ impl TaskEngine {
                     // Killing bwrap tears the whole cage down: it is the pid-namespace init for
                     // everything inside, so no descendant outlives the timeout.
                     timed_out = true;
+                    let _ = child.kill();
+                    break child.wait()?;
+                }
+                // A stop uses the same lever as the timeout and stays a *distinct* answer: both end
+                // the command, but one is the declaration's ceiling firing and the other is someone
+                // deciding, and a caller that cannot tell them apart cannot know which to act on.
+                None if self.stop_requested(invocation) => {
+                    stopped = true;
                     let _ = child.kill();
                     break child.wait()?;
                 }
@@ -773,7 +838,26 @@ impl TaskEngine {
             stderr,
             truncated: out_cut || err_cut,
             timed_out,
+            stopped,
         })
+    }
+
+    /// Whether invocation `id` has been asked to stop.
+    fn stop_requested(&self, id: u64) -> bool {
+        self.running
+            .lock()
+            .map(|r| r.get(&id).is_some_and(|e| e.stop))
+            .unwrap_or(false)
+    }
+
+    /// Record the cage's pid against the live invocation, so a reader can see which process a
+    /// long-running operation is.
+    fn note_pid(&self, id: u64, pid: u32) {
+        if let Ok(mut running) = self.running.lock() {
+            if let Some(entry) = running.get_mut(&id) {
+                entry.pid = Some(pid);
+            }
+        }
     }
 }
 
@@ -843,6 +927,79 @@ impl TaskEngine {
             task: task.name.clone(),
             held: self.output_held.clone(),
         })
+    }
+
+    /// Enter `id` in the live registry for the length of the invocation.
+    fn enter(&self, id: u64, task: &str) -> RunGuard {
+        if let Ok(mut running) = self.running.lock() {
+            running.insert(
+                id,
+                Running {
+                    task: task.to_string(),
+                    started: Instant::now(),
+                    pid: None,
+                    stop: false,
+                },
+            );
+        }
+        RunGuard {
+            id,
+            registry: self.running.clone(),
+        }
+    }
+
+    /// What is running right now, oldest first.
+    pub(crate) fn running(&self) -> Vec<RunningView> {
+        let Ok(running) = self.running.lock() else {
+            return Vec::new();
+        };
+        running
+            .iter()
+            .map(|(id, r)| RunningView {
+                id: *id,
+                task: r.task.clone(),
+                elapsed_ms: r.started.elapsed().as_millis() as u64,
+                pid: r.pid,
+                stopping: r.stop,
+            })
+            .collect()
+    }
+
+    /// Stop invocation `id`, and report what actually happened rather than what was asked for.
+    ///
+    /// Asking is instant; stopping is not. The runner honors the request at its next poll, and
+    /// anything already under way before the command spawned — a credential resolving through a
+    /// subprocess, a proxy being stood up — finishes first. So this sets the flag, waits a bounded
+    /// [`STOP_GRACE`] for the invocation to actually leave the registry, and distinguishes the two
+    /// outcomes. Reporting "stopped" for a request still in flight would be a claim about another
+    /// process that this one cannot make.
+    pub(crate) fn stop(&self, id: u64) -> StopOutcome {
+        {
+            let Ok(mut running) = self.running.lock() else {
+                return StopOutcome::NotRunning;
+            };
+            match running.get_mut(&id) {
+                Some(entry) => entry.stop = true,
+                None => return StopOutcome::NotRunning,
+            }
+        }
+        let deadline = Instant::now() + STOP_GRACE;
+        while Instant::now() < deadline {
+            if !self.is_running(id) {
+                return StopOutcome::Stopped;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        StopOutcome::Stopping
+    }
+
+    /// Whether invocation `id` is still in the registry — the one fact that tells a stop that
+    /// *happened* from a stop that was merely requested.
+    fn is_running(&self, id: u64) -> bool {
+        self.running
+            .lock()
+            .map(|r| r.contains_key(&id))
+            .unwrap_or(false)
     }
 
     /// Where an in-cage path lives on the host, read off the mounts this cage is built from. A path
@@ -1037,6 +1194,62 @@ impl Drop for OutputClaim {
     }
 }
 
+/// One invocation while it is still running: what it is, when it started, and whether someone has
+/// asked it to stop.
+#[derive(Debug)]
+struct Running {
+    task: String,
+    /// For the elapsed time, which is what a caller looking at a live invocation actually wants.
+    started: Instant,
+    /// The cage's pid once it exists — **display only**. Stopping goes through [`Running::stop`] and
+    /// the runner's own `Child`, never a signal aimed at a pid read from here: a pid can be reaped
+    /// and reused between the read and the signal, and the target of that race is another process
+    /// entirely.
+    pid: Option<u32>,
+    /// Set by [`TaskEngine::request_stop`]; read by the runner on its next poll.
+    stop: bool,
+}
+
+/// What a stop request actually achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    /// The invocation ended. Nothing of it is still running.
+    Stopped,
+    /// The request was recorded and the invocation is still finishing — it was in a step that has to
+    /// return before the runner can act (see [`TaskEngine::stop`]).
+    Stopping,
+    /// No invocation by that id is running.
+    NotRunning,
+}
+
+/// One live invocation as a reader sees it. A snapshot, deliberately: the registry's lock is held
+/// only long enough to copy, so listing what is running can never delay the thing being listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningView {
+    pub(crate) id: u64,
+    pub(crate) task: String,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) pid: Option<u32>,
+    pub(crate) stopping: bool,
+}
+
+/// One invocation's presence in the live registry, removed when it ends — by return, by error, or by
+/// panic. A guard rather than a pair of calls for the same reason as [`OutputClaim`]: an entry left
+/// behind would be an invocation `sbx task status` reports forever and `sbx task stop` can never
+/// stop.
+struct RunGuard {
+    id: u64,
+    registry: Arc<Mutex<BTreeMap<u64, Running>>>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.registry.lock() {
+            running.remove(&self.id);
+        }
+    }
+}
+
 /// The unsubstituted capture of one invocation, internal to the engine.
 struct RawOutput {
     exit: i32,
@@ -1044,6 +1257,7 @@ struct RawOutput {
     stderr: Vec<u8>,
     truncated: bool,
     timed_out: bool,
+    stopped: bool,
 }
 
 /// Read a stream up to `cap` bytes, reporting whether it was cut. Reading continues past the cap
@@ -1241,6 +1455,7 @@ impl TaskEngine {
             project: PathBuf::from("/nonexistent"),
             config_root: PathBuf::from("/nonexistent"),
             output_held: Arc::new(Mutex::new(BTreeSet::new())),
+            running: Arc::new(Mutex::new(BTreeMap::new())),
             tasks,
             limits: super::cgroup::Limits::default(),
             slug: "inventory".to_string(),
@@ -1450,6 +1665,7 @@ mod smoke {
                 "echo-secret",
                 &params(&[("value", "hello there")]),
                 &BTreeMap::new(),
+                1,
             )
             .expect("the task runs");
 
@@ -1477,6 +1693,7 @@ mod smoke {
             "echo-secret",
             &params(&[("value", "DROP TABLE t")]),
             &BTreeMap::new(),
+            1,
         );
         assert!(
             matches!(refused, Err(TaskError::Refused(_))),
@@ -1555,7 +1772,7 @@ mod smoke {
             return;
         };
         let outcome = engine
-            .run("pool-tool", &BTreeMap::new(), &BTreeMap::new())
+            .run("pool-tool", &BTreeMap::new(), &BTreeMap::new(), 1)
             .expect("the pool task runs");
 
         let stdout = outcome.stdout.unwrap_or_default();
@@ -1628,13 +1845,13 @@ mod smoke {
         };
 
         let killed = engine
-            .run("hang", &BTreeMap::new(), &BTreeMap::new())
+            .run("hang", &BTreeMap::new(), &BTreeMap::new(), 1)
             .expect("the hanging task returns");
         assert!(killed.timed_out, "the timeout must fire");
         assert_ne!(killed.exit, 0, "a killed command does not report success");
 
         let cut = engine
-            .run("loud", &BTreeMap::new(), &BTreeMap::new())
+            .run("loud", &BTreeMap::new(), &BTreeMap::new(), 1)
             .expect("the loud task returns");
         assert!(cut.truncated, "the output cap must report the truncation");
         assert!(
@@ -2005,6 +2222,7 @@ mod tests {
                 PathBuf::from("/nix/store/mise/bin/mise"),
             )),
             output_held: Arc::new(Mutex::new(BTreeSet::new())),
+            running: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 

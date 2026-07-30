@@ -30,7 +30,7 @@ use crate::{diag, help, sandbox, store, style};
 /// "it ran and failed"; 125 is the convention `env` and `docker` use for the same distinction.
 const REFUSED_EXIT: u8 = 125;
 
-/// `sbx task <subcommand>`: `list`, `secrets`, `run`, or `logs`.
+/// `sbx task <subcommand>`: `list`, `secrets`, `run`, `status`, `stop`, or `logs`.
 pub(crate) fn task_cmd(args: Vec<OsString>) -> ExitCode {
     if let Some(code) = help::maybe_help("task", &args) {
         return code;
@@ -39,6 +39,8 @@ pub(crate) fn task_cmd(args: Vec<OsString>) -> ExitCode {
         Some("list") | Some("ls") => task_list(&args[1..]),
         Some("secrets") => task_secrets(&args[1..]),
         Some("run") => task_run(&args[1..]),
+        Some("status") => task_status(&args[1..]),
+        Some("stop") => task_stop(&args[1..]),
         Some("logs") | Some("log") => task_logs(&args[1..]),
         None => {
             eprint!("{}", help::page_usage(&["task"]).unwrap_or_default());
@@ -252,6 +254,14 @@ fn task_run(args: &[OsString]) -> ExitCode {
             result.elapsed_ms
         ));
     }
+    // Said for the same reason as the timeout: what came back is a partial result, and the exit
+    // code alone would read as the command having failed on its own.
+    if result.stopped {
+        diag::warn(&format!(
+            "invocation {} was stopped after {}ms",
+            result.id, result.elapsed_ms
+        ));
+    }
     if result.truncated {
         diag::warn("the output reached the operation's `max_output` and was truncated");
     }
@@ -284,27 +294,148 @@ fn task_run(args: &[OsString]) -> ExitCode {
     ExitCode::from(result.exit.clamp(0, 255) as u8)
 }
 
-/// `sbx task logs [<id>]`: the session's invocation log — host-only, by design.
-fn task_logs(args: &[OsString]) -> ExitCode {
+/// The session's **host-only** socket — the log, what is running, and the stop.
+///
+/// Refuses outright when the environment says this sbx is talking to a plane rather than owning one:
+/// these verbs are host-side by construction (the socket is never bound into a cage), and the
+/// explicit refusal is what makes that a message instead of a connection error.
+fn host_socket(id: Option<&str>, verb: &str) -> Result<PathBuf, ExitCode> {
     if std::env::var_os(TASK_SOCKET_ENV).is_some() {
-        diag::error("sbx: task logs: the invocation log is not readable from inside the cage");
-        return ExitCode::from(2);
+        diag::error(&format!(
+            "sbx: task {verb}: this is host-side only — a cage may invoke operations, not watch them"
+        ));
+        return Err(ExitCode::from(2));
     }
-    let id = match positional_id(args, "logs") {
-        Ok(id) => id,
-        Err(code) => return code,
-    };
     let Some(layout) = store::Layout::from_env() else {
         diag::error(
             "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
         );
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     };
-    let pid = match resolve_task_session(layout.data_dir(), id.as_deref(), "logs") {
-        Ok(pid) => pid,
+    let pid = resolve_task_session(layout.data_dir(), id, verb)?;
+    Ok(sandbox::task_control::log_socket(layout.data_dir(), pid))
+}
+
+/// `sbx task status [<id>]`: the invocations this session is running right now.
+fn task_status(args: &[OsString]) -> ExitCode {
+    let id = match positional_id(args, "status") {
+        Ok(id) => id,
         Err(code) => return code,
     };
-    let socket = sandbox::task_control::log_socket(layout.data_dir(), pid);
+    let socket = match host_socket(id.as_deref(), "status") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match sandbox::task_control::read_status(&socket) {
+        Ok(rows) if rows.is_empty() => {
+            println!("no operation is running");
+            ExitCode::SUCCESS
+        }
+        Ok(rows) => {
+            let palette = style::Palette::for_stream(std::io::stdout().is_terminal());
+            for row in rows {
+                println!(
+                    "{}{}{} {}",
+                    palette.name,
+                    row.id,
+                    palette.reset,
+                    row.fields.join("  ")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => unreachable_plane(&e),
+    }
+}
+
+/// `sbx task stop <invocation> [--session <id>]`: end one running invocation.
+///
+/// The argument is an **invocation** id — the number `sbx task status` shows and the one the
+/// invocation's log line carries — while the session, when several offer operations, is named with
+/// `--session`. That split is deliberate: the two ids are different things, and a verb that took
+/// either positionally would let a mistyped session id read as an invocation.
+fn task_stop(args: &[OsString]) -> ExitCode {
+    let mut invocation: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].to_str() {
+            Some("--session") => match args.get(i + 1).and_then(|a| a.to_str()) {
+                Some(v) => {
+                    session = Some(v.to_string());
+                    i += 2;
+                }
+                None => {
+                    diag::error("sbx: task stop: `--session` needs a session id");
+                    return ExitCode::from(2);
+                }
+            },
+            Some(s) if !s.starts_with('-') && invocation.is_none() => {
+                invocation = Some(s.to_string());
+                i += 1;
+            }
+            other => {
+                diag::error(&format!(
+                    "sbx: task stop: unexpected argument {:?}",
+                    other.unwrap_or_default()
+                ));
+                eprint!(
+                    "{}",
+                    help::page_usage(&["task", "stop"]).unwrap_or_default()
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(id) = invocation.and_then(|v| v.parse::<u64>().ok()) else {
+        diag::error("sbx: task stop: name the invocation to stop, as `sbx task status` shows it");
+        eprint!(
+            "{}",
+            help::page_usage(&["task", "stop"]).unwrap_or_default()
+        );
+        return ExitCode::from(2);
+    };
+    let socket = match host_socket(session.as_deref(), "stop") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match sandbox::task_control::stop_invocation(&socket, id) {
+        Ok(sandbox::task_control::StopReply::Stopped) => {
+            println!("stopped invocation {id}");
+            ExitCode::SUCCESS
+        }
+        // Accepted but not yet done, and said as exactly that: everything under way before the
+        // command spawned — a credential resolving, a proxy standing up — completes first.
+        Ok(sandbox::task_control::StopReply::Stopping) => {
+            diag::warn(&format!(
+                "invocation {id} was asked to stop and is still finishing"
+            ));
+            diag::hint("       `sbx task status` shows it until it ends.");
+            ExitCode::FAILURE
+        }
+        Ok(sandbox::task_control::StopReply::Finished) => {
+            diag::note(&format!("invocation {id} had already finished"));
+            ExitCode::SUCCESS
+        }
+        Ok(sandbox::task_control::StopReply::Refused(reason)) => {
+            diag::error(&format!("sbx: task stop: {reason}"));
+            diag::hint("       `sbx task status` lists what is running.");
+            ExitCode::FAILURE
+        }
+        Err(e) => unreachable_plane(&e),
+    }
+}
+
+/// `sbx task logs [<id>]`: the session's invocation log — host-only, by design.
+fn task_logs(args: &[OsString]) -> ExitCode {
+    let id = match positional_id(args, "logs") {
+        Ok(id) => id,
+        Err(code) => return code,
+    };
+    let socket = match host_socket(id.as_deref(), "logs") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     match sandbox::task_control::read_log(&socket) {
         Ok(lines) => {
             let mut any = false;
