@@ -716,8 +716,6 @@ mod tests {
             stderr: OutputDisposition::Show,
             timeout: Duration::from_secs(30),
             max_output: 4096,
-            exec_allow: vec![],
-            exec_deny: vec![],
             network: vec![],
             nonce: false,
             packages: vec![],

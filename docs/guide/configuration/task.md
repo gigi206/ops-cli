@@ -70,7 +70,6 @@ oracle over the credential.
 | `stdout` / `stderr` | `"show"` (default) or `"hide"` |
 | `timeout` | this task's wall-clock ceiling (`"20s"`), overriding `[task.defaults]` |
 | `max_output` | this task's per-stream capture ceiling (`"64KiB"`), overriding `[task.defaults]` |
-| `allow` / `deny` | exec targets, as the globs `[proc]` speaks; `deny` wins |
 | `network` | the egress this task's cage gets, as allowlist entries (empty = no network) |
 | `packages` | the `mise:` tools the command needs (see [below](#which-binaries-a-task-may-run)) |
 
@@ -226,6 +225,22 @@ Two are different:
   installs it into a pool of its own (below).
 - an **inline `[flakes.<name>]`** flake builds in-cage to an out-link under the agent's `$HOME`,
   which a task cage does not have. Use a remote `flake:` reference, which builds host-side.
+
+### What sbx does *not* bound: what the command spawns
+
+sbx fixes the program a task runs. It does **not** police what that program goes on to spawn —
+`allow` / `deny` keys on a task are refused rather than accepted into silence.
+
+This is a deliberate limit, not an oversight. Deciding an `execve` by path takes a seccomp
+user-notification supervisor, and the supervisor needs a shim binary bound inside the cage — which
+here is the one cage holding a plaintext credential in its environment. Putting a full sbx binary
+back in there to gain a guardrail is a bad trade: the guardrail stops a *misbehaving* command, the
+binary would help a *compromised* one.
+
+What bounds a task instead is its shape. The command is fixed by a trusted declaration, every
+caller-supplied value is bounded by `params`, the cage has **no network** unless `network` declares
+one (an empty netns, so a spawned child has nowhere to send anything), the project is read-only, and
+the `$HOME` is a fresh tmpfs that dies with the invocation.
 
 ### The task tool pool
 

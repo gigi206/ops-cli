@@ -287,8 +287,6 @@ mod tests {
             stderr: Default::default(),
             timeout: std::time::Duration::from_secs(20),
             max_output: 4096,
-            exec_allow: vec![],
-            exec_deny: vec![],
             network: vec![],
             nonce: false,
             packages: vec![],

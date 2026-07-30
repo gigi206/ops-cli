@@ -749,12 +749,14 @@ pub(crate) struct RawTask {
     pub(crate) timeout: Option<String>,
     /// This task's captured-output ceiling, overriding `[task.defaults] max_output`.
     pub(crate) max_output: Option<String>,
-    /// Exec targets the command may run, as the shell-style globs the process policy already
-    /// speaks (`*`/`?`; a rule containing `/` matches the whole path, one without matches the
-    /// basename). Empty means only the resolved `cmd[0]` itself.
+    /// Present only so a task declaring them is **refused** rather than parsing into silence.
+    /// Policing which programs a task's command may go on to spawn is not offered: it would take an
+    /// in-cage exec supervisor, and standing one up puts a full sbx binary inside the one cage that
+    /// holds a plaintext credential. Since unknown keys are ignored by design, a security-shaped key
+    /// has to exist here to be rejected at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allow: Vec<String>,
-    /// Exec targets the command may never run. `deny` wins over `allow`, as everywhere else.
+    /// Refused for the same reason as `allow`, and present for the same reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) deny: Vec<String>,
     /// The egress this task's cage gets, as allowlist entries. Empty (the default) means an empty

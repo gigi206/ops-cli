@@ -483,10 +483,6 @@ pub(crate) struct TaskSpec {
     /// The captured-output ceiling per stream, in bytes. Output past it is truncated, and the
     /// truncation is reported — never silently dropped.
     pub(crate) max_output: u64,
-    /// Exec targets the command may run, as process-policy globs. Empty means `cmd[0]` only.
-    pub(crate) exec_allow: Vec<String>,
-    /// Exec targets it may never run; `deny` wins over `allow`.
-    pub(crate) exec_deny: Vec<String>,
     /// The egress the task cage gets, as classified allowlist rules. Empty means no network at all.
     pub(crate) network: Vec<Rule>,
     /// Whether a substituted credential is named with a per-invocation nonce (`${NAME@a91f3c}`)

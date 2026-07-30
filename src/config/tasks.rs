@@ -194,8 +194,23 @@ pub(super) fn validate_task(
         None => defaults.max_output,
     };
 
-    for rule in raw.allow.iter().chain(raw.deny.iter()) {
-        crate::proc_policy::validate_rule(rule)?;
+    // A task cannot police what its command goes on to spawn, so it must not look as though it can.
+    // Deciding an exec by path needs a seccomp user-notification supervisor, which needs a shim
+    // binary inside the cage — and that cage is the one holding a plaintext credential. Refusing is
+    // the honest answer: an ignored key here would read as a fence and be none.
+    for field in ["allow", "deny"] {
+        let declared = if field == "allow" {
+            &raw.allow
+        } else {
+            &raw.deny
+        };
+        if !declared.is_empty() {
+            return Err(format!(
+                "`{field}` is not a task control — sbx does not police which programs a task's \
+                 command may spawn; what bounds a task is its fixed `cmd`, the `params` bounds, and \
+                 a cage with no network unless `network` declares one"
+            ));
+        }
     }
 
     let packages = validate_task_packages(&raw.packages)?;
@@ -213,8 +228,6 @@ pub(super) fn validate_task(
         stderr: parse_disposition("stderr", raw.stderr.as_deref())?,
         timeout,
         max_output,
-        exec_allow: raw.allow,
-        exec_deny: raw.deny,
         network,
         nonce: defaults.nonce,
         packages,
@@ -796,6 +809,27 @@ mod tests {
             assert!(
                 validate(raw).is_err(),
                 "`{var}` must never be settable for a task"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exec_policy_on_a_task_is_refused_rather_than_ignored() {
+        // Unknown keys are ignored by design, so a security-shaped key sbx does not honour has to be
+        // rejected explicitly — otherwise `deny = [...]` reads as a fence and silently is none.
+        for (label, apply) in [
+            (
+                "allow",
+                (|r: &mut RawTask| r.allow = vec!["/bin/sh".into()]) as fn(&mut RawTask),
+            ),
+            ("deny", |r: &mut RawTask| r.deny = vec!["curl".into()]),
+        ] {
+            let mut raw = raw_task();
+            apply(&mut raw);
+            let err = validate(raw).expect_err("an exec policy must not parse into silence");
+            assert!(
+                err.contains(label) && err.contains("not a task control"),
+                "`{label}` must be refused by name, said plainly: {err}"
             );
         }
     }
