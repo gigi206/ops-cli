@@ -255,6 +255,16 @@ fn task_run(args: &[OsString]) -> ExitCode {
     if result.truncated {
         diag::warn("the output reached the operation's `max_output` and was truncated");
     }
+    // What `spawn` refused. Reported for the same reason as truncation: the refusal leaves no trace
+    // in the result — the program that was refused decides whether to mention it, and many do not,
+    // so an empty output would otherwise read as a command that simply found nothing.
+    if !result.refused.is_empty() {
+        diag::warn("the operation was not allowed to run:");
+        for target in &result.refused {
+            eprintln!("  {target}");
+        }
+        diag::note("this operation declares `spawn`; a program it needs must be listed there.");
+    }
     if result.redacted > 0 {
         let named = match &result.nonce {
             // With the nonce on, report it: a `${NAME@nonce}` in the text is only unforgeable

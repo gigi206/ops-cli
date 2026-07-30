@@ -194,6 +194,13 @@ pub(crate) struct TaskOutcome {
     /// (here, not in the text) on purpose: that is what makes a `${NAME@nonce}` in the output
     /// unforgeable for this invocation — the command could not have predicted it.
     pub(crate) nonce: Option<String>,
+    /// The exec targets `spawn` refused during this invocation, if any.
+    ///
+    /// Reported for the same reason as `truncated`: the refusal is invisible in the result. The
+    /// `execve` returns an error to a process that decides for itself whether to mention it, and
+    /// several say nothing at all — leaving a caller an empty output and a success code with no
+    /// account of either. A refusal a caller cannot see is one they would debug as a broken command.
+    pub(crate) refused: Vec<String>,
 }
 
 /// Draw this invocation's substitution nonce: 6 hex characters from the system CSPRNG (already in the
@@ -412,7 +419,7 @@ impl TaskEngine {
         // reach its proxy. Fail-closed: a supervisor that cannot be stood up refuses the invocation
         // rather than running the command unconfined.
         let mut proc_binds = Vec::new();
-        let _enforce = match &task.spawn {
+        let enforce = match &task.spawn {
             None => None,
             Some(declared) => {
                 let policy = self
@@ -511,6 +518,7 @@ impl TaskEngine {
             redacted: out_hits + err_hits,
             timed_out: raw.timed_out,
             elapsed_ms,
+            refused: enforce.map(|e| e.refusals()).unwrap_or_default(),
         })
     }
 

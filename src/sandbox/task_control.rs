@@ -27,8 +27,8 @@
 //! → SECRETS                       ← secret <name>\t<where>\t<description>… then `ok`
 //! → RUN <name>                    ← exit <code>, redacted <n>, truncated <0|1>,
 //!   param <key> <len>\n<bytes>       timed-out <0|1>, elapsed-ms <n>, [nonce <hex>],
-//!   env <key> <len>\n<bytes>         stdout <len>\n<bytes>, stderr <len>\n<bytes>, then `ok`
-//!   run
+//!   env <key> <len>\n<bytes>         [refused-exec <path>…],
+//!   run                              stdout <len>\n<bytes>, stderr <len>\n<bytes>, then `ok`
 //! ```
 //!
 //! Any refusal is a single `err <message>` line. A message never echoes a caller's value back: a
@@ -483,6 +483,13 @@ fn write_outcome(writer: &mut UnixStream, outcome: &TaskOutcome) -> io::Result<(
     if let Some(nonce) = &outcome.nonce {
         writeln!(writer, "nonce {nonce}")?;
     }
+    // What `spawn` refused. One line per target, because which program was refused is the whole
+    // content of the report — a count would say "something you declared is missing" and leave the
+    // caller to guess which. The path carries no space (it is an exec target the cage resolved), so
+    // the line-based framing holds.
+    for target in &outcome.refused {
+        writeln!(writer, "refused-exec {target}")?;
+    }
     for (label, stream) in [("stdout", &outcome.stdout), ("stderr", &outcome.stderr)] {
         match stream {
             Some(text) => {
@@ -657,6 +664,9 @@ pub(crate) mod client {
         pub(crate) nonce: Option<String>,
         /// The refusal message when the plane answered `err …`.
         pub(crate) error: Option<String>,
+        /// The exec targets `spawn` refused during the invocation. Carried because the refusal is
+        /// invisible in the result otherwise — the refused program decides whether to mention it.
+        pub(crate) refused: Vec<String>,
     }
 
     /// Parse a `RUN` response. The length-prefixed streams are read by byte count, so a payload
@@ -682,6 +692,7 @@ pub(crate) mod client {
                 "timed-out" => out.timed_out = value == "1",
                 "elapsed-ms" => out.elapsed_ms = value.parse().unwrap_or(0),
                 "nonce" => out.nonce = Some(value.to_string()),
+                "refused-exec" => out.refused.push(value.to_string()),
                 "stdout" | "stderr" => {
                     let len: i64 = value.parse().unwrap_or(-1);
                     if len < 0 {
@@ -1080,6 +1091,7 @@ mod tests {
             timed_out: false,
             elapsed_ms: 12,
             nonce: Some("a91f3c".to_string()),
+            refused: Vec::new(),
         };
         std::thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
@@ -1124,6 +1136,81 @@ mod tests {
         );
     }
 
+    // A refusal leaves no trace in the result: the refused program decides for itself whether to say
+    // anything, and many say nothing — so an empty output and a success code would be all a caller
+    // saw. The report has to cross the wire and reach the caller, naming what was refused, or
+    // declaring `spawn` turns a missing entry into an unexplainable command.
+    #[test]
+    fn a_refused_exec_is_reported_to_the_caller_by_name() {
+        let Some(bash) = crate::pathfind::find_on_path("bash") else {
+            return;
+        };
+        let (Some(socat), Some(head)) = (
+            crate::pathfind::find_on_path("socat"),
+            crate::pathfind::find_on_path("head"),
+        ) else {
+            return;
+        };
+        let dir = TmpDir::new();
+        let socket = dir.path().join("replay.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+
+        let outcome = super::super::task::TaskOutcome {
+            exit: 0,
+            // What a refused `psql \!` actually looks like: nothing printed, a success code.
+            stdout: Some(String::new()),
+            stderr: Some(String::new()),
+            truncated: false,
+            redacted: 0,
+            timed_out: false,
+            elapsed_ms: 4,
+            nonce: None,
+            refused: vec![
+                "/nix/store/demo/bin/sh".to_string(),
+                "/nix/store/demo/bin/base64".to_string(),
+            ],
+        };
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line.trim_end() == "run" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let mut writer = stream;
+                let _ = write_outcome(&mut writer, &outcome);
+            }
+        });
+
+        let script = dir.path().join("client");
+        super::super::task_shim::write(
+            &script,
+            &bash,
+            &socat,
+            &head,
+            socket.to_str().expect("a utf-8 socket path"),
+        )
+        .expect("write the client");
+        let out = run_client(&script, &["task", "run", "probe"]);
+
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("not allowed to run"),
+            "the refusal must be said at all: {err}"
+        );
+        assert!(
+            err.contains("/nix/store/demo/bin/sh") && err.contains("/nix/store/demo/bin/base64"),
+            "and must name every target, since which one is the whole content: {err}"
+        );
+        assert!(
+            err.contains("`spawn`"),
+            "and point at the declaration that decides it: {err}"
+        );
+    }
+
     // A stream the declaration hides carries no payload at all — not an empty one. The client must
     // keep the two apart, or it would consume a framing newline that was never written and read the
     // next header as payload.
@@ -1151,6 +1238,7 @@ mod tests {
             timed_out: false,
             elapsed_ms: 1,
             nonce: None,
+            refused: Vec::new(),
         };
         std::thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {

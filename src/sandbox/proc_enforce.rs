@@ -217,6 +217,25 @@ pub(crate) struct ProcEnforce {
     handle: Option<JoinHandle<()>>,
     notif_socket: PathBuf,
     control_socket: Option<PathBuf>,
+    ring: Arc<ExecRing>,
+}
+
+impl ProcEnforce {
+    /// The exec targets this supervisor refused, in order, deduplicated.
+    ///
+    /// A refusal is invisible from the outside: the `execve` returns an error to a process that
+    /// decides for itself whether to mention it, and several do not — a caller then sees an empty
+    /// result and a success code with nothing to explain them. Where a launch has no interactive
+    /// control plane to consult (a task's), this is how the refusals get said out loud.
+    pub(crate) fn refusals(&self) -> Vec<String> {
+        let mut seen = Vec::new();
+        for event in self.ring.snapshot(None).events {
+            if event.verdict == "deny" && !seen.contains(&event.command) {
+                seen.push(event.command);
+            }
+        }
+        seen
+    }
 }
 
 impl Drop for ProcEnforce {
@@ -332,6 +351,7 @@ fn start_inner(
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
+    let kept = ring.clone();
     let handle = std::thread::spawn(move || {
         supervise(listener, &flag, &policy, &overlay, &ring, &pending);
     });
@@ -354,6 +374,7 @@ fn start_inner(
             handle: Some(handle),
             notif_socket,
             control_socket,
+            ring: kept,
         },
         Wiring { binds },
     ))

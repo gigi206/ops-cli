@@ -299,6 +299,20 @@ resolved path does not. Write an entry with a `/` and it is kept as you wrote it
 (`/nix/store/*/bin/git`). A name that is nowhere in the cage refuses the launch rather than becoming
 a rule that matches nothing.
 
+**A refusal is reported, never silent.** The `execve` comes back as an error to a program that
+decides for itself whether to mention it — and many say nothing at all, leaving an empty result and a
+success code. So the invocation reports what it refused, by name:
+
+```console
+$ sbx task run db-query -p 'sql=…'
+sbx: warning: the operation was not allowed to run:
+  /bin/sh
+sbx: note: this operation declares `spawn`; a program it needs must be listed there.
+```
+
+That is how a missing entry reads as a missing entry rather than as a command that mysteriously
+returned nothing.
+
 **It governs the whole tree, at any depth.** The filter is inherited across `fork` and `exec`, so a
 program run by a program run by the command traps the same supervisor. That is why `spawn` is a flat
 list and not a table: `spawn = { git = [...] }` would read as "git may run these", which is a

@@ -224,7 +224,7 @@ run_task() {{
         }} | "$socat" -t "$wait_for_answer" - "UNIX-CONNECT:$sock" 2>/dev/null
     )
 
-    local line complete=0 code=0 redacted=0 truncated=0 timed_out=0 elapsed=0 nonce=''
+    local line complete=0 code=0 redacted=0 truncated=0 timed_out=0 elapsed=0 nonce='' refused=''
     while IFS= read -r -u 3 line; do
         case $line in
             ok) complete=1; break ;;
@@ -240,6 +240,8 @@ run_task() {{
             'timed-out '*) timed_out=${{line#timed-out }} ;;
             'elapsed-ms '*) elapsed=${{line#elapsed-ms }} ;;
             'nonce '*) nonce=${{line#nonce }} ;;
+            'refused-exec '*) refused="$refused${{line#refused-exec }}
+" ;;
             'stdout '*) copy_stream "${{line#stdout }}" 1 ;;
             'stderr '*) copy_stream "${{line#stderr }}" 2 ;;
         esac
@@ -253,6 +255,16 @@ run_task() {{
         printf 'sbx: warning: the operation was killed at its timeout after %sms\n' "$elapsed" >&2
     [ "$truncated" = 1 ] &&
         printf 'sbx: warning: the output reached the operation'"'"'s `max_output` and was truncated\n' >&2
+    # What the operation was not allowed to run. Said out loud because the refusal is invisible
+    # otherwise: the program that was refused decides for itself whether to mention it, and many say
+    # nothing — leaving an empty result that reads like a command that simply found nothing.
+    if [ -n "$refused" ]; then
+        printf 'sbx: warning: the operation was not allowed to run:\n' >&2
+        printf '%s' "$refused" | while IFS= read -r target; do
+            [ -n "$target" ] && printf '  %s\n' "$target" >&2
+        done
+        printf 'sbx: note: this operation declares `spawn`; a program it needs must be listed there.\n' >&2
+    fi
     if [ "$redacted" != 0 ]; then
         if [ -n "$nonce" ]; then
             # With the nonce on, report it: a `${{NAME@nonce}}` in the text is unforgeable only
