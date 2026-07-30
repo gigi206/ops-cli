@@ -195,10 +195,15 @@ impl Drop for TaskPlane {
         let _ = std::fs::remove_file(&self.cage_socket);
         let _ = std::fs::remove_file(&self.log_socket);
         let _ = std::fs::remove_file(&self.shim);
+        let _ = std::fs::remove_file(self.dir.join(INCARNATION));
         // Last: the directory only goes when what it held is gone.
         let _ = std::fs::remove_dir(&self.dir);
     }
 }
+
+/// Records which incarnation of the directory's pid owns it: the launcher's start time in clock
+/// ticks, the same discriminator the session registry uses against pid reuse.
+const INCARNATION: &str = "incarnation";
 
 /// The directory a session's task sockets live in, under the `0700` data dir.
 pub(crate) fn task_dir(data_dir: &Path, pid: u32) -> PathBuf {
@@ -226,9 +231,21 @@ pub(crate) fn start(
     engine: TaskEngine,
     client: &ClientPrograms<'_>,
 ) -> io::Result<TaskPlane> {
+    // Sweep first, for its effect rather than its answer: every launch removes the directories of
+    // sessions that are gone, so the listing stays honest on a machine where nobody runs
+    // `sbx task list` between crashes.
+    let _ = session_pids(data_dir);
+
     let dir = task_dir(data_dir, pid);
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    // Stamp which incarnation of this pid owns the directory, before anything else is put in it.
+    // Nothing guarantees a plane gets to clean up after itself — a `SIGKILL`ed session never runs
+    // its `Drop` — so what makes the directory listing trustworthy is not tidy shutdown but this
+    // stamp, which [`session_pids`] re-checks and which no reused pid can satisfy.
+    if let Some(ticks) = crate::session::read_start_ticks(pid) {
+        std::fs::write(dir.join(INCARNATION), ticks.to_string())?;
+    }
 
     let cage_socket = dir.join("control.sock");
     let log_path = log_socket(data_dir, pid);
@@ -516,19 +533,54 @@ pub(crate) fn read_log(socket: &Path) -> io::Result<Vec<String>> {
     Ok(text.lines().map(str::to_string).collect())
 }
 
-/// The session pids that have a task log socket present, sorted. A superset of the live sessions: a
-/// stale socket from a crashed launch is listed, but connecting to it simply fails and the caller
-/// skips it — the same discovery model as the other control planes.
+/// The pids of the sessions currently offering declared operations, sorted — and, as a side effect,
+/// the removal of the directories that no longer belong to one.
+///
+/// A directory is not evidence of a session. Nothing removes it when a session is killed rather than
+/// closed, so an unvalidated listing accumulates: after a few crashed launches, naming a session
+/// becomes a choice between pids that are all dead, and the caller has no way to tell which. This is
+/// the same reason the session registry validates rather than trusts, and the fix is the same shape
+/// — check, and prune what fails, so a crash heals itself at the next read.
+///
+/// The check is the `(pid, start_ticks)` pair, never the pid alone, because the kernel reuses pids
+/// and a reused one would otherwise resurrect a dead session's directory.
 pub(crate) fn session_pids(data_dir: &Path) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir(data_dir.join("tasks")) else {
+    let root = data_dir.join("tasks");
+    let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
-    let mut pids: Vec<u32> = entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
-        .collect();
+    let mut pids: Vec<u32> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let dir = root.join(pid.to_string());
+        if plane_is_live(&dir, pid) {
+            pids.push(pid);
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
     pids.sort_unstable();
     pids
+}
+
+/// Whether `dir` belongs to a session that is still running.
+///
+/// With a stamp, the answer is exact: the pid must still be the incarnation that wrote it. Without
+/// one, the directory is either older than the stamp or is being created right now by a plane that
+/// has not written it yet — so the weaker test applies, and a live pid is left alone. Erring toward
+/// keeping is the safe direction: a directory kept one read too long is a stale row, while one
+/// removed too early takes a running session's sockets with it.
+fn plane_is_live(dir: &Path, pid: u32) -> bool {
+    let running = crate::session::read_start_ticks(pid);
+    match std::fs::read_to_string(dir.join(INCARNATION))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        Some(stamped) => running == Some(stamped),
+        None => running.is_some(),
+    }
 }
 
 /// The in-cage (or host-side) client: one connection, one command.
@@ -750,6 +802,76 @@ mod tests {
         )
         .expect("write the client");
         Some((data, plane, script))
+    }
+
+    /// A directory left by a session that is gone is neither listed nor left behind.
+    ///
+    /// Nothing removes it at the time: a `SIGKILL`ed launcher never runs its `Drop`, and stopping a
+    /// session sweeps its process tree, not its files. So the listing has to be the thing that
+    /// heals — otherwise naming a session degrades, after a few crashes, into choosing among pids
+    /// that are all dead.
+    #[test]
+    fn a_dead_sessions_directory_is_neither_listed_nor_left_behind() {
+        let data = TmpDir::new();
+        let live = std::process::id();
+
+        // A directory stamped with an incarnation that is not this process's: whatever pid wrote it,
+        // that incarnation is gone. Pid 1 is certain to exist and equally certain not to have this
+        // start time, so the pair fails while the bare pid would have passed.
+        let dead = task_dir(data.path(), 1);
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("incarnation"), "1").unwrap();
+        std::fs::write(dead.join("control.sock"), "not really a socket").unwrap();
+
+        let mine = task_dir(data.path(), live);
+        std::fs::create_dir_all(&mine).unwrap();
+        let ticks = crate::session::read_start_ticks(live).expect("our own start time");
+        std::fs::write(mine.join("incarnation"), ticks.to_string()).unwrap();
+
+        assert_eq!(
+            session_pids(data.path()),
+            vec![live],
+            "only a session that is still running may be offered to a caller"
+        );
+        assert!(
+            !dead.exists(),
+            "the dead session's directory must be removed, not merely skipped — otherwise it \
+             accumulates until the listing is useless"
+        );
+        assert!(mine.exists(), "the live session's directory must survive");
+    }
+
+    /// A directory with no stamp yet is the one being created right now, so it is left alone while
+    /// its pid runs. Removing it would take a starting session's sockets with it.
+    #[test]
+    fn an_unstamped_directory_survives_while_its_process_runs() {
+        let data = TmpDir::new();
+        let live = std::process::id();
+        let dir = task_dir(data.path(), live);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(session_pids(data.path()), vec![live]);
+        assert!(dir.exists(), "a plane mid-creation must not be swept away");
+    }
+
+    /// Starting a plane stamps the directory, which is what makes the check above possible at all.
+    #[test]
+    fn a_started_plane_records_which_incarnation_owns_its_directory() {
+        let Some((data, _plane, _script)) = plane_and_client(vec![probe_task()]) else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let stamp = task_dir(data.path(), std::process::id()).join("incarnation");
+        let recorded: u64 = std::fs::read_to_string(&stamp)
+            .expect("the plane must stamp its directory")
+            .trim()
+            .parse()
+            .expect("the stamp is the start time in ticks");
+        assert_eq!(
+            Some(recorded),
+            crate::session::read_start_ticks(std::process::id()),
+            "the stamp must name this incarnation, not merely this pid"
+        );
     }
 
     /// A plane whose invocations take `seconds` to answer, plus the client that talks to it.

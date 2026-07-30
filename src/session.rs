@@ -634,7 +634,7 @@ pub(crate) fn pid_is_live(pid: u32) -> bool {
 }
 
 /// The start time (clock ticks since boot) of `pid`, or `None` if it is gone.
-fn read_start_ticks(pid: u32) -> Option<u64> {
+pub(crate) fn read_start_ticks(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_start_ticks(&stat)
 }
