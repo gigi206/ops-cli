@@ -749,10 +749,15 @@ pub(crate) struct RawTask {
     pub(crate) timeout: Option<String>,
     /// This task's captured-output ceiling, overriding `[task.defaults] max_output`.
     pub(crate) max_output: Option<String>,
-    /// Present only so a task declaring them is **refused** rather than parsing into silence.
-    /// Policing which programs a task's command may go on to spawn is not offered: it takes an
-    /// exec supervisor per invocation, to guard a command a trusted declaration already chose.
-    /// Since unknown keys are ignored by design, a security-shaped key has to exist here to be
+    /// The programs this task's command may run, beside the command itself. Absent means no exec
+    /// supervision at all; present — **including empty** — stands one up, and then only the command
+    /// and what is listed here may `execve`. Each entry is resolved to the absolute in-cage path it
+    /// will run as, so a name here names the program in the read-only store and not merely a
+    /// filename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) spawn: Option<RawTaskSpawn>,
+    /// Present only so a task declaring them is **refused** rather than parsing into silence. Since
+    /// unknown keys are ignored by design, a key shaped like a control has to exist here to be
     /// rejected at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allow: Vec<String>,
@@ -771,6 +776,25 @@ pub(crate) struct RawTask {
     /// read-only, so its binaries are on a task's path with nothing to declare here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) packages: Vec<String>,
+}
+
+/// The shapes `spawn` accepts. A string is one program with nothing under it, a list is several,
+/// and a table reads as "this program may run these" — a parent→child *graph*.
+///
+/// The graph form parses so that it can be **refused with its own reason** rather than as a type
+/// error: what is enforced today is the flat set (a filter is inherited across `fork` and `exec`, so
+/// a rule governs the whole cage at any depth, not one parent's children). Accepting the graph and
+/// flattening it would be the worst of both — a declaration that reads as a per-parent restriction
+/// and is none.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawTaskSpawn {
+    /// `spawn = "git"` — one program, nothing under it.
+    One(String),
+    /// `spawn = ["git", "less"]` — the enforced form.
+    Flat(Vec<String>),
+    /// `spawn = { git = ["git-remote-https"] }` — parsed to be refused, not applied.
+    Nested(BTreeMap<String, RawTaskSpawn>),
 }
 
 /// The two shapes a task parameter accepts: the terse pattern string, or a table adding `enum` and

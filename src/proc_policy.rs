@@ -37,6 +37,12 @@ pub(crate) enum ProcMode {
     /// Enforce interactively: `deny` targets return `EPERM`, `allow` targets run, and an **unmatched**
     /// target is parked for a live `sbx proc allow`/`deny` decision.
     Ask,
+    /// Enforce a strict **allowlist**: only an `allow` match runs; anything unmatched is refused. The
+    /// inverse posture of [`Enforce`](ProcMode::Enforce), for a cage whose whole program set is known
+    /// up front — a declared task's, where the command is fixed and what it may run is declared beside
+    /// it. Not reachable from `[proc] mode`: a posture that refuses everything undeclared is only
+    /// honest where the declaration enumerates the programs, which a general agent's does not.
+    Confine,
 }
 
 impl ProcMode {
@@ -61,13 +67,14 @@ impl ProcMode {
             ProcMode::Observe => "observe",
             ProcMode::Enforce => "enforce",
             ProcMode::Ask => "ask",
+            ProcMode::Confine => "confine",
         }
     }
 
     /// Whether this mode stands up the seccomp user-notification enforcement path (the in-cage shim +
-    /// host supervisor). Both `enforce` and `ask` do; `off`/`observe` do not.
+    /// host supervisor). `enforce`, `ask` and `confine` do; `off`/`observe` do not.
     pub(crate) fn enforcing(self) -> bool {
-        matches!(self, ProcMode::Enforce | ProcMode::Ask)
+        matches!(self, ProcMode::Enforce | ProcMode::Ask | ProcMode::Confine)
     }
 }
 
@@ -177,9 +184,10 @@ impl ProcPolicy {
 
     /// Decide one exec target. Deny-wins: a `deny` match is [`Deny`](Verdict::Deny) even if `allow`
     /// also matches. Otherwise an `allow` match is [`Allow`](Verdict::Allow). An **unmatched** target
-    /// is [`Allow`](Verdict::Allow) under `enforce` (the denylist default) and [`Ask`](Verdict::Ask)
-    /// under `ask`; under a non-enforcing mode it is [`Allow`](Verdict::Allow) (decide is never called
-    /// there, but the fallback is the safe, non-blocking one).
+    /// is [`Allow`](Verdict::Allow) under `enforce` (the denylist default), [`Ask`](Verdict::Ask)
+    /// under `ask`, and [`Deny`](Verdict::Deny) under `confine` (the allowlist default); under a
+    /// non-enforcing mode it is [`Allow`](Verdict::Allow) (decide is never called there, but the
+    /// fallback is the safe, non-blocking one).
     pub(crate) fn decide(&self, exec_path: &str) -> Verdict {
         self.decide_with(exec_path, &[], &[])
     }
@@ -203,9 +211,12 @@ impl ProcPolicy {
         if any(&self.allow) || any(overlay_allow) {
             return Verdict::Allow;
         }
+        // Exhaustive on purpose: the unmatched default is the whole difference between a denylist and
+        // an allowlist, so a new posture must state its own rather than inherit a catch-all.
         match self.mode {
             ProcMode::Ask => Verdict::Ask,
-            _ => Verdict::Allow,
+            ProcMode::Confine => Verdict::Deny,
+            ProcMode::Off | ProcMode::Observe | ProcMode::Enforce => Verdict::Allow,
         }
     }
 }

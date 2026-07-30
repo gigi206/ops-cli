@@ -78,6 +78,7 @@ oracle over the credential.
 | `max_output` | this task's per-stream capture ceiling (`"64KiB"`), overriding `[task.defaults]` |
 | `network` | the egress this task's cage gets, as allowlist entries (empty = no network) |
 | `packages` | the `mise:` tools the command needs (see [below](#which-binaries-a-task-may-run)) |
+| `spawn` | the programs the command may run beside itself — absent means no supervision (see [below](#what-the-command-may-run-spawn)) |
 
 ### Parameters
 
@@ -271,20 +272,47 @@ Two are different:
 - an **inline `[flakes.<name>]`** flake builds in-cage to an out-link under the agent's `$HOME`,
   which a task cage does not have. Use a remote `flake:` reference, which builds host-side.
 
-### What sbx does *not* bound: what the command spawns
+### What the command may run: `spawn`
 
-sbx fixes the program a task runs. It does **not** police what that program goes on to spawn —
-`allow` / `deny` keys on a task are refused rather than accepted into silence.
+sbx fixes the program a task runs. `spawn` declares what that program may run **beside itself**:
 
-This is a deliberate limit, not an oversight, but it is a limit that may not stay. Deciding an
-`execve` by path takes a seccomp user-notification supervisor and a shim bound inside the cage — and
-this cage is the one holding a plaintext credential in the command's environment, so what gets bound
-there matters more than anywhere else. The machinery [`[proc]`](proc.md) uses now binds a dedicated
-binary that can do three things and nothing else, which is a far better thing to place next to a
-credential than a general-purpose one. What is left to weigh is a supervisor per invocation against a
-guardrail on a command a trusted declaration already chose.
+```toml
+[task.gh-issue]
+cmd   = ["gh", "issue", "list", "--repo", "{repo}"]
+spawn = ["git", "git-remote-https"]
+```
 
-What bounds a task today is its shape. The command is fixed by a trusted declaration, every
+**Why it matters where a credential is involved.** A child of the command inherits its environment,
+so it inherits the credential. The output that comes back to the caller is redacted, but redaction
+matches the credential's **exact bytes** — a child that encodes it first is not caught. Confining
+what may run closes that.
+
+**Leaving `spawn` out is not the same as `spawn = []`.** Absent means no exec supervision at all: the
+command runs as it always has. Present — including empty — stands up a supervisor for that
+invocation, after which **only the command and what is listed may run**. `spawn = []` is therefore
+the strictest form: a command that must run nothing else.
+
+**A name is resolved to the program, not to a filename.** Each entry is looked up on the cage's own
+`PATH` and becomes the absolute path it will run as, in the read-only store. A rule matching a bare
+name would admit any file so called, including one written into the invocation's own tmpfs; the
+resolved path does not. Write an entry with a `/` and it is kept as you wrote it, globs included
+(`/nix/store/*/bin/git`). A name that is nowhere in the cage refuses the launch rather than becoming
+a rule that matches nothing.
+
+**It governs the whole tree, at any depth.** The filter is inherited across `fork` and `exec`, so a
+program run by a program run by the command traps the same supervisor. That is why `spawn` is a flat
+list and not a table: `spawn = { git = [...] }` would read as "git may run these", which is a
+per-parent restriction, and it is refused rather than accepted and flattened.
+
+**Listing an interpreter concedes most of the guard**, and sbx says so at load. `sh`, `python`, `awk`
+and the like can take a credential apart and put it back together with builtins alone, and nothing
+they do that way is an `execve` to decide. The same is true if `cmd` is itself a shell script.
+
+**What it is not.** It bounds what the command *runs*; it does not bound what the command *itself*
+does with the values the caller supplies. Both come back to `params` being the caller's lever, which
+is why the bounds there are the first line and this is the second.
+
+The rest of what bounds a task is its shape. The command is fixed by a trusted declaration, every
 caller-supplied value is bounded by `params`, the cage has **no network** unless `network` declares
 one (an empty netns, so a spawned child has nowhere to send anything), the project is read-only, and
 the `$HOME` is a fresh tmpfs that dies with the invocation. And where the credential is an HTTP one,

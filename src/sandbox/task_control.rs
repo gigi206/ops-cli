@@ -771,6 +771,7 @@ mod tests {
             network: vec![],
             nonce: false,
             packages: vec![],
+            spawn: None,
         }
     }
 

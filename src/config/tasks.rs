@@ -194,10 +194,10 @@ pub(super) fn validate_task(
         None => defaults.max_output,
     };
 
-    // A task cannot police what its command goes on to spawn, so it must not look as though it can.
-    // Deciding an exec by path needs a seccomp user-notification supervisor per invocation, to guard
-    // a command a trusted declaration already fixed. Refusing is the honest answer while that is not
-    // offered: an ignored key here would read as a fence and be none.
+    // `[proc]`'s key names on a task, refused rather than parsed into silence: what a task's command
+    // may run is declared by `spawn`, whose semantics are a task's (a fixed command plus what it may
+    // run) and not a session's denylist. Accepting these as aliases would make two spellings of one
+    // control, each with a different unmatched default.
     for field in ["allow", "deny"] {
         let declared = if field == "allow" {
             &raw.allow
@@ -206,13 +206,14 @@ pub(super) fn validate_task(
         };
         if !declared.is_empty() {
             return Err(format!(
-                "`{field}` is not a task control — sbx does not police which programs a task's \
-                 command may spawn; what bounds a task is its fixed `cmd`, the `params` bounds, and \
-                 a cage with no network unless `network` declares one"
+                "`{field}` is not a task control — what a task's command may run beside itself is \
+                 declared by `spawn`, and what else bounds a task is its fixed `cmd`, the `params` \
+                 bounds, and a cage with no network unless `network` declares one"
             ));
         }
     }
 
+    let spawn = validate_task_spawn(name, raw.spawn)?;
     let packages = validate_task_packages(&raw.packages)?;
 
     Ok(TaskSpec {
@@ -231,7 +232,70 @@ pub(super) fn validate_task(
         network,
         nonce: defaults.nonce,
         packages,
+        spawn,
     })
+}
+
+/// Programs whose whole job is to run whatever they are told, in a language of their own. Listing
+/// one does not merely widen the set — it concedes the gate: an interpreter can take a credential
+/// apart and put it back together with builtins alone, and nothing it does that way is an `execve`
+/// to decide. A declaration is still allowed to make that trade (a command that genuinely shells
+/// out has no other option), but it is worth saying out loud.
+const OPEN_ENDED: &[&str] = &[
+    "sh", "bash", "dash", "zsh", "ksh", "fish", "env", "python", "python3", "perl", "ruby", "node",
+    "awk", "gawk", "xargs",
+];
+
+/// Validate a task's `spawn` and return the declared entries, or `None` when the key is absent.
+///
+/// Absent and empty are **different**: absent is no exec supervision at all (the command runs as it
+/// always has), empty is a supervised cage where only the command itself may run. That distinction is
+/// the field's whole ergonomics, so it is carried as an `Option` rather than flattened to a list.
+fn validate_task_spawn(
+    name: &str,
+    raw: Option<crate::config::schema::RawTaskSpawn>,
+) -> Result<Option<Vec<String>>, String> {
+    use crate::config::schema::RawTaskSpawn;
+    let entries = match raw {
+        None => return Ok(None),
+        Some(RawTaskSpawn::One(s)) => vec![s],
+        Some(RawTaskSpawn::Flat(v)) => v,
+        Some(RawTaskSpawn::Nested(_)) => {
+            return Err(
+                "`spawn` is a list, not a table — a table reads as \"this program may run these\", \
+                 and that is not what is enforced: the exec filter is inherited across `fork` and \
+                 `exec`, so an entry governs the whole cage at any depth rather than one parent's \
+                 children. Declare the flat set of programs that may run."
+                    .to_string(),
+            );
+        }
+    };
+    for entry in &entries {
+        let trimmed = entry.trim();
+        crate::proc_policy::validate_rule(trimmed)?;
+        if trimmed == "*" || trimmed == "**" {
+            return Err(
+                "`spawn = [\"*\"]` allows everything, which is what leaving `spawn` out already \
+                 means — one way to say a thing. Remove the key, or name the programs."
+                    .to_string(),
+            );
+        }
+        let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        if OPEN_ENDED.contains(&base) {
+            crate::diag::warn(&format!(
+                "task `{name}`: `spawn` lists `{base}` — an interpreter concedes most of this \
+                 guard, since what it does with its own builtins never reaches an `execve` to \
+                 decide"
+            ));
+        }
+    }
+    Ok(Some(
+        entries
+            .into_iter()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .collect(),
+    ))
 }
 
 /// Validate a task's `packages` and return the bare mise tokens (the `mise:` prefix stripped).
@@ -830,6 +894,75 @@ mod tests {
             assert!(
                 err.contains(label) && err.contains("not a task control"),
                 "`{label}` must be refused by name, said plainly: {err}"
+            );
+        }
+    }
+
+    // Absent and empty are different declarations, and the difference is the whole ergonomics of the
+    // field: leaving `spawn` out is "do not supervise this at all", while `spawn = []` is "supervise
+    // it, and only the command itself may run". Flattening one into the other would either brick
+    // every existing task or make the strict form unwritable.
+    #[test]
+    fn an_absent_spawn_is_not_the_same_declaration_as_an_empty_one() {
+        let absent = validate(raw_task()).expect("a task with no spawn");
+        assert_eq!(absent.spawn, None, "absent means no supervision at all");
+
+        let mut raw = raw_task();
+        raw.spawn = Some(crate::config::schema::RawTaskSpawn::Flat(vec![]));
+        let empty = validate(raw).expect("a task declaring an empty spawn");
+        assert_eq!(
+            empty.spawn,
+            Some(vec![]),
+            "an empty list is a declaration, not the absence of one"
+        );
+    }
+
+    // The terse single-program form, since one is the common case.
+    #[test]
+    fn a_bare_string_spawn_is_one_program() {
+        let mut raw = raw_task();
+        raw.spawn = Some(crate::config::schema::RawTaskSpawn::One("git".into()));
+        assert_eq!(
+            validate(raw).expect("a task").spawn,
+            Some(vec!["git".to_string()])
+        );
+    }
+
+    // The table form reads as "this program may run these" — a per-parent restriction. What is
+    // enforced is the flat set, because the exec filter is inherited across fork and exec. Accepting
+    // the table and flattening it would be a declaration that means less than it says, which is the
+    // failure this field exists to avoid.
+    #[test]
+    fn a_nested_spawn_is_refused_rather_than_flattened() {
+        let mut raw = raw_task();
+        raw.spawn = Some(crate::config::schema::RawTaskSpawn::Nested(
+            [(
+                "git".to_string(),
+                crate::config::schema::RawTaskSpawn::Flat(vec!["git-remote-https".into()]),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        let e = validate(raw).unwrap_err();
+        assert!(
+            e.contains("list, not a table") && e.contains("any depth"),
+            "the refusal must say what is enforced instead: {e}"
+        );
+    }
+
+    // Allowing everything is what leaving the key out already means. Two spellings of one thing
+    // would make the declaration say nothing about whether its author considered the question.
+    #[test]
+    fn a_wildcard_spawn_is_refused() {
+        for wildcard in ["*", "**"] {
+            let mut raw = raw_task();
+            raw.spawn = Some(crate::config::schema::RawTaskSpawn::Flat(vec![
+                wildcard.to_string()
+            ]));
+            let e = validate(raw).unwrap_err();
+            assert!(
+                e.contains("Remove the key"),
+                "`{wildcard}` must be refused with the alternative: {e}"
             );
         }
     }

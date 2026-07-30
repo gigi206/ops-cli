@@ -405,6 +405,33 @@ impl TaskEngine {
         let mut proxy_env = Vec::new();
         let mut tcp_plan = super::egress::TcpPlan::default();
         let mut argv = argv;
+
+        // Exec confinement, when the task declares `spawn`: a supervisor of this invocation's own,
+        // and the command wrapped in the shim **innermost** — before the egress wrap below, so the
+        // filter covers the command and its descendants and not the forwarder the cage needs to
+        // reach its proxy. Fail-closed: a supervisor that cannot be stood up refuses the invocation
+        // rather than running the command unconfined.
+        let mut proc_binds = Vec::new();
+        let _enforce = match &task.spawn {
+            None => None,
+            Some(declared) => {
+                let policy = self
+                    .spawn_policy(task, declared, &cage_env)
+                    .map_err(|e| TaskError::Refused(format!("task `{name}`: {e}")))?;
+                let shim = crate::store::ensure_proc_shim(&self.layout).map_err(TaskError::Io)?;
+                let (guard, wiring) = super::proc_enforce::start_for_task(
+                    self.layout.data_dir(),
+                    &shim,
+                    policy,
+                    invocation,
+                )
+                .map_err(TaskError::Io)?;
+                argv = super::proc_enforce::wrap_command(argv);
+                proc_binds = wiring.binds;
+                Some(guard)
+            }
+        };
+
         let _proxy = if task.network.is_empty() {
             None
         } else {
@@ -435,6 +462,7 @@ impl TaskEngine {
             Some(guard)
         };
         cage_env.extend(proxy_env);
+        proxy_binds.extend(proc_binds);
 
         let spec = self
             .build_spec(
@@ -679,6 +707,105 @@ impl TaskEngine {
         }
         let bins = super::taskpool::bins_for(pool, &task.packages).bins;
         (!bins.is_empty()).then_some(bins)
+    }
+
+    /// Where an in-cage path lives on the host, read off the mounts this cage is built from. A path
+    /// under no mount has no host counterpart — the cage is hermetic, so that is the normal answer
+    /// for anything the declaration did not put there.
+    ///
+    /// The **longest** matching mount wins: a cage nests them (the tool pool sits under a directory
+    /// the skeleton also maps), and the innermost is the one whose source the kernel will actually
+    /// resolve through.
+    fn host_path(&self, incage: &Path, task: &TaskSpec) -> Option<PathBuf> {
+        let mut best: Option<(usize, PathBuf)> = None;
+        let mut consider = |src: &Path, dest: &Path| {
+            if let Ok(rest) = incage.strip_prefix(dest) {
+                let depth = dest.components().count();
+                if best.as_ref().is_none_or(|(d, _)| depth > *d) {
+                    best = Some((depth, src.join(rest)));
+                }
+            }
+        };
+        for mount in &self.base_mounts {
+            match mount {
+                Mount::RoBind { src, dest } | Mount::Bind { src, dest } => consider(src, dest),
+                _ => {}
+            }
+        }
+        if let Some((pool, _)) = &self.pool {
+            if !task.packages.is_empty() {
+                consider(pool, Path::new(super::taskpool::POOL_INCAGE));
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
+    /// Resolve one declared `spawn` entry (or the command itself) to the rule that will match the
+    /// `execve` the cage really issues.
+    ///
+    /// A bare name is looked up on the cage's own `PATH` and returned as the **absolute in-cage
+    /// path**. That is the whole point of resolving: a basename rule would admit any file of that
+    /// name, including one written into the invocation's own tmpfs, while a resolved path names the
+    /// program in the read-only store and nothing else. An entry that already carries a `/` is a
+    /// path or a path glob the author wrote deliberately, and is kept verbatim.
+    ///
+    /// Not finding a declared name refuses the launch: a rule that matches nothing would leave the
+    /// program it names unrunnable, which is not what the declaration says.
+    fn resolve_spawn_entry(
+        &self,
+        entry: &str,
+        path_dirs: &[PathBuf],
+        task: &TaskSpec,
+    ) -> Result<String, String> {
+        use std::os::unix::fs::PermissionsExt;
+        if entry.contains('/') {
+            return Ok(entry.to_string());
+        }
+        for dir in path_dirs {
+            let incage = dir.join(entry);
+            let Some(host) = self.host_path(&incage, task) else {
+                continue;
+            };
+            let executable = std::fs::metadata(&host)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if executable {
+                return Ok(incage.to_string_lossy().into_owned());
+            }
+        }
+        Err(format!(
+            "`{entry}` is not on this task's path — a declared program must exist in the cage, or \
+             the rule naming it would match nothing"
+        ))
+    }
+
+    /// The exec policy for one invocation: a strict allowlist of the command itself plus what the
+    /// declaration says it may run, each resolved to an absolute in-cage path.
+    fn spawn_policy(
+        &self,
+        task: &TaskSpec,
+        declared: &[String],
+        cage_env: &[(String, String)],
+    ) -> Result<crate::proc_policy::ProcPolicy, String> {
+        let path_dirs: Vec<PathBuf> = cage_env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.split(':').filter(|d| !d.is_empty()).map(PathBuf::from))
+            .into_iter()
+            .flatten()
+            .collect();
+        // The command comes first because it is not optional: the shim's own exec of it is the first
+        // notified `execve`, and a policy that did not admit it would refuse the task outright.
+        let mut allow = vec![self.resolve_spawn_entry(&task.cmd[0], &path_dirs, task)?];
+        for entry in declared {
+            allow.push(self.resolve_spawn_entry(entry, &path_dirs, task)?);
+        }
+        Ok(crate::proc_policy::ProcPolicy::new(
+            crate::proc_policy::ProcMode::Confine,
+            &allow,
+            &[],
+        ))
     }
 }
 
@@ -1061,6 +1188,7 @@ mod smoke {
             network: vec![],
             nonce: false,
             packages: vec![],
+            spawn: None,
         }
     }
 
@@ -1203,6 +1331,7 @@ mod smoke {
             network: vec![],
             nonce: false,
             packages: vec!["demo-tool".into()],
+            spawn: None,
         };
 
         let Some((engine, _data)) = engine_with(vec![spec], project.path(), Some(&pool)) else {
@@ -1325,6 +1454,7 @@ mod tests {
             network: vec![],
             nonce: false,
             packages: vec![],
+            spawn: None,
         }
     }
 
@@ -1676,6 +1806,122 @@ mod tests {
         });
         std::fs::create_dir_all(data.join("egress")).expect("the egress directory");
         engine
+    }
+
+    /// An engine whose `/nix` is a real directory on disk, with `programs` laid down executable in
+    /// the store — what a resolution test needs, since resolving asks the filesystem.
+    fn engine_with_store(root: &Path, programs: &[&str], tasks: Vec<TaskSpec>) -> TaskEngine {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("nix/store/demo/bin");
+        std::fs::create_dir_all(&bin).expect("the store bin");
+        for p in programs {
+            let path = bin.join(p);
+            std::fs::write(&path, b"#!/bin/true\n").expect("the program");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        }
+        let mut engine = engine_at(root, tasks);
+        engine.base_mounts = vec![Mount::RoBind {
+            src: root.join("nix"),
+            dest: PathBuf::from("/nix"),
+        }];
+        engine.base_env = vec![("PATH".to_string(), "/nix/store/demo/bin".to_string())];
+        engine
+    }
+
+    /// A declared name becomes the **absolute in-cage path** it will run as. That is the difference
+    /// between naming a program and naming a filename: a basename rule would admit any file so
+    /// called, including one written into the invocation's own tmpfs, while the resolved path names
+    /// the one in the read-only store.
+    #[test]
+    fn a_declared_name_resolves_to_the_program_in_the_store() {
+        let root = crate::testutil::TmpDir::new();
+        let task = task();
+        let engine = engine_with_store(root.path(), &["psql", "less"], vec![task.clone()]);
+        let dirs = vec![PathBuf::from("/nix/store/demo/bin")];
+
+        assert_eq!(
+            engine.resolve_spawn_entry("less", &dirs, &task).unwrap(),
+            "/nix/store/demo/bin/less"
+        );
+        // An entry the author wrote as a path is theirs — kept verbatim, globs included.
+        assert_eq!(
+            engine
+                .resolve_spawn_entry("/nix/store/*/bin/git", &dirs, &task)
+                .unwrap(),
+            "/nix/store/*/bin/git"
+        );
+        // A name that is nowhere refuses: a rule matching nothing would leave the program it names
+        // unrunnable, which is not what the declaration says.
+        let e = engine
+            .resolve_spawn_entry("nosuchtool", &dirs, &task)
+            .unwrap_err();
+        assert!(e.contains("not on this task's path"), "{e}");
+    }
+
+    /// The policy a declaration produces: the command is admitted because it is not optional, the
+    /// declared programs are admitted, and **everything else is refused** — the posture is an
+    /// allowlist, not the session's denylist.
+    #[test]
+    fn a_declared_spawn_confines_the_cage_to_the_command_and_what_it_names() {
+        let root = crate::testutil::TmpDir::new();
+        let mut task = task();
+        task.spawn = Some(vec!["less".to_string()]);
+        let engine = engine_with_store(root.path(), &["psql", "less"], vec![task.clone()]);
+
+        let policy = engine
+            .spawn_policy(&task, task.spawn.as_ref().unwrap(), &engine.base_env)
+            .expect("a policy");
+        assert_eq!(policy.mode, crate::proc_policy::ProcMode::Confine);
+        use crate::proc_policy::Verdict;
+        assert_eq!(
+            policy.decide("/nix/store/demo/bin/psql"),
+            Verdict::Allow,
+            "the command itself must run, or the task refuses itself"
+        );
+        assert_eq!(policy.decide("/nix/store/demo/bin/less"), Verdict::Allow);
+        assert_eq!(
+            policy.decide("/bin/sh"),
+            Verdict::Deny,
+            "an undeclared program is refused — that is the whole field"
+        );
+        // The resolved path is what matches, so a same-named file elsewhere in the cage does not.
+        assert_eq!(
+            policy.decide("/tmp/less"),
+            Verdict::Deny,
+            "a file that merely shares the name must not satisfy the rule"
+        );
+    }
+
+    /// Nested mounts: the innermost is the one the kernel resolves through, so translation must pick
+    /// the longest match rather than the first.
+    #[test]
+    fn translating_an_in_cage_path_prefers_the_innermost_mount() {
+        let root = crate::testutil::TmpDir::new();
+        let mut engine = engine_with_store(root.path(), &[], vec![task()]);
+        engine.base_mounts = vec![
+            Mount::RoBind {
+                src: PathBuf::from("/host/outer"),
+                dest: PathBuf::from("/opt"),
+            },
+            Mount::RoBind {
+                src: PathBuf::from("/host/inner"),
+                dest: PathBuf::from("/opt/sbx/tools"),
+            },
+        ];
+        assert_eq!(
+            engine.host_path(Path::new("/opt/sbx/tools/bin/x"), &task()),
+            Some(PathBuf::from("/host/inner/bin/x"))
+        );
+        assert_eq!(
+            engine.host_path(Path::new("/opt/other"), &task()),
+            Some(PathBuf::from("/host/outer/other"))
+        );
+        assert_eq!(
+            engine.host_path(Path::new("/elsewhere"), &task()),
+            None,
+            "a path under no mount has no host counterpart — the cage is hermetic"
+        );
     }
 
     /// A destination plan for one `tcp://` rule, built the way a launch builds it.

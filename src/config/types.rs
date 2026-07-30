@@ -493,6 +493,12 @@ pub(crate) struct TaskSpec {
     /// the project's task pool, which the task cage mounts read-only — so the program a task runs
     /// comes from a tree no cage can write, exactly like a store-built package.
     pub(crate) packages: Vec<String>,
+    /// What the command may run beside itself, as declared. `None` is no exec supervision at all —
+    /// the command runs as it always has. `Some` stands up a supervisor and confines the cage to the
+    /// command plus these entries, **including when the list is empty** (a command that must run
+    /// nothing else). Entries are declaration text; the launch resolves a bare name to the absolute
+    /// in-cage path it will run as.
+    pub(crate) spawn: Option<Vec<String>>,
 }
 
 /// Whether a captured stream is returned to the caller. Substitution of secret values happens

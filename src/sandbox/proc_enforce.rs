@@ -246,6 +246,41 @@ pub(crate) fn start(
     shim_bin: &Path,
     policy: ProcPolicy,
 ) -> io::Result<(ProcEnforce, Wiring)> {
+    start_inner(data_dir, shim_bin, policy, "", true)
+}
+
+/// The same supervisor for **one task invocation**, which differs from a session's in two ways.
+///
+/// Its socket carries the invocation number, because a session serving two invocations at once would
+/// otherwise have them race for one path — the loser either fails to bind or has its live socket
+/// unlinked from under it. The separator is a `.` so the runtime sweep can still read the pid out of
+/// the name.
+///
+/// And it opens **no control socket**: `sbx proc allow`/`deny` decide a parked `execve`, and nothing
+/// parks here — a task is confined by an allowlist, which refuses rather than asks. A socket nobody
+/// can answer would be one more per-invocation file for no reach.
+pub(crate) fn start_for_task(
+    data_dir: &Path,
+    shim_bin: &Path,
+    policy: ProcPolicy,
+    invocation: u64,
+) -> io::Result<(ProcEnforce, Wiring)> {
+    start_inner(
+        data_dir,
+        shim_bin,
+        policy,
+        &format!(".t{invocation}"),
+        false,
+    )
+}
+
+fn start_inner(
+    data_dir: &Path,
+    shim_bin: &Path,
+    policy: ProcPolicy,
+    instance: &str,
+    control: bool,
+) -> io::Result<(ProcEnforce, Wiring)> {
     use std::os::unix::fs::DirBuilderExt;
     let dir = super::proc_control::proc_control_dir(data_dir);
     std::fs::DirBuilder::new()
@@ -264,29 +299,33 @@ pub(crate) fn start(
     // The proc control socket: `sbx proc logs` reads the ring, `sbx proc allow`/`deny` (under ask)
     // answer a parked `execve` or (with `--session`) load a live rule into the overlay. Best-effort — a
     // failure here still leaves enforcement running, only the out-of-band viewer/decider is unavailable.
-    let control_socket = super::proc_control::proc_control_socket(data_dir, std::process::id());
-    let _ = std::fs::remove_file(&control_socket);
-    let control_socket = match UnixListener::bind(&control_socket) {
-        Ok(l) => {
-            let ring = ring.clone();
-            let pending = pending.clone();
-            let overlay = overlay.clone();
-            std::thread::spawn(move || {
-                let _ = super::proc_control::serve_enforced(l, ring, pending, overlay, mode);
-            });
-            Some(control_socket)
-        }
-        Err(e) => {
-            crate::diag::warn(&format!(
-                "could not bind the process-observation socket ({e}) — `sbx proc logs`/`allow`/`deny` \
-                 will not see this session; under `ask` an unmatched exec then has no way to be \
-                 decided and is auto-denied when its timeout lapses"
-            ));
-            None
+    let control_socket = if !control {
+        None
+    } else {
+        let control_socket = super::proc_control::proc_control_socket(data_dir, std::process::id());
+        let _ = std::fs::remove_file(&control_socket);
+        match UnixListener::bind(&control_socket) {
+            Ok(l) => {
+                let ring = ring.clone();
+                let pending = pending.clone();
+                let overlay = overlay.clone();
+                std::thread::spawn(move || {
+                    let _ = super::proc_control::serve_enforced(l, ring, pending, overlay, mode);
+                });
+                Some(control_socket)
+            }
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "could not bind the process-observation socket ({e}) — `sbx proc \
+                     logs`/`allow`/`deny` will not see this session; under `ask` an unmatched exec \
+                     then has no way to be decided and is auto-denied when its timeout lapses"
+                ));
+                None
+            }
         }
     };
 
-    let notif_socket = dir.join(format!("notif-{}.sock", std::process::id()));
+    let notif_socket = dir.join(format!("notif-{}{instance}.sock", std::process::id()));
     let _ = std::fs::remove_file(&notif_socket);
     let listener = UnixListener::bind(&notif_socket)?;
     listener.set_nonblocking(true)?;
@@ -423,11 +462,13 @@ fn handle_notif(
     }
     let path = read_exec_path(req.pid, req.data.args[0]).unwrap_or_default();
     let verdict = if path.is_empty() {
-        // Could not read the path: fall back to the mode's unmatched default (allow under a denylist,
-        // park under ask) rather than guessing a name match.
+        // Could not read the path: fall back to the mode's unmatched default rather than guessing a
+        // name match — allow under a denylist, park under ask, refuse under an allowlist (where an
+        // undecidable target is exactly the one that must not run).
         match policy.mode {
             ProcMode::Ask => Verdict::Ask,
-            _ => Verdict::Allow,
+            ProcMode::Confine => Verdict::Deny,
+            ProcMode::Off | ProcMode::Observe | ProcMode::Enforce => Verdict::Allow,
         }
     } else {
         // Decide against the config policy folded with the live `--session` overlay (deny wins across
@@ -446,7 +487,7 @@ fn handle_notif(
         }
         Verdict::Deny => {
             ring.push_verdict(req.pid, shown, "deny");
-            respond_errno(notif_fd, req.id, libc::EPERM);
+            respond_errno(notif_fd, req.id, refusal_errno(req.pid, shown));
         }
         Verdict::Ask => {
             // Park it: register the kernel notification id so the control plane can answer it later.
@@ -454,6 +495,30 @@ fn handle_notif(
             ring.push_verdict(req.pid, shown, "ask");
             pending.park(notif_fd, req.id, req.pid, shown);
         }
+    }
+}
+
+/// Which errno a refusal answers with: `ENOENT` when the target does not exist, `EPERM` otherwise.
+///
+/// This is not a security choice — the syscall never runs either way, and a file's absence is not a
+/// secret the caller could not learn with `stat`. It is what keeps a **name lookup behaving like a
+/// name lookup**. `execvp("git")` is not one syscall: it issues an `execve` per `PATH` entry until
+/// one succeeds, and glibc only keeps walking on `ENOENT`/`EACCES`. Answering `EPERM` for a
+/// candidate that was never there aborts the walk before it reaches the directory that has the
+/// program — so under an allowlist keyed to absolute paths, every allowed program not sitting in the
+/// first `PATH` entry would become unlaunchable. Measured, not assumed.
+///
+/// The target's path is read in **its** mount namespace, so existence is tested through
+/// `/proc/<pid>/root`. Anything that cannot be resolved that way (a relative path, a dead target)
+/// keeps `EPERM`, the stricter answer.
+fn refusal_errno(pid: u32, path: &str) -> libc::c_int {
+    if !path.starts_with('/') {
+        return libc::EPERM;
+    }
+    if Path::new(&format!("/proc/{pid}/root{path}")).exists() {
+        libc::EPERM
+    } else {
+        libc::ENOENT
     }
 }
 
@@ -805,17 +870,29 @@ mod tests {
         overlay: &ProcOverlay,
         notifs: usize,
     ) -> (Option<i32>, Arc<ExecRing>) {
+        run_under_supervisor_full(payload, policy, overlay, notifs, None)
+    }
+
+    /// The harness with the payload's `PATH` pinned, so a test about name lookup does not depend on
+    /// what the developer's own `PATH` happens to hold.
+    fn run_under_supervisor_full(
+        payload: &[&str],
+        policy: &ProcPolicy,
+        overlay: &ProcOverlay,
+        notifs: usize,
+        path: Option<&str>,
+    ) -> (Option<i32>, Arc<ExecRing>) {
         let dir = TmpDir::new();
         let shim = materialized_shim(&dir);
         let sock_path = dir.join("notif.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
 
-        let mut child = spawn_shim(
-            std::process::Command::new(&shim)
-                .arg(&sock_path)
-                .arg("--")
-                .args(payload),
-        );
+        let mut cmd = std::process::Command::new(&shim);
+        cmd.arg(&sock_path).arg("--").args(payload);
+        if let Some(p) = path {
+            cmd.env("PATH", p);
+        }
+        let mut child = spawn_shim(&mut cmd);
 
         let (sock, _) = listener.accept().expect("the shim never connected");
         let notif = recv_fd(&sock).expect("receive the listener fd");
@@ -876,6 +953,56 @@ mod tests {
                 .iter()
                 .any(|e| e.command.contains("/bin/true") && e.verdict == "allow"),
             "the ring must record the allowed exec"
+        );
+    }
+
+    /// A strict allowlist must not break name lookup. `execvp("true")` is not one syscall: it issues
+    /// an `execve` per `PATH` entry until one succeeds, and glibc only keeps walking on
+    /// `ENOENT`/`EACCES`. Refusing a candidate that was never there with `EPERM` would abort the walk
+    /// before it reached the directory that has the program — so the refusal answers `ENOENT` when
+    /// the path does not exist, and the lookup completes. Without that, an allowlisted program not
+    /// sitting in the first `PATH` entry is unlaunchable.
+    #[test]
+    fn a_confined_allowlist_still_lets_a_name_lookup_find_its_program() {
+        let empty = TmpDir::new();
+        std::fs::create_dir_all(empty.join("a")).expect("an empty PATH entry");
+        std::fs::create_dir_all(empty.join("b")).expect("another empty PATH entry");
+        let path = format!(
+            "{}:{}:/usr/bin",
+            empty.join("a").display(),
+            empty.join("b").display()
+        );
+
+        let policy = ProcPolicy::new(
+            ProcMode::Confine,
+            &["/usr/bin/env".to_string(), "/usr/bin/true".to_string()],
+            &[],
+        );
+        let (code, ring) = run_under_supervisor_full(
+            &["/usr/bin/env", "true"],
+            &policy,
+            &ProcOverlay::new(),
+            8,
+            Some(&path),
+        );
+
+        let events = ring.snapshot(None).events;
+        assert_eq!(
+            code,
+            Some(0),
+            "the allowed program must still be found through PATH: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.command.ends_with("/a/true") && e.verdict == "deny"),
+            "the walk's earlier candidates are refused — that is the situation under test: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.command == "/usr/bin/true" && e.verdict == "allow"),
+            "and the walk reached the real one: {events:?}"
         );
     }
 
