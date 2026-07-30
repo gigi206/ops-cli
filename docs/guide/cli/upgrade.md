@@ -11,7 +11,7 @@ advance **only here**, never on an `sbx` binary update.
 |---|---|
 | `all` | every managed channel (the default) |
 | `nix` | the nixpkgs channel (base userland + native `nix:` packages) |
-| `mise` | the mise engine, the project's `nix:` tools, and `mise:` packages |
+| `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the [task tool pool](../configuration/task.md#the-task-tool-pool) |
 | `flake` | the project's and apps' `flake:` packages |
 | `deb` | the project's and apps' `deb:` packages |
 | `appimage` | the project's and apps' `appimage:` packages |
@@ -32,7 +32,8 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
 
 - `sbx upgrade nix` rolls the base channel, leaving the mise engine lock untouched.
 - `sbx upgrade mise` rolls the mise engine + the project's `nix:` tools + `mise:`
-  packages (an in-cage `mise upgrade` per home), leaving `nixpkgs.lock` intact.
+  packages (an in-cage `mise upgrade` per home) + the declared operations' tool pool
+  (host-side, under a `task pool` line), leaving `nixpkgs.lock` intact.
 - `sbx upgrade flake` re-pins the project's and apps' `flake:` packages.
 
 ### Targeting another project

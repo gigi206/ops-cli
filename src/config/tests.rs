@@ -71,6 +71,7 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
+        task: None,
         env: env
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -571,6 +572,7 @@ fn raw_app(
     network: Option<NetworkField>,
 ) -> RawApp {
     RawApp {
+        task: None,
         cmd: if cmd.is_empty() {
             None
         } else {
@@ -619,6 +621,8 @@ fn raw_with_app(name: &str, app: RawApp) -> RawConfig {
 /// dependence on the default resolver order).
 fn a_header_secret() -> HeaderSecret {
     let raw = RawHostSecret {
+        name: None,
+        description: None,
         kind: None,
         key: None,
         from: Some(SecretFrom::One("env://TOKEN".into())),
@@ -2012,6 +2016,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
             ..Default::default()
         },
         secrets: vec![],
+        tasks: vec![],
         default_methods: crate::allowlist::Methods::Unspecified,
         cmd_origin: Default::default(),
         network_origin: Default::default(),
@@ -2069,6 +2074,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
 fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        tasks: vec![],
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
         env: vec![],
@@ -2112,6 +2118,7 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
 fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        tasks: vec![],
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
         env: vec![],
@@ -2167,6 +2174,7 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
         dbus: None,
         limits: Default::default(),
         secrets: vec![],
+        tasks: vec![],
         default_methods,
         cmd_origin: Default::default(),
         network_origin: Default::default(),
@@ -2289,6 +2297,7 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
+        tasks: vec![],
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
         env: vec![],
@@ -2354,6 +2363,7 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         dbus: None,
         limits: Default::default(),
         secrets: vec![],
+        tasks: vec![],
         default_methods: crate::allowlist::Methods::Unspecified,
         cmd_origin: Default::default(),
         network_origin: Default::default(),
@@ -4226,6 +4236,8 @@ fn raw_secret(
     (
         to.into(),
         RawHostSecret {
+            name: None,
+            description: None,
             kind: Some("http-header".into()),
             key: None,
             from,
@@ -4285,6 +4297,8 @@ fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConf
 /// A `RawHostSecret` whose `from` is the given resolver-ref list, for the validation tests.
 fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
     RawHostSecret {
+        name: None,
+        description: None,
         kind: Some("http-header".into()),
         key: None,
         from: Some(SecretFrom::Many(
@@ -4300,6 +4314,88 @@ fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
 /// fixed concrete target so the tests focus on the source form.
 fn validate(secret: RawHostSecret) -> Result<HeaderSecret, String> {
     vhs("api.github.com", secret, &SecretDefaults::default())
+}
+
+// A credential with no `name` is still named — after its destination host, the section key — so
+// the inventory and a redacted value always have something to print.
+#[test]
+fn a_secret_without_a_name_is_named_after_its_host() {
+    let secret = validate(raw_secret_from(vec!["env://TOKEN"])).unwrap();
+    assert_eq!(secret.name, "api.github.com");
+    assert_eq!(secret.description, None);
+}
+
+// An explicit name and description survive validation; the description is the label the inventory
+// prints beside the name.
+#[test]
+fn an_explicit_name_and_description_are_kept() {
+    let mut raw = raw_secret_from(vec!["env://TOKEN"]);
+    raw.name = Some("gh_token".into());
+    raw.description = Some("Read-only GitHub API token".into());
+    let secret = validate(raw).unwrap();
+    assert_eq!(secret.name, "gh_token");
+    assert_eq!(
+        secret.description.as_deref(),
+        Some("Read-only GitHub API token")
+    );
+}
+
+// The name is rendered into output as `${name}`, so a character that could close the placeholder
+// or drive a terminal is refused at validation rather than reaching a text sink.
+#[test]
+fn a_name_carrying_a_placeholder_or_control_character_is_refused() {
+    for bad in ["gh}token", "gh token", "gh\ntoken", "gh$token", ""] {
+        let mut raw = raw_secret_from(vec!["env://TOKEN"]);
+        raw.name = Some(bad.into());
+        assert!(
+            validate(raw).is_err(),
+            "a name of {bad:?} must be refused — it is rendered into output"
+        );
+    }
+}
+
+// A description is a label, not a document: control characters become spaces (so it can neither
+// forge a second output line nor emit an escape sequence), whitespace runs collapse, and the
+// result is capped. A sloppy description is cleaned, never a reason to drop the credential.
+#[test]
+fn a_description_is_flattened_to_one_capped_line() {
+    let mut raw = raw_secret_from(vec!["env://TOKEN"]);
+    raw.description = Some("first\nsecond\t\tthird\u{1b}[31m".into());
+    let secret = validate(raw).unwrap();
+    assert_eq!(
+        secret.description.as_deref(),
+        Some("first second third [31m")
+    );
+
+    let mut long = raw_secret_from(vec!["env://TOKEN"]);
+    long.description = Some("x".repeat(500));
+    let capped = validate(long).unwrap().description.unwrap();
+    assert_eq!(capped.chars().count(), 200, "the description is capped");
+}
+
+// Two credentials may legally share a name (it is a label, not a key), but a redacted value
+// prints only the name — so the reader could not tell which was withheld. Warn, naming both
+// destinations, and keep both.
+#[test]
+fn two_secrets_sharing_a_name_warn_and_both_survive() {
+    let mut a = raw_secret_from(vec!["env://A"]);
+    a.name = Some("shared".into());
+    let mut b = raw_secret_from(vec!["env://B"]);
+    b.name = Some("shared".into());
+    let first = vhs("api.github.com", a, &SecretDefaults::default()).unwrap();
+    let second = vhs("api.npmjs.org", b, &SecretDefaults::default()).unwrap();
+
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    upsert_secret(&mut out, &mut warnings, "global config", first);
+    upsert_secret(&mut out, &mut warnings, "global config", second);
+
+    assert_eq!(out.len(), 2, "both credentials are kept");
+    assert_eq!(warnings.len(), 1, "the name clash warns once: {warnings:?}");
+    let w = &warnings[0];
+    assert!(w.contains("shared"), "the warning names the name: {w}");
+    assert!(w.contains("api.github.com"), "and the first target: {w}");
+    assert!(w.contains("api.npmjs.org"), "and the second target: {w}");
 }
 
 /// [`validate_host_secret`] with no installed plugins — the default for the secret tests,
@@ -4798,6 +4894,8 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
 /// A terse `RawHostSecret` — `key` only, no explicit `from` — for the expansion tests.
 fn terse(key: &str) -> RawHostSecret {
     RawHostSecret {
+        name: None,
+        description: None,
         kind: None,
         key: Some(key.into()),
         from: None,
@@ -4811,6 +4909,8 @@ fn terse(key: &str) -> RawHostSecret {
 /// `[secret.defaults]` — for the default-header/type tests.
 fn terse_bare(key: &str) -> RawHostSecret {
     RawHostSecret {
+        name: None,
+        description: None,
         kind: None,
         key: Some(key.into()),
         from: None,
@@ -5341,6 +5441,8 @@ fn an_untrusted_project_secret_section_steers_nothing() {
         hosts.insert(
             "api.github.com".to_string(),
             RawHostSecrets::One(RawHostSecret {
+                name: None,
+                description: None,
                 kind: None,
                 key: None,
                 from: Some(SecretFrom::One("sops://prod.yaml#tok".into())),

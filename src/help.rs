@@ -563,6 +563,141 @@ const PAGES: &[Page] = &[
             the host. Precise per-syscall capture (and blocking) is a later increment.",
     },
     Page {
+        path: &["secret"],
+        synopsis: "sbx secret <subcommand> [args...]",
+        summary: "the credential inventory this configuration declares",
+        options: &[],
+        details:
+            "What credentials this project carries and what they are for — by name. Values are never\n\
+            read and sources are never resolved: an inventory that decrypted a sops file to print a\n\
+            name would be a way to make sbx decrypt on demand.\n\
+            \n\
+            Two kinds appear: the wire-injected ones (`[secret.\"host\"]`, brokered into a request by\n\
+            the egress proxy, so the value never enters the cage) and the ones a declared operation\n\
+            reads from its environment (`[task.<name>.secret]`).",
+    },
+    Page {
+        path: &["secret", "list"],
+        synopsis: "sbx secret list [-a|--app <name>] [--sources]",
+        summary: "the declared credentials, by name",
+        options: &[
+            (
+                "-a, --app <name>",
+                "fold that app's overlay, so the inventory is what `sbx app run <name>` would carry",
+            ),
+            (
+                "--sources",
+                "also show where each value would come from, by locator (a variable name, a file path)",
+            ),
+        ],
+        details:
+            "One line per credential: its name, where it goes (a destination host for a wire\n\
+            injection, the operation and variable for a task credential), and its description.\n\
+            \n\
+            Set `name` and `description` on a `[secret.\"host\"]` entry to make this listing legible —\n\
+            a credential with no name is listed under its destination host. A name is also what a\n\
+            substituted value is reported as (`${NAME}`) in a task's output, so keep names\n\
+            non-sensitive.",
+    },
+    Page {
+        path: &["task"],
+        synopsis: "sbx task <subcommand> [args...]",
+        summary: "list and invoke the declared operations a session offers",
+        options: &[],
+        details:
+            "A **declared operation** is a fixed command sbx runs on a caller's behalf, in an\n\
+            ephemeral sibling cage, with a credential the caller never holds — so an agent can use a\n\
+            token or a database password without the value ever entering its own cage. Declared as\n\
+            `[task.<name>]` in a trusted config, an app profile, or a bundle.\n\
+            \n\
+            The caller influences exactly two things: the declared `params` (each bounded by a\n\
+            `match` pattern or an `enum`) and the variable names in `env_allow`. The program, the\n\
+            environment, the credential and the ceilings are the declaration's.\n\
+            \n\
+            These verbs work both inside the cage (where the agent uses them) and on the host, so an\n\
+            operation is testable exactly as the agent sees it. `logs` is host-only: the invocation\n\
+            log lives on a socket the cage never reaches.\n\
+            \n\
+            A task's program must come from a tree no cage can write. Every host-side package backend\n\
+            (`nix:`, a remote `flake:`, `deb:`, `appimage:`, `tarball:`, `prebuilt:`) already is one.\n\
+            A `mise:` tool is not — it installs in-cage under a writable home — so a task declares it\n\
+            in its own `packages` and sbx fills a per-project pool host-side, mounted read-only.",
+    },
+    Page {
+        path: &["task", "list"],
+        synopsis: "sbx task list [<id>]",
+        summary: "the operations a session offers, with their parameters and ceilings",
+        options: &[(
+            "<id>",
+            "the PID of the session to ask; omit it when only one is offering operations",
+        )],
+        details:
+            "One line per operation: its name, its parameter names, whether each stream is shown or\n\
+            hidden, and its timeout. Inside the cage the session is implicit (a caller may only\n\
+            reach its own).\n\
+            \n\
+            A `missing-tools=` field marks a task whose declared `packages` are not in the tool pool.\n\
+            The pool is filled best-effort at launch, so that task will fail at exec — this is where\n\
+            it shows before you invoke it.",
+    },
+    Page {
+        path: &["task", "secrets"],
+        synopsis: "sbx task secrets [<id>]",
+        summary: "the credentials the operations carry — names and descriptions only",
+        options: &[("<id>", "the PID of the session to ask")],
+        details:
+            "Names, the operation each belongs to, the encoding it is rendered with, and its\n\
+            description. Never a value, and never a source locator: what a caller needs to know is\n\
+            which credentials an operation carries, not where they come from.\n\
+            \n\
+            A credential's name is what a substituted value is reported as (`${NAME}`) if it ever\n\
+            reaches the output — so keep names non-sensitive.",
+    },
+    Page {
+        path: &["task", "run"],
+        synopsis: "sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]",
+        summary: "invoke one declared operation",
+        options: &[
+            ("<name>", "the operation to run, as `sbx task list` shows it"),
+            (
+                "-p, --param KEY=VALUE",
+                "a declared parameter's value; repeatable. Refused unless it satisfies the declared bound",
+            ),
+            (
+                "-e, --env KEY=VALUE",
+                "a variable the declaration's `env_allow` permits; repeatable",
+            ),
+            ("--session <id>", "the session to run in (host-side, when several offer operations)"),
+        ],
+        details:
+            "The exit code is the command's own, so an operation composes in a script like the program\n\
+            it wraps; a *refusal* — an unknown operation, a value outside its bound, an unlisted\n\
+            variable, an exhausted quota — is exit **125** and never runs anything, so it stays\n\
+            distinguishable from the command having run and failed.\n\
+            \n\
+            stdout and stderr are returned only if the declaration shows them, and every credential\n\
+            value found in either is replaced by `${NAME}` first. That substitution is hygiene, not a\n\
+            boundary: it catches the dominant accident (a credential echoed into an error message)\n\
+            and cannot catch a value the command itself transformed. The count of substitutions is\n\
+            reported, and it is the trustworthy signal — a `${NAME}` in the text could have been\n\
+            printed by the command.",
+    },
+    Page {
+        path: &["task", "logs"],
+        synopsis: "sbx task logs [<id>]",
+        summary: "a session's invocation log (host-only)",
+        options: &[("<id>", "the PID of the session whose log to read")],
+        details:
+            "One line per invocation: when, which operation, the exit code, how many credential\n\
+            values were substituted out, whether the output was truncated or the timeout fired, and\n\
+            how long it took. A refusal is recorded too, with its reason.\n\
+            \n\
+            Neither the command nor any parameter value is recorded: the command is fixed by the\n\
+            declaration, and a value can carry a secret. The log is in-RAM, bounded, and dies with\n\
+            the session — and it is not readable from inside the cage, because the recorded party\n\
+            does not get to read the record.",
+    },
+    Page {
         path: &["plugins"],
         synopsis: "sbx plugins <subcommand> [args...]",
         summary: "inspect and manage resolver plugins and plugin stores",
@@ -913,7 +1048,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "mise",
-                "the mise engine, the project's nix: tools, and mise: packages",
+                "the mise engine, the project's nix: tools, mise: packages, and the task tool pool",
             ),
             ("flake", "the project's and apps' flake: packages"),
             ("deb", "the project's and apps' deb: packages"),

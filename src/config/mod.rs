@@ -20,6 +20,7 @@ pub(crate) mod overrides;
 pub(crate) mod safety;
 mod schema;
 mod secrets;
+mod tasks;
 mod types;
 pub(crate) mod view;
 
@@ -36,6 +37,10 @@ pub(crate) use schema::RawBundle;
 use load::{canonicalize_binds, global_path, read_global, sbx_control_plane_roots};
 // The secret source/validation machinery the resolution engine folds into the resolved set.
 use secrets::{apply_secret_section, count_host_secrets, upsert_secret, SecretDefaults};
+// The two leaf checks the task engine re-runs at invocation time: a caller's value against its
+// declared bound, and the `{param}` placeholders in one argv element. They live with the validator
+// so the check a task is accepted under and the check its invocation enforces cannot drift.
+pub(crate) use tasks::check_value;
 // Leaf secret validators the (cross-cutting) config unit tests exercise directly; the resolution
 // engine reaches them only through `apply_secret_section`.
 #[cfg(test)]
@@ -49,7 +54,8 @@ use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
 use schema::{
     NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawHostSecret, RawHostSecrets,
-    RawInlineFlake, RawResolve, RawSecretDefaults, SecretFrom,
+    RawInlineFlake, RawResolve, RawSecretDefaults, RawTask, RawTaskDefaults, RawTaskParam,
+    RawTaskSecret, RawTaskSection, SecretFrom,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -281,6 +287,12 @@ pub(crate) struct Resolved {
     /// the baseline posture would clear is still inheritable. The baseline launch/display use
     /// `secrets`; only the per-app fold reads this.
     pub(crate) declared_secrets: Vec<HeaderSecret>,
+    /// Declared operations a caller may invoke — each a fixed command sbx runs in an ephemeral
+    /// sibling cage with a credential the caller never holds. A security field, gated like
+    /// `secrets`: an untrusted project may neither declare a task nor loosen one. Unlike `secrets`
+    /// these are **not** cleared by the network posture — a task's egress is its own (served by a
+    /// per-invocation proxy), so it neither needs nor inherits the session's posture.
+    pub(crate) tasks: Vec<TaskSpec>,
     /// Named application launch profiles, each a gated overlay over this baseline. Keyed
     /// by name; `sbx app <name>` looks one up and folds it on with [`Resolved::merge_app`].
     /// `sbx run` ignore them.
@@ -364,6 +376,9 @@ pub(crate) struct ResolvedApp {
     pub(crate) forward: Vec<u16>,
     /// Credentials to inject for this app (gated; the plaintext never enters the cage).
     pub(crate) secrets: Vec<HeaderSecret>,
+    /// Declared operations this app contributes, unioned onto the baseline's at [`merge_app`] (the
+    /// app wins on a name collision). A security field, gated like the app's `secrets`.
+    pub(crate) tasks: Vec<TaskSpec>,
     /// The verbs this app's unscoped (`{...}`-less) allow rules default to — its read-by-default
     /// posture. Every Mode-B app defaults to `Only(["GET","HEAD"])`; an `[app.<name>.network]
     /// default_methods` override sets a different set (or `Any` for `["*"]`, all verbs). Applied to
@@ -481,6 +496,13 @@ impl Resolved {
             upsert_secret(&mut self.secrets, &mut self.warnings, "app overlay", secret);
         }
         enforce_secret_posture(&self.network, &mut self.secrets, &mut self.warnings);
+        // The app's tasks fold onto the baseline's by name — an app task shadows a baseline one of
+        // the same name (like env/packages/secrets) rather than offering two operations a caller
+        // cannot tell apart. No posture check: a task's egress is its own, served by its own
+        // per-invocation proxy, so the session's network posture neither enables nor clears it.
+        for task in app.tasks {
+            tasks::upsert_task(&mut self.tasks, &mut self.warnings, "app overlay", task);
+        }
     }
 
     /// Apply a one-shot override's **nixpkgs channel**, if it set one, as the authoritative pin for
@@ -564,8 +586,11 @@ impl Resolved {
             // inline
             // `[flakes]`, `[tarball]`, `[deb]`, and `[appimage]` tables are dropped (fail-closed): a
             // one-shot `--config` blob is no place for a multiline `flake.nix` or an auto-upgrade
-            // resolver command, so all are declared in a profile or project config.
+            // resolver command, so all are declared in a profile or project config. `[task]` joins
+            // them for the same reason: a declared operation is a program plus a credential, vetted
+            // where it is read and listed, not assembled on a command line for one launch.
             nixpkgs: _,
+            task: _,
             net: _,
             app: _,
             bundle: _,
@@ -1114,6 +1139,25 @@ fn resolve(
         );
     }
 
+    // Tasks are trusted by location at the global layer, like secrets. `[task.defaults]` is captured
+    // as the base a trusted project may override field by field.
+    let mut tasks: Vec<TaskSpec> = Vec::new();
+    let mut task_defaults = tasks::TaskDefaults::default();
+    if let Some(section) = global.task {
+        if let Some(raw_defaults) = &section.defaults {
+            task_defaults = task_defaults.merged_with(raw_defaults, GLOBAL_CONFIG, &mut warnings);
+        }
+        tasks::apply_task_section(
+            &mut tasks,
+            &mut warnings,
+            GLOBAL_CONFIG,
+            section,
+            &task_defaults,
+            &secret_defaults,
+            plugins,
+        );
+    }
+
     let mut nixpkgs_project = None;
     // The secret resolver defaults a PROJECT-LOCAL app resolves against: the global defaults, plus
     // a trusted project's own `[secret.defaults]` (captured below), so an app declared in the
@@ -1377,6 +1421,34 @@ fn resolve(
                 }
             }
         }
+        // The `[task]` section is a security field, and the strongest one a project could reach for:
+        // a task is a program sbx runs on a caller's behalf with a credential attached. A trusted
+        // project may declare tasks (and tighten or loosen the section ceilings); an untrusted or
+        // changed one may not — the whole section, defaults included, is dropped with one count
+        // warning.
+        if let Some(section) = proj.task {
+            if trusted {
+                if let Some(raw_defaults) = &section.defaults {
+                    task_defaults =
+                        task_defaults.merged_with(raw_defaults, PROJECT_CONFIG, &mut warnings);
+                }
+                tasks::apply_task_section(
+                    &mut tasks,
+                    &mut warnings,
+                    PROJECT_CONFIG,
+                    section,
+                    &task_defaults,
+                    &project_secret_defaults,
+                    plugins,
+                );
+            } else if !section.tasks.is_empty() {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring {} task(s) ({})",
+                    section.tasks.len(),
+                    untrusted_reason(state)
+                ));
+            }
+        }
     }
 
     // Capture the declared baseline credentials before the posture clear: an app overlay that
@@ -1392,6 +1464,7 @@ fn resolve(
         project_apps,
         &secret_defaults,
         &project_secret_defaults,
+        &task_defaults,
         &net_groups,
         &network,
         &proc,
@@ -1440,6 +1513,7 @@ fn resolve(
         devices_origin,
         secrets,
         declared_secrets,
+        tasks,
         apps,
         warnings,
     }
@@ -1837,6 +1911,7 @@ fn resolve_apps(
     project_apps: Option<(BTreeMap<String, RawApp>, TrustState)>,
     secret_defaults: &SecretDefaults,
     project_secret_defaults: &SecretDefaults,
+    task_defaults: &tasks::TaskDefaults,
     net_groups: &NetGroups,
     baseline_network: &NetworkPolicy,
     baseline_proc: &crate::proc_policy::ProcPolicy,
@@ -1868,6 +1943,7 @@ fn resolve_apps(
             project,
             secret_defaults,
             project_secret_defaults,
+            task_defaults,
             net_groups,
             baseline_network,
             baseline_proc,
@@ -1907,6 +1983,7 @@ fn resolve_app(
     project: Option<(RawApp, TrustState)>,
     secret_defaults: &SecretDefaults,
     project_secret_defaults: &SecretDefaults,
+    task_defaults: &tasks::TaskDefaults,
     net_groups: &NetGroups,
     baseline_network: &NetworkPolicy,
     baseline_proc: &crate::proc_policy::ProcPolicy,
@@ -1917,6 +1994,7 @@ fn resolve_app(
     let mut binds: Vec<Bind> = Vec::new();
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
+    let mut tasks: Vec<TaskSpec> = Vec::new();
     let mut network: Option<NetworkPolicy> = None;
     // Every Mode-B app reads by default ({GET,HEAD}); a trusted layer's `default_methods` overrides it.
     let mut default_methods = builtin_app_default_methods();
@@ -2055,6 +2133,20 @@ fn resolve_app(
                 &mut warnings,
                 &source,
                 section,
+                secret_defaults,
+                plugins,
+            );
+        }
+        // The app's tasks — trusted by location at this layer, like its secrets. The section
+        // ceilings come from the baseline's `[task.defaults]`; an app tunes a task's own `timeout`
+        // and `max_output` on the task itself.
+        if let Some(section) = app.task {
+            tasks::apply_task_section(
+                &mut tasks,
+                &mut warnings,
+                &source,
+                section,
+                task_defaults,
                 secret_defaults,
                 plugins,
             );
@@ -2302,6 +2394,28 @@ fn resolve_app(
                 }
             }
         }
+        // A project layer's tasks mirror its secrets: a trusted project may declare tasks on its own
+        // app or on a trusted one; an untrusted project may not — a task it could add would run a
+        // program of its choosing with a credential attached.
+        if let Some(section) = app.task {
+            if trusted {
+                tasks::apply_task_section(
+                    &mut tasks,
+                    &mut warnings,
+                    &source,
+                    section,
+                    task_defaults,
+                    project_secret_defaults,
+                    plugins,
+                );
+            } else if !section.tasks.is_empty() {
+                warnings.push(format!(
+                    "{source}: ignoring {} task(s) ({})",
+                    section.tasks.len(),
+                    untrusted_reason(state)
+                ));
+            }
+        }
         if let Some(c) = app.cmd {
             if trusted || !cmd_trusted {
                 cmd = c.into_argv();
@@ -2348,6 +2462,7 @@ fn resolve_app(
         devices,
         forward,
         secrets,
+        tasks,
         default_methods,
         cmd_origin,
         network_origin,

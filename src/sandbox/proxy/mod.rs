@@ -4239,7 +4239,10 @@ mod tests {
             ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
                 .unwrap()
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
-                .with_redactions(vec![SecretNeedle::new(b"s3cret-reflected-value".to_vec())]),
+                .with_redactions(vec![SecretNeedle::named(
+                    "test-secret",
+                    b"s3cret-reflected-value".to_vec(),
+                )]),
         );
         let resp = through_cleartext(
             ctx,
@@ -4630,7 +4633,10 @@ mod tests {
             ProxyCtx::new(ca, policy(&["host.test:*"]))
                 .unwrap()
                 .with_log(log.clone())
-                .with_redactions(vec![SecretNeedle::new(b"s3cret-token-value".to_vec())])
+                .with_redactions(vec![SecretNeedle::named(
+                    "test-secret",
+                    b"s3cret-token-value".to_vec(),
+                )])
                 .with_resolver(Box::new(|_| {
                     panic!("resolve must not run on a secret leak")
                 })),
@@ -6163,7 +6169,7 @@ mod tests {
 
     #[test]
     fn secret_needle_debug_is_redacted() {
-        let n = SecretNeedle::new(b"topsecretvalue".to_vec());
+        let n = SecretNeedle::named("test-secret", b"topsecretvalue".to_vec());
         let d = format!("{n:?}");
         assert!(
             !d.contains("topsecretvalue"),
@@ -6186,7 +6192,7 @@ mod tests {
                 .with_redactions(
                     needles
                         .iter()
-                        .map(|n| SecretNeedle::new(n.as_bytes().to_vec()))
+                        .map(|n| SecretNeedle::named("test-secret", n.as_bytes().to_vec()))
                         .collect(),
                 ),
         );
@@ -6440,7 +6446,10 @@ mod tests {
                     .unwrap()
                     .with_stats(s.clone())
                     .with_log(log.clone())
-                    .with_redactions(vec![SecretNeedle::new(b"s3cret-reflected-value".to_vec())])
+                    .with_redactions(vec![SecretNeedle::named(
+                        "test-secret",
+                        b"s3cret-reflected-value".to_vec(),
+                    )])
                     .with_resolver(Box::new(|_| {
                         panic!("resolve must not run on a secret leak")
                     })),
@@ -6557,7 +6566,7 @@ mod tests {
                 .with_redactions(
                     needles
                         .iter()
-                        .map(|n| SecretNeedle::new(n.as_bytes().to_vec()))
+                        .map(|n| SecretNeedle::named("test-secret", n.as_bytes().to_vec()))
                         .collect(),
                 ),
         );
@@ -6681,7 +6690,7 @@ mod tests {
                 .with_redactions(
                     needles
                         .iter()
-                        .map(|n| SecretNeedle::new(n.as_bytes().to_vec()))
+                        .map(|n| SecretNeedle::named("test-secret", n.as_bytes().to_vec()))
                         .collect(),
                 ),
         );
@@ -6777,8 +6786,8 @@ mod tests {
     #[test]
     fn redact_in_place_masks_every_occurrence_at_equal_length() {
         let needles = vec![
-            SecretNeedle::new(b"AAA".to_vec()),
-            SecretNeedle::new(b"BB".to_vec()),
+            SecretNeedle::named("test-secret", b"AAA".to_vec()),
+            SecretNeedle::named("test-secret", b"BB".to_vec()),
         ];
         let mut buf = b"AAA-mid-AAA-BB".to_vec();
         let before = buf.len();
@@ -6793,8 +6802,8 @@ mod tests {
     #[test]
     fn redact_in_place_ignores_an_overlong_or_empty_needle() {
         let needles = vec![
-            SecretNeedle::new(b"WAYTOOLONG".to_vec()),
-            SecretNeedle::new(Vec::new()),
+            SecretNeedle::named("test-secret", b"WAYTOOLONG".to_vec()),
+            SecretNeedle::named("test-secret", Vec::new()),
         ];
         let mut buf = b"short".to_vec();
         redact_in_place(&mut buf, &needles);
@@ -6803,7 +6812,7 @@ mod tests {
 
     #[test]
     fn pump_redacting_masks_a_match_straddling_read_boundaries() {
-        let needles = vec![SecretNeedle::new(b"SECRET".to_vec())];
+        let needles = vec![SecretNeedle::named("test-secret", b"SECRET".to_vec())];
         // one byte per read forces the 6-byte needle to span six separate reads
         let mut r = ChunkReader {
             data: b"xxSECRETyy".to_vec(),
@@ -6820,7 +6829,7 @@ mod tests {
 
     #[test]
     fn pump_redacting_passes_clean_bytes_through_unchanged() {
-        let needles = vec![SecretNeedle::new(b"SECRET".to_vec())];
+        let needles = vec![SecretNeedle::named("test-secret", b"SECRET".to_vec())];
         let mut r = ChunkReader {
             data: b"nothing to see here".to_vec(),
             pos: 0,

@@ -46,6 +46,8 @@ type = "raw"
 
 | Field | Meaning |
 |---|---|
+| `name` | a logical name for the inventory, defaulting to the section key (the destination host) |
+| `description` | one line saying what the credential is for, printed beside the name |
 | `kind` | the broker kind; defaults to the only kind today, `"http-header"` |
 | `key` | a **terse** source name, expanded through `[secret.defaults]` (optionally pinned `key@resolver`) |
 | `from` | an **explicit** source: one `scheme://locator` ref, or an array = a fallback chain |
@@ -56,6 +58,17 @@ type = "raw"
 A secret must have **exactly one** of `key` or `from`. It must have a `header` and a
 `type`, either on itself or from `[secret.defaults]` — a secret that names neither is
 an **explicit error**, never a silent (and likely wrong) default.
+
+`name` and `description` are what [`sbx secret list`](../cli/secret.md) prints, and the name matters
+for more than tidiness: it is what a substituted value is reported as (`${NAME}`) if a credential ever
+reaches a [task's](task.md) output. Two credentials sharing a name are both kept but warned about — a
+reader could not tell which one was withheld. Keep a name non-sensitive: it is a label, and it is
+shown to the caller. Its character set is narrow (letters, digits, `_`, `-`, `.`) precisely because it
+is rendered into output.
+
+For a credential a *declared operation* reads from its environment, see
+[`[task.<name>.secret]`](task.md#credentials): there the key **is** the variable, so the reported name
+is the variable's own.
 
 ## `[secret.defaults]`
 

@@ -65,7 +65,19 @@ pub(super) fn upsert_secret(
             ));
             *slot = secret;
         }
-        None => out.push(secret),
+        None => {
+            // Two credentials under one name are legal (the name is a label, not a key) but
+            // ambiguous where the name is *rendered*: a redacted value prints `${name}`, so the
+            // reader could not tell which credential was withheld. Warn, naming both targets.
+            if let Some(clash) = out.iter().find(|s| s.name == secret.name) {
+                warnings.push(format!(
+                    "{source}: two secrets share the name `{}` ({} and {}) — a redacted value \
+                     names only the name, so give them distinct ones",
+                    secret.name, clash.to, secret.to
+                ));
+            }
+            out.push(secret);
+        }
     }
 }
 
@@ -100,12 +112,66 @@ pub(super) fn validate_host_secret(
     validate_header_name(header)?;
     let value_type = raw.value_type.as_deref().or(defaults.value_type.as_deref());
     let shape = validate_header_shape(value_type, raw.prefix.as_deref())?;
+    let name = match raw.name.as_deref() {
+        Some(n) => validate_secret_name(n)?.to_string(),
+        None => host.to_string(),
+    };
     Ok(HeaderSecret {
+        name,
+        description: raw.description.as_deref().map(sanitize_description),
         sources,
         to,
         header: header.to_string(),
         shape,
     })
+}
+
+/// The longest description kept, in characters — a label for one terminal line, not a document.
+const DESCRIPTION_MAX: usize = 200;
+
+/// The longest logical name accepted, in characters.
+const NAME_MAX: usize = 64;
+
+/// Validate a secret's logical name: a short label of letters, digits, `_`, `-`, or `.`. The
+/// character set is deliberately narrow because the name is *rendered into output* — a redacted
+/// value is replaced by `${<name>}` — so a name carrying `}`, a newline, or an escape sequence
+/// could forge a placeholder or a terminal control sequence in text a human then reads.
+pub(super) fn validate_secret_name(name: &str) -> Result<&str, String> {
+    if name.is_empty() {
+        return Err("`name` is empty — omit it to default to the host".to_string());
+    }
+    if name.chars().count() > NAME_MAX {
+        return Err(format!("`name` is longer than {NAME_MAX} characters"));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    {
+        return Err(format!(
+            "`name` contains `{bad}` — use letters, digits, `_`, `-`, or `.` \
+             (the name is rendered into output as `${{name}}`)"
+        ));
+    }
+    Ok(name)
+}
+
+/// Reduce a free-text description to one safe display line: control characters (a newline, an
+/// escape that could drive a terminal) become spaces, runs of whitespace collapse, and the result
+/// is truncated. Never rejects — a description is a label, so a sloppy one is cleaned rather than
+/// dropping the credential it documents.
+pub(super) fn sanitize_description(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out = String::with_capacity(cleaned.len());
+    for word in cleaned.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out.chars().take(DESCRIPTION_MAX).collect()
 }
 
 /// The resolver chain for a host secret: either the explicit `from` (a single `scheme://locator`
@@ -214,7 +280,10 @@ impl SecretDefaults {
 /// never carry a path separator into the `file`/`sops` locator), each resolver builds a
 /// `scheme://locator` ref, and the existing [`parse_secret_ref`] validates it — one validation
 /// path for terse and explicit sources alike. A missing binding or an empty order fails closed.
-fn expand_key(spec: &str, defaults: &SecretDefaults) -> Result<Vec<SecretSource>, String> {
+pub(super) fn expand_key(
+    spec: &str,
+    defaults: &SecretDefaults,
+) -> Result<Vec<SecretSource>, String> {
     let (name, resolvers) = match spec.rsplit_once('@') {
         Some((name, pin)) => {
             let list: Vec<String> = pin.split(',').map(|r| r.trim().to_string()).collect();
@@ -323,7 +392,10 @@ fn validate_terse_key(key: &str) -> Result<(), String> {
 /// built-in schemes are `env`, `file`, and `sops`; any other scheme must be claimed by an
 /// installed resolver plugin, else it is an error. A bare token with no `://` is an error too
 /// (fail-closed: never a silent mis-read as a path or a variable).
-fn parse_secret_ref(reff: &str, plugins: &PluginRegistry) -> Result<SecretSource, String> {
+pub(super) fn parse_secret_ref(
+    reff: &str,
+    plugins: &PluginRegistry,
+) -> Result<SecretSource, String> {
     let Some((scheme, locator)) = reff.split_once("://") else {
         return Err(format!(
             "a secret source needs a scheme, e.g. `env://VAR` or `file:///abs/path` (`{reff}`)"

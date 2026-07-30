@@ -150,6 +150,12 @@ pub(crate) struct RawConfig {
     /// and only effective under a network allowlist — the filtering proxy is what performs
     /// the injection, so the plaintext never enters the cage.
     pub(crate) secret: Option<RawSecretSection>,
+    /// Declared operations, the `[task]` section: named fixed commands sbx runs in an ephemeral
+    /// sibling cage with a credential the caller never holds. A security field — honored from the
+    /// global config or a trusted project, ignored from an untrusted one: a task is a program sbx
+    /// runs on a caller's behalf with a credential attached, which an untrusted project may neither
+    /// declare nor loosen.
+    pub(crate) task: Option<RawTaskSection>,
     /// Named application launch profiles, declared as `[app.<name>]` tables. Each is an
     /// overlay over the sandbox baseline — a command to run plus the extra tools,
     /// environment, binds, network posture, and credentials that app needs. The overlay's
@@ -236,6 +242,11 @@ pub(crate) struct RawBundle {
     /// app's `[secret]` section — effective only under a network allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) secret: Option<RawSecretSection>,
+    /// Declared operations this bundle contributes, `[bundle.<name>.task.<task>]`. Folded into any
+    /// app that names the bundle in `use`, like its packages and credentials — a tool that ships a
+    /// brokered operation carries it with the rest of what it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task: Option<RawTaskSection>,
     /// Inline nix flakes this bundle's packages refer to, `[bundle.<name>.flakes.<tool>]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
@@ -455,6 +466,9 @@ pub(crate) struct RawApp {
     /// Credentials the egress proxy injects for this app. A security field, effective only
     /// under a network allowlist, like the baseline `[secret]` section.
     pub(crate) secret: Option<RawSecretSection>,
+    /// The app's declared operations, `[app.<name>.task.<task>]`, unioned onto the baseline's (the
+    /// app wins on a name collision). A security field, gated like the baseline `[task]` section.
+    pub(crate) task: Option<RawTaskSection>,
     /// The app's cgroup resource limits, overriding the baseline's per field. A security field,
     /// gated like the baseline `[limits]` (loosening them weakens the anti-DoS control), so an
     /// untrusted project's app `[limits]` is dropped whole. An unset `Option` is omitted on
@@ -570,6 +584,14 @@ pub(crate) enum RawHostSecrets {
 /// resolver ref/chain — exactly one of the two. `header`/`type`/`prefix` shape what is set.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawHostSecret {
+    /// A logical name for this credential, for the inventory `sbx secret list` prints. Optional,
+    /// defaulting to the section key (the destination host) — several credentials to one host are
+    /// what make it worth setting. It is a label, never a source: naming a secret does not select
+    /// it, so a duplicate name is a warning, not a resolution rule.
+    pub(crate) name: Option<String>,
+    /// A one-line description of what this credential is for, printed beside the name. Free text,
+    /// stripped of control characters and length-capped at validation.
+    pub(crate) description: Option<String>,
     /// The broker kind; optional, defaulting to the only kind today, `"http-header"`.
     pub(crate) kind: Option<String>,
     /// The terse source: a key name resolved through the default resolver order, optionally
@@ -639,6 +661,165 @@ pub(crate) struct RawEnvDefaults {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawFileDefaults {
     pub(crate) dir: String,
+}
+
+/// The `[task]` section: a reserved `defaults` table plus one entry per named task. Mirrors
+/// [`RawSecretSection`]'s shape, and for the same reason — the per-section settings live in an
+/// explicit `[task.defaults]` sub-table rather than as bare keys beside the entries, so a setting
+/// can never be swallowed by whichever entry table happens to precede it in the file.
+///
+/// A task can therefore not be named `defaults`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawTaskSection {
+    /// Section-wide defaults an entry may override (`timeout`, `max_output`).
+    pub(crate) defaults: Option<RawTaskDefaults>,
+    /// One entry per task name. The reserved `defaults` key is consumed above.
+    #[serde(flatten)]
+    pub(crate) tasks: BTreeMap<String, RawTask>,
+}
+
+/// Section-wide task settings, declared once under `[task.defaults]`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawTaskDefaults {
+    /// The wall-clock ceiling for a task that sets none, as a duration (`"30s"`, `"2m"`).
+    pub(crate) timeout: Option<String>,
+    /// The captured-output ceiling for a task that sets none (`"64KiB"`).
+    pub(crate) max_output: Option<String>,
+    /// Whether a substituted credential is named with a per-invocation nonce (`${NAME@a91f3c}`)
+    /// instead of the plain `${NAME}`. Off by default, because the plain form is what a reader
+    /// expects; on, a placeholder in *this* output cannot have been forged by the command (it could
+    /// not predict the nonce), and one copied from an earlier result is detectably stale.
+    pub(crate) nonce: Option<bool>,
+}
+
+/// A `[task.<name>]` table: one **declared operation** — a fixed command sbx runs in an ephemeral
+/// sibling cage with a credential the caller never holds, returning the exit status and whichever
+/// of stdout/stderr the declaration permits.
+///
+/// The security property is that **sbx fixes the program**: `cmd` is an argv list (never a shell
+/// string), its first element resolves host-side against a tree the cage cannot write, and the only
+/// caller-supplied values are the declared `params`, each bounded by a pattern or an enum. A whole
+/// section is a security field — honored from the global config or a trusted project, never from an
+/// untrusted one, which may neither declare a task nor loosen one.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawTask {
+    /// A one-line description of the operation, listed to the caller. This is the task's
+    /// user-facing documentation: an agent picks a task by it.
+    pub(crate) description: Option<String>,
+    /// The command, as an argv list. Never a shell string — `;`, `&&` and friends carry no meaning
+    /// in an `execve` argv, so what bounds the command is this list, the resolved program, and the
+    /// `params` bounds, not a metacharacter filter. A `{param}` placeholder substitutes **inside**
+    /// the element that contains it and never splits into extra elements.
+    #[serde(default)]
+    pub(crate) cmd: Vec<String>,
+    /// The caller-supplied values `cmd` may interpolate, each declared with its bounds: the terse
+    /// form is the pattern itself (`sql = "^SELECT .*$"`), the table form adds `enum` and
+    /// `default`. A parameter with no `default` is required; an undeclared placeholder or a missing
+    /// value is a hard error, never an empty substitution.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) params: BTreeMap<String, RawTaskParam>,
+    /// The credentials the command reads from its environment, keyed by **variable name** — so the
+    /// name a redacted value is reported under is the name the declaration already gives it. The
+    /// value is a resolver ref (`sops://f#k`, `env://VAR`, `file:///p`, a plugin scheme) or a terse
+    /// key expanded through `[secret.defaults]`; the table form adds `encode`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) secret: BTreeMap<String, RawTaskSecret>,
+    /// Credentials injected **on the wire** by this task's own proxy instead of into its
+    /// environment, keyed by destination host exactly like the top-level `[secret]` table. The
+    /// strongest form available: the plaintext never enters the task cage at all, so the command
+    /// runs knowing nothing. Requires the task to declare `network` reaching that host.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) inject: BTreeMap<String, RawHostSecrets>,
+    /// Fixed environment for the command, from the declaration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+    /// The variable **names** a caller may set for one invocation. An allowlist of names, never a
+    /// free map: an unlisted name is refused. It cannot reuse the `[env]` reserved-key denylist,
+    /// which is untrusted-*config*-only (a trusted config harms only itself) — a caller reaching in
+    /// over the control socket is a different actor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) env_allow: Vec<String>,
+    /// Whether the caller receives stdout: `"show"` (the default) or `"hide"`. Substitution of
+    /// secret values is unconditional and independent of this — `hide` withholds the stream, it is
+    /// not what protects the credential.
+    pub(crate) stdout: Option<String>,
+    /// Whether the caller receives stderr: `"show"` (the default) or `"hide"`.
+    pub(crate) stderr: Option<String>,
+    /// This task's wall-clock ceiling, overriding `[task.defaults] timeout`.
+    pub(crate) timeout: Option<String>,
+    /// This task's captured-output ceiling, overriding `[task.defaults] max_output`.
+    pub(crate) max_output: Option<String>,
+    /// Exec targets the command may run, as the shell-style globs the process policy already
+    /// speaks (`*`/`?`; a rule containing `/` matches the whole path, one without matches the
+    /// basename). Empty means only the resolved `cmd[0]` itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allow: Vec<String>,
+    /// Exec targets the command may never run. `deny` wins over `allow`, as everywhere else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) deny: Vec<String>,
+    /// The egress this task's cage gets, as allowlist entries. Empty (the default) means an empty
+    /// network namespace with no proxy at all. A task's rules are its own: they are served by a
+    /// per-invocation proxy, never by the session's, so a task credential is unreachable from the
+    /// agent's lane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) network: Vec<String>,
+    /// The `mise:` tools this task's command needs, installed host-side into the project's task
+    /// pool and bound **read-only** into the task cage. Only the `mise:` prefix is accepted: every
+    /// other backend already builds host-side into the shared store, which a task cage mounts
+    /// read-only, so its binaries are on a task's path with nothing to declare here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) packages: Vec<String>,
+}
+
+/// The two shapes a task parameter accepts: the terse pattern string, or a table adding `enum` and
+/// `default`. An untagged enum so both TOML forms parse.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawTaskParam {
+    /// `sql = "^SELECT [A-Za-z ]+$"` — the pattern the value must match, anchored by the author.
+    Pattern(String),
+    /// `sql = { match = "...", default = "...", enum = ["a", "b"] }`.
+    Table(RawTaskParamTable),
+}
+
+/// The table form of a task parameter: at most one of `match`/`enum` bounds the value, and
+/// `default` makes it optional.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawTaskParamTable {
+    /// A regular expression the whole value must match.
+    #[serde(rename = "match")]
+    pub(crate) pattern: Option<String>,
+    /// The exact set of accepted values.
+    #[serde(rename = "enum", default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) choices: Vec<String>,
+    /// The value used when the caller supplies none, which also makes the parameter optional.
+    pub(crate) default: Option<String>,
+}
+
+/// The two shapes a task credential accepts: the terse resolver ref (or terse key), or a table
+/// adding `encode` and a description. An untagged enum so both TOML forms parse.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawTaskSecret {
+    /// `PGPASSWORD = "sops://secrets.enc.yaml#db.password"`.
+    Ref(String),
+    /// `PGPASSWORD = { from = "...", encode = "base64" }`.
+    Table(RawTaskSecretTable),
+}
+
+/// The table form of a task credential.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawTaskSecretTable {
+    /// A terse key expanded through `[secret.defaults]`, optionally pinned `key@resolver`.
+    pub(crate) key: Option<String>,
+    /// An explicit resolver ref, or a fallback chain tried in order.
+    pub(crate) from: Option<SecretFrom>,
+    /// How the resolved value is rendered into the variable: `raw` (the default), `base64`, `url`,
+    /// or `json-string`. Every encoding registers its rendered form for substitution, so a value
+    /// cannot reach a text sink in a spelling the redactor does not know.
+    pub(crate) encode: Option<String>,
+    /// A one-line description of the credential, for the inventory.
+    pub(crate) description: Option<String>,
 }
 
 /// The two shapes a secret's `from` accepts: a single resolver ref string, or a list of refs

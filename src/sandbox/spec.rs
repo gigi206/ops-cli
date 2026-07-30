@@ -219,6 +219,23 @@ impl SandboxSpec {
         self
     }
 
+    /// This cage's filesystem exposure, for deriving a **sibling** cage from it (the task engine
+    /// filters it down to the structural skeleton). Read-only: a derived cage is built by
+    /// constructing a new spec, never by mutating this one.
+    pub(crate) fn mounts(&self) -> &[Mount] {
+        &self.mounts
+    }
+
+    /// This cage's environment, for the same derivation.
+    pub(crate) fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+
+    /// This cage's readable slug, for naming a derived cage's cgroup scope.
+    pub(crate) fn cage_slug(&self) -> &str {
+        &self.cage_slug
+    }
+
     /// Switch to a private-pty terminal (see [`TerminalPolicy::PrivateTty`]).
     /// The caller **must** then launch through the pty supervisor; otherwise the
     /// sandbox would inherit the launching terminal. An interactive `sbx run`

@@ -713,7 +713,7 @@ mod tests {
         // — exercised by neither the live nor the committed e2e (grpcb.in echoes into the body),
         // so pin it here: a masked value keeps its length (equal-length `*`) and a header with no
         // secret is untouched.
-        let needles = vec![SecretNeedle::new(b"topsecret".to_vec())];
+        let needles = vec![SecretNeedle::named("test-secret", b"topsecret".to_vec())];
         let mut headers = http::HeaderMap::new();
         headers.insert("x-echo", "before-topsecret-after".parse().unwrap());
         headers.insert("x-clean", "nothing to see".parse().unwrap());

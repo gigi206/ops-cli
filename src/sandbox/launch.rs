@@ -1008,15 +1008,30 @@ pub(crate) fn upgrade_mise_packages(
             )
         );
     }
-    if groups.is_empty() {
+    // The declared operations' own tool pool rolls here too: it is filled by `mise use -g`, which
+    // records a spec the launch then short-circuits on, so without this pass a pool tool would be
+    // frozen at whatever the first fill resolved.
+    let pool_tokens: Vec<String> = cfg
+        .tasks
+        .iter()
+        .flat_map(|t| t.packages.iter().cloned())
+        .fold(Vec::new(), |mut acc, t| {
+            if !acc.contains(&t) {
+                acc.push(t);
+            }
+            acc
+        });
+
+    if groups.is_empty() && pool_tokens.is_empty() {
         if withheld == 0 {
             println!("  {dim}no mise: packages to roll.{r}");
         }
         return true;
     }
 
-    // Only now, with groups to roll, take on the sandbox prerequisites — against `cwd`, the project
-    // being upgraded, so `--project` builds the roll cage in that project's store and home rather
+    // Only now, with something to roll, take on the sandbox prerequisites — against `cwd`, the
+    // project being upgraded, so `--project` builds the roll cage in that project's store and home
+    // rather
     // than wherever the command was invoked.
     let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none()) {
         Ok(p) => p,
@@ -1161,8 +1176,45 @@ pub(crate) fn upgrade_mise_packages(
         }
     }
 
-    // Close with the one line that answers "which apps changed?": the rolled apps by name, plus a
-    // tally of the rest — coloured by outcome (a failure paints it a warning, a clean no-op dims).
+    // The task tool pool, rolled host-side rather than in a cage (that is where it is filled). Its
+    // own line, because it belongs to the declared operations, not to any app.
+    if !pool_tokens.is_empty() {
+        // Counted into the same tallies the apps use, so the closing recap can never read
+        // "nothing to roll" one line under a pool that rolled.
+        match roll_task_pool(cwd, &mut prep, cfg) {
+            Ok(true) => {
+                println!(
+                    "{}",
+                    roll_line("task pool", width.max(9), &format!("{ok_c}rolled{r}"), pal)
+                );
+                rolled.push("task pool".to_string());
+            }
+            Ok(false) => {
+                println!(
+                    "{}",
+                    roll_line(
+                        "task pool",
+                        width.max(9),
+                        &format!("{dim}nothing to roll{r}"),
+                        pal
+                    )
+                );
+                up_to_date += 1;
+            }
+            Err(e) => {
+                println!(
+                    "{}",
+                    roll_line("task pool", width.max(9), &format!("{warn}{e}{r}"), pal)
+                );
+                failed += 1;
+                ok = false;
+            }
+        }
+    }
+
+    // Close with the one line that answers "what changed?": each rolled app — and the task tool
+    // pool, when it rolled — by name, plus a tally of the rest, coloured by outcome (a failure
+    // paints it a warning, a clean no-op dims).
     let recap = mise_roll_recap(&rolled, up_to_date, skipped, failed);
     let hue = if failed > 0 {
         warn
@@ -1173,6 +1225,63 @@ pub(crate) fn upgrade_mise_packages(
     };
     println!("  {hue}{recap}{r}");
     ok
+}
+
+/// Roll the declared operations' tool pool forward. Returns whether anything was rolled, or the
+/// reason it could not run.
+///
+/// The pool is filled and rolled **host-side**, so unlike an app's `mise:` packages this needs no
+/// launch — only a spec to derive the task cage's skeleton from, which is what a pool tool runs
+/// against. The spec is built for a command that never executes: `build` is the one place that
+/// assembles the cage, and reproducing it here would be a second implementation of the thing whose
+/// whole point is to be the same.
+fn roll_task_pool(
+    cwd: &Path,
+    prep: &mut Prepared,
+    cfg: &crate::config::Resolved,
+) -> Result<bool, String> {
+    let id = super::binds::project_runtime_id(cwd).map_err(|e| format!("no project tree ({e})"))?;
+    // The per-app loop above leaves `prep.cfg` on whichever app it rolled last. The pool belongs to
+    // the project's declared operations, not to any app, so restore the baseline before deriving a
+    // cage from it.
+    prep.cfg = cfg.clone();
+    let (spec, guard) = build(
+        prep,
+        binds::Runtime::ProjectDefault,
+        vec![OsString::from("/bin/true")],
+    )
+    .map_err(|_| "cannot assemble a cage".to_string())?;
+    let engine = super::task::TaskEngine::from_cage(
+        &prep.bwrap,
+        &spec,
+        &prep.layout,
+        cwd,
+        cwd,
+        cfg.tasks.clone(),
+        cfg.limits.clone(),
+        spec.cage_slug(),
+        Some(prep.userland.ca_bundle_src.as_path()),
+    )
+    .with_pool(
+        super::taskpool::pool_dir(prep.layout.data_dir(), &id),
+        prep.userland.mise_bin.clone(),
+    );
+    let outcome = engine.upgrade_pool().map_err(|e| e.to_string());
+    // Dropped only now: the guard holds the launch's runtime files, and the roll runs against the
+    // spec derived from them.
+    drop(guard);
+    match outcome? {
+        None => Ok(false),
+        Some(run) if run.ok => Ok(true),
+        Some(run) => Err(format!(
+            "mise upgrade failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("no output")
+        )),
+    }
 }
 
 /// `sbx gc [--all] [--prune]`: reclaim sbx's store space.
@@ -3324,6 +3433,11 @@ pub(crate) struct LaunchGuard {
     /// its presence forces the supervised path (a live parent). Dropping it stops the supervisor and
     /// unlinks the handoff socket.
     pub(crate) proc_enforce: Option<super::proc_enforce::ProcEnforce>,
+    /// The task control plane (`[task.*]` declared), when one is serving. Its two listeners are host
+    /// threads — one reachable from the cage to invoke a task, one host-only carrying the invocation
+    /// log — so it must outlive the cage; its presence forces the supervised path (a live parent, and
+    /// an exec-replaced launch would leave nobody serving). Dropping it removes both sockets.
+    pub(crate) task: Option<super::task_control::TaskPlane>,
 }
 
 impl LaunchGuard {
@@ -3362,6 +3476,11 @@ impl Drop for LaunchGuard {
         }
         if let Some(proc_enforce) = self.proc_enforce.take() {
             drop(proc_enforce);
+        }
+        // Last: the task plane's Drop unlinks both sockets, and an invocation may still have been
+        // running when the cage ended.
+        if let Some(task) = self.task.take() {
+            drop(task);
         }
     }
 }
@@ -4317,10 +4436,46 @@ fn build(
         }
     }
 
+    // Declared operations: when this session has any, the task control socket crosses into the cage
+    // and sbx's own binary is bound read-only beside it, so an in-cage caller can list and invoke a
+    // task. The socket path is derived here (before the spec) and the plane is started below (before
+    // the launch), so bwrap finds the socket present. This is the ONE control plane that crosses —
+    // its surface is three commands, and the invocation log lives on a second, host-only socket that
+    // the recorded party cannot read.
+    let mut task_env: Vec<(String, String)> = Vec::new();
+    let task_socket = (!prep.cfg.tasks.is_empty()).then(|| {
+        let path = super::task_control::task_dir(prep.layout.data_dir(), std::process::id())
+            .join("control.sock");
+        extra_binds.push(binds::ExtraBind {
+            src: path.clone(),
+            // Writable so a connect is never refused on a permission subtlety; the *file* is bound,
+            // never its directory, so in-cage code cannot unlink it and serve its own listener at
+            // the same path.
+            dest: PathBuf::from(super::task_control::CAGE_TASK_UDS),
+            writable: true,
+        });
+        task_env.push((
+            super::task_control::TASK_SOCKET_ENV.to_string(),
+            super::task_control::CAGE_TASK_UDS.to_string(),
+        ));
+        if let Ok(exe) = std::env::current_exe() {
+            extra_binds.push(binds::ExtraBind {
+                src: exe,
+                dest: PathBuf::from(super::task_control::TASK_SHIM_INCAGE),
+                writable: false,
+            });
+            task_env.push((
+                "SBX_TASK_CLI".to_string(),
+                super::task_control::TASK_SHIM_INCAGE.to_string(),
+            ));
+        }
+        path
+    });
+
     // Environment, lowest precedence first: host passthrough, then sbx's hermetic CA bundle, then
     // the Wayland GUI keys, then the non-nix auto-equip variable, then a trusted project's mise
-    // `[env]`, then the egress machinery (proxy + CA), then the `.sbx.toml` `[env]` (the sbx-native
-    // config has the final say). The structural
+    // `[env]`, then the egress machinery (proxy + CA), then the task plane's discovery handles, then
+    // the `.sbx.toml` `[env]` (the sbx-native config has the final say). The structural
     // HOME/PATH/... are added by the assembler, which upserts all of these over them. An
     // untrusted config has already lost its reserved keys upstream — including the proxy and
     // CA keys — so it can neither redirect the egress nor swap the CA; a trusted config
@@ -4332,6 +4487,7 @@ fn build(
         autoequip_env,
         mise_env(prep)?,
         egress_env,
+        task_env,
         &prep.cfg.env,
     );
 
@@ -4404,10 +4560,65 @@ fn build(
     } else {
         spec
     };
+    // Stand the task plane up now: the spec is final (so a task cage can be derived from it) and the
+    // launch has not happened yet (so bwrap finds the bound socket present). A failure here aborts
+    // the launch rather than running a cage whose declared operations silently do not exist — the
+    // agent would keep trying and never learn why.
+    let task_plane = match &task_socket {
+        None => None,
+        Some(_) => {
+            let engine = super::task::TaskEngine::from_cage(
+                &prep.bwrap,
+                &spec,
+                &prep.layout,
+                &prep.cwd,
+                // A relative `sops://` file resolves against the config's directory, exactly as it
+                // does for a wire injection.
+                &prep.cwd,
+                prep.cfg.tasks.clone(),
+                prep.cfg.limits.clone(),
+                spec.cage_slug(),
+                Some(prep.userland.ca_bundle_src.as_path()),
+            );
+            // The task tool pool, when any task declares a `mise:` tool. Filled host-side now — a
+            // cold fill is minutes long, so it belongs at launch where the user is watching, not
+            // inside the first invocation. Best-effort, unlike the `nix:` package path: a pool tool
+            // that will not install is one task's problem, and aborting the whole session over it
+            // would take the agent down with it. The task then fails naming the missing tool, and
+            // `sbx task list` flags it before it is ever invoked.
+            let engine = match super::binds::project_runtime_id(&prep.cwd) {
+                Ok(id) => engine.with_pool(
+                    super::taskpool::pool_dir(prep.layout.data_dir(), &id),
+                    prep.userland.mise_bin.clone(),
+                ),
+                Err(e) => {
+                    if prep.cfg.tasks.iter().any(|t| !t.packages.is_empty()) {
+                        crate::diag::warn(&format!(
+                            "the task tool pool has no home for this project ({e}) — tasks \
+                             declaring `packages` will not find their tools"
+                        ));
+                    }
+                    engine
+                }
+            };
+            if let Err(e) = engine.ensure_pool() {
+                crate::diag::warn(&format!("the task tool pool could not be prepared: {e}"));
+            }
+            match super::task_control::start(prep.layout.data_dir(), std::process::id(), engine) {
+                Ok(plane) => Some(plane),
+                Err(e) => {
+                    eprintln!("sbx: cannot start the task control plane: {e}");
+                    return Err(ExitCode::FAILURE);
+                }
+            }
+        }
+    };
+
     let guard = if egress_guard.is_some()
         || forward_guard.is_some()
         || portal_host.is_some()
         || proc_enforce_guard.is_some()
+        || task_plane.is_some()
     {
         Some(LaunchGuard {
             egress: egress_guard,
@@ -4416,6 +4627,7 @@ fn build(
             theme: theme_relay,
             portal: portal_host,
             proc_enforce: proc_enforce_guard,
+            task: task_plane,
         })
     } else {
         None
@@ -4905,12 +5117,10 @@ fn mise_roll_recap(rolled: &[String], up_to_date: usize, skipped: usize, failed:
             format!("nothing rolled{tally}.")
         }
     } else {
-        let noun = if rolled.len() == 1 { "app" } else { "apps" };
-        format!(
-            "{} {noun} rolled: {}{tally}.",
-            rolled.len(),
-            rolled.join(", ")
-        )
+        // No noun: the names are an app's most of the time, but the declared operations' tool pool
+        // rolls under this same recap and is not an app. Counting them without naming a kind keeps
+        // the line accurate for both rather than mislabelling one.
+        format!("{} rolled: {}{tally}.", rolled.len(), rolled.join(", "))
     }
 }
 
@@ -4919,7 +5129,7 @@ fn mise_roll_recap(rolled: &[String], up_to_date: usize, skipped: usize, failed:
 /// not close-on-exec, and dropping a `File` early would close the descriptor
 /// bwrap is told to read. Seccomp is loaded on every launch path the same way the
 /// namespace hardening is emitted unconditionally by `to_argv`.
-fn seccomp_argv(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
+pub(super) fn seccomp_argv(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
     let memfds = super::seccomp::memfds(&spec.seccomp)?;
     let mut argv = super::seccomp::argv_prefix(&memfds);
     argv.extend(super::argv::to_argv(spec));
@@ -4928,7 +5138,7 @@ fn seccomp_argv(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
 
 /// A process's exit code in the shell convention: its own code, or 128 + the signal that
 /// killed it (matching the pty supervisor's `pump`).
-fn status_code(status: std::process::ExitStatus) -> i32 {
+pub(super) fn status_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
         .code()
@@ -5116,6 +5326,9 @@ fn keep_passthrough(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(St
 /// untrusted-config denylist, so a host CA variable could otherwise clobber sbx's hermetic
 /// bundle. The GUI keys (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) collide with nothing else, so their
 /// position is immaterial; they sit here for a single, documented precedence order.
+// One parameter per environment *source*, in precedence order: the whole point is that the order is
+// visible at the call site, which a bundling struct would hide.
+#[allow(clippy::too_many_arguments)]
 fn extra_cage_env(
     passthrough: Vec<(String, String)>,
     cacert: Vec<(String, String)>,
@@ -5123,6 +5336,7 @@ fn extra_cage_env(
     autoequip: Vec<(String, String)>,
     mise: Vec<(String, String)>,
     egress: Vec<(String, String)>,
+    task: Vec<(String, String)>,
     config: &[(String, String)],
 ) -> Vec<(String, String)> {
     let mut env = passthrough;
@@ -5131,6 +5345,7 @@ fn extra_cage_env(
     env.extend(autoequip);
     env.extend(mise);
     env.extend(egress);
+    env.extend(task);
     env.extend(config.iter().cloned());
     env
 }
@@ -5240,19 +5455,20 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     }
 
     #[test]
-    fn mise_roll_recap_names_the_apps_that_rolled_and_tallies_the_rest() {
-        // The headline case: two apps advanced out of many — the recap names them and tallies the
-        // untouched majority, so "which apps are concerned?" reads at a glance.
+    fn mise_roll_recap_names_what_rolled_and_tallies_the_rest() {
+        // The headline case: two advanced out of many — the recap names them and tallies the
+        // untouched majority, so "what is concerned?" reads at a glance. No noun on the count: the
+        // names are usually apps, but the task tool pool rolls under this same recap and is not one.
         assert_eq!(
             mise_roll_recap(&["demo-app".into(), "other-app".into()], 15, 0, 0),
-            "2 apps rolled: demo-app, other-app (15 up to date)."
+            "2 rolled: demo-app, other-app (15 up to date)."
         );
         // Nothing advanced, everything current — collapse to one reassuring line, not "0 rolled".
         assert_eq!(mise_roll_recap(&[], 17, 0, 0), "all 17 up to date.");
-        // Singular noun, and a mixed tally (skips + failures) still surfaces.
+        // A mixed tally (skips + failures) still surfaces.
         assert_eq!(
             mise_roll_recap(&["demo-app".into()], 0, 1, 2),
-            "1 app rolled: demo-app (1 skipped, 2 failed)."
+            "1 rolled: demo-app (1 skipped, 2 failed)."
         );
         // Nothing rolled but not a clean no-op — say what got in the way.
         assert_eq!(
@@ -5415,6 +5631,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
+            tasks: vec![],
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
             devices: Vec::new(),
@@ -5464,6 +5681,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             limits: Default::default(),
             forward: vec![],
             secrets: vec![],
+            tasks: vec![],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
@@ -5710,6 +5928,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             vec![],
             vec![],
             egress.clone(),
+            vec![],
             &[],
         );
         assert_eq!(
@@ -5719,7 +5938,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         );
 
         let cfg = vec![("SSL_CERT_FILE".into(), "/cfg/ca.pem".into())];
-        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], egress, &cfg);
+        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], egress, vec![], &cfg);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/cfg/ca.pem"),
@@ -5731,7 +5950,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             "SSL_CERT_FILE".into(),
             "/etc/ssl/certs/ca-bundle.crt".into(),
         )];
-        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], vec![], &[]);
+        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], vec![], vec![], &[]);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/etc/ssl/certs/ca-bundle.crt"),

@@ -48,6 +48,8 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`network`](configuration/network.md) — the egress posture (links to [Networking](networking/README.md)).
 - [`[proc]`](configuration/proc.md) — observe or block what the agent execs (trusted-only).
 - [`[secret]`](configuration/secret.md) — credential injection (links to [Secrets](secrets/README.md)).
+- [`[task.<name>]`](configuration/task.md) — declared operations: a fixed command sbx runs with a
+  credential the caller never holds (trusted-only).
 - [`[app.<name>]`](configuration/apps.md) — named launch profiles (links to [Apps](apps/README.md)).
 - [`[net.groups]`](configuration/net-groups.md) — reusable egress groups.
 - [`[bundle.<name>]`](configuration/bundles.md) — reusable tool bundles an app names with `use`.
@@ -69,6 +71,8 @@ rationale and threat analysis behind each subsystem, each section links out to t
 | [`net`](cli/net.md) | inspect and manage the egress policy |
 | [`proc`](cli/proc.md) | observe a running sandbox's process tree |
 | [`fs`](cli/fs.md) | observe the files a running sandbox writes |
+| [`task`](cli/task.md) | list and invoke a session's declared operations |
+| [`secret`](cli/secret.md) | the credential inventory, by name |
 | [`plugins`](cli/plugins.md) | manage resolver plugins and plugin stores |
 | [`session`](cli/session.md) | list, attach to, and stop the live sessions |
 | [`trust` / `untrust`](cli/trust.md) | vouch for a project config |

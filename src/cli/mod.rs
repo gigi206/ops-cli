@@ -14,9 +14,11 @@ pub(crate) mod plugins;
 pub(crate) mod proc;
 pub(crate) mod projects;
 pub(crate) mod search;
+pub(crate) mod secret;
 pub(crate) mod session;
 pub(crate) mod storage;
 pub(crate) mod store;
+pub(crate) mod task;
 pub(crate) mod test;
 pub(crate) mod trust;
 pub(crate) mod upgrade;
@@ -113,6 +115,8 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "net" => net::net_cmd(rest),
         "proc" => proc::proc_cmd(rest),
         "fs" => fs::fs_cmd(rest),
+        "task" | "tasks" => task::task_cmd(rest),
+        "secret" | "secrets" => secret::secret_cmd(rest),
         "plugins" => plugins::plugins_cmd(rest),
         other => {
             diag::error(&format!("sbx: unknown command '{other}'"));

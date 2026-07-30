@@ -1017,6 +1017,7 @@ mod tests {
             limits: Default::default(),
             limits_origin: Default::default(),
             secrets: vec![],
+            tasks: vec![],
             seccomp: Default::default(),
             seccomp_origin: Default::default(),
             devices: Vec::new(),

@@ -16,6 +16,12 @@ mod pty;
 mod smoke;
 mod spec;
 
+// Declared operations: a fixed command run in an ephemeral sibling cage with a brokered credential,
+// plus the control plane a caller reaches to invoke one and the host-only invocation log.
+pub(crate) mod task;
+pub(crate) mod task_control;
+pub(crate) mod taskpool;
+
 // Provisioning & packaging: the nix/mise engines, the package backends, the store.
 mod appimage;
 mod deb;
@@ -41,6 +47,7 @@ mod forward;
 pub(crate) mod netlearn;
 mod netns;
 mod proxy;
+pub(crate) mod redact;
 
 // In-cage enforcement: seccomp denylist, cgroup limits, exec policy.
 pub(crate) mod cgroup;

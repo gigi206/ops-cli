@@ -375,11 +375,10 @@ pub(crate) fn start(
     ))
 }
 
-/// A secret shorter than this many bytes is not added to the outbound-redaction set: such a value
-/// would match too many benign requests and refuse legitimate egress (a self-inflicted denial),
-/// and is too low-entropy to be a credential worth a tripwire. The injection still applies — only
+/// The shortest value worth substituting, shared with the text-sink substituter so the wire and a
+/// task's output can never disagree on the threshold. Below it the injection still applies — only
 /// the leak tripwire is skipped, and loudly (a silent skip would be a false-confidence trap).
-const REDACT_MIN_LEN: usize = 8;
+use super::redact::REDACT_MIN_LEN;
 
 /// Resolve each declared header secret into a proxy injection plus the outbound-redaction needles,
 /// reading every source host-side. Fail-closed: a missing or empty source, or one carrying a
@@ -413,26 +412,7 @@ fn resolve_one(
     project_root: &Path,
     bwrap: &Path,
 ) -> io::Result<(HeaderInjection, Vec<SecretNeedle>)> {
-    // Try each source in order, the first that resolves winning. A clean "absent" (an unset
-    // variable, a missing file, an empty value) falls through to the next source; a HARD error
-    // (a file that exists but cannot be read, a value carrying a header-splitting byte) aborts the
-    // whole launch fail-closed — it must never silently downgrade to a weaker fallback source.
-    let mut tried = Vec::with_capacity(secret.sources.len());
-    let mut resolved = None;
-    for source in &secret.sources {
-        tried.push(source.describe());
-        if let Some(value) = read_source(source, &secret.header, project_root, bwrap)? {
-            resolved = Some(value);
-            break;
-        }
-    }
-    let trimmed = resolved.ok_or_else(|| {
-        io::Error::other(format!(
-            "no source resolved the secret for `{}` (tried: {})",
-            secret.header,
-            tried.join(", ")
-        ))
-    })?;
+    let trimmed = resolve_chain(&secret.sources, &secret.header, project_root, bwrap)?;
     let trimmed = trimmed.as_str();
 
     let needles = if trimmed.len() < REDACT_MIN_LEN {
@@ -444,11 +424,13 @@ fn resolve_one(
         ));
         Vec::new()
     } else {
+        // Every spelling of one credential carries that credential's logical name: the wire path
+        // ignores it (it substitutes length-preserving `*`), a text sink renders `${name}`.
         secret
             .shape
             .needles(trimmed)
             .into_iter()
-            .map(SecretNeedle::new)
+            .map(|bytes| SecretNeedle::named(&secret.name, bytes))
             .collect()
     };
 
@@ -460,6 +442,36 @@ fn resolve_one(
         },
         needles,
     ))
+}
+
+/// Read a credential's source chain host-side and return the first value that resolves, trimmed.
+///
+/// Try each source in order, the first that resolves winning. A clean "absent" (an unset variable, a
+/// missing file, an empty value) falls through to the next source; a HARD error (a file that exists
+/// but cannot be read, a value carrying a header-splitting byte) aborts fail-closed — it must never
+/// silently downgrade to a weaker fallback source. `label` names the consumer in an error message (a
+/// header name for a wire injection, a variable name for a task credential), so a failure says which
+/// declaration it belongs to without ever naming a value.
+///
+/// Shared with the task engine, which resolves a credential per invocation: one resolver path for
+/// both consumers, so a source that works for an injection works for a task and vice versa.
+pub(crate) fn resolve_chain(
+    sources: &[crate::config::SecretSource],
+    label: &str,
+    project_root: &Path,
+    bwrap: &Path,
+) -> io::Result<String> {
+    let mut tried = Vec::with_capacity(sources.len());
+    for source in sources {
+        tried.push(source.describe());
+        if let Some(value) = read_source(source, label, project_root, bwrap)? {
+            return Ok(value);
+        }
+    }
+    Err(io::Error::other(format!(
+        "no source resolved the secret for `{label}` (tried: {})",
+        tried.join(", ")
+    )))
 }
 
 /// Read one source host-side, classifying the outcome so the fallback chain stays safe:
@@ -896,6 +908,8 @@ mod tests {
         shape: crate::config::HeaderShape,
     ) -> HeaderSecret {
         HeaderSecret {
+            name: to.to_string(),
+            description: None,
             sources,
             to: crate::allowlist::classify(to).unwrap(),
             header: header.to_string(),

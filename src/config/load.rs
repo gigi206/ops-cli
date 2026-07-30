@@ -915,6 +915,17 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle) {
             None => acc.secret = Some(secret),
         }
     }
+    if let Some(task) = higher.task {
+        match acc.task.as_mut() {
+            Some(base) => {
+                if task.defaults.is_some() {
+                    base.defaults = task.defaults;
+                }
+                base.tasks.extend(task.tasks);
+            }
+            None => acc.task = Some(task),
+        }
+    }
 }
 
 /// Fold the accumulated bundle *under* one app: every entry the app does not already declare is
@@ -949,6 +960,22 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
                 }
             }
             None => app.secret = Some(secret),
+        }
+    }
+    // A bundle's declared operations fold under the app's, like its packages and credentials: a tool
+    // that ships a brokered operation carries it along, and an app that declares a task of the same
+    // name keeps its own.
+    if let Some(task) = acc.task {
+        match app.task.as_mut() {
+            Some(own) => {
+                if own.defaults.is_none() {
+                    own.defaults = task.defaults;
+                }
+                for (name, entry) in task.tasks {
+                    own.tasks.entry(name).or_insert(entry);
+                }
+            }
+            None => app.task = Some(task),
         }
     }
 

@@ -250,6 +250,13 @@ impl GuiPolicy {
 /// injection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeaderSecret {
+    /// The credential's logical name — what the inventory lists and what a redacted value is
+    /// named after. Defaults to the destination host when the declaration omits it. A label
+    /// only: it never selects a source, so two secrets may share it (with a warning).
+    pub(crate) name: String,
+    /// A one-line description of what the credential is for, or `None`. Printed beside the name;
+    /// validated free text (no control characters, length-capped).
+    pub(crate) description: Option<String>,
     /// The resolver chain sbx reads the plaintext from at launch — host-side, never inside the
     /// cage — tried in order, the first that resolves winning (a later one is a fallback).
     pub(crate) sources: Vec<SecretSource>,
@@ -441,9 +448,272 @@ pub(crate) struct Bind {
     pub(crate) writable: bool,
 }
 
+/// A validated declared operation: a fixed command sbx runs in an ephemeral sibling cage on a
+/// caller's behalf, with a credential the caller never holds.
+///
+/// Everything a caller can influence is enumerated here — the declared [`params`](Self::params) and
+/// the environment names in [`env_allow`](Self::env_allow). The program itself is not: `cmd[0]` is
+/// resolved host-side against a tree no cage can write, which is what makes "sbx fixes the program"
+/// true rather than aspirational.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskSpec {
+    /// The task's name, as declared (`[task.<name>]`) — how a caller addresses it.
+    pub(crate) name: String,
+    /// The one-line description listed to a caller, or `None`.
+    pub(crate) description: Option<String>,
+    /// The command as an argv list, `{param}` placeholders unsubstituted. Never a shell string.
+    pub(crate) cmd: Vec<String>,
+    /// The declared parameters, in declaration order.
+    pub(crate) params: Vec<TaskParam>,
+    /// Credentials injected into the command's environment, keyed by variable name.
+    pub(crate) secrets: Vec<TaskSecret>,
+    /// Credentials injected on the wire by this task's own proxy — the plaintext never enters the
+    /// task cage at all.
+    pub(crate) injections: Vec<HeaderSecret>,
+    /// Fixed environment from the declaration.
+    pub(crate) env: BTreeMap<String, String>,
+    /// The variable names a caller may set for one invocation. An allowlist of names.
+    pub(crate) env_allow: Vec<String>,
+    /// Whether the caller receives stdout.
+    pub(crate) stdout: OutputDisposition,
+    /// Whether the caller receives stderr.
+    pub(crate) stderr: OutputDisposition,
+    /// The wall-clock ceiling for one invocation.
+    pub(crate) timeout: std::time::Duration,
+    /// The captured-output ceiling per stream, in bytes. Output past it is truncated, and the
+    /// truncation is reported — never silently dropped.
+    pub(crate) max_output: u64,
+    /// Exec targets the command may run, as process-policy globs. Empty means `cmd[0]` only.
+    pub(crate) exec_allow: Vec<String>,
+    /// Exec targets it may never run; `deny` wins over `allow`.
+    pub(crate) exec_deny: Vec<String>,
+    /// The egress the task cage gets, as classified allowlist rules. Empty means no network at all.
+    pub(crate) network: Vec<Rule>,
+    /// Whether a substituted credential is named with a per-invocation nonce (`${NAME@a91f3c}`)
+    /// rather than the plain `${NAME}`. Inherited from `[task.defaults] nonce`, like the ceilings.
+    pub(crate) nonce: bool,
+    /// The mise tools this task's command needs, as **bare mise tokens** with the declaration's
+    /// `mise:` prefix already stripped (`aqua:cli/gh`, `node@22`). They are installed host-side into
+    /// the project's task pool, which the task cage mounts read-only — so the program a task runs
+    /// comes from a tree no cage can write, exactly like a store-built package.
+    pub(crate) packages: Vec<String>,
+}
+
+/// Whether a captured stream is returned to the caller. Substitution of secret values happens
+/// either way — `Hide` withholds the stream, it is not what protects the credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OutputDisposition {
+    /// Return the stream (after substitution). The default.
+    #[default]
+    Show,
+    /// Withhold the stream; the caller still gets the exit status.
+    Hide,
+}
+
+impl OutputDisposition {
+    /// The declared spelling, for `sbx config`/`sbx task list`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OutputDisposition::Show => "show",
+            OutputDisposition::Hide => "hide",
+        }
+    }
+}
+
+/// One declared parameter: the name a `{name}` placeholder in `cmd` refers to, the bound its value
+/// must satisfy, and an optional default (which is what makes it optional).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskParam {
+    pub(crate) name: String,
+    pub(crate) bound: ParamBound,
+    /// The value used when the caller supplies none. `None` makes the parameter required — a
+    /// missing value is an error, never an empty substitution (`psql -c ""` is a different
+    /// command than the one declared).
+    pub(crate) default: Option<String>,
+}
+
+/// What a parameter's value must satisfy. Bounds are load-bearing, not ergonomics: a value loose
+/// enough to embed a comparison can rebuild an exit-status oracle over the credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParamBound {
+    /// The whole value must match this regular expression. Kept as the source pattern (validated
+    /// compilable here) and compiled at invocation, so the spec stays comparable and cloneable.
+    Pattern(String),
+    /// The value must be one of these.
+    Choices(Vec<String>),
+}
+
+/// One credential a task's command reads from its environment. The variable name **is** the
+/// credential's name, so what a substituted value is reported as (`${PGPASSWORD}`) is what the
+/// declaration already called it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskSecret {
+    /// The environment variable the command reads.
+    pub(crate) var: String,
+    /// The resolver chain, tried in order — read host-side per invocation, never held for a session.
+    pub(crate) sources: Vec<SecretSource>,
+    /// How the resolved value is rendered into the variable.
+    pub(crate) encode: Encoding,
+    /// A one-line description for the inventory, or `None`.
+    pub(crate) description: Option<String>,
+}
+
+/// How a resolved plaintext is rendered into a task's environment variable.
+///
+/// The set is deliberately **closed**: each variant must also be able to state its rendered form as
+/// a substitution needle ([`Self::variants`]), so a value can never reach a text sink in a spelling
+/// the substituter does not recognize. An open-ended transform would be a leak channel with a
+/// friendly name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Encoding {
+    /// The plaintext as-is.
+    #[default]
+    Raw,
+    /// Standard base64 with padding.
+    Base64,
+    /// Percent-encoded for use inside a URL component.
+    Url,
+    /// Escaped as the inside of a JSON string (no surrounding quotes).
+    JsonString,
+}
+
+impl Encoding {
+    /// Parse the declared spelling.
+    pub(crate) fn parse(s: &str) -> Option<Encoding> {
+        match s {
+            "raw" => Some(Encoding::Raw),
+            "base64" => Some(Encoding::Base64),
+            "url" => Some(Encoding::Url),
+            "json-string" => Some(Encoding::JsonString),
+            _ => None,
+        }
+    }
+
+    /// The declared spelling, for `sbx config`/`sbx secret list`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Encoding::Raw => "raw",
+            Encoding::Base64 => "base64",
+            Encoding::Url => "url",
+            Encoding::JsonString => "json-string",
+        }
+    }
+
+    /// Render the plaintext into the form the variable carries.
+    pub(crate) fn render(self, plaintext: &str) -> String {
+        match self {
+            Encoding::Raw => plaintext.to_string(),
+            Encoding::Base64 => base64_encode(plaintext.as_bytes()),
+            Encoding::Url => percent_encode(plaintext),
+            Encoding::JsonString => json_escape(plaintext),
+        }
+    }
+
+    /// Every spelling of this value a text sink might carry: the plaintext **and** the rendered
+    /// form. Both, because the command sees the rendered form while an error message it composes
+    /// (or a log of what was resolved) may carry either. Registering both here is what makes
+    /// "adding an encoding without its substitution variant" impossible.
+    pub(crate) fn variants(self, plaintext: &str) -> Vec<Vec<u8>> {
+        let mut out = vec![plaintext.as_bytes().to_vec()];
+        let rendered = self.render(plaintext);
+        if rendered.as_bytes() != out[0].as_slice() {
+            out.push(rendered.into_bytes());
+        }
+        out
+    }
+}
+
+/// Percent-encode everything outside the unreserved set (RFC 3986), so a value is safe inside any
+/// URL component. Deliberately strict — `/`, `&`, `=`, `?` and `+` all encode — since a credential
+/// in a URL must never be read as structure.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Escape a value for use inside a JSON string literal (the caller supplies the quotes). Control
+/// characters become `\uXXXX` escapes, so a value can neither close the string nor inject a
+/// structural character.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every encoding must be able to state the spelling it produces, or a value could reach a text
+    // sink in a form the substituter does not recognize. Pin render and variants together.
+    #[test]
+    fn every_encoding_registers_its_rendered_form_as_a_variant() {
+        let plaintext = "p@ss word/1+2=3\n";
+        for encoding in [
+            Encoding::Raw,
+            Encoding::Base64,
+            Encoding::Url,
+            Encoding::JsonString,
+        ] {
+            let rendered = encoding.render(plaintext);
+            let variants = encoding.variants(plaintext);
+            assert!(
+                variants.contains(&plaintext.as_bytes().to_vec()),
+                "{}: the plaintext is always a variant",
+                encoding.as_str()
+            );
+            assert!(
+                variants.contains(&rendered.clone().into_bytes()),
+                "{}: the rendered form must be a variant, else it is unredactable",
+                encoding.as_str()
+            );
+            assert_eq!(
+                Encoding::parse(encoding.as_str()),
+                Some(encoding),
+                "the spelling round-trips"
+            );
+        }
+    }
+
+    // The renderings themselves: a credential must never be readable as structure by whatever
+    // consumes it.
+    #[test]
+    fn the_encodings_render_their_declared_form() {
+        assert_eq!(Encoding::Raw.render("a b"), "a b");
+        assert_eq!(Encoding::Base64.render("foobar"), "Zm9vYmFy");
+        assert_eq!(Encoding::Url.render("a b/c&d=e+f"), "a%20b%2Fc%26d%3De%2Bf");
+        assert_eq!(
+            Encoding::JsonString.render("say \"hi\"\n\\"),
+            "say \\\"hi\\\"\\n\\\\"
+        );
+        assert_eq!(Encoding::JsonString.render("\u{1}"), "\\u0001");
+    }
+
+    // An unknown encoding is not a silent fallback to raw: it must fail validation, since the
+    // author asked for a transform sbx cannot substitute back out.
+    #[test]
+    fn an_unknown_encoding_does_not_parse() {
+        assert_eq!(Encoding::parse("rot13"), None);
+        assert_eq!(Encoding::parse("RAW"), None);
+    }
 
     #[test]
     fn base64_encode_matches_rfc_4648_vectors() {

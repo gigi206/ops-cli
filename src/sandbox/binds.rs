@@ -27,7 +27,14 @@ const SANDBOX_HOME: &str = "/home/sandbox";
 /// The in-sandbox shell path. A hermetic sandbox has no host `/usr`, so `/bin/sh`
 /// is synthesised as a symlink to the nix shell; scripts and `system(3)` resolve
 /// here, and the synthetic passwd points its shell field at the same path.
-const SANDBOX_SHELL: &str = "/bin/sh";
+pub(super) const SANDBOX_SHELL: &str = "/bin/sh";
+
+/// Where the **nix-ld** shim is bound: the standard interpreter path a *foreign* (non-nix) binary
+/// hard-codes. A nix-built binary finds its loader by absolute RPATH and never comes here; an npm
+/// or pip artefact does, and the shim then re-execs it against the base loader named by `NIX_LD`.
+/// This is the value `resolve_userland` produces as `interp_dest`, named here so a cage assembled
+/// from another cage's mounts can recognise it without carrying the userland along.
+pub(super) const LOADER_DEST: &str = "/lib64/ld-linux-x86-64.so.2";
 
 /// The in-sandbox `/bin/bash`, synthesised as a symlink to the same nix shell as
 /// `/bin/sh`. A great many upstream scripts carry a `#!/bin/bash` shebang (a host
@@ -43,7 +50,7 @@ pub(crate) const SANDBOX_BASH: &str = "/bin/bash";
 /// cage has no host `/usr`). With `/bin/sh` and `/bin/bash` these are the three FHS
 /// paths nix's own ecosystem standardises, so synthesising it follows nix convention
 /// rather than working around it.
-const SANDBOX_ENV: &str = "/usr/bin/env";
+pub(super) const SANDBOX_ENV: &str = "/usr/bin/env";
 
 /// The in-sandbox `/usr/bin/xdg-open`, synthesised as a tiny shell script. A
 /// hermetic cage has no host display, no browser, and no file manager, so a tool
@@ -554,7 +561,7 @@ fn assemble(
 /// [`structural_nesting_warning`] surfaces it. Kept in lockstep with `assemble` by
 /// `structural_dests_lists_every_fixed_mount_assemble_emits`, which fails if a new structural mount
 /// is added without being listed here.
-const STRUCTURAL_DESTS: &[&str] = &[
+pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     "/nix",
     "/proc",
     "/dev",
@@ -566,7 +573,7 @@ const STRUCTURAL_DESTS: &[&str] = &[
     "/var/lib/dbus/machine-id",
     "/etc/resolv.conf",
     "/etc/ssl/certs/ca-certificates.crt",
-    "/lib64/ld-linux-x86-64.so.2",
+    LOADER_DEST,
     SANDBOX_HOME,
     SANDBOX_SHELL,
     SANDBOX_BASH,
@@ -826,7 +833,7 @@ fn mise_env(per_project_primary: bool, store_on_btrfs: bool) -> Vec<(String, Str
 /// Where sbx's CA bundle appears in the cage. The cacert tree is bound at `/etc/ssl`
 /// (replacing the host's), so the bundle sits at the path nix and OpenSSL look for by
 /// default.
-const CAGE_CA_BUNDLE: &str = "/etc/ssl/certs/ca-bundle.crt";
+pub(super) const CAGE_CA_BUNDLE: &str = "/etc/ssl/certs/ca-bundle.crt";
 
 /// The CA-bundle environment, naming sbx's own bundle so the cage's toolchains trust it
 /// without depending on the host having certificates. It uses the exact key set the egress

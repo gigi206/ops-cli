@@ -50,6 +50,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `dbus` | security | [dbus](dbus.md) |
 | `network` | security | [network](network.md) |
 | `[secret]` | security | [secret](secret.md) |
+| `[task.<name>]` | security | [task](task.md) |
 | `[app.<name>]` | security overlay | [apps](apps.md) |
 | `[net.groups]` | security (global-only) | [net-groups](net-groups.md) |
 | `[bundle.<name>]` | security (global-only) | [bundles](bundles.md) |

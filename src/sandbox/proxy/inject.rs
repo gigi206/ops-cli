@@ -36,23 +36,45 @@ impl fmt::Debug for HeaderInjection {
 /// request head — the egress leak tripwire. Held as raw bytes so the byte-substring scan matches
 /// whatever spelling reaches the wire (the plaintext, or its base64 form for Basic). Its `Debug`
 /// is redacted so the value can never reach a log or a panic message.
-pub(crate) struct SecretNeedle(Vec<u8>);
+///
+/// It also carries the credential's **logical name**, which the wire path ignores (it substitutes
+/// length-preserving `*`) and a text sink uses to render `${name}` — one needle set, two
+/// renderings. The name is a label, never secret, so `Debug` shows it: it is what makes a redacted
+/// `Debug` line diagnosable.
+pub(crate) struct SecretNeedle {
+    name: String,
+    bytes: Vec<u8>,
+}
 
 impl SecretNeedle {
-    pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+    /// A needle whose name is the credential's logical name.
+    pub(crate) fn named(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            bytes,
+        }
     }
 
     /// The needle bytes — used by the scan, and by the egress tests to confirm a needle was
     /// derived. Deliberately a named method, never `Debug`, so it is only ever read explicitly.
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
+    }
+
+    /// The credential's logical name, for the `${name}` rendering on a text sink.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 }
 
 impl fmt::Debug for SecretNeedle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SecretNeedle(<redacted {} bytes>)", self.0.len())
+        write!(
+            f,
+            "SecretNeedle({}, <redacted {} bytes>)",
+            self.name,
+            self.bytes.len()
+        )
     }
 }
 
@@ -90,7 +112,7 @@ mod tests {
     #[test]
     fn secret_needle_debug_redacts_the_value_but_reports_its_length() {
         let secret = b"SECRET-TOKEN-abc123";
-        let needle = SecretNeedle::new(secret.to_vec());
+        let needle = SecretNeedle::named("test-secret", secret.to_vec());
         assert_eq!(needle.as_bytes(), secret);
         let shown = format!("{needle:?}");
         assert!(

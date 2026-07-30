@@ -1683,6 +1683,7 @@ mod tests {
             limits: Default::default(),
             forward: vec![],
             secrets: vec![],
+            tasks: vec![],
             default_methods: crate::allowlist::Methods::Unspecified,
             cmd_origin: Default::default(),
             network_origin: Default::default(),
@@ -1711,6 +1712,8 @@ mod tests {
     /// A minimal HTTP-header credential, for the secret-posture agreement below.
     fn a_header_secret() -> crate::config::HeaderSecret {
         crate::config::HeaderSecret {
+            name: "api.example.com".into(),
+            description: None,
             sources: vec![crate::config::SecretSource::Env("TOKEN".into())],
             to: crate::allowlist::Rule {
                 kind: crate::allowlist::RuleKind::Host(
@@ -1734,6 +1737,7 @@ mod tests {
         let baseline = Resolved {
             env: vec![],
             env_layer: Default::default(),
+            tasks: vec![],
             // One bind the app shadows by path (with a different mode), one it inherits unchanged.
             binds: vec![
                 crate::config::Bind {
@@ -1810,6 +1814,7 @@ mod tests {
             // The app adds its own port; the baseline's 9090 must survive the union.
             forward: vec![1455],
             secrets: vec![],
+            tasks: vec![],
             proc: None,
             proc_origin: Default::default(),
             default_methods: crate::allowlist::Methods::Unspecified,
