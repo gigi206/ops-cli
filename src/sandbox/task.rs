@@ -51,6 +51,12 @@ const TASK_HOME: &str = "/tmp/task-home";
 /// systemd scope. A session can serve two invocations at once, and both would otherwise derive
 /// those names from the launcher pid alone and collide on them. Monotonic per process, which is all
 /// it has to be: the pid already separates sessions.
+///
+/// It reaches a socket path, which the kernel caps at `SUN_LEN` (108), so its width is worth
+/// knowing rather than assuming: the per-session call quota bounds it, making the suffix five bytes
+/// (`-t499`) at its widest. Measured against a deliberately long install path
+/// (`/home/<32 chars>/.local/share/sbx`) with a seven-digit pid, the full control-socket path is 84
+/// bytes — the suffix spends five of roughly thirty spare.
 static TASK_INVOCATION: AtomicU64 = AtomicU64::new(0);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);

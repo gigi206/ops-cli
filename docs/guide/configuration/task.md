@@ -241,7 +241,13 @@ cmd = [
 ]
 params  = { sql = "^SELECT [A-Za-z0-9_,.* ]{1,400}$" }
 network = ["tcp://db.staging.internal:5432"]
-packages = ["mise:aqua:..."]   # or `[packages] socat = "nix:socat"` — socat must be on PATH
+
+# socat and psql come from the top-level table: a `nix:` package is built host-side into the shared
+# store, which every task cage mounts read-only, so it is on a task's PATH with nothing to declare
+# in the task itself. (A task's own `packages` field is for `mise:` tools only — see below.)
+[packages]
+socat = "nix:socat"
+psql  = "nix:postgresql"
 ```
 
 Two details in that shape are load-bearing:
