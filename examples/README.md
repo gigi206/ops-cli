@@ -145,6 +145,25 @@ proxy strips the placeholder and substitutes the real key on the wire. Egress is
 an **allowlist** (deny-by-construction), so even with the key in flight the agent
 can only reach the provider you listed.
 
+### The GitHub API — the one you hit while importing these
+
+Several profiles here install their tool through mise's `aqua:` backend, which reads the
+GitHub API to resolve a release. Anonymously that ceiling is **60 requests an hour per IP**,
+and importing a handful of profiles — or one `sbx upgrade mise` across them — exhausts it:
+the install then fails with `403 rate limit exceeded` and `github auth: no`. A cage inherits
+no token from your shell by design, so the fix is the same shape as every credential here:
+
+```toml
+[secret."api.github.com"]
+from   = "env://GITHUB_TOKEN"
+header = "Authorization"
+type   = "bearer"
+```
+
+Global (in `sbx.toml`) authenticates every cage that can reach that host, as you; in one app
+profile it stays that app's. The full reasoning, the verification, and the scope trade-off are
+in [the worked example](../docs/guide/configuration/secret.md#worked-example-authenticating-the-github-api).
+
 > **Status:** the profiles import and resolve cleanly (covered by a test), and the
 > tool is **provisioned fresh and runs** under the profile's own allowlist — proven
 > live for `claude-code` (2.1.185, equipped via `mise use -g` and run through the
@@ -163,6 +182,16 @@ can only reach the provider you listed.
 > key?); for `freebuff`, completing its account **login** once inside the cage (the token then
 > persists in the isolated home). Both are the flagship validation, still to be proven with a
 > real key/account.
+>
+> One half of that is now discharged. The **injection mechanism** was proven live against a real
+> service: a `[secret."api.github.com"]` block resolving `env://GITHUB_TOKEN` host-side, from a
+> cage under `mode = "deny"` — `curl https://api.github.com/rate_limit` returned the authenticated
+> `"limit": 5000` where the same call had returned `0/60` minutes earlier. So host-side resolve →
+> proxy injects the header → the service accepts it works end to end, with the plaintext never in
+> the cage. What that does **not** cover is the other half: whether a given agent CLI starts on an
+> in-cage placeholder and lets the proxy substitute it. GitHub needed no placeholder — the tool
+> (mise) sent no credential at all and the proxy added one. A BYOK agent that *expects* a key in
+> its own config is still the untested case.
 >
 > `agy` is a special case of the account posture. Bringing it up surfaced a real **cage gap**,
 > now fixed: `agy` starts an internal language server that binds `localhost`, and a hermetic cage
