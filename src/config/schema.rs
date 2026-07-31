@@ -1074,12 +1074,109 @@ pub(crate) struct ProcTable {
     pub(crate) deny: Vec<String>,
 }
 
+/// How deep [`locate_type_error`] will go looking for the key at fault. Three levels reach a
+/// `[task.<name>].<field>` and an `[app.<name>].<field>`, which is as nested as this schema gets.
+const LOCATE_DEPTH: usize = 3;
+
+/// The most keys [`locate_type_error`] will test at one level. The search re-parses the document
+/// once per candidate, so this bounds the work on a large config; a document wider than this simply
+/// keeps the original message.
+const LOCATE_MAX_KEYS: usize = 128;
+
+/// Point at the key a *type* error came from, which the parser's own span does not.
+///
+/// `toml` reports a value nested inside a map against the map's **own** key: a `packages` written
+/// as a table under `[task.deploy]` is blamed on `task`, whose header may be sections away from the
+/// mistake — and since a failed parse drops the whole file, the reader is left with a caret on a
+/// line that is perfectly correct. The document is syntactically valid (only a type is wrong), so
+/// the offending key can be found by **elimination**: remove one candidate at a time and re-parse;
+/// the one whose removal makes the document load is the culprit. Removal rather than isolation
+/// because a sibling may be *required* — deserializing `{task.deploy.packages}` alone would fail on
+/// the missing `cmd` and frame the wrong key.
+///
+/// Returns the dotted path and, when the document still carries its spans, the line it is written
+/// on. Gives up quietly — a document with two errors is never fixed by removing one key, and a
+/// guess is worse than the parser's own message.
+fn locate_type_error<T: serde::de::DeserializeOwned>(
+    text: &str,
+) -> Option<(String, Option<usize>)> {
+    let doc: toml_edit::DocumentMut = text.parse().ok()?;
+    let mut path: Vec<String> = Vec::new();
+
+    for _ in 0..LOCATE_DEPTH {
+        let keys = keys_at(&doc, &path)?;
+        if keys.len() > LOCATE_MAX_KEYS {
+            return None;
+        }
+        let culprit = keys.into_iter().find(|key| {
+            let mut trial = doc.clone();
+            remove_at(&mut trial, &path, key) && toml::from_str::<T>(&trial.to_string()).is_ok()
+        })?;
+        path.push(culprit);
+        // Descend only while the blamed value is itself a table: once it is a scalar or an array,
+        // it *is* the mistake and there is nothing finer to name.
+        if keys_at(&doc, &path).is_none() {
+            break;
+        }
+    }
+
+    Some((path.join("."), line_of(text, &path)))
+}
+
+/// The keys of the table at `path`, or `None` when the path does not lead to one.
+fn keys_at(doc: &toml_edit::DocumentMut, path: &[String]) -> Option<Vec<String>> {
+    let mut table = doc.as_table() as &dyn toml_edit::TableLike;
+    for step in path {
+        table = table.get(step)?.as_table_like()?;
+    }
+    Some(table.iter().map(|(k, _)| k.to_string()).collect())
+}
+
+/// Remove `key` from the table at `path`. False when the path or the key is not there.
+fn remove_at(doc: &mut toml_edit::DocumentMut, path: &[String], key: &str) -> bool {
+    let mut table = doc.as_table_mut() as &mut dyn toml_edit::TableLike;
+    for step in path {
+        match table
+            .get_mut(step)
+            .and_then(|item| item.as_table_like_mut())
+        {
+            Some(next) => table = next,
+            None => return false,
+        }
+    }
+    table.remove(key).is_some()
+}
+
+/// The 1-based line `path` is written on, read from a span-preserving parse of the same text.
+fn line_of(text: &str, path: &[String]) -> Option<usize> {
+    let doc = toml_edit::ImDocument::parse(text).ok()?;
+    let mut item = doc.as_item();
+    for step in path {
+        item = item.as_table_like()?.get(step)?;
+    }
+    let start = item.span()?.start;
+    Some(text.get(..start)?.matches('\n').count() + 1)
+}
+
+/// Append the located key to a parse error, when one can be found.
+fn with_location<T: serde::de::DeserializeOwned>(text: &str, message: String) -> String {
+    match locate_type_error::<T>(text) {
+        Some((path, Some(line))) => {
+            format!("{message}\n  --> the value at `{path}` (line {line}) is the one at fault")
+        }
+        Some((path, None)) => {
+            format!("{message}\n  --> the value at `{path}` is the one at fault")
+        }
+        None => message,
+    }
+}
+
 /// Parse config bytes as TOML. The error is a human-readable string: the loader
 /// turns it into a warning and ignores the layer rather than aborting a command,
 /// so a malformed config never wedges the sandbox.
 pub(crate) fn parse(bytes: &[u8]) -> Result<RawConfig, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
-    toml::from_str(text).map_err(|e| e.to_string())
+    toml::from_str(text).map_err(|e| with_location::<RawConfig>(text, e.to_string()))
 }
 
 /// Serialize an app as a top-level profile — the inverse of [`parse_app`], producing the portable
@@ -1099,7 +1196,73 @@ pub(crate) fn serialize_app(app: &RawApp) -> Result<String, String> {
 /// that by requiring a `cmd`, so the wrong shape is refused rather than silently mis-imported.
 pub(crate) fn parse_app(bytes: &[u8]) -> Result<RawApp, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
-    toml::from_str(text).map_err(|e| e.to_string())
+    toml::from_str(text).map_err(|e| with_location::<RawApp>(text, e.to_string()))
+}
+
+#[cfg(test)]
+mod locating {
+    use super::*;
+
+    /// The case this exists for, taken from a real mistake: a task's `packages` is a **list** of
+    /// `mise:` entries, and writing it as a table makes the parser blame `task` — whose header can
+    /// be sections away — while the whole file is dropped on it.
+    #[test]
+    fn a_type_error_inside_a_named_table_names_the_field_not_the_section() {
+        let text = "\
+[env]
+A = \"b\"
+
+[task.deploy]
+cmd = [\"sshpass\", \"-e\", \"ssh\"]
+
+[task.deploy.packages]
+sshpass = \"nix:sshpass\"
+";
+        let err = parse(text.as_bytes()).unwrap_err();
+        assert!(
+            err.contains("`task.deploy.packages`"),
+            "the field at fault must be named: {err}"
+        );
+        assert!(err.contains("line 7"), "and pointed at its own line: {err}");
+        // The parser's own message survives; the location is added, never substituted.
+        assert!(
+            err.contains("invalid type: map, expected a sequence"),
+            "{err}"
+        );
+    }
+
+    /// A direct field already has a good span, and the located path must agree with it rather than
+    /// wander off into a neighbour.
+    #[test]
+    fn a_top_level_field_locates_to_itself() {
+        let err = parse(b"network = 42\n").unwrap_err();
+        assert!(err.contains("`network`"), "{err}");
+    }
+
+    /// Two mistakes cannot be found by removing one key, so the search gives up and the reader
+    /// keeps the parser's own message — a guess would be worse than none.
+    #[test]
+    fn two_errors_leave_the_original_message_alone() {
+        let text = "network = 42\ngui = 7\n";
+        let err = parse(text.as_bytes()).unwrap_err();
+        assert!(!err.contains("is the one at fault"), "{err}");
+    }
+
+    /// A syntax error is not a type error: nothing is located, because the document cannot even be
+    /// read as a tree to search.
+    #[test]
+    fn a_syntax_error_is_left_as_it_is() {
+        let err = parse(b"[task.deploy\ncmd = 1\n").unwrap_err();
+        assert!(!err.contains("is the one at fault"), "{err}");
+    }
+
+    /// The same treatment reaches an imported app profile, whose fields are the app's own.
+    #[test]
+    fn an_app_profile_locates_its_own_field() {
+        let text = "cmd = [\"demo\"]\n\n[packages]\nx = 1\n";
+        let err = parse_app(text.as_bytes()).unwrap_err();
+        assert!(err.contains("`packages.x`"), "{err}");
+    }
 }
 
 #[cfg(test)]
