@@ -337,11 +337,16 @@ different machine's, so the listener goes on the cage's `localhost` at that port
 host's. `-h localhost -p 5432` reaches the service you meant.
 
 **What gets no listener**, and is reported at launch rather than passed over: a rule naming no single
-port (`tcp://host:*`, or a port range — sbx will not open a thousand listeners on a guess), a **port
-below 1024** (binding one needs a capability the cage does not have — so ssh's port 22 is in this
-group), a non-loopback IP literal the cage's network namespace has no way to hold, and a host in the
-cage's own `sbx-*` hostname space. Those rules still govern the proxy; what they lose is the
-convenience, and the command has to tunnel itself.
+port (`tcp://host:*`, or a port range — sbx will not open a thousand listeners on a guess), a
+non-loopback IP literal the cage's network namespace has no way to hold, and a host in the cage's own
+`sbx-*` hostname space. Those rules still govern the proxy; what they lose is the convenience, and
+the command has to tunnel itself.
+
+A **port below 1024** gets no listener either (binding one needs a capability the cage does not
+have), but it is not left to the command: that covers ssh's port 22, and for it the task's cage gets
+its own `/etc/ssh/ssh_config` with a `ProxyCommand` toward this task's proxy. So a declared
+`ssh deploy@host …` on the default port works as written, routed through the task's own egress
+policy — not the agent session's.
 
 ## Which binaries a task may run
 

@@ -169,10 +169,26 @@ pub(crate) struct TcpDestination {
     pub(crate) map_name: bool,
 }
 
+/// A `tcp://` destination that gets no listener because the port it names is **privileged**, and so
+/// must be reached by asking the in-cage `CONNECT` proxy for it explicitly.
+///
+/// Kept apart from [`TcpPlan::skipped`]'s prose because something can still be done for it: an ssh
+/// client reaches it through a generated `ProxyCommand` ([`ssh_config_contents`]), which is the
+/// overwhelmingly common case — port 22.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectOnly {
+    /// The host exactly as the rule names it.
+    pub(crate) host: String,
+    /// The privileged ports declared for it.
+    pub(crate) ports: Vec<u16>,
+}
+
 /// What [`tcp_destinations`] made of a policy's raw-splice rules.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct TcpPlan {
     pub(crate) destinations: Vec<TcpDestination>,
+    /// Destinations reachable only through an explicit `CONNECT` — see [`ConnectOnly`].
+    pub(crate) connect_only: Vec<ConnectOnly>,
     /// Rules that name no single port to listen on, or an address the cage cannot hold. Returned
     /// rather than warned about here so the caller decides how loudly to say it — and so this stays
     /// a pure function of the policy.
@@ -247,17 +263,33 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
         };
         // A port below 1024 is privileged, and the cage holds no capability at all — the bind would
         // fail, leaving the name pointing at an address nothing listens on, which reads as a flat
-        // "connection refused" with no clue why. Reported per port and dropped, so a rule naming
-        // both a privileged and an ordinary port still gets a listener for the one it can hold.
+        // "connection refused" with no clue why. Recorded apart and dropped from the listener set,
+        // so a rule naming both a privileged and an ordinary port still gets a listener for the one
+        // it can hold — and the privileged one still gets its `ProxyCommand`.
         let (ports, privileged): (Vec<u16>, Vec<u16>) = ports
             .into_iter()
             .partition(|p| *p >= FIRST_UNPRIVILEGED_PORT);
-        for port in privileged {
+        if !privileged.is_empty() && !ssh_config_host_ok(&host) {
+            // Not spellable in the generated ssh config, so not even ssh is wired for it: this one
+            // really is on its author to tunnel, which is what `skipped` says.
             plan.skipped.push(format!(
-                "tcp://{host}:{port} — a port below {FIRST_UNPRIVILEGED_PORT} cannot be bound \
-                 inside the cage, which holds no capability; reach it with an explicit CONNECT \
-                 (`ssh -o ProxyCommand='socat - PROXY:127.0.0.1:%h:%p,proxyport={CAGE_PROXY_PORT}'`)"
+                "tcp://{host} — a port below {FIRST_UNPRIVILEGED_PORT} needs an explicit CONNECT, \
+                 and this host cannot be written into the cage's ssh config"
             ));
+        } else if !privileged.is_empty() {
+            match plan.connect_only.iter_mut().find(|c| c.host == host) {
+                Some(existing) => {
+                    for port in privileged {
+                        if !existing.ports.contains(&port) {
+                            existing.ports.push(port);
+                        }
+                    }
+                }
+                None => plan.connect_only.push(ConnectOnly {
+                    host: host.clone(),
+                    ports: privileged,
+                }),
+            }
         }
         if ports.is_empty() {
             continue;
@@ -345,6 +377,69 @@ fn tcp_forwarders(socat: &Path, destinations: &[TcpDestination]) -> String {
         }
     }
     out
+}
+
+/// Whether a host may be written into a generated `ssh_config` as itself.
+///
+/// A `Host` line is a **pattern**, not a name: a `*` or `?` in it would silently widen the block to
+/// destinations the rule never named, and a newline would close the block and turn the rest of the
+/// string into directives of its own — at the top level of a system-wide file, where they would
+/// apply to every destination. The rule's host is already validated a layer away (an exact hostname
+/// or an IP literal), but a generated file must not rest on a property proved elsewhere, so the
+/// emitter admits exactly the characters a hostname or IPv4 literal is made of and refuses the rest.
+/// An IPv6 literal's colons are refused here too: it would additionally need bracketing in the
+/// `CONNECT` clause, which is a different spelling than the one written below.
+fn ssh_config_host_ok(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+/// The synthetic system-wide ssh client config that reaches the [`ConnectOnly`] destinations, or
+/// `None` when there is nothing to write.
+///
+/// A privileged port cannot have an in-cage listener, so the name-resolves-and-just-works path the
+/// other `tcp://` destinations get is unavailable — and port 22 is what a privileged `tcp://` rule
+/// almost always names. What remains is asking the cage's `CONNECT` proxy explicitly, which ssh can
+/// do on its own with a `ProxyCommand`. Writing it here means `git push` and `ssh <host>` work as
+/// written, instead of every author having to rediscover the same incantation.
+///
+/// It goes in the **system-wide** file, which is the last one ssh consults: since the first value
+/// obtained for a keyword wins, a `~/.ssh/config` block of the user's (or the agent's) own overrides
+/// this one. Every directive stays inside a `Host` block, so nothing here applies to a destination
+/// it does not name. This is ergonomics, not a fence — the rule the proxy enforces is the fence, and
+/// it is unchanged whether the client finds this file or not.
+pub(crate) fn ssh_config_contents(socat: &Path, connect_only: &[ConnectOnly]) -> Option<String> {
+    let usable: Vec<&ConnectOnly> = connect_only
+        .iter()
+        .filter(|c| ssh_config_host_ok(&c.host))
+        .collect();
+    if usable.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "# Written by sbx for this cage, and read-only: a `tcp://<host>:<port>` rule whose port is\n\
+         # below 1024 gets no in-cage listener, because that bind needs a capability the cage does\n\
+         # not hold. ssh reaches those destinations through the cage's own CONNECT proxy instead —\n\
+         # the same proxy, and the same rule, that governs every other request.\n\
+         #\n\
+         # This is the system-wide file, the last one ssh reads: a `Host` block of your own in\n\
+         # ~/.ssh/config takes precedence over anything here.\n",
+    );
+    for dest in usable {
+        let ports: Vec<String> = dest.ports.iter().map(u16::to_string).collect();
+        out.push_str(&format!(
+            "\n# declared as tcp://{host}:{ports}\n\
+             Host {host}\n    \
+             ProxyCommand {socat} - PROXY:127.0.0.1:%h:%p,proxyport={CAGE_PROXY_PORT}\n",
+            host = dest.host,
+            ports = ports.join(","),
+            socat = socat.display(),
+        ));
+    }
+    Some(out)
 }
 
 /// Assemble the `bash -c '<preamble> exec "$@"'` forwarder wrapper shared by the egress and
@@ -1048,12 +1143,13 @@ mod tests {
         assert!(!dest.map_name, "an address needs no `/etc/hosts` entry");
     }
 
-    /// A privileged port cannot be bound by a capability-less cage, so it gets no listener — and
-    /// says so. Measured, not assumed: in a live cage a `tcp://github.com:22` rule left the mapped
-    /// name pointing at an address nothing listened on, and ssh reported a bare "connection
-    /// refused". A rule naming an ordinary port beside it keeps that one.
+    /// A privileged port cannot be bound by a capability-less cage, so it gets no listener — and is
+    /// recorded as reachable only through an explicit CONNECT. Measured, not assumed: in a live cage
+    /// a `tcp://github.com:22` rule left the mapped name pointing at an address nothing listened on,
+    /// and ssh reported a bare "connection refused". A rule naming an ordinary port beside it keeps
+    /// that one, so a host declared on both is served both ways.
     #[test]
-    fn a_privileged_port_gets_no_listener_and_is_reported() {
+    fn a_privileged_port_gets_no_listener_but_a_connect_route() {
         let plan = tcp_destinations(&tcp_policy(&["tcp://github.com:22,2200"]));
 
         let dest = &plan.destinations[0];
@@ -1062,19 +1158,107 @@ mod tests {
             vec![2200],
             "only the bindable port is listened on"
         );
-        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
         assert!(
-            plan.skipped[0].contains("github.com:22") && plan.skipped[0].contains("ProxyCommand"),
-            "the report names the port and the way through: {:?}",
+            plan.skipped.is_empty(),
+            "ssh is wired for it, so there is nothing to warn about: {:?}",
             plan.skipped
         );
+        assert_eq!(plan.connect_only.len(), 1, "{:?}", plan.connect_only);
+        assert_eq!(plan.connect_only[0].host, "github.com");
+        assert_eq!(plan.connect_only[0].ports, vec![22]);
 
         // A rule with nothing but a privileged port yields no destination at all — and so no
         // `/etc/hosts` line, which is the honest outcome: the name does not resolve rather than
-        // resolving to a dead address.
+        // resolving to a dead address. The CONNECT route is what carries it instead.
         let plan = tcp_destinations(&tcp_policy(&["tcp://github.com:22"]));
         assert!(plan.destinations.is_empty());
+        assert_eq!(plan.connect_only.len(), 1, "{:?}", plan.connect_only);
+    }
+
+    /// The generated ssh config sends exactly the CONNECT-only hosts through the cage's proxy, each
+    /// inside its own `Host` block — a directive at the top level of a system-wide file would apply
+    /// to every destination, including the ones with a listener of their own.
+    #[test]
+    fn the_generated_ssh_config_routes_only_the_declared_hosts() {
+        let plan = tcp_destinations(&tcp_policy(&[
+            "tcp://github.com:22",
+            "tcp://db.internal:5432",
+            "tcp://192.168.1.10:22",
+        ]));
+        let socat = Path::new("/nix/store/abc-socat/bin/socat");
+        let cfg = ssh_config_contents(socat, &plan.connect_only).expect("a config");
+
+        assert!(cfg.contains("\nHost github.com\n"), "{cfg}");
+        assert!(
+            cfg.contains("\nHost 192.168.1.10\n"),
+            "an address too: {cfg}"
+        );
+        assert!(
+            !cfg.contains("db.internal"),
+            "a host with a listener needs no ProxyCommand: {cfg}"
+        );
+        assert!(
+            cfg.contains(&format!(
+                "ProxyCommand {} - PROXY:127.0.0.1:%h:%p,proxyport={CAGE_PROXY_PORT}",
+                socat.display()
+            )),
+            "{cfg}"
+        );
+        for line in cfg.lines() {
+            let directive = line.trim_start();
+            assert!(
+                line.starts_with('#')
+                    || line.trim().is_empty()
+                    || line.starts_with("Host ")
+                    || (line.starts_with(' ') && directive.starts_with("ProxyCommand ")),
+                "every directive stays inside a Host block: {line:?}"
+            );
+        }
+
+        // Nothing to route means no file at all, rather than one with only a header in it.
+        assert!(ssh_config_contents(socat, &[]).is_none());
+    }
+
+    /// A `Host` line is a *pattern*: a wildcard in it would widen the route to destinations the rule
+    /// never named, and a newline would close the block and turn what follows into top-level
+    /// directives. The emitter admits only what a hostname or IPv4 literal is made of — checked here
+    /// against the emitter itself, not against the parser one layer away that is supposed to have
+    /// rejected these already.
+    #[test]
+    fn a_host_that_is_not_plainly_a_name_is_never_written_into_the_config() {
+        for host in [
+            "*",
+            "*.example.com",
+            "gh?b.com",
+            "github.com\nHost *",
+            "github.com ProxyJump evil",
+            "::1",
+            "",
+        ] {
+            assert!(!ssh_config_host_ok(host), "{host:?} must be refused");
+            let only = [ConnectOnly {
+                host: host.to_string(),
+                ports: vec![22],
+            }];
+            assert!(
+                ssh_config_contents(Path::new("/nix/store/abc-socat/bin/socat"), &only).is_none(),
+                "{host:?} must reach no config"
+            );
+        }
+        assert!(ssh_config_host_ok("github.com"));
+        assert!(ssh_config_host_ok("192.168.1.10"));
+        assert!(ssh_config_host_ok("build-01_internal"));
+    }
+
+    /// A destination the config cannot spell falls back to the plain report: not even ssh is wired
+    /// for it, so its author has to know they are on their own.
+    #[test]
+    fn an_unspellable_privileged_host_is_reported_instead() {
+        let plan = tcp_destinations(&tcp_policy(&["tcp://[::1]:22"]));
+
+        assert!(plan.connect_only.is_empty(), "{:?}", plan.connect_only);
         assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
+        assert!(plan.skipped[0].contains("::1"), "{:?}", plan.skipped);
     }
 
     /// What cannot be given a listener is reported, never dropped in silence: the rule still governs

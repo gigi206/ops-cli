@@ -152,7 +152,7 @@ There is no field for one, in either direction:
 The nearest thing to "ask me for a password each time" is `ssh-add -c` above: not a secret
 to declare, a confirmation you give.
 
-## It needs egress too — and port 22 needs a `ProxyCommand`
+## It needs egress too
 
 The broker rides a Unix socket, so it is independent of the network posture — and equally,
 it opens no network. A signature with nowhere to go is no use: under an allowlist posture
@@ -161,7 +161,6 @@ the cage reaches ssh only through a raw `tcp://` rule.
 ```toml
 [packages]
 openssh = "nix:openssh"
-socat   = "nix:socat"
 
 [ssh_agent]
 allow = ["deploy@example"]
@@ -171,40 +170,35 @@ mode  = "allow"
 allow = ["tcp://github.com:22"]
 ```
 
-For most `tcp://` destinations sbx also plants an **in-cage listener** and an `/etc/hosts`
-entry, so the client dials the name unchanged. **Port 22 is not one of them.** A port below
-1024 is privileged and the cage holds no capability, so that listener cannot exist — sbx
-says so at launch rather than leaving the name pointing at a dead address:
-
-```
-sbx: warning: no in-cage listener for tcp://github.com:22 — a port below 1024 cannot be
-     bound inside the cage, which holds no capability; reach it with an explicit CONNECT …
-```
-
-The rule still governs the proxy, so the route is there — the client just has to ask for it
-explicitly, through the in-cage CONNECT proxy:
+That is the whole configuration — `git push` then works as written:
 
 ```bash
-ssh -o 'ProxyCommand=socat - PROXY:127.0.0.1:%h:%p,proxyport=18043' git@github.com
+git push        # or ssh git@github.com, git clone git@…, scp, rsync -e ssh
 ```
 
-Put it in the cage's ssh config to keep `git push` verbatim:
+Port 22 needs one thing the other destinations do not, and sbx supplies it. For most
+`tcp://` destinations sbx plants an **in-cage listener** and an `/etc/hosts` entry, so the
+client dials the name unchanged; a port below 1024 is privileged and the cage holds no
+capability, so that listener cannot exist. Instead sbx writes a `ProxyCommand` for the host
+into the cage's system-wide `/etc/ssh/ssh_config`, pointing at the cage's own `CONNECT`
+proxy — the route the rule already governs. It notes it at launch, because a **non-ssh**
+client on such a port still has to ask for that `CONNECT` itself:
 
-```bash
-mkdir -p ~/.ssh
-cat > ~/.ssh/config <<'EOF'
-Host github.com
-    ProxyCommand socat - PROXY:127.0.0.1:%h:%p,proxyport=18043
-EOF
-chmod 600 ~/.ssh/config      # ssh refuses a group- or world-readable config
+```
+sbx: note: tcp://github.com:22 is a privileged port, which the cage cannot listen on — ssh
+     reaches it through the cage's CONNECT proxy (wired in /etc/ssh/ssh_config); another
+     client has to ask for that CONNECT itself
 ```
 
-The `chmod` is not optional: without it ssh stops at `Bad owner or permissions on
-~/.ssh/config` and never dials.
+The generated file is read-only and contains nothing but a `Host` block per declared
+destination. It is the **system-wide** config, the last file ssh reads, so a `~/.ssh/config`
+you write inside the cage takes precedence over it — measured both ways. Nothing about the
+fence changes: an undeclared host or port is refused whether or not a client reads this file.
 
-Verified end to end, both forms: the cage reaches `github.com:22`, completes the key
-exchange, binds the agent to the server's host key, and offers the granted key — the whole
-path, with the private key never leaving the host agent. See [`[network]`](network.md).
+Verified end to end: the cage reaches `github.com:22` through the generated `ProxyCommand`,
+completes the key exchange, binds the agent to the server's host key, and offers the granted
+key — the whole path, with the private key never leaving the host agent. See
+[`[network]`](network.md).
 
 ## Seeing the grant
 

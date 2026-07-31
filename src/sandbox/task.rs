@@ -650,7 +650,7 @@ impl TaskEngine {
                 &Invocation {
                     number: invocation,
                     proxy_binds: &proxy_binds,
-                    tcp: &tcp_plan.destinations,
+                    tcp: &tcp_plan,
                     output: output.as_ref().map(|o| o.dir.as_path()),
                 },
             )
@@ -832,7 +832,7 @@ impl TaskEngine {
         // agent cage maps the *agent's* destinations. Written per invocation and bound over the
         // inherited mount, so a task's command resolves the hosts this task declared and nothing
         // else. Swept with the invocation's other runtime files.
-        if !tcp.is_empty() {
+        if !tcp.destinations.is_empty() {
             let hosts = self
                 .layout
                 .data_dir()
@@ -840,7 +840,7 @@ impl TaskEngine {
                 .join(format!("hosts-{}.t{invocation}", std::process::id()));
             let body = super::binds::hosts_contents(
                 &super::naming::cage_hostname(&format!("{}-task{invocation}", self.slug)),
-                tcp,
+                &tcp.destinations,
             );
             std::fs::write(&hosts, body).map_err(|e| {
                 format!(
@@ -853,6 +853,31 @@ impl TaskEngine {
             mounts.push(Mount::RoBind {
                 src: hosts,
                 dest: PathBuf::from("/etc/hosts"),
+            });
+        }
+        // Likewise for a destination on a privileged port, which no cage can listen on: this task's
+        // own ssh config, bound over whatever the agent cage carried, so `ssh`/`scp` in a declared
+        // command reaches the destination *this task* declared through its own proxy — and nothing
+        // else. Written per invocation and swept with the invocation's other runtime files.
+        if let Some(body) =
+            super::egress::ssh_config_contents(&self.forwarder.socat, &tcp.connect_only)
+        {
+            let ssh_config = self
+                .layout
+                .data_dir()
+                .join("egress")
+                .join(format!("sshcfg-{}.t{invocation}", std::process::id()));
+            std::fs::write(&ssh_config, body).map_err(|e| {
+                format!(
+                    "cannot write {}, the ssh config this task's cage reaches a privileged port \
+                     through: {e}. The command would dial a port nothing listens on, so the task \
+                     is refused rather than run into a bare connection refused.",
+                    ssh_config.display()
+                )
+            })?;
+            mounts.push(Mount::RoBind {
+                src: ssh_config,
+                dest: PathBuf::from(super::binds::SSH_CONFIG_INCAGE),
             });
         }
 
@@ -1523,8 +1548,9 @@ struct Invocation<'a> {
     number: u64,
     /// The proxy socket and CA, when the task declared egress.
     proxy_binds: &'a [super::binds::ExtraBind],
-    /// The destinations that get an in-cage listener.
-    tcp: &'a [super::egress::TcpDestination],
+    /// Where this task's declared `tcp://` destinations live inside its cage — the ones with a
+    /// listener, and the ones only an explicit `CONNECT` reaches.
+    tcp: &'a super::egress::TcpPlan,
     /// The writable output directory, when the task declared one.
     output: Option<&'a Path>,
 }
@@ -2095,7 +2121,7 @@ mod smoke {
             &[],
             NetPolicy::Isolated,
             "",
-            &[],
+            &Default::default(),
             super::super::seccomp::SeccompPolicy::default(),
             &[],
             vec![OsString::from("/bin/true")],
@@ -3253,7 +3279,7 @@ mod tests {
                 &Invocation {
                     number: 3,
                     proxy_binds: &[],
-                    tcp: &[],
+                    tcp: &Default::default(),
                     output: Some(claim.dir.as_path()),
                 },
             )
@@ -3290,7 +3316,7 @@ mod tests {
                 &Invocation {
                     number: 4,
                     proxy_binds: &[],
-                    tcp: &[],
+                    tcp: &Default::default(),
                     output: None,
                 },
             )
@@ -3347,18 +3373,10 @@ mod tests {
     }
 
     /// A destination plan for one `tcp://` rule, built the way a launch builds it.
-    fn tcp_plan(
-        rule: &str,
-    ) -> (
-        Vec<crate::allowlist::Rule>,
-        Vec<super::super::egress::TcpDestination>,
-    ) {
+    fn tcp_plan(rule: &str) -> (Vec<crate::allowlist::Rule>, super::super::egress::TcpPlan) {
         let rules = vec![crate::allowlist::classify(rule).expect("a valid rule")];
         let policy = crate::allowlist::EgressPolicy::new(rules.clone(), Vec::new());
-        (
-            rules,
-            super::super::egress::tcp_destinations(&policy).destinations,
-        )
+        (rules, super::super::egress::tcp_destinations(&policy))
     }
 
     /// A networked task resolves names through a hosts file of **its own**, bound over the one it
@@ -3432,7 +3450,7 @@ mod tests {
                 &Invocation {
                     number: 8,
                     proxy_binds: &[],
-                    tcp: &[],
+                    tcp: &Default::default(),
                     output: None,
                 },
             )
@@ -3514,7 +3532,7 @@ mod tests {
                 &Invocation {
                     number: 0,
                     proxy_binds: &[],
-                    tcp: &[],
+                    tcp: &Default::default(),
                     output: None,
                 },
             )
@@ -3563,7 +3581,7 @@ mod tests {
                 &Invocation {
                     number: 0,
                     proxy_binds: &[],
-                    tcp: &[],
+                    tcp: &Default::default(),
                     output: None,
                 },
             )

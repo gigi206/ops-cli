@@ -4232,6 +4232,19 @@ fn build(
                  that cannot speak an HTTP CONNECT proxy will have to tunnel itself"
             ));
         }
+        // A privileged port has no listener either, but ssh is wired for it — so this is a note,
+        // not a warning: what an author must know is that *ssh* works as written while another
+        // client on such a port still has to ask the proxy itself.
+        for dest in &tcp_plan.connect_only {
+            let ports: Vec<String> = dest.ports.iter().map(u16::to_string).collect();
+            crate::diag::note(&format!(
+                "tcp://{}:{} is a privileged port, which the cage cannot listen on — ssh reaches it \
+                 through the cage's CONNECT proxy (wired in /etc/ssh/ssh_config); another client \
+                 has to ask for that CONNECT itself",
+                dest.host,
+                ports.join(",")
+            ));
+        }
     }
     if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
         // An `sbx app <name>` launch tags its egress stats with the app, so `sbx net stats --app`
@@ -4668,8 +4681,10 @@ fn build(
         net_policy(&prep.cfg.network),
         &egress_contract,
         // The `tcp://` destinations get `/etc/hosts` entries pointing at the addresses the preamble
-        // above listens on, so a declaration reads the same inside the cage as outside it.
-        &tcp_plan.destinations,
+        // above listens on, so a declaration reads the same inside the cage as outside it — and the
+        // ones whose port is privileged, which can have no such listener, get a generated ssh
+        // `ProxyCommand` toward the cage's CONNECT proxy instead.
+        &tcp_plan,
         // The trusted seccomp relaxation from the resolved (post-`merge_app`) config, so an app's
         // `[seccomp] allow` union is in effect for `sbx app`, exactly like its limits.
         prep.cfg.seccomp.clone(),

@@ -64,6 +64,13 @@ pub(super) const SANDBOX_ENV: &str = "/usr/bin/env";
 /// it owns no data, opens nothing.
 const XDG_OPEN_INCAGE: &str = "/usr/bin/xdg-open";
 
+/// Where the synthetic ssh client config is bound read-only. This is OpenSSH's compiled-in
+/// **system-wide** path (verified against the binary the cage actually runs), which is the last file
+/// an ssh client reads: since the first value obtained for a keyword wins, a `~/.ssh/config` block
+/// of the cage's own overrides everything written here. A hermetic cage carries no `/etc/ssh`, so
+/// this shadows nothing.
+pub(crate) const SSH_CONFIG_INCAGE: &str = "/etc/ssh/ssh_config";
+
 /// The synthetic `xdg-open` body. POSIX `sh` (the cage's `/bin/sh`), prints every
 /// argument (the common call is a single file or URL) to stderr with an `sbx:`
 /// prefix, then exits 0. Robust to any argv a tool passes: it never inspects or
@@ -234,6 +241,9 @@ struct SandboxPaths<'a> {
     xdg_open_src: &'a Path,
     /// Synthetic `/etc/hosts`; bound read-only at `/etc/hosts`.
     hosts_src: &'a Path,
+    /// Synthetic system-wide ssh client config; bound read-only at `/etc/ssh/ssh_config`. `None`
+    /// when no declared destination needs one, so no cage carries a file with nothing in it.
+    ssh_config_src: Option<&'a Path>,
     /// Synthetic `/etc/machine-id`; bound read-only at `/etc/machine-id` and
     /// `/var/lib/dbus/machine-id`.
     machine_id_src: &'a Path,
@@ -443,6 +453,19 @@ fn assemble(
         mounts.push(Mount::Bind {
             src: src.to_path_buf(),
             dest: PathBuf::from(MISE_PROJECT_INCAGE),
+        });
+    }
+
+    // Zone 1 — the synthetic system-wide ssh client config, present only when a declared `tcp://`
+    // destination needs one: a privileged port gets no in-cage listener, so ssh has to ask the
+    // cage's CONNECT proxy for it, and this is where that instruction is written. Read-only and
+    // sourced from outside every writable mount, like the other synthetic `/etc` files. It is the
+    // *system-wide* path on purpose — the last file ssh consults — so the cage's own
+    // `~/.ssh/config` still wins, which keeps this an affordance rather than a constraint.
+    if let Some(src) = paths.ssh_config_src {
+        mounts.push(Mount::RoBind {
+            src: src.to_path_buf(),
+            dest: PathBuf::from(SSH_CONFIG_INCAGE),
         });
     }
 
@@ -1129,7 +1152,7 @@ pub(crate) fn build_spec(
     extra_binds: &[ExtraBind],
     net: NetPolicy,
     egress_contract: &str,
-    tcp_destinations: &[super::egress::TcpDestination],
+    tcp: &super::egress::TcpPlan,
     seccomp: super::seccomp::SeccompPolicy,
     devices: &[PathBuf],
     cmd: Vec<OsString>,
@@ -1207,8 +1230,26 @@ pub(crate) fn build_spec(
     let hosts = rt.etc_dir.join("hosts");
     write_atomic(
         &hosts,
-        hosts_contents(&super::naming::cage_hostname(&slug), tcp_destinations).as_bytes(),
+        hosts_contents(&super::naming::cage_hostname(&slug), &tcp.destinations).as_bytes(),
     )?;
+
+    // The synthetic ssh client config, materialized beside the other synthetic `/etc` files (and,
+    // like them, outside every writable mount — the agent may override it from its own home, but
+    // not rewrite the file the cage is handed). Written only when a declared destination needs one;
+    // otherwise no such mount exists at all. A stale file from a previous launch of the same home is
+    // removed rather than left behind, so the cage never reads a rule the current config dropped.
+    let ssh_config = rt.etc_dir.join("ssh_config");
+    let ssh_config_src =
+        match super::egress::ssh_config_contents(&userland.socat_bin, &tcp.connect_only) {
+            Some(contents) => {
+                write_atomic(&ssh_config, contents.as_bytes())?;
+                Some(ssh_config.as_path())
+            }
+            None => {
+                let _ = std::fs::remove_file(&ssh_config);
+                None
+            }
+        };
 
     // A synthetic `/etc/machine-id`, stable per app-home and unique per home, materialized beside
     // the other synthetic `/etc` files (outside every writable mount, so the agent has no writable
@@ -1229,6 +1270,7 @@ pub(crate) fn build_spec(
         contract_src: &contract,
         xdg_open_src: &xdg_open,
         hosts_src: &hosts,
+        ssh_config_src,
         machine_id_src: &machine_id,
     };
     assemble(
@@ -1315,6 +1357,10 @@ mod tests {
     }
 
     fn assembled() -> SandboxSpec {
+        assembled_with_ssh_config(None)
+    }
+
+    fn assembled_with_ssh_config(ssh_config_src: Option<&Path>) -> SandboxSpec {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
             home_src: Path::new("/data/sbx/projects/abc/home"),
@@ -1326,6 +1372,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            ssh_config_src,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
@@ -1423,6 +1470,33 @@ mod tests {
                 "bound from the synthetic source"
             ),
             other => panic!("/etc/hosts must be a read-only bind, got {other:?}"),
+        }
+    }
+
+    /// The generated ssh config is mounted only when something needs it, and then read-only from
+    /// the synthetic source — the agent may override it from its own `~/.ssh/config` (this is the
+    /// lowest-precedence file ssh reads), but it cannot rewrite the one the cage was handed.
+    #[test]
+    fn the_ssh_config_is_mounted_read_only_and_only_when_needed() {
+        let bare = assembled();
+        assert!(
+            !bare
+                .mounts
+                .iter()
+                .any(|m| m.dest() == Path::new(SSH_CONFIG_INCAGE)),
+            "no CONNECT-only destination, no file"
+        );
+
+        let src = Path::new("/data/sbx/projects/abc/etc/ssh_config");
+        let spec = assembled_with_ssh_config(Some(src));
+        let mount = spec
+            .mounts
+            .iter()
+            .find(|m| m.dest() == Path::new(SSH_CONFIG_INCAGE))
+            .expect("the ssh config is mounted");
+        match mount {
+            Mount::RoBind { src: got, .. } => assert_eq!(got.as_path(), src),
+            other => panic!("the ssh config must be a read-only bind, got {other:?}"),
         }
     }
 
@@ -1608,6 +1682,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
@@ -1791,6 +1866,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
@@ -1866,6 +1942,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let overlay = Overlay {
@@ -2175,6 +2252,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
+            ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
         };
         let nix = NixMount {
@@ -2450,6 +2528,7 @@ mod tests {
             contract_src: Path::new("/store/egress-contract.md"),
             xdg_open_src: Path::new("/data/sbx/apps/demo-app/etc/xdg-open"),
             hosts_src: Path::new("/data/sbx/apps/demo-app/etc/hosts"),
+            ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/apps/demo-app/etc/machine-id"),
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
@@ -2565,7 +2644,7 @@ mod tests {
             &[],
             NetPolicy::Shared,
             "",
-            &[],
+            &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             vec![OsString::from("/bin/sh")],
@@ -2716,7 +2795,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
-            &[],
+            &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,
@@ -2873,7 +2952,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
-            &[],
+            &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             vec![foreign.clone().into_os_string()],
@@ -2918,7 +2997,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
-            &[],
+            &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             vec![OsString::from("hello")],
@@ -3060,7 +3139,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
-            &[],
+            &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,
@@ -3229,7 +3308,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
-            &[],
+            &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,
@@ -3396,7 +3475,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
-            &[],
+            &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,
@@ -3523,7 +3602,7 @@ mod smoke {
                 &[],
                 NetPolicy::Shared,
                 "",
-                &[],
+                &Default::default(),
                 crate::sandbox::seccomp::SeccompPolicy::default(),
                 &[],
                 cmd,
@@ -3652,7 +3731,7 @@ mod smoke {
             &[],
             NetPolicy::Shared,
             "",
-            &[],
+            &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             cmd,

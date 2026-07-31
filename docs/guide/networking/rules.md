@@ -307,12 +307,33 @@ and a non-loopback IP literal get no listener — reported at launch, since the 
 proxy and only the convenience is missing.
 
 A **port below 1024** gets no listener either, for a reason that cannot be worked around: binding
-one needs `CAP_NET_BIND_SERVICE` and the cage holds no capability at all. That covers ssh, so
-`tcp://github.com:22` is a valid rule the proxy honors, reached with an explicit `CONNECT`:
+one needs `CAP_NET_BIND_SERVICE` and the cage holds no capability at all. That covers ssh — and for
+ssh sbx writes the way through itself. A `tcp://<host>:<port below 1024>` rule puts a `ProxyCommand`
+for that host in the cage's system-wide `/etc/ssh/ssh_config`, pointing at the cage's own `CONNECT`
+proxy, so the ordinary command works as written:
 
 ```bash
-ssh -o 'ProxyCommand=socat - PROXY:127.0.0.1:%h:%p,proxyport=18043' git@github.com
+ssh git@github.com      # and `git push`, `git clone git@…`, `scp`, `rsync -e ssh`
 ```
+
+sbx says so at launch, because the same is *not* true of a non-ssh client on such a port — it has to
+ask for the `CONNECT` itself:
+
+```
+sbx: note: tcp://github.com:22 is a privileged port, which the cage cannot listen on — ssh reaches
+     it through the cage's CONNECT proxy (wired in /etc/ssh/ssh_config); another client has to ask
+     for that CONNECT itself
+```
+
+```bash
+socat - PROXY:127.0.0.1:%h:%p,proxyport=18043      # what that ask looks like
+```
+
+The generated file is read-only and holds nothing but a `Host` block per declared destination. It is
+the **system-wide** config, the last file ssh reads, so a `~/.ssh/config` of your own inside the cage
+overrides it (measured, both ways). It changes nothing about what is reachable: the rule the proxy
+enforces is the fence, and an undeclared host or port is refused whether or not a client finds this
+file.
 
 See [`[ssh_agent]`](../configuration/ssh-agent.md), which is the other half of git-over-ssh.
 

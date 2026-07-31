@@ -1144,7 +1144,10 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 /// private in-cage portal, so nothing writes there any more; sweeping it reclaims the residue an
 /// older version left behind, after which the directory simply stays empty.
 const RUNTIME_DIRS: &[(&str, &[&str])] = &[
-    ("egress", &["ca-", "proxy-", "control-", "hosts-"]),
+    (
+        "egress",
+        &["ca-", "proxy-", "control-", "hosts-", "sshcfg-"],
+    ),
     ("ssh-agent", &["agent-"]),
     ("forward", &["fwd-"]),
     ("portal", &[""]),
