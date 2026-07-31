@@ -95,6 +95,37 @@ the source: grant a key whose **own** authority is narrow.
   listing shows every key), so the launch note and `sbx config show` read the same either
   way — the constraint bites at use, not at admission.
 
+- Require a **confirmation for every use**, and each signature the cage asks for becomes a
+  prompt **on your desktop**:
+
+  ```bash
+  ssh-add -c ~/.ssh/id_deploy
+  ```
+
+  Verified both directions through the broker: approving yields the signature; refusing
+  gives the cage `agent refused operation` and no signature. The prompt is raised by your
+  agent, on the host — the cage has no way to see it, answer it, or suppress it. Note it
+  fires on the **signature**, not on the offer: an ssh login where the server rejects the
+  key outright never reaches the signing step, so no prompt appears.
+
+## There is no password to set — and that is the point
+
+There is no field for one, in either direction:
+
+- **The key's passphrase stays on the host.** You type it once into `ssh-add`, and your
+  agent holds the unlocked key from then on. sbx never sees the passphrase, never asks for
+  it, and has nowhere to store it — putting it in a config file would move the secret to
+  exactly the place this feature exists to keep it out of.
+- **The broker socket has no password**, and one would buy nothing: it is a socket in a
+  `0700` directory, and the cage runs as your own uid. Anything on the host running as you
+  can already talk to your real agent directly.
+- **Password-based ssh login is a different thing entirely.** A password typed by an ssh
+  client *inside* the cage is a secret the cage holds — the [exposed tier](../secrets/README.md),
+  not this one. If a destination only takes passwords, the agent cannot help; use a key.
+
+The nearest thing to "ask me for a password each time" is `ssh-add -c` above: not a secret
+to declare, a confirmation you give.
+
 ## It needs egress too — and port 22 needs a `ProxyCommand`
 
 The broker rides a Unix socket, so it is independent of the network posture — and equally,
@@ -168,8 +199,9 @@ by the same config, unless a future field says otherwise.
 
 ## Residuals
 
-- **No per-signature prompt.** Every request from an admitted key is granted silently.
-  (`ssh-add -c` on the host still applies — your agent asks you, not sbx.)
+- **No per-signature prompt from sbx.** Every request from an admitted key is granted
+  silently by the broker. Per-use confirmation exists, but it is your agent's
+  (`ssh-add -c`, above), not a field here.
 - **No per-destination fence in sbx.** Destination constraints exist, enforced by your own
   agent, as above.
 - **No signature counter.** The grant is reported at launch; individual signatures are not
