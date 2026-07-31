@@ -270,10 +270,12 @@ run_task() {{
     fi
     if [ -n "$refused" ]; then
         printf 'sbx: warning: the operation was not allowed to run:\n' >&2
-        printf '%s' "$refused" | while IFS= read -r target; do
-            [ -n "$target" ] && printf '  %s\n' "$target" >&2
+        # Each line arrives as "<caller> <target>": what may run depends on who is running it, so the
+        # target alone would send a reader to add an entry that may already be there.
+        printf '%s' "$refused" | while IFS= read -r refusal; do
+            [ -n "$refusal" ] && printf '  %s  ->  %s\n' "${{refusal%% *}}" "${{refusal#* }}" >&2
         done
-        printf 'sbx: note: this operation declares `spawn`; a program it needs must be listed there.\n' >&2
+        printf 'sbx: note: this operation declares `spawn`; list the target there when the caller is the command itself, and under `[task.<name>.exec.<caller>]` otherwise.\n' >&2
     fi
     if [ "$redacted" != 0 ]; then
         if [ -n "$nonce" ]; then

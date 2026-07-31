@@ -261,13 +261,14 @@ pub(crate) struct TaskOutcome {
     /// told; reporting it anyway is what makes "the operation produced something" visible at the
     /// point of use rather than something to go and check.
     pub(crate) output: Option<(String, u64)>,
-    /// The exec targets `spawn` refused during this invocation, if any.
+    /// The `execve`s `spawn` refused during this invocation, if any — each as the program that
+    /// reached and the program it reached for.
     ///
     /// Reported for the same reason as `truncated`: the refusal is invisible in the result. The
     /// `execve` returns an error to a process that decides for itself whether to mention it, and
     /// several say nothing at all — leaving a caller an empty output and a success code with no
     /// account of either. A refusal a caller cannot see is one they would debug as a broken command.
-    pub(crate) refused: Vec<String>,
+    pub(crate) refused: Vec<super::proc_enforce::Refusal>,
 }
 
 /// Draw this invocation's substitution nonce: 6 hex characters from the system CSPRNG (already in the
@@ -1101,6 +1102,11 @@ impl TaskEngine {
                 consider(pool, Path::new(super::taskpool::POOL_INCAGE));
             }
         }
+        // The project, read-only at the path it occupies on the host. Bound when the cage is built
+        // rather than carried in the base list, and it has to be named here too: a command that is a
+        // script in the repository is reachable only through this mapping, and without it the file
+        // could not be read to see what runs it.
+        consider(&self.project, &self.project);
         best.map(|(_, p)| p)
     }
 
@@ -1217,6 +1223,52 @@ impl TaskEngine {
         }
     }
 
+    /// The program a cage path is **entered as**: itself for a binary, its interpreter for a script.
+    ///
+    /// A `#!` line is read by the kernel inside the `execve` that named the script — there is no
+    /// second syscall — so nothing observes the script as a running program. Only the interpreter
+    /// runs, and only the interpreter can be the caller of anything the script goes on to do.
+    ///
+    /// Read from the file rather than assumed, and followed through an interpreter that is itself a
+    /// script, which the kernel does not do (Linux runs one `#!` hop) but a reader might write. The
+    /// hop cap is what a loop meets; an unreadable file is left as itself, and the policy then simply
+    /// governs a program that never appears — fail-closed.
+    fn entered_as(&self, incage: &str, task: &TaskSpec) -> String {
+        const MAX_HOPS: usize = 4;
+        let mut cur = incage.to_string();
+        for _ in 0..MAX_HOPS {
+            let Some(interpreter) = self.shebang_of(&cur, task) else {
+                break;
+            };
+            cur = interpreter;
+        }
+        cur
+    }
+
+    /// The interpreter a cage path's `#!` line names, or `None` when the file is not a script.
+    ///
+    /// Only the first token after `#!` — Linux passes the rest as a single argument to the
+    /// interpreter, so `#!/usr/bin/env bash` runs **`env`**, and it is `env` that goes on to run
+    /// bash. Reporting `bash` here would name a program that is not what the process becomes.
+    fn shebang_of(&self, incage: &str, task: &TaskSpec) -> Option<String> {
+        use std::io::Read;
+        // The kernel reads at most one BINPRM_BUF_SIZE page of `#!` line; far less is enough to
+        // decide, and a bounded read keeps a named pipe or a huge binary from being pulled in.
+        const PROBE: usize = 512;
+        let host = self.host_path(Path::new(incage), task)?;
+        let mut head = [0u8; PROBE];
+        let read = std::fs::File::open(&host).ok()?.read(&mut head).ok()?;
+        let line = head[..read].split(|b| *b == b'\n').next()?;
+        let rest = line.strip_prefix(b"#!")?;
+        let interpreter = std::str::from_utf8(rest).ok()?.split_whitespace().next()?;
+        // A relative interpreter is resolved against the caller's working directory, which is not a
+        // fact this policy has. Leaving it unresolved keeps the node honest rather than inventing a
+        // path that would match nothing anyway.
+        interpreter
+            .starts_with('/')
+            .then(|| interpreter.to_string())
+    }
+
     /// The exec policy for one invocation: what each program may run, keyed by the program running
     /// it, with every name resolved to the absolute in-cage path it will run as.
     fn spawn_policy(
@@ -1265,7 +1317,13 @@ impl TaskEngine {
                 .map(|e| self.resolve_spawn_entry(e, &path_dirs, task))
                 .collect()
         };
-        node(&task.cmd[0], &command, resolve_all(declared)?)?;
+        // The command's node is keyed by what the command's process actually **is**, which for a
+        // script is its interpreter: the kernel loads that interpreter inside the very `execve` that
+        // started the script, so from its first instruction the process is `bash`, `python`, `env` —
+        // never the file. Keyed by the file, the node would govern a caller that never exists, and
+        // its whole list would sit there being read by nothing.
+        let entered_as = self.entered_as(&command, task);
+        node(&task.cmd[0], &entered_as, resolve_all(declared)?)?;
         for (program, entries) in &task.exec {
             let incage = self.resolve_spawn_entry(program, &path_dirs, task)?;
             self.warn_if_multicall(program, &incage, task);
@@ -2563,7 +2621,10 @@ mod tests {
         std::fs::create_dir_all(&bin).expect("the store bin");
         for p in programs {
             let path = bin.join(p);
-            std::fs::write(&path, b"#!/bin/true\n").expect("the program");
+            // An ELF header's first bytes, so these stand for *binaries*: a `#!` here would make
+            // every fixture program a script, and the policy keys a program's node on what it is
+            // entered as — which for a script is its interpreter, not the file.
+            std::fs::write(&path, b"\x7fELF\x02\x01\x01\x00").expect("the program");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("executable");
         }
@@ -2667,6 +2728,44 @@ mod tests {
         assert_eq!(
             policy.decide(&[], "/nix/store/demo/bin/less"),
             Verdict::Deny
+        );
+    }
+
+    /// A script's `spawn` governs its **interpreter**. The kernel loads that interpreter inside the
+    /// very `execve` that named the script, so from its first instruction the process is the
+    /// interpreter and the script is never a running program — a node keyed on the file would sit
+    /// there being read by nothing, and everything the script ran would be refused with the target
+    /// named in a list that was already naming it.
+    #[test]
+    fn a_script_commands_node_is_keyed_on_the_interpreter_that_runs_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::testutil::TmpDir::new();
+        let mut task = task();
+        task.cmd = vec!["/nix/store/demo/bin/report.sh".to_string()];
+        task.spawn = Some(vec!["less".to_string()]);
+        let engine = engine_with_store(root.path(), &["sh", "less"], vec![task.clone()]);
+        let script = root.path().join("nix/store/demo/bin/report.sh");
+        std::fs::write(&script, b"#!/nix/store/demo/bin/sh -e\nless\n").expect("the script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+        let policy = engine
+            .spawn_policy(&task, task.spawn.as_ref().unwrap(), &engine.base_env)
+            .expect("a policy");
+        use crate::proc_policy::Verdict;
+        // Only the first token of the `#!` line: Linux hands the rest to the interpreter as one
+        // argument, so `-e` is an argument and not a second program.
+        assert_eq!(
+            policy.decide(
+                &["/nix/store/demo/bin/sh".to_string()],
+                "/nix/store/demo/bin/less"
+            ),
+            Verdict::Allow,
+            "the interpreter is what the declaration governs"
+        );
+        assert_eq!(
+            policy.decide(&[task.cmd[0].clone()], "/nix/store/demo/bin/less"),
+            Verdict::Deny,
+            "and the file itself never runs, so a node on it would be read by nothing"
         );
     }
 

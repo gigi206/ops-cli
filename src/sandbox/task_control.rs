@@ -611,12 +611,18 @@ fn write_outcome(writer: &mut UnixStream, id: u64, outcome: &TaskOutcome) -> io:
     if let Some(nonce) = &outcome.nonce {
         writeln!(writer, "nonce {nonce}")?;
     }
-    // What `spawn` refused. One line per target, because which program was refused is the whole
+    // What `spawn` refused. One line per `execve`, because which program was refused is the whole
     // content of the report — a count would say "something you declared is missing" and leave the
-    // caller to guess which. The path carries no space (it is an exec target the cage resolved), so
-    // the line-based framing holds.
-    for target in &outcome.refused {
-        writeln!(writer, "refused-exec {target}")?;
+    // caller to guess which. Two paths, caller first: what may run depends on who is running it, so
+    // the target alone can send a reader to add an entry that is already there. Neither carries a
+    // space (both are exec paths the cage resolved), so the line-based framing holds; the caller is
+    // `-` when the policy decided by target alone, keeping the field count fixed.
+    for refusal in &outcome.refused {
+        let caller = match refusal.caller.is_empty() {
+            true => "-",
+            false => &refusal.caller,
+        };
+        writeln!(writer, "refused-exec {caller} {}", refusal.target)?;
     }
     // Where the invocation left its artifacts, as the caller's own cage sees the path, with the size
     // so "it produced something" is visible without going to look.
@@ -942,9 +948,10 @@ pub(crate) mod client {
         pub(crate) nonce: Option<String>,
         /// The refusal message when the plane answered `err …`.
         pub(crate) error: Option<String>,
-        /// The exec targets `spawn` refused during the invocation. Carried because the refusal is
-        /// invisible in the result otherwise — the refused program decides whether to mention it.
-        pub(crate) refused: Vec<String>,
+        /// The `execve`s `spawn` refused during the invocation, each as the program that reached and
+        /// the program it reached for. Carried because the refusal is invisible in the result
+        /// otherwise — the refused program decides whether to mention it.
+        pub(crate) refused: Vec<crate::sandbox::proc_enforce::Refusal>,
         /// Where the invocation left its artifacts, and how many bytes.
         pub(crate) output: Option<(String, u64)>,
     }
@@ -974,7 +981,16 @@ pub(crate) mod client {
                 "stopped" => out.stopped = value == "1",
                 "elapsed-ms" => out.elapsed_ms = value.parse().unwrap_or(0),
                 "nonce" => out.nonce = Some(value.to_string()),
-                "refused-exec" => out.refused.push(value.to_string()),
+                "refused-exec" => {
+                    let (caller, target) = value.split_once(' ').unwrap_or(("-", value));
+                    out.refused.push(crate::sandbox::proc_enforce::Refusal {
+                        caller: match caller {
+                            "-" => String::new(),
+                            named => named.to_string(),
+                        },
+                        target: target.to_string(),
+                    });
+                }
                 "output" => {
                     if let Some((bytes, path)) = value.split_once(' ') {
                         out.output = Some((path.to_string(), bytes.parse().unwrap_or(0)));
@@ -1691,8 +1707,14 @@ mod tests {
             elapsed_ms: 4,
             nonce: None,
             refused: vec![
-                "/nix/store/demo/bin/sh".to_string(),
-                "/nix/store/demo/bin/base64".to_string(),
+                crate::sandbox::proc_enforce::Refusal {
+                    caller: "/nix/store/demo/bin/psql".to_string(),
+                    target: "/nix/store/demo/bin/sh".to_string(),
+                },
+                crate::sandbox::proc_enforce::Refusal {
+                    caller: String::new(),
+                    target: "/nix/store/demo/bin/base64".to_string(),
+                },
             ],
             output: None,
         };
@@ -1730,6 +1752,11 @@ mod tests {
         assert!(
             err.contains("/nix/store/demo/bin/sh") && err.contains("/nix/store/demo/bin/base64"),
             "and must name every target, since which one is the whole content: {err}"
+        );
+        assert!(
+            err.contains("/nix/store/demo/bin/psql  ->  /nix/store/demo/bin/sh"),
+            "with the caller beside it — the target alone would send a reader to add an entry that \
+             is already there: {err}"
         );
         assert!(
             err.contains("`spawn`"),

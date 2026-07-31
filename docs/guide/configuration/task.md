@@ -443,10 +443,51 @@ That refusal — and the one for a program that is nowhere in the cage — arriv
 is invoked**, not at load: which binary a name reaches is a fact about the cage, and there is no cage
 until then. So a task can list cleanly and refuse on its first run, naming the program either way.
 
-**A refusal names what was refused, and only what was there.** Looking up a program by name issues
-one `execve` per `PATH` entry until one succeeds, so a program found in the fourth directory leaves
-three refusals of files that never existed. Those are not reported — they are what a cage with no
-policy at all would produce.
+**A refusal names who reached and what for**, because under this model the target alone misleads — a
+program can be declared and still refused, to whoever reached for it:
+
+```console
+sbx: warning: the operation was not allowed to run:
+  /nix/store/…/bin/git  →  /nix/store/…/libexec/git-core/git-remote-https
+sbx: note: this operation declares `spawn`; list the target there when the caller is the command
+       itself, and under `[task.<name>.exec.<caller>]` otherwise.
+```
+
+Only what was **there** is reported. Looking up a program by name issues one `execve` per `PATH`
+entry until one succeeds, so a program found in the fourth directory leaves three refusals of files
+that never existed — those are what a cage with no policy at all would produce.
+
+### When the command is a script
+
+A `#!` line is read by the kernel **inside** the `execve` that named the script: there is no second
+call, and nothing ever observes the script as a running program. Only the interpreter runs. So
+`spawn` on a script task says what its **interpreter** may run, and sbx keys it that way — a node on
+the file would govern a caller that never exists.
+
+With the interpreter named by path, that is invisible and everything reads as expected:
+
+```toml
+[task.report]
+cmd   = ["/srv/repo/report.sh"]   # #!/bin/sh
+spawn = ["git"]                   # what the shell running it may run
+```
+
+`#!/usr/bin/env bash` has one more step, and it is a real one — Linux runs **`env`**, passing `bash`
+as its argument, and it is `env` that goes on to run bash:
+
+```toml
+[task.report]
+cmd   = ["/srv/repo/report.sh"]   # #!/usr/bin/env bash
+spawn = ["bash"]                  # env runs bash
+
+[task.report.exec.bash]
+spawn = ["git"]                   # bash runs git
+```
+
+Leave the second line out and the refusal reads
+`/nix/store/…/bin/coreutils  →  /nix/store/…/bin/bash` — `coreutils` because `env` is one of its
+hundred names, as [above](#what-each-program-may-run-in-turn-execprogram). That caller is the
+command's own entry point, so what it may run is `spawn`.
 
 **What it is not.** It bounds what the command *runs*; it does not bound what the command *itself*
 does with the values the caller supplies. Both come back to `params` being the caller's lever, which

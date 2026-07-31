@@ -55,6 +55,12 @@ pub(crate) struct ExecEvent {
     /// `observe` — it records what ran, not a decision. A short, fixed token, so it is safe before the
     /// verbatim `command` on the wire.
     pub(crate) verdict: String,
+    /// The program that issued the `execve`, as its own executable — empty when the policy did not
+    /// need to know (the flat model decides by target alone, so asking would be a syscall spent on
+    /// an answer nobody reads). Where a policy decides **by caller**, this is the other half of the
+    /// fact: a refusal that names only the target reads as "you did not declare this" even when it
+    /// was declared, just not for whoever reached for it.
+    pub(crate) caller: String,
     pub(crate) command: String,
 }
 
@@ -98,13 +104,14 @@ impl ExecRing {
     /// next sequence number and evicting the oldest if the ring is full. `command` must already be
     /// sanitised of control characters and length-capped by the caller. Returns the assigned sequence.
     pub(crate) fn push(&self, pid: u32, command: &str) -> u64 {
-        self.push_verdict(pid, command, "observe")
+        self.push_verdict(pid, "", command, "observe")
     }
 
     /// Append one enforced exec (the seccomp user-notification path), tagged with its `verdict`
-    /// (`allow` / `deny` / `ask`). `command` — here the exec target path — must already be sanitised of
+    /// (`allow` / `deny` / `ask` / `absent`) and the `caller` that issued it (empty where the policy
+    /// decides by target alone). `command` — here the exec target path — must already be sanitised of
     /// control characters and length-capped by the caller. Returns the assigned sequence.
-    pub(crate) fn push_verdict(&self, pid: u32, command: &str, verdict: &str) -> u64 {
+    pub(crate) fn push_verdict(&self, pid: u32, caller: &str, command: &str, verdict: &str) -> u64 {
         let at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -117,6 +124,7 @@ impl ExecRing {
             at_epoch_ms,
             pid,
             verdict: verdict.to_string(),
+            caller: caller.to_string(),
             command: command.to_string(),
         });
         while g.events.len() > self.cap {
@@ -335,9 +343,17 @@ fn dispatch(cmd: &str, ring: &ExecRing) -> String {
 /// Format one event as a control-wire line. The fixed fields are `key=value` tokens; `cmd` is emitted
 /// **last** and taken verbatim by the reader (the command carries spaces). The observer has stripped
 /// control characters from the command, so it cannot inject a second line.
+///
+/// `by=` appears only when a caller was read, which keeps every line a policy deciding by target
+/// alone produces byte-for-byte what it produced before — and the reader ignores tokens it does not
+/// know, so neither side has to be the newer one.
 fn format_event_line(ev: &ExecEvent) -> String {
+    let by = match ev.caller.is_empty() {
+        true => String::new(),
+        false => format!("by={} ", ev.caller),
+    };
     format!(
-        "event seq={} at={} pid={} verdict={} cmd={}\n",
+        "event seq={} at={} pid={} verdict={} {by}cmd={}\n",
         ev.seq, ev.at_epoch_ms, ev.pid, ev.verdict, ev.command
     )
 }
@@ -550,7 +566,8 @@ fn parse_event_line(line: &str) -> Option<ExecEvent> {
         Some((h, c)) => (h, c.to_string()),
         None => return None,
     };
-    let (mut seq, mut at, mut pid, mut verdict) = (None, None, None, String::new());
+    let (mut seq, mut at, mut pid) = (None, None, None);
+    let (mut verdict, mut caller) = (String::new(), String::new());
     for token in head.split_whitespace() {
         let (key, value) = token.split_once('=')?;
         match key {
@@ -558,6 +575,7 @@ fn parse_event_line(line: &str) -> Option<ExecEvent> {
             "at" => at = value.parse().ok(),
             "pid" => pid = value.parse().ok(),
             "verdict" => verdict = value.to_string(),
+            "by" => caller = value.to_string(),
             _ => {}
         }
     }
@@ -566,6 +584,7 @@ fn parse_event_line(line: &str) -> Option<ExecEvent> {
         at_epoch_ms: at?,
         pid: pid?,
         verdict,
+        caller,
         command,
     })
 }
@@ -630,11 +649,30 @@ mod tests {
             at_epoch_ms: 1_700_000_000_123,
             pid: 4242,
             verdict: "deny".to_string(),
+            caller: "/nix/store/x/bin/bash".to_string(),
             command: "sh -c FOO=bar cmd=baz --flag=v".to_string(),
         };
         let line = format_event_line(&ev);
         let line = line.trim_end();
         assert_eq!(parse_event_line(line), Some(ev));
+    }
+
+    /// A policy that decides by target alone reads no caller, and the line it produces must be the
+    /// one it produced before there was a field for it — a reader on either side of the change sees
+    /// the same bytes.
+    #[test]
+    fn an_event_with_no_caller_carries_no_field_for_one() {
+        let ev = ExecEvent {
+            seq: 1,
+            at_epoch_ms: 2,
+            pid: 3,
+            verdict: "allow".to_string(),
+            caller: String::new(),
+            command: "/bin/rg".to_string(),
+        };
+        let line = format_event_line(&ev);
+        assert_eq!(line, "event seq=1 at=2 pid=3 verdict=allow cmd=/bin/rg\n");
+        assert_eq!(parse_event_line(line.trim_end()), Some(ev));
     }
 
     #[test]

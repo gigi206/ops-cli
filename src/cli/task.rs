@@ -791,10 +791,20 @@ fn task_run(args: &[OsString]) -> ExitCode {
     // so an empty output would otherwise read as a command that simply found nothing.
     if !result.refused.is_empty() {
         diag::warn("the operation was not allowed to run:");
-        for target in &result.refused {
-            eprintln!("  {target}");
+        // Caller first, then what it reached for. Under a policy where what may run depends on who
+        // is running it, the target alone misleads: a program can be declared and still refused —
+        // to whoever reached for it — and a reader told only the target goes to add an entry that
+        // is already there.
+        for refusal in &result.refused {
+            match refusal.caller.is_empty() {
+                true => eprintln!("  {}", refusal.target),
+                false => eprintln!("  {}  →  {}", refusal.caller, refusal.target),
+            }
         }
-        diag::note("this operation declares `spawn`; a program it needs must be listed there.");
+        diag::note(
+            "this operation declares `spawn`; list the target there when the caller is the command \
+             itself, and under `[task.<name>.exec.<caller>]` otherwise.",
+        );
     }
     if result.redacted > 0 {
         let named = match &result.nonce {
@@ -843,8 +853,9 @@ struct RunView<'a> {
     /// This invocation's substitution nonce, when the operation enabled it — the out-of-band half of
     /// an unforgeable `${NAME@nonce}` placeholder.
     nonce: Option<&'a str>,
-    /// What `spawn` refused to let the command run. Empty unless the operation confines exec.
-    refused: &'a [String],
+    /// What `spawn` refused, each as the program that reached and the one it reached for. Empty
+    /// unless the operation confines exec.
+    refused: Vec<RunRefusalView<'a>>,
     /// Where the invocation left its artifacts, when the operation declares `output`.
     output: Option<RunOutputView<'a>>,
     /// Why the plane refused, or `null`. Non-null means nothing was executed.
@@ -855,6 +866,15 @@ struct RunView<'a> {
 struct RunOutputView<'a> {
     path: &'a str,
     bytes: u64,
+}
+
+/// One refused `execve`. Two fields rather than one rendered string, because a reader that parses
+/// this is deciding which node to add the target to, and that is `caller`'s answer.
+#[derive(serde::Serialize)]
+struct RunRefusalView<'a> {
+    /// The program that issued it, or `null` where the policy decided by target alone.
+    caller: Option<&'a str>,
+    target: &'a str,
 }
 
 /// The document's model. Pure, so what the fields mean is pinned by a test rather than by a live
@@ -875,7 +895,14 @@ fn run_view<'a>(name: &'a str, result: &'a client::RunResult) -> RunView<'a> {
         elapsed_ms: result.elapsed_ms,
         redacted: result.redacted,
         nonce: result.nonce.as_deref(),
-        refused: &result.refused,
+        refused: result
+            .refused
+            .iter()
+            .map(|r| RunRefusalView {
+                caller: (!r.caller.is_empty()).then_some(r.caller.as_str()),
+                target: &r.target,
+            })
+            .collect(),
         output: result.output.as_ref().map(|(path, bytes)| RunOutputView {
             path,
             bytes: *bytes,
@@ -1825,7 +1852,10 @@ mod tests {
             elapsed_ms: 412,
             nonce: Some("a91f3c".to_string()),
             error: None,
-            refused: vec!["/nix/store/x/bin/curl".to_string()],
+            refused: vec![crate::sandbox::proc_enforce::Refusal {
+                caller: "/nix/store/x/bin/bash".to_string(),
+                target: "/nix/store/x/bin/curl".to_string(),
+            }],
             output: Some(("/opt/sbx/task-out/dump".to_string(), 4096)),
         };
         let doc: serde_json::Value = serde_json::from_str(
@@ -1842,7 +1872,10 @@ mod tests {
         assert_eq!(doc["timed_out"], true);
         assert_eq!(doc["truncated"], true);
         assert_eq!(doc["stopped"], false);
-        assert_eq!(doc["refused"][0], "/nix/store/x/bin/curl");
+        // Two fields, not one rendered line: a reader parsing this is deciding which node the
+        // target belongs under, and that is what `caller` answers.
+        assert_eq!(doc["refused"][0]["target"], "/nix/store/x/bin/curl");
+        assert_eq!(doc["refused"][0]["caller"], "/nix/store/x/bin/bash");
         assert_eq!(doc["output"]["path"], "/opt/sbx/task-out/dump");
         assert_eq!(doc["output"]["bytes"], 4096);
         assert!(doc["error"].is_null());

@@ -232,15 +232,34 @@ impl ProcEnforce {
     /// passes through, and reporting those would announce a handful of refusals every time a program
     /// is found somewhere other than the first entry — while the run succeeded and nothing was kept
     /// from it.
-    pub(crate) fn refusals(&self) -> Vec<String> {
-        let mut seen = Vec::new();
+    pub(crate) fn refusals(&self) -> Vec<Refusal> {
+        let mut seen: Vec<Refusal> = Vec::new();
         for event in self.ring.snapshot(None).events {
-            if event.verdict == "deny" && !seen.contains(&event.command) {
-                seen.push(event.command);
+            if event.verdict != "deny" {
+                continue;
+            }
+            let refusal = Refusal {
+                caller: event.caller,
+                target: event.command,
+            };
+            if !seen.contains(&refusal) {
+                seen.push(refusal);
             }
         }
         seen
     }
+}
+
+/// One `execve` a policy stopped: who reached, and for what.
+///
+/// Both halves, because under a per-caller policy the target alone misleads. A program can be
+/// declared and still refused — to whoever reached for it — and a report naming only the target
+/// sends its reader to add an entry that is already there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    /// The caller's own executable, or empty where the policy decided by target alone.
+    pub(crate) caller: String,
+    pub(crate) target: String,
 }
 
 impl Drop for ProcEnforce {
@@ -487,6 +506,7 @@ fn handle_notif(
         return;
     }
     let path = read_exec_path(req.pid, req.data.args[0]).unwrap_or_default();
+    let caller = caller_chain(policy, req.pid);
     let verdict = if path.is_empty() {
         // Could not read the path: fall back to the mode's unmatched default rather than guessing a
         // name match — allow under a denylist, park under ask, refuse under an allowlist (where an
@@ -495,16 +515,17 @@ fn handle_notif(
     } else {
         // Decide against the config policy folded with the live `--session` overlay (deny wins across
         // both). The overlay read-lock is held only for this decision.
-        overlay.decide(policy, &caller_chain(policy, req.pid), &path)
+        overlay.decide(policy, &caller, &path)
     };
     let shown = if path.is_empty() {
         "<unreadable>"
     } else {
         &path
     };
+    let by = caller.last().map(String::as_str).unwrap_or_default();
     match verdict {
         Verdict::Allow => {
-            ring.push_verdict(req.pid, shown, "allow");
+            ring.push_verdict(req.pid, by, shown, "allow");
             respond_continue(notif_fd, req.id);
         }
         Verdict::Deny => {
@@ -519,13 +540,13 @@ fn handle_notif(
             } else {
                 "deny"
             };
-            ring.push_verdict(req.pid, shown, recorded);
+            ring.push_verdict(req.pid, by, shown, recorded);
             respond_errno(notif_fd, req.id, errno);
         }
         Verdict::Ask => {
             // Park it: register the kernel notification id so the control plane can answer it later.
             // The receive loop does not block — it returns to draining the next notification.
-            ring.push_verdict(req.pid, shown, "ask");
+            ring.push_verdict(req.pid, by, shown, "ask");
             pending.park(notif_fd, req.id, req.pid, shown);
         }
     }
