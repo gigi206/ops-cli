@@ -565,9 +565,12 @@ fn handle_notif(
 /// so a double-fork does not turn a program into an unknown. It resolves symlinks, which is why the
 /// keys a policy is built from are resolved the same way and never guessed.
 ///
-/// Skipped entirely under a flat policy, where the caller decides nothing: one `readlink` is
-/// negligible beside a notification round-trip, but a syscall issued for an answer nobody reads is
-/// not negligible, it is wrong.
+/// Skipped entirely under a flat policy, where the caller decides nothing. Measured on a workload
+/// that does nothing but `execve`, the `readlink` costs ~3 µs: about a sixth of the ~17 µs the
+/// supervisor spends per notification, and a tenth of the ~31 µs enforcement adds to an `execve`.
+/// Small in absolute terms — but there is one receive loop for the whole cage, so per-notification
+/// work is a throughput ceiling and not merely a latency; and a syscall issued for an answer nobody
+/// reads is not a small cost, it is a wrong one.
 fn caller_chain(policy: &ProcPolicy, pid: u32) -> Vec<String> {
     if policy.graph.is_none() {
         return Vec::new();
