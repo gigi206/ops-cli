@@ -26,7 +26,7 @@
 //! arbitrary text (SQL with newlines, a JSON body), so it is never squeezed onto a line:
 //!
 //! ```text
-//! → LIST                          ← task <name>\tparams=a,b\torigin=<where>\t<description>… `ok`
+//! → LIST                          ← task <name>\tparams=a,b\tdeclared-in=<where>\t<desc>… `ok`
 //! → SECRETS                       ← secret <name>\t<where>\t<description>… then `ok`
 //! → RUN <name>                    ← id <n>, exit <code>, redacted <n>, truncated <0|1>,
 //!   param <key> <len>\n<bytes>       timed-out <0|1>, stopped <0|1>, elapsed-ms <n>,
@@ -389,7 +389,7 @@ fn serve_cage(
             };
             writeln!(
                 writer,
-                "task {}\tparams={}\tstdout={}\tstderr={}\ttimeout={}s{}{}\torigin={}\t{}",
+                "task {}\tparams={}\tstdout={}\tstderr={}\ttimeout={}s{}{}\tdeclared-in={}\t{}",
                 task.name,
                 params.join(","),
                 task.stdout.as_str(),
@@ -397,9 +397,11 @@ fn serve_cage(
                 task.timeout.as_secs(),
                 missing,
                 output,
-                // Which config declared it. A session can be offered operations by the project, by
-                // its app, and by each bundle the app names, and the name alone does not say which —
-                // so a caller wondering where to go and change one is told.
+                // Which config the `[task.<name>]` block is in. A session can be offered
+                // operations by the project, by its app, and by each bundle the app names, and the
+                // name alone does not say which — so a caller wondering which file to open is told.
+                // It claims the block's location and nothing more: a ceiling the block does not set
+                // is inherited, and `sbx task show` is where that is spelled out.
                 sanitize(&task.origin.label()),
                 sanitize(task.description.as_deref().unwrap_or("")),
             )?;
@@ -1070,6 +1072,8 @@ mod tests {
             spawn: None,
             output: false,
             origin: crate::config::TaskOrigin::Project,
+            timeout_from: crate::config::Ceiling::Declared,
+            max_output_from: crate::config::Ceiling::Declared,
         }
     }
 

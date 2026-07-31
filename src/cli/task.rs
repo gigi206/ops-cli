@@ -488,10 +488,13 @@ fn list_table(
     let missing = any("missing-tools", &|_| true);
     let described = parsed.iter().any(|(_, _, d)| !d.is_empty());
     // Where each operation is declared, by the same rule: worth a column when the rows disagree, and
-    // noise when a project's whole set comes from one file. `sbx task show <name>` always says it.
+    // noise when a project's whole set comes from one file. The two never overlap — rows disagree
+    // exactly when more than one source contributed, which is exactly when `sbx session ls` (which
+    // names the app and the project, but no bundle) cannot answer it. `sbx task show <name>` says it
+    // either way.
     let origins: Vec<&str> = parsed
         .iter()
-        .map(|(_, f, _)| f.get("origin").copied().unwrap_or_default())
+        .map(|(_, f, _)| f.get("declared-in").copied().unwrap_or_default())
         .collect();
     let mixed_origins = origins.windows(2).any(|w| w[0] != w[1]);
 
@@ -517,7 +520,7 @@ fn list_table(
         align.push(Align::Right);
     }
     for (wanted, label) in [
-        (mixed_origins, "ORIGIN"),
+        (mixed_origins, "DECLARED IN"),
         (streams, "STDOUT"),
         (streams, "STDERR"),
         (output, "OUTPUT"),
@@ -546,7 +549,7 @@ fn list_table(
                 });
             }
             if mixed_origins {
-                row.push(cell("origin"));
+                row.push(cell("declared-in"));
             }
             if streams {
                 row.push(cell("stdout"));
@@ -1058,22 +1061,43 @@ fn task_show(args: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     plane.announce();
+    // Where a value came from, when it is not from the operation's own block. Not a row of its own:
+    // it says where the row it names got its value, which belongs beside that value rather than
+    // under it as a field a reader has to pair up by eye.
+    let provenance: BTreeMap<&str, &str> = fields
+        .iter()
+        .filter_map(|(key, value)| Some((key.strip_suffix("_from")?, value.as_str())))
+        .collect();
     // The plane sends data and this side renders it, the same split the log has: an epoch crosses
     // the wire, a time of day reaches the reader — and a field whose label names its unit loses the
     // unit once the value carries it.
-    let shown: Vec<(String, String)> = fields
+    let shown: Vec<(String, String, Option<&str>)> = fields
         .iter()
-        .map(|(key, value)| match (key.as_str(), value.parse::<u128>()) {
-            ("finished_at", Ok(secs)) => ("finished".into(), crate::format_log_time(secs * 1000)),
-            ("elapsed_ms", Ok(ms)) => ("elapsed".into(), format_elapsed(ms as u64)),
-            ("timeout_s", Ok(s)) => ("timeout".into(), format_elapsed(s as u64 * 1000)),
-            _ => (key.clone(), value.clone()),
+        .filter(|(key, _)| !key.ends_with("_from"))
+        .map(|(key, value)| {
+            let (label, text) = match (key.as_str(), value.parse::<u128>()) {
+                ("finished_at", Ok(secs)) => {
+                    ("finished".into(), crate::format_log_time(secs * 1000))
+                }
+                ("elapsed_ms", Ok(ms)) => ("elapsed".into(), format_elapsed(ms as u64)),
+                ("timeout_s", Ok(s)) => ("timeout".into(), format_elapsed(s as u64 * 1000)),
+                _ => (key.clone(), value.clone()),
+            };
+            // Looked up under the key the *plane* sent, not the label: the rename above is this
+            // side's presentation and the pairing is the plane's.
+            (label, text, provenance.get(key.as_str()).copied())
         })
         .collect();
-    let width = shown.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let width = shown.iter().map(|(k, _, _)| k.len()).max().unwrap_or(0);
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    for (key, value) in &shown {
-        println!("{}{key:<width$}{}  {value}", pal.head, pal.reset);
+    for (key, value, from) in &shown {
+        match from {
+            Some(from) => println!(
+                "{}{key:<width$}{}  {value}  {}({from}){}",
+                pal.head, pal.reset, pal.dim, pal.reset
+            ),
+            None => println!("{}{key:<width$}{}  {value}", pal.head, pal.reset),
+        }
     }
     if !also.is_empty() {
         diag::note(&format!(
@@ -1746,11 +1770,11 @@ mod tests {
     /// project whose whole set comes from one file gets the same table it always had, and
     /// `sbx task show <name>` says it either way.
     #[test]
-    fn the_listing_names_the_origin_only_when_the_rows_disagree() {
+    fn the_listing_names_where_an_operation_is_declared_only_when_the_rows_disagree() {
         let same = list_table(
             &[
-                row("a", &["params=", "timeout=30s", "origin=project", ""]),
-                row("b", &["params=", "timeout=30s", "origin=project", ""]),
+                row("a", &["params=", "timeout=30s", "declared-in=project", ""]),
+                row("b", &["params=", "timeout=30s", "declared-in=project", ""]),
             ],
             &BTreeMap::new(),
             &[],
@@ -1763,17 +1787,26 @@ mod tests {
 
         let mixed = list_table(
             &[
-                row("a", &["params=", "timeout=30s", "origin=project", ""]),
-                row("b", &["params=", "timeout=30s", "origin=bundle psql", ""]),
-                row("c", &["params=", "timeout=30s", "origin=app agent", ""]),
+                row("a", &["params=", "timeout=30s", "declared-in=project", ""]),
+                row(
+                    "b",
+                    &["params=", "timeout=30s", "declared-in=bundle:psql", ""],
+                ),
+                row(
+                    "c",
+                    &["params=", "timeout=30s", "declared-in=app:agent", ""],
+                ),
             ],
             &BTreeMap::new(),
             &[],
         );
-        assert_eq!(mixed.headers, vec!["NAME", "PARAMS", "TIMEOUT", "ORIGIN"]);
+        assert_eq!(
+            mixed.headers,
+            vec!["NAME", "PARAMS", "TIMEOUT", "DECLARED IN"]
+        );
         assert_eq!(mixed.rows[0], vec!["a", "-", "30s", "project"]);
-        assert_eq!(mixed.rows[1], vec!["b", "-", "30s", "bundle psql"]);
-        assert_eq!(mixed.rows[2], vec!["c", "-", "30s", "app agent"]);
+        assert_eq!(mixed.rows[1], vec!["b", "-", "30s", "bundle:psql"]);
+        assert_eq!(mixed.rows[2], vec!["c", "-", "30s", "app:agent"]);
     }
 
     /// A ran invocation as a document: the streams inside it, and everything the prose path would

@@ -502,11 +502,50 @@ pub(crate) struct TaskSpec {
     /// nothing else). Entries are declaration text; the launch resolves a bare name to the absolute
     /// in-cage path it will run as.
     pub(crate) spawn: Option<Vec<String>>,
-    /// Where this operation was declared. Display-only: it answers "which of my configs put this
-    /// here?", which the name alone cannot once a project, an app and its bundles each contribute
-    /// operations to one session. It decides nothing — a task's identity is its name, which is what
-    /// the last-wins fold compares.
+    /// Where this operation's `[task.<name>]` block is. Display-only: it answers "which of my
+    /// configs put this here?", which the name alone cannot once a project, an app and its bundles
+    /// each contribute operations to one session. It decides nothing — a task's identity is its
+    /// name, which is what the last-wins fold compares.
+    ///
+    /// It claims exactly what it says and no more: **where the block is**, not where every effective
+    /// value came from. A ceiling the block does not set is inherited from a `[task.defaults]` in
+    /// some layer, which may not be this one — [`timeout_from`](Self::timeout_from) and
+    /// [`max_output_from`](Self::max_output_from) are what say so.
     pub(crate) origin: TaskOrigin,
+    /// Where [`timeout`](Self::timeout) came from, when the task did not set it itself.
+    pub(crate) timeout_from: Ceiling,
+    /// Where [`max_output`](Self::max_output) came from, when the task did not set it itself.
+    pub(crate) max_output_from: Ceiling,
+}
+
+/// Where a ceiling came from, for display. An operation is genuinely composed of two layers — its
+/// own block plus whatever `[task.defaults]` it inherits — and naming only the block would let a
+/// reader go and edit a file that does not contain the value they are looking at.
+///
+/// Only the two ceilings shown by `sbx task show` carry one. `nonce` is inherited the same way but
+/// is not displayed, and provenance nothing reads is provenance that rots.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum Ceiling {
+    /// The task's own `[task.<name>]` block set it. The ordinary case, and the one a reader assumes.
+    #[default]
+    Declared,
+    /// A `[task.defaults]` table, in the layer named. Only the global config and a trusted project
+    /// have one — an app tunes a ceiling on the task itself.
+    Defaults(TaskOrigin),
+    /// sbx's built-in ceiling: no config set one at all.
+    BuiltIn,
+}
+
+impl Ceiling {
+    /// How it reads beside the value, or `None` when the task declared the value itself — where
+    /// saying so would repeat what the reader already assumes.
+    pub(crate) fn label(&self) -> Option<String> {
+        match self {
+            Ceiling::Declared => None,
+            Ceiling::Defaults(origin) => Some(format!("{} [task.defaults]", origin.label())),
+            Ceiling::BuiltIn => Some("sbx default".to_string()),
+        }
+    }
 }
 
 /// Which layer an operation came from, for display.
@@ -528,13 +567,17 @@ pub(crate) enum TaskOrigin {
 }
 
 impl TaskOrigin {
-    /// How the origin reads in a listing: a kind, and a name where there is one.
+    /// How the origin reads in a listing: a kind, joined to a name by a colon where there is one.
+    ///
+    /// One token, `kind:name`, because that is how the rest of sbx already names a kind and its
+    /// instance — `sbx session ls` shows `app:<name>` in its `KIND` column, and `sbx config show`
+    /// tags a value `app:global`. A reader should not have to learn a second spelling per listing.
     pub(crate) fn label(&self) -> String {
         match self {
             TaskOrigin::Global => "global".to_string(),
             TaskOrigin::Project => "project".to_string(),
-            TaskOrigin::App(name) => format!("app {name}"),
-            TaskOrigin::Bundle(name) => format!("bundle {name}"),
+            TaskOrigin::App(name) => format!("app:{name}"),
+            TaskOrigin::Bundle(name) => format!("bundle:{name}"),
         }
     }
 }

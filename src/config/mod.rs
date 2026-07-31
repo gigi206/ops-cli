@@ -1144,16 +1144,19 @@ fn resolve(
     let mut tasks: Vec<TaskSpec> = Vec::new();
     let mut task_defaults = tasks::TaskDefaults::default();
     if let Some(section) = global.task {
+        // One value for the layer, so the ceilings it sets and the operations it declares can never
+        // disagree about which config they came from.
+        let layer = tasks::TaskLayer {
+            source: GLOBAL_CONFIG,
+            origin: TaskOrigin::Global,
+        };
         if let Some(raw_defaults) = &section.defaults {
-            task_defaults = task_defaults.merged_with(raw_defaults, GLOBAL_CONFIG, &mut warnings);
+            task_defaults = task_defaults.merged_with(raw_defaults, &layer, &mut warnings);
         }
         tasks::apply_task_section(
             &mut tasks,
             &mut warnings,
-            &tasks::TaskLayer {
-                source: GLOBAL_CONFIG,
-                origin: TaskOrigin::Global,
-            },
+            &layer,
             section,
             &task_defaults,
             &secret_defaults,
@@ -1431,17 +1434,17 @@ fn resolve(
         // warning.
         if let Some(section) = proj.task {
             if trusted {
+                let layer = tasks::TaskLayer {
+                    source: PROJECT_CONFIG,
+                    origin: TaskOrigin::Project,
+                };
                 if let Some(raw_defaults) = &section.defaults {
-                    task_defaults =
-                        task_defaults.merged_with(raw_defaults, PROJECT_CONFIG, &mut warnings);
+                    task_defaults = task_defaults.merged_with(raw_defaults, &layer, &mut warnings);
                 }
                 tasks::apply_task_section(
                     &mut tasks,
                     &mut warnings,
-                    &tasks::TaskLayer {
-                        source: PROJECT_CONFIG,
-                        origin: TaskOrigin::Project,
-                    },
+                    &layer,
                     section,
                     &task_defaults,
                     &project_secret_defaults,

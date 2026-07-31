@@ -658,9 +658,14 @@ const PAGES: &[Page] = &[
             pool. The pool is filled best-effort at launch, so that operation will fail at exec —\n\
             this is where it shows before you invoke it.\n\
             \n\
-            An `ORIGIN` column says which config declared each operation — `project`, `global`,\n\
-            `app <name>` or `bundle <name>` — and appears only when they do not all agree, by the\n\
-            same rule as the others. `sbx task show <operation>` gives it either way.\n\
+            A `DECLARED IN` column says which config holds each operation's `[task.<name>]` block —\n\
+            `global`, `project`, `app:<name>` or `bundle:<name>`, the same `kind:name` spelling\n\
+            `sbx session ls` uses — and appears only when they do not all agree, like the others. It never overlaps with `sbx session ls`,\n\
+            which names the app and the project but no bundle: the rows disagree exactly when more\n\
+            than one source contributed, which is exactly when that listing cannot answer it.\n\
+            `sbx task show <operation>` gives it either way, and adds where an inherited ceiling\n\
+            came from — an operation is composed of its own block plus whatever `[task.defaults]`\n\
+            it inherits, and those can be different files.\n\
             \n\
             Inside the cage the session is implicit (a caller may only reach its own).",
     },

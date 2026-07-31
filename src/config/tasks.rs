@@ -88,6 +88,11 @@ pub(super) struct TaskDefaults {
     pub(super) max_output: u64,
     /// Whether a substituted credential carries a per-invocation nonce.
     pub(super) nonce: bool,
+    /// Which layer's `[task.defaults]` set each ceiling, so a task that inherits one can say where
+    /// it came from. Carried here because this is the only place that knows: by the time a task is
+    /// validated the layers have already merged into one value.
+    pub(super) timeout_from: Ceiling,
+    pub(super) max_output_from: Ceiling,
 }
 
 /// sbx's built-in task ceilings, used when no layer sets them. A task is a short brokered
@@ -99,6 +104,8 @@ impl Default for TaskDefaults {
             timeout: std::time::Duration::from_secs(30),
             max_output: 64 * 1024,
             nonce: false,
+            timeout_from: Ceiling::BuiltIn,
+            max_output_from: Ceiling::BuiltIn,
         }
     }
 }
@@ -110,13 +117,17 @@ impl TaskDefaults {
     pub(super) fn merged_with(
         &self,
         raw: &RawTaskDefaults,
-        source: &str,
+        layer: &TaskLayer,
         warnings: &mut Vec<String>,
     ) -> Self {
+        let source = layer.source;
         let mut out = self.clone();
         if let Some(raw_timeout) = &raw.timeout {
             match parse_task_timeout(raw_timeout) {
-                Ok(d) => out.timeout = d,
+                Ok(d) => {
+                    out.timeout = d;
+                    out.timeout_from = Ceiling::Defaults(layer.origin.clone());
+                }
                 Err(e) => warnings.push(format!(
                     "{source}: ignoring `[task.defaults] timeout` — {e}"
                 )),
@@ -124,7 +135,10 @@ impl TaskDefaults {
         }
         if let Some(raw_max) = &raw.max_output {
             match parse_output_cap(raw_max) {
-                Ok(n) => out.max_output = n,
+                Ok(n) => {
+                    out.max_output = n;
+                    out.max_output_from = Ceiling::Defaults(layer.origin.clone());
+                }
                 Err(e) => warnings.push(format!(
                     "{source}: ignoring `[task.defaults] max_output` — {e}"
                 )),
@@ -202,13 +216,16 @@ pub(super) fn validate_task(
         ));
     }
 
-    let timeout = match &raw.timeout {
-        Some(t) => parse_task_timeout(t)?,
-        None => defaults.timeout,
+    // Each ceiling with where it came from: the block itself, or whichever layer's `[task.defaults]`
+    // the merged defaults last took it from. An operation really is composed of two layers, and a
+    // reader shown only the block would go and edit a file that does not contain the value.
+    let (timeout, timeout_from) = match &raw.timeout {
+        Some(t) => (parse_task_timeout(t)?, Ceiling::Declared),
+        None => (defaults.timeout, defaults.timeout_from.clone()),
     };
-    let max_output = match &raw.max_output {
-        Some(m) => parse_output_cap(m)?,
-        None => defaults.max_output,
+    let (max_output, max_output_from) = match &raw.max_output {
+        Some(m) => (parse_output_cap(m)?, Ceiling::Declared),
+        None => (defaults.max_output, defaults.max_output_from.clone()),
     };
 
     // `[proc]`'s key names on a task, refused rather than parsed into silence: what a task's command
@@ -257,6 +274,8 @@ pub(super) fn validate_task(
             Some(bundle) => TaskOrigin::Bundle(bundle),
             None => origin.clone(),
         },
+        timeout_from,
+        max_output_from,
     })
 }
 
@@ -1225,7 +1244,66 @@ mod tests {
         task.origin = TaskOrigin::Bundle("psql".to_string());
         upsert_task(&mut out, &mut warnings, "app overlay", task);
         assert_eq!(out[0].origin, TaskOrigin::Bundle("psql".to_string()));
-        assert_eq!(out[0].origin.label(), "bundle psql");
+        assert_eq!(out[0].origin.label(), "bundle:psql");
+    }
+
+    /// An operation really is composed of two layers: its own block, plus whatever `[task.defaults]`
+    /// it inherits. Naming only the block would send a reader to a file that does not contain the
+    /// value they are looking at — so a ceiling the block does not set carries where it came from.
+    #[test]
+    fn a_ceiling_the_task_does_not_set_says_which_layer_it_came_from() {
+        let defaults = TaskDefaults::default().merged_with(
+            &RawTaskDefaults {
+                timeout: Some("90s".into()),
+                max_output: None,
+                nonce: None,
+            },
+            &TaskLayer {
+                source: "sbx.toml",
+                origin: TaskOrigin::Global,
+            },
+            &mut Vec::new(),
+        );
+
+        // Declared in the project, but its timeout is the global config's and its output cap is
+        // sbx's own — three layers behind one operation, which is the whole point of the field.
+        let inherited = validate_task(
+            "db-query",
+            raw_task(),
+            &TaskOrigin::Project,
+            &defaults,
+            &SecretDefaults::default(),
+            &PluginRegistry::default(),
+        )
+        .expect("valid");
+        assert_eq!(inherited.origin, TaskOrigin::Project);
+        assert_eq!(
+            inherited.timeout_from.label().as_deref(),
+            Some("global [task.defaults]")
+        );
+        assert_eq!(
+            inherited.max_output_from.label().as_deref(),
+            Some("sbx default")
+        );
+
+        // A task that sets its own says nothing: repeating "declared here" is what a reader already
+        // assumes, and `label()` returning `None` is what drops the row.
+        let own = validate_task(
+            "db-query",
+            RawTask {
+                timeout: Some("10s".into()),
+                max_output: Some("1KiB".into()),
+                ..raw_task()
+            },
+            &TaskOrigin::Project,
+            &defaults,
+            &SecretDefaults::default(),
+            &PluginRegistry::default(),
+        )
+        .expect("valid");
+        assert_eq!(own.timeout, std::time::Duration::from_secs(10));
+        assert_eq!(own.timeout_from.label(), None);
+        assert_eq!(own.max_output_from.label(), None);
     }
 
     /// Each layer stamps its own, and a bundle's stamp survives the fold that made its entry look
@@ -1235,9 +1313,9 @@ mod tests {
         let cases = [
             (TaskOrigin::Global, None, "global"),
             (TaskOrigin::Project, None, "project"),
-            (TaskOrigin::App("agent".into()), None, "app agent"),
+            (TaskOrigin::App("agent".into()), None, "app:agent"),
             // The app layer is what validates a bundle's entry, and the stamp still wins.
-            (TaskOrigin::App("agent".into()), Some("psql"), "bundle psql"),
+            (TaskOrigin::App("agent".into()), Some("psql"), "bundle:psql"),
         ];
         for (origin, from_bundle, expected) in cases {
             let raw = RawTask {
@@ -1297,12 +1375,22 @@ mod tests {
                 nonce: None,
                 max_output: Some("1MiB".into()),
             },
-            "global config",
+            &TaskLayer {
+                source: "global config",
+                origin: TaskOrigin::Global,
+            },
             &mut warnings,
         );
         assert_eq!(merged.timeout, std::time::Duration::from_secs(300));
         assert_eq!(merged.max_output, 1024 * 1024);
         assert!(warnings.is_empty());
+        // And each ceiling remembers the layer that set it, which is not the layer a task inheriting
+        // it was declared in.
+        assert_eq!(
+            merged.timeout_from,
+            Ceiling::Defaults(TaskOrigin::Global),
+            "a ceiling knows which `[task.defaults]` set it"
+        );
 
         let kept = merged.merged_with(
             &RawTaskDefaults {
@@ -1310,12 +1398,21 @@ mod tests {
                 nonce: None,
                 max_output: Some("0".into()),
             },
-            ".sbx.toml",
+            &TaskLayer {
+                source: ".sbx.toml",
+                origin: TaskOrigin::Project,
+            },
             &mut warnings,
         );
         assert_eq!(kept.timeout, merged.timeout, "a bad value keeps the prior");
         assert_eq!(kept.max_output, merged.max_output);
         assert_eq!(warnings.len(), 2, "both are reported: {warnings:?}");
+        assert_eq!(
+            kept.timeout_from,
+            Ceiling::Defaults(TaskOrigin::Global),
+            "a refused value leaves the earlier layer's, provenance included — the value shown and \
+             the layer named must never come apart"
+        );
     }
 
     /// `packages` takes `mise:` and nothing else, and the prefix comes off — what reaches the pool

@@ -895,15 +895,33 @@ fn expand_bundles(
                     task.from_bundle = Some(name.clone());
                 }
             }
-            absorb_bundle(&mut acc, bundle);
+            absorb_bundle(&mut acc, bundle, notes);
         }
         fold_bundle_into_app(app, acc, notes);
     }
 }
 
+/// Name a declared operation that was dropped because something else already declares the name.
+/// Both sides are named — which bundle brought the one being dropped, and where the one that stands
+/// comes from — because "operation X was shadowed" without either is a message a reader cannot act
+/// on.
+fn shadowed_task_note(name: &str, dropped: &RawTask, kept: &RawTask) -> String {
+    let whose = |t: &RawTask| match &t.from_bundle {
+        Some(bundle) => format!("bundle `{bundle}`"),
+        None => "this app".to_string(),
+    };
+    format!(
+        "{} declares operation `{name}`, which {} declares too — the one from {} is used and the \
+         other is dropped",
+        whose(dropped),
+        whose(kept),
+        whose(kept),
+    )
+}
+
 /// Merge `higher` onto `acc` with `higher` winning per key — the "a later `use` entry overrides an
 /// earlier one" half of the fold.
-fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle) {
+fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>) {
     acc.packages.extend(higher.packages);
     acc.env.extend(higher.env);
     acc.allow.extend(higher.allow);
@@ -930,7 +948,15 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle) {
                 if task.defaults.is_some() {
                     base.defaults = task.defaults;
                 }
-                base.tasks.extend(task.tasks);
+                // Two bundles naming one operation: the later `use` entry wins, as it does for every
+                // other key — but said out loud, for the reason above. Here neither side is the
+                // app's, so the note names both bundles.
+                for (name, entry) in task.tasks {
+                    if let Some(existing) = base.tasks.get(&name) {
+                        notes.push(shadowed_task_note(&name, existing, &entry));
+                    }
+                    base.tasks.insert(name, entry);
+                }
             }
             None => acc.task = Some(task),
         }
@@ -974,6 +1000,12 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
     // A bundle's declared operations fold under the app's, like its packages and credentials: a tool
     // that ships a brokered operation carries it along, and an app that declares a task of the same
     // name keeps its own.
+    //
+    // Unlike a shadowed package, a shadowed *operation* is said out loud. A task is a command sbx
+    // runs on a caller's behalf with a credential attached, which is why the config layers already
+    // warn when one replaces another (`upsert_task`); a bundle's being silently replaced was the one
+    // place that did not, and two operations a caller cannot tell apart is exactly what those
+    // warnings exist to prevent.
     if let Some(task) = acc.task {
         match app.task.as_mut() {
             Some(own) => {
@@ -981,7 +1013,11 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
                     own.defaults = task.defaults;
                 }
                 for (name, entry) in task.tasks {
-                    own.tasks.entry(name).or_insert(entry);
+                    if let Some(existing) = own.tasks.get(&name) {
+                        notes.push(shadowed_task_note(&name, &entry, existing));
+                        continue;
+                    }
+                    own.tasks.insert(name, entry);
                 }
             }
             None => app.task = Some(task),
@@ -1201,6 +1237,62 @@ mod tests {
         );
         let (app, _) = expand_one(own, &[]);
         assert_eq!(app.task.expect("kept").tasks["own"].from_bundle, None);
+    }
+
+    /// A shadowed *operation* is said out loud, unlike a shadowed package. A task is a command sbx
+    /// runs on a caller's behalf with a credential attached — the config layers already warn when
+    /// one replaces another, and the bundle fold was the one place that did not.
+    #[test]
+    fn an_operation_a_bundle_loses_to_something_else_is_reported() {
+        let with_task = |marker: &str| {
+            let mut b = bundle(marker);
+            b.task = Some(
+                schema::parse(b"[task.probe]\ncmd = [\"/bin/true\"]\n")
+                    .expect("the fixture parses")
+                    .task
+                    .expect("a task section"),
+            );
+            b
+        };
+
+        // The app declares the same name: the app's stands, and the note names both sides.
+        let mut own = app_using(&["a"]);
+        own.task = Some(
+            schema::parse(b"[task.probe]\ncmd = [\"/bin/false\"]\n")
+                .expect("the fixture parses")
+                .task
+                .expect("a task section"),
+        );
+        let (app, notes) = expand_one(own, &[("a", with_task("a"))]);
+        assert_eq!(
+            app.task.expect("kept").tasks["probe"].cmd,
+            vec!["/bin/false".to_string()],
+            "the app's own operation is the one that stands"
+        );
+        let note = notes
+            .iter()
+            .find(|n| n.contains("probe"))
+            .unwrap_or_else(|| panic!("the shadowing must be reported: {notes:?}"));
+        assert!(note.contains("bundle `a`"), "{note}");
+        assert!(note.contains("this app"), "{note}");
+
+        // Two bundles naming one operation: the later `use` entry wins, and that is said too.
+        let (_, notes) = expand_one(
+            app_using(&["a", "b"]),
+            &[("a", with_task("a")), ("b", with_task("b"))],
+        );
+        let note = notes
+            .iter()
+            .find(|n| n.contains("probe"))
+            .unwrap_or_else(|| panic!("the shadowing must be reported: {notes:?}"));
+        assert!(
+            note.contains("bundle `a`") && note.contains("bundle `b`"),
+            "{note}"
+        );
+
+        // And a clean fold still warns about nothing.
+        let (_, quiet) = expand_one(app_using(&["a"]), &[("a", with_task("a"))]);
+        assert!(quiet.is_empty(), "{quiet:?}");
     }
 
     #[test]

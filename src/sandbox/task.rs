@@ -1309,10 +1309,12 @@ fn declared_fields(task: &TaskSpec) -> Vec<(String, String)> {
             "description".to_string(),
             task.description.clone().unwrap_or_default(),
         ),
-        // Always shown here, unlike the listing, which drops it when every row says the same: a
-        // reader asking about *one* operation is often asking exactly this.
-        ("origin".to_string(), task.origin.label()),
         ("declared".to_string(), shell_line(&task.cmd)),
+        // Beside the declaration it belongs to, and always shown here unlike the listing, which
+        // drops the column when every row says the same: a reader asking about *one* operation is
+        // often asking exactly this. It names where the block is and nothing more — a ceiling the
+        // block does not set carries its own source, below.
+        ("declared in".to_string(), task.origin.label()),
         (
             "parameters".to_string(),
             list(
@@ -1326,7 +1328,18 @@ fn declared_fields(task: &TaskSpec) -> Vec<(String, String)> {
             ),
         ),
         ("timeout_s".to_string(), task.timeout.as_secs().to_string()),
+        // A ceiling the task did not set itself says which `[task.defaults]` it came from. Its own
+        // key rather than text folded into the value, so the reader that formats the number does not
+        // have to take it apart again; the `_from` suffix is what pairs the two.
+        (
+            "timeout_s_from".to_string(),
+            task.timeout_from.label().unwrap_or_default(),
+        ),
         ("max_output".to_string(), task.max_output.to_string()),
+        (
+            "max_output_from".to_string(),
+            task.max_output_from.label().unwrap_or_default(),
+        ),
         ("stdout".to_string(), task.stdout.as_str().to_string()),
         ("stderr".to_string(), task.stderr.as_str().to_string()),
         (
@@ -1780,6 +1793,8 @@ mod smoke {
             spawn: None,
             output: false,
             origin: crate::config::TaskOrigin::Project,
+            timeout_from: crate::config::Ceiling::Declared,
+            max_output_from: crate::config::Ceiling::Declared,
         }
     }
 
@@ -1927,6 +1942,8 @@ mod smoke {
             spawn: None,
             output: false,
             origin: crate::config::TaskOrigin::Project,
+            timeout_from: crate::config::Ceiling::Declared,
+            max_output_from: crate::config::Ceiling::Declared,
         };
 
         let Some((engine, _data)) = engine_with(vec![spec], project.path(), Some(&pool)) else {
@@ -2052,6 +2069,8 @@ mod tests {
             spawn: None,
             output: false,
             origin: crate::config::TaskOrigin::Project,
+            timeout_from: crate::config::Ceiling::Declared,
+            max_output_from: crate::config::Ceiling::Declared,
         }
     }
 

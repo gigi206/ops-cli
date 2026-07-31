@@ -293,6 +293,8 @@ mod tests {
             spawn: None,
             output: false,
             origin: crate::config::TaskOrigin::Project,
+            timeout_from: crate::config::Ceiling::Declared,
+            max_output_from: crate::config::Ceiling::Declared,
         }
     }
 
