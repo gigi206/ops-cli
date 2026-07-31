@@ -404,6 +404,11 @@ For an invocation that is over it reports what the log kept — how it ended, wh
 then the same declaration, because an invocation *is* its declaration plus what one run of it did.
 Naming an operation rather than an id gives the declaration alone.
 
+A [detached](#--detach) invocation reads as `state detached` while it runs, and once it is over its
+state is how it *ended* (`finished`, `stopped`, `timed out`) with a separate `detached yes` line —
+detaching is orthogonal to how an invocation ends, and that line is what says its result went to
+[`result`](#result) rather than to a caller.
+
 **`declared in` is always here**, unlike the [listing's column](#list) which appears only when the
 rows disagree: a reader asking about *one* operation is often asking exactly that.
 

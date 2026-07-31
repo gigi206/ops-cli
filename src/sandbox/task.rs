@@ -948,7 +948,7 @@ impl TaskEngine {
     /// resolved per invocation and never held anywhere this can reach. What a reader gets is the
     /// declaration and the command, which is the pair that answers "what is this doing".
     pub(crate) fn describe(&self, id: u64) -> Option<Vec<(String, String)>> {
-        let (task, elapsed, argv, pid, stopping) = {
+        let (task, elapsed, argv, pid, stopping, detached) = {
             let running = self.running.lock().ok()?;
             let entry = running.get(&id)?;
             (
@@ -957,16 +957,20 @@ impl TaskEngine {
                 entry.argv.clone(),
                 entry.pid,
                 entry.stop,
+                entry.detached,
             )
         };
         let mut out = vec![
             ("id".into(), id.to_string()),
             ("operation".into(), task.clone()),
             (
+                // A stop that has been asked for is the more urgent fact, so it wins the field; a
+                // detached invocation that is stopping is a stopping one, and the listing agrees.
                 "state".into(),
-                match stopping {
-                    true => "stopping".into(),
-                    false => "running".to_string(),
+                match (stopping, detached) {
+                    (true, _) => "stopping".into(),
+                    (false, true) => "detached".to_string(),
+                    (false, false) => "running".to_string(),
                 },
             ),
             ("elapsed_ms".into(), elapsed.to_string()),
@@ -1942,6 +1946,16 @@ impl TaskEngine {
     #[cfg(test)]
     pub(crate) fn with_launcher(mut self, bwrap: PathBuf) -> Self {
         self.bwrap = bwrap;
+        self
+    }
+
+    /// Give the engine a real data directory and project, so a test can exercise the output
+    /// directory a task claims. It is the one part of an invocation that touches the filesystem
+    /// before any cage exists, and therefore the one an inventory-only engine cannot reach.
+    #[cfg(test)]
+    pub(crate) fn with_tree(mut self, data_dir: &Path, project: PathBuf) -> Self {
+        self.layout = crate::store::Layout::under(data_dir);
+        self.project = project;
         self
     }
 }

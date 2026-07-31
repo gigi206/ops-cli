@@ -809,6 +809,11 @@ const PAGES: &[Page] = &[
             then carry the declaration it runs under — the ceilings, the streams, what it may reach\n\
             on the network, which tools it needs, and which credentials it carries.\n\
             \n\
+            A detached invocation reads as `detached` while it runs; once it is over its state is how\n\
+            it *ended* and a separate `detached` line says so. The two are orthogonal — a detached\n\
+            invocation can equally have finished, been stopped, or timed out — and that line is what\n\
+            says its result went to `sbx task result` rather than to a caller.\n\
+            \n\
             **Never an environment value.** A task's credentials are resolved for one invocation and\n\
             held nowhere this can reach, so their absence is structural rather than a filter; what is\n\
             shown is their names, which is what a substituted value is reported as anyway.\n\

@@ -755,6 +755,13 @@ fn finished_fields(
             ("finished_at".to_string(), entry.at.to_string()),
             ("elapsed_ms".to_string(), entry.elapsed_ms.to_string()),
         ];
+        // Beside the state rather than folded into it: detaching is orthogonal to how an invocation
+        // ended, and a detached one can equally have finished, been stopped, or timed out. Shown only
+        // when true, like the other fields that appear when they have something to say — and shown at
+        // all because it is what says where the result went, which is the next thing a reader asks.
+        if entry.detached {
+            out.push(("detached".to_string(), "yes".to_string()));
+        }
         if entry.refused.is_none() {
             out.push(("exit".to_string(), entry.exit.to_string()));
         }
@@ -1491,6 +1498,96 @@ mod tests {
         )
         .expect("write the client");
         Some((data, plane, script))
+    }
+
+    /// A plane whose single operation declares an output directory, over a real project tree.
+    ///
+    /// The tree has to be real: the directory's path is derived from the project's canonical
+    /// location, so an engine pointed at a path that does not exist cannot claim one at all.
+    fn plane_with_output(body: &str) -> Option<(TmpDir, TmpDir, TaskPlane)> {
+        use std::os::unix::fs::PermissionsExt;
+        let bash = crate::pathfind::find_on_path("bash")?;
+        let socat = crate::pathfind::find_on_path("socat")?;
+        let head = crate::pathfind::find_on_path("head")?;
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+
+        let launcher = data.path().join("launcher");
+        std::fs::write(&launcher, format!("#!{}\n{body}", bash.display())).expect("the launcher");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("make the launcher executable");
+
+        let mut task = probe_task();
+        task.output = true;
+        let engine = super::super::task::TaskEngine::inventory_only(vec![task])
+            .with_launcher(launcher)
+            .with_tree(data.path(), project.path().to_path_buf());
+        let programs = ClientPrograms {
+            bash: &bash,
+            socat: &socat,
+            head: &head,
+        };
+        let plane = start(data.path(), std::process::id(), engine, &programs).expect("start");
+        Some((data, project, plane))
+    }
+
+    /// A second detached invocation of an operation that writes is refused **synchronously**, while
+    /// the first is still holding the directory.
+    ///
+    /// This is the case the admission split exists for. A task's output directory is one per *task*,
+    /// so two invocations at once would interleave in it — and a detached caller stops listening the
+    /// moment it has an id, so discovering that inside the thread would mean handing back an id for
+    /// an invocation that died on a refusal nobody ever saw. The assertion that carries it is the
+    /// **absent id**: refused before admission, not after.
+    #[test]
+    fn a_second_detached_writer_is_refused_before_it_is_given_an_id() {
+        let Some((_data, _project, plane)) = plane_with_output("sleep 3\nprintf 'wrote\\n'\n")
+        else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        let params = BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]);
+
+        let first = client::run_detached(&host, "probe", &params, &BTreeMap::new()).expect("start");
+        assert_eq!(first.error, None, "the first writer must be admitted");
+
+        let second =
+            client::run_detached(&host, "probe", &params, &BTreeMap::new()).expect("start");
+        let reason = second
+            .error
+            .expect("a second concurrent writer must be refused");
+        assert!(
+            reason.contains("still writing to its output directory"),
+            "the refusal must name what is in the way: {reason}"
+        );
+        assert_eq!(
+            read_status(&host)
+                .expect("status")
+                .iter()
+                .filter(|row| row.id != first.id)
+                .count(),
+            0,
+            "a refused invocation must not be running"
+        );
+
+        // And once the first has finished, the directory is free again — the claim is released by
+        // the thread that took it, not by the connection that asked for it.
+        let done = eventually(|| {
+            let answer = client::result(&host, first.id).expect("result");
+            answer.error.is_none().then_some(answer)
+        })
+        .expect("the first writer must finish");
+        assert!(
+            done.output.is_some(),
+            "an operation that declares an output directory must report it"
+        );
+        let third = client::run_detached(&host, "probe", &params, &BTreeMap::new()).expect("start");
+        assert_eq!(
+            third.error, None,
+            "the directory must be free once the invocation holding it has ended"
+        );
+        let _ = stop_invocation(&host, third.id);
     }
 
     /// An operation that takes longer than an instant still answers the in-cage caller.
