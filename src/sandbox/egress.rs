@@ -186,6 +186,11 @@ pub(crate) struct TcpPlan {
 const FIRST_CAGE_ADDR: u32 = 0x7f00_0002; // 127.0.0.2
 const LAST_CAGE_ADDR: u32 = 0x7fff_fffe;
 
+/// The lowest port the cage can bind. Below it a bind needs `CAP_NET_BIND_SERVICE`, and the cage
+/// holds no capability — so an in-cage listener there is impossible, not merely unusual. The cage's
+/// network namespace starts at the kernel default and nothing inside it can lower that.
+const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+
 /// Names the cage's synthetic `/etc/hosts` already maps to `127.0.0.1`. A destination called one of
 /// these cannot be given an address of its own: the built-in line comes first in the file and wins
 /// the lookup, so the listener would sit somewhere the client never dials — and it would fail
@@ -205,9 +210,10 @@ const CAGE_HOSTNAME_PREFIX: &str = "sbx-";
 /// a launch is reproducible.
 ///
 /// A rule is skipped when it names no single port (`:*`, or a range — sbx will not open a thousand
-/// listeners on a guess) or a non-loopback IP literal, which the cage's network namespace has no
-/// way to hold. Skipping is reported, never silent: the rule still governs the proxy's verdict, so
-/// what the author loses is the convenience, and they need to know they must tunnel themselves.
+/// listeners on a guess), a **privileged** port (below 1024, which a capability-less cage cannot
+/// bind), or a non-loopback IP literal, which the cage's network namespace has no way to hold.
+/// Skipping is reported, never silent: the rule still governs the proxy's verdict, so what the
+/// author loses is the convenience, and they need to know they must tunnel themselves.
 pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPlan {
     use crate::allowlist::{Layer, Ports, RuleKind};
     use std::net::{IpAddr, Ipv4Addr};
@@ -239,6 +245,23 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
                 continue;
             }
         };
+        // A port below 1024 is privileged, and the cage holds no capability at all — the bind would
+        // fail, leaving the name pointing at an address nothing listens on, which reads as a flat
+        // "connection refused" with no clue why. Reported per port and dropped, so a rule naming
+        // both a privileged and an ordinary port still gets a listener for the one it can hold.
+        let (ports, privileged): (Vec<u16>, Vec<u16>) = ports
+            .into_iter()
+            .partition(|p| *p >= FIRST_UNPRIVILEGED_PORT);
+        for port in privileged {
+            plan.skipped.push(format!(
+                "tcp://{host}:{port} — a port below {FIRST_UNPRIVILEGED_PORT} cannot be bound \
+                 inside the cage, which holds no capability; reach it with an explicit CONNECT \
+                 (`ssh -o ProxyCommand='socat - PROXY:127.0.0.1:%h:%p,proxyport={CAGE_PROXY_PORT}'`)"
+            ));
+        }
+        if ports.is_empty() {
+            continue;
+        }
         // An IP literal is its own address: the cage listens where the client was going to dial. A
         // loopback one it can hold; anything else would need an address the netns does not have.
         let (addr, map_name) = match literal {
@@ -1023,6 +1046,35 @@ mod tests {
         let dest = &plan.destinations[0];
         assert_eq!(dest.cage_addr.to_string(), "127.0.0.1");
         assert!(!dest.map_name, "an address needs no `/etc/hosts` entry");
+    }
+
+    /// A privileged port cannot be bound by a capability-less cage, so it gets no listener — and
+    /// says so. Measured, not assumed: in a live cage a `tcp://github.com:22` rule left the mapped
+    /// name pointing at an address nothing listened on, and ssh reported a bare "connection
+    /// refused". A rule naming an ordinary port beside it keeps that one.
+    #[test]
+    fn a_privileged_port_gets_no_listener_and_is_reported() {
+        let plan = tcp_destinations(&tcp_policy(&["tcp://github.com:22,2200"]));
+
+        let dest = &plan.destinations[0];
+        assert_eq!(
+            dest.ports,
+            vec![2200],
+            "only the bindable port is listened on"
+        );
+        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
+        assert!(
+            plan.skipped[0].contains("github.com:22") && plan.skipped[0].contains("ProxyCommand"),
+            "the report names the port and the way through: {:?}",
+            plan.skipped
+        );
+
+        // A rule with nothing but a privileged port yields no destination at all — and so no
+        // `/etc/hosts` line, which is the honest outcome: the name does not resolve rather than
+        // resolving to a dead address.
+        let plan = tcp_destinations(&tcp_policy(&["tcp://github.com:22"]));
+        assert!(plan.destinations.is_empty());
+        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
     }
 
     /// What cannot be given a listener is reported, never dropped in silence: the rule still governs
