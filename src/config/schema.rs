@@ -204,6 +204,12 @@ pub(crate) struct RawConfig {
     /// config (trusted by location); a project's `[bundle]` is ignored.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) bundle: BTreeMap<String, RawBundle>,
+    /// Every top-level key sbx does not know. Unknown keys stay **ignored** — that is what lets a
+    /// config written for a newer sbx load on an older one — but a misspelled `memory_maxx` and a
+    /// field from next year's release are indistinguishable in silence, and only one of them is
+    /// harmless. Kept so the loader can say what it passed over. See [`RawIgnored`].
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// A `[bundle.<name>]` table: what one tool needs to be installed and to reach its own services.
@@ -328,6 +334,10 @@ pub(crate) struct RawLimits {
     pub(crate) memory_high: Option<RawLimit>,
     pub(crate) memory_max: Option<RawLimit>,
     pub(crate) tasks_max: Option<RawLimit>,
+    /// Unknown keys in this table, kept so they can be reported. A misspelled limit is the sharpest
+    /// case of the silence: the ceiling the author asked for is simply not in effect.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// One resource-limit value as declared: a bare number — a byte count for memory, a task count
@@ -366,6 +376,9 @@ impl RawLimit {
 pub(crate) struct RawSeccomp {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allow: Vec<String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The `[devices]` table: a trusted grant of host device nodes into the cage. Each `allow` entry is
@@ -379,6 +392,9 @@ pub(crate) struct RawSeccomp {
 pub(crate) struct RawDevices {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allow: Vec<String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The `[ssh_agent]` table: which of the host agent's keys the cage may sign with. Each `allow`
@@ -392,6 +408,9 @@ pub(crate) struct RawDevices {
 pub(crate) struct RawSshAgent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allow: Vec<String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox

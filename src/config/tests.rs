@@ -71,6 +71,7 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
+        rest: Default::default(),
         task: None,
         env: env
             .iter()
@@ -531,6 +532,7 @@ fn raw_forward(ports: &[u16]) -> RawConfig {
 fn raw_devices(paths: &[&str]) -> RawConfig {
     RawConfig {
         devices: Some(schema::RawDevices {
+            rest: Default::default(),
             allow: paths.iter().map(|s| s.to_string()).collect(),
         }),
         ..RawConfig::default()
@@ -541,6 +543,7 @@ fn raw_devices(paths: &[&str]) -> RawConfig {
 fn raw_ssh_agent(keys: &[&str]) -> RawConfig {
     RawConfig {
         ssh_agent: Some(schema::RawSshAgent {
+            rest: Default::default(),
             allow: keys.iter().map(|s| s.to_string()).collect(),
         }),
         ..RawConfig::default()
@@ -550,6 +553,7 @@ fn raw_ssh_agent(keys: &[&str]) -> RawConfig {
 fn raw_seccomp(tokens: &[&str]) -> RawConfig {
     RawConfig {
         seccomp: Some(schema::RawSeccomp {
+            rest: Default::default(),
             allow: tokens.iter().map(|s| s.to_string()).collect(),
         }),
         ..RawConfig::default()
@@ -566,6 +570,7 @@ fn raw_limits(
     let text = |o: Option<&str>| o.map(|s| schema::RawLimit::Text(s.to_string()));
     RawConfig {
         limits: Some(schema::RawLimits {
+            rest: Default::default(),
             memory_high: text(memory_high),
             memory_max: text(memory_max),
             tasks_max: text(tasks_max),
@@ -1347,6 +1352,7 @@ fn a_global_apps_devices_grant_survives_an_untrusted_projects_override_attempt()
         "demo-app",
         RawApp {
             devices: Some(schema::RawDevices {
+                rest: Default::default(),
                 allow: vec!["/dev/kvm".into()],
             }),
             ..raw_app(&["demo-app"], &[], &[], &[], None)
@@ -1357,6 +1363,7 @@ fn a_global_apps_devices_grant_survives_an_untrusted_projects_override_attempt()
         "demo-app",
         RawApp {
             devices: Some(schema::RawDevices {
+                rest: Default::default(),
                 allow: vec!["/dev/dri".into()],
             }),
             ..raw_app(&[], &[], &[], &[], None)
@@ -1376,6 +1383,7 @@ fn a_global_apps_devices_grant_survives_an_untrusted_projects_override_attempt()
         "mine",
         RawApp {
             devices: Some(schema::RawDevices {
+                rest: Default::default(),
                 allow: vec!["/dev/kvm".into()],
             }),
             ..raw_app(&["tool"], &[], &[], &[], None)
@@ -1397,6 +1405,7 @@ fn a_trusted_app_devices_grant_is_honored() {
         "demo-app",
         RawApp {
             devices: Some(schema::RawDevices {
+                rest: Default::default(),
                 allow: vec!["/dev/kvm".into()],
             }),
             ..raw_app(&["demo-app"], &[], &[], &[], None)
@@ -1415,6 +1424,7 @@ fn app_raw_limits(
 ) -> schema::RawLimits {
     let text = |o: Option<&str>| o.map(|s| schema::RawLimit::Text(s.to_string()));
     schema::RawLimits {
+        rest: Default::default(),
         memory_high: text(memory_high),
         memory_max: text(memory_max),
         tasks_max: text(tasks_max),
@@ -1755,6 +1765,7 @@ fn a_value_set_to_its_default_still_records_its_layer_not_default() {
         network: Some(NetworkField::Posture("shared".into())),
         gui: Some("none".into()),
         limits: Some(schema::RawLimits {
+            rest: Default::default(),
             memory_high: None,
             memory_max: None,
             tasks_max: Some(schema::RawLimit::Number(16384)),
@@ -1800,6 +1811,7 @@ fn a_trusted_project_records_its_layer_as_the_origin() {
     let project = RawConfig {
         network: Some(NetworkField::Posture("none".into())),
         limits: Some(schema::RawLimits {
+            rest: Default::default(),
             memory_high: None,
             memory_max: Some(schema::RawLimit::Text("8G".into())),
             tasks_max: None,
@@ -4768,6 +4780,7 @@ fn an_override_gui_and_limits_win_and_are_stamped_override() {
         RawConfig {
             gui: Some("wayland".into()),
             limits: Some(schema::RawLimits {
+                rest: Default::default(),
                 memory_high: None,
                 memory_max: None,
                 tasks_max: Some(schema::RawLimit::Number(4096)),
@@ -6169,5 +6182,52 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
     assert!(
         checked >= 16,
         "expected the shipped agent bundles to be checked, saw {checked}"
+    );
+}
+
+#[test]
+fn an_unknown_key_is_named_rather_than_passed_over_in_silence() {
+    // Unknown keys stay ignored — that is the forward-compatibility contract — but a misspelling
+    // and a field from a newer sbx are indistinguishable in silence, and only one is harmless.
+    let mut raw = RawConfig::default();
+    raw.rest.insert("netowrk".into(), schema::RawIgnored);
+    raw.limits = Some(schema::RawLimits {
+        memory_max: Some(schema::RawLimit::Text("8G".into())),
+        rest: [("memory_maxx".to_string(), schema::RawIgnored)]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    });
+    let r = resolve_no_plugins(raw, None);
+
+    assert!(
+        r.warnings.iter().any(|w| w.contains("`netowrk`")),
+        "a misspelled top-level field must be named: {:?}",
+        r.warnings
+    );
+    let limit_warning = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("`memory_maxx`"))
+        .unwrap_or_else(|| panic!("{:?}", r.warnings));
+    assert!(
+        limit_warning.contains("[limits]"),
+        "and placed in its table: {limit_warning}"
+    );
+    // The layer still loads: the sibling that *was* understood is in effect.
+    assert_eq!(r.limits.memory_max.as_deref(), Some("8G"));
+}
+
+#[test]
+fn an_untrusted_projects_unknown_key_is_reported_too() {
+    // A spelling question is not a capability, so withholding the answer from an untrusted project
+    // would only leave its author guessing.
+    let mut proj = RawConfig::default();
+    proj.rest.insert("bindz".into(), schema::RawIgnored);
+    let r = resolve_no_plugins(RawConfig::default(), Some((proj, TrustState::Untrusted)));
+    assert!(
+        r.warnings.iter().any(|w| w.contains("`bindz`")),
+        "{:?}",
+        r.warnings
     );
 }

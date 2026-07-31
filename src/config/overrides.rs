@@ -660,11 +660,13 @@ fn build_typed_fragment(
     // one path (the field does not comma-split a device).
     if !seccomp.is_empty() {
         raw.seccomp = Some(RawSeccomp {
+            rest: Default::default(),
             allow: seccomp.to_vec(),
         });
     }
     if !devices.is_empty() {
         raw.devices = Some(RawDevices {
+            rest: Default::default(),
             allow: devices.to_vec(),
         });
     }

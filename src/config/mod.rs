@@ -611,6 +611,8 @@ impl Resolved {
             tarball: _,
             deb: _,
             appimage: _,
+            // An override blob's unknown keys are reported where every layer's are, before this.
+            rest: _,
         } = raw;
 
         // Validate the scalar security postures FIRST, into locals — a set-but-invalid one is fatal,
@@ -985,6 +987,9 @@ fn resolve(
         }
     }
 
+    // Say what was passed over before anything is applied, so a misspelled field is named next to
+    // the values that did take effect rather than inferred from their absence.
+    warn_unknown_keys(&mut warnings, GLOBAL_CONFIG, &global);
     // The global config is trusted by location, so it is honored in full: no
     // denylist, only key validation and the absolute-bind requirement.
     apply_env(
@@ -1201,6 +1206,9 @@ fn resolve(
     let mut project_secret_defaults = secret_defaults.clone();
     if let Some((proj, state)) = project {
         let trusted = state == TrustState::Trusted;
+        // Reported for an untrusted project too: an unknown key is a spelling question, not a
+        // capability, so withholding the answer would only leave the author guessing.
+        warn_unknown_keys(&mut warnings, PROJECT_CONFIG, &proj);
         // `env` is a free field — applied from any project, minus the reserved-key
         // denylist for an untrusted or changed one.
         apply_env(
@@ -1811,6 +1819,42 @@ fn union_forward(base: &mut Vec<u16>, extra: Vec<u16>) {
 /// [`union_forward`]: a layer (a trusted project overlay, an app) adds device grants, never removes
 /// another layer's. A path already present is kept (idempotent); the result is sorted so two
 /// equivalent layers produce one canonical set.
+/// Report every key a layer wrote that sbx does not know.
+///
+/// Unknown keys stay **ignored**: that is what lets a config written for a newer sbx load on an
+/// older one, and refusing them would turn the schema into a wall a project could trip a command
+/// on. But silence cannot tell a misspelling from a field that does not exist yet, and only one of
+/// those is harmless — a `memory_maxx` is a ceiling the author asked for and did not get, with
+/// nothing anywhere to say so. So the key is named, the layer loads on regardless, and the reader
+/// decides which it was.
+///
+/// Covers the top level and the tables where the silence costs the most: a limit that is not in
+/// effect, and a grant that is not granted. A `[task.<name>]`/`[app.<name>]` entry's own fields are
+/// not walked here — those carry a `cmd` whose absence already fails loudly.
+fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::RawConfig) {
+    let mut report = |section: &str, keys: &BTreeMap<String, schema::RawIgnored>| {
+        for key in keys.keys() {
+            warnings.push(format!(
+                "{source}: ignoring unknown key `{key}`{section} — sbx does not know this field \
+                 (check the spelling; a newer sbx's fields are ignored here on purpose)"
+            ));
+        }
+    };
+    report("", &raw.rest);
+    if let Some(limits) = &raw.limits {
+        report(" under `[limits]`", &limits.rest);
+    }
+    if let Some(seccomp) = &raw.seccomp {
+        report(" under `[seccomp]`", &seccomp.rest);
+    }
+    if let Some(devices) = &raw.devices {
+        report(" under `[devices]`", &devices.rest);
+    }
+    if let Some(ssh_agent) = &raw.ssh_agent {
+        report(" under `[ssh_agent]`", &ssh_agent.rest);
+    }
+}
+
 /// Validate a `[ssh_agent] allow` list into the entries the broker will match on, dropping a
 /// malformed one with a warning and keeping the rest (the drop-bad-entry shape of `[devices]`).
 ///
