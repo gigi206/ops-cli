@@ -1357,9 +1357,11 @@ mod tests {
         let egress = root.join("egress");
         let forward = root.join("forward");
         let portal = root.join("portal");
+        let sshagent = root.join("ssh-agent");
         std::fs::create_dir_all(&egress).unwrap();
         std::fs::create_dir_all(&forward).unwrap();
         std::fs::create_dir_all(&portal).unwrap();
+        std::fs::create_dir_all(&sshagent).unwrap();
 
         // pid 1 is live, pid 2 is gone.
         for name in ["ca-1.pem", "proxy-1.sock", "ca-2.pem", "control-2.sock"] {
@@ -1373,6 +1375,10 @@ mod tests {
         std::fs::create_dir_all(forward.join("fwd-2").join("nested")).unwrap();
         std::fs::create_dir(portal.join("1")).unwrap();
         std::fs::create_dir(portal.join("2")).unwrap();
+        // The ssh-agent broker's socket, which a signal-killed session leaves behind (its guard's
+        // `Drop` never runs) — the case this backstop exists for.
+        std::fs::write(sshagent.join("agent-1.sock"), b"x").unwrap();
+        std::fs::write(sshagent.join("agent-2.sock"), b"x").unwrap();
 
         let live = |pid: u32| pid == 1;
 
@@ -1380,8 +1386,8 @@ mod tests {
         let listed = sweep_runtime_dirs_with(root, false, &live);
         assert_eq!(
             listed.len(),
-            4,
-            "ca-2, control-2, fwd-2, portal/2: {listed:?}"
+            5,
+            "ca-2, control-2, fwd-2, portal/2, agent-2: {listed:?}"
         );
         assert!(
             egress.join("ca-2.pem").exists(),
@@ -1391,9 +1397,14 @@ mod tests {
 
         // The sweep removes exactly those four — files and directories alike.
         let removed = sweep_runtime_dirs_with(root, true, &live);
-        assert_eq!(removed.len(), 4);
+        assert_eq!(removed.len(), 5);
         assert!(!egress.join("ca-2.pem").exists());
         assert!(!egress.join("control-2.sock").exists());
+        assert!(!sshagent.join("agent-2.sock").exists());
+        assert!(
+            sshagent.join("agent-1.sock").exists(),
+            "a live launch keeps its broker socket"
+        );
         assert!(
             !forward.join("fwd-2").exists(),
             "a directory entry is removed recursively"
