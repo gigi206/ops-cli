@@ -199,11 +199,16 @@ not be named `defaults`.
 
 ## Output: what substitution does and does not promise
 
-Every credential value found in a returned stream, in an error message sbx composes, or in a log line
-is replaced by **`${NAME}`** — the credential's own name, so the output stays readable and says what
-was withheld. It covers the plaintext *and* each registered encoding of it. Values shorter than 8
-bytes are not substituted: such a needle would match benign text and leak the value through the
-positions of its own placeholders.
+Every credential value found in a returned stream, in an error message sbx composes, in a log line, or
+in the paths an exec refusal names is replaced by **`${NAME}`** — the credential's own name, so the
+output stays readable and says what was withheld. It covers the plaintext *and* each registered
+encoding of it. Values shorter than 8 bytes are not substituted: such a needle would match benign text
+and leak the value through the positions of its own placeholders.
+
+The refusal paths are on that list because they are text the **command** composed rather than text it
+printed: a program name is chosen by whoever calls `execve`, so a command that built one out of its
+credential would otherwise hand the caller that spelling untouched. What is promised is about the
+spelling, not about who wrote the command.
 
 Two things to keep in mind:
 

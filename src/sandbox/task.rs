@@ -684,12 +684,47 @@ impl TaskEngine {
             timed_out: raw.timed_out,
             stopped: raw.stopped,
             elapsed_ms,
-            refused: enforce.map(|e| e.refusals()).unwrap_or_default(),
+            refused: Self::substituted_refusals(
+                enforce.map(|e| e.refusals()).unwrap_or_default(),
+                &needles,
+                &placeholder,
+            ),
             output: output.map(|o| {
                 let size = o.size();
                 (format!("{TASK_OUT_AGENT}/{}", task.name), size)
             }),
         })
+    }
+
+    /// Substitute credentials out of the paths an exec refusal names, exactly as the output is.
+    ///
+    /// These paths are a **third sink**. `stdout` and `stderr` are scanned because they leave; a
+    /// refusal leaves too — straight to the caller — and it is the one text a caller receives that
+    /// the command chose without writing a byte of output. The program a command reaches for is the
+    /// command's own choice, so a command that spelled a credential into a program name would hand
+    /// the caller that spelling verbatim.
+    ///
+    /// It cannot happen while every command is fixed and every parameter is bounded, which is the
+    /// state of a declaration today. That is the wrong thing to rely on: the substituter's promise is
+    /// about **spelling**, not about who composed the command, and a promise that holds only while a
+    /// neighbouring check holds is one that breaks the day the neighbour moves.
+    ///
+    /// The hits are deliberately **not** added to the invocation's redaction count. That count is
+    /// reported as values substituted out of the *output*, and a path is not output; the caller can
+    /// see the substitution in the refusal line it is already reading, so a number would restate what
+    /// it is looking at.
+    fn substituted_refusals(
+        refusals: Vec<super::proc_enforce::Refusal>,
+        needles: &[super::proxy::SecretNeedle],
+        placeholder: &Placeholder,
+    ) -> Vec<super::proc_enforce::Refusal> {
+        refusals
+            .into_iter()
+            .map(|r| super::proc_enforce::Refusal {
+                caller: super::redact::redact_string(&r.caller, needles, placeholder).0,
+                target: super::redact::redact_string(&r.target, needles, placeholder).0,
+            })
+            .collect()
     }
 
     /// The argv the cage actually runs: the task's own command, preceded by the egress forwarder
@@ -2190,6 +2225,86 @@ mod smoke {
         std::env::remove_var("SBX_SMOKE_TASK_TOKEN");
     }
 
+    /// The paths an exec refusal names are substituted, proven through the real supervisor rather
+    /// than against the helper alone: the command writes the credential into a program name and
+    /// reaches for it, `spawn` refuses the `execve`, and what comes back to the caller is the
+    /// credential's **name**.
+    ///
+    /// The file has to be created first. A refusal only counts as one when the target was *there* —
+    /// a `PATH` walk refuses a candidate per directory and those are not reported — so reaching for
+    /// a path that never existed would prove nothing. It is created with shell redirection alone,
+    /// because `spawn` is declared empty here: the command may run, and nothing else may.
+    #[test]
+    fn a_credential_in_a_refused_exec_path_is_substituted_by_the_real_supervisor() {
+        let project = TmpDir::new();
+        // Its own variable and its own value: the environment is process-global, so sharing the
+        // other smoke test's name would have each one clearing the other's credential mid-run.
+        std::env::set_var("SBX_SMOKE_REFUSAL_TOKEN", "refusal-token-abcdef");
+
+        let shell = match crate::store::resolve_nix(None).and_then(|nix| {
+            let data = TmpDir::new();
+            let layout = crate::store::Layout::under(data.path());
+            let nixpkgs = crate::store::LockTarget::global(&layout, None)
+                .resolve(&nix, &layout)
+                .ok()?;
+            super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
+                .ok()
+                .map(|u| u.shell_bin)
+        }) {
+            Some(shell) => shell,
+            None => {
+                eprintln!("skipping refusal smoke: need nix and a provisioned userland");
+                return;
+            }
+        };
+
+        let mut task = echo_task(&shell.to_string_lossy());
+        task.name = "reach-for-it".into();
+        task.secrets = vec![TaskSecret {
+            var: "DEMO_TOKEN".into(),
+            sources: vec![crate::config::SecretSource::Env(
+                "SBX_SMOKE_REFUSAL_TOKEN".into(),
+            )],
+            encode: Encoding::Raw,
+            description: None,
+        }];
+        task.cmd = vec![
+            shell.to_string_lossy().into_owned(),
+            "-c".into(),
+            ": > \"/tmp/$DEMO_TOKEN\"; exec \"/tmp/$DEMO_TOKEN\"".into(),
+        ];
+        task.params = vec![];
+        // Declared and empty: stand the supervisor up, and let the command run nothing further.
+        task.spawn = Some(vec![]);
+
+        let Some((engine, _data)) = engine_for(vec![task], project.path()) else {
+            eprintln!("skipping refusal smoke: need bwrap, userns, and nix");
+            return;
+        };
+
+        let outcome = engine
+            .run("reach-for-it", &BTreeMap::new(), &BTreeMap::new(), 1)
+            .expect("the task runs");
+
+        let refused = &outcome.refused;
+        assert!(
+            !refused.is_empty(),
+            "the supervisor must have refused the exec: {outcome:?}"
+        );
+        assert!(
+            refused.iter().any(|r| r.target == "/tmp/${DEMO_TOKEN}"),
+            "the refused path must come back named: {refused:?}"
+        );
+        assert!(
+            !refused
+                .iter()
+                .any(|r| r.caller.contains("refusal-token-abcdef")
+                    || r.target.contains("refusal-token-abcdef")),
+            "the plaintext must never reach the caller in a refusal: {refused:?}"
+        );
+        std::env::remove_var("SBX_SMOKE_REFUSAL_TOKEN");
+    }
+
     /// The task tool pool, end to end in a real cage: a tool realized in the pool exactly as mise
     /// lays one out is found by **name** (so the pool reached `PATH`), it is a `#!/bin/sh` script
     /// (so the cage kept the synthetic shell a shebang needs — the affordance a mise-installed tool
@@ -2421,6 +2536,64 @@ mod tests {
             OsString::from("{}"),
             "an empty brace pair is literal"
         );
+    }
+
+    // The paths an exec refusal names reach the caller like the output does, so they are scanned
+    // like the output — otherwise the one text a caller receives that the *command* composed would
+    // be the one spelling the substituter never saw.
+    #[test]
+    fn a_credential_spelled_into_an_exec_path_comes_back_substituted() {
+        let needles = vec![crate::sandbox::proxy::SecretNeedle::named(
+            "DEMO_API_KEY",
+            b"s3cr3t-value".to_vec(),
+        )];
+        let refusals = vec![
+            crate::sandbox::proc_enforce::Refusal {
+                caller: "/nix/store/demo/bin/sh".to_string(),
+                target: "/nix/store/demo/bin/s3cr3t-value".to_string(),
+            },
+            // The caller is attacker-influenced too the moment a command is composed rather than
+            // declared, so both fields are scanned, not just the target.
+            crate::sandbox::proc_enforce::Refusal {
+                caller: "/tmp/s3cr3t-value".to_string(),
+                target: "/nix/store/demo/bin/curl".to_string(),
+            },
+        ];
+
+        let out = TaskEngine::substituted_refusals(refusals, &needles, &Placeholder::Plain);
+
+        assert_eq!(
+            out[0].target, "/nix/store/demo/bin/${DEMO_API_KEY}",
+            "the credential must not reach the caller in the program name"
+        );
+        assert_eq!(
+            out[1].caller, "/tmp/${DEMO_API_KEY}",
+            "nor in the name of the program that reached for it"
+        );
+        assert_eq!(
+            out[0].caller, "/nix/store/demo/bin/sh",
+            "a path carrying no credential is left exactly as the kernel reported it"
+        );
+        assert_eq!(out[1].target, "/nix/store/demo/bin/curl");
+    }
+
+    // An empty caller is the policy deciding by target alone; scanning must not invent a value for
+    // it, because the wire writes `-` for empty and a fabricated one would change the field count.
+    #[test]
+    fn a_refusal_with_no_caller_keeps_its_empty_caller() {
+        let needles = vec![crate::sandbox::proxy::SecretNeedle::named(
+            "DEMO_API_KEY",
+            b"s3cr3t-value".to_vec(),
+        )];
+        let out = TaskEngine::substituted_refusals(
+            vec![crate::sandbox::proc_enforce::Refusal {
+                caller: String::new(),
+                target: "/nix/store/demo/bin/base64".to_string(),
+            }],
+            &needles,
+            &Placeholder::Plain,
+        );
+        assert!(out[0].caller.is_empty(), "an empty caller stays empty");
     }
 
     // A caller's value is re-checked against the bound at invocation, not just at declaration.

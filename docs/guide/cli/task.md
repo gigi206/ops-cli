@@ -253,7 +253,9 @@ $ sbx task run db-query --param sql="SELECT id FROM users" --json
 ```
 
 A stream the declaration **withholds** is `null`; one that ran and printed nothing is `""`. `redacted`
-is the substitution count, `refused` lists what [`spawn`](../configuration/task.md) blocked, and `output` is
+is the substitution count, `refused` lists what [`spawn`](../configuration/task.md) blocked — its paths
+are substituted exactly as the output is, so a credential a command spelled into a program name comes
+back named rather than in the clear — and `output` is
 `{"path": …, "bytes": …}` when the operation declares one. A refusal is a document too — `error` says
 why and `exit` is `null`, because nothing ran; the exit code is still 125. `id` is `null` only when
 the plane declined before admitting the request (an exhausted quota), where no invocation exists to
