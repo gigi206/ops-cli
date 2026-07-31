@@ -65,8 +65,10 @@ The one exception is `session-bind@openssh.com`, which is **forwarded** — see 
 section, where it does real work.
 
 Admission is re-derived from your agent on **every** request, so a key you `ssh-add -d`
-mid-session stops working immediately, and one you add is picked up without relaunching
-(if the grant names it).
+mid-session stops working immediately, and one you add mid-session is picked up without
+relaunching — provided the grant names it *and* the broker is running. If nothing matched
+at launch there is no broker to pick anything up, and a later `ssh-add` changes nothing
+until the next launch.
 
 ## What this does *not* contain
 
@@ -86,7 +88,12 @@ the source: grant a key whose **own** authority is narrow.
   ssh-add -h 'git@github.com' ~/.ssh/id_deploy
   ```
 
-  That check runs in **your agent**, not in sbx — sbx's part is not to break it.
+  That check runs in **your agent**, not in sbx — sbx's part is not to break it. Verified
+  both directions through the broker: toward `github.com` the key is offered and signs;
+  toward any other host the agent withholds it entirely once the client binds the session
+  to that host's key, so it is never even offered. The grant still lists it (an *unbound*
+  listing shows every key), so the launch note and `sbx config show` read the same either
+  way — the constraint bites at use, not at admission.
 
 ## It needs egress too — and port 22 needs a `ProxyCommand`
 
@@ -126,16 +133,21 @@ ssh -o 'ProxyCommand=socat - PROXY:127.0.0.1:%h:%p,proxyport=18043' git@github.c
 
 Put it in the cage's ssh config to keep `git push` verbatim:
 
-```
-# ~/.ssh/config, inside the cage
+```bash
+mkdir -p ~/.ssh
+cat > ~/.ssh/config <<'EOF'
 Host github.com
     ProxyCommand socat - PROXY:127.0.0.1:%h:%p,proxyport=18043
+EOF
+chmod 600 ~/.ssh/config      # ssh refuses a group- or world-readable config
 ```
 
-Verified end to end: with that `ProxyCommand`, a cage reaches `github.com:22`, completes the
-key exchange, binds the agent to the server's host key, and offers the granted key — the
-whole path, with the private key never leaving the host agent. See
-[`[network]`](network.md).
+The `chmod` is not optional: without it ssh stops at `Bad owner or permissions on
+~/.ssh/config` and never dials.
+
+Verified end to end, both forms: the cage reaches `github.com:22`, completes the key
+exchange, binds the agent to the server's host key, and offers the granted key — the whole
+path, with the private key never leaving the host agent. See [`[network]`](network.md).
 
 ## Seeing the grant
 

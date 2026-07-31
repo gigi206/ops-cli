@@ -31,6 +31,12 @@
 //! it: a key the user loaded with `ssh-add -h <destination>` keeps that constraint, since the agent
 //! needs these messages to check it. Destination scoping therefore exists today, enforced by
 //! OpenSSH's agent, and sbx's job is to let it through intact.
+//!
+//! Measured, both directions, through this broker: toward the permitted host the constrained key is
+//! offered and signs; toward any other, the agent withholds it from the *bound* identities answer
+//! entirely, so it is never even offered. An **unbound** listing still shows it — which is what
+//! [`admission`] reads, so a constrained key is admitted at launch like any other and the constraint
+//! bites at use rather than at admission.
 
 use super::binds::ExtraBind;
 use crate::store::Layout;
