@@ -44,6 +44,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[limits]` | security | [limits](limits.md) |
 | `[seccomp]` | security | [seccomp](seccomp.md) |
 | `[devices]` | security | [devices](devices.md) |
+| `[ssh_agent]` | security | [ssh-agent](ssh-agent.md) |
 | `gui` | security | [gui](gui.md) |
 | `gpu` | security | [gpu](gpu.md) |
 | `audio` | security | [audio](audio.md) |

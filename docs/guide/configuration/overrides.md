@@ -73,6 +73,11 @@ warned and skipped (less relaxation/no device — fail-closed), never fatal. Gra
 node exposes it; it does not confer a Linux capability, so a device that needs one (a VPN
 tun) is not made *usable* this way.
 
+[`[ssh_agent]`](ssh-agent.md) rides the same parity rule with no flag of its own: there is
+no `--ssh-agent`, but a `--config` blob's `[ssh_agent] allow` is honored for one launch and
+unions onto the configured grant, like `--device`. An unmatchable entry is warned and
+skipped, never fatal.
+
 #### `--proc` — the exec posture for one launch
 
 `--proc` sets only the [exec](proc.md) **mode** (`off`/`observe`/`enforce`/`ask`), the bare-string

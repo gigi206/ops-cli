@@ -86,6 +86,11 @@ pub(crate) struct ConfigView {
     pub(crate) devices: Vec<String>,
     /// Which layer supplied the device grant (`Default` when neither config did).
     pub(crate) devices_origin: ProvenanceView,
+    /// The ssh-agent keys the cage may sign with (`[ssh_agent] allow`), each naming one key by its
+    /// `SHA256:…` fingerprint or its comment. Empty when the cage gets no agent at all.
+    pub(crate) ssh_agent: Vec<String>,
+    /// Which layer supplied the ssh-agent grant (`Default` when neither config did).
+    pub(crate) ssh_agent_origin: ProvenanceView,
     /// The cage's effective cgroup resource limits (anti-DoS), each a config override or the default.
     pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
@@ -593,6 +598,10 @@ pub(crate) struct AppDetailView {
     /// is `Inherited` when the app added none of its own (it takes the baseline's grant).
     pub(crate) devices: Vec<String>,
     pub(crate) devices_origin: ProvenanceView,
+    /// The ssh-agent keys this app's cage may sign with. An app carries no grant of its own, so this
+    /// is the baseline's, and the origin is `Inherited` whenever it grants anything.
+    pub(crate) ssh_agent: Vec<String>,
+    pub(crate) ssh_agent_origin: ProvenanceView,
     /// The effective cgroup limits — the app's overrides folded onto the baseline — each field
     /// carrying its provenance (`Inherited` when the app left it to the baseline).
     pub(crate) limits: LimitsView,
@@ -769,6 +778,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         seccomp_origin: resolved.seccomp_origin.into(),
         devices: device_paths(&resolved.devices),
         devices_origin: resolved.devices_origin.into(),
+        ssh_agent: resolved.ssh_agent.clone(),
+        ssh_agent_origin: resolved.ssh_agent_origin.into(),
         limits,
         secrets,
         apps,
@@ -1247,6 +1258,14 @@ fn app_detail_view(
         seccomp_origin,
         devices: device_paths(&eff_devices),
         devices_origin,
+        // An app declares no ssh-agent grant of its own, so the baseline's stands as-is: whatever it
+        // grants, this app's cage inherits.
+        ssh_agent: baseline.ssh_agent.clone(),
+        ssh_agent_origin: if baseline.ssh_agent.is_empty() {
+            ProvenanceView::Default
+        } else {
+            ProvenanceView::Inherited
+        },
         limits,
         env: app
             .env
@@ -1487,6 +1506,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Default,
             devices: vec![],
             devices_origin: ProvenanceView::Default,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -1780,6 +1801,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             declared_secrets: vec![a_header_secret()],
             apps: Default::default(),
             warnings: vec![],

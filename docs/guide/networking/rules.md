@@ -306,6 +306,16 @@ the host name, so the verdict is made on what you wrote. A rule naming no single
 and a non-loopback IP literal get no listener — reported at launch, since the rule still governs the
 proxy and only the convenience is missing.
 
+A **port below 1024** gets no listener either, for a reason that cannot be worked around: binding
+one needs `CAP_NET_BIND_SERVICE` and the cage holds no capability at all. That covers ssh, so
+`tcp://github.com:22` is a valid rule the proxy honors, reached with an explicit `CONNECT`:
+
+```bash
+ssh -o 'ProxyCommand=socat - PROXY:127.0.0.1:%h:%p,proxyport=18043' git@github.com
+```
+
+See [`[ssh_agent]`](../configuration/ssh-agent.md), which is the other half of git-over-ssh.
+
 `tcp://localhost:<port>` is a special case worth naming, because it is the rule a developer writes
 for a service on their own machine. The cage's `localhost` is its own loopback — a different machine
 — so the listener is placed **there**, on the port declared, and the connection it forwards goes to

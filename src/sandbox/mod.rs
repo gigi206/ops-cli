@@ -51,6 +51,9 @@ mod netns;
 mod proxy;
 pub(crate) mod redact;
 
+// Credential brokers: the cage gets the capability, never the secret behind it.
+pub(crate) mod sshagent;
+
 // In-cage enforcement: seccomp denylist, cgroup limits, exec policy.
 pub(crate) mod cgroup;
 pub(crate) mod proc_control;

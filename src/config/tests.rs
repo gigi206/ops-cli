@@ -95,6 +95,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
         limits: None,
         seccomp: None,
         devices: None,
+        ssh_agent: None,
         proc: None,
         net: Default::default(),
     }
@@ -531,6 +532,16 @@ fn raw_devices(paths: &[&str]) -> RawConfig {
     RawConfig {
         devices: Some(schema::RawDevices {
             allow: paths.iter().map(|s| s.to_string()).collect(),
+        }),
+        ..RawConfig::default()
+    }
+}
+
+/// A `RawConfig` declaring an `[ssh_agent] allow` list from the given key identifiers.
+fn raw_ssh_agent(keys: &[&str]) -> RawConfig {
+    RawConfig {
+        ssh_agent: Some(schema::RawSshAgent {
+            allow: keys.iter().map(|s| s.to_string()).collect(),
         }),
         ..RawConfig::default()
     }
@@ -4038,6 +4049,88 @@ fn an_untrusted_project_devices_grant_is_dropped_but_the_global_survives() {
             "the dropped untrusted device grant must warn"
         );
     }
+}
+
+#[test]
+fn the_default_ssh_agent_grant_is_empty() {
+    // No `[ssh_agent]` means no agent in the cage at all — not an agent holding no keys.
+    let r = resolve_no_plugins(RawConfig::default(), None);
+    assert!(r.ssh_agent.is_empty());
+    assert_eq!(r.ssh_agent_origin, Provenance::Default);
+}
+
+#[test]
+fn a_trusted_project_ssh_agent_grant_unions_onto_the_global_set() {
+    // Global is trusted by location; a trusted project *adds* keys, it does not replace — and the
+    // merged set is sorted and deduped, like the device grant.
+    let r = resolve_no_plugins(
+        raw_ssh_agent(&["deploy-key"]),
+        Some((
+            raw_ssh_agent(&["build-key", "deploy-key"]),
+            TrustState::Trusted,
+        )),
+    );
+    assert_eq!(
+        r.ssh_agent,
+        vec!["build-key".to_string(), "deploy-key".to_string()],
+        "the project adds, never replaces; deduped and sorted"
+    );
+    assert!(r.warnings.is_empty());
+    assert_eq!(r.ssh_agent_origin, Provenance::Project);
+}
+
+#[test]
+fn an_untrusted_project_ssh_agent_grant_is_dropped_but_the_global_survives() {
+    // The flagship property, on the field where it bites hardest: a key the cage can sign with
+    // authenticates as the user everywhere that key is trusted, so untrusted code may not name one.
+    // What the *user* granted globally still stands.
+    for state in [TrustState::Untrusted, TrustState::Changed] {
+        let r = resolve_no_plugins(
+            raw_ssh_agent(&["build-key"]),
+            Some((raw_ssh_agent(&["deploy-key"]), state)),
+        );
+        assert_eq!(
+            r.ssh_agent,
+            vec!["build-key".to_string()],
+            "the trusted global grant survives an untrusted overlay"
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("[ssh_agent]")),
+            "the dropped untrusted grant must warn"
+        );
+    }
+}
+
+#[test]
+fn an_unmatchable_ssh_agent_entry_is_dropped_and_the_rest_kept() {
+    // The two spellings that would silently never match anything: a wildcard (there is none — a
+    // grant names each key so it can be audited) and a fingerprint that lost its tail to a
+    // copy-paste. Both are dropped with a warning; the valid entries beside them survive.
+    let full = "SHA256:asAp51067jpFuXnlqkJj32f+5u0IhJDux0qGku0+XHs";
+    let r = resolve_no_plugins(
+        raw_ssh_agent(&[
+            "*",
+            "SHA256:asAp51067jpFuXnlq",
+            full,
+            "ansible on host-b",
+            "  ",
+        ]),
+        None,
+    );
+    assert_eq!(
+        r.ssh_agent,
+        vec![full.to_string(), "ansible on host-b".to_string()],
+        "a comment is free-form (spaces and all); only the unmatchable spellings go"
+    );
+    assert_eq!(
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("[ssh_agent] allow"))
+            .count(),
+        2,
+        "one warning per dropped entry — a blank one is not an entry"
+    );
+    assert!(r.warnings.iter().any(|w| w.contains("no wildcard")));
 }
 
 #[test]

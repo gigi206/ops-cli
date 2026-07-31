@@ -294,7 +294,13 @@ Transport / broker bricks, in parallel:
 
 6. **tunnel lane** (blind TCP / SOCKS, `host:port`, trusted-only) — the transport for
    SSH/DB/anything.
-7. **ssh-agent forward** (sign-oracle, key never in the cage).
+7. **ssh-agent forward — DONE** (sign-oracle, key never in the cage): `[ssh_agent] allow`
+   names keys by fingerprint or comment; ops serves the cage a filtering agent socket whose
+   identities answer carries only those keys, refuses a signature for any other **without
+   contacting the host agent**, and allowlists the message types (no add/remove/wipe/unknown
+   extension). The host agent's socket is never bound. Residual: a signature names its
+   session, not its destination — narrow the key, or constrain it with `ssh-add -h` (the
+   binding message is forwarded, so that check still runs in the user's own agent).
 8. **DB protocol-aware proxy**, **mTLS client-cert injection**, **cloud signing
    proxy** — as needs arise.
 9. **command-MCP / exec tier** — the opt-in, off-by-default, risk-documented escape

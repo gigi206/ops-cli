@@ -1,0 +1,164 @@
+# `[ssh_agent]` — signing with a key the cage never holds
+
+A cage that must `git push` over ssh needs a **signature** from one of your keys. It must
+not need the key. `[ssh_agent] allow` names the keys your running agent may sign with on
+the cage's behalf — and sbx puts a **filtering agent** in front of the host's, rather than
+handing the cage the host agent's socket.
+
+```toml
+[ssh_agent]
+allow = ["deploy@example", "SHA256:asAp51067jpFuXnlqkJj32f+5u0IhJDux0qGku0+XHs"]
+```
+
+`[ssh_agent]` is a **security field** — honored from the global config or a trusted
+project, ignored from an untrusted one — because a key the cage can sign with
+authenticates as you on every host that trusts it. An empty or absent `allow` leaves the
+cage with **no agent at all** (not an agent holding no keys): `$SSH_AUTH_SOCK` is unset
+inside, and the host agent's socket is in no mount the cage holds.
+
+See also: [Secrets](../secrets/README.md) · [The trust gate](../concepts/trust.md) ·
+[`[network]`](network.md) · [`[devices]`](devices.md).
+
+## Naming a key
+
+An entry names **one** key, by either spelling `ssh-add -l` prints:
+
+```
+$ ssh-add -l
+256 SHA256:asAp51067jpFuXnlqkJj32f+5u0IhJDux0qGku0+XHs deploy@example (ED25519)
+    └───────────────── the fingerprint ──────────────┘ └── the comment ─┘
+```
+
+- the **`SHA256:…` fingerprint** — exact, and unchanged if you re-comment the key;
+- the **comment** — what a human recognises; free-form, spaces and all.
+
+Both are matched by exact equality. There is **no wildcard**: a `"*"` entry is dropped with
+a warning, as is a `SHA256:` fingerprint that lost its tail to a copy-paste (a real one is
+43 characters). A grant you could not read off a listing would not be a grant anyone could
+audit.
+
+The keys the grant resolves to are settled **at launch**, against what your agent is
+actually holding then:
+
+```
+sbx: ssh-agent: the cage may sign with deploy@example (5 other keys withheld)
+```
+
+If no agent is running, or no key it holds matches, sbx **warns and gives the cage no
+agent** — it never falls back to a wider grant.
+
+## What the broker allows
+
+The cage talks to a socket sbx serves, not to your agent. Every message is checked against
+an **allowlist of message types**:
+
+| The cage asks | Answer |
+|---|---|
+| list identities | the keys `allow` names — the rest are **absent from the listing**, not merely unusable |
+| sign with a listed key | forwarded to your agent; the signature comes back |
+| sign with any other key | refused, **without contacting your agent** |
+| add a key, remove one, remove all | refused — the cage cannot plant a key in your agent, or wipe it |
+| lock / unlock / smartcard | refused |
+| any other extension, or a message type sbx has never seen | refused |
+
+The one exception is `session-bind@openssh.com`, which is **forwarded** — see the next
+section, where it does real work.
+
+Admission is re-derived from your agent on **every** request, so a key you `ssh-add -d`
+mid-session stops working immediately, and one you add is picked up without relaunching
+(if the grant names it).
+
+## What this does *not* contain
+
+Any code in the cage can authenticate as an allowed key to **any host that trusts that
+key**, for as long as the cage runs. The broker bounds *which key* and *which operation* —
+never *which destination*. A signature request names the session it belongs to, not the
+host it will be spent on.
+
+So this is a labelled step down from confidentiality-by-absence, and the mitigation is at
+the source: grant a key whose **own** authority is narrow.
+
+- Prefer a **deploy key** scoped to one repository over your personal key.
+- Load a key with a **destination constraint** and the constraint holds, because sbx
+  forwards the binding message OpenSSH's agent needs to check it:
+
+  ```bash
+  ssh-add -h 'git@github.com' ~/.ssh/id_deploy
+  ```
+
+  That check runs in **your agent**, not in sbx — sbx's part is not to break it.
+
+## It needs egress too — and port 22 needs a `ProxyCommand`
+
+The broker rides a Unix socket, so it is independent of the network posture — and equally,
+it opens no network. A signature with nowhere to go is no use: under an allowlist posture
+the cage reaches ssh only through a raw `tcp://` rule.
+
+```toml
+[packages]
+openssh = "nix:openssh"
+socat   = "nix:socat"
+
+[ssh_agent]
+allow = ["deploy@example"]
+
+[network]
+mode  = "allow"
+allow = ["tcp://github.com:22"]
+```
+
+For most `tcp://` destinations sbx also plants an **in-cage listener** and an `/etc/hosts`
+entry, so the client dials the name unchanged. **Port 22 is not one of them.** A port below
+1024 is privileged and the cage holds no capability, so that listener cannot exist — sbx
+says so at launch rather than leaving the name pointing at a dead address:
+
+```
+sbx: warning: no in-cage listener for tcp://github.com:22 — a port below 1024 cannot be
+     bound inside the cage, which holds no capability; reach it with an explicit CONNECT …
+```
+
+The rule still governs the proxy, so the route is there — the client just has to ask for it
+explicitly, through the in-cage CONNECT proxy:
+
+```bash
+ssh -o 'ProxyCommand=socat - PROXY:127.0.0.1:%h:%p,proxyport=18043' git@github.com
+```
+
+Put it in the cage's ssh config to keep `git push` verbatim:
+
+```
+# ~/.ssh/config, inside the cage
+Host github.com
+    ProxyCommand socat - PROXY:127.0.0.1:%h:%p,proxyport=18043
+```
+
+Verified end to end: with that `ProxyCommand`, a cage reaches `github.com:22`, completes the
+key exchange, binds the agent to the server's host key, and offers the granted key — the
+whole path, with the private key never leaving the host agent. See
+[`[network]`](network.md).
+
+## Seeing the grant
+
+`sbx config show` reports it with its provenance, like every other resolved value:
+
+```
+  ssh-agent: deploy@example (keys the cage may sign with) (global)
+```
+
+An app inherits the baseline grant; there is no per-app `ssh_agent` field.
+
+## A task cage gets no agent
+
+The grant is the agent cage's. A [declared operation](task.md) runs in its own ephemeral
+sibling cage, which inherits only an allowlist of mounts and environment variables — the
+broker socket and `SSH_AUTH_SOCK` are in neither. So a task cannot sign, even one declared
+by the same config, unless a future field says otherwise.
+
+## Residuals
+
+- **No per-signature prompt.** Every request from an admitted key is granted silently.
+  (`ssh-add -c` on the host still applies — your agent asks you, not sbx.)
+- **No per-destination fence in sbx.** Destination constraints exist, enforced by your own
+  agent, as above.
+- **No signature counter.** The grant is reported at launch; individual signatures are not
+  logged.

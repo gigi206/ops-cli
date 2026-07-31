@@ -965,6 +965,8 @@ mod tests {
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             declared_secrets: vec![],
             apps: apps.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),
             warnings: vec![],

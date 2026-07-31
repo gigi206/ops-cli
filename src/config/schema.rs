@@ -181,6 +181,12 @@ pub(crate) struct RawConfig {
     /// becomes reachable from the cage), a choice an untrusted project may not make. Empty or absent
     /// leaves the cage's minimal `/dev` (null/zero/urandom/tty…) with no host devices.
     pub(crate) devices: Option<RawDevices>,
+    /// A trusted grant of ssh-agent keys into the cage, declared as the `[ssh_agent]` table. A
+    /// security field — honored from the global config or a trusted project, ignored from an
+    /// untrusted one: a key the cage can sign with authenticates as the user everywhere that key is
+    /// trusted, a choice an untrusted project may not make. Empty or absent leaves the cage with no
+    /// agent at all.
+    pub(crate) ssh_agent: Option<RawSshAgent>,
     /// Network-scoped config that is not itself a posture — currently the reusable egress
     /// groups (`[net.groups]`). A group is a named list of egress entries that any `[network]`
     /// `allow`/`deny` list may reference with `@<name>`, so a set of hosts is declared once and
@@ -207,7 +213,8 @@ pub(crate) struct RawConfig {
 /// (`allow`/`deny`/`mute`), and the credential it authenticates with (`secret`) — and **nothing
 /// about the shape of the cage**. There is deliberately no `cmd` (an app's command is its own
 /// identity, and inheriting one would be an integrity hijack), no `binds`/`forward`/`devices`/
-/// `seccomp`/`limits` (host exposure and kernel surface stay declared where they are granted), and
+/// `ssh_agent`/`seccomp`/`limits` (host exposure and kernel surface stay declared where they are
+/// granted), and
 /// none of the posture scalars (`network.mode`, `gui`, `gpu`, `audio`, `dbus`, `proc`,
 /// `home_scope`) — a bundle that silently switched on a microphone because the tool it packages
 /// can use one is exactly the surprise this shape rules out. So using a bundle can add a tool, its
@@ -370,6 +377,19 @@ pub(crate) struct RawSeccomp {
 /// launch, not fatal. Empty or absent leaves the minimal `/dev`.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawDevices {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allow: Vec<String>,
+}
+
+/// The `[ssh_agent]` table: which of the host agent's keys the cage may sign with. Each `allow`
+/// entry names **one** key, by the `SHA256:…` fingerprint or by the comment `ssh-add -l` prints
+/// beside it. There is no wildcard: a grant that could not be read off a listing would not be a
+/// grant anyone could audit. sbx never binds the host agent's socket — it serves the cage a socket
+/// of its own whose answers carry only the named keys, and whose message types are an allowlist, so
+/// the cage can list and sign and nothing else (no add, no remove, no wipe). Empty or absent leaves
+/// the cage with no agent.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawSshAgent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allow: Vec<String>,
 }

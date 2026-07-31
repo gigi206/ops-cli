@@ -1178,7 +1178,8 @@ const PAGES: &[Page] = &[
         details:
             "Shows the resolved configuration for the current project — the layered global and\n\
             project environment, binds, packages, tools, network, GUI, secrets, resource\n\
-            limits, the seccomp relaxation, the host device grant, and app profiles, after the\n\
+            limits, the seccomp relaxation, the host device grant, the ssh-agent grant, and app\n\
+            profiles, after the\n\
             trust gate has dropped\n\
             anything an untrusted project may not set. Each value is tagged with where it came\n\
             from — (default), (global), or\n\
@@ -1681,7 +1682,8 @@ const PAGES: &[Page] = &[
             in before resolution — so an orchestrator that drives another agent's CLI states that\n\
             agent's requirements once instead of copying them, and the copies cannot drift apart.\n\
             A bundle carries NOTHING about the shape of the cage: no `cmd`, no `binds`, `forward`,\n\
-            `devices`, `seccomp` or `limits`, and none of the postures (`network` mode, `gui`, `gpu`,\n\
+            `devices`, `ssh_agent`, `seccomp` or `limits`, and none of the postures (`network` mode,\n\
+            `gui`, `gpu`,\n\
             `audio`, `dbus`, `proc`, `home_scope`) — using one can add a tool, its environment, its\n\
             egress and its credential, never widen what the cage exposes of the host. Bundles are\n\
             global-only (like `[net.groups]`), so this command has no scope flag. Read-only (except\n\

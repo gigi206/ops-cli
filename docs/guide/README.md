@@ -41,6 +41,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`[limits]`](configuration/limits.md) — cgroup resource limits.
 - [`[seccomp]`](configuration/seccomp.md) — relax the mandatory syscall denylist (trusted-only).
 - [`[devices]`](configuration/devices.md) — expose host device nodes into the cage (trusted-only).
+- [`[ssh_agent]`](configuration/ssh-agent.md) — sign with a named key the cage never holds (trusted-only).
 - [`gui`](configuration/gui.md) — the Wayland display posture.
 - [`gpu`](configuration/gpu.md) — hardware-accelerated GPU rendering (mesa: Intel/AMD/nouveau).
 - [`audio`](configuration/audio.md) — microphone and playback via PulseAudio.

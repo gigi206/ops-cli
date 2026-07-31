@@ -276,6 +276,16 @@ pub(crate) struct Resolved {
     /// (`Default` when neither config did), like `forward_origin`. A display affordance for
     /// `sbx config`; the launcher ignores it.
     pub(crate) devices_origin: Provenance,
+    /// The ssh-agent keys a trusted `[ssh_agent] allow` grants the cage, each entry naming one key
+    /// by its `SHA256:…` fingerprint or its comment. A security field, gated like
+    /// `devices`/`seccomp` — a key the cage can sign with authenticates as the user wherever that
+    /// key is trusted, so an untrusted project may not grant one. The default (empty) leaves the
+    /// cage with no agent. The layering unions (a project adds to the global set), like `devices`.
+    pub(crate) ssh_agent: Vec<String>,
+    /// Which layer supplied the ssh-agent grant — the highest-trust layer that granted anything
+    /// (`Default` when neither config did), like `devices_origin`. A display affordance for
+    /// `sbx config`; the launcher ignores it.
+    pub(crate) ssh_agent_origin: Provenance,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -543,8 +553,9 @@ impl Resolved {
     ///
     /// Trusted **by invocation**: every field is honored, since the invoker owns the process argv
     /// and environment (no lower-trust context can reach them). This includes the two fields a config
-    /// file gates trusted-only — `[seccomp]` (relax the syscall denylist) and `[devices]` (grant a
-    /// host device): the justification is **parity with the trusted config** — the invoker strictly
+    /// file gates trusted-only — `[seccomp]` (relax the syscall denylist), `[devices]` (grant a
+    /// host device) and `[ssh_agent]` (grant a key the cage may sign with): the justification is
+    /// **parity with the trusted config** — the invoker strictly
     /// outranks any config layer, so it may declare exactly the relaxation/grant a *trusted* config
     /// already can. (Not the `network`/`binds` axis: relaxing the denylist re-permits a syscall whose
     /// only containment was the filter, widening the in-cage kernel attack surface.) Each field it
@@ -557,10 +568,11 @@ impl Resolved {
     /// A set-but-invalid **scalar security posture** (`network`/`gui`/`[limits]`) is a **hard error**
     /// (`Err`, the launch aborts): there is no safe fallback — silently keeping the baseline could
     /// leave a *wider* posture than the user's explicit (mistyped) intent, the exact fail-open this
-    /// feature must not have. The additive fields (`env`/`binds`/`packages`/`seccomp`/`devices`)
+    /// feature must not have. The additive fields
+    /// (`env`/`binds`/`packages`/`seccomp`/`devices`/`ssh_agent`)
     /// instead fail *closed* by dropping a bad entry (a missing bind, an unbuilt tool, an unknown
-    /// syscall token, or a malformed device path is *less* capability/relaxation, never a wider
-    /// posture), so they warn and skip rather than abort. On a hard error nothing is applied (the
+    /// syscall token, a malformed device path, or an unmatchable key is *less*
+    /// capability/relaxation, never a wider posture), so they warn and skip rather than abort. On a hard error nothing is applied (the
     /// scalars are validated up front, before any mutation), so a caller that surfaces the error can
     /// still show the untouched baseline.
     pub(crate) fn apply_override(&mut self, ov: Override) -> Result<(), Vec<String>> {
@@ -579,6 +591,7 @@ impl Resolved {
             forward,
             seccomp,
             devices,
+            ssh_agent,
             proc,
             // The channel is applied earlier (before the lock is chosen); groups/apps/bundles are
             // not launch-shaping and were noticed and dropped at collection time (a bundle is only
@@ -748,6 +761,13 @@ impl Resolved {
             if !over.is_empty() {
                 union_devices(&mut self.devices, over);
                 self.devices_origin = Provenance::Override;
+            }
+        }
+        if ssh_agent.is_some() {
+            let over = apply_ssh_agent(&mut self.warnings, OVERRIDE_SOURCE, ssh_agent);
+            if !over.is_empty() {
+                union_ssh_agent(&mut self.ssh_agent, over);
+                self.ssh_agent_origin = Provenance::Override;
             }
         }
 
@@ -1122,6 +1142,14 @@ fn resolve(
     } else {
         Provenance::Global
     };
+    // The ssh-agent grant is trusted by location at the global layer, and layers like the device
+    // grant: a bad entry is dropped (warned), a project's unions onto this.
+    let mut ssh_agent = apply_ssh_agent(&mut warnings, GLOBAL_CONFIG, global.ssh_agent);
+    let mut ssh_agent_origin = if ssh_agent.is_empty() {
+        Provenance::Default
+    } else {
+        Provenance::Global
+    };
     // Secrets are trusted by location at the global layer. The `[secret.defaults]` table is
     // captured for the global hosts and as the base a trusted project may extend.
     let mut secret_defaults = SecretDefaults::default();
@@ -1397,6 +1425,23 @@ fn resolve(
                 ));
             }
         }
+        // `[ssh_agent]` is a security field — a trusted project may grant a key the cage can sign
+        // with; an untrusted or changed one may not, because that signature authenticates as the
+        // user on every host that trusts the key. Unions onto the global set, like `[devices]`.
+        if let Some(raw) = proj.ssh_agent {
+            if trusted {
+                let project_keys = apply_ssh_agent(&mut warnings, PROJECT_CONFIG, Some(raw));
+                if !project_keys.is_empty() {
+                    ssh_agent_origin = Provenance::Project;
+                }
+                union_ssh_agent(&mut ssh_agent, project_keys);
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `[ssh_agent]` ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // The `[secret]` section is a security field — a trusted project may inject
         // credentials (and extend the resolver defaults); an untrusted or changed one may
         // not (it would aim the user's secrets at a host of its choosing). The whole
@@ -1520,6 +1565,8 @@ fn resolve(
         seccomp_origin,
         devices,
         devices_origin,
+        ssh_agent,
+        ssh_agent_origin,
         secrets,
         declared_secrets,
         tasks,
@@ -1764,6 +1811,61 @@ fn union_forward(base: &mut Vec<u16>, extra: Vec<u16>) {
 /// [`union_forward`]: a layer (a trusted project overlay, an app) adds device grants, never removes
 /// another layer's. A path already present is kept (idempotent); the result is sorted so two
 /// equivalent layers produce one canonical set.
+/// Validate a `[ssh_agent] allow` list into the entries the broker will match on, dropping a
+/// malformed one with a warning and keeping the rest (the drop-bad-entry shape of `[devices]`).
+///
+/// An entry is matched against a key's fingerprint or its comment by **exact equality**, so the two
+/// mistakes worth catching are the ones that would silently never match: a wildcard (there is none —
+/// a grant names each key, so that it can be read off a listing and audited) and a truncated
+/// `SHA256:` fingerprint (a base64 SHA-256 is always 43 characters once its padding is dropped, so a
+/// shorter one is a copy-paste that lost its tail). Everything else is taken as a comment, which is
+/// free-form by nature: `ssh-add -l` prints comments with spaces in them.
+fn apply_ssh_agent(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: Option<schema::RawSshAgent>,
+) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let Some(raw) = raw else {
+        return keys;
+    };
+    for entry in &raw.allow {
+        let key = entry.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let reason = if key == "*" {
+            Some("there is no wildcard — name each key by its `SHA256:…` fingerprint or its comment, as `ssh-add -l` prints them")
+        } else if let Some(digest) = key.strip_prefix("SHA256:") {
+            let base64ish = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/';
+            (digest.len() != 43 || !digest.chars().all(base64ish))
+                .then_some("not a whole `SHA256:` fingerprint (43 base64 characters, unpadded)")
+        } else {
+            None
+        };
+        match reason {
+            None => keys.push(key.to_string()),
+            Some(reason) => warnings.push(format!(
+                "{source}: ignoring `[ssh_agent] allow` entry `{key}` ({reason})"
+            )),
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Union an ssh-agent grant onto the base set: a layer adds keys, never removes one, like
+/// [`union_devices`].
+fn union_ssh_agent(base: &mut Vec<String>, extra: Vec<String>) {
+    for key in extra {
+        if !base.contains(&key) {
+            base.push(key);
+        }
+    }
+    base.sort();
+}
+
 fn union_devices(base: &mut Vec<PathBuf>, extra: Vec<PathBuf>) {
     for dev in extra {
         if !base.contains(&dev) {

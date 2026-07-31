@@ -422,7 +422,7 @@ struct SandboxSpec {
     fhs:        FhsUserland,      // { loader, lib_paths } — 100% nix userland
     net:        NetPolicy,        // Shared{blocks} | Isolated | Allowlist(future)
     namespaces: NsPolicy,         // pid: REQUIRED, user, ipc, uts, mount…
-    holes:      Holes,            // { gui: None|Wayland|X11, ssh_agent, container_socket }
+    holes:      Holes,            // { gui: None|Wayland|X11, container_socket } — ssh-agent is a broker, not a hole
     cmd:        Vec<String>,
 }
 ```
@@ -493,7 +493,7 @@ project-root/store/synthetic for `Untrusted`; `env.clearenv == true`;
 | **M2** | Config + trust | global/project layering; content-hash trust gate (direnv); gating of untrusted fields | `.ops.toml` drives the sandbox **safely** |
 | **M3** | Tool provisioning | mise+nix bridge; declarative packages; **ops-mediated provisioning (store rw) via an inside→outside install channel** (the agent requests, ops provisions — `/nix` is ro at consumption, so the agent cannot `nix install` itself); pinned nixpkgs | reproducible tools |
 | **M4** | Apps + **Mode B** | app definitions; policy engine (A/B × trust → holes); least-privilege secret injection; **the seccomp denylist (incl. `io_uring`/`AF_UNIX`) + Landlock-FS enforcement** ([security-stack](bwrap-security-stack.md) §3–4). ⚠️ **ships the flagship with the confidentiality hole OPEN until M6** (injected API key + open network = possible exfiltration, cf. threat-model §1) — mitigate by landing the **credential-injection proxy** (security-stack §6) here, so the agent never holds the key | **`ops app claude` = the differentiator** |
-| **M5** | Parity holes + GC | GUI (Wayland); container socket **Mode A only**; ssh-agent; **GC of per-project `$HOME` + stale store generations** (`session/`) | opt-in conveniences + housekeeping |
+| **M5** | Parity holes + GC | GUI (Wayland); container socket **Mode A only**; **ssh-agent — shipped as a filtering broker (`[ssh_agent] allow`), not a socket bind**; **GC of per-project `$HOME` + stale store generations** (`session/`) | opt-in conveniences + housekeeping |
 | **M6** | **Network policy / allowlist** | netns layer + filtering (nono/greywall); metadata/localhost blocks → allowlist | **closes the confidentiality hole — LAST** |
 | **M7** | Hardening (later) | subuid tier; Landlock file ACL; cgroups/DoS limits | opt-in tiers |
 

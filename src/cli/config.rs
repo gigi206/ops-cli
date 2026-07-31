@@ -738,6 +738,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         );
     }
 
+    // ssh-agent grant — shown only when a trusted `[ssh_agent] allow` names a key, so the default
+    // (no agent in the cage at all) stays uncluttered. The entries read as written; which of them
+    // the host agent actually holds is settled at launch, and reported there.
+    if !view.ssh_agent.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}ssh-agent:{r} {} {dim}(keys the cage may sign with){r}{}",
+            view.ssh_agent.join(", "),
+            provenance_tag(view.ssh_agent_origin, pal)
+        );
+    }
+
     // Credentials the egress proxy injects — by destination and source locator, never the value.
     if !view.secrets.is_empty() {
         let _ = writeln!(
@@ -1258,6 +1270,18 @@ fn render_app_detail(
             o,
             "  {h}devices:{r} {} {dim}(host device nodes exposed){r}{devices_tag}",
             view.devices.join(", ")
+        );
+    }
+
+    // The ssh-agent grant this app's cage inherits from the baseline. Shown only when it grants
+    // something: an app declares no keys of its own, so "none" here would say nothing the baseline
+    // view does not already say.
+    if !view.ssh_agent.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}ssh-agent:{r} {} {dim}(keys the cage may sign with){r}{}",
+            view.ssh_agent.join(", "),
+            app_provenance_tag(view.ssh_agent_origin, pal)
         );
     }
 
@@ -2097,6 +2121,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Default,
             devices: vec![],
             devices_origin: ProvenanceView::Default,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
             apps: vec![],
@@ -2288,6 +2314,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Inherited,
             devices: vec![],
             devices_origin: ProvenanceView::Inherited,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: LimitsView {
                 memory_high: LimitView {
                     value: "70%".into(),
@@ -2540,6 +2568,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Default,
             devices: vec![],
             devices_origin: ProvenanceView::Default,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -2635,6 +2665,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Default,
             devices: vec![],
             devices_origin: ProvenanceView::Default,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -2764,6 +2796,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Default,
             devices: vec![],
             devices_origin: ProvenanceView::Default,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
             apps: vec![
@@ -2834,6 +2868,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Default,
             devices: vec![],
             devices_origin: ProvenanceView::Default,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -2940,6 +2976,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Default,
             devices: vec![],
             devices_origin: ProvenanceView::Default,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
@@ -3046,6 +3084,8 @@ mod tests {
             seccomp_origin: ProvenanceView::Default,
             devices: vec![],
             devices_origin: ProvenanceView::Default,
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {

@@ -1123,9 +1123,9 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 /// entries are keyed by the **launcher pid**.
 ///
 /// These hold a launch's live plumbing — the egress MITM CA and its proxy/control sockets, the
-/// inbound forwarder's socket dir, the in-cage portal's runtime dir, the process-observation
-/// sockets, the declared-operations plane's socket dir — all of which a clean exit unlinks through
-/// an RAII guard. A `Drop` does not run on a
+/// ssh-agent broker's socket, the inbound forwarder's socket dir, the in-cage portal's runtime dir,
+/// the process-observation sockets, the declared-operations plane's socket dir — all of which a
+/// clean exit unlinks through an RAII guard. A `Drop` does not run on a
 /// signal, and a cage normally ends on one (Ctrl-C, `sbx session stop`'s SIGTERM→SIGKILL, a
 /// detached launch killed later), so the guard covers the minority case and the rest accumulate.
 /// [`sweep_runtime_dirs`] is the backstop: the same doctrine the session registry already applies
@@ -1145,6 +1145,7 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 /// older version left behind, after which the directory simply stays empty.
 const RUNTIME_DIRS: &[(&str, &[&str])] = &[
     ("egress", &["ca-", "proxy-", "control-", "hosts-"]),
+    ("ssh-agent", &["agent-"]),
     ("forward", &["fwd-"]),
     ("portal", &[""]),
     ("proc", &["control-", "notif-"]),

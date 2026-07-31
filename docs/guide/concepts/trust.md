@@ -12,10 +12,14 @@ The config schema is split by the trust gate, not by two schemas:
 
 | | Free | Security |
 |---|---|---|
-| Fields | `env` | `binds`, `network`, `secret`, `packages`, `nixpkgs`, `gui`, `[limits]`, `[app.<name>]`, `[net.groups]` |
+| Fields | `env` | `binds`, `network`, `secret`, `packages`, `nixpkgs`, `forward`, `gui`, `gpu`, `audio`, `dbus`, `[proc]`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[task.<name>]`, `[app.<name>]`, `[net.groups]`, `[bundle.<name>]` |
 | From an untrusted project | applied (minus a reserved-key denylist) | **dropped**, with a warning |
 | From the global config | applied | applied (trusted by location) |
-| From a trusted project | applied | applied |
+| From a trusted project | applied | applied¹ |
+
+¹ Two are **global-only** rather than merely trusted-only: `[net.groups]` and
+`[bundle.<name>]` are ignored from *any* project, trusted or not. They are declared once
+where the user owns them, and referenced (`@group`, `use`) from anywhere.
 
 The `env` field is *free* because an untrusted project setting an environment
 variable can only harm itself inside the cage — with one exception: a **reserved-key

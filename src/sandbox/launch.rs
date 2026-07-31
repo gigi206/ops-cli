@@ -31,6 +31,7 @@ use super::egress;
 use super::forward;
 use super::pty::{copy_winsize, pump, RawMode, WinchRelay};
 use super::spec::{NetPolicy, SandboxSpec, TerminalPolicy};
+use super::sshagent;
 use crate::session::{self, Kind, RecordGuard, Session};
 use crate::store::Layout;
 use std::ffi::{CString, OsString};
@@ -3441,6 +3442,10 @@ fn establish_control_plane_pins(pins: &[crate::config::Bind]) -> io::Result<Vec<
 /// closing the listeners; the threads are detached and exit when their listener closes.
 pub(crate) struct LaunchGuard {
     pub(crate) egress: Option<egress::Egress>,
+    /// The filtering ssh-agent broker (`[ssh_agent] allow`), when one is running. Its accept loop is
+    /// a detached host thread that must outlive the cage; this owns the socket file, unlinked when
+    /// the launch ends.
+    pub(crate) ssh_agent: Option<sshagent::SshAgent>,
     pub(crate) forward: Option<forward::Forwarder>,
     /// The in-cage desktop-notifications relay (`dbus = true`), when one is running. It runs on a
     /// host thread bridging the private bus to the host notifications daemon, so it must outlive the
@@ -3491,6 +3496,9 @@ impl Drop for LaunchGuard {
         }
         if let Some(forward) = self.forward.take() {
             drop(forward);
+        }
+        if let Some(ssh_agent) = self.ssh_agent.take() {
+            drop(ssh_agent);
         }
         // Before the portal directory: the relay must disconnect from the private bus before its
         // socket is removed.
@@ -4269,6 +4277,64 @@ fn build(
         egress_guard = Some(guard);
     }
 
+    // The ssh-agent broker: a filtering agent socket in front of the host's own, so the cage can
+    // sign with the keys `[ssh_agent] allow` names and do nothing else — not list the rest, not add
+    // a key, not wipe the set. Independent of the network posture: it rides a bound Unix socket, so
+    // the empty netns is untouched. Where a signature is then *spent* is the egress allowlist's
+    // business: a `git push` also needs a `tcp://<host>:22` rule, and — since a capability-less cage
+    // cannot bind a privileged port — an explicit `CONNECT` to reach it.
+    //
+    // A grant that resolves to nothing is a warning and no agent, never a silent partial: the two
+    // ways that happens — no agent running, no held key matching — are both a mistake worth naming
+    // at the moment it is made. Only a failure to *stand up* the broker is fatal, like the egress
+    // proxy's: the user asked for it and it cannot be provided.
+    let mut sshagent_guard = None;
+    let mut sshagent_binds: Vec<binds::ExtraBind> = Vec::new();
+    let mut sshagent_env: Vec<(String, String)> = Vec::new();
+    if !prep.cfg.ssh_agent.is_empty() {
+        let grant = prep.cfg.ssh_agent.join(", ");
+        match sshagent::host_socket() {
+            None => crate::diag::warn(&format!(
+                "`[ssh_agent] allow` names {grant} but no agent is running on the host \
+                 (`$SSH_AUTH_SOCK` is unset) — the cage gets no agent"
+            )),
+            Some(host_sock) => {
+                let filter = sshagent::Filter::new(&prep.cfg.ssh_agent);
+                match sshagent::admission(&host_sock, &filter) {
+                    Err(e) => crate::diag::warn(&format!(
+                        "cannot reach the host ssh-agent at {} ({e}) — the cage gets no agent",
+                        host_sock.display()
+                    )),
+                    Ok(a) if a.admitted.is_empty() => crate::diag::warn(&format!(
+                        "no key the host agent holds matches `[ssh_agent] allow` ({grant}) — the \
+                         cage gets no agent. `ssh-add -l` prints the fingerprint and comment an \
+                         entry may name."
+                    )),
+                    Ok(a) => {
+                        let (guard, wiring) =
+                            sshagent::start(&prep.layout, &prep.cfg.ssh_agent, &host_sock)
+                                .map_err(|e| {
+                                    eprintln!("sbx: cannot start the ssh-agent broker: {e}");
+                                    ExitCode::FAILURE
+                                })?;
+                        crate::diag::note(&format!(
+                            "ssh-agent: the cage may sign with {}{}",
+                            a.admitted.join(", "),
+                            match a.withheld {
+                                0 => String::new(),
+                                1 => " (1 other key withheld)".to_string(),
+                                n => format!(" ({n} other keys withheld)"),
+                            }
+                        ));
+                        sshagent_binds = wiring.binds;
+                        sshagent_env = wiring.env;
+                        sshagent_guard = Some(guard);
+                    }
+                }
+            }
+        }
+    }
+
     // GUI hole: under `gui = "wayland"`, bind the host's Wayland compositor socket read-only so a
     // graphical app can map a window. The cage runs same-uid, so a read-only bind suffices to
     // connect(). Only the socket *file* is bound, never `$XDG_RUNTIME_DIR` itself — that directory
@@ -4461,6 +4527,7 @@ fn build(
     // (socket + CA) and the GUI socket. Their destinations are sbx's or the host's, never a
     // project path, so they neither shadow nor are shadowed by a structural mount.
     let mut extra_binds = egress_binds;
+    extra_binds.extend(sshagent_binds);
     extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
     extra_binds.extend(inline_flake_binds);
@@ -4565,6 +4632,7 @@ fn build(
         autoequip_env,
         mise_env(prep)?,
         egress_env,
+        sshagent_env,
         task_env,
         &prep.cfg.env,
     );
@@ -4713,6 +4781,7 @@ fn build(
     };
 
     let guard = if egress_guard.is_some()
+        || sshagent_guard.is_some()
         || forward_guard.is_some()
         || portal_host.is_some()
         || proc_enforce_guard.is_some()
@@ -4720,6 +4789,7 @@ fn build(
     {
         Some(LaunchGuard {
             egress: egress_guard,
+            ssh_agent: sshagent_guard,
             forward: forward_guard,
             notify: notify_relay,
             theme: theme_relay,
@@ -5420,7 +5490,8 @@ fn keep_passthrough(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(St
 
 /// Layer the cage's extra environment, lowest precedence first: host passthrough, then sbx's
 /// hermetic CA bundle, then the Wayland GUI hole, then the non-`nix:` auto-equip variable, then a
-/// trusted project's mise `[env]`, then the egress machinery, then the `.sbx.toml` `[env]`. The
+/// trusted project's mise `[env]`, then the egress machinery, then the ssh-agent broker's socket,
+/// then the `.sbx.toml` `[env]`. The
 /// assembler upserts these over the structural defaults and takes the last occurrence of a key,
 /// so a later layer wins: the egress proxy's per-session CA overrides the structural cacert under
 /// an allowlist, and a trusted config has the final say (self-harm only). The CA bundle sits
@@ -5438,6 +5509,7 @@ fn extra_cage_env(
     autoequip: Vec<(String, String)>,
     mise: Vec<(String, String)>,
     egress: Vec<(String, String)>,
+    ssh_agent: Vec<(String, String)>,
     task: Vec<(String, String)>,
     config: &[(String, String)],
 ) -> Vec<(String, String)> {
@@ -5447,6 +5519,7 @@ fn extra_cage_env(
     env.extend(autoequip);
     env.extend(mise);
     env.extend(egress);
+    env.extend(ssh_agent);
     env.extend(task);
     env.extend(config.iter().cloned());
     env
@@ -5836,6 +5909,8 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             seccomp_origin: Default::default(),
             devices: Vec::new(),
             devices_origin: Default::default(),
+            ssh_agent: vec![],
+            ssh_agent_origin: Default::default(),
             declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
@@ -6160,6 +6235,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             vec![],
             egress.clone(),
             vec![],
+            vec![],
             &[],
         );
         assert_eq!(
@@ -6169,7 +6245,17 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         );
 
         let cfg = vec![("SSL_CERT_FILE".into(), "/cfg/ca.pem".into())];
-        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], egress, vec![], &cfg);
+        let env = extra_cage_env(
+            vec![],
+            cacert,
+            vec![],
+            vec![],
+            vec![],
+            egress,
+            vec![],
+            vec![],
+            &cfg,
+        );
         assert_eq!(
             winner(&env).as_deref(),
             Some("/cfg/ca.pem"),
@@ -6181,7 +6267,17 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             "SSL_CERT_FILE".into(),
             "/etc/ssl/certs/ca-bundle.crt".into(),
         )];
-        let env = extra_cage_env(vec![], cacert, vec![], vec![], vec![], vec![], vec![], &[]);
+        let env = extra_cage_env(
+            vec![],
+            cacert,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            &[],
+        );
         assert_eq!(
             winner(&env).as_deref(),
             Some("/etc/ssl/certs/ca-bundle.crt"),

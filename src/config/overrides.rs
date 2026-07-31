@@ -470,13 +470,14 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     base.forward = union_forward_opt(base.forward, higher.forward);
     base.seccomp = union_allow_opt(base.seccomp, higher.seccomp, |s| &mut s.allow);
     base.devices = union_allow_opt(base.devices, higher.devices, |d| &mut d.allow);
+    base.ssh_agent = union_allow_opt(base.ssh_agent, higher.ssh_agent, |s| &mut s.allow);
     base.net.groups.extend(higher.net.groups);
     base.app.extend(higher.app);
     base.bundle.extend(higher.bundle);
     base
 }
 
-/// Union two optional `{ allow: Vec<String> }` tables (`[seccomp]` / `[devices]`), a higher tier's
+/// Union two optional `{ allow: Vec<String> }` tables (`[seccomp]` / `[devices]` / `[ssh_agent]`), a higher tier's
 /// entries appended onto a lower's — the collection-union rule, so `--seccomp`/`--device` accumulate
 /// across the tiers rather than clobbering a blob's list. `None` means "this tier set none". The
 /// downstream `apply_*` dedups (devices) or is idempotent (seccomp), so a plain append is enough.
@@ -1590,11 +1591,15 @@ mod tests {
     }
 
     #[test]
-    fn a_config_blob_seccomp_and_devices_survive_the_fold() {
-        // Regression guard: overlay_into must copy the [seccomp]/[devices] tables (they were once
-        // dropped in the fold, so a --config blob's relaxation silently vanished before apply).
+    fn a_config_blob_seccomp_devices_and_ssh_agent_survive_the_fold() {
+        // Regression guard for a bug this fold has produced twice: `overlay_into` merges field by
+        // field with nothing to check the list is complete, so a table it forgets is dropped in
+        // *silence* — a --config blob's grant simply never reaches apply. Every `allow`-shaped
+        // security table belongs here, and a new one must be added the day it is written.
         let ov = collect_cli(Cli {
-            config: &["[seccomp]\nallow = [\"ptrace\"]\n[devices]\nallow = [\"/dev/kvm\"]"],
+            config: &["[seccomp]\nallow = [\"ptrace\"]\n\
+                 [devices]\nallow = [\"/dev/kvm\"]\n\
+                 [ssh_agent]\nallow = [\"deploy-key\"]"],
             ..Default::default()
         })
         .unwrap();
@@ -1605,6 +1610,10 @@ mod tests {
         assert_eq!(
             ov.raw.devices.as_ref().map(|d| d.allow.as_slice()),
             Some(&["/dev/kvm".to_string()][..])
+        );
+        assert_eq!(
+            ov.raw.ssh_agent.as_ref().map(|s| s.allow.as_slice()),
+            Some(&["deploy-key".to_string()][..])
         );
     }
 
