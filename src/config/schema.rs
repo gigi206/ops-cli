@@ -854,9 +854,14 @@ impl<'de> Deserialize<'de> for RawIgnored {
     }
 }
 
+/// Written back as an empty table, because a profile that holds one of these still has to be
+/// writable: `sbx app export` serializes what was *parsed*, and TOML has no unit — a unit here
+/// failed the whole export with "unsupported unit type", naming neither the app nor the key. An
+/// empty table keeps the key visible, parses back to this same value, and is refused at load exactly
+/// as it was before the round-trip.
 impl Serialize for RawIgnored {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_unit()
+        s.collect_map(std::iter::empty::<((), ())>())
     }
 }
 
@@ -1388,6 +1393,27 @@ mod tests {
         // A multiline flake source may re-emit escaped through `toml::to_string`; the round-trip is
         // on the parsed value, so this proves export→import preserves the flake byte-for-byte.
         assert_eq!(app, reparsed, "export must round-trip losslessly");
+    }
+
+    /// An exec node's unknown key is refused at load, but the profile holding it still has to be
+    /// **writable**: `sbx app export` serializes what was parsed, before any validation. TOML has no
+    /// unit, so a unit here failed the whole export with "unsupported unit type" — an error naming
+    /// neither the app nor the key.
+    #[test]
+    fn an_unknown_key_in_an_exec_node_still_exports() {
+        let app = parse_app(
+            b"cmd = \"demo\"\n\
+              [task.t]\ncmd = [\"tool\"]\nspawn = [\"git\"]\n\
+              [task.t.exec.git]\nspawn = [\"ssh\"]\nbogus = { a = 1 }\n",
+        )
+        .unwrap();
+        let out = serialize_app(&app).expect("a parsed profile must be writable");
+        assert!(out.contains("bogus"), "the key stays visible, got:\n{out}");
+        assert_eq!(
+            parse_app(out.as_bytes()).unwrap(),
+            app,
+            "and what was written parses back to what was read"
+        );
     }
 
     #[test]

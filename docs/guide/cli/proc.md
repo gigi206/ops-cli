@@ -127,12 +127,19 @@ Under a non-enforcing `--observe` run the feed is populated by a short-interval 
 process that starts and exits within one tick can be missed — and each line's verdict reads
 `observe` (it records what ran, not a decision). Under [`[proc] mode = enforce`/`ask`](../configuration/proc.md)
 the feed comes from the seccomp user-notification supervisor instead: **every** `execve` is captured
-exactly, and each carries its real verdict — `allow`, `deny`, or `ask`.
+exactly, and each carries its real verdict — `allow`, `deny`, `ask`, or `absent`.
 
 ```
 #   14:02:11  deny     12346  /nix/store/…/bin/curl
 #   14:02:13  allow    12400  /nix/store/…/bin/rg
+#   14:02:13  absent   12400  /nix/store/…/bin/rg
 ```
+
+`absent` is a refusal of a file that was not there. Looking up a program by name issues one `execve`
+per `PATH` entry until one succeeds, so a program found in the fourth directory leaves three of
+these behind it — nothing was kept from the run, and the same lines would appear with no policy at
+all. They are shown because the feed shows every `execve`, and set apart because `deny` is the one
+that stopped something.
 
 ## `pending`
 

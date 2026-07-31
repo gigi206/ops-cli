@@ -423,6 +423,7 @@ plausibly runs.
 |---|---|
 | a section with no `spawn` on the task | nothing enforces it — `spawn` is what stands the supervisor up |
 | a section nothing can reach | it says what a program may run when no program may run that program |
+| `[exec.git]` where the list says `/nix/store/…/bin/git` | reachability is by **spelling**: the cage's `PATH` is what resolves a name, and there is no cage yet at load. Write the section key the way the list writes it |
 | a section for the command itself | what the command may run is `spawn`; two declarations would each be half of one |
 | `[exec.git.ssh]` | a program is the whole address |
 | `[exec.git] spawn = []` | that is what having no section already means |
@@ -437,6 +438,10 @@ are one file behind many names: every coreutils tool is a symlink to `coreutils`
 different binary. What bounds it is that only a program that is **allowed to run** can ever be a
 caller, so the over-grant never reaches past what the declaration already admits. Two sections that
 turn out to be the same executable are refused: nothing could tell them apart.
+
+That refusal — and the one for a program that is nowhere in the cage — arrives **when the operation
+is invoked**, not at load: which binary a name reaches is a fact about the cage, and there is no cage
+until then. So a task can list cleanly and refuse on its first run, naming the program either way.
 
 **A refusal names what was refused, and only what was there.** Looking up a program by name issues
 one `execve` per `PATH` entry until one succeeds, so a program found in the fourth directory leaves
