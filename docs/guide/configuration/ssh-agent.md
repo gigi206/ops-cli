@@ -119,9 +119,35 @@ There is no field for one, in either direction:
 - **The broker socket has no password**, and one would buy nothing: it is a socket in a
   `0700` directory, and the cage runs as your own uid. Anything on the host running as you
   can already talk to your real agent directly.
-- **Password-based ssh login is a different thing entirely.** A password typed by an ssh
-  client *inside* the cage is a secret the cage holds — the [exposed tier](../secrets/README.md),
-  not this one. If a destination only takes passwords, the agent cannot help; use a key.
+- **Password-based ssh login is a different thing entirely.** The proxy splices port 22
+  byte for byte, so there is no request head to inject into and a `tcp://` host is refused
+  as a `[secret]` destination. If a destination only takes passwords, the agent cannot
+  help — use a key where you can, and a [declared operation](task.md) where you cannot:
+
+  ```toml
+  [packages]
+  sshpass = "nix:sshpass"      # a task's own `packages` takes `mise:` only
+  openssh = "nix:openssh"
+
+  [task.deploy]
+  cmd     = ["sshpass", "-e", "ssh", "-o", "PubkeyAuthentication=no",
+             "-o", "PreferredAuthentications=password",
+             "-p", "2222", "deploy@localhost", "{action}"]
+  params  = { action = "^(systemctl restart myapp|id -un)$" }
+  network = ["tcp://localhost:2222"]
+
+  [task.deploy.secret]
+  SSHPASS = "env://DEPLOY_PASSWORD"
+  ```
+
+  Verified against a real sshd: the password is resolved host-side and materialised only
+  in the ephemeral task cage, the agent's own cage holds no trace of it, and an
+  invocation whose credential cannot be resolved is refused before anything runs. The
+  `PubkeyAuthentication=no` pair is not decoration — without it ssh burns its
+  authentication attempts offering keys and the server disconnects on `Too many
+  authentication failures` before password auth is ever tried. This is the template tier,
+  weaker than the broker: keep `action` genuinely bounded, since a pattern that admits an
+  arbitrary command hands the password to whoever calls it.
 
 The nearest thing to "ask me for a password each time" is `ssh-add -c` above: not a secret
 to declare, a confirmation you give.
