@@ -744,8 +744,13 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     if !view.ssh_agent.is_empty() {
         let _ = writeln!(
             o,
-            "  {h}ssh-agent:{r} {} {dim}(keys the cage may sign with){r}{}",
+            "  {h}ssh-agent:{r} {} {dim}({}){r}{}",
             view.ssh_agent.join(", "),
+            if view.ssh_agent_confirm {
+                "keys the cage may sign with, each signature confirmed on your desktop"
+            } else {
+                "keys the cage may sign with"
+            },
             provenance_tag(view.ssh_agent_origin, pal)
         );
     }
@@ -1003,6 +1008,12 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             // The host device grant this overlay adds (its own `/dev/` paths, not the merged set).
             if !app.devices.is_empty() {
                 let _ = writeln!(o, "      {dim}devices:{r} {}", app.devices.join(", "));
+            }
+            // The ssh-agent keys this overlay grants (its own entries, not the merged set) — the
+            // whole point of the per-app field is that one app may sign where another may not, so a
+            // listing that folded it into the baseline would hide exactly what it is for.
+            if !app.ssh_agent.is_empty() {
+                let _ = writeln!(o, "      {dim}ssh-agent:{r} {}", app.ssh_agent.join(", "));
             }
             // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
             // unions them with the baseline only for the launch) — a count by default, expanded
@@ -1273,14 +1284,19 @@ fn render_app_detail(
         );
     }
 
-    // The ssh-agent grant this app's cage inherits from the baseline. Shown only when it grants
-    // something: an app declares no keys of its own, so "none" here would say nothing the baseline
-    // view does not already say.
+    // The effective ssh-agent grant — the app's own keys unioned with the baseline's, tagged with
+    // where they came from. Shown only when something is granted: "none" would say nothing the
+    // baseline view does not already say.
     if !view.ssh_agent.is_empty() {
         let _ = writeln!(
             o,
-            "  {h}ssh-agent:{r} {} {dim}(keys the cage may sign with){r}{}",
+            "  {h}ssh-agent:{r} {} {dim}({}){r}{}",
             view.ssh_agent.join(", "),
+            if view.ssh_agent_confirm {
+                "keys the cage may sign with, each signature confirmed on your desktop"
+            } else {
+                "keys the cage may sign with"
+            },
             app_provenance_tag(view.ssh_agent_origin, pal)
         );
     }
@@ -2057,6 +2073,7 @@ mod tests {
     fn sample_config_view() -> config::view::ConfigView {
         use config::view::*;
         ConfigView {
+            ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![EnvVar {
                 key: "EDITOR".into(),
@@ -2281,6 +2298,7 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let view = AppDetailView {
+            ssh_agent_confirm: false,
             name: "demo".into(),
             cwd: "/proj".into(),
             cmd: Some("demo-agent".into()),
@@ -2458,6 +2476,7 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let app = |name: &str, limits: Option<AppLimitsView>| AppView {
+            ssh_agent: Vec::new(),
             name: name.into(),
             cmd: Some(name.into()),
             home_scope: "global (shared across projects)".into(),
@@ -2514,6 +2533,7 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -2573,6 +2593,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
@@ -2630,6 +2651,7 @@ mod tests {
         // a profile's app-overlay allowlist surfaces what `sbx app <name>` can actually reach.
         use config::view::*;
         let view = ConfigView {
+            ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -2670,6 +2692,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
@@ -2742,6 +2765,7 @@ mod tests {
         // with or without `--details` — the default render is enough to pin them.
         use config::view::*;
         let app = |name: &str, network: Option<AppNetworkView>, gui: Option<GuiView>| AppView {
+            ssh_agent: Vec::new(),
             name: name.into(),
             cmd: Some(name.into()),
             home_scope: "global (shared across projects)".into(),
@@ -2761,6 +2785,7 @@ mod tests {
             notes: vec![],
         };
         let view = ConfigView {
+            ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -2833,6 +2858,7 @@ mod tests {
         // profile's credential surfaces in `sbx config` (the baseline `secrets` section is empty).
         use config::view::*;
         let view = ConfigView {
+            ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -2873,6 +2899,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
@@ -2941,6 +2968,7 @@ mod tests {
         // profile's overlay env/binds surface, mirroring the baseline `env`/`binds` sections.
         use config::view::*;
         let view = ConfigView {
+            ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -2981,6 +3009,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
@@ -3049,6 +3078,7 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
             binds: vec![],
@@ -3089,6 +3119,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),

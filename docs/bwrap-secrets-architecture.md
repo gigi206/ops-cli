@@ -298,9 +298,16 @@ Transport / broker bricks, in parallel:
    names keys by fingerprint or comment; ops serves the cage a filtering agent socket whose
    identities answer carries only those keys, refuses a signature for any other **without
    contacting the host agent**, and allowlists the message types (no add/remove/wipe/unknown
-   extension). The host agent's socket is never bound. Residual: a signature names its
-   session, not its destination — narrow the key, or constrain it with `ssh-add -h` (the
-   binding message is forwarded, so that check still runs in the user's own agent).
+   extension). The host agent's socket is never bound. `confirm = true` puts a host-desktop
+   prompt in front of every signature the cage asks for (askpass resolved from ops' own
+   environment, never the cage's `[env]`; no helper ⇒ no agent), and an
+   `[app.<name>.ssh_agent]` grant scopes a key to one app's cage instead of the whole
+   project. Every decision — offered, signed, refused — lands in a per-session ring read
+   host-side through `sbx ssh-agent logs` over a socket never bound into the cage. Residual:
+   a signature names its session, not its destination — narrow the key, or constrain it with
+   `ssh-add -h` (the binding message is forwarded, so that check still runs in the user's own
+   agent). The log *names* the destination (the host key the client bound the session to);
+   it does not fence it.
 8. **DB protocol-aware proxy**, **mTLS client-cert injection**, **cloud signing
    proxy** — as needs arise.
 9. **command-MCP / exec tier** — the opt-in, off-by-default, risk-documented escape

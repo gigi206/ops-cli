@@ -286,6 +286,11 @@ pub(crate) struct Resolved {
     /// (`Default` when neither config did), like `devices_origin`. A display affordance for
     /// `sbx config`; the launcher ignores it.
     pub(crate) ssh_agent_origin: Provenance,
+    /// Whether every signature must be confirmed on the host desktop before the broker forwards it
+    /// (`[ssh_agent] confirm`). ORs across layers: a layer may ask for the prompt, none may remove
+    /// it. With no askpass helper on the host the launch gives the cage no agent at all, rather than
+    /// a grant whose promised confirmation never appears.
+    pub(crate) ssh_agent_confirm: bool,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -379,6 +384,12 @@ pub(crate) struct ResolvedApp {
     /// [`merge_app`]; empty means the app grants no device and inherits the baseline grant. A
     /// security field, gated like the baseline `[devices]`.
     pub(crate) devices: Vec<PathBuf>,
+    /// The app's own ssh-agent grant, set only from a trusted source (an untrusted project's app
+    /// `[ssh_agent]` is dropped, like its `network`/`devices`). Unions onto the baseline at
+    /// [`merge_app`]; empty means the app names no key of its own and inherits the baseline grant.
+    /// A security field, gated like the baseline `[ssh_agent]` — and the field that makes a deploy
+    /// key grantable to one app rather than to every cage the project launches.
+    pub(crate) ssh_agent: Vec<String>,
     /// The app's own host loopback forward ports, set only from a trusted source (an untrusted
     /// project's app `forward` is dropped, like its `network`/`gui`). The set **unions** onto the
     /// baseline's at [`merge_app`]; an empty vec means the app adds none and inherits the baseline
@@ -418,6 +429,12 @@ pub(crate) struct ResolvedApp {
     /// Which app layer (`Global`/`Project`) supplied the app's own device grant, or `Default` when
     /// the app declared none. The merged effective grant is the app's own ∪ the baseline's.
     pub(crate) devices_origin: Provenance,
+    /// Which app layer (`Global`/`Project`) supplied the app's own ssh-agent grant, or `Default`
+    /// when the app declared none. The merged effective grant is the app's own ∪ the baseline's.
+    pub(crate) ssh_agent_origin: Provenance,
+    /// Whether this app asks for a per-signature confirmation (`[app.<name>.ssh_agent] confirm`).
+    /// ORed onto the baseline's at [`merge_app`], never subtracted.
+    pub(crate) ssh_agent_confirm: bool,
     pub(crate) home_scope_origin: Option<Provenance>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
     /// launched, not on every `sbx run`.
@@ -489,6 +506,14 @@ impl Resolved {
         // The app's device grant unions onto the baseline's — an app adds devices, never removes
         // the trusted baseline's (the same flagship property, holding for the same reason).
         union_devices(&mut self.devices, app.devices);
+        // The app's ssh-agent grant unions onto the baseline's, for the same reason and with the
+        // same property: an app adds a key it needs, and cannot take away one the trusted baseline
+        // granted. A key named by only one app is therefore granted to that app's cage alone — every
+        // other launch of the project sees an agent without it.
+        union_ssh_agent(&mut self.ssh_agent, app.ssh_agent);
+        // …and its confirmation posture ORs on, for the same reason: an app may ask for the prompt,
+        // and no app may take away one the baseline asked for.
+        self.ssh_agent_confirm |= app.ssh_agent_confirm;
         // Drop the baseline secret-posture warning: it judged the *baseline* network, but the app's
         // posture re-decides injection just below — keeping it would let `sbx app <name>` both inject
         // a credential and print "ignoring N HTTP-header secret(s)". The re-check re-emits it only if
@@ -766,7 +791,10 @@ impl Resolved {
             }
         }
         if ssh_agent.is_some() {
-            let over = apply_ssh_agent(&mut self.warnings, OVERRIDE_SOURCE, ssh_agent);
+            let (over, confirm) = apply_ssh_agent(&mut self.warnings, OVERRIDE_SOURCE, ssh_agent);
+            // Confirmation ORs in, like every other layer: an invoker may add the prompt, and the
+            // one place it must not be possible to *remove* it is the most convenient one to try.
+            self.ssh_agent_confirm |= confirm;
             if !over.is_empty() {
                 union_ssh_agent(&mut self.ssh_agent, over);
                 self.ssh_agent_origin = Provenance::Override;
@@ -1149,7 +1177,8 @@ fn resolve(
     };
     // The ssh-agent grant is trusted by location at the global layer, and layers like the device
     // grant: a bad entry is dropped (warned), a project's unions onto this.
-    let mut ssh_agent = apply_ssh_agent(&mut warnings, GLOBAL_CONFIG, global.ssh_agent);
+    let (mut ssh_agent, mut ssh_agent_confirm) =
+        apply_ssh_agent(&mut warnings, GLOBAL_CONFIG, global.ssh_agent);
     let mut ssh_agent_origin = if ssh_agent.is_empty() {
         Provenance::Default
     } else {
@@ -1438,7 +1467,9 @@ fn resolve(
         // user on every host that trusts the key. Unions onto the global set, like `[devices]`.
         if let Some(raw) = proj.ssh_agent {
             if trusted {
-                let project_keys = apply_ssh_agent(&mut warnings, PROJECT_CONFIG, Some(raw));
+                let (project_keys, confirm) =
+                    apply_ssh_agent(&mut warnings, PROJECT_CONFIG, Some(raw));
+                ssh_agent_confirm |= confirm;
                 if !project_keys.is_empty() {
                     ssh_agent_origin = Provenance::Project;
                 }
@@ -1575,6 +1606,7 @@ fn resolve(
         devices_origin,
         ssh_agent,
         ssh_agent_origin,
+        ssh_agent_confirm,
         secrets,
         declared_secrets,
         tasks,
@@ -1864,15 +1896,18 @@ fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::Raw
 /// `SHA256:` fingerprint (a base64 SHA-256 is always 43 characters once its padding is dropped, so a
 /// shorter one is a copy-paste that lost its tail). Everything else is taken as a comment, which is
 /// free-form by nature: `ssh-add -l` prints comments with spaces in them.
+/// Returns the entries **and** whether this layer asked for per-signature confirmation, which the
+/// caller ORs onto what it already has: a layer may turn confirmation on, never off.
 fn apply_ssh_agent(
     warnings: &mut Vec<String>,
     source: &str,
     raw: Option<schema::RawSshAgent>,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     let mut keys: Vec<String> = Vec::new();
     let Some(raw) = raw else {
-        return keys;
+        return (keys, false);
     };
+    let confirm = raw.confirm.unwrap_or(false);
     for entry in &raw.allow {
         let key = entry.trim();
         if key.is_empty() {
@@ -1896,7 +1931,7 @@ fn apply_ssh_agent(
     }
     keys.sort();
     keys.dedup();
-    keys
+    (keys, confirm)
 }
 
 /// Union an ssh-agent grant onto the base set: a layer adds keys, never removes one, like
@@ -2169,6 +2204,9 @@ fn resolve_app(
     // trusted project unions, an untrusted one dropped. Empty means the app inherits the baseline's.
     let mut devices: Vec<PathBuf> = Vec::new();
     let mut devices_origin = Provenance::Default;
+    let mut ssh_agent: Vec<String> = Vec::new();
+    let mut ssh_agent_origin = Provenance::Default;
+    let mut ssh_agent_confirm = false;
     let mut cmd: Vec<String> = Vec::new();
     // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
     // *own* app's command, but may not override the command of an app a trusted layer defined
@@ -2282,6 +2320,12 @@ fn resolve_app(
             devices_origin = Provenance::Global;
         }
         union_devices(&mut devices, global_devices);
+        let (global_ssh_agent, confirm) = apply_ssh_agent(&mut warnings, &source, app.ssh_agent);
+        ssh_agent_confirm |= confirm;
+        if !global_ssh_agent.is_empty() {
+            ssh_agent_origin = Provenance::Global;
+        }
+        union_ssh_agent(&mut ssh_agent, global_ssh_agent);
         if let Some(section) = app.secret {
             apply_app_secret(
                 &mut secrets,
@@ -2511,6 +2555,26 @@ fn resolve_app(
                 ));
             }
         }
+        // `[ssh_agent]` mirrors `[devices]`: a trusted project may grant its own app a key to sign
+        // with; an untrusted one may not, because such a key authenticates as the user on every host
+        // that trusts it. Dropped before the union, so an untrusted project cannot widen the grant a
+        // global app was given.
+        if let Some(raw) = app.ssh_agent {
+            if trusted {
+                let (project_ssh_agent, confirm) =
+                    apply_ssh_agent(&mut warnings, &source, Some(raw));
+                ssh_agent_confirm |= confirm;
+                if !project_ssh_agent.is_empty() {
+                    ssh_agent_origin = Provenance::Project;
+                }
+                union_ssh_agent(&mut ssh_agent, project_ssh_agent);
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `[ssh_agent]` ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // `forward` mirrors `network`/`gui`: a trusted project may add forward ports to its own
         // app or a trusted one; an untrusted project may not (opening a host port is an inbound
         // hole). The ports union onto the app's own set, so the project adds, never replaces.
@@ -2621,6 +2685,8 @@ fn resolve_app(
         limits,
         seccomp,
         devices,
+        ssh_agent,
+        ssh_agent_confirm,
         forward,
         secrets,
         tasks,
@@ -2635,6 +2701,7 @@ fn resolve_app(
         forward_origin,
         seccomp_origin,
         devices_origin,
+        ssh_agent_origin,
         limits_origin,
         home_scope_origin,
         warnings,

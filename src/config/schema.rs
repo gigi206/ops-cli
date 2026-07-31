@@ -408,6 +408,14 @@ pub(crate) struct RawDevices {
 pub(crate) struct RawSshAgent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allow: Vec<String>,
+    /// Ask before **every** signature: sbx raises a prompt on the host desktop naming the key (and,
+    /// when the client bound one, the server), and signs only if it is approved. Unlike `ssh-add -c`
+    /// this asks for what the *cage* requests and nothing else, so ordinary use outside the sandbox
+    /// is unaffected. Fail-closed in every direction: with no askpass helper on the host the cage
+    /// gets no agent at all, and the flag ORs across layers — a layer that asks for confirmation
+    /// cannot have it turned off by another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirm: Option<bool>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,
@@ -523,6 +531,13 @@ pub(crate) struct RawApp {
     /// so an untrusted project's app `[devices]` is dropped. An unset `Option` is omitted on export,
     /// so an app that needs no device carries no `[devices]` table.
     pub(crate) devices: Option<RawDevices>,
+    /// The ssh-agent keys this app's cage may sign with, unioned onto the baseline's. A security
+    /// field, gated like the baseline `[ssh_agent]` (a key the cage can sign with authenticates as
+    /// the user on every host that trusts it), so an untrusted project's app `[ssh_agent]` is
+    /// dropped. This is what lets a deploy key be granted to *one* agent rather than to every cage
+    /// the project launches. An unset `Option` is omitted on export, so an app that signs nothing
+    /// carries no `[ssh_agent]` table.
+    pub(crate) ssh_agent: Option<RawSshAgent>,
     /// Where this app's persistent `$HOME` (its config, login state, history) lives:
     /// `"global"` (the default) — one home per app, shared across every project, so the app
     /// keeps a single identity wherever it runs; or `"project"` — a home per (project, app),

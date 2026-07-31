@@ -72,6 +72,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 | [`net`](cli/net.md) | inspect and manage the egress policy |
 | [`proc`](cli/proc.md) | observe a running sandbox's process tree |
 | [`fs`](cli/fs.md) | observe the files a running sandbox writes |
+| [`ssh-agent`](cli/ssh-agent.md) | what a running sandbox asked your ssh keys to sign |
 | [`task`](cli/task.md) | list and invoke a session's declared operations |
 | [`secret`](cli/secret.md) | the credential inventory, by name |
 | [`plugins`](cli/plugins.md) | manage resolver plugins and plugin stores |

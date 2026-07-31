@@ -543,6 +543,7 @@ fn raw_devices(paths: &[&str]) -> RawConfig {
 fn raw_ssh_agent(keys: &[&str]) -> RawConfig {
     RawConfig {
         ssh_agent: Some(schema::RawSshAgent {
+            confirm: None,
             rest: Default::default(),
             allow: keys.iter().map(|s| s.to_string()).collect(),
         }),
@@ -588,6 +589,7 @@ fn raw_app(
     network: Option<NetworkField>,
 ) -> RawApp {
     RawApp {
+        ssh_agent: None,
         task: None,
         cmd: if cmd.is_empty() {
             None
@@ -1416,6 +1418,210 @@ fn a_trusted_app_devices_grant_is_honored() {
     assert_eq!(r.apps["demo-app"].devices_origin, Provenance::Global);
 }
 
+/// An `[ssh_agent]` table granting these entries.
+fn app_raw_ssh_agent(allow: &[&str]) -> schema::RawSshAgent {
+    schema::RawSshAgent {
+        confirm: None,
+        rest: Default::default(),
+        allow: allow.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// The point of the per-app field: a deploy key granted to one app, and to nothing else the
+/// project launches.
+#[test]
+fn an_app_ssh_agent_grant_is_its_own_and_unions_onto_the_baseline() {
+    let mut global = raw_with_app(
+        "deployer",
+        RawApp {
+            ssh_agent: Some(app_raw_ssh_agent(&["deploy@example"])),
+            ..raw_app(&["deployer"], &[], &[], &[], None)
+        },
+    );
+    global.ssh_agent = Some(app_raw_ssh_agent(&["work@example"]));
+
+    let r = resolve_no_plugins(global, None);
+    assert_eq!(r.apps["deployer"].ssh_agent, vec!["deploy@example"]);
+    assert_eq!(r.apps["deployer"].ssh_agent_origin, Provenance::Global);
+    // The baseline — what a plain `sbx run` gets — is untouched by the app's grant.
+    assert_eq!(r.ssh_agent, vec!["work@example"]);
+
+    // Launching the app unions the two: an app adds a key, and can never take away one the
+    // trusted baseline granted.
+    let mut merged = r.clone();
+    merged.merge_app(merged.apps["deployer"].clone());
+    assert_eq!(merged.ssh_agent, vec!["deploy@example", "work@example"]);
+}
+
+#[test]
+fn a_global_apps_ssh_agent_grant_survives_an_untrusted_projects_override_attempt() {
+    // The flagship property, for the field where it matters most: a key the cage can sign with
+    // authenticates as the user wherever that key is trusted, so an untrusted project may neither
+    // widen a trusted app's grant nor grant one on an app of its own.
+    let global = raw_with_app(
+        "deployer",
+        RawApp {
+            ssh_agent: Some(app_raw_ssh_agent(&["deploy@example"])),
+            ..raw_app(&["deployer"], &[], &[], &[], None)
+        },
+    );
+    let project = raw_with_app(
+        "deployer",
+        RawApp {
+            ssh_agent: Some(app_raw_ssh_agent(&["personal@example"])),
+            ..raw_app(&[], &[], &[], &[], None)
+        },
+    );
+    let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+    let app = &r.apps["deployer"];
+    assert_eq!(
+        app.ssh_agent,
+        vec!["deploy@example"],
+        "an untrusted project may not add a key to a trusted app's grant"
+    );
+    assert!(app.warnings.iter().any(|w| w.contains("[ssh_agent]")));
+
+    let project = raw_with_app(
+        "mine",
+        RawApp {
+            ssh_agent: Some(app_raw_ssh_agent(&["deploy@example"])),
+            ..raw_app(&["tool"], &[], &[], &[], None)
+        },
+    );
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+    let app = &r.apps["mine"];
+    assert!(
+        app.ssh_agent.is_empty(),
+        "an untrusted project may not grant a key at all"
+    );
+    assert!(app.warnings.iter().any(|w| w.contains("[ssh_agent]")));
+}
+
+/// A trusted project may grant its own app a key — the same gate as `[devices]`, and the case a
+/// per-repository deploy key is written for.
+#[test]
+fn a_trusted_project_app_may_grant_a_key() {
+    let project = raw_with_app(
+        "deployer",
+        RawApp {
+            ssh_agent: Some(app_raw_ssh_agent(&["deploy@example"])),
+            ..raw_app(&["deployer"], &[], &[], &[], None)
+        },
+    );
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+    assert_eq!(r.apps["deployer"].ssh_agent, vec!["deploy@example"]);
+    assert_eq!(r.apps["deployer"].ssh_agent_origin, Provenance::Project);
+}
+
+/// Confirmation ORs across every layer: a layer may ask for the prompt, and none may take it away.
+/// The direction matters — the layer most likely to try is the least trusted one.
+#[test]
+fn ssh_agent_confirmation_can_be_added_by_any_layer_and_removed_by_none() {
+    let confirming = |allow: &str, confirm: Option<bool>| RawConfig {
+        ssh_agent: Some(schema::RawSshAgent {
+            rest: Default::default(),
+            allow: vec![allow.to_string()],
+            confirm,
+        }),
+        ..Default::default()
+    };
+    let global = confirming("work@example", Some(true));
+
+    // A trusted project writing `confirm = false` does not turn the global's prompt off.
+    let project = confirming("deploy@example", Some(false));
+    let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+    assert!(
+        r.ssh_agent_confirm,
+        "a layer may add the prompt, never remove it"
+    );
+    assert_eq!(r.ssh_agent, vec!["deploy@example", "work@example"]);
+
+    // And the other direction: a project may turn it on over a global that did not ask.
+    let r = resolve_no_plugins(
+        confirming("work@example", None),
+        Some((
+            confirming("deploy@example", Some(true)),
+            TrustState::Trusted,
+        )),
+    );
+    assert!(r.ssh_agent_confirm);
+
+    // An *untrusted* project's `[ssh_agent]` is dropped whole, so it can neither grant a key nor
+    // touch the confirmation posture — in either direction.
+    let r = resolve_no_plugins(
+        confirming("work@example", None),
+        Some((
+            confirming("deploy@example", Some(true)),
+            TrustState::Untrusted,
+        )),
+    );
+    assert!(
+        !r.ssh_agent_confirm,
+        "an untrusted layer contributes nothing"
+    );
+    assert_eq!(r.ssh_agent, vec!["work@example"]);
+}
+
+/// An app may ask for the prompt for its own launches, and a merge never loses the baseline's.
+#[test]
+fn an_app_may_add_the_confirmation_prompt_but_not_drop_it() {
+    let mut global = raw_with_app(
+        "deployer",
+        RawApp {
+            ssh_agent: Some(schema::RawSshAgent {
+                rest: Default::default(),
+                allow: vec!["deploy@example".into()],
+                confirm: Some(true),
+            }),
+            ..raw_app(&["deployer"], &[], &[], &[], None)
+        },
+    );
+    global.ssh_agent = Some(app_raw_ssh_agent(&["work@example"]));
+
+    let r = resolve_no_plugins(global, None);
+    assert!(
+        !r.ssh_agent_confirm,
+        "the baseline is unaffected by what an app asks for"
+    );
+    assert!(r.apps["deployer"].ssh_agent_confirm);
+
+    let mut merged = r.clone();
+    merged.merge_app(merged.apps["deployer"].clone());
+    assert!(
+        merged.ssh_agent_confirm,
+        "launching the app turns the prompt on for that launch"
+    );
+}
+
+/// An entry the baseline would refuse is refused here too — the validation is one function, so a
+/// per-app grant cannot become the place a wildcard slips in.
+#[test]
+fn an_app_grant_refuses_what_the_baseline_grant_refuses() {
+    let global = raw_with_app(
+        "deployer",
+        RawApp {
+            ssh_agent: Some(app_raw_ssh_agent(&[
+                "*",
+                "SHA256:tooshort",
+                "deploy@example",
+            ])),
+            ..raw_app(&["deployer"], &[], &[], &[], None)
+        },
+    );
+    let r = resolve_no_plugins(global, None);
+    let app = &r.apps["deployer"];
+    assert_eq!(app.ssh_agent, vec!["deploy@example"]);
+    assert_eq!(
+        app.warnings
+            .iter()
+            .filter(|w| w.contains("`[ssh_agent] allow` entry"))
+            .count(),
+        2,
+        "both bad entries are named: {:?}",
+        app.warnings
+    );
+}
+
 /// Build a `RawLimits` from optional tokens, for the per-app overlay tests.
 fn app_raw_limits(
     memory_high: Option<&str>,
@@ -2005,6 +2211,29 @@ fn validating_a_profile_requires_a_command_and_summarizes_its_posture() {
     assert!(validate_profile(b"[env]\nA = \"1\"\n").is_err());
     let wrapped = validate_profile(b"[app.demo-app]\ncmd = \"demo-app\"\n").unwrap_err();
     assert!(wrapped.contains("cmd"), "{wrapped}");
+
+    // An imported profile lands in the *global* config, where it is trusted by location — so every
+    // grant it arrives with must be in the consent report, or the import is consent to something
+    // unstated. The ssh-agent one most of all: it asks the user's own agent to sign.
+    let granting = validate_profile(
+        br#"
+            cmd = "demo-app"
+            [ssh_agent]
+            allow = ["deploy@example"]
+            [devices]
+            allow = ["/dev/kvm"]
+            [seccomp]
+            allow = ["userfaultfd"]
+            "#,
+    )
+    .unwrap();
+    let joined = granting.summary.join("\n");
+    assert!(
+        joined.contains("ssh-agent: deploy@example") && joined.contains("ask your agent to sign"),
+        "the key grant is stated in words: {joined}"
+    );
+    assert!(joined.contains("devices: /dev/kvm"), "{joined}");
+    assert!(joined.contains("seccomp allow: userfaultfd"), "{joined}");
 }
 
 #[test]
@@ -2024,6 +2253,9 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
     // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
     base.dbus = false;
     let app = ResolvedApp {
+        ssh_agent_confirm: false,
+        ssh_agent_origin: Default::default(),
+        ssh_agent: Vec::new(),
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
         env: vec![("A".into(), "app".into()), ("C".into(), "app".into())],
@@ -2097,6 +2329,9 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
 fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        ssh_agent_confirm: false,
+        ssh_agent_origin: Default::default(),
+        ssh_agent: Vec::new(),
         tasks: vec![],
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
@@ -2141,6 +2376,9 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
 fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        ssh_agent_confirm: false,
+        ssh_agent_origin: Default::default(),
+        ssh_agent: Vec::new(),
         tasks: vec![],
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
@@ -2185,6 +2423,9 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     use crate::allowlist::{classify, EgressPolicy, Methods};
     let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
     let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
+        ssh_agent_confirm: false,
+        ssh_agent_origin: Default::default(),
+        ssh_agent: Vec::new(),
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
         env: vec![],
@@ -2320,6 +2561,9 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
+        ssh_agent_confirm: false,
+        ssh_agent_origin: Default::default(),
+        ssh_agent: Vec::new(),
         tasks: vec![],
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
@@ -2372,6 +2616,9 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         "the baseline-effective set is cleared under a shared posture"
     );
     let app = ResolvedApp {
+        ssh_agent_confirm: false,
+        ssh_agent_origin: Default::default(),
+        ssh_agent: Vec::new(),
         cmd: vec!["x".into()],
         home_scope: AppHomeScope::Global,
         env: vec![],

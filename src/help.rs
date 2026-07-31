@@ -563,6 +563,53 @@ const PAGES: &[Page] = &[
             the host. Precise per-syscall capture (and blocking) is a later increment.",
     },
     Page {
+        path: &["ssh-agent"],
+        synopsis: "sbx ssh-agent <subcommand> [args...]",
+        summary: "what a running sandbox asked your ssh keys to sign",
+        options: &[],
+        details:
+            "The credential lens of a running session, sibling of `sbx net` (egress), `sbx fs`\n\
+            (files) and `sbx proc` (processes). A cage granted a key through `[ssh_agent] allow`\n\
+            never holds it — it asks a filtering broker, which asks your own agent. `sbx ssh-agent\n\
+            logs` is the record of those asks.\n\
+            \n\
+            Run one of the subcommands below.",
+    },
+    Page {
+        path: &["ssh-agent", "logs"],
+        synopsis: "sbx ssh-agent logs [<id>] [-f|--follow] [--json]",
+        summary: "the signature feed of a session with a granted key",
+        options: &[
+            (
+                "<id>",
+                "the PID `sbx session ls` shows; omit it when only one session is live",
+            ),
+            (
+                "-f, --follow",
+                "stream new decisions until the session ends (Ctrl+C to stop)",
+            ),
+            ("--json", "emit one object per event (NDJSON), for a pipe"),
+        ],
+        details:
+            "One line per decision the ssh-agent broker made, in order, with the time it was made:\n\
+            \n\
+              list     which granted keys were offered, and how many were withheld\n\
+              sign     a signature was produced — with which key, and toward which server\n\
+              refuse   a request was turned away, and why\n\
+            \n\
+            A signature request names a key and a session, never a destination. But an ssh client\n\
+            binds the connection to the server's host key first (that is how an `ssh-add -h`\n\
+            constraint is enforced), so a signature is recorded `toward the server holding\n\
+            SHA256:…` — the same spelling `known_hosts` uses. It is what the client said, not\n\
+            something sbx verified.\n\
+            \n\
+            Read host-side over a socket under the data directory that is never bound into the\n\
+            cage, so the agent can neither read the record of what it asked for nor amend it. The\n\
+            ring lives in the launcher's memory for the life of the session and is never written to\n\
+            disk. A session whose config grants no key has no broker, and is reported as such —\n\
+            distinct from a broker nothing has asked anything of.",
+    },
+    Page {
         path: &["secret"],
         synopsis: "sbx secret <subcommand> [args...]",
         summary: "the credential inventory this configuration declares",

@@ -43,6 +43,7 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 | [`sbx session`](session.md) | list, attach to, and stop the live sandbox sessions |
 | [`sbx proc`](proc.md) | observe a running session's process tree |
 | [`sbx fs`](fs.md) | observe the files a running session writes in its project |
+| [`sbx ssh-agent`](ssh-agent.md) | what a running session asked your ssh keys to sign |
 | [`sbx task`](task.md) | list and invoke a session's declared operations |
 | [`sbx secret`](secret.md) | the credential inventory this configuration declares |
 | [`sbx projects`](projects.md) | list and remove per-project runtime trees |

@@ -42,8 +42,10 @@ sbx app import <file> [--as <name>] [--force]
 
 - The **deliberate command is the consent** — an agent in the cage cannot run it, and
   the profile stays **inert until `sbx app run <name>`** launches it.
-- The **granted posture is printed** (command, home scope, packages, binds, network,
-  and each credential by destination + source — never a plaintext value).
+- The **granted posture is printed** (command, home scope, packages, binds, network, each
+  credential by destination + source — never a plaintext value — and every grant that widens
+  what the cage reaches of the host: `devices`, `seccomp allow`, and
+  [`ssh_agent`](../configuration/ssh-agent.md), the one that asks your own agent to sign).
 - The file must have a `cmd` (an empty parse is the tell-tale of a wrongly
   `[app.<name>]`-wrapped file, refused with a hint).
 - `--as` renames the imported app (default: the file's stem); `--force` overwrites an

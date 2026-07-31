@@ -16,6 +16,7 @@ pub(crate) mod projects;
 pub(crate) mod search;
 pub(crate) mod secret;
 pub(crate) mod session;
+pub(crate) mod sshagent;
 pub(crate) mod storage;
 pub(crate) mod store;
 pub(crate) mod task;
@@ -109,6 +110,7 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "test" => test::test_cmd(rest),
         "bundle" => bundle::bundle_cmd(&rest),
         "net" => net::net_cmd(rest),
+        "ssh-agent" => sshagent::ssh_agent_cmd(rest),
         "proc" => proc::proc_cmd(rest),
         "fs" => fs::fs_cmd(rest),
         "task" | "tasks" => task::task_cmd(rest),

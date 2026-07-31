@@ -91,6 +91,8 @@ pub(crate) struct ConfigView {
     pub(crate) ssh_agent: Vec<String>,
     /// Which layer supplied the ssh-agent grant (`Default` when neither config did).
     pub(crate) ssh_agent_origin: ProvenanceView,
+    /// Whether every signature must be confirmed on the host desktop first (`[ssh_agent] confirm`).
+    pub(crate) ssh_agent_confirm: bool,
     /// The cage's effective cgroup resource limits (anti-DoS), each a config override or the default.
     pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
@@ -534,6 +536,10 @@ pub(crate) struct AppView {
     /// baseline-merged set. Empty when it grants none; the merge unions it with the baseline only for
     /// the launch itself.
     pub(crate) devices: Vec<String>,
+    /// The ssh-agent keys this overlay grants over the baseline — its *own* entries, not the
+    /// baseline-merged set. Empty when it names none; the merge unions it with the baseline only for
+    /// the launch itself.
+    pub(crate) ssh_agent: Vec<String>,
     /// The cgroup limits this overlay overrides, when it tunes any — its *own* fields, not the
     /// baseline-merged set, so an app that changes nothing shows nothing.
     pub(crate) limits: Option<AppLimitsView>,
@@ -598,10 +604,12 @@ pub(crate) struct AppDetailView {
     /// is `Inherited` when the app added none of its own (it takes the baseline's grant).
     pub(crate) devices: Vec<String>,
     pub(crate) devices_origin: ProvenanceView,
-    /// The ssh-agent keys this app's cage may sign with. An app carries no grant of its own, so this
-    /// is the baseline's, and the origin is `Inherited` whenever it grants anything.
+    /// The effective ssh-agent grant — the app's own ∪ the baseline's. The origin is `Inherited`
+    /// when the app named no key of its own (it signs with whatever the baseline granted).
     pub(crate) ssh_agent: Vec<String>,
     pub(crate) ssh_agent_origin: ProvenanceView,
+    /// Whether every signature must be confirmed on the host desktop first (`[ssh_agent] confirm`).
+    pub(crate) ssh_agent_confirm: bool,
     /// The effective cgroup limits — the app's overrides folded onto the baseline — each field
     /// carrying its provenance (`Inherited` when the app left it to the baseline).
     pub(crate) limits: LimitsView,
@@ -780,6 +788,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         devices_origin: resolved.devices_origin.into(),
         ssh_agent: resolved.ssh_agent.clone(),
         ssh_agent_origin: resolved.ssh_agent_origin.into(),
+        ssh_agent_confirm: resolved.ssh_agent_confirm,
         limits,
         secrets,
         apps,
@@ -1064,6 +1073,7 @@ fn app_view(
         forward: app.forward.clone(),
         seccomp: app.seccomp.tokens(),
         devices: device_paths(&app.devices),
+        ssh_agent: app.ssh_agent.clone(),
         limits: app_limits_view(&app.limits),
         secrets: if injects {
             app.secrets
@@ -1173,6 +1183,12 @@ fn app_detail_view(
     super::union_devices(&mut eff_devices, app.devices.clone());
     let devices_origin = origin_or_inherited(!app.devices.is_empty(), app.devices_origin);
 
+    // Effective ssh-agent grant: the app's own ∪ the baseline's — the same union `merge_app`
+    // performs — with the origin `Inherited` when the app named no key of its own.
+    let mut eff_ssh_agent = baseline.ssh_agent.clone();
+    super::union_ssh_agent(&mut eff_ssh_agent, app.ssh_agent.clone());
+    let ssh_agent_origin = origin_or_inherited(!app.ssh_agent.is_empty(), app.ssh_agent_origin);
+
     // Effective limits: the app's overrides folded onto the baseline; each field's origin is the
     // app's when it set the field, else inherited from the baseline.
     let mut eff_limits = baseline.limits.clone();
@@ -1258,14 +1274,10 @@ fn app_detail_view(
         seccomp_origin,
         devices: device_paths(&eff_devices),
         devices_origin,
-        // An app declares no ssh-agent grant of its own, so the baseline's stands as-is: whatever it
-        // grants, this app's cage inherits.
-        ssh_agent: baseline.ssh_agent.clone(),
-        ssh_agent_origin: if baseline.ssh_agent.is_empty() {
-            ProvenanceView::Default
-        } else {
-            ProvenanceView::Inherited
-        },
+        ssh_agent: eff_ssh_agent,
+        ssh_agent_origin,
+        // ORed, like the merge: an app may ask for the prompt, and cannot remove the baseline's.
+        ssh_agent_confirm: baseline.ssh_agent_confirm || app.ssh_agent_confirm,
         limits,
         env: app
             .env
@@ -1442,6 +1454,7 @@ mod tests {
     #[test]
     fn the_view_model_serializes_to_a_json_object() {
         let view = ConfigView {
+            ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![EnvVar {
                 key: "A".into(),
@@ -1511,6 +1524,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
                 home_scope: "global (shared across projects)".into(),
@@ -1689,6 +1703,9 @@ mod tests {
 
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
+            ssh_agent_confirm: false,
+            ssh_agent_origin: Default::default(),
+            ssh_agent: Vec::new(),
             cmd: vec!["pinned-tool".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
@@ -1756,6 +1773,7 @@ mod tests {
         // A baseline credential the app inherits — and that the app's narrowed network drops, the
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
+            ssh_agent_confirm: false,
             env: vec![],
             env_layer: Default::default(),
             tasks: vec![],
@@ -1809,6 +1827,9 @@ mod tests {
         };
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
+            ssh_agent_confirm: false,
+            ssh_agent_origin: Default::default(),
+            ssh_agent: Vec::new(),
             cmd: vec!["demo".into()],
             home_scope: AppHomeScope::Global,
             env: vec![],
