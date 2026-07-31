@@ -129,21 +129,48 @@ satisfies the second on paper and voids it in fact, and the second is the one ho
 - **The substitution count stops meaning anything.** It is described [below](#output-what-substitution-does-and-does-not-promise)
   as the trustworthy signal, and it counts *substitutions* — so a value that leaves in an unrecognised
   spelling leaves with the count reading **zero**. Nothing was withheld, and nothing says so.
-- **Hiding the streams does not close it.** `stdout = "hide"` removes the widest channel and leaves
-  others the caller still receives: the exit status is a byte per invocation, the elapsed time is
-  whatever a `sleep` encodes, and `output = true` is a directory the calling cage can simply read.
+- **Nothing closes it; two things narrow it a lot.** See the shape below — what is left after them
+  costs the caller an invocation per character instead of one call for the whole value.
 
 So the honest description is **accident containment, not a boundary**: the credential never touches
 the calling agent's own environment, its logs or its files unless that agent asks — and asking is
 trivial. Against a mistake that is worth something. Against a program that is looking, it is worth
 nothing.
 
-If you use it anyway, the shape that costs least: a low-value credential rather than one that matters,
-a `network` allowlist narrowed to the one host the task exists to reach, and the understanding that
-you have chosen convenience over the guarantee. Where a credential must stay out of reach, either
-bound the parameter for real, or give the task no `secret` at all and declare an
-[`inject`](#wire-injected-credentials-the-strongest-form) instead: the plaintext never enters the cage,
-so a command the caller composed has nothing to read, whatever it is allowed to run.
+#### If you do it anyway, the shape that costs least
+
+```toml
+[task.shell]
+cmd     = ["bash", "-c", "{script}"]
+params  = { script = "(?s).*" }
+stdout  = "hide"                     # the widest channel — and the only one that
+stderr  = "hide"                     # returns the whole value in a single call
+network = ["api.example.com"]        # one host, not the project's posture
+# `output` is deliberately absent (it defaults to off). A declared one is a directory
+# the *calling* cage reads, so a value written there needs no encoding at all — it is
+# the shortest path of the lot, shorter than the output streams this hides.
+
+[task.shell.secret]
+DEMO_API_KEY = "env://MY_TOKEN"      # something low-value, never the crown jewels
+```
+
+Those two lines — hidden streams, no output directory — are worth writing, and the difference is not
+cosmetic. They remove every channel that carries the **whole credential in one call**. What remains is
+narrow: the exit status is a byte per invocation, the elapsed time is whatever a `sleep` encodes, and
+the substitution count is an integer the command chooses. Each of those costs a separate invocation
+per character, each invocation is counted against the session's call quota, and each one is recorded
+host-side where `sbx task logs` shows it. The extraction goes from instant and silent to slow and
+loud — which is a real difference against a mistake, or against something not really trying, and no
+difference at all against something that is.
+
+It is also better than the alternative it usually replaces: putting the credential in the agent's own
+cage, where it lives for the whole session, is inherited by every child process, and leaves through
+whatever egress that session has rather than the one host above.
+
+Where a credential must stay out of reach, neither of those is the answer: either bound the parameter
+for real, or give the task no `secret` at all and declare an
+[`inject`](#wire-injected-credentials-the-strongest-form) instead — the plaintext never enters the
+cage, so a command the caller composed has nothing to read, whatever it is allowed to run.
 
 ### Caller-set variables
 
