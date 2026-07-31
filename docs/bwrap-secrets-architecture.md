@@ -84,7 +84,7 @@ structural; everything below it is a conscious, labelled step down.
 | **Broker** (HTTP-header / ssh-agent / DB-proxy / mTLS) | **ops** (the protocol binds the secret to its destination) | **structural** — agent never touches plaintext | yes | a *reflecting/cooperating allowed upstream* (irreducible) |
 | **Template** (MCP) — `op.run("db-query", {sql})` | **ops** (fixed command), agent supplies **bounded data params** | structural, per-template vetted | yes | a too-general template; an escape hatch in the templated tool |
 | **Command-MCP** — free command + `$SECRET` substitution, command allow/deny regex + TOFU approval | **agent** (chooses the program) | **procedural**, egress-bounded | only once trained | the *sudoers problem* (allowed binaries have exec escapes); exfil to an allowed writable host; trained "always-allow" re-opens headless auto-run |
-| **Exposed** — arbitrary agent code holding the plaintext (e.g. a python script that spawns sub-commands) | **agent** (full interpreter) | none beyond the network boundary | n/a | only the egress allowlist + empty netns contain it |
+| **Exposed** — arbitrary agent code holding the plaintext (e.g. a python script that spawns sub-commands) | **agent** (full interpreter) | **none** — the agent holds the plaintext | n/a | nothing contains it: an invocation's exit status carries it back a byte at a time, no packet involved. The egress allowlist narrows where it can be *spent*, and only within the lane that has it |
 
 The line through the table: **safe ⟺ ops controls the program/sink that touches the
 plaintext; unsafe ⟺ the agent does.** "Who calls `exec()`" is irrelevant — a broker
@@ -133,15 +133,19 @@ but fenced:
 3. **Egress allowlist MANDATORY** for any exposed/command tier — refuse to combine an
    exposed secret with `network = shared` (secret in agent code + open internet =
    instant exfil). For the exposed tier the command-allowlist is useless (the
-   interpreter bypasses it), so **the egress allowlist + empty netns are the only net**
-   — keep it mandatory and tight.
+   interpreter bypasses it), so the egress allowlist + empty netns are what is left —
+   keep it mandatory and tight. **They are not a net.** An exposed secret reaches the
+   agent without a packet: the invocation's exit status is a channel the agent both
+   authors and reads, one byte at a time. The allowlist cannot contain a value that
+   never travels by network, and once the agent holds it, the exposed tier's own
+   allowlist is not the one it will send it through.
 4. **Per-secret exposability flag** — a `broker-only` secret (e.g. a production DB
    password) is never usable by the command/exec tiers, even with the plugin enabled.
    The crown jewels stay structural; only a low-value token is exposable to the
    python tier.
 5. **Loud runtime warning** — a launch that exposes a secret to agent-controlled code
-   says so plainly ("secret X is exposed to agent code; only the egress allowlist
-   contains it").
+   says so plainly, and says the true thing: *"secret X is disclosed to agent code; the
+   egress allowlist narrows where the agent can spend it, and contains nothing."*
 
 ## 6. Schema sketch
 

@@ -376,9 +376,13 @@ the plaintext *and* its base64 form for `basic` (`config/secrets.rs`).
 
 ## 10. Increments
 
-> **Status (2026-07-30): 1 and 2 are SHIPPED in full**, §4.1's task mise pool included; tests green
-> (`cargo test --bins`, clippy clean). Increment 3 (free command) and 4 (MCP façade) are deliberately
-> not built.
+> **Status (2026-07-31): 2 is SHIPPED in full**, §4.1's task mise pool included; **1 is shipped
+> except `exposable`**, which does not exist in `src/` — it gates only increment 3, so building it
+> alone would be a security field nothing reads. Tests green (`cargo test --bins`, clippy clean).
+>
+> **Increment 3 (free command) is held on the argument in §10.1, not merely unbuilt** — its
+> containment claim does not survive, and the tier it describes is accident-containment rather than
+> a boundary. Increment 4 (MCP façade) is unbuilt with no such finding against it.
 
 ### Where the shipped code lives
 
@@ -406,12 +410,41 @@ the plaintext *and* its base64 form for `basic` (`config/secrets.rs`).
    `sbx task run` host-side so a task is testable without an agent. Plus: a per-session call
    quota, and fail-closed when an approval is required but the session is detached/headless.
 3. **Free command.** Opt-in, off by default, `exposable` required on the secret, egress allowlist
-   mandatory, loud launch warning, documented as *"the secret is deemed disclosed to the agent;
-   only the egress allowlist and the empty netns contain it"*.
+   mandatory, loud launch warning, documented as *"the secret is deemed disclosed to the agent"*.
+   **Held — see §10.1**, which retires the second half of that sentence.
 4. **MCP façade**, auto-wired per app profile where the format is known.
 
 With `where` gone, `exposable` gates exactly one thing: increment 3. A `broker-only` secret stays
 usable by a fixed-command declared task, never by a command the agent composes.
+
+### 10.1 Why increment 3 is held
+
+Increment 3 was written to be documented as *"the secret is deemed disclosed to the agent; only the
+egress allowlist and the empty netns contain it"*. Those two clauses cannot both be true, and the
+second is the false one.
+
+**The proof is the exit code.** An invocation answers its caller with `exit <n>` verbatim. With a
+**fixed** command that is harmless: the agent never authors the program that touches the secret, and
+the values it does supply are checked against each parameter's declared bound before substitution.
+A **free** command removes exactly that — the agent writes the program, so it can encode a byte of
+the secret in the status it chooses to exit with, one character per invocation, without a packet
+leaving the cage. The egress allowlist cannot contain a secret that never travels by network.
+
+**The consequence outlives the mechanism.** Once the secret is in the agent's hands, the task cage's
+narrow allowlist constrains nothing: the agent sends it out through its **own** lane, whose posture
+is a separate and usually wider setting. So separating the lanes protects against a *careless*
+agent — a credential leaking into a log, a prompt, a commit — and not against a hostile one. This
+project's default actor is Mode B, whose actions are untrusted. Against the default, the tier buys
+nothing.
+
+**What covers the use case instead.** A parameterized fixed command already reaches most of what a
+free command is wanted for, and it is the shipped, sound shape: the config author writes the
+program, the agent fills declared holes, and each value is bounded. A use case that genuinely does
+not fit is usually one more parameter rather than one more tier.
+
+**If it is built anyway**, it ships labelled as a Mode-A (interactive, semi-trusted) convenience for
+containing accidents, with the containment clause struck — never as a boundary against the agent it
+hands the secret to.
 
 ## 11. Naming and the amended doc
 
