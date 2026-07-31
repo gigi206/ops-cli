@@ -118,6 +118,10 @@ pub(crate) struct LogEntry {
     pub(crate) at: u64,
     pub(crate) task: String,
     pub(crate) exit: i32,
+    /// Substitutions across **both** streams, including one the declaration withheld from the
+    /// caller. This log never crosses into a cage, so it is the one place the question "did the
+    /// credential reach the output" can be answered whether or not the caller was shown the output
+    /// — and answering it is the point of keeping the log host-side.
     pub(crate) redacted: usize,
     pub(crate) truncated: bool,
     pub(crate) timed_out: bool,
@@ -590,7 +594,7 @@ fn finished(id: u64, name: &str, outcome: &TaskOutcome, detached: bool) -> LogEn
         at: 0,
         task: name.to_string(),
         exit: outcome.exit,
-        redacted: outcome.redacted,
+        redacted: outcome.redacted + outcome.redacted_withheld,
         truncated: outcome.truncated,
         timed_out: outcome.timed_out,
         stopped: outcome.stopped,
@@ -2260,6 +2264,7 @@ mod tests {
             stderr: Some("caf\u{e9} warning\n".to_string()),
             truncated: true,
             redacted: 2,
+            redacted_withheld: 0,
             timed_out: false,
             stopped: false,
             elapsed_ms: 12,
@@ -2336,6 +2341,7 @@ mod tests {
             stderr: Some(String::new()),
             truncated: false,
             redacted: 0,
+            redacted_withheld: 0,
             timed_out: false,
             stopped: false,
             elapsed_ms: 4,
@@ -2422,6 +2428,7 @@ mod tests {
             stderr: None,
             truncated: false,
             redacted: 0,
+            redacted_withheld: 0,
             timed_out: false,
             stopped: false,
             elapsed_ms: 1,
@@ -2554,6 +2561,37 @@ mod tests {
         let (tail, _) = log.since(4);
         assert_eq!(tail.len(), 1, "a cursor returns only what is past it");
         assert_eq!(tail[0].seq, 5);
+    }
+
+    // The caller and the log answer different questions, so they carry different numbers: the
+    // caller is told what was substituted in what it received, and the log — which never crosses
+    // into a cage — is told whether the credential reached the output at all.
+    #[test]
+    fn the_log_counts_a_withheld_streams_substitutions_and_the_caller_does_not() {
+        let outcome = super::super::task::TaskOutcome {
+            exit: 0,
+            stdout: None, // withheld
+            stderr: Some(String::new()),
+            truncated: false,
+            redacted: 1,          // what the caller received
+            redacted_withheld: 3, // what it did not
+            timed_out: false,
+            stopped: false,
+            elapsed_ms: 4,
+            nonce: None,
+            refused: vec![],
+            output: None,
+        };
+        let entry = finished(7, "print-both", &outcome, false);
+        assert_eq!(
+            entry.redacted, 4,
+            "the log holds the total, so a withheld stream is not a blind spot"
+        );
+        assert!(
+            entry.to_line().contains("redacted=4"),
+            "{}",
+            entry.to_line()
+        );
     }
 
     // A refusal is recorded too — a caller probing a task it may not run is exactly what a human

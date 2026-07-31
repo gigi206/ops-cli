@@ -156,12 +156,12 @@ DEMO_API_KEY = "env://MY_TOKEN"      # something low-value, never the crown jewe
 
 Those two lines — hidden streams, no output directory — are worth writing, and the difference is not
 cosmetic. They remove every channel that carries the **whole credential in one call**. What remains is
-narrow: the exit status is a byte per invocation, the elapsed time is whatever a `sleep` encodes, and
-the substitution count is an integer the command chooses. Each of those costs a separate invocation
-per character, each invocation is counted against the session's call quota, and each one is recorded
-host-side where `sbx task logs` shows it. The extraction goes from instant and silent to slow and
-loud — which is a real difference against a mistake, or against something not really trying, and no
-difference at all against something that is.
+narrow: the exit status is a byte per invocation, and the elapsed time is whatever a `sleep` encodes.
+(The substitution count is not among them — hiding a stream withholds its count too, for exactly this
+reason.) Each of those costs a separate invocation per character, each invocation is counted against
+the session's call quota, and each one is recorded host-side where `sbx task logs` shows it. The
+extraction goes from instant and silent to slow and loud — which is a real difference against a
+mistake, or against something not really trying, and no difference at all against something that is.
 
 It is also better than the alternative it usually replaces: putting the credential in the agent's own
 cage, where it lives for the whole session, is inherited by every child process, and leaves through
@@ -291,7 +291,11 @@ Two things to keep in mind:
   transformed (hashed, encrypted, split).
 - **`${NAME}` in the text is not proof.** The command can print that literal itself. The trustworthy
   signal is the substitution **count**, computed host-side and reported with the result (and in
-  `sbx task logs`).
+  `sbx task logs`). The count returned to the caller covers **the streams the caller received**; a
+  withheld stream's substitutions are recorded only in the log, which never crosses into a cage.
+  Otherwise a declaration that hides its output would still hand back a number the command chooses
+  by printing the credential as many times as it likes — a channel out of a cage whose streams were
+  hidden to close one. The log holds the total, so hiding a stream is not a blind spot for you.
 
 `nonce = true` makes each invocation's placeholders unforgeable: they read `${NAME@a91f3c}` where the
 nonce is drawn per call and reported out of band, so the command could not have predicted it, and a

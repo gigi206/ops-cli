@@ -253,7 +253,10 @@ $ sbx task run db-query --param sql="SELECT id FROM users" --json
 ```
 
 A stream the declaration **withholds** is `null`; one that ran and printed nothing is `""`. `redacted`
-is the substitution count, `refused` lists what [`spawn`](../configuration/task.md) blocked — its paths
+is the substitution count **over the streams you received** — a withheld stream's substitutions are
+recorded in `sbx task logs` and are not reported here, because a count over output that was never
+handed over is a number the command could choose and you could read. `refused` lists what
+[`spawn`](../configuration/task.md) blocked — its paths
 are substituted exactly as the output is, so a credential a command spelled into a program name comes
 back named rather than in the clear — and `output` is
 `{"path": …, "bytes": …}` when the operation declares one. A refusal is a document too — `error` says

@@ -250,8 +250,18 @@ pub(crate) struct TaskOutcome {
     /// Whether a stream hit `max_output` and was cut. Reported, never silent — a truncated result
     /// that looked complete would be worse than no result.
     pub(crate) truncated: bool,
-    /// How many secret values were substituted out, across both streams.
+    /// How many secret values were substituted out of the streams the caller **receives**.
+    ///
+    /// A withheld stream contributes to [`redacted_withheld`](Self::redacted_withheld) instead. The
+    /// split matters because this number goes back to the caller: a count over output that was never
+    /// handed over is not the caller's to have, and it is a number the *command* chooses — printing
+    /// the credential a chosen number of times makes the count a value it picked, which is a channel
+    /// out of a cage whose streams were hidden precisely to close one.
     pub(crate) redacted: usize,
+    /// The same count over the streams the declaration **withholds**. Recorded host-side, where the
+    /// session's log answers "did the credential reach the output" whether or not the caller saw it;
+    /// never written back to the caller.
+    pub(crate) redacted_withheld: usize,
     /// Whether the timeout killed the command.
     pub(crate) timed_out: bool,
     /// Whether `sbx task stop` ended it. Distinct from `timed_out` although both end the command the
@@ -665,6 +675,15 @@ impl TaskEngine {
         // character and hide it from the scan.
         let (out_bytes, out_hits) = redact_named(&raw.stdout, &needles, &placeholder);
         let (err_bytes, err_hits) = redact_named(&raw.stderr, &needles, &placeholder);
+        // Which side of the split each stream's count falls on is decided by whether that stream is
+        // returned, one stream at a time: a declaration that shows stdout and hides stderr reports
+        // what happened in the half the caller is holding, and no more.
+        let split = |disposition: OutputDisposition, hits: usize| match disposition {
+            OutputDisposition::Show => (hits, 0),
+            OutputDisposition::Hide => (0, hits),
+        };
+        let (out_shown, out_withheld) = split(task.stdout, out_hits);
+        let (err_shown, err_withheld) = split(task.stderr, err_hits);
         Ok(TaskOutcome {
             nonce: match &placeholder {
                 Placeholder::Nonced(n) => Some(n.clone()),
@@ -680,7 +699,8 @@ impl TaskEngine {
                 OutputDisposition::Hide => None,
             },
             truncated: raw.truncated,
-            redacted: out_hits + err_hits,
+            redacted: out_shown + err_shown,
+            redacted_withheld: out_withheld + err_withheld,
             timed_out: raw.timed_out,
             stopped: raw.stopped,
             elapsed_ms,
@@ -2223,6 +2243,75 @@ mod smoke {
             "an out-of-bound value must be refused: {refused:?}"
         );
         std::env::remove_var("SBX_SMOKE_TASK_TOKEN");
+    }
+
+    /// A withheld stream's substitution count does not go back to the caller, and the host-side log
+    /// still holds it.
+    ///
+    /// The two streams are given **different** dispositions on purpose: it proves the split is
+    /// decided per stream rather than by one switch over the pair, which is the shape a caller
+    /// receiving half the output needs. The command prints the credential once on each, so a count
+    /// that leaked would be visible as an off-by-one rather than as nothing at all.
+    #[test]
+    fn a_withheld_streams_substitution_count_stays_host_side() {
+        let project = TmpDir::new();
+        std::env::set_var("SBX_SMOKE_COUNT_TOKEN", "count-token-abcdef");
+
+        let shell = match crate::store::resolve_nix(None).and_then(|nix| {
+            let data = TmpDir::new();
+            let layout = crate::store::Layout::under(data.path());
+            let nixpkgs = crate::store::LockTarget::global(&layout, None)
+                .resolve(&nix, &layout)
+                .ok()?;
+            super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
+                .ok()
+                .map(|u| u.shell_bin)
+        }) {
+            Some(shell) => shell,
+            None => {
+                eprintln!("skipping count smoke: need nix and a provisioned userland");
+                return;
+            }
+        };
+
+        let mut task = echo_task(&shell.to_string_lossy());
+        task.name = "print-both".into();
+        task.cmd = vec![
+            shell.to_string_lossy().into_owned(),
+            "-c".into(),
+            "echo \"$DEMO_TOKEN\"; echo \"$DEMO_TOKEN\" >&2".into(),
+        ];
+        task.params = vec![];
+        task.secrets = vec![TaskSecret {
+            var: "DEMO_TOKEN".into(),
+            sources: vec![crate::config::SecretSource::Env(
+                "SBX_SMOKE_COUNT_TOKEN".into(),
+            )],
+            encode: Encoding::Raw,
+            description: None,
+        }];
+        task.stdout = OutputDisposition::Hide;
+        task.stderr = OutputDisposition::Show;
+
+        let Some((engine, _data)) = engine_for(vec![task], project.path()) else {
+            eprintln!("skipping count smoke: need bwrap, userns, and nix");
+            return;
+        };
+
+        let outcome = engine
+            .run("print-both", &BTreeMap::new(), &BTreeMap::new(), 1)
+            .expect("the task runs");
+
+        assert!(outcome.stdout.is_none(), "stdout is withheld");
+        assert_eq!(
+            outcome.redacted, 1,
+            "only the shown stream's substitution is the caller's: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.redacted_withheld, 1,
+            "and the withheld stream's is kept apart, not dropped: {outcome:?}"
+        );
+        std::env::remove_var("SBX_SMOKE_COUNT_TOKEN");
     }
 
     /// The paths an exec refusal names are substituted, proven through the real supervisor rather
