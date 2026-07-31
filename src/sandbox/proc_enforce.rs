@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 
 use super::binds::ExtraBind;
 use super::proc_control::ExecRing;
-use crate::proc_policy::{ProcMode, ProcPolicy, ProcRule, Verdict};
+use crate::proc_policy::{ProcPolicy, ProcRule, Verdict};
 
 /// The most `ask`-parked `execve`s a session holds at once. Beyond this, a further undecided `execve`
 /// is denied outright (fail-closed) rather than growing the registry without bound — mirroring the
@@ -97,7 +97,7 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(120);
 /// Where the exec shim is bound read-only inside the cage, and where the notification handoff
 /// socket appears. Both under `/opt/sbx`, beside the egress CA — a path the cage cannot reach outside
 /// of these binds.
-const SHIM_CAGE_PATH: &str = "/opt/sbx/proc-shim";
+pub(super) const SHIM_CAGE_PATH: &str = "/opt/sbx/proc-shim";
 const NOTIF_SOCK_CAGE_PATH: &str = "/opt/sbx/proc-notif.sock";
 
 // ── seccomp notification ioctl request codes (absent from the libc crate) ─────────────────────────
@@ -179,12 +179,12 @@ impl ProcOverlay {
     /// Decide an exec target with the current overlay folded onto `base` (a short read-lock held for
     /// the decision). Fast-pathed when the overlay is empty — the common case — to `base.decide`,
     /// mirroring the egress proxy's borrow-when-empty effective policy.
-    pub(crate) fn decide(&self, base: &ProcPolicy, exec_path: &str) -> Verdict {
+    pub(crate) fn decide(&self, base: &ProcPolicy, caller: &[String], exec_path: &str) -> Verdict {
         let g = self.inner.read().expect("overlay lock");
         if g.allow.is_empty() && g.deny.is_empty() {
-            base.decide(exec_path)
+            base.decide(caller, exec_path)
         } else {
-            base.decide_with(exec_path, &g.allow, &g.deny)
+            base.decide_chain(caller, exec_path, &g.allow, &g.deny)
         }
     }
 
@@ -227,6 +227,11 @@ impl ProcEnforce {
     /// decides for itself whether to mention it, and several do not — a caller then sees an empty
     /// result and a success code with nothing to explain them. Where a launch has no interactive
     /// control plane to consult (a task's), this is how the refusals get said out loud.
+    ///
+    /// Only a target that was **there** counts. A `PATH` walk refuses one candidate per directory it
+    /// passes through, and reporting those would announce a handful of refusals every time a program
+    /// is found somewhere other than the first entry — while the run succeeded and nothing was kept
+    /// from it.
     pub(crate) fn refusals(&self) -> Vec<String> {
         let mut seen = Vec::new();
         for event in self.ring.snapshot(None).events {
@@ -486,15 +491,11 @@ fn handle_notif(
         // Could not read the path: fall back to the mode's unmatched default rather than guessing a
         // name match — allow under a denylist, park under ask, refuse under an allowlist (where an
         // undecidable target is exactly the one that must not run).
-        match policy.mode {
-            ProcMode::Ask => Verdict::Ask,
-            ProcMode::Confine => Verdict::Deny,
-            ProcMode::Off | ProcMode::Observe | ProcMode::Enforce => Verdict::Allow,
-        }
+        policy.unmatched()
     } else {
         // Decide against the config policy folded with the live `--session` overlay (deny wins across
         // both). The overlay read-lock is held only for this decision.
-        overlay.decide(policy, &path)
+        overlay.decide(policy, &caller_chain(policy, req.pid), &path)
     };
     let shown = if path.is_empty() {
         "<unreadable>"
@@ -507,8 +508,19 @@ fn handle_notif(
             respond_continue(notif_fd, req.id);
         }
         Verdict::Deny => {
-            ring.push_verdict(req.pid, shown, "deny");
-            respond_errno(notif_fd, req.id, refusal_errno(req.pid, shown));
+            let errno = refusal_errno(req.pid, shown);
+            // A name lookup is one `execve` per `PATH` entry, so a program found in the fourth
+            // directory leaves three refusals behind it — of files that were never there. Recorded
+            // apart from a refusal of something real, because they are the same event a cage with
+            // no policy at all would produce, and a warning that fires when nothing was denied
+            // teaches a reader to stop reading it.
+            let recorded = if errno == libc::ENOENT {
+                "absent"
+            } else {
+                "deny"
+            };
+            ring.push_verdict(req.pid, shown, recorded);
+            respond_errno(notif_fd, req.id, errno);
         }
         Verdict::Ask => {
             // Park it: register the kernel notification id so the control plane can answer it later.
@@ -517,6 +529,32 @@ fn handle_notif(
             pending.park(notif_fd, req.id, req.pid, shown);
         }
     }
+}
+
+/// How the caller of a notified `execve` is addressed, when the policy decides by caller at all.
+///
+/// One element today: the program the calling process **is** at the moment of the syscall, read from
+/// `/proc/<pid>/exe`. A chain rather than a bare program because the address is what a deeper form
+/// would lengthen, and because `decide_chain` reading only the last element is a fact stated in one
+/// place instead of a signature everything would have to change.
+///
+/// `/proc/<pid>/exe` and not the argv the process was started with: a process writes its own
+/// `cmdline`, so that is the caller's own account of itself. `exe` is the kernel's, it survives
+/// `fork` (a child that has not exec'd is still its parent's program), and it survives reparenting —
+/// so a double-fork does not turn a program into an unknown. It resolves symlinks, which is why the
+/// keys a policy is built from are resolved the same way and never guessed.
+///
+/// Skipped entirely under a flat policy, where the caller decides nothing: one `readlink` is
+/// negligible beside a notification round-trip, but a syscall issued for an answer nobody reads is
+/// not negligible, it is wrong.
+fn caller_chain(policy: &ProcPolicy, pid: u32) -> Vec<String> {
+    if policy.graph.is_none() {
+        return Vec::new();
+    }
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| vec![p.to_string_lossy().into_owned()])
+        .unwrap_or_default()
 }
 
 /// Which errno a refusal answers with: `ENOENT` when the target does not exist, `EPERM` otherwise.
@@ -1016,8 +1054,9 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e.command.ends_with("/a/true") && e.verdict == "deny"),
-            "the walk's earlier candidates are refused — that is the situation under test: {events:?}"
+                .any(|e| e.command.ends_with("/a/true") && e.verdict == "absent"),
+            "the walk's earlier candidates are refused, and recorded as the absences they are — that \
+             is the situation under test: {events:?}"
         );
         assert!(
             events

@@ -502,6 +502,14 @@ pub(crate) struct TaskSpec {
     /// nothing else). Entries are declaration text; the launch resolves a bare name to the absolute
     /// in-cage path it will run as.
     pub(crate) spawn: Option<Vec<String>>,
+    /// What each of *those* programs may run in turn, keyed by the entry that named it. Empty is the
+    /// ordinary case: a program with no node of its own may run nothing.
+    ///
+    /// This is what lets a declaration permit a **chain** without granting a **shortcut**. A flat
+    /// set that has to name `git`, `ssh` and `gpg` so that git can reach ssh and ssh can reach gpg
+    /// also lets the command run `gpg` itself, with the credential in hand and nothing in between.
+    /// A node reaching only the next link does not.
+    pub(crate) exec: std::collections::BTreeMap<String, Vec<String>>,
     /// Where this operation's `[task.<name>]` block is. Display-only: it answers "which of my
     /// configs put this here?", which the name alone cannot once a project, an app and its bundles
     /// each contribute operations to one session. It decides nothing — a task's identity is its

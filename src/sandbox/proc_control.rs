@@ -685,7 +685,7 @@ mod tests {
             ),
             "ok\n"
         );
-        assert_eq!(overlay.decide(&policy, "/bin/curl"), Verdict::Deny);
+        assert_eq!(overlay.decide(&policy, &[], "/bin/curl"), Verdict::Deny);
 
         // REMEMBER ALLOW under ask un-parks a target that would otherwise park.
         assert_eq!(
@@ -698,7 +698,7 @@ mod tests {
             ),
             "ok\n"
         );
-        assert_eq!(overlay.decide(&policy, "/usr/bin/git"), Verdict::Allow);
+        assert_eq!(overlay.decide(&policy, &[], "/usr/bin/git"), Verdict::Allow);
 
         // RULES lists what was loaded, then `ok`.
         let listing = dispatch_enforced("RULES", &ring, &pending, &overlay, ProcMode::Ask);

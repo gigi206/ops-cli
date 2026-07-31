@@ -79,6 +79,7 @@ oracle over the credential.
 | `network` | the egress this task's cage gets, as allowlist entries (empty = no network) |
 | `packages` | the `mise:` tools the command needs (see [below](#which-binaries-a-task-may-run)) |
 | `spawn` | the programs the command may run beside itself — absent means no supervision (see [below](#what-the-command-may-run-spawn)) |
+| `[exec.<program>]` | what one of those programs may run in turn (see [below](#what-each-program-may-run-in-turn-execprogram)) |
 | `output` | give the invocation a writable directory whose contents outlive it (see [below](#producing-a-file-output)) |
 
 ### Parameters
@@ -336,8 +337,11 @@ sbx fixes the program a task runs. `spawn` declares what that program may run **
 ```toml
 [task.gh-issue]
 cmd   = ["gh", "issue", "list", "--repo", "{repo}"]
-spawn = ["git", "git-remote-https"]
+spawn = ["git"]
 ```
+
+What `git` may then run is [a section of its own](#what-each-program-may-run-in-turn-execprogram) —
+naming it here would let the command run it directly instead.
 
 **Why it matters where a credential is involved.** A child of the command inherits its environment,
 so it inherits the credential. The output that comes back to the caller is redacted, but redaction
@@ -346,8 +350,8 @@ what may run closes that.
 
 **Leaving `spawn` out is not the same as `spawn = []`.** Absent means no exec supervision at all: the
 command runs as it always has. Present — including empty — stands up a supervisor for that
-invocation, after which **only the command and what is listed may run**. `spawn = []` is therefore
-the strictest form: a command that must run nothing else.
+invocation, after which **only the command, what it lists, and what a section below allows may
+run**. `spawn = []` is therefore the strictest form: a command that must run nothing else.
 
 **A name is resolved to the program, not to a filename.** Each entry is looked up on the cage's own
 `PATH` and becomes the absolute path it will run as, in the read-only store. A rule matching a bare
@@ -371,13 +375,73 @@ That is how a missing entry reads as a missing entry rather than as a command th
 returned nothing.
 
 **It governs the whole tree, at any depth.** The filter is inherited across `fork` and `exec`, so a
-program run by a program run by the command traps the same supervisor. That is why `spawn` is a flat
-list and not a table: `spawn = { git = [...] }` would read as "git may run these", which is a
-per-parent restriction, and it is refused rather than accepted and flattened.
+program run by a program run by the command traps the same supervisor. What decides is then *who is
+running*, which is what the next section is about.
 
 **Listing an interpreter concedes most of the guard**, and sbx says so at load. `sh`, `python`, `awk`
 and the like can take a credential apart and put it back together with builtins alone, and nothing
 they do that way is an `execve` to decide. The same is true if `cmd` is itself a shell script.
+
+### What each program may run in turn: `[exec.<program>]`
+
+`spawn` says what the **command** may run. A section says what one of those programs may run once it
+is running:
+
+```toml
+[task.release]
+cmd   = ["make", "release"]
+spawn = ["git"]
+
+[task.release.exec.git]
+spawn = ["ssh"]
+
+[task.release.exec.ssh]
+spawn = ["gpg"]
+```
+
+**This permits a chain without granting a shortcut**, which is the whole reason the form exists. To
+let `make → git → ssh → gpg` happen with one flat list you would have to write
+`spawn = ["git", "ssh", "gpg"]` — and then the command may run `gpg` **itself**, with the credential
+in hand and nothing in between. Above, the command may run `git` and nothing else.
+
+**A program with no section of its own may run nothing.** There is no inheritance down the chain:
+inheritance would hand back the shortcut. So a program that needs to run something needs a section
+naming it, and `spawn = ["git"]` alone means git runs on its own or not at all.
+
+**A section addresses a program, wherever that program was reached from.** `[exec.ssh]` is *ssh*, not
+"the ssh git ran" — so an ssh reached some other way is governed by the same rule, and a program
+reachable three ways is declared once. There is nothing deeper to address, and a deeper section
+(`[exec.git.ssh]`) is refused rather than quietly ignored.
+
+`exec` is a namespace rather than the program's own name at the top: `[task.release.env]` is already
+the task's environment, and `env`, `network`, `output` and `secret` are all programs a command
+plausibly runs.
+
+**What is refused at load**, each by name, with the rest of the file left standing:
+
+| Written | Why |
+|---|---|
+| a section with no `spawn` on the task | nothing enforces it — `spawn` is what stands the supervisor up |
+| a section nothing can reach | it says what a program may run when no program may run that program |
+| a section for the command itself | what the command may run is `spawn`; two declarations would each be half of one |
+| `[exec.git.ssh]` | a program is the whole address |
+| `[exec.git] spawn = []` | that is what having no section already means |
+| `[exec.git*]` | a caller is one executable, so two patterns matching it would both claim it |
+
+A pattern may still appear in a `spawn` list, where the answer is only yes or no. It just cannot
+*address* a node — the program it admits then has no section, and may run nothing.
+
+**Several names, one binary.** A caller is addressed by the executable it **is**, and some programs
+are one file behind many names: every coreutils tool is a symlink to `coreutils`, and `/bin/sh` is
+`bash`. So `[exec.ls]` governs every coreutils program, and sbx says so when a name resolves to a
+different binary. What bounds it is that only a program that is **allowed to run** can ever be a
+caller, so the over-grant never reaches past what the declaration already admits. Two sections that
+turn out to be the same executable are refused: nothing could tell them apart.
+
+**A refusal names what was refused, and only what was there.** Looking up a program by name issues
+one `execve` per `PATH` entry until one succeeds, so a program found in the fourth directory leaves
+three refusals of files that never existed. Those are not reported — they are what a cage with no
+policy at all would produce.
 
 **What it is not.** It bounds what the command *runs*; it does not bound what the command *itself*
 does with the values the caller supplies. Both come back to `params` being the caller's lever, which

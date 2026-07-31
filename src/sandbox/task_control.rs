@@ -1070,6 +1070,7 @@ mod tests {
             nonce: false,
             packages: vec![],
             spawn: None,
+            exec: Default::default(),
             output: false,
             origin: crate::config::TaskOrigin::Project,
             timeout_from: crate::config::Ceiling::Declared,

@@ -1148,14 +1148,84 @@ impl TaskEngine {
         Err(format!("`{entry}` is not on this task's path{hint}"))
     }
 
-    /// The exec policy for one invocation: a strict allowlist of the command itself plus what the
-    /// declaration says it may run, each resolved to an absolute in-cage path.
+    /// Resolve a cage path's symlinks **in cage space**, down to the path the kernel will report as
+    /// `/proc/<pid>/exe` for a process running it — which is how a caller is addressed.
+    ///
+    /// Cage space and not the host's, because the two disagree in both directions. A cage's `/bin/sh`
+    /// is a symlink bubblewrap creates, so no host file answers for it; and a program built into a
+    /// per-project store sits at a host path that is not the path the cage runs it by. So each link
+    /// is read through whichever side knows it — the mount list for the names the cage synthesises,
+    /// the host file for everything the cage merely maps — and its target is read as a cage path
+    /// either way.
+    ///
+    /// Only the final component is followed: a directory in the middle could be a symlink too, but
+    /// the paths here come from the cage's own `PATH` and its own mount list, which name directories
+    /// as the cage creates them.
+    fn canonical_incage(&self, incage: &str, task: &TaskSpec) -> String {
+        // Enough hops for a name that goes through the FHS shim and then a multi-call binary; past
+        // that a link is looping, and the unresolved path simply matches no caller — fail-closed.
+        const MAX_HOPS: usize = 8;
+        let mut cur = PathBuf::from(incage);
+        for _ in 0..MAX_HOPS {
+            let Some(target) = self.read_incage_link(&cur, task) else {
+                break;
+            };
+            cur = if target.is_absolute() {
+                target
+            } else {
+                match cur.parent() {
+                    Some(parent) => lexical_join(parent, &target),
+                    None => break,
+                }
+            };
+        }
+        cur.to_string_lossy().into_owned()
+    }
+
+    /// Read one cage path as a symlink, or `None` when it is not one.
+    fn read_incage_link(&self, incage: &Path, task: &TaskSpec) -> Option<PathBuf> {
+        let synthesised = self.base_mounts.iter().find_map(|mount| match mount {
+            Mount::Symlink { target, dest } if dest == incage => Some(target.clone()),
+            _ => None,
+        });
+        match synthesised {
+            Some(target) => Some(target),
+            None => std::fs::read_link(self.host_path(incage, task)?).ok(),
+        }
+    }
+
+    /// Say so when a node names one of several programs that are the **same executable**, since its
+    /// rule then governs all of them. A caller is addressed by the executable it is, and a
+    /// multi-call binary — coreutils is one file behind a hundred names — cannot tell its own names
+    /// apart from the outside.
+    ///
+    /// Only for a declared node: `cmd = ["/bin/sh", …]` reaches the same binary as `bash`, and
+    /// warning about the commonest command there is, on every invocation, would teach a reader to
+    /// stop reading. What bounds it either way is that only an **allowed** program can be running,
+    /// so the over-grant never reaches past the programs the declaration already admits.
+    fn warn_if_multicall(&self, program: &str, incage: &str, task: &TaskSpec) {
+        let canonical = self.canonical_incage(incage, task);
+        let real = Path::new(&canonical).file_name().unwrap_or_default();
+        let named = Path::new(incage).file_name().unwrap_or_default();
+        if real != named {
+            crate::diag::warn(&format!(
+                "task `{}`: `{program}` is one name of `{}`, a binary that answers to several — so \
+                 what `{program}` may run, every program sharing that binary may run too",
+                task.name,
+                real.to_string_lossy()
+            ));
+        }
+    }
+
+    /// The exec policy for one invocation: what each program may run, keyed by the program running
+    /// it, with every name resolved to the absolute in-cage path it will run as.
     fn spawn_policy(
         &self,
         task: &TaskSpec,
         declared: &[String],
         cage_env: &[(String, String)],
     ) -> Result<crate::proc_policy::ProcPolicy, String> {
+        use crate::proc_policy::{CallerGraph, ProcRule};
         let path_dirs: Vec<PathBuf> = cage_env
             .iter()
             .rev()
@@ -1164,18 +1234,63 @@ impl TaskEngine {
             .into_iter()
             .flatten()
             .collect();
-        // The command comes first because it is not optional: the shim's own exec of it is the first
+
+        // The command's own node comes from the shim: the shim's exec of the command is the first
         // notified `execve`, and a policy that did not admit it would refuse the task outright.
-        let mut allow = vec![self.resolve_spawn_entry(&task.cmd[0], &path_dirs, task)?];
-        for entry in declared {
-            allow.push(self.resolve_spawn_entry(entry, &path_dirs, task)?);
+        let command = self.resolve_spawn_entry(&task.cmd[0], &path_dirs, task)?;
+        let mut callers: BTreeMap<String, Vec<ProcRule>> = BTreeMap::from([(
+            super::proc_enforce::SHIM_CAGE_PATH.to_string(),
+            vec![ProcRule::new(&command)],
+        )]);
+
+        // A target is matched against the path the process **asked** for, before symlinks — which is
+        // what keeps `ls` meaning `ls`. Resolving targets the way callers are resolved would make
+        // every coreutils name mean all of them, so the two sides are deliberately not symmetrical.
+        let mut node = |program: &str, incage: &str, entries: Vec<String>| -> Result<(), String> {
+            let key = self.canonical_incage(incage, task);
+            if callers.contains_key(&key) {
+                return Err(format!(
+                    "`{program}` cannot have a node of its own: it is the same executable as \
+                     another program already declared here, so nothing could tell the two apart \
+                     when one of them runs something"
+                ));
+            }
+            callers.insert(key, entries.iter().map(|e| ProcRule::new(e)).collect());
+            Ok(())
+        };
+
+        let resolve_all = |entries: &[String]| -> Result<Vec<String>, String> {
+            entries
+                .iter()
+                .map(|e| self.resolve_spawn_entry(e, &path_dirs, task))
+                .collect()
+        };
+        node(&task.cmd[0], &command, resolve_all(declared)?)?;
+        for (program, entries) in &task.exec {
+            let incage = self.resolve_spawn_entry(program, &path_dirs, task)?;
+            self.warn_if_multicall(program, &incage, task);
+            node(program, &incage, resolve_all(entries)?)?;
         }
-        Ok(crate::proc_policy::ProcPolicy::new(
-            crate::proc_policy::ProcMode::Confine,
-            &allow,
-            &[],
-        ))
+        Ok(crate::proc_policy::ProcPolicy::confined(CallerGraph {
+            callers,
+        }))
     }
+}
+
+/// Join a relative symlink target onto its directory, resolving `.` and `..` **lexically** — the
+/// path is a cage path, so there is no filesystem here to ask.
+fn lexical_join(base: &Path, target: &Path) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for part in target.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Put `dirs` at the front of the environment's `PATH`, preserving the rest. Upserts, so a `PATH`
@@ -1377,6 +1492,17 @@ fn declared_fields(task: &TaskSpec) -> Vec<(String, String)> {
         ),
         ("env_allow".to_string(), list(task.env_allow.clone())),
     ];
+    // One row per program that has a node, keyed by the program so the rows read as the chain they
+    // are — `spawn` says what the command may run, `git spawns` what git may run in turn. Placed
+    // beside `spawn` rather than folded into it: a single cell holding a graph is a cell nobody
+    // reads twice.
+    if let Some(at) = out.iter().position(|(k, _)| k == "spawn") {
+        let nodes = task
+            .exec
+            .iter()
+            .map(|(program, entries)| (format!("{program} spawns"), list(entries.clone())));
+        out.splice(at + 1..at + 1, nodes);
+    }
     // An empty field is left out rather than shown as a blank: this is read as prose, and a page of
     // "network:" with nothing after it says less than its absence does.
     out.retain(|(_, v)| !v.is_empty());
@@ -1791,6 +1917,7 @@ mod smoke {
             nonce: false,
             packages: vec![],
             spawn: None,
+            exec: Default::default(),
             output: false,
             origin: crate::config::TaskOrigin::Project,
             timeout_from: crate::config::Ceiling::Declared,
@@ -1940,6 +2067,7 @@ mod smoke {
             nonce: false,
             packages: vec!["demo-tool".into()],
             spawn: None,
+            exec: Default::default(),
             output: false,
             origin: crate::config::TaskOrigin::Project,
             timeout_from: crate::config::Ceiling::Declared,
@@ -2067,6 +2195,7 @@ mod tests {
             nonce: false,
             packages: vec![],
             spawn: None,
+            exec: Default::default(),
             output: false,
             origin: crate::config::TaskOrigin::Project,
             timeout_from: crate::config::Ceiling::Declared,
@@ -2487,9 +2616,9 @@ mod tests {
         );
     }
 
-    /// The policy a declaration produces: the command is admitted because it is not optional, the
-    /// declared programs are admitted, and **everything else is refused** — the posture is an
-    /// allowlist, not the session's denylist.
+    /// The policy a declaration produces: the shim may run the command because that exec is not
+    /// optional, the command may run what it declares, and **everything else is refused** — the
+    /// posture is an allowlist, not the session's denylist.
     #[test]
     fn a_declared_spawn_confines_the_cage_to_the_command_and_what_it_names() {
         let root = crate::testutil::TmpDir::new();
@@ -2502,22 +2631,78 @@ mod tests {
             .expect("a policy");
         assert_eq!(policy.mode, crate::proc_policy::ProcMode::Confine);
         use crate::proc_policy::Verdict;
+        let shim = [super::super::proc_enforce::SHIM_CAGE_PATH.to_string()];
+        let command = ["/nix/store/demo/bin/psql".to_string()];
         assert_eq!(
-            policy.decide("/nix/store/demo/bin/psql"),
+            policy.decide(&shim, "/nix/store/demo/bin/psql"),
             Verdict::Allow,
             "the command itself must run, or the task refuses itself"
         );
-        assert_eq!(policy.decide("/nix/store/demo/bin/less"), Verdict::Allow);
         assert_eq!(
-            policy.decide("/bin/sh"),
+            policy.decide(&command, "/nix/store/demo/bin/less"),
+            Verdict::Allow
+        );
+        assert_eq!(
+            policy.decide(&command, "/bin/sh"),
             Verdict::Deny,
             "an undeclared program is refused — that is the whole field"
         );
         // The resolved path is what matches, so a same-named file elsewhere in the cage does not.
         assert_eq!(
-            policy.decide("/tmp/less"),
+            policy.decide(&command, "/tmp/less"),
             Verdict::Deny,
             "a file that merely shares the name must not satisfy the rule"
+        );
+        // No inheritance: the program the command was allowed to run has no node of its own, so it
+        // may run nothing. Inheritance would hand back the shortcut the graph exists to remove.
+        assert_eq!(
+            policy.decide(
+                &["/nix/store/demo/bin/less".to_string()],
+                "/nix/store/demo/bin/less"
+            ),
+            Verdict::Deny,
+            "a program with no node of its own may run nothing"
+        );
+        // A caller nobody could name is the one execve that must not run.
+        assert_eq!(
+            policy.decide(&[], "/nix/store/demo/bin/less"),
+            Verdict::Deny
+        );
+    }
+
+    /// The value the graph exists for: a chain is permitted without the shortcut a flat set would
+    /// grant. The command may run `less` and only `less`; `less` may run `psql`; the command may
+    /// **not** run `psql` itself, which is precisely what naming all three in one list would allow.
+    #[test]
+    fn a_node_permits_a_chain_without_granting_the_shortcut() {
+        let root = crate::testutil::TmpDir::new();
+        let mut task = task();
+        task.cmd = vec!["/bin/sh".to_string()];
+        task.spawn = Some(vec!["less".to_string()]);
+        task.exec = [("less".to_string(), vec!["psql".to_string()])]
+            .into_iter()
+            .collect();
+        let engine = engine_with_store(root.path(), &["psql", "less"], vec![task.clone()]);
+
+        let policy = engine
+            .spawn_policy(&task, task.spawn.as_ref().unwrap(), &engine.base_env)
+            .expect("a policy");
+        use crate::proc_policy::Verdict;
+        let command = ["/bin/sh".to_string()];
+        let less = ["/nix/store/demo/bin/less".to_string()];
+        assert_eq!(
+            policy.decide(&command, "/nix/store/demo/bin/less"),
+            Verdict::Allow
+        );
+        assert_eq!(
+            policy.decide(&less, "/nix/store/demo/bin/psql"),
+            Verdict::Allow,
+            "the node is what makes the chain reachable"
+        );
+        assert_eq!(
+            policy.decide(&command, "/nix/store/demo/bin/psql"),
+            Verdict::Deny,
+            "permitting a chain must not grant the command the far end of it"
         );
     }
 

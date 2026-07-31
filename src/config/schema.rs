@@ -764,6 +764,14 @@ pub(crate) struct RawTask {
     /// filename.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) spawn: Option<RawTaskSpawn>,
+    /// What each of those programs may run in turn: `[task.<name>.exec.<program>] spawn = [...]`.
+    ///
+    /// `exec` is a namespace and not a program of its own, because a section named directly after
+    /// the program would collide with the task's own fields — `[task.<name>.env]` is the task's
+    /// environment, not the `env` binary, and `env`, `output`, `network` and `secret` are all
+    /// programs a command plausibly runs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) exec: BTreeMap<String, RawTaskExecNode>,
     /// Present only so a task declaring them is **refused** rather than parsing into silence. Since
     /// unknown keys are ignored by design, a key shaped like a control has to exist here to be
     /// rejected at all.
@@ -813,6 +821,43 @@ pub(crate) enum RawTaskSpawn {
     Flat(Vec<RawSpawnEntry>),
     /// `spawn = { git = ["git-remote-https"] }` — parsed to be refused, not applied.
     Nested(BTreeMap<String, RawTaskSpawn>),
+}
+
+/// One program's own node in a task's exec graph: what **it** may run.
+///
+/// A section rather than a list entry because a section body stays flat — a program that runs a
+/// dozen others is a twelve-element list under one header, never twelve levels of indentation — and
+/// because a section can gain a field later where a string cannot.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawTaskExecNode {
+    /// What this program may run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) spawn: Option<RawTaskSpawn>,
+    /// Everything else written in the section, kept so it can be **refused**. Unknown keys are
+    /// ignored by design, so a deeper section (`[task.t.exec.git.ssh]`, which lands here as a table)
+    /// and a misspelled key would both be silent — and a node that means less than it says is the
+    /// one failure this whole field exists to avoid.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// A value kept only for its key's sake: whatever was written under an unknown key is about to be
+/// refused, so its content is never read. Accepting *any* shape is the point — a type that could
+/// fail to deserialize would report against the whole file, taking every other declaration in it
+/// down over a key that was already going to be rejected on its own.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawIgnored;
+
+impl<'de> Deserialize<'de> for RawIgnored {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(d).map(|_| RawIgnored)
+    }
+}
+
+impl Serialize for RawIgnored {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_unit()
+    }
 }
 
 /// One element of a `spawn` list: a program name, or a table under it.

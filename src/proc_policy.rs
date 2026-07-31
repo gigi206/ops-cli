@@ -153,6 +153,20 @@ pub(crate) struct ProcPolicy {
     pub(crate) mode: ProcMode,
     pub(crate) allow: Vec<ProcRule>,
     pub(crate) deny: Vec<ProcRule>,
+    /// Present when what may run depends on **who is running it**. Absent is the flat model, where
+    /// one set governs the whole cage at any depth.
+    pub(crate) graph: Option<CallerGraph>,
+}
+
+/// What each program may run, keyed by the program doing the running.
+///
+/// The key is the caller's executable as `/proc/<pid>/exe` reports it — an absolute in-cage path
+/// with every symlink already followed, since that is what the kernel records. A program with no
+/// entry may run **nothing**: there is no inheritance from whoever ran it, because inheritance would
+/// hand back the very shortcut a graph exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CallerGraph {
+    pub(crate) callers: std::collections::BTreeMap<String, Vec<ProcRule>>,
 }
 
 impl ProcPolicy {
@@ -162,6 +176,18 @@ impl ProcPolicy {
             mode: ProcMode::Off,
             allow: Vec::new(),
             deny: Vec::new(),
+            graph: None,
+        }
+    }
+
+    /// A per-caller allowlist: an unmatched target is refused, and what is matched depends on which
+    /// program is doing the running.
+    pub(crate) fn confined(graph: CallerGraph) -> ProcPolicy {
+        ProcPolicy {
+            mode: ProcMode::Confine,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            graph: Some(graph),
         }
     }
 
@@ -178,6 +204,7 @@ impl ProcPolicy {
             mode,
             allow: compile(allow),
             deny: compile(deny),
+            graph: None,
         }
     }
 
@@ -192,17 +219,26 @@ impl ProcPolicy {
     /// under `ask`, and [`Deny`](Verdict::Deny) under `confine` (the allowlist default); under a
     /// non-enforcing mode it is [`Allow`](Verdict::Allow) (decide is never called there, but the
     /// fallback is the safe, non-blocking one).
-    pub(crate) fn decide(&self, exec_path: &str) -> Verdict {
-        self.decide_with(exec_path, &[], &[])
+    pub(crate) fn decide(&self, caller: &[String], exec_path: &str) -> Verdict {
+        self.decide_chain(caller, exec_path, &[], &[])
     }
 
-    /// Decide one exec target, folding in a live `--session` overlay's extra allow/deny rules on top
-    /// of this config policy. **Deny wins across both sets**: an overlay `deny` cuts a config-allowed
-    /// target, and a config `deny` cannot be overridden by an overlay `allow`. Otherwise an `allow`
-    /// from either set matches; an unmatched target then follows the mode default (`Ask` under `ask`,
-    /// else `Allow`). [`decide`](Self::decide) is this with an empty overlay.
-    pub(crate) fn decide_with(
+    /// Decide one exec target for a caller addressed by its chain of programs, innermost **last**,
+    /// folding in a live `--session` overlay's extra allow/deny rules on top of this config policy.
+    /// **Deny wins across both sets**: an overlay `deny` cuts a config-allowed target, and a config
+    /// `deny` cannot be overridden by an overlay `allow`.
+    ///
+    /// Under a [`CallerGraph`] only the last element is read — a node addresses a program, wherever
+    /// that program was reached from. The whole chain is taken rather than the one program it uses,
+    /// so that a chain-scoped address could be added without touching a single call site: an address
+    /// that grows is a slice that grows.
+    ///
+    /// An **empty** chain against a graph matches nothing, which under `confine` is a refusal. That
+    /// is the wanted answer for a caller whose program could not be read: the one execve that must
+    /// not run is the one nothing can account for.
+    pub(crate) fn decide_chain(
         &self,
+        caller: &[String],
         exec_path: &str,
         overlay_allow: &[ProcRule],
         overlay_deny: &[ProcRule],
@@ -212,11 +248,26 @@ impl ProcPolicy {
         if any(&self.deny) || any(overlay_deny) {
             return Verdict::Deny;
         }
+        if let Some(graph) = &self.graph {
+            // Only the caller's own node answers. An overlay `allow` is deliberately not folded in
+            // here: it arrives from a live control plane, and a per-caller policy is a task's, whose
+            // plane has no such channel — while an overlay `deny`, decided above, still cuts.
+            let allowed = caller.last().and_then(|c| graph.callers.get(c.as_str()));
+            return match allowed {
+                Some(rules) if any(rules) => Verdict::Allow,
+                _ => self.unmatched(),
+            };
+        }
         if any(&self.allow) || any(overlay_allow) {
             return Verdict::Allow;
         }
-        // Exhaustive on purpose: the unmatched default is the whole difference between a denylist and
-        // an allowlist, so a new posture must state its own rather than inherit a catch-all.
+        self.unmatched()
+    }
+
+    /// The verdict for a target no rule spoke about. Exhaustive on purpose: this default is the whole
+    /// difference between a denylist and an allowlist, so a new posture must state its own rather
+    /// than inherit a catch-all.
+    pub(crate) fn unmatched(&self) -> Verdict {
         match self.mode {
             ProcMode::Ask => Verdict::Ask,
             ProcMode::Confine => Verdict::Deny,
@@ -303,40 +354,40 @@ mod tests {
     #[test]
     fn basename_rule_matches_the_final_component_only() {
         let deny = policy(ProcMode::Enforce, &[], &["curl"]);
-        assert_eq!(deny.decide("/usr/bin/curl"), Verdict::Deny);
-        assert_eq!(deny.decide("curl"), Verdict::Deny);
+        assert_eq!(deny.decide(&[], "/usr/bin/curl"), Verdict::Deny);
+        assert_eq!(deny.decide(&[], "curl"), Verdict::Deny);
         // A basename rule does not match a same-named directory prefix.
-        assert_eq!(deny.decide("/opt/curl/bin/wget"), Verdict::Allow);
+        assert_eq!(deny.decide(&[], "/opt/curl/bin/wget"), Verdict::Allow);
     }
 
     #[test]
     fn path_rule_matches_the_whole_path() {
         let deny = policy(ProcMode::Enforce, &[], &["/usr/bin/*"]);
-        assert_eq!(deny.decide("/usr/bin/ssh"), Verdict::Deny);
-        assert_eq!(deny.decide("/usr/local/bin/ssh"), Verdict::Allow);
+        assert_eq!(deny.decide(&[], "/usr/bin/ssh"), Verdict::Deny);
+        assert_eq!(deny.decide(&[], "/usr/local/bin/ssh"), Verdict::Allow);
     }
 
     #[test]
     fn deny_wins_over_allow() {
         let p = policy(ProcMode::Ask, &["curl"], &["curl"]);
-        assert_eq!(p.decide("/usr/bin/curl"), Verdict::Deny);
+        assert_eq!(p.decide(&[], "/usr/bin/curl"), Verdict::Deny);
     }
 
     #[test]
     fn enforce_allows_an_unmatched_target_but_ask_parks_it() {
         let enforce = policy(ProcMode::Enforce, &["git"], &["curl"]);
         assert_eq!(
-            enforce.decide("/bin/rg"),
+            enforce.decide(&[], "/bin/rg"),
             Verdict::Allow,
             "denylist default-allow"
         );
-        assert_eq!(enforce.decide("/usr/bin/curl"), Verdict::Deny);
+        assert_eq!(enforce.decide(&[], "/usr/bin/curl"), Verdict::Deny);
 
         let ask = policy(ProcMode::Ask, &["git"], &["curl"]);
-        assert_eq!(ask.decide("/usr/bin/git"), Verdict::Allow);
-        assert_eq!(ask.decide("/usr/bin/curl"), Verdict::Deny);
+        assert_eq!(ask.decide(&[], "/usr/bin/git"), Verdict::Allow);
+        assert_eq!(ask.decide(&[], "/usr/bin/curl"), Verdict::Deny);
         assert_eq!(
-            ask.decide("/bin/rg"),
+            ask.decide(&[], "/bin/rg"),
             Verdict::Ask,
             "unmatched under ask parks"
         );
@@ -373,21 +424,21 @@ mod tests {
 
         // An overlay deny cuts a target the base would allow (unmatched → allow under enforce)…
         assert_eq!(
-            base.decide_with("/bin/wget", &[], &one("wget")),
+            base.decide_chain(&[], "/bin/wget", &[], &one("wget")),
             Verdict::Deny
         );
         // …while with no overlay that same target runs (denylist default-allow).
-        assert_eq!(base.decide("/bin/wget"), Verdict::Allow);
+        assert_eq!(base.decide(&[], "/bin/wget"), Verdict::Allow);
         // Deny wins across BOTH sets: a base deny is not overridden by an overlay allow.
         assert_eq!(
-            base.decide_with("/bin/curl", &one("curl"), &[]),
+            base.decide_chain(&[], "/bin/curl", &one("curl"), &[]),
             Verdict::Deny
         );
         // Under ask, an overlay allow un-parks an otherwise-unmatched target.
         let ask = policy(ProcMode::Ask, &[], &[]);
-        assert_eq!(ask.decide("/bin/node"), Verdict::Ask);
+        assert_eq!(ask.decide(&[], "/bin/node"), Verdict::Ask);
         assert_eq!(
-            ask.decide_with("/bin/node", &one("node"), &[]),
+            ask.decide_chain(&[], "/bin/node", &one("node"), &[]),
             Verdict::Allow
         );
     }

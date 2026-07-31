@@ -247,7 +247,10 @@ pub(super) fn validate_task(
         }
     }
 
-    let spawn = validate_task_spawn(name, raw.spawn)?;
+    let spawn = spawn_entries(raw.spawn)?
+        .map(|entries| validate_spawn_entries(name, "`spawn`", entries))
+        .transpose()?;
+    let exec = validate_task_exec(name, &raw.cmd, spawn.as_ref(), raw.exec)?;
     let packages = validate_task_packages(&raw.packages)?;
 
     Ok(TaskSpec {
@@ -267,6 +270,7 @@ pub(super) fn validate_task(
         nonce: defaults.nonce,
         packages,
         spawn,
+        exec,
         output: raw.output,
         // A bundle folded into an app keeps the bundle's name: the fold made the entry look like
         // the app's own, and the bundle is where a reader would go to change it.
@@ -289,13 +293,14 @@ const OPEN_ENDED: &[&str] = &[
     "awk", "gawk", "xargs",
 ];
 
-/// Validate a task's `spawn` and return the declared entries, or `None` when the key is absent.
+/// Read the entries out of one `spawn` declaration, refusing the shapes that are not the field, and
+/// return them **unvalidated** — [`validate_spawn_entries`] is what judges them, and it needs to
+/// know which list it is naming.
 ///
 /// Absent and empty are **different**: absent is no exec supervision at all (the command runs as it
 /// always has), empty is a supervised cage where only the command itself may run. That distinction is
 /// the field's whole ergonomics, so it is carried as an `Option` rather than flattened to a list.
-fn validate_task_spawn(
-    name: &str,
+fn spawn_entries(
     raw: Option<crate::config::schema::RawTaskSpawn>,
 ) -> Result<Option<Vec<String>>, String> {
     use crate::config::schema::{RawSpawnEntry, RawTaskSpawn};
@@ -320,32 +325,145 @@ fn validate_task_spawn(
             .collect::<Result<_, _>>()?,
         Some(RawTaskSpawn::Nested(_)) => return Err(graph_refusal()),
     };
+    Ok(Some(entries))
+}
+
+/// Validate the entries of one `spawn` list — the task's own or a node's — and return them trimmed,
+/// with empty entries dropped. `whose` names the list in a refusal, since a task can hold several.
+fn validate_spawn_entries(
+    name: &str,
+    whose: &str,
+    entries: Vec<String>,
+) -> Result<Vec<String>, String> {
     for entry in &entries {
         let trimmed = entry.trim();
         crate::proc_policy::validate_rule(trimmed)?;
         if trimmed == "*" || trimmed == "**" {
-            return Err(
-                "`spawn = [\"*\"]` allows everything, which is what leaving `spawn` out already \
-                 means — one way to say a thing. Remove the key, or name the programs."
-                    .to_string(),
-            );
+            return Err(format!(
+                "{whose} lists `{trimmed}`, which allows everything — and that is what leaving \
+                 `spawn` out already means. One way to say a thing: remove the key, or name the \
+                 programs."
+            ));
         }
         let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
         if OPEN_ENDED.contains(&base) {
             crate::diag::warn(&format!(
-                "task `{name}`: `spawn` lists `{base}` — an interpreter concedes most of this \
+                "task `{name}`: {whose} lists `{base}` — an interpreter concedes most of this \
                  guard, since what it does with its own builtins never reaches an `execve` to \
                  decide"
             ));
         }
     }
-    Ok(Some(
-        entries
-            .into_iter()
-            .map(|e| e.trim().to_string())
-            .filter(|e| !e.is_empty())
-            .collect(),
-    ))
+    Ok(entries
+        .into_iter()
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .collect())
+}
+
+/// Validate the `[task.<name>.exec.<program>]` sections against the root `spawn` list, and return
+/// them as program → what that program may run.
+///
+/// A section addresses **a program, wherever it was reached from**: one rule per program, read off
+/// the caller's own executable. That is why a section body is flat and why there is no deeper
+/// address — a chain-scoped form would decide the same target differently depending on how it was
+/// reached, and every deeper spelling would have to be written out.
+///
+/// Three things are refused rather than accepted-and-ignored, all of them the same failure: a
+/// declaration that is read nowhere. A section with no supervisor to enforce it (`spawn` absent), a
+/// section nothing can reach, and a section for the command itself — which already has `spawn`.
+fn validate_task_exec(
+    name: &str,
+    cmd: &[String],
+    root: Option<&Vec<String>>,
+    raw: BTreeMap<String, crate::config::schema::RawTaskExecNode>,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    if raw.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let Some(root) = root else {
+        return Err(
+            "`[exec.<program>]` says what a program may run once the command has run it, and \
+             nothing enforces that unless the task declares `spawn` — which is what stands the \
+             supervisor up. Declare `spawn` with the programs the command itself may run."
+                .to_string(),
+        );
+    };
+    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, node) in raw {
+        let program = key.trim().to_string();
+        if program.is_empty() {
+            return Err("`[exec.<program>]` needs a program name".to_string());
+        }
+        crate::proc_policy::validate_rule(&program)?;
+        // A glob may say what *may run*, because there the answer is only yes or no. It cannot say
+        // *who is running*: a caller is one program, and two overlapping patterns would both claim
+        // it with no honest way to pick. So a name here is literal, and a program admitted by a
+        // pattern simply has no node — it may run nothing, which is the fail-closed answer.
+        if program.contains('*') || program.contains('?') {
+            return Err(format!(
+                "`[exec.{program}]` is a pattern, and a section names one program: the caller of an \
+                 `execve` is a single executable, so two patterns matching it would both claim it. \
+                 Write the program, or leave it without a section — it may then run nothing."
+            ));
+        }
+        if cmd.first().is_some_and(|c| c.trim() == program) {
+            return Err(format!(
+                "`[exec.{program}]` is the command itself, and what the command may run is `spawn`. \
+                 Two declarations of one thing would each be half of it."
+            ));
+        }
+        if let Some(unknown) = node.rest.keys().next() {
+            // A deeper section arrives here as a table under the node, which is the same message: a
+            // node is addressed by its program and by nothing else.
+            return Err(format!(
+                "`[exec.{program}]` holds `{unknown}`, which is not a key of a node — a node \
+                 declares `spawn`, the programs it may run. A section addresses a program, wherever \
+                 that program was reached from, so there is nothing deeper to address."
+            ));
+        }
+        let Some(spawn) = node.spawn else {
+            return Err(format!(
+                "`[exec.{program}]` declares nothing — a node without `spawn` says what a program \
+                 may run and then names none of it, which is what having no section already means."
+            ));
+        };
+        let entries = spawn_entries(Some(spawn))?.expect("a declared spawn is never absent");
+        let whose = format!("`[exec.{program}]`'s `spawn`");
+        let entries = validate_spawn_entries(name, &whose, entries)?;
+        // An empty list is meaningful on the task — it is what stands the supervisor up, for a
+        // command that must run nothing else. On a node it is not: a program with no node may
+        // already run nothing, so this would be the second way to say one thing.
+        if entries.is_empty() {
+            return Err(format!(
+                "`[exec.{program}]` allows nothing, which is what having no section for `{program}` \
+                 already means. Remove the section, or name what it may run."
+            ));
+        }
+        graph.insert(program, entries);
+    }
+
+    // Reachability, by the spelling each declaration uses: a node is reached when the root list or
+    // some reached node names it. A node nothing reaches is a control that is read nowhere — the
+    // failure a security-shaped field must never have, and the reason this walks rather than trusts.
+    let mut reached: BTreeSet<&str> = BTreeSet::new();
+    let mut queue: Vec<&str> = root.iter().map(String::as_str).collect();
+    while let Some(program) = queue.pop() {
+        if !reached.insert(program) {
+            continue; // already walked: a self-edge and a cycle are both legitimate here
+        }
+        if let Some(children) = graph.get(program) {
+            queue.extend(children.iter().map(String::as_str));
+        }
+    }
+    if let Some(orphan) = graph.keys().find(|k| !reached.contains(k.as_str())) {
+        return Err(format!(
+            "`[exec.{orphan}]` says what `{orphan}` may run, but nothing may run `{orphan}`: it is \
+             in neither `spawn` nor any section that is itself reachable. Name it where it is run, \
+             spelled as it is there."
+        ));
+    }
+    Ok(graph)
 }
 
 /// Validate a task's `packages` and return the bare mise tokens (the `mise:` prefix stripped).
@@ -1055,6 +1173,126 @@ mod tests {
         );
     }
 
+    /// One `[task.<name>.exec.<program>]` section.
+    fn node(spawn: &[&str]) -> crate::config::schema::RawTaskExecNode {
+        crate::config::schema::RawTaskExecNode {
+            spawn: Some(spawn_names(spawn)),
+            rest: BTreeMap::new(),
+        }
+    }
+
+    // The whole point of the graph: what a program may run in turn, addressed by that program.
+    #[test]
+    fn a_node_says_what_one_program_may_run_in_turn() {
+        let mut raw = raw_task();
+        raw.spawn = Some(spawn_names(&["git"]));
+        raw.exec = [
+            ("git".to_string(), node(&["ssh"])),
+            ("ssh".to_string(), node(&["gpg"])),
+        ]
+        .into_iter()
+        .collect();
+        let task = validate(raw).expect("a task declaring a chain");
+        assert_eq!(task.spawn, Some(vec!["git".to_string()]));
+        assert_eq!(task.exec["git"], vec!["ssh".to_string()]);
+        assert_eq!(task.exec["ssh"], vec!["gpg".to_string()]);
+    }
+
+    // A node with nothing to enforce it is a control that is read nowhere — the failure this field
+    // exists to avoid, and the one a security-shaped key must never have.
+    #[test]
+    fn a_node_without_a_task_spawn_is_refused() {
+        let mut raw = raw_task();
+        raw.exec = [("git".to_string(), node(&["ssh"]))].into_iter().collect();
+        let e = validate(raw).unwrap_err();
+        assert!(e.contains("declares `spawn`"), "{e}");
+    }
+
+    // A node nothing can reach says what a program may run when no program may run it. Same failure,
+    // caught by walking from the task's own list rather than trusting the declaration.
+    #[test]
+    fn a_node_nothing_reaches_is_refused() {
+        let mut raw = raw_task();
+        raw.spawn = Some(spawn_names(&["git"]));
+        raw.exec = [
+            ("git".to_string(), node(&["ssh"])),
+            ("make".to_string(), node(&["cc"])),
+        ]
+        .into_iter()
+        .collect();
+        let e = validate(raw).unwrap_err();
+        assert!(
+            e.contains("[exec.make]") && e.contains("nothing may run"),
+            "{e}"
+        );
+    }
+
+    // A cycle is legitimate — recursive `make`, a shell that runs a script that runs the shell — so
+    // the reachability walk must terminate on one rather than refuse it or spin.
+    #[test]
+    fn a_cycle_between_nodes_is_reachable_and_terminates() {
+        let mut raw = raw_task();
+        raw.spawn = Some(spawn_names(&["make"]));
+        raw.exec = [
+            ("make".to_string(), node(&["cc", "make"])),
+            ("cc".to_string(), node(&["make"])),
+        ]
+        .into_iter()
+        .collect();
+        let task = validate(raw).expect("a cycle is a legitimate graph");
+        assert_eq!(task.exec.len(), 2);
+    }
+
+    // A caller is one executable, so two patterns matching it would both claim it with no honest way
+    // to choose. A pattern may still say what *may run*, where the answer is only yes or no.
+    #[test]
+    fn a_node_key_may_not_be_a_pattern() {
+        let mut raw = raw_task();
+        raw.spawn = Some(spawn_names(&["git*"]));
+        raw.exec = [("git*".to_string(), node(&["ssh"]))].into_iter().collect();
+        let e = validate(raw).unwrap_err();
+        assert!(e.contains("is a pattern"), "{e}");
+    }
+
+    // What the command may run is `spawn`. A node for the command itself would be the other half of
+    // one declaration, and a reader would have to know both to know either.
+    #[test]
+    fn a_node_for_the_command_itself_is_refused() {
+        let mut raw = raw_task();
+        raw.cmd = vec!["git".to_string(), "push".to_string()];
+        raw.params.clear();
+        raw.spawn = Some(spawn_names(&["ssh"]));
+        raw.exec = [("git".to_string(), node(&["gpg"]))].into_iter().collect();
+        let e = validate(raw).unwrap_err();
+        assert!(e.contains("is the command itself"), "{e}");
+    }
+
+    // A deeper section arrives as an unknown key holding a table. Unknown keys are ignored by
+    // design, so it has to be refused explicitly or a whole addressing scheme would parse into
+    // silence — and a node addresses a program, wherever that program was reached from.
+    #[test]
+    fn a_deeper_section_is_refused_rather_than_ignored() {
+        let mut raw = raw_task();
+        raw.spawn = Some(spawn_names(&["git"]));
+        let mut deeper = node(&["ssh"]);
+        deeper
+            .rest
+            .insert("ssh".to_string(), crate::config::schema::RawIgnored);
+        raw.exec = [("git".to_string(), deeper)].into_iter().collect();
+        let e = validate(raw).unwrap_err();
+        assert!(e.contains("nothing deeper to address"), "{e}");
+    }
+
+    // A node allowing nothing is what having no node already means.
+    #[test]
+    fn an_empty_node_is_refused() {
+        let mut raw = raw_task();
+        raw.spawn = Some(spawn_names(&["git"]));
+        raw.exec = [("git".to_string(), node(&[]))].into_iter().collect();
+        let e = validate(raw).unwrap_err();
+        assert!(e.contains("allows nothing"), "{e}");
+    }
+
     // Allowing everything is what leaving the key out already means. Two spellings of one thing
     // would make the declaration say nothing about whether its author considered the question.
     #[test]
@@ -1064,7 +1302,7 @@ mod tests {
             raw.spawn = Some(spawn_names(&[wildcard]));
             let e = validate(raw).unwrap_err();
             assert!(
-                e.contains("Remove the key"),
+                e.contains("remove the key"),
                 "`{wildcard}` must be refused with the alternative: {e}"
             );
         }
