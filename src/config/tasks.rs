@@ -298,20 +298,27 @@ fn validate_task_spawn(
     name: &str,
     raw: Option<crate::config::schema::RawTaskSpawn>,
 ) -> Result<Option<Vec<String>>, String> {
-    use crate::config::schema::RawTaskSpawn;
-    let entries = match raw {
+    use crate::config::schema::{RawSpawnEntry, RawTaskSpawn};
+    // Both spellings of a graph get the same refusal, because they are the same declaration: a
+    // reader who guessed the other one deserves the reason and not a different treatment.
+    let graph_refusal = || {
+        "`spawn` is a flat list of programs; putting a table under one reads as \"this program may \
+         run these\", and that is not what is enforced: the exec filter is inherited across `fork` \
+         and `exec`, so an entry governs the whole cage at any depth rather than one parent's \
+         children. Declare the flat set of programs that may run."
+            .to_string()
+    };
+    let entries: Vec<String> = match raw {
         None => return Ok(None),
         Some(RawTaskSpawn::One(s)) => vec![s],
-        Some(RawTaskSpawn::Flat(v)) => v,
-        Some(RawTaskSpawn::Nested(_)) => {
-            return Err(
-                "`spawn` is a list, not a table — a table reads as \"this program may run these\", \
-                 and that is not what is enforced: the exec filter is inherited across `fork` and \
-                 `exec`, so an entry governs the whole cage at any depth rather than one parent's \
-                 children. Declare the flat set of programs that may run."
-                    .to_string(),
-            );
-        }
+        Some(RawTaskSpawn::Flat(v)) => v
+            .into_iter()
+            .map(|entry| match entry {
+                RawSpawnEntry::Name(s) => Ok(s),
+                RawSpawnEntry::Nested(_) => Err(graph_refusal()),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(RawTaskSpawn::Nested(_)) => return Err(graph_refusal()),
     };
     for entry in &entries {
         let trimmed = entry.trim();
@@ -998,6 +1005,16 @@ mod tests {
         );
     }
 
+    /// A `spawn` list of plain program names.
+    fn spawn_names(names: &[&str]) -> crate::config::schema::RawTaskSpawn {
+        crate::config::schema::RawTaskSpawn::Flat(
+            names
+                .iter()
+                .map(|n| crate::config::schema::RawSpawnEntry::Name(n.to_string()))
+                .collect(),
+        )
+    }
+
     // The table form reads as "this program may run these" — a per-parent restriction. What is
     // enforced is the flat set, because the exec filter is inherited across fork and exec. Accepting
     // the table and flattening it would be a declaration that means less than it says, which is the
@@ -1006,17 +1023,35 @@ mod tests {
     fn a_nested_spawn_is_refused_rather_than_flattened() {
         let mut raw = raw_task();
         raw.spawn = Some(crate::config::schema::RawTaskSpawn::Nested(
-            [(
-                "git".to_string(),
-                crate::config::schema::RawTaskSpawn::Flat(vec!["git-remote-https".into()]),
-            )]
-            .into_iter()
-            .collect(),
+            [("git".to_string(), spawn_names(&["git-remote-https"]))]
+                .into_iter()
+                .collect(),
         ));
         let e = validate(raw).unwrap_err();
         assert!(
-            e.contains("list, not a table") && e.contains("any depth"),
+            e.contains("flat list") && e.contains("any depth"),
             "the refusal must say what is enforced instead: {e}"
+        );
+    }
+
+    // The same declaration, spelled as a table *inside* the list. It has to reach the same refusal:
+    // an untagged variant that matches nothing is a deserialization error, and that is reported
+    // against the whole file — one mis-shaped key would take every other task down with it.
+    #[test]
+    fn a_table_inside_the_spawn_list_is_refused_by_name() {
+        let mut raw = raw_task();
+        raw.spawn = Some(crate::config::schema::RawTaskSpawn::Flat(vec![
+            crate::config::schema::RawSpawnEntry::Name("git".into()),
+            crate::config::schema::RawSpawnEntry::Nested(
+                [("ssh".to_string(), spawn_names(&["gpg"]))]
+                    .into_iter()
+                    .collect(),
+            ),
+        ]));
+        let e = validate(raw).unwrap_err();
+        assert!(
+            e.contains("flat list") && e.contains("any depth"),
+            "both spellings of a graph get one reason: {e}"
         );
     }
 
@@ -1026,9 +1061,7 @@ mod tests {
     fn a_wildcard_spawn_is_refused() {
         for wildcard in ["*", "**"] {
             let mut raw = raw_task();
-            raw.spawn = Some(crate::config::schema::RawTaskSpawn::Flat(vec![
-                wildcard.to_string()
-            ]));
+            raw.spawn = Some(spawn_names(&[wildcard]));
             let e = validate(raw).unwrap_err();
             assert!(
                 e.contains("Remove the key"),

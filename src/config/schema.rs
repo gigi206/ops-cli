@@ -799,14 +799,33 @@ pub(crate) struct RawTask {
 /// a rule governs the whole cage at any depth, not one parent's children). Accepting the graph and
 /// flattening it would be the worst of both — a declaration that reads as a per-parent restriction
 /// and is none.
+///
+/// A graph has **two plausible spellings** and both have to reach that refusal. Whatever shape is
+/// not accepted still has to *parse*, because an untagged variant that matches nothing is not a
+/// refusal — it is a deserialization error, and a deserialization error is reported against the
+/// file, so one mis-shaped key would take every other task and every other section down with it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum RawTaskSpawn {
     /// `spawn = "git"` — one program, nothing under it.
     One(String),
     /// `spawn = ["git", "less"]` — the enforced form.
-    Flat(Vec<String>),
+    Flat(Vec<RawSpawnEntry>),
     /// `spawn = { git = ["git-remote-https"] }` — parsed to be refused, not applied.
+    Nested(BTreeMap<String, RawTaskSpawn>),
+}
+
+/// One element of a `spawn` list: a program name, or a table under it.
+///
+/// The table exists here for the same reason [`RawTaskSpawn::Nested`] does — so that
+/// `spawn = ["git", { ssh = ["gpg"] }]` is a task that gets refused by name rather than a file that
+/// fails to load.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawSpawnEntry {
+    /// `"git"` — a program.
+    Name(String),
+    /// `{ ssh = ["gpg"] }` — parsed to be refused, not applied.
     Nested(BTreeMap<String, RawTaskSpawn>),
 }
 
