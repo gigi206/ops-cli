@@ -39,6 +39,7 @@ pub(crate) fn task_cmd(args: Vec<OsString>) -> ExitCode {
         Some("list") | Some("ls") => task_list(&args[1..]),
         Some("secrets") => task_secrets(&args[1..]),
         Some("run") => task_run(&args[1..]),
+        Some("result") => task_result(&args[1..]),
         Some("status") => task_status(&args[1..]),
         Some("show") => task_show(&args[1..]),
         Some("stop") => task_stop(&args[1..]),
@@ -203,7 +204,8 @@ fn no_sessions(verb: &str) -> ExitCode {
 fn plane_for(id: Option<&str>, verb: &str, side: Side) -> Result<Plane, ExitCode> {
     if side == Side::Host && std::env::var_os(TASK_SOCKET_ENV).is_some() {
         diag::error(&format!(
-            "sbx: task {verb}: this is host-side only — a cage may invoke operations, not watch them"
+            "sbx: task {verb}: this is host-side only — a cage may invoke operations, not watch or \
+             collect them"
         ));
         return Err(ExitCode::from(2));
     }
@@ -689,6 +691,7 @@ fn task_run(args: &[OsString]) -> ExitCode {
     let mut params = BTreeMap::new();
     let mut env = BTreeMap::new();
     let mut json = false;
+    let mut detach = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str() {
@@ -708,6 +711,10 @@ fn task_run(args: &[OsString]) -> ExitCode {
             },
             Some("--json") => {
                 json = true;
+                i += 1;
+            }
+            Some("--detach") => {
+                detach = true;
                 i += 1;
             }
             Some("--session") => match args.get(i + 1).and_then(|a| a.to_str()) {
@@ -739,6 +746,9 @@ fn task_run(args: &[OsString]) -> ExitCode {
         eprint!("{}", help::page_usage(&["task", "run"]).unwrap_or_default());
         return ExitCode::from(2);
     };
+    if detach {
+        return run_detached(id.as_deref(), &name, &params, &env, json);
+    }
     let plane = match plane_for(id.as_deref(), "run", Side::Cage) {
         Ok(p) => p,
         Err(code) => return code,
@@ -749,11 +759,166 @@ fn task_run(args: &[OsString]) -> ExitCode {
         Ok(r) => r,
         Err(e) => return unreachable_plane(&e),
     };
+    render_result("run", &name, &result, json)
+}
+
+/// `sbx task run --detach`: start an operation and return its invocation id without waiting.
+///
+/// Host-only, and on the session's host-only socket rather than the crossing one. A detached
+/// invocation can only be watched with `status`, ended with `stop` and collected with `result` — all
+/// three host-only — so a cage that could start one could create invocations it can neither see nor
+/// end. It would also be able to hold several at once, which having to wait for each is what prevents.
+fn run_detached(
+    session: Option<&str>,
+    name: &str,
+    params: &BTreeMap<String, String>,
+    env: &BTreeMap<String, String>,
+    json: bool,
+) -> ExitCode {
+    if std::env::var_os(TASK_SOCKET_ENV).is_some() {
+        diag::error(
+            "sbx: task run: `--detach` is host-side only — a detached invocation is watched, \
+             stopped and collected from the host",
+        );
+        return ExitCode::from(2);
+    }
+    let plane = match plane_for(session, "run", Side::Host) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let result = match client::run_detached(&plane.socket, name, params, env) {
+        Ok(r) => r,
+        Err(e) => return unreachable_plane(&e),
+    };
     if json {
-        return run_as_json(&name, &result);
+        let view = DetachView {
+            task: name,
+            id: (result.id != 0).then_some(result.id),
+            detached: result.error.is_none(),
+            error: result.error.as_deref(),
+        };
+        return match serde_json::to_string_pretty(&view) {
+            Ok(doc) => {
+                println!("{doc}");
+                match result.error {
+                    Some(_) => ExitCode::from(REFUSED_EXIT),
+                    None => ExitCode::SUCCESS,
+                }
+            }
+            Err(e) => {
+                diag::error(&format!("sbx: task run: failed to serialize: {e}"));
+                ExitCode::FAILURE
+            }
+        };
     }
     if let Some(error) = &result.error {
         diag::error(&format!("sbx: task run: {error}"));
+        return ExitCode::from(REFUSED_EXIT);
+    }
+    // The id alone on stdout, so `id=$(sbx task run --detach <name>)` is the whole of it. Everything
+    // else a person needs goes to stderr, where it cannot end up in that variable.
+    println!("{}", result.id);
+    diag::note(&format!(
+        "invocation {} is running detached — `sbx task status` watches it, `sbx task result {}` \
+         collects what it produced",
+        result.id, result.id
+    ));
+    ExitCode::SUCCESS
+}
+
+/// `sbx task result <invocation>`: what a detached invocation produced.
+///
+/// Deliberately the same rendering as a foreground `run`, down to the exit code, so that detaching
+/// changes *when* a result arrives and nothing about what it is.
+fn task_result(args: &[OsString]) -> ExitCode {
+    let mut target: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].to_str() {
+            Some("--json") => {
+                json = true;
+                i += 1;
+            }
+            Some("--session") => match args.get(i + 1).and_then(|a| a.to_str()) {
+                Some(v) => {
+                    session = Some(v.to_string());
+                    i += 2;
+                }
+                None => {
+                    diag::error("sbx: task result: `--session` needs a session id");
+                    return ExitCode::from(2);
+                }
+            },
+            Some(s) if !s.starts_with('-') && target.is_none() => {
+                target = Some(s.to_string());
+                i += 1;
+            }
+            other => {
+                diag::error(&format!(
+                    "sbx: task result: unexpected argument {:?}",
+                    other.unwrap_or_default()
+                ));
+                eprint!(
+                    "{}",
+                    help::page_usage(&["task", "result"]).unwrap_or_default()
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(target) = target else {
+        diag::error("sbx: task result: name the invocation to collect");
+        eprint!(
+            "{}",
+            help::page_usage(&["task", "result"]).unwrap_or_default()
+        );
+        return ExitCode::from(2);
+    };
+    // An invocation, never an operation. The listings take either because narrowing by name is
+    // useful there; a result belongs to one run, and an operation name would name several.
+    let Ok(id) = target.parse::<u64>() else {
+        diag::error(&format!(
+            "sbx: task result: `{target}` is not an invocation id"
+        ));
+        diag::hint("       it is the number `sbx task run --detach` returned.");
+        return ExitCode::from(2);
+    };
+    let plane = match plane_for(session.as_deref(), "result", Side::Host) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let result = match client::result(&plane.socket, id) {
+        Ok(r) => r,
+        Err(e) => return unreachable_plane(&e),
+    };
+    // Which operation this was is asked of the session rather than of the caller, who named an
+    // invocation and has no reason to also remember what it ran. A session that no longer knows
+    // leaves the field as the id, which is still true.
+    let name = sandbox::task_control::read_info(&plane.socket, &target)
+        .ok()
+        .and_then(|fields| {
+            fields
+                .iter()
+                .find(|(key, _)| key == "operation")
+                .map(|(_, value)| value.clone())
+        })
+        .unwrap_or_else(|| target.clone());
+    render_result("result", &name, &result, json)
+}
+
+/// Print one invocation's result — as prose on the real streams, or as one JSON document.
+///
+/// `verb` names the subcommand a refusal is reported under: the same answer reaches this from `run`
+/// (the plane declined to run anything) and from `result` (there is nothing here to give you), and a
+/// message prefixed with the wrong one sends a reader to the wrong page.
+fn render_result(verb: &str, name: &str, result: &client::RunResult, json: bool) -> ExitCode {
+    if json {
+        return run_as_json(name, result);
+    }
+    if let Some(error) = &result.error {
+        diag::error(&format!("sbx: task {verb}: {error}"));
         // Not 2: that is a plausible exit code for the wrapped command itself, and a caller must be
         // able to tell "sbx refused to run it" from "it ran and exited 2". 125 is the convention
         // `env`/`docker` use for exactly this — the runner refused, nothing was executed.
@@ -866,6 +1031,21 @@ struct RunView<'a> {
 struct RunOutputView<'a> {
     path: &'a str,
     bytes: u64,
+}
+
+/// A detached start, as a machine reads it. Its own document rather than a [`RunView`] with most
+/// fields empty: nothing has run yet, so an `exit` of `0` and an `elapsed_ms` of `0` would be
+/// answers to questions that have not been asked. What exists at this point is the id.
+#[derive(serde::Serialize)]
+struct DetachView<'a> {
+    task: &'a str,
+    /// The invocation to collect with `sbx task result`. `null` when the plane refused before
+    /// admitting the request, where no invocation exists to name.
+    id: Option<u64>,
+    /// True once the invocation is running; false alongside an `error`, where nothing started.
+    detached: bool,
+    /// Why the plane refused, or `null`.
+    error: Option<&'a str>,
 }
 
 /// One refused `execve`. Two fields rather than one rendered string, because a reader that parses
@@ -999,8 +1179,12 @@ fn task_status(args: &[OsString]) -> ExitCode {
                     .map(format_elapsed)
                     .unwrap_or_else(|| NONE.to_string()),
                 f.get("pid").copied().unwrap_or(NONE).to_string(),
-                match f.get("stopping") {
-                    Some(&"1") => "stopping".to_string(),
+                // Detached is part of the state rather than a column of its own: a reader looking at
+                // a live invocation wants one answer to "what is this doing", and an invocation is
+                // either being waited for or not. `stopping` still wins — it is the more urgent fact.
+                match (f.get("stopping"), f.get("detached")) {
+                    (Some(&"1"), _) => "stopping".to_string(),
+                    (_, Some(&"1")) => "detached".to_string(),
                     _ => "running".to_string(),
                 },
             ]
@@ -1333,6 +1517,11 @@ fn log_row(line: &str) -> Option<Vec<String>> {
         Some(reason) => format!("refused: {reason}"),
         None => {
             let mut notes = Vec::new();
+            // First, because it says who was there to see the rest: nobody waited for this one, so
+            // whatever it printed went to the result ring rather than to a terminal.
+            if flag("detached") {
+                notes.push("detached".to_string());
+            }
             if flag("stopped") {
                 notes.push("stopped".to_string());
             }
@@ -1879,6 +2068,52 @@ mod tests {
         assert_eq!(doc["output"]["path"], "/opt/sbx/task-out/dump");
         assert_eq!(doc["output"]["bytes"], 4096);
         assert!(doc["error"].is_null());
+    }
+
+    /// A detached start is its own document, carrying what exists at that point and nothing more.
+    ///
+    /// The absent fields are the assertion. Reusing the result document would have printed `"exit":
+    /// 0` and `"elapsed_ms": 0` for a command that has not run — answers to questions nobody asked,
+    /// and the first one reads as success.
+    #[test]
+    fn a_detached_start_reports_its_id_and_claims_no_result() {
+        let doc: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&DetachView {
+                task: "nightly-dump",
+                id: Some(7),
+                detached: true,
+                error: None,
+            })
+            .expect("encode"),
+        )
+        .expect("decode");
+        assert_eq!(doc["task"], "nightly-dump");
+        assert_eq!(doc["id"], 7);
+        assert_eq!(doc["detached"], true);
+        assert!(doc["error"].is_null());
+        assert!(
+            doc.get("exit").is_none() && doc.get("stdout").is_none(),
+            "nothing has run, so there is no exit code and no output to report: {doc}"
+        );
+    }
+
+    /// A refusal is a document too, and it says plainly that nothing started — `detached` is false
+    /// beside the reason, so a reader that only checks that field is not misled.
+    #[test]
+    fn a_refused_detach_says_nothing_started() {
+        let doc: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&DetachView {
+                task: "nightly-dump",
+                id: None,
+                detached: false,
+                error: Some("this session's task quota is exhausted"),
+            })
+            .expect("encode"),
+        )
+        .expect("decode");
+        assert!(doc["id"].is_null());
+        assert_eq!(doc["detached"], false);
+        assert_eq!(doc["error"], "this session's task quota is exhausted");
     }
 
     /// A withheld stream is `null` and a stream that ran and printed nothing is `""` — the whole

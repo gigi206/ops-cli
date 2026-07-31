@@ -44,7 +44,17 @@
 //! → LOG [after=<seq>]             ← [dropped=<n>], event seq=<id> …… then `ok`
 //! → STATUS                        ← running <id>\ttask=<name>\telapsed_ms=<n>…  then `ok`
 //! → STOP <id>                     ← stopped <id> | stopping <id> | finished <id>, then `ok`
+//! → DETACH <name>                 ← id <n>, then `ok` — or `err <reason>`
+//!   param/env payloads, then run
+//! → RESULT <id>                   ← the same shape a `RUN` answers with, or `err <reason>`
 //! ```
+//!
+//! `DETACH` and `RESULT` are on **this** socket rather than the crossing one, and that placement is
+//! the access control. A detached invocation is one nobody is waiting for, so it can only be watched,
+//! stopped and collected through the host-only verbs — putting the start of it within reach of a cage
+//! would let a caller create invocations it cannot then see or end, and let it hold several at once,
+//! which having to wait is what prevents today. It is also why `RUN` is not merely given a flag: the
+//! crossing socket has no way to tell a host caller from an in-cage one.
 //!
 //! Any refusal is a single `err <message>` line. A message never echoes a caller's value back: a
 //! value can carry the very secret a caller is probing for.
@@ -81,6 +91,13 @@ pub(crate) const TASK_SHIM_INCAGE: &str = "/opt/sbx/bin/sbx";
 /// How many invocations a session retains in its log ring.
 const LOG_CAPACITY: usize = 512;
 
+/// How many detached results a session holds for collection.
+///
+/// Smaller than the log ring on purpose: a log entry is a line, while a result carries both streams,
+/// each already bounded by the task's `max_output`. Comfortably above the number that can be produced
+/// between two collections, since only [`super::task::MAX_DETACHED`] can run at once.
+const RESULT_CAPACITY: usize = 32;
+
 /// The default ceiling on invocations per session — a task is a brokered operation, not a loop
 /// primitive, and an exit-status oracle over a credential gets cheaper the more calls it can make.
 /// Reaching it refuses further invocations rather than degrading anything silently.
@@ -110,6 +127,11 @@ pub(crate) struct LogEntry {
     pub(crate) elapsed_ms: u64,
     /// A refusal reason, when the invocation never ran.
     pub(crate) refused: Option<String>,
+    /// Whether it ran detached. Recorded because it is what makes the entry answerable later: a
+    /// detached result is held for collection and can fall out of that ring, and "it was dropped to
+    /// make room" is a different answer from "no such invocation" — this field is what tells them
+    /// apart once the result itself is gone.
+    pub(crate) detached: bool,
 }
 
 impl LogEntry {
@@ -118,7 +140,7 @@ impl LogEntry {
     fn to_line(&self) -> String {
         let mut line = format!(
             "event seq={} at={} exit={} redacted={} truncated={} timed_out={} stopped={} \
-             elapsed_ms={} task={}",
+             detached={} elapsed_ms={} task={}",
             self.seq,
             self.at,
             self.exit,
@@ -126,6 +148,7 @@ impl LogEntry {
             u8::from(self.truncated),
             u8::from(self.timed_out),
             u8::from(self.stopped),
+            u8::from(self.detached),
             self.elapsed_ms,
             sanitize(&self.task),
         );
@@ -209,6 +232,43 @@ impl TaskLog {
     fn entry(&self, id: u64) -> Option<LogEntry> {
         let inner = self.inner.lock().expect("task log");
         inner.entries.iter().find(|e| e.seq == id).cloned()
+    }
+}
+
+/// The finished detached invocations a session is holding for collection.
+///
+/// In RAM and never on disk, for the same reason as [`TaskLog`]: this holds a command's own output,
+/// which is exactly the class of data the log ring is careful not to leave behind. It dies with the
+/// session, which is also the longest a detached invocation can live — the plane runs in the session's
+/// process, so nothing is ever waiting for a result whose session is gone.
+/// What a detached invocation left behind: what it produced, or why it never produced anything. Both
+/// are held, because an invocation can still fail *after* it was admitted — a credential that will not
+/// resolve, a proxy that will not start — and the caller that would have been told is already gone.
+type Held = Result<TaskOutcome, String>;
+
+#[derive(Default)]
+pub(crate) struct TaskResults {
+    inner: Mutex<std::collections::VecDeque<(u64, Held)>>,
+}
+
+impl TaskResults {
+    /// Hold one finished invocation's result, evicting the oldest when the ring is full.
+    fn store(&self, id: u64, held: Held) {
+        let mut results = self.inner.lock().expect("the detached results");
+        if results.len() == RESULT_CAPACITY {
+            results.pop_front();
+        }
+        results.push_back((id, held));
+    }
+
+    /// What is held for `id`. A read, not a take: collecting a result must not be the thing that
+    /// destroys it, or a caller whose terminal scrolled would have no second look.
+    fn get(&self, id: u64) -> Option<Held> {
+        let results = self.inner.lock().expect("the detached results");
+        results
+            .iter()
+            .find(|(held_id, _)| *held_id == id)
+            .map(|(_, held)| held.clone())
     }
 }
 
@@ -306,6 +366,7 @@ pub(crate) fn start(
 
     let engine = Arc::new(engine);
     let log = Arc::new(TaskLog::new());
+    let results = Arc::new(TaskResults::default());
     let quota = Arc::new(AtomicU64::new(DEFAULT_CALL_QUOTA));
 
     let cage_listener = UnixListener::bind(&cage_socket)?;
@@ -331,15 +392,19 @@ pub(crate) fn start(
     {
         let engine = Arc::clone(&engine);
         let log = Arc::clone(&log);
+        let results = Arc::clone(&results);
+        let quota = Arc::clone(&quota);
         std::thread::spawn(move || {
             for stream in log_listener.incoming().flatten() {
                 let engine = Arc::clone(&engine);
                 let log = Arc::clone(&log);
+                let results = Arc::clone(&results);
+                let quota = Arc::clone(&quota);
                 // Its own thread for the same reason the crossing socket's connections get one: a
                 // `STOP` waits for the invocation to end, and a `STATUS` behind it must not queue
                 // behind that wait.
                 std::thread::spawn(move || {
-                    let _ = serve_host(stream, &engine, &log);
+                    let _ = serve_host(stream, &engine, &log, &results, &quota);
                 });
             }
         });
@@ -438,39 +503,39 @@ fn serve_cage(
     writeln!(writer, "err unknown command")
 }
 
-/// Read a `RUN`'s parameter/environment payloads, invoke the task, and write the result.
-fn serve_run(
-    reader: &mut BufReader<UnixStream>,
-    writer: &mut UnixStream,
-    name: &str,
-    engine: &TaskEngine,
-    log: &TaskLog,
-    quota: &AtomicU64,
-) -> io::Result<()> {
+/// A request's caller-supplied parameters and environment.
+type Payloads = (BTreeMap<String, String>, BTreeMap<String, String>);
+
+/// Read the length-prefixed `param`/`env` payloads up to the `run` terminator.
+///
+/// Every refusal here is a fixed string rather than one built from what was read: a malformed request
+/// is malformed in the framing, and echoing the bytes back would put a caller's value — which can be
+/// the very secret it is probing for — into an error message.
+fn read_payloads(reader: &mut BufReader<UnixStream>) -> io::Result<Result<Payloads, &'static str>> {
     let mut params = BTreeMap::new();
     let mut env = BTreeMap::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return writeln!(writer, "err truncated request");
+            return Ok(Err("truncated request"));
         }
         let line = line.trim_end();
         if line == "run" {
             break;
         }
         let Some((kind, rest)) = line.split_once(' ') else {
-            return writeln!(writer, "err malformed request line");
+            return Ok(Err("malformed request line"));
         };
         let Some((key, len)) = rest.rsplit_once(' ') else {
-            return writeln!(writer, "err malformed request line");
+            return Ok(Err("malformed request line"));
         };
         let Ok(len) = len.parse::<usize>() else {
-            return writeln!(writer, "err malformed payload length");
+            return Ok(Err("malformed payload length"));
         };
         // A caller must not be able to make sbx allocate arbitrarily: one payload is bounded well
         // above any legitimate parameter and far below anything that would matter.
         if len > 1 << 20 {
-            return writeln!(writer, "err payload too large");
+            return Ok(Err("payload too large"));
         }
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf)?;
@@ -480,12 +545,23 @@ fn serve_run(
         match kind {
             "param" => params.insert(key.to_string(), value),
             "env" => env.insert(key.to_string(), value),
-            _ => return writeln!(writer, "err unknown request field"),
+            _ => return Ok(Err("unknown request field")),
         };
     }
+    Ok(Ok((params, env)))
+}
 
-    // The quota is decremented before the run, so a refusal is recorded once and a concurrent pair
-    // of callers cannot both slip past the last slot.
+/// Take a slot from the session's call quota and draw the invocation's id.
+///
+/// The quota is decremented before anything runs, so a refusal is recorded once and a concurrent pair
+/// of callers cannot both slip past the last slot. `None` means the quota is exhausted and the caller
+/// has already been answered.
+fn admit_quota(
+    writer: &mut UnixStream,
+    name: &str,
+    log: &TaskLog,
+    quota: &AtomicU64,
+) -> io::Result<Option<u64>> {
     if quota
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
             (left > 0).then(|| left - 1)
@@ -497,29 +573,53 @@ fn serve_run(
         // keeps the id inside the width the socket paths were sized against — the quota is the bound
         // on how many are ever drawn.
         log.push(refusal(0, name, &reason));
-        return writeln!(writer, "err {reason}");
+        writeln!(writer, "err {reason}")?;
+        return Ok(None);
     }
-
     // Admitted: from here the invocation has an identity, and it is the *same* number wherever it
     // appears — in the host-side names it stands up, in the row `sbx task status` shows while it
     // runs, in the id `sbx task stop` takes, and in the line it leaves in this log. Drawn here
     // rather than inside the engine so a refusal the engine returns is recorded under it too.
-    let id = super::task::next_invocation();
+    Ok(Some(super::task::next_invocation()))
+}
+
+/// The log entry one finished invocation leaves.
+fn finished(id: u64, name: &str, outcome: &TaskOutcome, detached: bool) -> LogEntry {
+    LogEntry {
+        seq: id,
+        at: 0,
+        task: name.to_string(),
+        exit: outcome.exit,
+        redacted: outcome.redacted,
+        truncated: outcome.truncated,
+        timed_out: outcome.timed_out,
+        stopped: outcome.stopped,
+        elapsed_ms: outcome.elapsed_ms,
+        refused: None,
+        detached,
+    }
+}
+
+/// Read a `RUN`'s parameter/environment payloads, invoke the task, and write the result.
+fn serve_run(
+    reader: &mut BufReader<UnixStream>,
+    writer: &mut UnixStream,
+    name: &str,
+    engine: &TaskEngine,
+    log: &TaskLog,
+    quota: &AtomicU64,
+) -> io::Result<()> {
+    let (params, env) = match read_payloads(reader)? {
+        Ok(payloads) => payloads,
+        Err(reason) => return writeln!(writer, "err {reason}"),
+    };
+    let Some(id) = admit_quota(writer, name, log, quota)? else {
+        return Ok(());
+    };
 
     match engine.run(name, &params, &env, id) {
         Ok(outcome) => {
-            log.push(LogEntry {
-                seq: id,
-                at: 0,
-                task: name.to_string(),
-                exit: outcome.exit,
-                redacted: outcome.redacted,
-                truncated: outcome.truncated,
-                timed_out: outcome.timed_out,
-                stopped: outcome.stopped,
-                elapsed_ms: outcome.elapsed_ms,
-                refused: None,
-            });
+            log.push(finished(id, name, &outcome, false));
             write_outcome(writer, id, &outcome)
         }
         Err(e) => {
@@ -533,6 +633,101 @@ fn serve_run(
             writeln!(writer, "err {}", sanitize(&reason))
         }
     }
+}
+
+/// Read a `DETACH`'s payloads, admit the invocation, hand it to a thread, and answer with its id.
+///
+/// The split between what happens here and what happens in the thread is the whole design: everything
+/// a caller could act on is decided **before** it is told the invocation was admitted, because after
+/// that it is no longer listening. What runs in the thread is the command itself and the things that
+/// can only fail once it is under way — a credential that will not resolve, a proxy that will not
+/// start — and those are held for `RESULT` rather than reported to a caller that has gone.
+fn serve_detach(
+    reader: &mut BufReader<UnixStream>,
+    writer: &mut UnixStream,
+    name: &str,
+    engine: &Arc<TaskEngine>,
+    log: &Arc<TaskLog>,
+    results: &Arc<TaskResults>,
+    quota: &AtomicU64,
+) -> io::Result<()> {
+    let (params, env) = match read_payloads(reader)? {
+        Ok(payloads) => payloads,
+        Err(reason) => return writeln!(writer, "err {reason}"),
+    };
+    let Some(id) = admit_quota(writer, name, log, quota)? else {
+        return Ok(());
+    };
+    let admitted = match engine.admit(name, &params, &env, id, true) {
+        Ok(admitted) => admitted,
+        Err(e) => {
+            let reason = e.to_string();
+            log.push(refusal(id, name, &reason));
+            writeln!(writer, "id {id}")?;
+            return writeln!(writer, "err {}", sanitize(&reason));
+        }
+    };
+
+    // The admission moves into the thread with everything it holds — the registry entry that makes
+    // the invocation visible to `status` and stoppable by `stop`, and the output directory's claim —
+    // so both are released when the command ends rather than when this connection closes.
+    {
+        let engine = Arc::clone(engine);
+        let log = Arc::clone(log);
+        let results = Arc::clone(results);
+        let name = name.to_string();
+        std::thread::spawn(move || match engine.run_admitted(&name, admitted) {
+            Ok(outcome) => {
+                log.push(finished(id, &name, &outcome, true));
+                results.store(id, Ok(outcome));
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                let mut entry = refusal(id, &name, &reason);
+                entry.detached = true;
+                log.push(entry);
+                results.store(id, Err(reason));
+            }
+        });
+    }
+    writeln!(writer, "id {id}")?;
+    writeln!(writer, "ok")
+}
+
+/// Answer `RESULT <id>` — the held result, or which of the four other things is true instead.
+fn serve_result(
+    writer: &mut UnixStream,
+    engine: &TaskEngine,
+    log: &TaskLog,
+    results: &TaskResults,
+    id: u64,
+) -> io::Result<()> {
+    match results.get(id) {
+        Some(Ok(outcome)) => return write_outcome(writer, id, &outcome),
+        Some(Err(reason)) => {
+            // The same shape a refused `RUN` answers with, so one parser reads both: an invocation
+            // that failed after admission is still an invocation that has an id and no result.
+            writeln!(writer, "id {id}")?;
+            return writeln!(writer, "err {}", sanitize(&reason));
+        }
+        None => {}
+    }
+    let reason = if engine.running().iter().any(|row| row.id == id) {
+        format!("invocation {id} is still running")
+    } else {
+        match log.entry(id) {
+            Some(entry) if entry.detached => format!(
+                "invocation {id} has finished, but its result is no longer held — a session keeps \
+                 the last {RESULT_CAPACITY}, and newer ones have replaced it"
+            ),
+            Some(_) => format!(
+                "invocation {id} did not run detached, so its result went to the caller that waited \
+                 for it"
+            ),
+            None => format!("no invocation {id}"),
+        }
+    };
+    writeln!(writer, "err {reason}")
 }
 
 /// The fields for a target that is not running: an invocation the log remembers, or an operation
@@ -590,6 +785,7 @@ fn refusal(id: u64, task: &str, reason: &str) -> LogEntry {
         stopped: false,
         elapsed_ms: 0,
         refused: Some(reason.to_string()),
+        detached: false,
     }
 }
 
@@ -651,7 +847,13 @@ fn write_outcome(writer: &mut UnixStream, id: u64, outcome: &TaskOutcome) -> io:
 /// not get to read the record. `STATUS`/`STOP`: ids are per session, so an in-cage caller reaching
 /// them could see and end an invocation *another* caller started — the human at the terminal — and
 /// nothing in the cage distinguishes the two, since a task plane has no per-caller identity.
-fn serve_host(stream: UnixStream, engine: &TaskEngine, log: &TaskLog) -> io::Result<()> {
+fn serve_host(
+    stream: UnixStream,
+    engine: &Arc<TaskEngine>,
+    log: &Arc<TaskLog>,
+    results: &Arc<TaskResults>,
+    quota: &AtomicU64,
+) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut command = String::new();
@@ -664,15 +866,35 @@ fn serve_host(stream: UnixStream, engine: &TaskEngine, log: &TaskLog) -> io::Res
         for row in engine.running() {
             writeln!(
                 writer,
-                "running {}\ttask={}\telapsed_ms={}\tpid={}\tstopping={}",
+                "running {}\ttask={}\telapsed_ms={}\tpid={}\tstopping={}\tdetached={}",
                 row.id,
                 sanitize(&row.task),
                 row.elapsed_ms,
                 row.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
                 u8::from(row.stopping),
+                u8::from(row.detached),
             )?;
         }
         return writeln!(writer, "ok");
+    }
+
+    if let Some(name) = command.strip_prefix("DETACH ") {
+        return serve_detach(
+            &mut reader,
+            &mut writer,
+            name.trim(),
+            engine,
+            log,
+            results,
+            quota,
+        );
+    }
+
+    if let Some(rest) = command.strip_prefix("RESULT ") {
+        let Ok(id) = rest.trim().parse::<u64>() else {
+            return writeln!(writer, "err a result names an invocation id");
+        };
+        return serve_result(&mut writer, engine, log, results, id);
     }
 
     if let Some(rest) = command.strip_prefix("INFO ") {
@@ -912,8 +1134,33 @@ pub(crate) mod client {
         params: &BTreeMap<String, String>,
         env: &BTreeMap<String, String>,
     ) -> io::Result<RunResult> {
+        invoke(socket, "RUN", name, params, env)
+    }
+
+    /// Start a task without waiting for it: the answer carries the invocation's id and nothing else.
+    ///
+    /// A different socket from [`run`] — the session's host-only one — which is what keeps a cage from
+    /// starting an invocation it could then neither watch nor stop.
+    pub(crate) fn run_detached(
+        socket: &Path,
+        name: &str,
+        params: &BTreeMap<String, String>,
+        env: &BTreeMap<String, String>,
+    ) -> io::Result<RunResult> {
+        invoke(socket, "DETACH", name, params, env)
+    }
+
+    /// Send one invocation request and parse the answer. `RUN` and `DETACH` differ in the verb, in
+    /// the socket they are sent to, and in how much of the answer is filled in — not in their framing.
+    fn invoke(
+        socket: &Path,
+        verb: &str,
+        name: &str,
+        params: &BTreeMap<String, String>,
+        env: &BTreeMap<String, String>,
+    ) -> io::Result<RunResult> {
         let mut stream = UnixStream::connect(socket)?;
-        writeln!(stream, "RUN {name}")?;
+        writeln!(stream, "{verb} {name}")?;
         for (kind, map) in [("param", params), ("env", env)] {
             for (key, value) in map {
                 writeln!(stream, "{kind} {key} {}", value.len())?;
@@ -922,6 +1169,16 @@ pub(crate) mod client {
             }
         }
         writeln!(stream, "run")?;
+        stream.flush()?;
+        let mut raw = Vec::new();
+        BufReader::new(stream).read_to_end(&mut raw)?;
+        parse_run(&raw)
+    }
+
+    /// Collect what a detached invocation produced, in the same shape [`run`] returns.
+    pub(crate) fn result(socket: &Path, id: u64) -> io::Result<RunResult> {
+        let mut stream = UnixStream::connect(socket)?;
+        writeln!(stream, "RESULT {id}")?;
         stream.flush()?;
         let mut raw = Vec::new();
         BufReader::new(stream).read_to_end(&mut raw)?;
@@ -1262,6 +1519,286 @@ mod tests {
             out.status.code(),
             Some(0),
             "the operation's own exit code must come back: stderr={stderr}"
+        );
+    }
+
+    /// Poll `f` until it answers, or give up. The invocation ids these tests work with cannot be
+    /// predicted — the counter is per process and the tests share one — so they are read the way a
+    /// person reads them, and a command that takes time is waited for rather than assumed done.
+    fn eventually<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
+        for _ in 0..400 {
+            if let Some(value) = f() {
+                return Some(value);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        None
+    }
+
+    /// The whole of `--detach`: the caller is answered with an id while the command is still running,
+    /// the invocation is visible as detached in the meantime, and its output is there to collect
+    /// afterwards.
+    ///
+    /// The load-bearing assertion is the middle one. A `run_detached` that merely returned early
+    /// would pass the first and the third even if it had run the command inline and thrown the answer
+    /// away; seeing the invocation *live* under its own id is what says the command is genuinely
+    /// elsewhere and still reachable by `status` and `stop`.
+    #[test]
+    fn a_detached_invocation_is_answered_at_once_and_collected_afterwards() {
+        let Some((_data, plane, _script)) =
+            plane_with_launcher("sleep 2\nprintf 'the-answer\\n'\n")
+        else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        let started = client::run_detached(
+            &host,
+            "probe",
+            &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+            &BTreeMap::new(),
+        )
+        .expect("the detached start");
+
+        assert_eq!(
+            started.error, None,
+            "the invocation must have been admitted"
+        );
+        assert_ne!(started.id, 0, "an admitted invocation has an id");
+        assert_eq!(
+            started.stdout, None,
+            "a detached start carries no streams — nothing has run yet"
+        );
+
+        let row = read_status(&host)
+            .expect("status")
+            .into_iter()
+            .find(|row| row.id == started.id)
+            .expect("the detached invocation must be running while its caller is free");
+        assert!(
+            row.fields.iter().any(|f| f == "detached=1"),
+            "status must say nobody is waiting for it: {:?}",
+            row.fields
+        );
+
+        let result = eventually(|| {
+            let answer = client::result(&host, started.id).expect("result");
+            answer.error.is_none().then_some(answer)
+        })
+        .expect("the detached invocation must finish and hold its result");
+        assert_eq!(
+            result.stdout.as_deref(),
+            Some("the-answer\n"),
+            "collecting must give the command's own output"
+        );
+        assert_eq!(result.exit, 0, "and its own exit code");
+        assert_eq!(result.id, started.id, "one id, whichever verb reports it");
+    }
+
+    /// Reading a result does not consume it: a caller whose terminal scrolled gets a second look.
+    #[test]
+    fn a_collected_result_stays_collectable() {
+        let Some((_data, plane, _script)) = plane_with_launcher("printf 'twice\\n'\n") else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        let started = client::run_detached(
+            &host,
+            "probe",
+            &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+            &BTreeMap::new(),
+        )
+        .expect("the detached start");
+        let first = eventually(|| {
+            let answer = client::result(&host, started.id).expect("result");
+            answer.error.is_none().then_some(answer)
+        })
+        .expect("a result");
+        let second = client::result(&host, started.id).expect("result");
+        assert_eq!(
+            first.stdout, second.stdout,
+            "a second collection must give the same result, not an empty one"
+        );
+    }
+
+    /// A refusal a caller could act on happens **before** it is told the invocation was admitted.
+    ///
+    /// This is the reason the engine's admission is split from its run. A detached caller stops
+    /// listening the moment it has an id, so an id handed back for an invocation that then dies on a
+    /// bad parameter would be a caller told "it is running" about something that never ran.
+    #[test]
+    fn a_detached_invocation_is_refused_before_it_is_given_an_id() {
+        let Some((_data, plane, _script)) = plane_and_client(vec![probe_task()]) else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        let started = client::run_detached(
+            &host,
+            "probe",
+            &BTreeMap::from([("sql".to_string(), "not the declared value".to_string())]),
+            &BTreeMap::new(),
+        )
+        .expect("the detached start");
+        assert!(
+            started.error.is_some(),
+            "a value outside its declared bound must be refused synchronously"
+        );
+        assert!(
+            read_status(&host).expect("status").is_empty(),
+            "nothing may be running after a refusal"
+        );
+    }
+
+    /// Detaching is not something a cage can ask for. The verb lives on the host-only socket, and the
+    /// crossing socket does not know it — which is the access control itself, not a check that could
+    /// be forgotten: a cage that could start an invocation it cannot see or stop would be creating
+    /// invocations nobody owns, several at once.
+    #[test]
+    fn the_crossing_socket_does_not_know_how_to_detach() {
+        let Some((_data, plane, _script)) = plane_and_client(vec![probe_task()]) else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let refused = client::run_detached(
+            // The socket a cage reaches, rather than the host-only one the verb belongs to.
+            &plane.cage_socket,
+            "probe",
+            &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+            &BTreeMap::new(),
+        )
+        .expect("an answer");
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("unknown command"),
+            "the crossing socket must not serve DETACH"
+        );
+        assert_eq!(refused.id, 0, "and must not have admitted anything");
+    }
+
+    /// Past the concurrency cap, a further detached invocation is refused rather than queued.
+    ///
+    /// The session's call quota does not cover this: it bounds how many invocations are ever started,
+    /// not how many run together, and detaching is what removes the caller's own wait as a limit.
+    #[test]
+    fn detached_invocations_are_capped_while_they_are_live() {
+        let Some((_data, plane, _script)) = plane_with_launcher("exec sleep 20\n") else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        let start_one = || {
+            client::run_detached(
+                &host,
+                "probe",
+                &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+                &BTreeMap::new(),
+            )
+            .expect("a detached start")
+        };
+        let mut ids = Vec::new();
+        for _ in 0..super::super::task::MAX_DETACHED {
+            let started = start_one();
+            assert_eq!(started.error, None, "up to the cap, each one is admitted");
+            ids.push(started.id);
+        }
+        let over = start_one();
+        let reason = over.error.expect("past the cap, an invocation is refused");
+        assert!(
+            reason.contains("detached invocations are already running"),
+            "the refusal must say what the limit is about: {reason}"
+        );
+
+        for id in ids {
+            let _ = stop_invocation(&host, id);
+        }
+    }
+
+    /// The four things a session can say about an invocation's result are kept apart, because they
+    /// call for different things: wait, look elsewhere, or stop looking.
+    #[test]
+    fn a_result_tells_running_from_foreground_from_unknown() {
+        let Some((_data, plane, _script)) = plane_with_launcher("exec sleep 20\n") else {
+            eprintln!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        let cage = plane.cage_socket.clone();
+
+        let unknown = client::result(&host, 999_999).expect("an answer");
+        assert_eq!(
+            unknown.error.as_deref(),
+            Some("no invocation 999999"),
+            "an id this session never drew is not a dropped result"
+        );
+
+        let running = client::run_detached(
+            &host,
+            "probe",
+            &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+            &BTreeMap::new(),
+        )
+        .expect("the detached start");
+        let answer = client::result(&host, running.id).expect("an answer");
+        assert_eq!(
+            answer.error.as_deref(),
+            Some(&*format!("invocation {} is still running", running.id)),
+            "a result that has not happened yet is not a missing one"
+        );
+        let _ = stop_invocation(&host, running.id);
+
+        // A foreground invocation's result went to the caller that waited for it, and was never kept
+        // here — which is a different thing to be told than "there is no such invocation".
+        let attached = std::thread::spawn(move || {
+            client::run(
+                &cage,
+                "probe",
+                &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+                &BTreeMap::new(),
+            )
+        });
+        let id = eventually(|| {
+            read_status(&host)
+                .expect("status")
+                .iter()
+                .find(|row| row.fields.iter().any(|f| f == "detached=0"))
+                .map(|row| row.id)
+        })
+        .expect("the foreground invocation must be visible while it runs");
+        let _ = stop_invocation(&host, id);
+        let _ = attached.join().expect("the caller thread");
+
+        let answer = client::result(&host, id).expect("an answer");
+        assert_eq!(
+            answer.error.as_deref(),
+            Some(&*format!(
+                "invocation {id} did not run detached, so its result went to the caller that waited \
+                 for it"
+            )),
+            "a foreground invocation is named as such rather than reported missing"
+        );
+    }
+
+    /// The result ring is bounded, and what falls out of it is answerable as *dropped* rather than as
+    /// *never existed* — the log entry is what survives to say so.
+    #[test]
+    fn the_result_ring_evicts_its_oldest() {
+        let results = TaskResults::default();
+        for id in 1..=(RESULT_CAPACITY as u64 + 1) {
+            results.store(id, Err(format!("result {id}")));
+        }
+        assert!(
+            results.get(1).is_none(),
+            "the oldest must be gone once the ring is full"
+        );
+        assert!(
+            results.get(2).is_some(),
+            "and the one after it must still be held"
+        );
+        assert!(
+            results.get(RESULT_CAPACITY as u64 + 1).is_some(),
+            "as must the newest"
         );
     }
 
@@ -1895,6 +2432,7 @@ mod tests {
             stopped: false,
             elapsed_ms: 12,
             refused: None,
+            detached: false,
         }
     }
 

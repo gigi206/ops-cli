@@ -95,6 +95,16 @@ pub(crate) fn next_invocation() -> u64 {
     TASK_INVOCATION.fetch_add(1, Ordering::Relaxed)
 }
 
+/// How many detached invocations may be live at once.
+///
+/// A separate bound from the session's call quota, which counts admissions over the session's whole
+/// life and so bounds nothing about how many run *together*. An attached invocation needs no such cap
+/// — its caller is blocked waiting for it, which is a limit of one per caller. Detaching removes
+/// exactly that, and each live invocation holds a cage, a per-invocation proxy, an exec supervisor
+/// and a systemd scope: without a cap, `--detach` in a loop is a way to stand up as many of those as
+/// the quota allows, all at once.
+pub(super) const MAX_DETACHED: usize = 4;
+
 /// How often the runner checks whether the command has exited, whether its timeout has passed, and
 /// whether it has been asked to stop. Short enough that a fast task is not visibly delayed, long
 /// enough not to spin.
@@ -434,13 +444,37 @@ impl TaskEngine {
         env: &BTreeMap<String, String>,
         invocation: u64,
     ) -> Result<TaskOutcome, TaskError> {
+        let admitted = self.admit(name, params, env, invocation, false)?;
+        self.run_admitted(name, admitted)
+    }
+
+    /// Decide everything that can be decided before the command starts, and take what an invocation
+    /// must hold for its whole life: its place in the live registry and, when the task declares one,
+    /// its output directory.
+    ///
+    /// Split out from [`Self::run_admitted`] because of `--detach`. A detached caller is told its
+    /// invocation was admitted and then stops listening, so every refusal it could act on has to have
+    /// happened by then — an unknown operation, a value outside its bound, an unlisted variable, and
+    /// above all the output directory, which is one per *task* and therefore refuses a second
+    /// concurrent invocation of the same one. Deciding that inside the detached thread would hand
+    /// back an id for an invocation that died on a refusal its caller never saw.
+    pub(crate) fn admit(
+        &self,
+        name: &str,
+        params: &BTreeMap<String, String>,
+        env: &BTreeMap<String, String>,
+        invocation: u64,
+        detached: bool,
+    ) -> Result<Admission, TaskError> {
         let task = self
             .task(name)
             .ok_or_else(|| TaskError::Unknown(name.into()))?;
         // Live from here on: everything below can take real time — a credential resolves through a
         // subprocess, a proxy is stood up — and an invocation that cannot be seen during that is one
         // that cannot be stopped during it either.
-        let _live = self.enter(invocation, name);
+        let live = self
+            .enter(invocation, name, detached)
+            .map_err(TaskError::Refused)?;
         let mut values = resolve_params(task, params).map_err(TaskError::Refused)?;
         let caller_env = caller_env(task, env).map_err(TaskError::Refused)?;
 
@@ -457,6 +491,31 @@ impl TaskEngine {
                 TASK_OUT_INCAGE.to_string(),
             );
         }
+        Ok(Admission {
+            id: invocation,
+            live,
+            values,
+            caller_env,
+            output,
+        })
+    }
+
+    /// Run an invocation the engine has already admitted.
+    pub(crate) fn run_admitted(
+        &self,
+        name: &str,
+        admitted: Admission,
+    ) -> Result<TaskOutcome, TaskError> {
+        let Admission {
+            id: invocation,
+            live: _live,
+            values,
+            caller_env,
+            output,
+        } = admitted;
+        let task = self
+            .task(name)
+            .ok_or_else(|| TaskError::Unknown(name.into()))?;
         let argv = substitute(&task.cmd, &values).map_err(TaskError::Refused)?;
         // Recorded here, where it is the task's own command: below it is wrapped for exec
         // confinement and for the egress forwarder, and neither is what a reader is asking about.
@@ -1000,24 +1059,54 @@ impl TaskEngine {
         })
     }
 
-    /// Enter `id` in the live registry for the length of the invocation.
-    fn enter(&self, id: u64, task: &str) -> RunGuard {
-        if let Ok(mut running) = self.running.lock() {
-            running.insert(
-                id,
-                Running {
-                    task: task.to_string(),
-                    started: Instant::now(),
-                    argv: Vec::new(),
-                    pid: None,
-                    stop: false,
-                },
-            );
+    /// Enter `id` in the live registry for the length of the invocation, refusing a detached one that
+    /// would exceed [`MAX_DETACHED`].
+    ///
+    /// The count and the insertion happen under one lock, so two callers racing for the last slot
+    /// cannot both take it. The cap is checked here rather than beside the call for that reason
+    /// alone — a check outside would be a read of a number that can change before it is used.
+    ///
+    /// A poisoned registry refuses a detached invocation and admits an attached one. That asymmetry
+    /// is deliberate: the cap is what keeps `--detach` from being a way to stand up unbounded cages,
+    /// and a cap that cannot be evaluated must not be assumed satisfied. An attached invocation is
+    /// bounded by its own caller waiting for it, which no lock is needed to know.
+    fn enter(&self, id: u64, task: &str, detached: bool) -> Result<RunGuard, String> {
+        match self.running.lock() {
+            Ok(mut running) => {
+                let live = running.values().filter(|r| r.detached).count();
+                if detached && live >= MAX_DETACHED {
+                    return Err(format!(
+                        "{live} detached invocations are already running, which is the limit — each \
+                         one holds a cage, a proxy and a scope of its own, so they are capped \
+                         separately from the session's call quota. `sbx task status` shows them; \
+                         `sbx task stop <id>` ends one"
+                    ));
+                }
+                running.insert(
+                    id,
+                    Running {
+                        task: task.to_string(),
+                        started: Instant::now(),
+                        argv: Vec::new(),
+                        pid: None,
+                        stop: false,
+                        detached,
+                    },
+                );
+            }
+            Err(_) if detached => {
+                return Err(
+                    "the invocation registry is unavailable, so the limit on detached \
+                            invocations cannot be checked"
+                        .to_string(),
+                )
+            }
+            Err(_) => {}
         }
-        RunGuard {
+        Ok(RunGuard {
             id,
             registry: self.running.clone(),
-        }
+        })
     }
 
     /// What is running right now, oldest first.
@@ -1033,6 +1122,7 @@ impl TaskEngine {
                 elapsed_ms: r.started.elapsed().as_millis() as u64,
                 pid: r.pid,
                 stopping: r.stop,
+                detached: r.detached,
             })
             .collect()
     }
@@ -1456,6 +1546,10 @@ struct Running {
     pid: Option<u32>,
     /// Set by [`TaskEngine::request_stop`]; read by the runner on its next poll.
     stop: bool,
+    /// Whether the caller that started this one is no longer waiting for it. Recorded because it is
+    /// the only thing a reader cannot infer: a detached invocation looks exactly like an attached one
+    /// while it runs, and it is the one whose result nobody is holding a terminal open for.
+    detached: bool,
 }
 
 /// Render an argv as one readable line, quoting only what needs it — this is for a person to read,
@@ -1588,6 +1682,25 @@ pub(crate) struct RunningView {
     pub(crate) elapsed_ms: u64,
     pub(crate) pid: Option<u32>,
     pub(crate) stopping: bool,
+    pub(crate) detached: bool,
+}
+
+/// An invocation the engine has accepted but not yet run: the decisions a caller can act on, plus
+/// the two things it holds for its whole life. Both are guards, so an admission that is dropped
+/// without being run releases its registry entry and its output directory rather than stranding them.
+///
+/// It exists so that a **detached** caller can be answered before the command starts and still have
+/// been told every refusal that concerns it. Passing it back to [`TaskEngine::run_admitted`] is what
+/// makes the attached and detached paths one path: they differ in which thread runs the second half,
+/// and in nothing else.
+pub(crate) struct Admission {
+    id: u64,
+    live: RunGuard,
+    /// The parameter values, checked against their declared bounds, with `{out}` already resolved.
+    values: BTreeMap<String, String>,
+    /// The caller-supplied variables, checked against `env_allow`.
+    caller_env: Vec<(String, String)>,
+    output: Option<OutputClaim>,
 }
 
 /// One invocation's presence in the live registry, removed when it ends — by return, by error, or by

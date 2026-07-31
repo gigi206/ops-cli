@@ -3,7 +3,8 @@
 ```
 sbx task list [<operation>] [--session <id>]
 sbx task secrets [<operation>] [--session <id>]
-sbx task run <operation> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>]
+sbx task run <operation> [--param KEY=VALUE]... [--env KEY=VALUE]... [--detach] [--session <id>]
+sbx task result <invocation> [--session <id>]
 sbx task status [<invocation>|<operation>] [--session <id>]
 sbx task show <invocation>|<operation> [--session <id>]
 sbx task stop <invocation>|<operation> [--session <id>]
@@ -16,10 +17,13 @@ an ephemeral sibling cage, with a credential the caller never holds. Declared as
 
 `list`, `secrets` and `run` work **both inside the cage** (where the agent uses them, through the
 socket sbx binds there) **and on the host**, so an operation is testable exactly as the agent sees
-it. `status`, `stop` and `logs` are **host-only**, and by construction rather than by check: they
-live on a second socket that is never bound into a cage. The record is not for the recorded party to
-read, and an invocation id is per session — a cage able to stop one could stop the invocation *you*
-started, and same-uid leaves no way to tell the two callers apart.
+it. `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
+rather than by check: they live on a second socket that is never bound into a cage. The record is not
+for the recorded party to read, and an invocation id is per session — a cage able to stop one could
+stop the invocation *you* started, and same-uid leaves no way to tell the two callers apart. Starting
+a detached invocation is on that socket for the same reason: it is only reachable through those
+verbs, so a caller that could start one without being able to watch or end it would be creating
+invocations nobody owns.
 
 ## How an agent finds them
 
@@ -192,7 +196,7 @@ the output, so keep names non-sensitive.
 ## `run`
 
 ```
-sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>] [--json]
+sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--detach] [--session <id>] [--json]
 ```
 
 Invoke one operation.
@@ -201,6 +205,7 @@ Invoke one operation.
 |---|---|
 | `-p`, `--param KEY=VALUE` | a declared parameter's value; repeatable |
 | `-e`, `--env KEY=VALUE` | a variable the declaration's `env_allow` permits; repeatable |
+| `--detach` | start it and print its invocation id instead of waiting (host-side only) |
 | `--session <id>` | which session to run in (host-side, when several offer operations) |
 | `--json` | print the whole result as one JSON document on stdout, streams included |
 
@@ -257,6 +262,79 @@ name.
 Inside a cage the client stays as it is: it prints the same raw fields it always has, one per line.
 An agent parses that; a person reads this.
 
+### `--detach`
+
+Start the operation and get its invocation id back instead of its result. The id is the whole of
+stdout, so it assigns directly:
+
+```
+$ id=$(sbx task run nightly-dump --detach)
+invocation 7 is running detached — `sbx task status` watches it, `sbx task result 7` collects what it produced
+$ sbx task result "$id"
+wrote 41822 rows
+```
+
+Everything you could act on is still decided **before** the id comes back: an unknown operation, a
+value outside its bound, a variable not in `env_allow`, or an [output directory](../configuration/task.md)
+another invocation of the same operation is already using. So an id means it is running. What can
+only fail once it is under way — a credential that will not resolve, a proxy that will not start —
+is held and reported by [`result`](#result), not lost.
+
+**Host-side only.** A detached invocation is watched with `status`, ended with `stop`, and collected
+with `result`, and all three are host-only. A cage that could start one would be creating invocations
+it can neither see nor end — and could hold several at once, which having to wait for each is exactly
+what prevents.
+
+**At most four run at once.** Separate from the session's call quota, which bounds how many
+invocations are ever *started*, not how many run *together*: each live one holds a cage, a proxy and
+a scope of its own. An attached invocation needs no such cap, because its caller waiting for it is
+already a limit of one.
+
+**It dies with its session.** The plane that runs a detached invocation is part of the session
+process, so closing the session ends it. Detaching frees the *terminal*, not the session.
+
+With `--json` the start is its own small document — nothing has run yet, so there is no exit code to
+report:
+
+```
+$ sbx task run nightly-dump --detach --json
+{
+  "task": "nightly-dump",
+  "id": 7,
+  "detached": true,
+  "error": null
+}
+```
+
+## `result`
+
+```
+sbx task result <invocation> [--session <id>] [--json]
+```
+
+What a detached invocation produced — host-only.
+
+The output is **identical** to what a foreground `run` would have printed, down to the exit code:
+detaching changes when a result arrives, not what it is. The streams are already substituted and
+truncated exactly as they would have been, and `--json` prints the same document as `run --json`.
+
+It takes an **invocation id**, never an operation name — a result belongs to one run, and a name
+would name several.
+
+Reading a result does not consume it: a session holds the last **32**, so collecting one twice is
+fine, and older ones are dropped to make room once past that. Four answers are kept apart, because
+they call for different things:
+
+| Answer | What it means |
+|---|---|
+| the result | it finished, and this is what it produced |
+| `invocation 7 is still running` | give it time; [`status`](#status) is watching it |
+| `its result is no longer held` | it finished, but 32 newer ones have since replaced it |
+| `no invocation 7` | this session has never seen that id |
+
+An invocation that ran in the **foreground** is named as such — its result went to the caller that
+waited for it, and was never kept here.
+
 ## `status`
 
 ```
@@ -269,7 +347,7 @@ What the session is running **right now** — host-only.
 $ sbx task status
 session 318106 — /home/you/work/api
 ID  OPERATION      ELAPSED      PID  STATE
- 7  nightly-dump     42.3s   318204  running
+ 7  nightly-dump     42.3s   318204  detached
 ```
 
 | Column | Meaning |
@@ -278,16 +356,18 @@ ID  OPERATION      ELAPSED      PID  STATE
 | `OPERATION` | which operation it is |
 | `ELAPSED` | how long it has been running |
 | `PID` | the cage's process, for `ps` and `systemd-cgls` |
-| `STATE` | `running`, or `stopping` once it has been asked to stop |
+| `STATE` | `running`, `detached` when nobody is waiting for it, or `stopping` once it has been asked to stop |
 
 Every session offering operations is shown, with a `SESSION` column when there is more than one.
 Narrow it with an invocation id, an operation name, or `--session`. A caller blocked on its own
 `sbx task run` cannot see this — it is waiting for the answer. This is the view from another terminal, which is also
-the only place a stop can come from.
+the only place a stop can come from, and where a [detached](#--detach) invocation is watched from
+start to finish.
 
-**The three verbs share one number.** The id `status` shows is the id `stop` takes, the id `logs`
-carries once the invocation is over, and the id a stopped `run` names in its report — so `sbx task
-status 7` while it runs and `sbx task logs 7` afterwards are the same invocation.
+**The verbs share one number.** The id `status` shows is the id `stop` takes, the id `result`
+collects a detached one by, the id `logs` carries once the invocation is over, and the id a stopped
+`run` names in its report — so `sbx task status 7` while it runs and `sbx task logs 7` afterwards are
+the same invocation.
 
 ## `show`
 
@@ -407,7 +487,7 @@ ID  TIME      OPERATION  EXIT   TOOK  NOTE
 | `OPERATION` | the operation's name |
 | `EXIT` | the command's exit code, or `-` when nothing ran |
 | `TOOK` | how long it took |
-| `NOTE` | the refusal reason, or what happened to it: stopped, timed out, output truncated, credential values substituted |
+| `NOTE` | the refusal reason, or what happened to it: detached, stopped, timed out, output truncated, credential values substituted |
 
 The id is drawn when an invocation **starts** and its line is written when it **ends**, so two
 overlapping invocations appear in the order they finished and their ids can read out of order. A

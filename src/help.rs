@@ -615,15 +615,18 @@ const PAGES: &[Page] = &[
             environment, the credential and the ceilings are the declaration's.\n\
             \n\
             Every verb takes the thing it is about as its argument — an operation, or an invocation\n\
-            for `stop` — and `--session <id>` names which session, for the case where more than one\n\
+            for `stop` and `result` — and `--session <id>` names which session, for the case where more than one\n\
             is offering operations. An **invocation id** is the number `status` shows while it runs\n\
             and the one its line in `logs` carries afterwards; it is not a session id.\n\
             \n\
             `list`, `secrets` and `run` work both inside the cage (where the agent uses them) and on\n\
-            the host, so an operation is testable exactly as the agent sees it. `status`, `stop` and\n\
-            `logs` are **host-only**, and by construction: they live on a socket that is never bound\n\
-            into a cage. The record is not for the recorded party to read, and an invocation id is\n\
-            per session — a cage that could stop one could stop the invocation *you* started.\n\
+            the host, so an operation is testable exactly as the agent sees it. `status`, `stop`,\n\
+            `result`, `logs` and `run --detach` are **host-only**, and by construction: they live on\n\
+            a socket that is never bound into a cage. The record is not for the recorded party to\n\
+            read, and an invocation id is per session — a cage that could stop one could stop the\n\
+            invocation *you* started. `--detach` is there too because a detached invocation is only\n\
+            reachable through those verbs: a caller that could start one without being able to watch\n\
+            or end it would be creating invocations nobody owns, several at once.\n\
             \n\
             A task's program must come from a tree no cage can write. Every host-side package backend\n\
             (`nix:`, a remote `flake:`, `deb:`, `appimage:`, `tarball:`, `prebuilt:`) already is one.\n\
@@ -687,7 +690,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "run"],
-        synopsis: "sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--session <id>] [--json]",
+        synopsis: "sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--detach] [--session <id>] [--json]",
         summary: "invoke one declared operation",
         options: &[
             ("<name>", "the operation to run, as `sbx task list` shows it"),
@@ -698,6 +701,10 @@ const PAGES: &[Page] = &[
             (
                 "-e, --env KEY=VALUE",
                 "a variable the declaration's `env_allow` permits; repeatable",
+            ),
+            (
+                "--detach",
+                "start it and print its invocation id instead of waiting; collect it with `sbx task result` (host-side only)",
             ),
             ("--session <id>", "the session to run in (host-side, when several offer operations)"),
             ("--json", "print the whole result as one JSON document on stdout, streams included"),
@@ -719,7 +726,43 @@ const PAGES: &[Page] = &[
             among them, so nothing interleaves with it, and the warnings printed as prose otherwise\n\
             (`timed_out`, `stopped`, `truncated`, `redacted`, `refused`, `output`) are values rather\n\
             than text to match. A withheld stream is `null` and an empty one is `\"\"`. A refusal is a\n\
-            document too, with `error` set and `exit` null: nothing ran.",
+            document too, with `error` set and `exit` null: nothing ran.\n\
+            \n\
+            `--detach` starts the operation and returns straight away, printing the invocation id on\n\
+            stdout and nothing else — so `id=$(sbx task run --detach <name>)` is the whole of it.\n\
+            Everything a caller could act on is still decided before that id is handed back (an\n\
+            unknown operation, a value outside its bound, an output directory another invocation is\n\
+            already using), so an id means the operation is running. What can only fail later — a\n\
+            credential that will not resolve — is held and reported by `sbx task result`.\n\
+            \n\
+            At most **4** detached invocations run at once, separately from the session's call quota:\n\
+            each holds a cage, a proxy and a scope of its own, and the quota bounds how many are ever\n\
+            started rather than how many run together. Detached or not, an invocation dies with its\n\
+            session — the plane that runs it is part of it.",
+    },
+    Page {
+        path: &["task", "result"],
+        synopsis: "sbx task result <invocation> [--session <id>] [--json]",
+        summary: "collect what a detached invocation produced (host-only)",
+        options: &[
+            (
+                "<invocation>",
+                "the id `sbx task run --detach` returned; never an operation name, which would name several",
+            ),
+            ("--session <id>", "the session that ran it"),
+            ("--json", "the same document `sbx task run --json` prints"),
+        ],
+        details:
+            "Identical to what a foreground `sbx task run` would have printed, down to the exit code:\n\
+            detaching changes *when* a result arrives and nothing about what it is. The streams are\n\
+            already substituted and truncated exactly as they would have been.\n\
+            \n\
+            Reading a result does not consume it — a session holds the last **32**, so collecting one\n\
+            twice is fine and older ones are eventually dropped to make room. Four answers are\n\
+            distinguished rather than merged, because they call for different things: the result\n\
+            itself; *still running* (`sbx task status` watches it); *finished but no longer held*;\n\
+            and *no such invocation*. An invocation that ran in the foreground is named as such —\n\
+            its result went to the caller that waited for it and was never kept here.",
     },
     Page {
         path: &["task", "status"],
@@ -737,14 +780,16 @@ const PAGES: &[Page] = &[
         ],
         details:
             "One line per invocation in flight: its id, which operation it is, how long it has been\n\
-            running, the pid of its cage, and whether it has already been asked to stop.\n\
+            running, the pid of its cage, and its state — `running`, `detached` (nobody is waiting\n\
+            for it), or `stopping` (a stop has been asked for and it has not ended yet).\n\
             \n\
             The id is the **invocation's**, and it is the same number everywhere: `sbx task stop`\n\
-            takes it, and the line the invocation leaves in `sbx task logs` carries it.\n\
+            takes it, `sbx task result` collects a detached one by it, and the line the invocation\n\
+            leaves in `sbx task logs` carries it.\n\
             \n\
             A caller blocked on its own `sbx task run` cannot see it here — it is waiting for the\n\
             answer. This is the view from another terminal, which is also the only place a stop can\n\
-            come from.",
+            come from, and it is where a `--detach`ed invocation is watched from start to finish.",
     },
     Page {
         path: &["task", "show"],
