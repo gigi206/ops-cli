@@ -62,7 +62,9 @@ so the sandbox never holds a program able to act on sbx's own state. See
 **Every caller-supplied value is bounded.** A parameter must declare a `match` pattern or an `enum`,
 and the pattern must match the **whole** value. This is load-bearing rather than cosmetic: a value
 loose enough to embed a comparison (`… WHERE substr(:tok,1,1)='a'`) turns the exit status into an
-oracle over the credential.
+oracle over the credential. What sbx enforces is that a bound is *declared* — whether it excludes
+anything is yours to write, and [a pattern matching everything](#a-pattern-that-matches-everything-possible-not-recommended)
+is accepted with the consequences that come with it.
 
 ## Fields
 
@@ -97,6 +99,51 @@ region = { match = "^[a-z]{2}-[a-z]+-[0-9]$", default = "eu-west-1" }
 A parameter with no `default` is **required**: a missing value is an error, never an empty
 substitution (`psql -c ""` is a different command than the one declared). An undeclared `{name}` in
 `cmd`, and a declared parameter no `cmd` element uses, are both refused at validation.
+
+### A pattern that matches everything (possible, not recommended)
+
+`match` takes any regex that compiles, and nothing checks that it excludes anything. So a universal
+pattern is accepted:
+
+```toml
+[task.shell]
+cmd    = ["bash", "-c", "{script}"]
+params = { script = "(?s).*" }      # accepts any value, newlines included
+```
+
+This is worth stating plainly rather than leaving as folklore, because it does something specific:
+**it hands the command to the caller.** The declaration still fixes the *program* — `cmd[0]` is
+`bash` and no caller can change it — but a program whose whole job is to run the string it is given
+makes that distinction empty. One operation then replaces the fifteen you would otherwise declare,
+which is the reason people reach for it.
+
+What you give up is not a nuance. A declared task is safe because of **two** checks together: the
+program is the declaration's, and every caller-supplied value is bounded. A universal pattern
+satisfies the second on paper and voids it in fact, and the second is the one holding the credential:
+
+- **The credential is disclosed.** A command the caller composes can read its own environment and
+  re-encode the value in any spelling it likes. Substitution recognises the plaintext and the
+  encodings a declaration registers; it cannot recognise a value the command reversed, spaced out or
+  chunked, and a few shell builtins are enough. There is no configuration of this table that
+  prevents it.
+- **The substitution count stops meaning anything.** It is described [below](#output-what-substitution-does-and-does-not-promise)
+  as the trustworthy signal, and it counts *substitutions* — so a value that leaves in an unrecognised
+  spelling leaves with the count reading **zero**. Nothing was withheld, and nothing says so.
+- **Hiding the streams does not close it.** `stdout = "hide"` removes the widest channel and leaves
+  others the caller still receives: the exit status is a byte per invocation, the elapsed time is
+  whatever a `sleep` encodes, and `output = true` is a directory the calling cage can simply read.
+
+So the honest description is **accident containment, not a boundary**: the credential never touches
+the calling agent's own environment, its logs or its files unless that agent asks — and asking is
+trivial. Against a mistake that is worth something. Against a program that is looking, it is worth
+nothing.
+
+If you use it anyway, the shape that costs least: a low-value credential rather than one that matters,
+a `network` allowlist narrowed to the one host the task exists to reach, and the understanding that
+you have chosen convenience over the guarantee. Where a credential must stay out of reach, either
+bound the parameter for real, or give the task no `secret` at all and declare an
+[`inject`](#wire-injected-credentials-the-strongest-form) instead: the plaintext never enters the cage,
+so a command the caller composed has nothing to read, whatever it is allowed to run.
 
 ### Caller-set variables
 
