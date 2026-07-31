@@ -46,6 +46,10 @@ network     = false                # true = reach the network; false = empty net
 - `[sandbox]` declares only the resolver-specific extra; the runner supplies the
   structural environment (a minimal `PATH`, a read-only host userland, `HOME`,
   and — under `network` — DNS/TLS files) on top of it.
+- `allow_env` is how a resolver receives *its own* credential (`VAULT_TOKEN`, an
+  age identity), so the value never travels where another user could read it:
+  see [the cage's environment is not readable by other
+  users](../concepts/security-model.md#the-cages-environment-is-not-readable-by-other-users).
 
 ### The registry is trusted by location, and fail-closed
 

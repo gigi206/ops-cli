@@ -5111,7 +5111,9 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
     let (argv, _seccomp) = match seccomp_argv(spec) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("sbx: failed to prepare the seccomp filter: {e}");
+            // Not only the filter: this step also builds the descriptor carrying the cage's
+            // environment, and naming the wrong one would send a reader looking at `[seccomp]`.
+            eprintln!("sbx: cannot prepare the sandbox: {e}");
             return 1;
         }
     };
@@ -5138,7 +5140,7 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
 fn run_captured(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> (i32, String) {
     let (argv, _seccomp) = match seccomp_argv(spec) {
         Ok(v) => v,
-        Err(e) => return (1, format!("failed to prepare the seccomp filter: {e}")),
+        Err(e) => return (1, format!("cannot prepare the sandbox: {e}")),
     };
     // For a graphical isolated cage, route the launch through the netns holder so the namespace
     // carries a `dummy0` interface (see `super::netns`); a no-op `(bwrap, argv)` otherwise.

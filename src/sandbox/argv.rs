@@ -61,12 +61,29 @@ pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Option<F
 /// `HOME`) wins over a credential that took its name — the plumbing is what the cage needs to work,
 /// and a credential is never the right answer to `PATH`. (Declaring one name as both is already
 /// refused at load: one name, one source.)
+///
+/// **A NUL byte in a name or a value refuses the launch.** NUL is the separator here, so a value
+/// carrying one would end its own argument and turn everything after it into further bwrap
+/// arguments — `--bind /home /home` written by whoever supplied the value. Refused rather than
+/// stripped: silently removing a byte would change a credential's value, and a launch that ran with
+/// a *different* secret than the one declared is worse than one that did not run.
 fn env_fd(spec: &SandboxSpec) -> io::Result<Option<File>> {
     if spec.env.is_empty() && spec.secret_env.is_empty() {
         return Ok(None);
     }
     let mut bytes = Vec::new();
     for (key, value) in spec.secret_env.iter().chain(spec.env.iter()) {
+        if key.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
+            // The name, never the value: reporting the value would print a credential, and the name
+            // is what a person needs to find the declaration.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to launch: the value of `{key}` contains a NUL byte, which would \
+                     break out of its own argument and add arguments of its own"
+                ),
+            ));
+        }
         for part in ["--setenv", key.as_str(), value.as_str()] {
             bytes.extend_from_slice(part.as_bytes());
             bytes.push(0);
@@ -409,6 +426,52 @@ mod tests {
     fn a_cage_with_no_environment_names_no_descriptor() {
         let argv = to_argv(&spec(vec![], vec![], NetPolicy::Shared));
         assert!(index_of(&argv, "--args").is_none(), "{argv:?}");
+    }
+
+    /// NUL is the separator on the descriptor, so a value carrying one ends its own argument and
+    /// everything after it becomes further bwrap arguments — a mount of the author's choosing.
+    /// Measured on a live launch: an untrusted `.sbx.toml` bound the host `$HOME` into the cage.
+    ///
+    /// Refused, not stripped. Removing the byte would run the cage with a *different* value than the
+    /// one declared, which for a credential is worse than not running at all. Checked here rather
+    /// than at config load because this is the single choke point every source passes through: a
+    /// project's `[env]`, a resolver plugin's `allow_env` pass-through, and a resolved credential.
+    #[test]
+    fn a_nul_in_the_environment_refuses_the_launch_rather_than_adding_bwrap_arguments() {
+        let injected = "a\0--bind\0/home\0/home".to_string();
+
+        let plain = spec(
+            vec![],
+            vec![("FOO".to_string(), injected.clone())],
+            NetPolicy::Shared,
+        );
+        let e = compose(&plain).expect_err("a NUL-bearing value must refuse the launch");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("FOO"), "{e}");
+        assert!(
+            !e.to_string().contains("--bind"),
+            "the message names the variable, never its value: {e}"
+        );
+
+        // The same for a resolved credential, whose value is third-party bytes (a resolver plugin's
+        // stdout), and for a name — bwrap reads both off the same descriptor.
+        let secret = spec(vec![], vec![], NetPolicy::Shared)
+            .with_secret_env(vec![("TOKEN".to_string(), injected)]);
+        assert!(compose(&secret).is_err());
+        let named = spec(
+            vec![],
+            vec![("A\0--bind".to_string(), "x".to_string())],
+            NetPolicy::Shared,
+        );
+        assert!(compose(&named).is_err());
+
+        // An ordinary environment is untouched by the check.
+        let fine = spec(
+            vec![],
+            vec![("PATH".to_string(), "/bin".to_string())],
+            NetPolicy::Shared,
+        );
+        assert!(compose(&fine).is_ok());
     }
 
     #[test]
