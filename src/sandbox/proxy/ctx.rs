@@ -743,3 +743,77 @@ mod notify_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+    use crate::notify::{NotifyMode, NotifyPolicy};
+    use crate::sandbox::notify_sink::{Notifier, Sink};
+    use std::sync::Mutex;
+
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Sink for Recorder {
+        fn deliver(
+            &mut self,
+            summary: &str,
+            body: &str,
+            _: Option<u32>,
+        ) -> Result<Option<u32>, ()> {
+            self.0.lock().unwrap().push(format!("{summary}|{body}"));
+            Ok(None)
+        }
+    }
+
+    /// A refusal recorded through the decision chokepoint reaches the notifier.
+    ///
+    /// The unit tests above pin what `refusal_block` *decides*; this pins that `outcome` actually
+    /// calls it. Without this, removing the announcement from the chokepoint — or dropping the
+    /// `with_notifier` a launch attaches — would leave every test green and every refusal silent,
+    /// which is the one regression nothing else here would catch.
+    #[test]
+    fn a_refusal_recorded_through_the_chokepoint_reaches_the_notifier() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let notifier = Arc::new(Notifier::recording(
+            NotifyPolicy::uniform(NotifyMode::Once),
+            Box::new(Recorder(Arc::clone(&seen))),
+        ));
+        {
+            let ctx = ProxyCtx::new(
+                Arc::new(crate::sandbox::proxy::ca::Ca::ephemeral().unwrap()),
+                EgressPolicy::default(),
+            )
+            .unwrap()
+            .with_notifier(Arc::clone(&notifier));
+
+            ctx.outcome(
+                crate::sandbox::control::Proto::Https,
+                "api.example.com",
+                443,
+                Some("GET"),
+                Some("/v1/thing"),
+                StatKind::Deny,
+                "denied-default",
+            );
+            // An allowed request through the same chokepoint announces nothing.
+            ctx.outcome(
+                crate::sandbox::control::Proto::Https,
+                "ok.example.com",
+                443,
+                Some("GET"),
+                Some("/"),
+                StatKind::Allow,
+                "allowed",
+            );
+        }
+        drop(
+            Arc::try_unwrap(notifier)
+                .map_err(|_| "the notifier is still shared")
+                .unwrap(),
+        );
+        let out = seen.lock().unwrap().clone();
+        assert_eq!(out.len(), 1, "only the refusal is announced: {out:?}");
+        assert!(out[0].starts_with("sbx blocked a network request|"));
+        assert!(out[0].contains("api.example.com:443"));
+    }
+}

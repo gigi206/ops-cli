@@ -96,9 +96,18 @@ impl std::fmt::Debug for NotifyWiring {
 /// machine running them.
 pub(crate) trait Sink: Send {
     /// Deliver one announcement. `replaces` is the id of this problem's previous notification, when
-    /// there was one, so a repeat updates that toast in place. Returns the id the transport assigned,
-    /// when it has ids at all — `None` from a sink whose output cannot be revised (stderr).
-    fn deliver(&mut self, summary: &str, body: &str, replaces: Option<u32>) -> Option<u32>;
+    /// there was one, so a repeat updates that toast in place.
+    ///
+    /// `Ok(Some(id))` is the id the transport assigned; `Ok(None)` a delivery by a transport that has
+    /// no ids to revise (stderr). `Err(())` means the transport is **gone** — not that this one
+    /// announcement failed — and the caller replaces the sink rather than going quiet, which is the
+    /// difference between "your daemon restarted" and "you stopped being told anything".
+    fn deliver(
+        &mut self,
+        summary: &str,
+        body: &str,
+        replaces: Option<u32>,
+    ) -> Result<Option<u32>, ()>;
 }
 
 /// The fallback sink: one stderr line per announcement, in the diagnostic family's shape.
@@ -109,9 +118,16 @@ pub(crate) trait Sink: Send {
 struct StderrSink;
 
 impl Sink for StderrSink {
-    fn deliver(&mut self, summary: &str, body: &str, _replaces: Option<u32>) -> Option<u32> {
+    fn deliver(
+        &mut self,
+        summary: &str,
+        body: &str,
+        _replaces: Option<u32>,
+    ) -> Result<Option<u32>, ()> {
         crate::diag::warn(&format!("{summary}: {body}"));
-        None
+        // stderr cannot go away, so this sink never asks to be replaced — it is what replacement
+        // falls back *to*.
+        Ok(None)
     }
 }
 
@@ -122,6 +138,38 @@ impl Sink for StderrSink {
 /// in-cage relays use; sbx's own world is std threads).
 struct DesktopSink {
     proxy: crate::sandbox::notify_relay::HostNotificationsProxy<'static>,
+}
+
+/// One notification call over an already-bound proxy. Separated from [`DesktopSink::deliver`] so the
+/// retry after a reconnect runs exactly the same code as the first attempt.
+fn notify_over(
+    proxy: &crate::sandbox::notify_relay::HostNotificationsProxy<'static>,
+    summary: &str,
+    body: &str,
+    replaces: Option<u32>,
+) -> Result<u32, ()> {
+    let mut hints = std::collections::HashMap::new();
+    if let Ok(v) = zbus::zvariant::Value::from(URGENCY_NORMAL).try_into() {
+        hints.insert("urgency".to_string(), v);
+    }
+    if let Ok(v) = zbus::zvariant::Value::from("security").try_into() {
+        hints.insert("category".to_string(), v);
+    }
+    async_io::block_on(proxy.notify(
+        APP_NAME,
+        replaces.unwrap_or(0),
+        APP_ICON,
+        summary,
+        body,
+        // No action buttons: an action needs a live `ActionInvoked` subscription to mean anything,
+        // and a one-click "allow" on a security refusal is a decision that belongs at a prompt, not
+        // on a toast.
+        Vec::new(),
+        hints,
+        // Let the daemon apply its own default timeout.
+        -1,
+    ))
+    .map_err(|_| ())
 }
 
 impl DesktopSink {
@@ -143,34 +191,27 @@ impl DesktopSink {
 }
 
 impl Sink for DesktopSink {
-    fn deliver(&mut self, summary: &str, body: &str, replaces: Option<u32>) -> Option<u32> {
-        let hints = std::collections::HashMap::from([
-            (
-                "urgency".to_string(),
-                zbus::zvariant::Value::from(URGENCY_NORMAL)
-                    .try_into()
-                    .ok()?,
-            ),
-            (
-                "category".to_string(),
-                zbus::zvariant::Value::from("security").try_into().ok()?,
-            ),
-        ]);
-        async_io::block_on(self.proxy.notify(
-            APP_NAME,
-            replaces.unwrap_or(0),
-            APP_ICON,
-            summary,
-            body,
-            // No action buttons: an action needs a live `ActionInvoked` subscription to mean
-            // anything, and a one-click "allow" on a security refusal is a decision that belongs at a
-            // prompt, not on a toast.
-            Vec::new(),
-            hints,
-            // Let the daemon apply its own default timeout.
-            -1,
-        ))
-        .ok()
+    /// Deliver, and on failure **reconnect once** before giving up on the transport.
+    ///
+    /// The connection is bound once, at launch, and a session outlives a great deal: restart
+    /// `gnome-shell` (or any other daemon serving the interface) and every later call on the old
+    /// connection fails. Without this, a sandbox would simply stop announcing refusals — silently,
+    /// which is the one failure mode this whole path exists to prevent. So a failed call is retried
+    /// on a fresh connection, and only a failed *reconnect* reports the transport gone.
+    fn deliver(
+        &mut self,
+        summary: &str,
+        body: &str,
+        replaces: Option<u32>,
+    ) -> Result<Option<u32>, ()> {
+        if let Ok(id) = notify_over(&self.proxy, summary, body, replaces) {
+            return Ok(Some(id));
+        }
+        let fresh = DesktopSink::connect().ok_or(())?;
+        self.proxy = fresh.proxy;
+        // The id the old daemon handed out means nothing to a new one, so a retry after a reconnect
+        // posts a fresh notification rather than trying to revise one that no longer exists.
+        notify_over(&self.proxy, summary, body, None).map(Some)
     }
 }
 
@@ -294,8 +335,21 @@ impl Notifier {
                     // text that may carry a credential.
                     Err(_) => continue,
                 };
-                if let Some(id) = sink.deliver(&summary, &body, replaces) {
-                    coalescer.record_id(&block, id);
+                match sink.deliver(&summary, &body, replaces) {
+                    Ok(Some(id)) => coalescer.record_id(&block, id),
+                    Ok(None) => {}
+                    // The transport is gone and could not be re-established. Fall back to stderr for
+                    // the rest of the session rather than going quiet: a person who can no longer be
+                    // shown a toast can still be told, and silence here would look exactly like a
+                    // sandbox that refused nothing.
+                    Err(()) => {
+                        crate::diag::warn(
+                            "the desktop notification daemon went away — reporting blocked \
+                             requests on stderr for the rest of this session",
+                        );
+                        sink = Box::new(StderrSink);
+                        let _ = sink.deliver(&summary, &body, None);
+                    }
                 }
             }
         });
@@ -331,6 +385,33 @@ impl Notifier {
     }
 }
 
+/// The teardown advisory for `n` announcements the queue could not hold, or `None` when none were.
+/// Pure, so the wording is pinned without provoking a real overflow.
+fn drop_report(n: u64) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            "{n} blocked-request notification(s) were dropped: they arrived faster than the \
+             desktop could show them (the logs — `sbx net logs`, `sbx proc logs` — are complete)"
+        )
+    })
+}
+
+impl Notifier {
+    /// Stop delivering, drain what is queued, and report anything the queue could not hold.
+    ///
+    /// Called explicitly by the launch rather than left to [`Drop`]: the notifier is reached through
+    /// an `Arc` held by the proxy, the exec supervisor, the agent ring and the task engine, so
+    /// whether `drop` runs at all depends on which of those outlives the launch — and an advisory
+    /// that only fires when the reference graph happens to unwind in the right order is one that
+    /// never fires. Idempotent, so the `Drop` below stays a safety net.
+    pub(crate) fn finish(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(msg) = drop_report(self.dropped.swap(0, Ordering::Relaxed)) {
+            crate::diag::warn(&msg);
+        }
+    }
+}
+
 impl Drop for Notifier {
     fn drop(&mut self) {
         // Signal, close this notifier's own sender, then wait for the thread to finish what is
@@ -341,12 +422,10 @@ impl Drop for Notifier {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        let dropped = self.dropped.load(Ordering::Relaxed);
-        if dropped > 0 {
-            crate::diag::warn(&format!(
-                "{dropped} blocked-request notification(s) were dropped: they arrived faster than \
-                 the desktop could show them (the logs — `sbx net logs`, `sbx proc logs` — are complete)"
-            ));
+        // A safety net for a path that never called `finish`; `swap` makes the pair idempotent, so
+        // whichever runs second reports nothing rather than repeating the advisory.
+        if let Some(msg) = drop_report(self.dropped.swap(0, Ordering::Relaxed)) {
+            crate::diag::warn(&msg);
         }
     }
 }
@@ -371,10 +450,15 @@ mod tests {
     }
 
     impl Sink for Recorder {
-        fn deliver(&mut self, summary: &str, body: &str, replaces: Option<u32>) -> Option<u32> {
+        fn deliver(
+            &mut self,
+            summary: &str,
+            body: &str,
+            replaces: Option<u32>,
+        ) -> Result<Option<u32>, ()> {
             let mut seen = self.seen.lock().unwrap();
             seen.push((summary.to_string(), body.to_string(), replaces));
-            self.ids.then(|| seen.len() as u32)
+            Ok(self.ids.then(|| seen.len() as u32))
         }
     }
 
@@ -555,6 +639,66 @@ mod tests {
         );
         // The sender outlived the notifier; sending on it now simply finds no reader.
         let _ = held.try_send(net_block("late.example.com:443", "denied-default"));
+    }
+
+    /// A sink whose transport is gone: every delivery reports the transport lost.
+    struct DeadSink(Arc<AtomicU64>);
+
+    impl Sink for DeadSink {
+        fn deliver(&mut self, _: &str, _: &str, _: Option<u32>) -> Result<Option<u32>, ()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(())
+        }
+    }
+
+    #[test]
+    fn a_lost_transport_falls_back_instead_of_going_quiet() {
+        // The failure this guards: the notification daemon restarts mid-session, every later call on
+        // the bound connection fails, and the sandbox simply stops announcing refusals — silently,
+        // which is indistinguishable from a sandbox that refused nothing.
+        let attempts = Arc::new(AtomicU64::new(0));
+        {
+            let n = Notifier::with_sink(
+                NotifyPolicy::uniform(NotifyMode::Always),
+                Arc::new(RwLock::new(Vec::new())),
+                String::new(),
+                Some(Box::new(DeadSink(Arc::clone(&attempts)))),
+            );
+            n.block(net_block("a.example.com:443", "denied-default"));
+            n.block(net_block("b.example.com:443", "denied-default"));
+            n.block(net_block("c.example.com:443", "denied-default"));
+        }
+        // Exactly one attempt on the dead transport: it is replaced after the first failure rather
+        // than retried for every later refusal (which would mean one hung call each).
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "the dead sink must be replaced, not retried"
+        );
+    }
+
+    #[test]
+    fn the_teardown_advisory_reports_only_what_was_actually_dropped() {
+        assert_eq!(drop_report(0), None, "nothing dropped, nothing said");
+        let msg = drop_report(7).expect("a drop is reported");
+        assert!(msg.starts_with("7 blocked-request notification(s) were dropped"));
+        // It points at the record that *is* complete, so the reader knows nothing was actually lost.
+        assert!(msg.contains("sbx net logs"));
+    }
+
+    #[test]
+    fn finish_reports_once_and_drop_does_not_repeat_it() {
+        // `finish` and `Drop` both report, and both run in a real launch. The count is taken, not
+        // read, so the advisory appears once rather than twice.
+        let n = Notifier::disabled();
+        n.dropped.store(3, Ordering::Relaxed);
+        n.finish();
+        assert_eq!(
+            n.dropped.load(Ordering::Relaxed),
+            0,
+            "finish takes the count, so the Drop that follows reports nothing"
+        );
+        assert_eq!(drop_report(n.dropped.load(Ordering::Relaxed)), None);
     }
 
     #[test]

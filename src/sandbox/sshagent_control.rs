@@ -486,9 +486,14 @@ mod notify_tests {
     struct Recorder(Arc<Mutex<Vec<String>>>);
 
     impl Sink for Recorder {
-        fn deliver(&mut self, summary: &str, body: &str, _replaces: Option<u32>) -> Option<u32> {
+        fn deliver(
+            &mut self,
+            summary: &str,
+            body: &str,
+            _replaces: Option<u32>,
+        ) -> Result<Option<u32>, ()> {
             self.0.lock().unwrap().push(format!("{summary}|{body}"));
-            None
+            Ok(None)
         }
     }
 

@@ -3463,6 +3463,10 @@ pub(crate) struct LaunchGuard {
     /// rather than leaked by an exec — its presence forces the supervised path; dropping it removes
     /// the directory (socket and generated config).
     pub(crate) portal: Option<super::portal::HostDir>,
+    /// The refusal notifier (`[notify]`), held for as long as any lens can still refuse something.
+    /// Dropping the guard stops delivery and reports whatever the queue could not hold — explicitly,
+    /// rather than leaving that to whichever `Arc` happens to fall last.
+    pub(crate) notify_sink: Option<Arc<super::notify_sink::NotifyWiring>>,
     /// The exec-enforcement supervisor (`[proc] mode = enforce|ask`), when one is running. Its
     /// receive loop is a host thread deciding every notified `execve`, so it must outlive the cage;
     /// its presence forces the supervised path (a live parent). Dropping it stops the supervisor and
@@ -3492,6 +3496,11 @@ impl Drop for LaunchGuard {
         // The inner guards' Drops unlink the proxy/forwarder artifacts and close the listeners.
         // Taking them here runs those Drops explicitly (and reads the fields, so the RAII holds
         // are not flagged as unused — their whole purpose is to stay alive until this drop).
+        // First: stop announcing and say what was dropped. Before the lenses below are torn down,
+        // so a refusal decided in the last moments still finds a live delivery thread.
+        if let Some(notify) = self.notify_sink.take() {
+            notify.notifier.finish();
+        }
         if let Some(egress) = self.egress.take() {
             drop(egress);
         }
@@ -4889,6 +4898,7 @@ fn build(
         || task_plane.is_some()
     {
         Some(LaunchGuard {
+            notify_sink: Some(Arc::clone(&notify_wiring)),
             egress: egress_guard,
             ssh_agent: sshagent_guard,
             forward: forward_guard,
