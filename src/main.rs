@@ -314,6 +314,7 @@ fn take_override_flag(
         "--net" => &mut cli.net,
         "--gui" => &mut cli.gui,
         "--proc" => &mut cli.proc,
+        "--notify" => &mut cli.notify,
         "--nixpkgs" => &mut cli.nixpkgs,
         "--bind" => &mut cli.binds,
         "--forward" => &mut cli.forward,

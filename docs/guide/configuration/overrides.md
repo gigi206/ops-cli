@@ -39,6 +39,7 @@ Ergonomic shorthands for a single field, each with an `SBX_*` environment equiva
 | `--net <posture>` | `SBX_NET` | the network posture (below) |
 | `--gui <none\|offscreen\|wayland>` | `SBX_GUI` | the display posture |
 | `--proc <off\|observe\|enforce\|ask>` | `SBX_PROC` | the [process/exec](proc.md) posture (a bare mode) |
+| `--notify <off\|once\|always>` | `SBX_NOTIFY` | how loudly a refusal is [announced](notify.md) (a bare mode) |
 | `--nixpkgs <ref>` | `SBX_NIXPKGS` | the nixpkgs channel or revision |
 | `--bind <path[:ro\|:rw]>` | `SBX_BIND` | a host bind (read-only by default); repeatable |
 | `--forward <port[,port…]>` | `SBX_FORWARD` | host loopback TCP port(s) into the cage; repeatable |
@@ -96,6 +97,32 @@ blob** — do **not** split them across `--proc enforce` + `--config '[proc] den
 `--proc` beats the blob wholesale and would silently discard the deny list (leaving you with
 enforce-*nothing*, a fail-open).
 
+#### `--notify` — how loudly one launch speaks
+
+`--notify` sets one [notification](notify.md) **mode** (`off`/`once`/`always`) for **every**
+event, the bare-string form of the `notify` field. It is the flag for the two moments the
+baseline is wrong for the run in front of you: `--notify off` for a batch job whose refusals you
+will read in the logs, and `--notify always` to watch a single launch closely when the global
+config has gone quiet. A mistyped mode is a **hard error**, like `--proc`: falling back to the
+baseline could run the launch *quieter* than you asked, and a refusal nobody hears is what this
+feature exists to prevent.
+
+The **per-event table** and `repeat_after` are not on this flag — set them in a `--config` blob's
+`[notify]` table:
+
+```bash
+sbx run --config '[notify]
+mode = "always"
+repeat_after = "30s"
+[notify.events]
+task = "off"' -- ./agent
+```
+
+A bare `--notify <mode>` **replaces the whole policy** (every event's mode *and* the period), so
+keep the mode and its refinements together in one blob rather than splitting them across
+`--notify always` + `--config '[notify] repeat_after=…'` — the typed flag beats the blob wholesale
+and would discard the period.
+
 #### The `--net` posture
 
 `--net` takes `none | shared | ask | allow=h1,h2 | deny=h1,h2`. The `allow=`/`deny=`
@@ -127,8 +154,8 @@ blob**. Within that, an override beats the trusted project config and the app ov
 
 One uniform rule across all four tiers:
 
-- **Scalars** (`nixpkgs`, `network`, `gui`) are **replaced** by the highest tier that
-  sets them.
+- **Scalars** (`nixpkgs`, `network`, `gui`, `proc`, `notify`) are **replaced** by the highest
+  tier that sets them.
 - **Collections** (`env`, `packages`, `binds`, `forward`, `limits`, `seccomp`,
   `devices`) are **unioned**, the higher tier winning per key/entry — so `--bind` *adds*
   to whatever the blobs bound, and `--limit tasks_max=…` tunes one limit without dropping
@@ -139,9 +166,10 @@ One uniform rule across all four tiers:
 An override is the final word, so a mistake must never silently launch a *different*
 posture:
 
-- A **set-but-invalid** security value (a `--net nonee` typo, a `--gui bogus`, a bad
-  `[limits]` value, a bad `nixpkgs`) is a **hard error — exit 2, no launch**. Silently
-  keeping the baseline could leave a *wider* posture than the mistyped intent.
+- A **set-but-invalid** security value (a `--net nonee` typo, a `--gui bogus`, a
+  `--proc enfroce`, a `--notify alwyas`, a bad `[limits]` value, a bad `nixpkgs`) is a
+  **hard error — exit 2, no launch**. Silently keeping the baseline could leave a *wider*
+  posture — or, for `--notify`, a *quieter* one — than the mistyped intent.
 - A **structural** error (a `--limit` with no `=`, a `--bind` with an empty path, a bad
   `--net` keyword, an unknown limit key) is likewise a hard error.
 - The **additive** fields (`env`/`binds`/`packages`/`forward`/`seccomp`/`devices`) fail

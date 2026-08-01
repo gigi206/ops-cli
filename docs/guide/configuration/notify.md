@@ -166,6 +166,20 @@ baseline's for that app. That matters because how much an app's refusals are wor
 property of the app: a browser profile refused on every third-party asset it loads is noise, while
 the same refusal from a coding agent is the signal.
 
+## One launch at a time
+
+`--notify <off|once|always>` (or `SBX_NOTIFY`) sets one mode for every event, for a single launch,
+beating both the config and an app's own policy — see [overrides](overrides.md):
+
+```bash
+sbx run --notify off -- ./nightly-batch      # read the refusals in the log instead
+sbx app run agent --notify always            # watch this one closely
+```
+
+A mistyped mode is a hard error rather than a fall back to the baseline: the fallback could run the
+launch quieter than you asked for. The per-event table and `repeat_after` stay in a `--config`
+blob's `[notify]` table — the bare flag replaces the whole policy, period included.
+
 ## Seeing the effective policy
 
 ```console

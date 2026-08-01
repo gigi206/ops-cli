@@ -6700,3 +6700,73 @@ fn notify_repeat_after_resolves_and_is_flagged_where_it_cannot_bite() {
         r.warnings
     );
 }
+
+#[test]
+fn an_override_notify_mode_applies_and_beats_the_baseline_both_directions() {
+    use crate::notify::{NotifyEvent, NotifyMode};
+    use schema::NotifyField;
+
+    // Silence: the invoker turns off a baseline `always` for one launch, every event at once.
+    let mut quiet = resolve_no_plugins(RawConfig::default(), None);
+    assert_eq!(
+        quiet.notify.mode_for(NotifyEvent::Network),
+        NotifyMode::Always
+    );
+    quiet = with_override(
+        quiet,
+        RawConfig {
+            notify: Some(NotifyField::Mode("off".into())),
+            ..RawConfig::default()
+        },
+    );
+    for event in crate::notify::NotifyEvent::ALL {
+        assert_eq!(quiet.notify.mode_for(event), NotifyMode::Off, "{event:?}");
+    }
+    assert_eq!(quiet.notify_origin, Provenance::Override);
+
+    // And back up: a global that silences everything is overruled by the person at the keyboard,
+    // who wants this one launch to say what it refused.
+    let global: RawConfig = toml::from_str("notify = \"off\"").unwrap();
+    let mut loud = resolve_no_plugins(global, None);
+    assert_eq!(loud.notify.mode_for(NotifyEvent::Network), NotifyMode::Off);
+    loud = with_override(
+        loud,
+        RawConfig {
+            notify: Some(NotifyField::Mode("always".into())),
+            ..RawConfig::default()
+        },
+    );
+    assert_eq!(
+        loud.notify.mode_for(NotifyEvent::Network),
+        NotifyMode::Always
+    );
+    assert_eq!(loud.notify_origin, Provenance::Override);
+}
+
+#[test]
+fn a_set_but_invalid_override_notify_mode_is_a_hard_error_and_mutates_nothing() {
+    use crate::notify::{NotifyEvent, NotifyMode};
+    use schema::NotifyField;
+
+    // A mistyped notify mode is fatal rather than a silent revert to the baseline: reverting could
+    // leave a launch quieter than the invoker asked for, and a refusal nobody hears is the one
+    // failure this feature exists to prevent.
+    let global: RawConfig = toml::from_str("notify = \"off\"").unwrap();
+    let mut resolved = resolve_no_plugins(global, None);
+    let errs = resolved
+        .apply_override(Override::for_test(RawConfig {
+            notify: Some(NotifyField::Mode("alwyas".into())),
+            ..RawConfig::default()
+        }))
+        .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("notify")),
+        "the error should name the offending field: {errs:?}"
+    );
+    // and nothing was applied — the baseline stands.
+    assert_eq!(
+        resolved.notify.mode_for(NotifyEvent::Network),
+        NotifyMode::Off
+    );
+    assert_eq!(resolved.notify_origin, Provenance::Global);
+}

@@ -323,6 +323,39 @@ fn config_show_reflects_an_ambient_proc_override() {
 }
 
 #[test]
+fn config_show_reflects_an_ambient_notify_override() {
+    // `--notify`/`SBX_NOTIFY` decides whether a refusal is ever heard, so a stale ambient value must
+    // reach `sbx config show` through the same `collect` a launch uses, tagged `(override)`. The
+    // baseline is `always`, so `off` is the direction worth proving: a silenced session admits it.
+    let fx = Fixture::new();
+    let out = fx
+        .sbx(&["config", "show"])
+        .env("SBX_NOTIFY", "off")
+        .output()
+        .expect("spawn sbx");
+    assert!(out.status.success(), "config show should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("notify:") && stdout.contains("off") && stdout.contains("(override)"),
+        "config show must reflect and tag the ambient notify override:\n{stdout}"
+    );
+
+    // A set-but-invalid ambient mode is fatal, like `proc`: falling back to the baseline could run
+    // the launch quieter than the invoker asked for.
+    let bad = fx
+        .sbx(&["config", "show"])
+        .env("SBX_NOTIFY", "alwyas")
+        .output()
+        .expect("spawn sbx");
+    let text =
+        String::from_utf8_lossy(&bad.stdout).into_owned() + &String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        text.contains("refusing to launch") || text.contains("invalid value"),
+        "a set-but-invalid ambient notify mode must be surfaced:\n{text}"
+    );
+}
+
+#[test]
 fn config_show_rejects_an_unknown_argument() {
     let fx = Fixture::new();
     let out = fx.run(&["config", "show", "--bogus"]);

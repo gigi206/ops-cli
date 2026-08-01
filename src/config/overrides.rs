@@ -9,7 +9,7 @@
 //! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `SBX_CONFIG` — carries
 //! inline TOML shaped exactly like an `sbx.toml`, so it can set *any* field the schema has. A
 //! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/
-//! `--seccomp`/`--device`/`--proc`/`--gpu`/`--audio`/`--dbus` (and their `--env` sibling), each with
+//! `--seccomp`/`--device`/`--proc`/`--notify`/`--gpu`/`--audio`/`--dbus` (and their `--env` sibling), each with
 //! an `SBX_*` environment equivalent — is an ergonomic shorthand for one field. The booleans
 //! `--gpu`/`--audio`/`--dbus` are optional-value (bare = `true`, or `=true`/`=false`); the rest take
 //! a required value.
@@ -49,8 +49,8 @@
 //! launch aborts rather than silently dropping the field and running a different posture than asked.
 
 use super::schema::{
-    self, NetworkField, NetworkTable, ProcField, RawBind, RawBindTable, RawConfig, RawDevices,
-    RawLimit, RawLimits, RawSeccomp,
+    self, NetworkField, NetworkTable, NotifyField, ProcField, RawBind, RawBindTable, RawConfig,
+    RawDevices, RawLimit, RawLimits, RawSeccomp,
 };
 
 /// The environment-variable prefix that sets one cage environment variable per key:
@@ -122,6 +122,10 @@ pub(crate) struct CliOverrides {
     /// `--proc <off|observe|enforce|ask>` — the process/exec posture, a bare mode (last wins). The
     /// full `[proc]` table with `allow`/`deny` lists is set through a `--config` blob.
     pub(crate) proc: Vec<String>,
+    /// `--notify <off|once|always>` — how loudly a refusal is announced, a bare mode applied to
+    /// every event (last wins). The per-event table and `repeat_after` are set through a `--config`
+    /// blob.
+    pub(crate) notify: Vec<String>,
     /// `--nixpkgs <ref>` — the nixpkgs channel/revision (last wins).
     pub(crate) nixpkgs: Vec<String>,
     /// `--bind <path[:ro|:rw]>` — one host bind each.
@@ -164,6 +168,8 @@ struct AmbientOverrides {
     gui: Option<String>,
     /// `SBX_PROC` — the process/exec posture (a bare mode).
     proc: Option<String>,
+    /// `SBX_NOTIFY` — how loudly a refusal is announced (a bare mode).
+    notify: Option<String>,
     /// `SBX_NIXPKGS` — the nixpkgs channel/revision.
     nixpkgs: Option<String>,
     /// `SBX_BIND` — one host bind (a list is a blob concern).
@@ -238,6 +244,7 @@ fn scan_ambient() -> AmbientOverrides {
         net: env_nonempty("SBX_NET"),
         gui: env_nonempty("SBX_GUI"),
         proc: env_nonempty("SBX_PROC"),
+        notify: env_nonempty("SBX_NOTIFY"),
         nixpkgs: env_nonempty("SBX_NIXPKGS"),
         gpu: env_nonempty("SBX_GPU"),
         audio: env_nonempty("SBX_AUDIO"),
@@ -293,6 +300,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         ambient.net.as_deref(),
         ambient.gui.as_deref(),
         ambient.proc.as_deref(),
+        ambient.notify.as_deref(),
         ambient.nixpkgs.as_deref(),
         ambient.gpu.as_deref(),
         ambient.audio.as_deref(),
@@ -320,6 +328,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         cli.net.last().map(String::as_str),
         cli.gui.last().map(String::as_str),
         cli.proc.last().map(String::as_str),
+        cli.notify.last().map(String::as_str),
         cli.nixpkgs.last().map(String::as_str),
         cli.gpu.last().map(String::as_str),
         cli.audio.last().map(String::as_str),
@@ -406,6 +415,11 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ),
         ("gui", env_side.gui.is_some(), cli_side.gui.is_some()),
         ("proc", env_side.proc.is_some(), cli_side.proc.is_some()),
+        (
+            "notify",
+            env_side.notify.is_some(),
+            cli_side.notify.is_some(),
+        ),
         ("gpu", env_side.gpu.is_some(), cli_side.gpu.is_some()),
         ("audio", env_side.audio.is_some(), cli_side.audio.is_some()),
         ("dbus", env_side.dbus.is_some(), cli_side.dbus.is_some()),
@@ -454,6 +468,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     }
     if higher.proc.is_some() {
         base.proc = higher.proc;
+    }
+    if higher.notify.is_some() {
+        base.notify = higher.notify;
     }
     if higher.gpu.is_some() {
         base.gpu = higher.gpu;
@@ -586,6 +603,7 @@ fn build_typed_fragment(
     net: Option<&str>,
     gui: Option<&str>,
     proc: Option<&str>,
+    notify: Option<&str>,
     nixpkgs: Option<&str>,
     gpu: Option<&str>,
     audio: Option<&str>,
@@ -611,6 +629,13 @@ fn build_typed_fragment(
     // full `[proc]` table with `allow`/`deny` lists is set through a `--config` blob.
     if let Some(v) = proc {
         raw.proc = Some(ProcField::Mode(v.to_string()));
+    }
+    // `--notify` sets only the mode (the bare-string form of the `notify` field), applied uniformly
+    // to every event; the mode value is validated downstream (an unknown mode is fatal for an
+    // override, like `--proc`), and the per-event table and `repeat_after` are set through a
+    // `--config` blob.
+    if let Some(v) = notify {
+        raw.notify = Some(NotifyField::Mode(v.to_string()));
     }
     if let Some(v) = nixpkgs {
         raw.nixpkgs = Some(v.to_string());
@@ -840,6 +865,7 @@ mod tests {
         net: &'a [&'a str],
         gui: &'a [&'a str],
         proc: &'a [&'a str],
+        notify: &'a [&'a str],
         nixpkgs: &'a [&'a str],
         binds: &'a [&'a str],
         forward: &'a [&'a str],
@@ -863,6 +889,7 @@ mod tests {
             net: owned(cli.net),
             gui: owned(cli.gui),
             proc: owned(cli.proc),
+            notify: owned(cli.notify),
             nixpkgs: owned(cli.nixpkgs),
             binds: owned(cli.binds),
             forward: owned(cli.forward),
@@ -1731,5 +1758,90 @@ mod tests {
         assert_eq!(cli_wins.raw.proc, Some(ProcField::Mode("enforce".into())));
         // set on the CLI, so no env-source notice for it.
         assert!(!cli_wins.notices().iter().any(|n| n.contains("`proc`")));
+    }
+
+    // --- typed --notify flag ---
+
+    #[test]
+    fn a_typed_notify_flag_sets_the_bare_mode_and_is_non_empty() {
+        // `--notify once` sets the mode-only (bare-string) form of the `notify` field, which applies
+        // uniformly to every event; the mode value is validated downstream, not here.
+        let ov = collect_cli(Cli {
+            notify: &["once"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.notify, Some(NotifyField::Mode("once".into())));
+        assert!(!ov.is_empty(), "a set notify override must be non-empty");
+
+        // `--notify off` silences one launch. It is a *set* override, not an unset one — otherwise a
+        // baseline `always` would leak back in and the launch would talk anyway.
+        let off = collect_cli(Cli {
+            notify: &["off"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(off.raw.notify, Some(NotifyField::Mode("off".into())));
+        assert!(
+            !off.is_empty(),
+            "`--notify off` is a set override, not a no-op"
+        );
+
+        // Last occurrence wins (a scalar).
+        let last = collect_cli(Cli {
+            notify: &["off", "always"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(last.raw.notify, Some(NotifyField::Mode("always".into())));
+    }
+
+    #[test]
+    fn a_typed_notify_flag_beats_a_blob_notify_table() {
+        // `--notify` (scalar) replaces a `--config` blob's `[notify]` table on the same field — so
+        // the blob's `repeat_after` and per-event map go with it. Reach for the blob alone when
+        // either is wanted.
+        let ov = collect_cli(Cli {
+            config: &["[notify]\nmode = \"once\"\nrepeat_after = \"5m\""],
+            notify: &["always"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.notify, Some(NotifyField::Mode("always".into())));
+    }
+
+    #[test]
+    fn an_ambient_sbx_notify_is_noticed_and_the_cli_beats_it() {
+        // `SBX_NOTIFY` alone fires the security-via-environment notice: a stale export that silences
+        // refusals is exactly the kind of ambient setting worth naming out loud.
+        let ov = ambient(AmbientOverrides {
+            notify: Some("off".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ov.raw.notify, Some(NotifyField::Mode("off".into())));
+        assert!(
+            ov.notices().iter().any(|n| n.contains("`notify`")),
+            "{:?}",
+            ov.notices()
+        );
+
+        let cli_wins = collect_from(
+            &CliOverrides {
+                notify: owned(&["always"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                notify: Some("off".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cli_wins.raw.notify,
+            Some(NotifyField::Mode("always".into()))
+        );
+        // set on the CLI, so no env-source notice for it.
+        assert!(!cli_wins.notices().iter().any(|n| n.contains("`notify`")));
     }
 }
