@@ -118,10 +118,13 @@ repeat_after = "30s"
 task = "off"' -- ./agent
 ```
 
-A bare `--notify <mode>` **replaces the whole policy** (every event's mode *and* the period), so
-keep the mode and its refinements together in one blob rather than splitting them across
-`--notify always` + `--config '[notify] repeat_after=…'` — the typed flag beats the blob wholesale
-and would discard the period.
+A bare `--notify <mode>` sets **every event's mode** and says nothing about the period, so a
+`repeat_after` configured in a file below is **kept** — turning the announcements up for one launch
+does not silently remove the spacing that made them bearable.
+
+Within the override itself the ordinary rule still applies: the typed flag replaces a `--config`
+blob's `[notify]` table wholesale, period included. So do **not** split one intent across
+`--notify always` + `--config '[notify] repeat_after=…'`; put both in the blob.
 
 #### The `--net` posture
 

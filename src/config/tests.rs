@@ -6744,6 +6744,36 @@ fn an_override_notify_mode_applies_and_beats_the_baseline_both_directions() {
 }
 
 #[test]
+fn a_bare_override_notify_mode_keeps_the_configured_repeat_period() {
+    use crate::notify::{NotifyEvent, NotifyMode};
+    use schema::NotifyField;
+    use std::time::Duration;
+
+    // A bare mode sets every event's mode and says nothing about the period, so the period keeps
+    // what the layers below configured — the same parent-inheritance `proc` has for its lists. It
+    // matters here because the alternative is worse in a specific way: turning the announcements up
+    // for one launch would silently also remove the spacing that made `always` bearable.
+    let global: RawConfig =
+        toml::from_str("[notify]\nmode = \"once\"\nrepeat_after = \"5m\"").unwrap();
+    let resolved = with_override(
+        resolve_no_plugins(global, None),
+        RawConfig {
+            notify: Some(NotifyField::Mode("always".into())),
+            ..RawConfig::default()
+        },
+    );
+    assert_eq!(
+        resolved.notify.mode_for(NotifyEvent::Network),
+        NotifyMode::Always
+    );
+    assert_eq!(
+        resolved.notify.repeat_after(),
+        Some(Duration::from_secs(300)),
+        "a bare mode must not take the configured period with it"
+    );
+}
+
+#[test]
 fn a_set_but_invalid_override_notify_mode_is_a_hard_error_and_mutates_nothing() {
     use crate::notify::{NotifyEvent, NotifyMode};
     use schema::NotifyField;

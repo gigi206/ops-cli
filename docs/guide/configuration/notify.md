@@ -177,8 +177,12 @@ sbx app run agent --notify always            # watch this one closely
 ```
 
 A mistyped mode is a hard error rather than a fall back to the baseline: the fallback could run the
-launch quieter than you asked for. The per-event table and `repeat_after` stay in a `--config`
-blob's `[notify]` table — the bare flag replaces the whole policy, period included.
+launch quieter than you asked for.
+
+The flag sets one mode for every event and nothing else, so a configured `repeat_after` survives it
+— `--notify always` over a config with `repeat_after = "5m"` announces every event, still no more
+often than every five minutes. To change the period, or to refine a single event, use a `--config`
+blob's `[notify]` table (and put the mode in that same blob, since the typed flag would replace it).
 
 ## Seeing the effective policy
 
