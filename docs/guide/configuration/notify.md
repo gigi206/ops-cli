@@ -108,7 +108,7 @@ you where to go and change it.
 |---|---|---|
 | `network` | [`[network]`](network.md) | a request is refused — by a `deny` rule, because nothing allowed the host, because the method is not permitted, or by a security guard (a credential on its way out, an SSRF target) |
 | `proc` | [`[proc]`](proc.md) | a program is stopped before it runs |
-| `ssh_agent` | [`[ssh_agent]`](ssh-agent.md) | a signature is withheld |
+| `ssh_agent` | [`[ssh_agent]`](ssh-agent.md) | a request for a key is refused |
 | `task` | [`[task]`](task.md) | an invocation is refused |
 | `trust` | [trust gate](../concepts/trust.md) | a security field is dropped because the config declaring it is not trusted |
 

@@ -534,7 +534,7 @@ mod notify_tests {
             ),
         ]);
         assert_eq!(out.len(), 1, "only the refusal, got {out:?}");
-        assert!(out[0].starts_with("sbx withheld an ssh key|"));
+        assert!(out[0].starts_with("sbx blocked a request for an ssh key|"));
         assert!(out[0].contains("the grant does not name"));
     }
 

@@ -89,12 +89,18 @@ impl NotifyEvent {
     }
 
     /// The one-line headline for this event, the notification's summary.
+    ///
+    /// Four of the five open on the same verb, because they are the same act seen in four places:
+    /// something was attempted and sbx stopped it. One word makes a toast recognisable before it is
+    /// read. `Trust` keeps its own, and the difference is not cosmetic — nothing was attempted
+    /// there, so calling it a block would describe an agent halted mid-action when what happened is
+    /// that a file was not taken at its word.
     fn headline(self) -> &'static str {
         match self {
             NotifyEvent::Network => "sbx blocked a network request",
             NotifyEvent::Proc => "sbx blocked a program from running",
-            NotifyEvent::SshAgent => "sbx withheld an ssh key",
-            NotifyEvent::Task => "sbx refused a task",
+            NotifyEvent::SshAgent => "sbx blocked a request for an ssh key",
+            NotifyEvent::Task => "sbx blocked a task",
             NotifyEvent::Trust => "sbx dropped a setting from an untrusted config",
         }
     }
@@ -426,6 +432,32 @@ mod tests {
             detail: String::new(),
             fix: String::new(),
         }
+    }
+
+    #[test]
+    fn every_runtime_refusal_opens_on_the_same_verb_and_the_trust_drop_does_not() {
+        // A person meets these one at a time, days apart, in a corner of the screen. Four of them
+        // are the same act — something was attempted, sbx stopped it — and reading as one thing is
+        // worth more than four shades of accuracy nobody is comparing side by side.
+        for event in [
+            NotifyEvent::Network,
+            NotifyEvent::Proc,
+            NotifyEvent::SshAgent,
+            NotifyEvent::Task,
+        ] {
+            assert!(
+                event.headline().starts_with("sbx blocked "),
+                "{event:?}: {}",
+                event.headline()
+            );
+        }
+        // `trust` is the exception on purpose. Nothing ran and nothing was stopped: a field was not
+        // taken at its word when the config was read. Calling that a block would have the reader
+        // looking for an agent that was halted, and there was none.
+        assert_eq!(
+            NotifyEvent::Trust.headline(),
+            "sbx dropped a setting from an untrusted config"
+        );
     }
 
     #[test]
