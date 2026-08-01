@@ -55,6 +55,10 @@ pub(crate) struct ConfigView {
     pub(crate) proc: ProcView,
     /// Which layer supplied the proc posture (`Default` when neither config set it).
     pub(crate) proc_origin: ProvenanceView,
+    /// The resolved refusal-notification policy.
+    pub(crate) notify: NotifyView,
+    /// Which layer supplied the notification policy (`Default` when neither config set it).
+    pub(crate) notify_origin: ProvenanceView,
     /// The resolved GUI posture.
     pub(crate) gui: GuiView,
     /// Which layer supplied the GUI posture (`Default` when neither config set it).
@@ -415,6 +419,26 @@ pub(crate) fn proc_view(p: &crate::proc_policy::ProcPolicy) -> ProcView {
     }
 }
 
+/// The resolved refusal-notification policy, for `sbx config show`: one mode per event, always all
+/// of them. Rendered in full rather than only where it differs from the default, because "which
+/// refusals will I actually hear about" is the question this row exists to answer, and a partial
+/// listing would leave a reader inferring the rest.
+#[derive(Serialize, Default)]
+pub(crate) struct NotifyView {
+    /// Event name → `off` / `once` / `always`, in the events' declaration order.
+    pub(crate) events: Vec<(String, String)>,
+}
+
+/// Project a resolved [`crate::notify::NotifyPolicy`] into its view.
+pub(crate) fn notify_view(p: &crate::notify::NotifyPolicy) -> NotifyView {
+    NotifyView {
+        events: crate::notify::NotifyEvent::ALL
+            .iter()
+            .map(|e| (e.as_str().to_string(), p.mode_for(*e).as_str().to_string()))
+            .collect(),
+    }
+}
+
 /// The cage's effective cgroup resource limits: the throttle threshold, the hard memory ceiling,
 /// and the task cap, each its config override when set or sbx's built-in default otherwise.
 #[derive(Serialize, Default)]
@@ -580,6 +604,9 @@ pub(crate) struct AppDetailView {
     /// The effective process/exec posture (the app's own, else the baseline's).
     pub(crate) proc: ProcView,
     pub(crate) proc_origin: ProvenanceView,
+    /// The effective refusal-notification policy (the app's own, else the baseline's).
+    pub(crate) notify: NotifyView,
+    pub(crate) notify_origin: ProvenanceView,
     /// The effective GUI posture (the app's own, else the baseline's).
     pub(crate) gui: GuiView,
     pub(crate) gui_origin: ProvenanceView,
@@ -772,6 +799,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         egress_stats: resolved.egress_stats,
         proc: proc_view(&resolved.proc),
         proc_origin: resolved.proc_origin.into(),
+        notify: notify_view(&resolved.notify),
+        notify_origin: resolved.notify_origin.into(),
         gui,
         gui_origin: resolved.gui_origin.into(),
         gpu: resolved.gpu,
@@ -1151,6 +1180,9 @@ fn app_detail_view(
     let eff_proc = app.proc.clone().unwrap_or_else(|| baseline.proc.clone());
     let proc = proc_view(&eff_proc);
     let proc_origin = origin_or_inherited(app.proc.is_some(), app.proc_origin);
+    let eff_notify = app.notify.unwrap_or(baseline.notify);
+    let notify = notify_view(&eff_notify);
+    let notify_origin = origin_or_inherited(app.notify.is_some(), app.notify_origin);
     let eff_gui = app.gui.unwrap_or(baseline.gui);
     let gui = match eff_gui {
         super::GuiPolicy::Wayland => GuiView::Wayland,
@@ -1260,6 +1292,8 @@ fn app_detail_view(
         network_origin,
         proc,
         proc_origin,
+        notify,
+        notify_origin,
         gui,
         gui_origin,
         gpu: eff_gpu,
@@ -1454,6 +1488,8 @@ mod tests {
     #[test]
     fn the_view_model_serializes_to_a_json_object() {
         let view = ConfigView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![EnvVar {
@@ -1703,6 +1739,8 @@ mod tests {
 
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
+            notify: None,
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             ssh_agent_origin: Default::default(),
             ssh_agent: Vec::new(),
@@ -1773,6 +1811,8 @@ mod tests {
         // A baseline credential the app inherits — and that the app's narrowed network drops, the
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             env: vec![],
             env_layer: Default::default(),
@@ -1827,6 +1867,8 @@ mod tests {
         };
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
+            notify: None,
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             ssh_agent_origin: Default::default(),
             ssh_agent: Vec::new(),

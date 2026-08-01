@@ -639,8 +639,11 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             }
             // The refusal body carries a copy-paste `sbx net allow` — sound here because nothing
             // allowed the host (never for an explicit deny or a security refusal). It rides the
-            // response the client already shows, so there is no second, host-side message to
-            // duplicate it or interleave with it. Scoped to the app when this is an `sbx app` launch.
+            // response the client already shows, so the agent gets the reason in the reply itself.
+            // The *person* running sbx is told separately, through the notification the `outcome`
+            // chokepoint raises: the agent is under no obligation to surface a `403` body, and a
+            // boundary nobody hears about is one that looks like it never bit. Scoped to the app when
+            // this is an `sbx app` launch.
             return respond_refusal_tls(
                 &mut br,
                 "403 Forbidden",

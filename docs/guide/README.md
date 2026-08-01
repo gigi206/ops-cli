@@ -48,6 +48,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`dbus`](configuration/dbus.md) — a private in-cage desktop portal (file chooser + theme + notifications).
 - [`network`](configuration/network.md) — the egress posture (links to [Networking](networking/README.md)).
 - [`[proc]`](configuration/proc.md) — observe or block what the agent execs (trusted-only).
+- [`[notify]`](configuration/notify.md) — be told when something was blocked (trusted-only).
 - [`[secret]`](configuration/secret.md) — credential injection (links to [Secrets](secrets/README.md)).
 - [`[task.<name>]`](configuration/task.md) — declared operations: a fixed command sbx runs with a
   credential the caller never holds (trusted-only).

@@ -490,6 +490,10 @@ pub(crate) fn start(
     // What distinguishes this proxy's host-side paths from another's in the same process. Keep it
     // short: these become `AF_UNIX` paths, which the kernel caps at `SUN_LEN`.
     instance: &str,
+    // Where a refused request is announced, and the credential set the announcement is redacted
+    // against. `None` on the paths that raise no notifications (a task's per-invocation proxy runs
+    // under the session's notifier, attached by the engine).
+    notify: Option<&super::notify_sink::NotifyWiring>,
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -548,10 +552,36 @@ pub(crate) fn start(
         None
     };
 
+    // Publish the resolved needles to the notifier before any request can be refused, so no
+    // announcement can ever be composed against an empty set. The notifier is stood up earlier than
+    // this (the exec supervisor needs it first) and nothing is refused in between.
+    //
+    // Added to rather than replacing what is there: one session's notifier also serves the
+    // per-invocation proxies its declared tasks stand up, and each of those resolves its own
+    // credentials. Replacing would let a task's set erase the session's — a credential that then
+    // reaches a notification body unredacted. The union is bounded by the number of *distinct*
+    // credentials declared, not by the number of invocations, because an identical needle is
+    // recognised and skipped.
+    if let Some(wiring) = notify {
+        if let Ok(mut shared) = wiring.needles.write() {
+            for needle in &redactions {
+                let known = shared
+                    .iter()
+                    .any(|n| n.name() == needle.name() && n.as_bytes() == needle.as_bytes());
+                if !known {
+                    shared.push(needle.clone());
+                }
+            }
+        }
+    }
+
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_injections(injections)
         .with_redactions(redactions)
         .with_app(app.map(str::to_string));
+    if let Some(wiring) = notify {
+        ctx = ctx.with_notifier(Arc::clone(&wiring.notifier));
+    }
 
     // Stand up the control socket the host-side `sbx net pending`/`sbx net log`/`sbx net allow
     // --session` reach. It lives under the `0700` egress dir beside `<data>` and is **never** bound
@@ -986,6 +1016,7 @@ mod tests {
             false,
             Some(roots.as_path()),
             "-1",
+            None,
         )
         .expect("start the egress proxy");
 
@@ -1370,6 +1401,7 @@ mod tests {
             false,
             None,
             "-2",
+            None,
         )
         .expect("start the ask egress proxy");
 
@@ -1435,6 +1467,7 @@ mod tests {
             false,
             None,
             "-3",
+            None,
         )
         .expect("start with stats off");
         drop(guard);
@@ -1457,6 +1490,7 @@ mod tests {
             true,
             None,
             "-4",
+            None,
         )
         .expect("start with stats on");
         drop(guard);

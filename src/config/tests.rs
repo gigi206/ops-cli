@@ -71,6 +71,7 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
+        notify: None,
         rest: Default::default(),
         task: None,
         env: env
@@ -589,6 +590,7 @@ fn raw_app(
     network: Option<NetworkField>,
 ) -> RawApp {
     RawApp {
+        notify: None,
         ssh_agent: None,
         task: None,
         cmd: if cmd.is_empty() {
@@ -2253,6 +2255,8 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
     // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
     base.dbus = false;
     let app = ResolvedApp {
+        notify: None,
+        notify_origin: Default::default(),
         ssh_agent_confirm: false,
         ssh_agent_origin: Default::default(),
         ssh_agent: Vec::new(),
@@ -2329,6 +2333,8 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
 fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        notify: None,
+        notify_origin: Default::default(),
         ssh_agent_confirm: false,
         ssh_agent_origin: Default::default(),
         ssh_agent: Vec::new(),
@@ -2376,6 +2382,8 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
 fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        notify: None,
+        notify_origin: Default::default(),
         ssh_agent_confirm: false,
         ssh_agent_origin: Default::default(),
         ssh_agent: Vec::new(),
@@ -2423,6 +2431,8 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     use crate::allowlist::{classify, EgressPolicy, Methods};
     let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
     let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
+        notify: None,
+        notify_origin: Default::default(),
         ssh_agent_confirm: false,
         ssh_agent_origin: Default::default(),
         ssh_agent: Vec::new(),
@@ -2561,6 +2571,8 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
+        notify: None,
+        notify_origin: Default::default(),
         ssh_agent_confirm: false,
         ssh_agent_origin: Default::default(),
         ssh_agent: Vec::new(),
@@ -2616,6 +2628,8 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         "the baseline-effective set is cleared under a shared posture"
     );
     let app = ResolvedApp {
+        notify: None,
+        notify_origin: Default::default(),
         ssh_agent_confirm: false,
         ssh_agent_origin: Default::default(),
         ssh_agent: Vec::new(),
@@ -6476,5 +6490,173 @@ fn an_untrusted_projects_unknown_key_is_reported_too() {
         r.warnings.iter().any(|w| w.contains("`bindz`")),
         "{:?}",
         r.warnings
+    );
+}
+
+/// EVERY producer of a dropped-for-want-of-trust warning must be recognised as one.
+///
+/// There is more than one, and they are worded differently: the `ignoring \`<field>\` (…)` family
+/// built from `untrusted_reason`, and `binds`, which has its own sentence. A reworded producer that
+/// stopped matching would silently stop the launch announcing dropped fields — a failure of silence,
+/// which is exactly what nothing else would catch.
+#[test]
+fn every_dropped_security_field_warning_is_recognised_as_a_trust_drop() {
+    for state in [TrustState::Untrusted, TrustState::Changed] {
+        let from_reason = format!(
+            "{PROJECT_CONFIG}: ignoring `network` policy ({})",
+            super::untrusted_reason(state)
+        );
+        assert!(
+            super::is_trust_drop(&from_reason),
+            "{state:?} must be recognised: {from_reason}"
+        );
+        // `binds` does not use `untrusted_reason` — it has its own wording, and it is the field
+        // whose silent absence is hardest to diagnose from inside the cage.
+        let from_binds = super::dropped_binds_warning(state, 2);
+        assert!(
+            super::is_trust_drop(&from_binds),
+            "{state:?} binds must be recognised: {from_binds}"
+        );
+    }
+    // An ordinary warning is not one.
+    assert!(!super::is_trust_drop(
+        "sbx.toml: ignoring unknown notify event `egress`"
+    ));
+}
+
+/// A real resolution of an untrusted project: every warning about a dropped security field is
+/// recognised, so the launch announces all of them and not merely the ones phrased one way.
+#[test]
+fn an_untrusted_projects_dropped_fields_are_all_recognised() {
+    let project: RawConfig = toml::from_str(
+        "binds = [\"/etc\"]\nnetwork = \"shared\"\nnotify = \"off\"\ngui = \"wayland\"",
+    )
+    .unwrap();
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+    let announced: Vec<&String> = r
+        .warnings
+        .iter()
+        .filter(|w| super::is_trust_drop(w))
+        .collect();
+    for field in ["bind", "network", "notify", "gui"] {
+        assert!(
+            announced.iter().any(|w| w.contains(field)),
+            "the dropped `{field}` must be announced; got {announced:?}"
+        );
+    }
+}
+
+// --- `[notify]` — the refusal-notification policy ---
+
+/// The three TOML spellings all resolve, and the short one sets every event.
+#[test]
+fn notify_parses_the_bare_mode_the_list_and_the_per_event_table() {
+    use crate::notify::{NotifyEvent, NotifyMode};
+
+    // `notify = "always"` — one mode for everything.
+    let bare: RawConfig = toml::from_str("notify = \"always\"").unwrap();
+    let r = resolve_no_plugins(bare, None);
+    for e in NotifyEvent::ALL {
+        assert_eq!(r.notify.mode_for(e), NotifyMode::Always, "{e:?}");
+    }
+
+    // A list is an inclusion: the named events keep the table's mode, the rest go quiet.
+    let list: RawConfig =
+        toml::from_str("[notify]\nmode = \"always\"\nevents = [\"network\", \"proc\"]").unwrap();
+    let r = resolve_no_plugins(list, None);
+    assert_eq!(r.notify.mode_for(NotifyEvent::Network), NotifyMode::Always);
+    assert_eq!(r.notify.mode_for(NotifyEvent::Proc), NotifyMode::Always);
+    assert_eq!(
+        r.notify.mode_for(NotifyEvent::Task),
+        NotifyMode::Off,
+        "an event left out of the list is silenced"
+    );
+
+    // A table sets a mode per event over the table's own mode.
+    let table: RawConfig =
+        toml::from_str("[notify]\nmode = \"off\"\n[notify.events]\nnetwork = \"always\"").unwrap();
+    let r = resolve_no_plugins(table, None);
+    assert_eq!(r.notify.mode_for(NotifyEvent::Network), NotifyMode::Always);
+    assert_eq!(r.notify.mode_for(NotifyEvent::Trust), NotifyMode::Off);
+}
+
+/// With nothing declared, each distinct problem is announced once.
+#[test]
+fn notify_defaults_to_once_for_every_event() {
+    use crate::notify::{NotifyEvent, NotifyMode};
+    let r = resolve_no_plugins(RawConfig::default(), None);
+    for e in NotifyEvent::ALL {
+        assert_eq!(r.notify.mode_for(e), NotifyMode::Once, "{e:?}");
+    }
+    assert_eq!(r.notify_origin, Provenance::Default);
+}
+
+/// A project `[notify]` table with no `mode` refines one event and inherits the rest per event from
+/// the global layer — it must not reset the others to a default.
+#[test]
+fn a_project_notify_table_without_a_mode_inherits_per_event() {
+    use crate::notify::{NotifyEvent, NotifyMode};
+    let global: RawConfig = toml::from_str("notify = \"always\"").unwrap();
+    let project: RawConfig = toml::from_str("[notify]\n[notify.events]\ntask = \"off\"").unwrap();
+    let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+    assert_eq!(r.notify.mode_for(NotifyEvent::Task), NotifyMode::Off);
+    assert_eq!(
+        r.notify.mode_for(NotifyEvent::Network),
+        NotifyMode::Always,
+        "an event the project did not name keeps the global mode"
+    );
+}
+
+/// An untrusted project may not quieten its own refusals — the whole point of the field being
+/// security-gated: silencing the notification is the cheapest way to make a boundary look like it
+/// never bit.
+#[test]
+fn an_untrusted_project_cannot_silence_its_own_refusals() {
+    use crate::notify::{NotifyEvent, NotifyMode};
+    let project: RawConfig = toml::from_str("notify = \"off\"").unwrap();
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+    assert_eq!(
+        r.notify.mode_for(NotifyEvent::Network),
+        NotifyMode::Once,
+        "the default stands; the untrusted project's `off` is dropped"
+    );
+    assert!(r.warnings.iter().any(|w| w.contains("ignoring `notify`")));
+
+    // The same file, trusted, applies.
+    let project: RawConfig = toml::from_str("notify = \"off\"").unwrap();
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+    assert_eq!(r.notify.mode_for(NotifyEvent::Network), NotifyMode::Off);
+}
+
+/// A misspelled event or mode is named, never passed over — a typo that silently meant "never tell
+/// me" would be precisely the failure this field exists to prevent.
+#[test]
+fn an_unknown_notify_event_or_mode_is_named() {
+    use crate::notify::{NotifyEvent, NotifyMode};
+
+    let bad_event: RawConfig =
+        toml::from_str("[notify]\nmode = \"once\"\n[notify.events]\negress = \"always\"").unwrap();
+    let r = resolve_no_plugins(bad_event, None);
+    let named = r
+        .warnings
+        .iter()
+        .any(|w| w.contains("unknown notify event `egress`") && w.contains("network"));
+    assert!(
+        named,
+        "the key and the vocabulary must both be named: {:?}",
+        r.warnings
+    );
+
+    // An unknown *mode* keeps the layer below rather than guessing a quieter one.
+    let bad_mode: RawConfig = toml::from_str("notify = \"one\"").unwrap();
+    let r = resolve_no_plugins(bad_mode, None);
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("unknown notify mode `one`")));
+    assert_eq!(
+        r.notify.mode_for(NotifyEvent::Network),
+        NotifyMode::Once,
+        "an unrecognised mode must never silently disable notifications"
     );
 }

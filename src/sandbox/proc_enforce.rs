@@ -288,8 +288,9 @@ pub(crate) fn start(
     data_dir: &Path,
     shim_bin: &Path,
     policy: ProcPolicy,
+    notifier: Arc<crate::sandbox::notify_sink::Notifier>,
 ) -> io::Result<(ProcEnforce, Wiring)> {
-    start_inner(data_dir, shim_bin, policy, "", true)
+    start_inner(data_dir, shim_bin, policy, "", true, notifier)
 }
 
 /// The same supervisor for **one task invocation**, which differs from a session's in two ways.
@@ -307,6 +308,7 @@ pub(crate) fn start_for_task(
     shim_bin: &Path,
     policy: ProcPolicy,
     invocation: u64,
+    notifier: Arc<crate::sandbox::notify_sink::Notifier>,
 ) -> io::Result<(ProcEnforce, Wiring)> {
     start_inner(
         data_dir,
@@ -314,6 +316,7 @@ pub(crate) fn start_for_task(
         policy,
         &format!(".t{invocation}"),
         false,
+        notifier,
     )
 }
 
@@ -323,6 +326,7 @@ fn start_inner(
     policy: ProcPolicy,
     instance: &str,
     control: bool,
+    notifier: Arc<crate::sandbox::notify_sink::Notifier>,
 ) -> io::Result<(ProcEnforce, Wiring)> {
     use std::os::unix::fs::DirBuilderExt;
     let dir = super::proc_control::proc_control_dir(data_dir);
@@ -377,7 +381,9 @@ fn start_inner(
     let flag = stop.clone();
     let kept = ring.clone();
     let handle = std::thread::spawn(move || {
-        supervise(listener, &flag, &policy, &overlay, &ring, &pending);
+        supervise(
+            listener, &flag, &policy, &overlay, &ring, &pending, &notifier,
+        );
     });
 
     let binds = vec![
@@ -426,13 +432,14 @@ fn supervise(
     overlay: &ProcOverlay,
     ring: &ExecRing,
     pending: &PendingExec,
+    notifier: &crate::sandbox::notify_sink::Notifier,
 ) {
     let notif_fd = match accept_handoff(&listener, stop) {
         Some(fd) => fd,
         None => return, // stopped before the shim connected, or the handoff failed
     };
     drop(listener); // one handoff only; the agent cannot connect a second fd
-    recv_loop(notif_fd, stop, policy, overlay, ring, pending);
+    recv_loop(notif_fd, stop, policy, overlay, ring, pending, notifier);
     // SAFETY: notif_fd is our owned descriptor from recv_fd; closed exactly once here.
     unsafe { libc::close(notif_fd) };
 }
@@ -465,6 +472,7 @@ fn recv_loop(
     overlay: &ProcOverlay,
     ring: &ExecRing,
     pending: &PendingExec,
+    notifier: &crate::sandbox::notify_sink::Notifier,
 ) {
     while !stop.load(Ordering::Relaxed) {
         if !poll_readable(notif_fd, 250) {
@@ -485,7 +493,7 @@ fn recv_loop(
             }
             return; // ENOENT / hang-up: the cage's filter is gone
         }
-        handle_notif(notif_fd, &req, policy, overlay, ring, pending);
+        handle_notif(notif_fd, &req, policy, overlay, ring, pending, notifier);
     }
 }
 
@@ -499,6 +507,7 @@ fn handle_notif(
     overlay: &ProcOverlay,
     ring: &ExecRing,
     pending: &PendingExec,
+    notifier: &crate::sandbox::notify_sink::Notifier,
 ) {
     // Confirm the notification is still live before reading the target's memory (a reaped-and-reused
     // pid would otherwise be read/acted on as the wrong process).
@@ -541,6 +550,27 @@ fn handle_notif(
                 "deny"
             };
             ring.push_verdict(req.pid, by, shown, recorded);
+            // Announce only a refusal of something that was **there**. A `PATH` walk refuses one
+            // candidate per directory it passes through, and announcing those would raise a handful
+            // of notifications every time a program is simply found somewhere other than the first
+            // entry — while the run succeeded and nothing was kept from it. Same rule the refusal
+            // report applies, for the same reason.
+            if recorded == "deny" {
+                notifier.block(crate::notify::Block {
+                    event: crate::notify::NotifyEvent::Proc,
+                    subject: shown.to_string(),
+                    reason: "denied-by-policy".to_string(),
+                    detail: if by.is_empty() {
+                        "the exec policy does not allow this program to run".to_string()
+                    } else {
+                        format!("`{by}` is not allowed to run it by the exec policy")
+                    },
+                    // No `sbx proc allow` suggestion: under `enforce` the rule that refused is a
+                    // deliberate `deny` entry, and a one-line "allow it" would invite undoing the
+                    // very thing that was asked for. `sbx proc logs` is where the decision is read.
+                    fix: String::new(),
+                });
+            }
             respond_errno(notif_fd, req.id, errno);
         }
         Verdict::Ask => {
@@ -989,7 +1019,15 @@ mod tests {
             let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
             let rc = unsafe { libc::ioctl(notif, notif_recv_code() as libc::Ioctl, &mut req) };
             if rc >= 0 {
-                handle_notif(notif, &req, policy, overlay, &ring, &pending);
+                handle_notif(
+                    notif,
+                    &req,
+                    policy,
+                    overlay,
+                    &ring,
+                    &pending,
+                    &crate::sandbox::notify_sink::Notifier::disabled(),
+                );
             }
         }
         let status = child.wait().expect("wait for the shim");

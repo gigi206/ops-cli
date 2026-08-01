@@ -41,6 +41,7 @@ impl fmt::Debug for HeaderInjection {
 /// length-preserving `*`) and a text sink uses to render `${name}` — one needle set, two
 /// renderings. The name is a label, never secret, so `Debug` shows it: it is what makes a redacted
 /// `Debug` line diagnosable.
+#[derive(Clone)]
 pub(crate) struct SecretNeedle {
     name: String,
     bytes: Vec<u8>,

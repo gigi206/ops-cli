@@ -92,6 +92,17 @@ pub(crate) struct RawConfig {
     /// from the global config or a trusted project, ignored from an untrusted one — an untrusted
     /// project may neither forge nor loosen the enforcement of its own agent.
     pub(crate) proc: Option<ProcField>,
+    /// Which refusals sbx announces to the person running it, and how often. Either a bare mode
+    /// string — `"off"`, `"once"` (the default: the first of each distinct problem), or `"always"` —
+    /// or a table adding `events`, which narrows the set (a list) or sets a mode per event (a table).
+    /// The event names are the config sections that govern each refusal: `network`, `proc`,
+    /// `ssh_agent`, `task`, `trust`.
+    ///
+    /// A security field: honored from the global config or a trusted project, ignored from an
+    /// untrusted one. A refusal notification is the one signal that a config's own restrictions are
+    /// biting, so a `.sbx.toml` able to silence it could hide exactly what the boundary was built to
+    /// surface — and would do so from the side the boundary exists to contain.
+    pub(crate) notify: Option<NotifyField>,
     /// The sandbox's GUI posture: `"none"` (the default — no display access), `"offscreen"`
     /// (provision the fonts and — under a filtering egress posture — the NSS CA import a browser
     /// engine needs to render and to trust the proxy, without exposing any display), or
@@ -489,6 +500,11 @@ pub(crate) struct RawApp {
     pub(crate) network: Option<NetworkField>,
     /// The app's process/exec posture, overriding the baseline's when set. A security field.
     pub(crate) proc: Option<ProcField>,
+    /// The app's refusal-notification policy, overriding the baseline's when set. A security field,
+    /// like the baseline `notify`. Carried per app because how much an app's refusals are worth
+    /// hearing is a property of the app: a browser profile refused by the egress policy on every
+    /// third-party asset it loads is noise, while the same refusal from a coding agent is the signal.
+    pub(crate) notify: Option<NotifyField>,
     /// The app's GUI posture, overriding the baseline's when set. A security field, like the
     /// baseline `gui`. An unset `Option` is omitted by TOML on export, so an app with no GUI
     /// need carries no `gui` line.
@@ -1106,6 +1122,46 @@ pub(crate) struct ProcTable {
     pub(crate) allow: Vec<String>,
     #[serde(default)]
     pub(crate) deny: Vec<String>,
+}
+
+/// The two shapes the `notify` field accepts: a bare mode string, or a table for the per-event
+/// settings. An untagged enum so both TOML forms parse — `notify = "off"` and `[notify] mode = "once"`
+/// with `events` — keeping the simple case a one-liner. The string case must come first for serde
+/// untagged to prefer it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum NotifyField {
+    /// `notify = "off"` | `"once"` | `"always"`.
+    Mode(String),
+    /// `[notify] mode = "<mode>"` with an optional `events` list or table.
+    Table(NotifyTable),
+}
+
+/// The table form of the `notify` field: a mode for every event, plus an optional per-event `events`
+/// refinement.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct NotifyTable {
+    /// The mode every event takes unless `events` says otherwise. Absent means "inherit from the
+    /// parent config layer" while keeping this table's own per-event settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) events: Option<NotifyEvents>,
+}
+
+/// The two shapes `events` accepts, an untagged enum so both TOML forms parse.
+///
+/// A list (`events = ["network", "proc"]`) is an **inclusion**: the named events take the table's
+/// mode and every other event is silenced — the short way to say "only tell me about these". A table
+/// (`[notify.events] network = "always"`) sets a mode per event and leaves the unnamed ones on the
+/// table's mode, which is how one noisy lens is turned down without touching the rest.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum NotifyEvents {
+    /// `events = ["network", "proc"]` — these only, at the table's mode.
+    List(Vec<String>),
+    /// `[notify.events] network = "always"` — a mode per named event.
+    Map(BTreeMap<String, String>),
 }
 
 /// How deep [`locate_type_error`] will go looking for the key at fault. Three levels reach a

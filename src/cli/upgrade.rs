@@ -991,6 +991,8 @@ mod tests {
         let rev_a = "a".repeat(40);
         let rev_b = "b".repeat(40);
         let cfg = |global: &str| config::Resolved {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             env: vec![],
             env_layer: Default::default(),

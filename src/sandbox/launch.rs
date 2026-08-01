@@ -43,6 +43,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// The hard prerequisites and per-launch resolution shared by `run` and `shell`:
@@ -4043,6 +4044,53 @@ fn build(
     // below. Its guard forces the supervised path (a live parent for the supervisor thread).
     // Fail-closed: if the supervisor cannot be stood up, the launch is refused rather than running the
     // command unenforced.
+    // The refusal notifier (`[notify]`), stood up before the first lens that can refuse anything and
+    // held for the whole launch. The credential set it redacts against is filled in below, once the
+    // egress proxy has resolved this launch's secrets — the exec supervisor needs the notifier before
+    // that resolution happens, and nothing can be refused in between.
+    let notify_needles: super::notify_sink::Needles = Arc::new(RwLock::new(Vec::new()));
+    // Which sandbox every announcement names. The pid is this launcher's — the one `sbx session ls`
+    // lists and `sbx attach`/`sbx stop` take — so a notification points at something to act on.
+    let notify_origin = crate::notify::Origin {
+        app: match runtime {
+            binds::Runtime::GlobalApp(name) | binds::Runtime::ProjectApp(name) => name.to_string(),
+            binds::Runtime::ProjectDefault => String::new(),
+        },
+        project: prep
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        pid: std::process::id(),
+    };
+    let notify_wiring = Arc::new(super::notify_sink::NotifyWiring {
+        notifier: Arc::new(super::notify_sink::Notifier::start(
+            prep.cfg.notify,
+            Arc::clone(&notify_needles),
+            &notify_origin,
+        )),
+        needles: notify_needles,
+    });
+
+    // The trust lens: a security field this project declared and sbx dropped, because the config
+    // carrying it is not trusted. Announced here, once the notifier exists, because the symptom
+    // otherwise arrives much later and in disguise — a cage that is not shaped the way its config
+    // plainly reads, with the explanation buried in the launch's warning list.
+    for warning in prep
+        .cfg
+        .warnings
+        .iter()
+        .filter(|w| crate::config::is_trust_drop(w))
+    {
+        notify_wiring.notifier.block(crate::notify::Block {
+            event: crate::notify::NotifyEvent::Trust,
+            subject: warning.clone(),
+            reason: "not-trusted".to_string(),
+            detail: String::new(),
+            fix: "sbx trust".to_string(),
+        });
+    }
+
     let mut proc_enforce_guard = None;
     let mut proc_binds: Vec<binds::ExtraBind> = Vec::new();
     if prep.cfg.proc.enforcing() {
@@ -4053,12 +4101,16 @@ fn build(
             eprintln!("sbx: cannot place the exec-enforcement shim: {e}");
             ExitCode::FAILURE
         })?;
-        let (guard, wiring) =
-            super::proc_enforce::start(prep.layout.data_dir(), &shim_bin, prep.cfg.proc.clone())
-                .map_err(|e| {
-                    eprintln!("sbx: cannot start exec enforcement: {e}");
-                    ExitCode::FAILURE
-                })?;
+        let (guard, wiring) = super::proc_enforce::start(
+            prep.layout.data_dir(),
+            &shim_bin,
+            prep.cfg.proc.clone(),
+            Arc::clone(&notify_wiring.notifier),
+        )
+        .map_err(|e| {
+            eprintln!("sbx: cannot start exec enforcement: {e}");
+            ExitCode::FAILURE
+        })?;
         cmd = super::proc_enforce::wrap_command(cmd);
         proc_binds = wiring.binds;
         proc_enforce_guard = Some(guard);
@@ -4266,6 +4318,7 @@ fn build(
             Some(prep.userland.ca_bundle_src.as_path()),
             // The session's own proxy: a launch stands up exactly one, so the pid already names it.
             "",
+            Some(&notify_wiring),
         )
         .map_err(|e| {
             eprintln!("sbx: cannot start the egress filtering proxy: {e}");
@@ -4351,6 +4404,7 @@ fn build(
                             &prep.cfg.ssh_agent,
                             &host_sock,
                             confirm_with,
+                            Arc::clone(&notify_wiring.notifier),
                         )
                         .map_err(|e| {
                             eprintln!("sbx: cannot start the ssh-agent broker: {e}");
@@ -4780,7 +4834,8 @@ fn build(
                     socat: prep.userland.socat_bin.clone(),
                     shell: prep.userland.shell_bin.clone(),
                 },
-            );
+            )
+            .with_notifier(Arc::clone(&notify_wiring));
             // The task tool pool, when any task declares a `mise:` tool. Filled host-side now — a
             // cold fill is minutes long, so it belongs at launch where the user is watching, not
             // inside the first invocation. Best-effort, unlike the `nix:` package path: a pool tool
@@ -5924,6 +5979,8 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     /// A minimal resolved config carrying only the channel choices the builder reads.
     fn resolved(global: Option<&str>, project: Option<&str>) -> crate::config::Resolved {
         crate::config::Resolved {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             env: vec![],
             env_layer: Default::default(),
@@ -5990,6 +6047,8 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         packages: Vec<crate::config::Package>,
     ) -> crate::config::ResolvedApp {
         crate::config::ResolvedApp {
+            notify: None,
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             ssh_agent_origin: Default::default(),
             ssh_agent: Vec::new(),

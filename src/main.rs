@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod diag;
 mod help;
+mod notify;
 mod observe;
 mod pathfind;
 mod paths;

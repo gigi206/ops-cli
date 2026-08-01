@@ -50,6 +50,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `audio` | security | [audio](audio.md) |
 | `dbus` | security | [dbus](dbus.md) |
 | `network` | security | [network](network.md) |
+| `[notify]` | security | [notify](notify.md) |
 | `[secret]` | security | [secret](secret.md) |
 | `[task.<name>]` | security | [task](task.md) |
 | `[app.<name>]` | security overlay | [apps](apps.md) |

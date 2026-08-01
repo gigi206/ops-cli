@@ -688,6 +688,7 @@ pub(crate) fn start(
     allow: &[String],
     host_sock: &Path,
     confirm_with: Option<PathBuf>,
+    notifier: Arc<super::notify_sink::Notifier>,
 ) -> io::Result<(SshAgent, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::DirBuilderExt;
@@ -710,7 +711,8 @@ pub(crate) fn start(
     // **never** bound into the cage. A failure to stand it up is not a reason to refuse the grant:
     // the broker is the fence, the log is the witness — so it degrades to a broker with no reader
     // rather than to no broker at all.
-    let ring = Arc::new(AgentRing::new(super::sshagent_control::AGENT_RING_CAP));
+    let ring =
+        Arc::new(AgentRing::new(super::sshagent_control::AGENT_RING_CAP).with_notifier(notifier));
     let control_uds = dir.join(format!("control-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&control_uds);
     match UnixListener::bind(&control_uds) {

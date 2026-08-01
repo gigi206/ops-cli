@@ -72,6 +72,7 @@ mod fonts;
 mod gpu;
 mod guidata;
 mod notify_relay;
+mod notify_sink;
 mod portal;
 mod theme_relay;
 

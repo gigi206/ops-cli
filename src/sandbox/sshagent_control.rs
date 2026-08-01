@@ -121,6 +121,10 @@ fn sanitize_detail(s: &str) -> String {
 pub(crate) struct AgentRing {
     inner: Mutex<AgentInner>,
     cap: usize,
+    /// Where a refusal is announced (`[notify] events.ssh_agent`), or `None` when the launch wired
+    /// none. Consulted from [`AgentRing::push`] — the one place every outcome passes through — so a
+    /// refusal added later cannot forget to announce itself.
+    notifier: Option<Arc<crate::sandbox::notify_sink::Notifier>>,
 }
 
 struct AgentInner {
@@ -136,12 +140,43 @@ impl AgentRing {
                 events: VecDeque::new(),
             }),
             cap: cap.max(1),
+            notifier: None,
         }
     }
 
     /// Append one decision, assigning the next sequence number and evicting the oldest if the ring
     /// is full. Returns the assigned sequence number.
+    /// Attach the launch's refusal notifier, so a withheld key is said out loud and not only
+    /// recorded for whoever thinks to run `sbx ssh-agent logs`.
+    pub(crate) fn with_notifier(
+        mut self,
+        notifier: Arc<crate::sandbox::notify_sink::Notifier>,
+    ) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
     pub(crate) fn push(&self, kind: AgentKind, detail: &str) -> u64 {
+        // Announce a refusal from here, the single point every outcome passes through. A `list` or a
+        // `sign` is the channel working as granted — only a refusal is the boundary biting, and it is
+        // the one outcome the cage sees as a bare protocol failure it need never mention.
+        if kind == AgentKind::Refuse {
+            if let Some(notifier) = &self.notifier {
+                notifier.block(crate::notify::Block {
+                    event: crate::notify::NotifyEvent::SshAgent,
+                    // The detail is already the whole of what happened — which key, toward which
+                    // destination — so it is the identity a repeat is measured on. Two refusals of
+                    // the same key toward the same host read identically and coalesce; a different
+                    // key, or the same key toward somewhere else, is its own problem.
+                    subject: detail.to_string(),
+                    reason: "withheld".to_string(),
+                    detail: String::new(),
+                    // Nothing to suggest: widening `[ssh_agent] allow` because the cage reached for a
+                    // key it was not given is the opposite of the answer.
+                    fix: String::new(),
+                });
+            }
+        }
         let at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -437,5 +472,90 @@ mod tests {
         let snap = read_agent_log(&sock, Some(snap.head)).expect("the follow read");
         assert_eq!(snap.events.len(), 1);
         assert_eq!(snap.events[0].kind, AgentKind::Refuse);
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+    use crate::notify::{NotifyMode, NotifyPolicy};
+    use crate::sandbox::notify_sink::{Notifier, Sink};
+    use std::sync::Mutex;
+
+    /// Records the summaries a ring's outcomes produced.
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Sink for Recorder {
+        fn deliver(&mut self, summary: &str, body: &str, _replaces: Option<u32>) -> Option<u32> {
+            self.0.lock().unwrap().push(format!("{summary}|{body}"));
+            None
+        }
+    }
+
+    /// Push `events` through a ring wired to a recording notifier, and return what was announced.
+    fn announced(events: &[(AgentKind, &str)]) -> Vec<String> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let notifier = Arc::new(Notifier::recording(
+            NotifyPolicy::uniform(NotifyMode::Once),
+            Box::new(Recorder(Arc::clone(&seen))),
+        ));
+        {
+            let ring = AgentRing::new(16).with_notifier(Arc::clone(&notifier));
+            for (kind, detail) in events {
+                ring.push(*kind, detail);
+            }
+        }
+        // Drop the last reference so the delivery thread drains and joins before we read.
+        drop(
+            Arc::try_unwrap(notifier)
+                .map_err(|_| "the notifier is still shared")
+                .unwrap(),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    }
+
+    #[test]
+    fn only_a_refusal_is_announced() {
+        // A `list` and a `sign` are the channel working exactly as granted — announcing them would
+        // turn every authenticated `git push` into a desktop notification. Only the boundary biting
+        // is worth saying out loud.
+        let out = announced(&[
+            (AgentKind::List, "offered id_ed25519 (1 withheld)"),
+            (AgentKind::Sign, "id_ed25519 toward git@example.com"),
+            (
+                AgentKind::Refuse,
+                "a signature with a key the grant does not name",
+            ),
+        ]);
+        assert_eq!(out.len(), 1, "only the refusal, got {out:?}");
+        assert!(out[0].starts_with("sbx withheld an ssh key|"));
+        assert!(out[0].contains("the grant does not name"));
+    }
+
+    #[test]
+    fn a_refusal_toward_a_different_destination_is_its_own_problem() {
+        // The identity is the whole recorded detail, which carries the destination. Two reaches for
+        // the same withheld key toward *different* hosts are two separate attempts and are each
+        // worth hearing; two identical ones coalesce under `once`.
+        let out = announced(&[
+            (
+                AgentKind::Refuse,
+                "a signature with a key the grant does not name toward a@x",
+            ),
+            (
+                AgentKind::Refuse,
+                "a signature with a key the grant does not name toward b@y",
+            ),
+            (
+                AgentKind::Refuse,
+                "a signature with a key the grant does not name toward a@x",
+            ),
+        ]);
+        assert_eq!(
+            out.len(),
+            2,
+            "two destinations, the repeat coalesced: {out:?}"
+        );
     }
 }

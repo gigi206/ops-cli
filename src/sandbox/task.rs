@@ -223,6 +223,11 @@ pub(crate) struct TaskEngine {
     /// declare `network`, and one that does with no forwarder would find the proxy socket bound, the
     /// proxy variables set, and nothing listening on the port they name.
     forwarder: CageForwarder,
+    /// Where a refusal inside a task invocation is announced, shared with the launch that built this
+    /// engine so a task's refusals reach the same place the session's do. `None` on an inventory-only
+    /// or test engine, which announces nothing; the launch attaches the real wiring with
+    /// [`TaskEngine::with_notifier`].
+    notify: Option<Arc<super::notify_sink::NotifyWiring>>,
 }
 
 /// The two cage programs a task's egress forwarder is built from, named rather than passed as a pair
@@ -361,7 +366,15 @@ impl TaskEngine {
             forwarder,
             output_held: Arc::new(Mutex::new(BTreeSet::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
+            notify: None,
         }
+    }
+
+    /// Attach the launch's refusal notifier, so a program an invocation's `spawn` policy stops is
+    /// announced exactly like one the session's own exec policy stops.
+    pub(crate) fn with_notifier(mut self, notify: Arc<super::notify_sink::NotifyWiring>) -> Self {
+        self.notify = Some(notify);
+        self
     }
 
     /// Point the engine at this project's task tool pool, filled by `mise_bin`. Separate from
@@ -469,6 +482,45 @@ impl TaskEngine {
     /// concurrent invocation of the same one. Deciding that inside the detached thread would hand
     /// back an id for an invocation that died on a refusal its caller never saw.
     pub(crate) fn admit(
+        &self,
+        name: &str,
+        params: &BTreeMap<String, String>,
+        env: &BTreeMap<String, String>,
+        invocation: u64,
+        detached: bool,
+    ) -> Result<Admission, TaskError> {
+        let outcome = self.admit_inner(name, params, env, invocation, detached);
+        // Announce a refused invocation from the one place every admission decision surfaces, rather
+        // than at each `map_err` inside — there are seven, and a eighth added later would otherwise
+        // be silent. Only a *refusal* is announced: an `Io` failure is sbx breaking, not sbx
+        // refusing, and the caller already sees it.
+        if let Some(notify) = &self.notify {
+            let reason = match &outcome {
+                Err(TaskError::Refused(_)) => Some("refused"),
+                Err(TaskError::Unknown(_)) => Some("undeclared"),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                notify.notifier.block(crate::notify::Block {
+                    event: crate::notify::NotifyEvent::Task,
+                    subject: name.to_string(),
+                    reason: reason.to_string(),
+                    detail: match &outcome {
+                        Err(e) => e.to_string(),
+                        Ok(_) => String::new(),
+                    },
+                    // Nothing to suggest: a task is a declaration, and the answer to a refused one is
+                    // to change what is declared beside it — never a one-line command.
+                    fix: String::new(),
+                });
+            }
+        }
+        outcome
+    }
+
+    /// The admission decision itself. Split from [`Self::admit`] so the refusal announcement has one
+    /// place to sit, whatever path inside produced it.
+    fn admit_inner(
         &self,
         name: &str,
         params: &BTreeMap<String, String>,
@@ -602,6 +654,10 @@ impl TaskEngine {
                     &shim,
                     policy,
                     invocation,
+                    self.notify
+                        .as_ref()
+                        .map(|w| Arc::clone(&w.notifier))
+                        .unwrap_or_else(|| Arc::new(super::notify_sink::Notifier::disabled())),
                 )
                 .map_err(TaskError::Io)?;
                 argv = super::proc_enforce::wrap_command(argv);
@@ -625,6 +681,9 @@ impl TaskEngine {
                 false,
                 self.ca_bundle.as_deref(),
                 &format!(".t{invocation}"),
+                // A task's refusals reach the session's notifier, whose needle set this proxy's own
+                // resolved credentials are added to.
+                self.notify.as_deref(),
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;
@@ -2000,6 +2059,7 @@ impl TaskEngine {
     /// in-cage client be tested against the real plane rather than a stand-in for it.
     pub(crate) fn inventory_only(tasks: Vec<crate::config::TaskSpec>) -> Self {
         Self {
+            notify: None,
             bwrap: PathBuf::from("/nonexistent/bwrap"),
             forwarder: CageForwarder {
                 socat: PathBuf::from("/nonexistent/socat"),
@@ -2984,6 +3044,7 @@ mod tests {
     /// needs neither nix nor a kernel.
     fn engine_with_pool(pool: &Path, tasks: Vec<TaskSpec>) -> TaskEngine {
         TaskEngine {
+            notify: None,
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             forwarder: CageForwarder {
                 socat: PathBuf::from("/nix/store/base/bin/socat"),

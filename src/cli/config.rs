@@ -632,6 +632,39 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         }
     }
 
+    // The refusal notifications. Summarised as one mode when every event shares it (the common case,
+    // including the default), and spelled out per event only when they differ — a row that reads
+    // `notify: once` says everything there is to say, while five identical lines would be noise.
+    // `off` for everything is shown too, unlike the postures above: silence is exactly the state a
+    // reader wondering "why was I not told" needs to see.
+    {
+        let n = &view.notify;
+        let uniform = n
+            .events
+            .first()
+            .filter(|(_, first)| n.events.iter().all(|(_, m)| m == first))
+            .map(|(_, m)| m.clone());
+        match uniform {
+            Some(mode) => {
+                let _ = writeln!(
+                    o,
+                    "  {h}notify:{r} {mode}{}",
+                    provenance_tag(view.notify_origin, pal)
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    o,
+                    "  {h}notify:{r} {dim}per event{r}{}",
+                    provenance_tag(view.notify_origin, pal)
+                );
+                for (event, mode) in &n.events {
+                    let _ = writeln!(o, "      {dim}{event}{r} {mode}");
+                }
+            }
+        }
+    }
+
     // The GUI posture — shown only when opened, so a non-GUI config stays uncluttered. `wayland`
     // carries the compositor caveat; `offscreen` names what it supplies, since it exposes nothing.
     match view.gui {
@@ -2073,6 +2106,8 @@ mod tests {
     fn sample_config_view() -> config::view::ConfigView {
         use config::view::*;
         ConfigView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![EnvVar {
@@ -2298,6 +2333,8 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let view = AppDetailView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             name: "demo".into(),
             cwd: "/proj".into(),
@@ -2533,6 +2570,8 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
@@ -2651,6 +2690,8 @@ mod tests {
         // a profile's app-overlay allowlist surfaces what `sbx app <name>` can actually reach.
         use config::view::*;
         let view = ConfigView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
@@ -2785,6 +2826,8 @@ mod tests {
             notes: vec![],
         };
         let view = ConfigView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
@@ -2858,6 +2901,8 @@ mod tests {
         // profile's credential surfaces in `sbx config` (the baseline `secrets` section is empty).
         use config::view::*;
         let view = ConfigView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
@@ -2968,6 +3013,8 @@ mod tests {
         // profile's overlay env/binds surface, mirroring the baseline `env`/`binds` sections.
         use config::view::*;
         let view = ConfigView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],
@@ -3078,6 +3125,8 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
             env: vec![],

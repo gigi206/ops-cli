@@ -216,6 +216,12 @@ pub(crate) struct Resolved {
     pub(crate) proc: crate::proc_policy::ProcPolicy,
     /// Which layer supplied the winning `proc` posture (`Default` when neither config set it).
     pub(crate) proc_origin: Provenance,
+    /// The resolved refusal-notification policy: the default (`once` for every event) unless the
+    /// global config or a trusted project set one. An untrusted project's choice is dropped with a
+    /// warning — it may not silence the announcement of the refusals it provokes.
+    pub(crate) notify: crate::notify::NotifyPolicy,
+    /// Which layer supplied the winning `notify` policy (`Default` when neither config set it).
+    pub(crate) notify_origin: Provenance,
     /// The resolved GUI posture: the default (`None`) unless the global config or a trusted
     /// project asked for `"wayland"`. An untrusted project's choice is dropped with a warning
     /// — it may not open a display.
@@ -357,6 +363,9 @@ pub(crate) struct ResolvedApp {
     /// The app's own process/exec posture, set only when a trusted source declared one. `Some`
     /// overrides the baseline; `None` leaves the baseline posture in place.
     pub(crate) proc: Option<crate::proc_policy::ProcPolicy>,
+    /// The app's own refusal-notification policy, set only when a trusted source declared one.
+    /// `Some` overrides the baseline; `None` leaves the baseline policy in place.
+    pub(crate) notify: Option<crate::notify::NotifyPolicy>,
     /// The app's own GUI posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place.
     pub(crate) gui: Option<GuiPolicy>,
@@ -414,6 +423,7 @@ pub(crate) struct ResolvedApp {
     pub(crate) cmd_origin: Provenance,
     pub(crate) network_origin: Provenance,
     pub(crate) proc_origin: Provenance,
+    pub(crate) notify_origin: Provenance,
     pub(crate) gui_origin: Provenance,
     pub(crate) gpu_origin: Provenance,
     pub(crate) audio_origin: Provenance,
@@ -481,6 +491,11 @@ impl Resolved {
         // policy for its own agent); otherwise the baseline's stands.
         if let Some(proc) = app.proc {
             self.proc = proc;
+        }
+        // The app's notification policy replaces the baseline's when it declared one — how loud an
+        // app's own refusals are is the app's property, not the project's.
+        if let Some(notify) = app.notify {
+            self.notify = notify;
         }
         if let Some(gui) = app.gui {
             self.gui = gui;
@@ -618,6 +633,7 @@ impl Resolved {
             devices,
             ssh_agent,
             proc,
+            notify,
             // The channel is applied earlier (before the lock is chosen); groups/apps/bundles are
             // not launch-shaping and were noticed and dropped at collection time (a bundle is only
             // ever reached through an app's `use`, and an override declares no app). An override's
@@ -648,9 +664,11 @@ impl Resolved {
         let (scalars, fatal) = build_override_scalars(
             &self.network,
             &self.proc,
+            &self.notify,
             network,
             gui,
             proc,
+            notify,
             limits,
             &mut notes,
         );
@@ -661,6 +679,7 @@ impl Resolved {
             network: new_network,
             gui: new_gui,
             proc: new_proc,
+            notify: new_notify,
             limits: new_limits,
         } = scalars;
 
@@ -733,6 +752,13 @@ impl Resolved {
         if let Some(policy) = new_proc {
             self.proc = policy;
             self.proc_origin = Provenance::Override;
+        }
+        // `notify` — how loudly this launch's refusals are announced, validated above (a bad mode is
+        // fatal, like `proc`). Trusted by invocation and the final word: silencing a lens for one run
+        // is the invoker's call, and they are the person the notification is for.
+        if let Some(policy) = new_notify {
+            self.notify = policy;
+            self.notify_origin = Provenance::Override;
         }
         // `gpu` — a bool, so no value can be invalid (unlike `gui`/`network`); apply directly. The
         // override is trusted by invocation and the final word, so it may open or close GPU for this
@@ -839,9 +865,11 @@ impl Resolved {
         let (_, fatal) = build_override_scalars(
             &self.network,
             &self.proc,
+            &self.notify,
             ov.raw.network.clone(),
             ov.raw.gui.clone(),
             ov.raw.proc.clone(),
+            ov.raw.notify.clone(),
             ov.raw.limits.clone(),
             &mut notes,
         );
@@ -864,6 +892,8 @@ struct OverrideScalars {
     gui: Option<GuiPolicy>,
     /// The resolved process/exec posture (`Some` only when the override set `proc` and it validated).
     proc: Option<crate::proc_policy::ProcPolicy>,
+    /// The resolved notification policy (`Some` only when the override set `notify` and it validated).
+    notify: Option<crate::notify::NotifyPolicy>,
     limits: Option<crate::sandbox::cgroup::Limits>,
 }
 
@@ -875,9 +905,11 @@ struct OverrideScalars {
 fn build_override_scalars(
     baseline: &NetworkPolicy,
     baseline_proc: &crate::proc_policy::ProcPolicy,
+    baseline_notify: &crate::notify::NotifyPolicy,
     network: Option<NetworkField>,
     gui: Option<String>,
     proc: Option<schema::ProcField>,
+    notify: Option<schema::NotifyField>,
     limits: Option<schema::RawLimits>,
     notes: &mut Vec<String>,
 ) -> (OverrideScalars, Vec<String>) {
@@ -908,6 +940,15 @@ fn build_override_scalars(
         match validate_proc(notes, OVERRIDE_SOURCE, field, baseline_proc) {
             Some(policy) => scalars.proc = Some(policy),
             None => fatal.push("proc".to_string()),
+        }
+    }
+    // `notify` — a mode-less `[notify]` table inherits per event from `baseline_notify`; an *unknown*
+    // mode is fatal, like `proc`. Keeping the baseline on a typo could leave a launch quieter than the
+    // invoker's intent, which is the one direction this feature must never fail in.
+    if let Some(field) = notify {
+        match validate_notify(notes, OVERRIDE_SOURCE, field, baseline_notify) {
+            Some(policy) => scalars.notify = Some(policy),
+            None => fatal.push("notify".to_string()),
         }
     }
     if let Some(raw_limits) = limits {
@@ -1098,6 +1139,19 @@ fn resolve(
             policy
         }
         None => crate::proc_policy::ProcPolicy::off(),
+    };
+    // The notification policy is trusted by location at the global layer. `parent` is the built-in
+    // default (every event `once`) — the global layer has no lower config to inherit from.
+    let mut notify_origin = Provenance::Default;
+    let mut notify = match global
+        .notify
+        .and_then(|v| validate_notify(&mut warnings, GLOBAL_CONFIG, v, &Default::default()))
+    {
+        Some(policy) => {
+            notify_origin = Provenance::Global;
+            policy
+        }
+        None => crate::notify::NotifyPolicy::default(),
     };
     let mut gui_origin = Provenance::Default;
     let mut gui = match global
@@ -1333,6 +1387,25 @@ fn resolve(
                 ));
             }
         }
+        // `notify` is a security field — a trusted project may tune how loudly its own refusals are
+        // announced; an untrusted one may not, since silencing the notification is the cheapest way
+        // to make a boundary look like it never bit.
+        if let Some(value) = proj.notify {
+            if trusted {
+                // A project `[notify]` table without a `mode` inherits per event from the resolved
+                // global policy, so refining one lens leaves the others as the global layer set them.
+                if let Some(policy) = validate_notify(&mut warnings, PROJECT_CONFIG, value, &notify)
+                {
+                    notify = policy;
+                    notify_origin = Provenance::Project;
+                }
+            } else {
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `notify` policy ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
         // `gui` is a security field — a trusted project may open a display; an untrusted or
         // changed one may not (exposing a compositor socket is a confidentiality and integrity
         // choice an untrusted project must not make).
@@ -1561,6 +1634,7 @@ fn resolve(
         &net_groups,
         &network,
         &proc,
+        &notify,
         plugins,
     );
 
@@ -1588,6 +1662,8 @@ fn resolve(
         egress_stats,
         proc,
         proc_origin,
+        notify,
+        notify_origin,
         gui,
         gui_origin,
         gpu,
@@ -2105,6 +2181,7 @@ fn resolve_apps(
     net_groups: &NetGroups,
     baseline_network: &NetworkPolicy,
     baseline_proc: &crate::proc_policy::ProcPolicy,
+    baseline_notify: &crate::notify::NotifyPolicy,
     plugins: &PluginRegistry,
 ) -> BTreeMap<String, ResolvedApp> {
     let (mut project_apps, project_state) = match project_apps {
@@ -2137,6 +2214,7 @@ fn resolve_apps(
             net_groups,
             baseline_network,
             baseline_proc,
+            baseline_notify,
             plugins,
         );
         out.insert(name, resolved);
@@ -2177,6 +2255,7 @@ fn resolve_app(
     net_groups: &NetGroups,
     baseline_network: &NetworkPolicy,
     baseline_proc: &crate::proc_policy::ProcPolicy,
+    baseline_notify: &crate::notify::NotifyPolicy,
     plugins: &PluginRegistry,
 ) -> ResolvedApp {
     let mut warnings = Vec::new();
@@ -2189,6 +2268,7 @@ fn resolve_app(
     // Every Mode-B app reads by default ({GET,HEAD}); a trusted layer's `default_methods` overrides it.
     let mut default_methods = builtin_app_default_methods();
     let mut proc: Option<crate::proc_policy::ProcPolicy> = None;
+    let mut notify: Option<crate::notify::NotifyPolicy> = None;
     let mut gui: Option<GuiPolicy> = None;
     let mut gpu: Option<bool> = None;
     let mut audio: Option<bool> = None;
@@ -2226,6 +2306,7 @@ fn resolve_app(
     let mut cmd_origin = Provenance::Default;
     let mut network_origin = Provenance::Default;
     let mut proc_origin = Provenance::Default;
+    let mut notify_origin = Provenance::Default;
     let mut gui_origin = Provenance::Default;
     let mut gpu_origin = Provenance::Default;
     let mut audio_origin = Provenance::Default;
@@ -2277,6 +2358,15 @@ fn resolve_app(
             if let Some(policy) = validate_proc(&mut warnings, &source, field, parent) {
                 proc = Some(policy);
                 proc_origin = Provenance::Global;
+            }
+        }
+        if let Some(field) = app.notify {
+            // A table without a mode inherits per event from the app's own policy so far, else the
+            // baseline.
+            let parent = notify.as_ref().unwrap_or(baseline_notify);
+            if let Some(policy) = validate_notify(&mut warnings, &source, field, parent) {
+                notify = Some(policy);
+                notify_origin = Provenance::Global;
             }
         }
         if let Some(value) = app.gui {
@@ -2443,6 +2533,22 @@ fn resolve_app(
             } else {
                 warnings.push(format!(
                     "{source}: ignoring `proc` policy ({})",
+                    untrusted_reason(state)
+                ));
+            }
+        }
+        // `notify` mirrors `proc`: an untrusted project may not quieten an app's refusals, on its own
+        // app or by overriding a trusted one — the announcement is how a refusal is seen at all.
+        if let Some(field) = app.notify {
+            if trusted {
+                let parent = notify.as_ref().unwrap_or(baseline_notify);
+                if let Some(policy) = validate_notify(&mut warnings, &source, field, parent) {
+                    notify = Some(policy);
+                    notify_origin = Provenance::Project;
+                }
+            } else {
+                warnings.push(format!(
+                    "{source}: ignoring `notify` policy ({})",
                     untrusted_reason(state)
                 ));
             }
@@ -2678,6 +2784,7 @@ fn resolve_app(
         packages,
         network,
         proc,
+        notify,
         gui,
         gpu,
         audio,
@@ -2694,6 +2801,7 @@ fn resolve_app(
         cmd_origin,
         network_origin,
         proc_origin,
+        notify_origin,
         gui_origin,
         gpu_origin,
         audio_origin,
@@ -3392,6 +3500,21 @@ pub(crate) fn untrusted_reason(state: TrustState) -> &'static str {
     }
 }
 
+/// What every dropped-for-want-of-trust warning points its reader at, and nothing else in a
+/// resolution does.
+///
+/// The marker is the *remedy*, not the wording of any one reason, because there is more than one
+/// producer: [`untrusted_reason`] phrases it one way and [`dropped_binds_warning`] another, and a
+/// third added later will phrase it a third. Matching on a single reason's exact text would silently
+/// stop covering the others — which is a failure of **silence**, the one thing nothing else catches.
+/// A test pins every producer against this.
+const TRUST_DROP_MARKER: &str = "`sbx trust`";
+
+/// Whether a resolution warning is a security field dropped for want of trust.
+pub(crate) fn is_trust_drop(warning: &str) -> bool {
+    warning.contains(TRUST_DROP_MARKER)
+}
+
 /// Validate a `nixpkgs` override source, returning it when well-formed and warning
 /// when not. Dropping a malformed source keeps a bad value from reaching nix.
 fn validate_nixpkgs(
@@ -3464,6 +3587,116 @@ fn validate_proc(
         None => parent.mode,
     };
     Some(ProcPolicy::new(mode, &allow, &deny))
+}
+
+/// Validate a `notify` field — either a bare mode string or a `[notify]` table — into a resolved
+/// per-event policy, warning on anything unrecognized.
+///
+/// `parent` is the layer immediately below (the default for the global layer, the resolved baseline
+/// for a project or app). A table that omits `mode` inherits `parent` **per event**, so a
+/// `[notify.events]` refining one lens leaves the others exactly as the layer below left them.
+///
+/// Two failure shapes, deliberately different:
+/// - an unknown **mode** returns `None`, keeping the layer below rather than guessing — a typo must
+///   never silently decide how loud the boundary is;
+/// - an unknown **event name** is named in a warning and skipped, since one bad key is no reason to
+///   discard the settings written beside it.
+fn validate_notify(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    field: crate::config::schema::NotifyField,
+    parent: &crate::notify::NotifyPolicy,
+) -> Option<crate::notify::NotifyPolicy> {
+    use crate::config::schema::{NotifyEvents, NotifyField};
+    use crate::notify::{NotifyEvent, NotifyMode, NotifyPolicy};
+
+    /// Parse a mode, naming the offending value and the key it was written under.
+    fn mode_of(
+        warnings: &mut Vec<String>,
+        source_label: &str,
+        key: &str,
+        s: &str,
+    ) -> Option<NotifyMode> {
+        match NotifyMode::parse(s) {
+            Some(m) => Some(m),
+            None => {
+                warnings.push(format!(
+                    "{source_label}: ignoring unknown notify mode `{s}` for `{key}` \
+                     (expected \"off\", \"once\", or \"always\")"
+                ));
+                None
+            }
+        }
+    }
+
+    let (mode_str, events) = match field {
+        NotifyField::Mode(m) => (Some(m), None),
+        NotifyField::Table(t) => (t.mode, t.events),
+    };
+
+    // The mode this layer sets for every event, or `None` to keep the parent's per-event modes.
+    let base = match mode_str {
+        Some(m) => match NotifyMode::parse(&m) {
+            Some(mode) => Some(mode),
+            None => {
+                warnings.push(format!(
+                    "{source_label}: ignoring unknown notify mode `{m}` \
+                     (expected \"off\", \"once\", or \"always\")"
+                ));
+                return None;
+            }
+        },
+        None => None,
+    };
+
+    let policy = match events {
+        // A list is an inclusion: the named events keep speaking, everything else goes quiet. Each
+        // named event takes this layer's mode, or — with no `mode` written — the one it already had,
+        // so `events = [...]` alone narrows *which* refusals are announced without also changing how
+        // often.
+        Some(NotifyEvents::List(names)) => {
+            let mut policy = NotifyPolicy::uniform(NotifyMode::Off);
+            for name in names {
+                match NotifyEvent::parse(&name) {
+                    Some(event) => {
+                        policy = policy.with_event(event, base.unwrap_or(parent.mode_for(event)));
+                    }
+                    None => warnings.push(unknown_notify_event(source_label, &name)),
+                }
+            }
+            policy
+        }
+        // A table names a mode per event over this layer's base (or the parent, unchanged).
+        Some(NotifyEvents::Map(map)) => {
+            let mut policy = base.map(NotifyPolicy::uniform).unwrap_or(*parent);
+            for (name, value) in map {
+                match NotifyEvent::parse(&name) {
+                    Some(event) => {
+                        if let Some(mode) = mode_of(warnings, source_label, &name, &value) {
+                            policy = policy.with_event(event, mode);
+                        }
+                    }
+                    None => warnings.push(unknown_notify_event(source_label, &name)),
+                }
+            }
+            policy
+        }
+        None => base.map(NotifyPolicy::uniform).unwrap_or(*parent),
+    };
+    Some(policy)
+}
+
+/// The warning for an event name no lens answers to. Names the key *and* the vocabulary, because the
+/// names are the config sections and a reader who guessed `egress` needs to be told it is `network`.
+fn unknown_notify_event(source_label: &str, name: &str) -> String {
+    let known: Vec<&str> = crate::notify::NotifyEvent::ALL
+        .iter()
+        .map(|e| e.as_str())
+        .collect();
+    format!(
+        "{source_label}: ignoring unknown notify event `{name}` (expected one of: {})",
+        known.join(", ")
+    )
 }
 
 /// Validate a `network` field — either a posture string or a `[network]` table — mapping it to a

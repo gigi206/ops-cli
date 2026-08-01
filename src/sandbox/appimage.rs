@@ -895,6 +895,8 @@ mod tests {
 
     fn app_with(packages: Vec<crate::config::Package>) -> crate::config::ResolvedApp {
         crate::config::ResolvedApp {
+            notify: None,
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             ssh_agent_origin: Default::default(),
             ssh_agent: Vec::new(),
@@ -937,6 +939,8 @@ mod tests {
         apps: Vec<(&str, crate::config::ResolvedApp)>,
     ) -> crate::config::Resolved {
         crate::config::Resolved {
+            notify: Default::default(),
+            notify_origin: Default::default(),
             ssh_agent_confirm: false,
             env: vec![],
             env_layer: Default::default(),

@@ -46,12 +46,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Client proxy onto the **host** notifications daemon. Owned argument types (`Vec<String>`,
 /// `HashMap<String, OwnedValue>`) so a forwarded call needs no lifetime juggling — the `a{sv}` hints
 /// dictionary serialises identically whether its values are borrowed or owned.
+///
+/// Shared with [`super::notify_sink`], which raises sbx's *own* refusal notifications on the host
+/// bus. The two have nothing else in common — this relay exists only under a private in-cage bus,
+/// the sink runs on any launch — so what is shared is the interface declaration alone, not a
+/// lifecycle.
 #[proxy(
     interface = "org.freedesktop.Notifications",
     default_service = "org.freedesktop.Notifications",
     default_path = "/org/freedesktop/Notifications"
 )]
-trait HostNotifications {
+pub(crate) trait HostNotifications {
     #[allow(clippy::too_many_arguments)]
     fn notify(
         &self,
