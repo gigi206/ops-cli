@@ -16,9 +16,16 @@
 //!   is *not* tried — a resolver error must never silently downgrade to a weaker source). The
 //!   absent-vs-resolved split is applied by the caller's shared `classify_value`, so a plugin is
 //!   uniform with the `env`/`file`/`sops` built-ins and is safe in a non-terminal chain position.
+//! - **stderr** is the program's diagnostic channel and must never carry the value. It is folded
+//!   into the error of a failed run, and relayed as a warning when a run resolves *nothing* — so a
+//!   plugin can say *why* it found nothing (a misspelled entry, an empty field) without turning a
+//!   fall-through into a hard failure. A run that resolves a value stays silent: relaying its
+//!   stderr could put a plaintext a careless plugin logged in front of the user.
 //!
-//! The plaintext lives only in sbx's own memory (host-side, in the trusted computing base) and
-//! is never logged: a failure folds the plugin's *stderr* into the error, never its stdout.
+//! The plaintext lives only in sbx's own memory (host-side, in the trusted computing base) and is
+//! never logged: neither the error nor the warning ever carries the plugin's stdout. What is
+//! relayed is reduced to one bounded line first — a plugin is third-party code, and a diagnostic
+//! is the wrong place to let it drive the user's terminal with escape sequences.
 //!
 //! The cage is built from the audited [`SandboxSpec`]/[`to_argv`] keystone, so every cage gets
 //! the unconditional hardening (all namespaces, dropped capabilities, a cleared environment, a
@@ -86,8 +93,7 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
 
     if !out.status.success() {
         // Fold in the plugin's stderr (its diagnostics) but never its stdout (the plaintext).
-        let detail = String::from_utf8_lossy(&out.stderr);
-        let detail = detail.trim();
+        let detail = one_line_detail(&out.stderr);
         return Err(io::Error::other(format!(
             "the `{}` resolver plugin failed{}",
             plugin.scheme,
@@ -99,12 +105,67 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
         )));
     }
 
-    String::from_utf8(out.stdout).map_err(|_| {
+    let value = String::from_utf8(out.stdout).map_err(|_| {
         io::Error::other(format!(
             "the `{}` resolver plugin produced output that is not valid UTF-8",
             plugin.scheme
         ))
-    })
+    })?;
+
+    // This run resolved nothing, so the caller is about to fall through in silence. Relay the
+    // plugin's own account of why: a misspelled locator and a source that genuinely does not hold
+    // the secret are otherwise indistinguishable, and only the plugin can tell them apart.
+    if let Some(detail) = absent_detail(&value, &out.stderr) {
+        crate::diag::warn(&format!(
+            "the `{}` resolver plugin resolved nothing: {detail}",
+            plugin.scheme
+        ));
+    }
+    Ok(value)
+}
+
+/// The longest plugin diagnostic sbx repeats. A resolver's stderr is text of its own choosing, so
+/// bound how much of it can reach a terminal or a log line.
+const DETAIL_MAX: usize = 200;
+
+/// Reduce a plugin's stderr to one safe display line: control characters (a newline that would
+/// forge a second diagnostic, an escape that would drive the terminal) become spaces, runs of
+/// whitespace collapse, and the result is truncated. Never rejects — a diagnostic is a label, so a
+/// sloppy one is cleaned rather than dropped. Non-UTF-8 bytes are replaced, not refused: a plugin
+/// that garbles its own message must still be able to name the problem.
+fn one_line_detail(raw: &[u8]) -> String {
+    let cleaned: String = String::from_utf8_lossy(raw)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out = String::with_capacity(cleaned.len());
+    for word in cleaned.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.chars().count() > DETAIL_MAX {
+        out = out.chars().take(DETAIL_MAX - 1).collect::<String>() + "…";
+    }
+    out
+}
+
+/// The diagnostic to relay for a **successful** run, or `None` for silence. Pure, so the rule that
+/// decides whether a plugin gets a voice is testable without launching bubblewrap.
+///
+/// A run that produced a value has nothing to explain and is kept silent — its stderr is dropped
+/// rather than repeated, because a careless plugin that logged the secret there would otherwise put
+/// the plaintext in front of the user. Only a run that produced **nothing** speaks, and "nothing"
+/// is decided by the very rule the caller classifies values with
+/// ([`super::egress::strip_trailing_line_ending`]), so the warning cannot disagree with the
+/// fall-through it explains.
+fn absent_detail(stdout: &str, stderr: &[u8]) -> Option<String> {
+    if !super::egress::strip_trailing_line_ending(stdout).is_empty() {
+        return None;
+    }
+    let detail = one_line_detail(stderr);
+    (!detail.is_empty()).then_some(detail)
 }
 
 /// Read each declared `allow_env` variable from sbx's environment, keeping only the ones that
@@ -381,6 +442,86 @@ mod tests {
         // this empty string into a fall-through to the next source.
         let (_dir, p) = fake_resolver("exit 0");
         assert_eq!(run(&bwrap, &p, "test://x").expect("absent is exit 0"), "");
+    }
+
+    // --- what a plugin is allowed to say -------------------------------------------
+
+    #[test]
+    fn a_run_that_resolved_a_value_never_repeats_its_stderr() {
+        // The load-bearing half: a plugin that logged the secret to stderr must not have it echoed
+        // back at the user just because it was chatty. The trailing newline case matters too — the
+        // caller strips one before classifying, so "resolved" must be read the same way here.
+        assert_eq!(
+            absent_detail("the-secret", b"debug: opened the vault"),
+            None
+        );
+        assert_eq!(absent_detail("the-secret\n", b"debug: the-secret"), None);
+    }
+
+    #[test]
+    fn a_run_that_resolved_nothing_relays_the_plugins_account() {
+        assert_eq!(
+            absent_detail("", b"entry 'agents/githb' is not in the vault\n"),
+            Some("entry 'agents/githb' is not in the vault".to_string())
+        );
+        // A bare line ending is the same "absent" the caller sees, so the plugin still gets a voice.
+        assert_eq!(
+            absent_detail("\n", b"the `password` field is empty"),
+            Some("the `password` field is empty".to_string())
+        );
+    }
+
+    #[test]
+    fn an_absent_run_from_a_silent_plugin_says_nothing() {
+        // Nothing to relay must stay nothing — never an empty `resolved nothing:` line.
+        assert_eq!(absent_detail("", b""), None);
+        assert_eq!(absent_detail("", b"  \n \t "), None);
+    }
+
+    #[test]
+    fn a_relayed_diagnostic_is_one_bounded_line() {
+        // A plugin's text reaches a terminal: no escape may survive to drive it, and no newline may
+        // forge a second diagnostic line.
+        let out = one_line_detail(b"\x1b[31mred\x1b[0m\nsecond line");
+        assert!(!out.contains('\u{1b}'), "{out}");
+        assert!(!out.contains('\n'), "{out}");
+        assert_eq!(out, "[31mred [0m second line");
+
+        let long = one_line_detail(&b"a".repeat(DETAIL_MAX * 2));
+        assert_eq!(long.chars().count(), DETAIL_MAX);
+        assert!(long.ends_with('…'), "{long}");
+    }
+
+    #[test]
+    fn run_returns_the_value_of_a_chatty_plugin_untouched() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        // A plugin that logs while it resolves. The value comes back verbatim, and the run is not
+        // an absent — so the runner stays silent about that stderr rather than repeating a line in
+        // which a careless plugin put the plaintext.
+        let (_dir, p) = fake_resolver("printf 'the-secret' ; echo 'debug: the-secret' >&2");
+        assert_eq!(
+            run(&bwrap, &p, "test://x").expect("the resolver should run"),
+            "the-secret"
+        );
+    }
+
+    #[test]
+    fn run_sanitizes_the_stderr_it_folds_into_an_error() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let (_dir, p) = fake_resolver("printf 'boom\\033[2J\\nsbx: fake line' >&2 ; exit 3");
+        let err = run(&bwrap, &p, "test://x").unwrap_err().to_string();
+        assert!(err.contains("boom"), "{err}");
+        assert!(
+            !err.contains('\u{1b}'),
+            "no escape reaches the terminal: {err}"
+        );
+        assert!(!err.contains('\n'), "no forged second line: {err}");
     }
 
     #[test]

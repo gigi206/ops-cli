@@ -940,13 +940,21 @@ fn run_sops(
     classify_value(value, header, &format!("sops {}", file.display()))
 }
 
+/// Strip the single trailing line ending a source's raw output commonly carries and which is not
+/// part of the secret (a file's last newline, a program's `echo`). The one definition of that rule:
+/// the resolver runner reads it too, so "this source resolved nothing" means the same thing when a
+/// value is classified and when a plugin's silence is explained.
+pub(super) fn strip_trailing_line_ending(s: &str) -> &str {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    s.strip_suffix('\r').unwrap_or(s)
+}
+
 /// Trim and classify a value read from a source: strip a single trailing line ending (a file
 /// commonly ends in one), then an empty result is a clean **absent** (`Ok(None)` — fall through to
 /// the next source), while an embedded CR/LF/NUL is a **hard** error (`Err`) — it cannot be an HTTP
 /// header value, and a found-but-malformed secret must fail closed rather than fall through.
 fn classify_value(raw: String, header: &str, label: &str) -> io::Result<Option<String>> {
-    let trimmed = raw.strip_suffix('\n').unwrap_or(&raw);
-    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+    let trimmed = strip_trailing_line_ending(&raw);
     if trimmed.is_empty() {
         return Ok(None);
     }
@@ -1931,6 +1939,51 @@ mod tests {
         assert_eq!(injs[0].value, "Bearer ghp-from-the-plugin");
         assert_eq!(needles.len(), 1);
         assert_eq!(needles[0].as_bytes(), b"ghp-from-the-plugin");
+    }
+
+    #[test]
+    fn a_plugin_that_resolves_nothing_falls_through_to_the_next_source() {
+        // A resolver that exits 0 with nothing is an *absent*, even when it explains itself on
+        // stderr — the diagnostic the runner relays must not turn a fall-through into a failure,
+        // or a plugin could never be anything but the last source in a chain.
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            eprintln!("skipping plugin fall-through: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let dir = TmpDir::new();
+        let exec = dir.join("resolve");
+        std::fs::write(
+            &exec,
+            "#!/bin/sh\necho \"no entry for ${1#test://}\" >&2\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plugin = crate::plugins::ResolverPlugin {
+            name: "test".into(),
+            scheme: "test".into(),
+            dir: dir.path().to_path_buf(),
+            exec,
+            sandbox: crate::plugins::SandboxGrant::default(),
+            version: None,
+            description: None,
+        };
+        std::env::set_var("SBX_TEST_CHAIN_FALLBACK", "from-the-next-source");
+        let value = resolve_chain(
+            &[
+                SecretSource::Plugin {
+                    plugin,
+                    locator: "missing".into(),
+                },
+                SecretSource::Env("SBX_TEST_CHAIN_FALLBACK".into()),
+            ],
+            "Authorization",
+            Path::new("/"),
+            &bwrap,
+        );
+        std::env::remove_var("SBX_TEST_CHAIN_FALLBACK");
+        assert_eq!(value.unwrap(), "from-the-next-source");
     }
 
     #[test]

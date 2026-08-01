@@ -51,6 +51,30 @@ network     = false                # true = reach the network; false = empty net
   see [the cage's environment is not readable by other
   users](../concepts/security-model.md#the-cages-environment-is-not-readable-by-other-users).
 
+### The execution contract
+
+The runner passes the **full reference** as the executable's single argument
+(`argv[1]` — e.g. `vault://secret/data/ci#token`) and reads the outcome from the
+exit status and the output streams:
+
+| Outcome | Exit | stdout | Effect |
+| --- | --- | --- | --- |
+| resolved | `0` | the plaintext | the secret is used (one trailing line ending is stripped) |
+| absent | `0` | empty | a clean fall-through to the next source in the `from` chain |
+| failed | non-zero | ignored | a hard, fail-closed error — the launch aborts, and the next source is **not** tried |
+
+`stdin` is closed, so a resolver can never prompt for anything: everything it
+needs must come from its `[sandbox]` grant.
+
+**stderr is the diagnostic channel, and must never carry the value.** It is
+folded into the error of a failed run, and relayed as an `sbx: warning:` line
+when a run resolves *nothing* — so a plugin can explain a misspelled locator or
+an empty field without turning a fall-through into a hard failure. A run that
+returns a value stays silent, so a plugin that logs to stderr cannot echo a
+plaintext back at you. What is relayed is first reduced to a single bounded line
+with control characters removed, since a plugin's own text must not be able to
+drive your terminal.
+
 ### The registry is trusted by location, and fail-closed
 
 Plugins live under the owner-only (`0700`) data directory, which a project (which
