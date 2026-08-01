@@ -1213,6 +1213,27 @@ fn render_app_detail(
         view.proc.deny.len()
     );
 
+    // The effective refusal notifications — shown even when every event agrees, so the inherited
+    // story is visible, and spelled out per event only when they differ.
+    let notify_tag = app_provenance_tag(view.notify_origin, pal);
+    let uniform = view
+        .notify
+        .events
+        .first()
+        .filter(|(_, first)| view.notify.events.iter().all(|(_, m)| m == first))
+        .map(|(_, m)| m.clone());
+    match uniform {
+        Some(mode) => {
+            let _ = writeln!(o, "  {h}notify:{r}  {mode}{notify_tag}");
+        }
+        None => {
+            let _ = writeln!(o, "  {h}notify:{r}  {dim}per event{r}{notify_tag}");
+            for (event, mode) in &view.notify.events {
+                let _ = writeln!(o, "      {dim}{event}{r} {mode}");
+            }
+        }
+    }
+
     // The effective GUI posture — shown even when `none`, so the inherited story is visible.
     let gui_tag = app_provenance_tag(view.gui_origin, pal);
     match view.gui {
