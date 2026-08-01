@@ -18,8 +18,10 @@
 //! ## Modes
 //!
 //! Per event, one of [`NotifyMode`]: `off` (silent), `once` (the first of each distinct problem, then
-//! quiet), `always` (every occurrence). `once` is the default: a distinct problem is worth saying, and
-//! saying it a second time only trains its reader to dismiss it.
+//! quiet), `always` (every occurrence). `always` is the default, and is affordable because a repeat
+//! **revises** the notification already on screen rather than adding one — so the difference from
+//! `once` is that a problem still happening keeps saying so, not that the desktop fills up. `once`
+//! is there for the reader who wants each problem stated exactly once and never again.
 //!
 //! ## What "the same problem" means
 //!
@@ -115,11 +117,12 @@ pub(crate) enum NotifyMode {
     /// logs`) — only the notification is withheld.
     Off,
     /// The first occurrence of each distinct problem, then silence for that problem.
-    #[default]
     Once,
-    /// Every occurrence. A chatty agent against a restrictive policy can produce a great many, so the
-    /// sink coalesces repeats onto one notification rather than stacking them (see
-    /// [`Coalescer::decide`]).
+    /// Every occurrence — the default. A repeat does not stack a second toast: it updates the one
+    /// already on screen through `replaces_id` (see [`Coalescer::decide`]), so what `always` costs
+    /// over `once` is an accurate count rather than a pile to dismiss. An agent retrying a blocked
+    /// host in a loop therefore leaves one notification, not two hundred.
+    #[default]
     Always,
 }
 
@@ -420,10 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn the_default_policy_says_each_distinct_problem_once() {
+    fn the_default_policy_announces_every_occurrence() {
         let policy = NotifyPolicy::default();
         for e in NotifyEvent::ALL {
-            assert_eq!(policy.mode_for(e), NotifyMode::Once);
+            assert_eq!(policy.mode_for(e), NotifyMode::Always);
         }
         assert!(policy.any_enabled());
         assert!(!NotifyPolicy::uniform(NotifyMode::Off).any_enabled());

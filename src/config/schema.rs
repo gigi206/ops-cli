@@ -93,7 +93,8 @@ pub(crate) struct RawConfig {
     /// project may neither forge nor loosen the enforcement of its own agent.
     pub(crate) proc: Option<ProcField>,
     /// Which refusals sbx announces to the person running it, and how often. Either a bare mode
-    /// string — `"off"`, `"once"` (the default: the first of each distinct problem), or `"always"` —
+    /// string — `"off"`, `"once"` (the first of each distinct problem), or `"always"` (the default:
+    /// every occurrence, a repeat revising the notification already on screen) —
     /// or a table adding `events`, which narrows the set (a list) or sets a mode per event (a table).
     /// The event names are the config sections that govern each refusal: `network`, `proc`,
     /// `ssh_agent`, `task`, `trust`.

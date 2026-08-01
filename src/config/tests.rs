@@ -6580,13 +6580,13 @@ fn notify_parses_the_bare_mode_the_list_and_the_per_event_table() {
     assert_eq!(r.notify.mode_for(NotifyEvent::Trust), NotifyMode::Off);
 }
 
-/// With nothing declared, each distinct problem is announced once.
+/// With nothing declared, every occurrence is announced.
 #[test]
-fn notify_defaults_to_once_for_every_event() {
+fn notify_defaults_to_always_for_every_event() {
     use crate::notify::{NotifyEvent, NotifyMode};
     let r = resolve_no_plugins(RawConfig::default(), None);
     for e in NotifyEvent::ALL {
-        assert_eq!(r.notify.mode_for(e), NotifyMode::Once, "{e:?}");
+        assert_eq!(r.notify.mode_for(e), NotifyMode::Always, "{e:?}");
     }
     assert_eq!(r.notify_origin, Provenance::Default);
 }
@@ -6617,7 +6617,7 @@ fn an_untrusted_project_cannot_silence_its_own_refusals() {
     let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
     assert_eq!(
         r.notify.mode_for(NotifyEvent::Network),
-        NotifyMode::Once,
+        NotifyMode::Always,
         "the default stands; the untrusted project's `off` is dropped"
     );
     assert!(r.warnings.iter().any(|w| w.contains("ignoring `notify`")));
@@ -6656,7 +6656,7 @@ fn an_unknown_notify_event_or_mode_is_named() {
         .any(|w| w.contains("unknown notify mode `one`")));
     assert_eq!(
         r.notify.mode_for(NotifyEvent::Network),
-        NotifyMode::Once,
+        NotifyMode::Always,
         "an unrecognised mode must never silently disable notifications"
     );
 }

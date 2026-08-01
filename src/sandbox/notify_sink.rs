@@ -138,6 +138,10 @@ impl Sink for StderrSink {
 /// in-cage relays use; sbx's own world is std threads).
 struct DesktopSink {
     proxy: crate::sandbox::notify_relay::HostNotificationsProxy<'static>,
+    /// The bus this sink is bound to, so a reconnect goes back to the **same** bus rather than to
+    /// whatever the ambient environment names. `None` is the session bus, which is the production
+    /// case; a test binds a private one and must not have its retry escape onto the user's desktop.
+    address: Option<String>,
 }
 
 /// One notification call over an already-bound proxy. Separated from [`DesktopSink::deliver`] so the
@@ -176,8 +180,22 @@ impl DesktopSink {
     /// Connect to the session bus and bind the notifications proxy, or `None` when there is no bus to
     /// reach (a headless or `ssh` session, a cron run) or no daemon serving the interface.
     fn connect() -> Option<DesktopSink> {
+        DesktopSink::connect_to(None)
+    }
+
+    /// [`connect`](DesktopSink::connect) against a named bus address rather than the ambient session
+    /// one — the seam the reconnect test drives, so that path is exercised against a real bus and a
+    /// real daemon going away, without touching the user's desktop.
+    fn connect_to(address: Option<&str>) -> Option<DesktopSink> {
         async_io::block_on(async {
-            let conn = zbus::Connection::session().await.ok()?;
+            let conn = match address {
+                Some(addr) => zbus::connection::Builder::address(addr)
+                    .ok()?
+                    .build()
+                    .await
+                    .ok()?,
+                None => zbus::Connection::session().await.ok()?,
+            };
             let proxy = crate::sandbox::notify_relay::HostNotificationsProxy::new(&conn)
                 .await
                 .ok()?;
@@ -185,7 +203,10 @@ impl DesktopSink {
             // than discovering it at the first refusal — when the fallback would be too late to warn
             // about. The answer itself is not used.
             proxy.get_server_information().await.ok()?;
-            Some(DesktopSink { proxy })
+            Some(DesktopSink {
+                proxy,
+                address: address.map(str::to_string),
+            })
         })
     }
 }
@@ -207,7 +228,7 @@ impl Sink for DesktopSink {
         if let Ok(id) = notify_over(&self.proxy, summary, body, replaces) {
             return Ok(Some(id));
         }
-        let fresh = DesktopSink::connect().ok_or(())?;
+        let fresh = DesktopSink::connect_to(self.address.as_deref()).ok_or(())?;
         self.proxy = fresh.proxy;
         // The id the old daemon handed out means nothing to a new one, so a retry after a reconnect
         // posts a fresh notification rather than trying to revise one that no longer exists.
@@ -699,6 +720,155 @@ mod tests {
             "finish takes the count, so the Drop that follows reports nothing"
         );
         assert_eq!(drop_report(n.dropped.load(Ordering::Relaxed)), None);
+    }
+
+    /// A stand-in notifications daemon on a private bus: it owns the interface and counts calls, so
+    /// a test can serve real `Notify` requests and then take the server away.
+    struct FakeDaemon {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Notifications")]
+    impl FakeDaemon {
+        #[allow(clippy::too_many_arguments)]
+        async fn notify(
+            &self,
+            _app_name: String,
+            replaces_id: u32,
+            _app_icon: String,
+            _summary: String,
+            _body: String,
+            _actions: Vec<String>,
+            _hints: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+            _expire_timeout: i32,
+        ) -> u32 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if replaces_id != 0 {
+                replaces_id
+            } else {
+                77
+            }
+        }
+
+        async fn get_server_information(&self) -> (String, String, String, String) {
+            ("fake".into(), "sbx-test".into(), "1".into(), "1.2".into())
+        }
+    }
+
+    /// The desktop sink against a **real** bus and a real daemon that goes away mid-session.
+    ///
+    /// This is the path no recording sink can stand in for: the zbus call itself, and what happens
+    /// to it when the server that was answering disappears. Exercised on a private `dbus-daemon` so
+    /// it never touches the user's desktop — on a Wayland session the notification daemon *is* the
+    /// compositor, and restarting it to find out would take the session down.
+    #[test]
+    fn the_desktop_sink_reconnects_when_the_daemon_is_replaced() {
+        let Ok(bus) = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--print-address", "--nofork"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("skipping: no dbus-daemon on PATH");
+            return;
+        };
+        let mut bus = ChildGuard(bus);
+        let address = {
+            use std::io::BufRead as _;
+            let out = bus.0.stdout.take().expect("piped stdout");
+            let mut line = String::new();
+            std::io::BufReader::new(out)
+                .read_line(&mut line)
+                .expect("the bus prints its address");
+            line.trim().to_string()
+        };
+
+        let calls = Arc::new(AtomicU64::new(0));
+        // First server: owns the interface and answers.
+        let server = serve_fake(&address, Arc::clone(&calls));
+        let mut sink =
+            DesktopSink::connect_to(Some(&address)).expect("the fake daemon is reachable");
+        assert_eq!(
+            sink.deliver("s", "b", None),
+            Ok(Some(77)),
+            "a live daemon answers with its id"
+        );
+
+        // Take the server away, and wait for the *bus* to agree the name is unowned: closing a
+        // connection releases its names asynchronously, so asserting straight after the drop races
+        // the daemon and would fail for a reason that has nothing to do with the sink.
+        drop(server);
+        wait_until_unowned(&address);
+        // With no owner of the name, delivery fails and the reconnect finds no daemon either: the
+        // sink reports the transport gone rather than pretending it delivered.
+        assert_eq!(
+            sink.deliver("s", "b", None),
+            Err(()),
+            "a vanished daemon must be reported, not swallowed"
+        );
+
+        // A replacement daemon appears (the `gnome-shell` restart case): the very next delivery
+        // reconnects and succeeds, which is the whole point of the retry.
+        let _server = serve_fake(&address, Arc::clone(&calls));
+        assert_eq!(
+            sink.deliver("s", "b", None),
+            Ok(Some(77)),
+            "a fresh daemon must be found without restarting the launch"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "one call served by each daemon"
+        );
+    }
+
+    /// Block until nobody owns the notifications name on `address`, or a bounded wait elapses.
+    fn wait_until_unowned(address: &str) {
+        async_io::block_on(async {
+            let conn = zbus::connection::Builder::address(address)
+                .unwrap()
+                .build()
+                .await
+                .expect("the bus is up");
+            let dbus = zbus::fdo::DBusProxy::new(&conn)
+                .await
+                .expect("the bus daemon");
+            for _ in 0..100 {
+                let owned = dbus
+                    .name_has_owner("org.freedesktop.Notifications".try_into().unwrap())
+                    .await
+                    .unwrap_or(false);
+                if !owned {
+                    return;
+                }
+                async_io::Timer::after(Duration::from_millis(20)).await;
+            }
+            panic!("the name was still owned after the wait");
+        });
+    }
+
+    /// Own `org.freedesktop.Notifications` on `address` until the returned connection is dropped.
+    fn serve_fake(address: &str, calls: Arc<AtomicU64>) -> zbus::Connection {
+        async_io::block_on(async {
+            zbus::connection::Builder::address(address)
+                .unwrap()
+                .name("org.freedesktop.Notifications")
+                .unwrap()
+                .serve_at("/org/freedesktop/Notifications", FakeDaemon { calls })
+                .unwrap()
+                .build()
+                .await
+                .expect("the fake daemon owns the name")
+        })
+    }
+
+    /// Kills the bus when the test ends, however it ends.
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[test]

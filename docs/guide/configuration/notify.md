@@ -1,7 +1,7 @@
 # `[notify]` — being told when something was blocked
 
 ```toml
-notify = "once"          # off | once | always — the short form, one mode for everything
+notify = "always"        # off | once | always — the short form, one mode for everything
 
 # or, per event:
 [notify]
@@ -57,8 +57,13 @@ The project's **full path** is deliberately not there — no toast is wide enoug
 | Mode | What you get |
 |---|---|
 | `off` | nothing. The refusal still happens and is still recorded — `sbx net logs`, `sbx proc logs` |
-| `once` (default) | the **first** occurrence of each distinct problem, then silence for that one |
-| `always` | every occurrence |
+| `once` | the **first** occurrence of each distinct problem, then silence for that one |
+| `always` (default) | every occurrence — a repeat **revises** the notification already on screen rather than adding one |
+
+`always` is the default because the cost of a repeat is not a second toast: it updates the first
+one in place. So what you get over `once` is a problem that keeps saying it is still happening,
+not a desktop to clear. Switch to `once` if you would rather each problem be stated exactly once
+and never again.
 
 ### What `once` counts as "the same problem"
 
@@ -72,9 +77,9 @@ The identity is **the event, the subject, and the reason**. So:
 That memory lives in RAM for the session and is **never written to disk**. Start a new session and
 you are told again — deliberately: a refusal you dismissed yesterday can mean something new today.
 
-Under `always`, repeats of one problem **update the notification in place** rather than stacking, so
-an agent retrying a blocked host in a loop leaves you one toast that keeps counting up, not two
-hundred to dismiss.
+This is what makes `always` affordable as the default: an agent retrying a blocked host in a loop
+leaves you **one** notification being revised, not two hundred to dismiss. Under `once`, that same
+loop is announced a single time and then never mentioned again, even while it continues.
 
 ## Events
 
@@ -147,7 +152,7 @@ the same refusal from a coding agent is the signal.
 
 ```console
 $ sbx config show
-  notify: once (global)
+  notify: always (default)
 ```
 
 When the events differ, each is listed with its own mode. `sbx config show --app <name>` shows the
