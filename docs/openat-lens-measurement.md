@@ -52,9 +52,15 @@ x86-64, 16 cores, release `-O2`, each figure the spread of three runs:
   workloads rather than on a microbenchmark multiplied out.
 
 Two supporting harnesses (`ns_read`, `cold_pid`) isolate where the shipped exec supervisor's cost
-comes from. All of them, plus the trace parser, are kept in
-[`spikes/openat-lens/`](spikes/openat-lens/) so every figure below can be re-derived; they are not
-part of the build.
+comes from: one parks a child in a descendant user namespace and reads it, the other forks 400
+children and reads each pid exactly once against the same count of reads on one pid.
+
+The harnesses were throwaway and are not kept — this repo builds one Rust binary and nothing here
+compiles C. Each is short enough to rebuild from the description above, and the two that decide
+anything are the simplest: `cold_pid` needs only `fork`, `open("/proc/<pid>/mem")` and `pread`;
+`notif_run` is the `NEW_LISTENER` + `SCM_RIGHTS` handoff the shipped
+[`proc_enforce`](../src/sandbox/proc_enforce.rs) already implements, with `openat` in place of
+`execve` and `CONTINUE` as the verdict.
 
 ---
 
