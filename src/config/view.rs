@@ -427,6 +427,9 @@ pub(crate) fn proc_view(p: &crate::proc_policy::ProcPolicy) -> ProcView {
 pub(crate) struct NotifyView {
     /// Event name → `off` / `once` / `always`, in the events' declaration order.
     pub(crate) events: Vec<(String, String)>,
+    /// The quiet period between repeats of one problem, as it was written (`"5m"`), or empty when
+    /// every occurrence is announced.
+    pub(crate) repeat_after: String,
 }
 
 /// Project a resolved [`crate::notify::NotifyPolicy`] into its view.
@@ -436,6 +439,10 @@ pub(crate) fn notify_view(p: &crate::notify::NotifyPolicy) -> NotifyView {
             .iter()
             .map(|e| (e.as_str().to_string(), p.mode_for(*e).as_str().to_string()))
             .collect(),
+        repeat_after: p
+            .repeat_after()
+            .map(|d| format!("{}s", d.as_secs()))
+            .unwrap_or_default(),
     }
 }
 

@@ -32,6 +32,7 @@
 //! silenced yesterday must not stay silent today, when it may mean something new.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// A refusal sbx can announce. One variant per **config section that governs the refusal**, so the
 /// name in `[notify.events]` is also the name of the setting to go and change.
@@ -156,6 +157,15 @@ impl NotifyMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NotifyPolicy {
     modes: [NotifyMode; NotifyEvent::ALL.len()],
+    /// How long a problem stays quiet after being announced, under `always`. `None` announces every
+    /// occurrence.
+    ///
+    /// This is what makes `always` liveable on a session that lasts hours. A repeat revises the
+    /// notification already on screen, so a burst costs nothing — but an agent that keeps retrying
+    /// for an hour keeps putting that notification back in front of its reader, and *that* is the
+    /// spam. A period turns "every occurrence" into "at most once per period, per problem", which
+    /// still says a problem is ongoing without saying it every few seconds.
+    repeat_after: Option<Duration>,
 }
 
 impl Default for NotifyPolicy {
@@ -169,7 +179,19 @@ impl NotifyPolicy {
     pub(crate) fn uniform(mode: NotifyMode) -> NotifyPolicy {
         NotifyPolicy {
             modes: [mode; NotifyEvent::ALL.len()],
+            repeat_after: None,
         }
+    }
+
+    /// This policy with a quiet period between repeats of one problem.
+    pub(crate) fn with_repeat_after(mut self, period: Option<Duration>) -> NotifyPolicy {
+        self.repeat_after = period;
+        self
+    }
+
+    /// The quiet period between repeats, when one is set.
+    pub(crate) fn repeat_after(self) -> Option<Duration> {
+        self.repeat_after
     }
 
     /// This policy with one event's mode replaced — the per-event override, applied over a resolved
@@ -324,9 +346,19 @@ pub(crate) enum Speak {
 /// information.
 #[derive(Debug, Default)]
 pub(crate) struct Coalescer {
-    /// Key → the id of the live notification for that key (`None` until the daemon returns one, which
-    /// it may never do: a stderr fallback has no ids).
-    seen: HashMap<String, Option<u32>>,
+    /// Key → what is known about that problem's last announcement.
+    seen: HashMap<String, Announced>,
+}
+
+/// What a problem's last announcement left behind.
+#[derive(Debug, Clone, Copy)]
+struct Announced {
+    /// The id the daemon returned, so a repeat revises that notification rather than adding one.
+    /// `None` until a daemon returns one — which it may never do: a stderr fallback has no ids.
+    id: Option<u32>,
+    /// When it was announced, for the `repeat_after` quiet period. `None` when the announcement was
+    /// only *decided* and delivery has not been dated (never, in practice — `decide` dates it).
+    at: Option<Instant>,
 }
 
 impl Coalescer {
@@ -334,20 +366,37 @@ impl Coalescer {
     ///
     /// Records the key as seen, so a `once` event announces exactly one of each distinct problem. Pure
     /// apart from that memory — no I/O, no clock — so the whole repeat semantics is unit-testable.
-    pub(crate) fn decide(&mut self, policy: NotifyPolicy, block: &Block) -> Speak {
+    /// `now` is passed in rather than read here, so the quiet period is tested by advancing a clock
+    /// instead of by waiting.
+    pub(crate) fn decide(&mut self, policy: NotifyPolicy, block: &Block, now: Instant) -> Speak {
         let mode = policy.mode_for(block.event);
         if mode == NotifyMode::Off {
             return Speak::Stay;
         }
         let key = block.key();
-        match self.seen.get(&key) {
-            // Seen before: quiet under `once`, and under `always` an update of the same toast.
-            Some(prior) => match mode {
-                NotifyMode::Once => Speak::Stay,
-                _ => Speak::Say { replaces: *prior },
-            },
+        match self.seen.get_mut(&key) {
+            // Seen before: quiet under `once`; under `always` an update of the same toast, unless a
+            // quiet period is set and has not elapsed.
+            Some(prior) => {
+                if mode == NotifyMode::Once {
+                    return Speak::Stay;
+                }
+                if let (Some(period), Some(last)) = (policy.repeat_after(), prior.at) {
+                    if now.duration_since(last) < period {
+                        return Speak::Stay;
+                    }
+                }
+                prior.at = Some(now);
+                Speak::Say { replaces: prior.id }
+            }
             None => {
-                self.seen.insert(key, None);
+                self.seen.insert(
+                    key,
+                    Announced {
+                        id: None,
+                        at: Some(now),
+                    },
+                );
                 Speak::Say { replaces: None }
             }
         }
@@ -356,7 +405,11 @@ impl Coalescer {
     /// Record the id the daemon returned for `block`'s notification, so the next repeat of that problem
     /// replaces this toast rather than adding one. A no-op for a sink with no ids (stderr).
     pub(crate) fn record_id(&mut self, block: &Block, id: u32) {
-        self.seen.insert(block.key(), Some(id));
+        let entry = self
+            .seen
+            .entry(block.key())
+            .or_insert(Announced { id: None, at: None });
+        entry.id = Some(id);
     }
 }
 
@@ -441,9 +494,12 @@ mod tests {
             "api.example.com:443",
             "denied-default",
         );
-        assert_eq!(c.decide(policy, &b), Speak::Say { replaces: None });
-        assert_eq!(c.decide(policy, &b), Speak::Stay);
-        assert_eq!(c.decide(policy, &b), Speak::Stay);
+        assert_eq!(
+            c.decide(policy, &b, Instant::now()),
+            Speak::Say { replaces: None }
+        );
+        assert_eq!(c.decide(policy, &b, Instant::now()), Speak::Stay);
+        assert_eq!(c.decide(policy, &b, Instant::now()), Speak::Stay);
     }
 
     #[test]
@@ -455,16 +511,28 @@ mod tests {
         let mut c = Coalescer::default();
         let host = "api.example.com:443";
         assert_eq!(
-            c.decide(policy, &block(NotifyEvent::Network, host, "denied-default")),
+            c.decide(
+                policy,
+                &block(NotifyEvent::Network, host, "denied-default"),
+                Instant::now()
+            ),
             Speak::Say { replaces: None }
         );
         assert_eq!(
-            c.decide(policy, &block(NotifyEvent::Network, host, "denied-by-rule")),
+            c.decide(
+                policy,
+                &block(NotifyEvent::Network, host, "denied-by-rule"),
+                Instant::now()
+            ),
             Speak::Say { replaces: None }
         );
         // …and the same subject under a different lens is different again.
         assert_eq!(
-            c.decide(policy, &block(NotifyEvent::Proc, host, "denied-default")),
+            c.decide(
+                policy,
+                &block(NotifyEvent::Proc, host, "denied-default"),
+                Instant::now()
+            ),
             Speak::Say { replaces: None }
         );
     }
@@ -478,11 +546,20 @@ mod tests {
             "api.example.com:443",
             "denied-default",
         );
-        assert_eq!(c.decide(policy, &b), Speak::Say { replaces: None });
+        assert_eq!(
+            c.decide(policy, &b, Instant::now()),
+            Speak::Say { replaces: None }
+        );
         // Without an id from the daemon there is nothing to replace, but it still speaks.
-        assert_eq!(c.decide(policy, &b), Speak::Say { replaces: None });
+        assert_eq!(
+            c.decide(policy, &b, Instant::now()),
+            Speak::Say { replaces: None }
+        );
         c.record_id(&b, 42);
-        assert_eq!(c.decide(policy, &b), Speak::Say { replaces: Some(42) });
+        assert_eq!(
+            c.decide(policy, &b, Instant::now()),
+            Speak::Say { replaces: Some(42) }
+        );
         // A *different* problem is its own notification, never a replacement of this one.
         assert_eq!(
             c.decide(
@@ -491,9 +568,82 @@ mod tests {
                     NotifyEvent::Network,
                     "other.example.com:443",
                     "denied-default"
-                )
+                ),
+                Instant::now()
             ),
             Speak::Say { replaces: None }
+        );
+    }
+
+    #[test]
+    fn a_quiet_period_spaces_out_repeats_of_one_problem() {
+        // `always` revises the notification already on screen, so a burst is free — but an agent
+        // retrying for an hour keeps putting it back in front of its reader, and that is the spam a
+        // period is for. Driven by advancing a clock, never by waiting.
+        let policy = NotifyPolicy::uniform(NotifyMode::Always)
+            .with_repeat_after(Some(Duration::from_secs(300)));
+        let mut c = Coalescer::default();
+        let b = block(
+            NotifyEvent::Network,
+            "api.example.com:443",
+            "denied-default",
+        );
+        let t0 = Instant::now();
+
+        assert_eq!(c.decide(policy, &b, t0), Speak::Say { replaces: None });
+        // Inside the period: the refusal still happens and is still logged, it is simply not
+        // announced again.
+        assert_eq!(
+            c.decide(policy, &b, t0 + Duration::from_secs(1)),
+            Speak::Stay
+        );
+        assert_eq!(
+            c.decide(policy, &b, t0 + Duration::from_secs(299)),
+            Speak::Stay
+        );
+        // Past it: said again, because it is still happening.
+        assert_eq!(
+            c.decide(policy, &b, t0 + Duration::from_secs(301)),
+            Speak::Say { replaces: None }
+        );
+        // …and the clock restarts from that announcement, not from the first one.
+        assert_eq!(
+            c.decide(policy, &b, t0 + Duration::from_secs(400)),
+            Speak::Stay
+        );
+
+        // A *different* problem is never held back by another's period.
+        assert_eq!(
+            c.decide(
+                policy,
+                &block(
+                    NotifyEvent::Network,
+                    "other.example.com:443",
+                    "denied-default"
+                ),
+                t0 + Duration::from_secs(2)
+            ),
+            Speak::Say { replaces: None }
+        );
+    }
+
+    #[test]
+    fn a_quiet_period_does_not_resurrect_once() {
+        // `once` says a problem a single time whatever the period says — the period spaces repeats
+        // out, it does not create them.
+        let policy =
+            NotifyPolicy::uniform(NotifyMode::Once).with_repeat_after(Some(Duration::from_secs(1)));
+        let mut c = Coalescer::default();
+        let b = block(
+            NotifyEvent::Network,
+            "api.example.com:443",
+            "denied-default",
+        );
+        let t0 = Instant::now();
+        assert_eq!(c.decide(policy, &b, t0), Speak::Say { replaces: None });
+        assert_eq!(
+            c.decide(policy, &b, t0 + Duration::from_secs(3600)),
+            Speak::Stay
         );
     }
 
@@ -503,7 +653,11 @@ mod tests {
             .with_event(NotifyEvent::Task, NotifyMode::Off);
         let mut c = Coalescer::default();
         assert_eq!(
-            c.decide(policy, &block(NotifyEvent::Task, "deploy", "refused")),
+            c.decide(
+                policy,
+                &block(NotifyEvent::Task, "deploy", "refused"),
+                Instant::now()
+            ),
             Speak::Stay
         );
         assert_eq!(
@@ -513,7 +667,8 @@ mod tests {
                     NotifyEvent::Network,
                     "api.example.com:443",
                     "denied-default"
-                )
+                ),
+                Instant::now()
             ),
             Speak::Say { replaces: None }
         );

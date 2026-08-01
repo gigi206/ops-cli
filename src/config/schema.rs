@@ -1148,6 +1148,13 @@ pub(crate) struct NotifyTable {
     pub(crate) mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) events: Option<NotifyEvents>,
+    /// How long one problem stays quiet after being announced, as a duration (`"5m"`, `"90s"`,
+    /// `"2h"`). Only meaningful under `always`: it turns "every occurrence" into "at most once per
+    /// period, per problem", which is what keeps an agent looping for an hour from putting the same
+    /// notification back in front of you every few seconds. Absent (or `"0"`) means every occurrence
+    /// is announced, and `once` ignores it — that mode never repeats at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repeat_after: Option<String>,
 }
 
 /// The two shapes `events` accepts, an untagged enum so both TOML forms parse.

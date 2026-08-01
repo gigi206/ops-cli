@@ -644,18 +644,23 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             .first()
             .filter(|(_, first)| n.events.iter().all(|(_, m)| m == first))
             .map(|(_, m)| m.clone());
+        let every = if n.repeat_after.is_empty() {
+            String::new()
+        } else {
+            format!(" {dim}(a repeat waits {}){r}", n.repeat_after)
+        };
         match uniform {
             Some(mode) => {
                 let _ = writeln!(
                     o,
-                    "  {h}notify:{r} {mode}{}",
+                    "  {h}notify:{r} {mode}{every}{}",
                     provenance_tag(view.notify_origin, pal)
                 );
             }
             None => {
                 let _ = writeln!(
                     o,
-                    "  {h}notify:{r} {dim}per event{r}{}",
+                    "  {h}notify:{r} {dim}per event{r}{every}{}",
                     provenance_tag(view.notify_origin, pal)
                 );
                 for (event, mode) in &n.events {

@@ -1206,19 +1206,19 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
 }
 
 #[test]
-fn parse_ask_timeout_handles_units_and_rejects_garbage() {
+fn parse_duration_handles_units_and_rejects_garbage() {
     use std::time::Duration;
-    assert_eq!(parse_ask_timeout("90s"), Ok(Some(Duration::from_secs(90))));
-    assert_eq!(parse_ask_timeout("90"), Ok(Some(Duration::from_secs(90))));
-    assert_eq!(parse_ask_timeout("5m"), Ok(Some(Duration::from_secs(300))));
-    assert_eq!(parse_ask_timeout("2h"), Ok(Some(Duration::from_secs(7200))));
+    assert_eq!(parse_duration("90s"), Ok(Some(Duration::from_secs(90))));
+    assert_eq!(parse_duration("90"), Ok(Some(Duration::from_secs(90))));
+    assert_eq!(parse_duration("5m"), Ok(Some(Duration::from_secs(300))));
+    assert_eq!(parse_duration("2h"), Ok(Some(Duration::from_secs(7200))));
     // A zero of any unit means indefinite — the same as omitting the field.
-    assert_eq!(parse_ask_timeout("0"), Ok(None));
-    assert_eq!(parse_ask_timeout("0m"), Ok(None));
+    assert_eq!(parse_duration("0"), Ok(None));
+    assert_eq!(parse_duration("0m"), Ok(None));
     // Malformed values are refused (the caller then warns and falls back to indefinite).
-    assert!(parse_ask_timeout("soon").is_err());
-    assert!(parse_ask_timeout("9x").is_err());
-    assert!(parse_ask_timeout("").is_err());
+    assert!(parse_duration("soon").is_err());
+    assert!(parse_duration("9x").is_err());
+    assert!(parse_duration("").is_err());
 }
 
 #[test]
@@ -6658,5 +6658,45 @@ fn an_unknown_notify_event_or_mode_is_named() {
         r.notify.mode_for(NotifyEvent::Network),
         NotifyMode::Always,
         "an unrecognised mode must never silently disable notifications"
+    );
+}
+
+/// `repeat_after` resolves, inherits, and is refused politely when it cannot mean anything.
+#[test]
+fn notify_repeat_after_resolves_and_is_flagged_where_it_cannot_bite() {
+    use std::time::Duration;
+
+    let cfg: RawConfig =
+        toml::from_str("[notify]\nmode = \"always\"\nrepeat_after = \"5m\"").unwrap();
+    let r = resolve_no_plugins(cfg, None);
+    assert_eq!(r.notify.repeat_after(), Some(Duration::from_secs(300)));
+
+    // A project that only refines events inherits the global period rather than losing it.
+    let global: RawConfig =
+        toml::from_str("[notify]\nmode = \"always\"\nrepeat_after = \"5m\"").unwrap();
+    let project: RawConfig = toml::from_str("[notify]\n[notify.events]\ntask = \"off\"").unwrap();
+    let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+    assert_eq!(r.notify.repeat_after(), Some(Duration::from_secs(300)));
+
+    // A malformed duration keeps what was in effect — never "announce every occurrence".
+    let bad: RawConfig =
+        toml::from_str("[notify]\nmode = \"always\"\nrepeat_after = \"soon\"").unwrap();
+    let r = resolve_no_plugins(bad, None);
+    assert_eq!(r.notify.repeat_after(), None);
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("invalid `repeat_after`")));
+
+    // Set where nothing ever repeats, it is called out rather than silently ignored.
+    let moot: RawConfig =
+        toml::from_str("[notify]\nmode = \"once\"\nrepeat_after = \"5m\"").unwrap();
+    let r = resolve_no_plugins(moot, None);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("`repeat_after` has no effect")),
+        "{:?}",
+        r.warnings
     );
 }

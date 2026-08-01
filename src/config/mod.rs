@@ -3629,9 +3629,9 @@ fn validate_notify(
         }
     }
 
-    let (mode_str, events) = match field {
-        NotifyField::Mode(m) => (Some(m), None),
-        NotifyField::Table(t) => (t.mode, t.events),
+    let (mode_str, events, repeat_after) = match field {
+        NotifyField::Mode(m) => (Some(m), None, None),
+        NotifyField::Table(t) => (t.mode, t.events, t.repeat_after),
     };
 
     // The mode this layer sets for every event, or `None` to keep the parent's per-event modes.
@@ -3683,7 +3683,36 @@ fn validate_notify(
         }
         None => base.map(NotifyPolicy::uniform).unwrap_or(*parent),
     };
-    Some(policy)
+
+    // The quiet period between repeats. A malformed value keeps the layer below rather than
+    // silently announcing every occurrence — the direction a typo must not fail in. Inherited when
+    // this layer does not set one, like the modes above.
+    let period = match &repeat_after {
+        None => parent.repeat_after(),
+        Some(raw) => match parse_duration(raw) {
+            Ok(period) => period,
+            Err(reason) => {
+                warnings.push(format!(
+                    "{source_label}: ignoring invalid `repeat_after` — {reason}; \
+                     keeping the period already in effect"
+                ));
+                parent.repeat_after()
+            }
+        },
+    };
+    // A period is meaningless where nothing ever repeats. Said rather than silently ignored: a
+    // reader who set both is expecting one of them to be doing something.
+    if repeat_after.is_some()
+        && NotifyEvent::ALL
+            .iter()
+            .all(|e| policy.mode_for(*e) != NotifyMode::Always)
+    {
+        warnings.push(format!(
+            "{source_label}: `repeat_after` has no effect — it spaces out repeats, and no event is \
+             set to `always`"
+        ));
+    }
+    Some(policy.with_repeat_after(period))
 }
 
 /// The warning for an event name no lens answers to. Names the key *and* the vocabulary, because the
@@ -3835,7 +3864,7 @@ fn validate_network_table(
         // indefinite (warned), never a hard config failure.
         let timeout = match &table.ask_timeout {
             None => None,
-            Some(raw) => parse_ask_timeout(raw).unwrap_or_else(|reason| {
+            Some(raw) => parse_duration(raw).unwrap_or_else(|reason| {
                 warnings.push(format!(
                     "{source_label}: ignoring invalid `ask_timeout` — {reason}; \
                      parked requests will wait indefinitely"
@@ -3876,7 +3905,7 @@ fn validate_network_table(
 /// `"90"`. A zero-valued form (`"0"`, `"0m"`) means no timeout — an indefinite wait, the same as
 /// omitting the field — so it returns `Ok(None)`; a positive value returns `Ok(Some(duration))`.
 /// A malformed value is `Err(reason)` so the caller can warn and fall back to indefinite.
-fn parse_ask_timeout(raw: &str) -> Result<Option<std::time::Duration>, String> {
+fn parse_duration(raw: &str) -> Result<Option<std::time::Duration>, String> {
     let s = raw.trim();
     let malformed = || format!("`{raw}` is not a duration (try \"90s\", \"5m\", \"2h\")");
     let (digits, unit) = if let Some(n) = s.strip_suffix('s') {

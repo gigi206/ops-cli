@@ -155,7 +155,7 @@ impl TaskDefaults {
 /// number of seconds) — but a task's ceiling may not be zero/indefinite: an operation that can hang
 /// forever holds a caller and a credential open, so "no timeout" is not an available choice.
 pub(super) fn parse_task_timeout(raw: &str) -> Result<std::time::Duration, String> {
-    match super::parse_ask_timeout(raw)? {
+    match super::parse_duration(raw)? {
         Some(d) => Ok(d),
         None => Err(format!(
             "`{raw}` is zero — a task must have a positive timeout"

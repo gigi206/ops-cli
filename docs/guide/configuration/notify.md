@@ -65,6 +65,24 @@ one in place. So what you get over `once` is a problem that keeps saying it is s
 not a desktop to clear. Switch to `once` if you would rather each problem be stated exactly once
 and never again.
 
+### Spacing repeats out — `repeat_after`
+
+Revising a toast is free, but an agent retrying for an hour keeps putting that toast back in front
+of you, and *that* is the spam. A quiet period turns "every occurrence" into "at most once per
+period, per problem":
+
+```toml
+[notify]
+mode = "always"
+repeat_after = "5m"      # this problem stays quiet for 5 minutes after being announced
+```
+
+Durations are `"90s"`, `"5m"`, `"2h"` (a bare number is seconds). The clock restarts from each
+announcement, and it is **per problem** — one host being held back never delays another's first
+notification. `once` ignores it (that mode never repeats at all) and says so with a warning, and a
+malformed duration keeps whatever period was already in effect rather than falling back to
+announcing everything.
+
 ### What `once` counts as "the same problem"
 
 The identity is **the event, the subject, and the reason**. So:

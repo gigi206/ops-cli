@@ -340,7 +340,9 @@ impl Notifier {
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
-                let Speak::Say { replaces } = coalescer.decide(policy, &block) else {
+                let Speak::Say { replaces } =
+                    coalescer.decide(policy, &block, std::time::Instant::now())
+                else {
                     continue;
                 };
                 let (summary, body) = block.render(&context);
