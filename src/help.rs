@@ -634,7 +634,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["secret", "list"],
-        synopsis: "sbx secret list [-a|--app <name>] [--sources]",
+        synopsis: "sbx secret list [-a|--app <name>] [--sources]  (alias: sbx secret ls)",
         summary: "the declared credentials, by name",
         options: &[
             (
@@ -691,7 +691,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "list"],
-        synopsis: "sbx task list [<operation>] [--session <id>]",
+        synopsis: "sbx task list [<operation>] [--session <id>]  (alias: sbx task ls)",
         summary: "the operations a session offers, with their parameters and ceilings",
         options: &[
             ("<operation>", "show only this one; omit it for all of them"),
@@ -1457,7 +1457,7 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "list",
-                "list every runtime tree with its state, size, and last-used date",
+                "list every runtime tree with its state, size, and last-used date (alias: ls)",
             ),
             ("--json", "with list, emit the trees as a JSON document"),
             (
@@ -2134,7 +2134,7 @@ const PAGES: &[Page] = &[
     // ---- plugins subcommands ------------------------------------------------------
     Page {
         path: &["plugins", "list"],
-        synopsis: "sbx plugins list",
+        synopsis: "sbx plugins list  (alias: sbx plugins ls)",
         summary: "list installed resolver plugins and built-in schemes",
         options: &[],
         details: "Shows the reserved built-in schemes and every installed resolver plugin — its\n\
@@ -2188,7 +2188,7 @@ const PAGES: &[Page] = &[
     // ---- plugins store subcommands ------------------------------------------------
     Page {
         path: &["plugins", "store", "list"],
-        synopsis: "sbx plugins store list",
+        synopsis: "sbx plugins store list  (alias: sbx plugins store ls)",
         summary: "list the built-in store and configured remote stores",
         options: &[],
         details: "The resolver plugins bundled in the binary, then every configured remote store\n\
@@ -2652,6 +2652,26 @@ mod tests {
         let weird = paint_inline_code("an `unterminated span", &pal);
         assert!(weird.ends_with("`unterminated span"));
         assert!(!weird.trim_end().ends_with("\x1b["));
+    }
+
+    #[test]
+    fn every_list_page_advertises_its_ls_alias() {
+        // Every listing verb in the CLI accepts `ls` as well as `list`. A page that does not say
+        // so leaves the alias to be discovered by trial, and — worse — reads as if that surface
+        // were the one exception. This caught exactly that: `plugins` accepted only `list`, while
+        // `secret` and `task` accepted `ls` without ever mentioning it.
+        for page in PAGES {
+            if page.path.last() != Some(&"list") {
+                continue;
+            }
+            let prefix = page.path[..page.path.len() - 1].join(" ");
+            let alias = format!("sbx {prefix} ls");
+            assert!(
+                page.synopsis.contains(&alias),
+                "{:?}: the synopsis must advertise `{alias}`",
+                page.path
+            );
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ See also: [Resolver plugins and stores](../secrets/plugins.md) · [Resolvers](..
 
 | Subcommand | Purpose |
 |---|---|
-| `list` | list installed resolver plugins and the built-in schemes |
+| `list` (alias `ls`) | list installed resolver plugins and the built-in schemes |
 | `info <scheme>` | show a plugin's manifest and sandbox grant |
 | `install <name\|dir>` | install a built-in (bundled) or local plugin directory |
 | `rm <name>` | remove an installed resolver plugin |
@@ -40,7 +40,7 @@ sbx plugins store publish <dir> --key <key-file> [--rev <n>]
 
 | Subcommand | Purpose |
 |---|---|
-| `list` | the built-in store, then configured remote stores |
+| `list` (alias `ls`) | the built-in store, then configured remote stores |
 | `add` | configure and fetch a store; exactly one of `--key` (pin out-of-band) or `--trust` (trust-on-first-use) is required |
 | `update [name]` | re-fetch and re-verify one or all stores (refuses a rollback) |
 | `install <store> <plugin>` | install a plugin the store lists (pinned by content hash) |

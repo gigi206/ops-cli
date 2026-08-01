@@ -22,7 +22,7 @@ use crate::{diag, help, plugins, store, style};
 /// inspection verbs and names them on anything else (no inert stubs).
 pub(crate) fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
-        Some("list") => plugins_list(),
+        Some("list") | Some("ls") => plugins_list(),
         Some("info") => plugins_info(args.get(1).and_then(|a| a.to_str())),
         Some("install") => plugins_install(args.get(1)),
         Some("rm") => plugins_remove(args.get(1).and_then(|a| a.to_str())),
@@ -166,7 +166,7 @@ fn is_path_like(arg: &OsStr) -> bool {
 /// configured store; `rm` removes one.
 fn plugins_store(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
-        Some("list") => plugins_store_list(),
+        Some("list") | Some("ls") => plugins_store_list(),
         Some("add") => plugins_store_add(&args[1..]),
         Some("publish") => plugins_store_publish(&args[1..]),
         Some("update") => plugins_store_update(&args[1..]),
