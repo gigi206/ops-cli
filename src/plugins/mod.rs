@@ -18,15 +18,21 @@
 //! Loading is **infallible and fail-closed**: a malformed manifest, an unsupported type, a
 //! reserved or ill-formed scheme, or two plugins claiming one scheme drops the offending
 //! plugin(s) with a warning — never a failed launch, and never a silently-honored bad plugin.
+//! A claimed-twice scheme resolves to *nothing* and every claimant is disabled until one remains;
+//! installing is refused on both sides of that state, so the only way to reach it is to place a
+//! plugin directory by hand, and the conflict is then reported (not merely warned about) by
+//! `sbx plugins list` and `sbx plugins info <scheme>`.
 
 /// The remote signed-store subsystem lives alongside the registry: [`catalogue`] is the
 /// offline Ed25519 trust core, and [`stores`] is the impure git-driven fetch/verify/cache
-/// shell around it.
+/// shell around it. [`origin`] records where each installed plugin came from, which a manifest
+/// (identical whatever the source) cannot say.
 pub(crate) mod catalogue;
+pub(crate) mod origin;
 pub(crate) mod stores;
 
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +44,16 @@ const BUILTIN_SCHEMES: &[&str] = &["env", "file", "sops"];
 /// namespace and why these can never be a plugin.
 pub(crate) fn builtin_schemes() -> &'static [&'static str] {
     BUILTIN_SCHEMES
+}
+
+/// Render names as `` `a`, `b`, `c` `` — the one shape every conflict message uses, so a listing
+/// and a refusal never disagree about how they spell the plugins to remove.
+pub(crate) fn quoted_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A validated resolver plugin: running `exec` with a `scheme://locator` ref as its single
@@ -67,6 +83,18 @@ pub(crate) struct ResolverPlugin {
 }
 
 impl ResolverPlugin {
+    /// The plugin's on-disk identity: its directory name, which is the token `sbx plugins rm`
+    /// takes and the key its origin record is filed under. It may differ from `name` (a
+    /// hand-placed tree can declare any manifest `name`), so every message whose remedy is a
+    /// command must use this, never `name`. Falls back to `name` only if the directory name is
+    /// not UTF-8, which discovery would already have had to walk past.
+    pub(crate) fn dir_name(&self) -> &str {
+        self.dir
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or(&self.name)
+    }
+
     /// Whether the executable would be accepted by the runner at launch: a regular file owned by
     /// us and not writable by group or other. A plugin can pass [`PluginRegistry::load`] (the
     /// manifest is well-formed) yet fail this — so `sbx plugins` surfaces the gap, using the very
@@ -79,6 +107,43 @@ impl ResolverPlugin {
         let euid = unsafe { libc::geteuid() };
         verdict_exec(meta.mode(), meta.uid(), euid)
     }
+}
+
+/// Whether a *source* executable may be copied in: a regular file we own and that no other user
+/// can rewrite. Deliberately weaker than [`verdict_exec`], which governs the artifact about to run
+/// — a checkout under `umask 002` is group-writable, and refusing that would make a plugin
+/// uninstallable from its own repository, while the copy that is actually executed is placed
+/// `0755` under an owner-only tree.
+fn verdict_source(exec: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(exec).map_err(|e| {
+        format!(
+            "cannot read the plugin's executable {}: {e}",
+            exec.display()
+        )
+    })?;
+    let euid = unsafe { libc::geteuid() };
+    if meta.mode() & libc::S_IFMT != libc::S_IFREG {
+        return Err(format!(
+            "the plugin's executable {} is not a regular file",
+            exec.display()
+        ));
+    }
+    if meta.uid() != euid {
+        return Err(format!(
+            "the plugin's executable {} is owned by uid {}, expected {euid}",
+            exec.display(),
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o002 != 0 {
+        return Err(format!(
+            "the plugin's executable {} is writable by anyone — `chmod o-w {}` before installing",
+            exec.display(),
+            exec.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Pure ownership/mode decision for a plugin executable, shared by the runner (which refuses to
@@ -115,20 +180,33 @@ pub(crate) struct SandboxGrant {
     pub(crate) network: bool,
 }
 
-/// The installed resolver plugins, keyed by the scheme each claims.
+/// The installed resolver plugins, keyed by the scheme each claims, plus the schemes no plugin
+/// gets to claim because more than one does.
 #[derive(Debug, Default)]
 pub(crate) struct PluginRegistry {
     resolvers: BTreeMap<String, ResolverPlugin>,
+    /// Every ambiguous scheme → the directory names claiming it, in discovery order. A scheme
+    /// listed here is claimed by no one: all of its claimants are disabled until exactly one
+    /// remains. Recorded rather than merely warned about, so every surface can *show* the
+    /// conflict and name the plugins to remove.
+    conflicts: BTreeMap<String, Vec<String>>,
 }
 
 impl PluginRegistry {
-    /// Discover and validate every plugin under `<plugins_dir>/<name>/plugin.toml`. A directory
-    /// without a manifest is silently skipped (not every data subdirectory is a plugin); a
-    /// manifest that fails validation drops that plugin with a warning. When two plugins claim
-    /// the same scheme, **both** are dropped (the scheme is ambiguous — fail-closed, never an
-    /// arbitrary winner). The path expansions read `HOME`/`XDG_RUNTIME_DIR` from the environment
-    /// once, here.
+    /// Discover and validate every plugin under `<plugins_dir>/<name>/plugin.toml`, reporting
+    /// every reason a plugin was dropped — including scheme conflicts — as text in `warnings`.
+    /// This is the form for a caller that only relays diagnostics (a launch, a config load); a
+    /// caller that renders conflicts itself wants [`load_quiet`](Self::load_quiet).
     pub(crate) fn load(plugins_dir: &Path, warnings: &mut Vec<String>) -> Self {
+        let registry = Self::load_quiet(plugins_dir, warnings);
+        warnings.extend(registry.conflict_warnings());
+        registry
+    }
+
+    /// Discovery without the conflict warnings: a directory without a manifest is silently skipped
+    /// (not every data subdirectory is a plugin) and a manifest that fails validation still warns,
+    /// but an ambiguous scheme is left to [`conflicts`](Self::conflicts) for the caller to render.
+    pub(crate) fn load_quiet(plugins_dir: &Path, warnings: &mut Vec<String>) -> Self {
         let exp = Expansion::from_env();
         Self::load_with(plugins_dir, &exp, warnings)
     }
@@ -150,7 +228,7 @@ impl PluginRegistry {
         dirs.sort();
 
         let mut resolvers: BTreeMap<String, ResolverPlugin> = BTreeMap::new();
-        let mut conflicted: BTreeSet<String> = BTreeSet::new();
+        let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for dir in dirs {
             let plugin = match load_one(&dir, exp) {
                 Ok(Some(plugin)) => plugin,
@@ -163,30 +241,60 @@ impl PluginRegistry {
                 }
             };
             let scheme = plugin.scheme.clone();
-            if conflicted.contains(&scheme) {
-                warnings.push(format!(
-                    "plugins: ignoring `{}` — scheme `{scheme}` is claimed by more than one plugin",
-                    plugin.name
-                ));
+            // A scheme already known to be ambiguous stays ambiguous: record this claimant too, so
+            // the conflict names every plugin that has to be dealt with, not just the first two.
+            if let Some(claimants) = conflicts.get_mut(&scheme) {
+                claimants.push(plugin.dir_name().to_string());
                 continue;
             }
+            // The second claimant unseats the first: the scheme becomes ambiguous and *neither*
+            // resolves. The claimants are the directory names, because that is what `plugins rm`
+            // takes — a conflict whose remedy names something else is a remedy that fails.
             if let Some(prev) = resolvers.remove(&scheme) {
-                conflicted.insert(scheme.clone());
-                warnings.push(format!(
-                    "plugins: scheme `{scheme}` is claimed by both `{}` and `{}` — both ignored \
-                     (a scheme must be unique)",
-                    prev.name, plugin.name
-                ));
+                conflicts.insert(
+                    scheme,
+                    vec![prev.dir_name().to_string(), plugin.dir_name().to_string()],
+                );
                 continue;
             }
             resolvers.insert(scheme, plugin);
         }
-        Self { resolvers }
+        Self {
+            resolvers,
+            conflicts,
+        }
     }
 
-    /// The resolver claiming `scheme`, if any.
+    /// The resolver claiming `scheme`, if any. A scheme claimed by more than one plugin has no
+    /// resolver — ask [`conflict`](Self::conflict) to tell that apart from nothing claiming it.
     pub(crate) fn resolver(&self, scheme: &str) -> Option<&ResolverPlugin> {
         self.resolvers.get(scheme)
+    }
+
+    /// The directory names claiming `scheme` when more than one does — all of them disabled.
+    pub(crate) fn conflict(&self, scheme: &str) -> Option<&[String]> {
+        self.conflicts.get(scheme).map(Vec::as_slice)
+    }
+
+    /// Every ambiguous scheme with its claimants, ordered by scheme.
+    pub(crate) fn conflicts(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.conflicts
+            .iter()
+            .map(|(scheme, claimants)| (scheme.as_str(), claimants.as_slice()))
+    }
+
+    /// One line per ambiguous scheme, for a caller that relays diagnostics as text.
+    pub(crate) fn conflict_warnings(&self) -> Vec<String> {
+        self.conflicts
+            .iter()
+            .map(|(scheme, claimants)| {
+                format!(
+                    "plugins: scheme `{scheme}` is claimed by more than one plugin ({}) — all are \
+                     disabled until one remains (a scheme must be unique)",
+                    quoted_list(claimants)
+                )
+            })
+            .collect()
     }
 
     /// The installed resolver plugins, ordered by scheme (the `BTreeMap` key) — for `sbx plugins`.
@@ -205,6 +313,7 @@ impl PluginRegistry {
     pub(crate) fn with(plugins: impl IntoIterator<Item = ResolverPlugin>) -> Self {
         Self {
             resolvers: plugins.into_iter().map(|p| (p.scheme.clone(), p)).collect(),
+            conflicts: BTreeMap::new(),
         }
     }
 }
@@ -439,7 +548,21 @@ pub(crate) struct Installed {
 /// is not a safe directory component, an already-installed plugin of that name, or a scheme already
 /// claimed by another installed plugin each refuse before anything is placed.
 pub(crate) fn install(layout: &crate::store::Layout, source: &Path) -> Result<Installed, String> {
-    install_inner(layout, source, None)
+    // The recorded path is the source's canonical location, so a listing names a stable directory
+    // rather than whatever relative form the command line used. A path that does not canonicalize
+    // (or is not UTF-8) still installs — the origin simply records less.
+    let path = std::fs::canonicalize(source)
+        .unwrap_or_else(|_| source.to_path_buf())
+        .to_str()
+        .map(str::to_string);
+    // The digest is filled in by the install itself, once the tree is in place.
+    install_inner(
+        layout,
+        source,
+        None,
+        origin::Origin::Local { path, sha256: None },
+        Placement::Fresh,
+    )
 }
 
 /// Install a resolver plugin fetched from a signed store, reconciling the catalogue's advertised
@@ -457,17 +580,62 @@ pub(crate) fn install_from_store(
     source: &Path,
     expected_name: &str,
     expected_scheme: &str,
+    origin: origin::Origin,
 ) -> Result<Installed, String> {
-    install_inner(layout, source, Some((expected_name, expected_scheme)))
+    install_inner(
+        layout,
+        source,
+        Some((expected_name, expected_scheme)),
+        origin,
+        Placement::Fresh,
+    )
+}
+
+/// Replace an installed plugin with a newer tree from the same signed store — the placement behind
+/// `sbx plugins upgrade`. Identical to [`install_from_store`] in every check it runs; it differs
+/// only in what an existing plugin of that name means. The old tree is moved aside and kept until
+/// the new one is in place, and restored if the swap fails, so an upgrade that cannot complete
+/// leaves the plugin the user already had — the hole that `rm` followed by a fresh install opens.
+pub(crate) fn replace_from_store(
+    layout: &crate::store::Layout,
+    source: &Path,
+    expected_name: &str,
+    expected_scheme: &str,
+    origin: origin::Origin,
+) -> Result<Installed, String> {
+    install_inner(
+        layout,
+        source,
+        Some((expected_name, expected_scheme)),
+        origin,
+        Placement::Replace,
+    )
 }
 
 /// The shared body of [`install`] and [`install_from_store`]. `expect` is `Some((name, scheme))`
 /// only for a store install, where the catalogue's advertised identity is reconciled against the
 /// manifest before anything is placed; a local-directory or built-in install passes `None`.
+/// `origin` is where the plugin came from, recorded once it is in place — passed in rather than
+/// inferred from `source`, since a built-in install stages into a temp tree whose path says
+/// nothing about its provenance.
+///
+/// `placement` decides what an existing plugin of that name means: a refusal (the install verbs,
+/// where silently overwriting would discard a plugin the user did not ask to lose) or a
+/// replacement (the upgrade verb, which exists to do exactly that).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Refuse if the name is taken.
+    Fresh,
+    /// Swap the new tree in over the old one, keeping the old one until the swap succeeds.
+    Replace,
+}
+
 fn install_inner(
     layout: &crate::store::Layout,
     source: &Path,
     expect: Option<(&str, &str)>,
+    origin: origin::Origin,
+    placement: Placement,
 ) -> Result<Installed, String> {
     let exp = Expansion::from_env();
 
@@ -498,14 +666,16 @@ fn install_inner(
         }
     }
 
-    // For a local source the executable is validated up front (fail fast). A store checkout's file
-    // modes come from `git` plus the local umask — noise, since the catalogue pins only the content
-    // and the executable bit (which `verify_entry` already checked) — so its executable is instead
-    // canonicalized after the copy and validated on the staged copy below.
+    // A local source is checked up front (fail fast, before anything is copied), but against a
+    // *source* rule rather than the runner's: a regular file we own and that is not
+    // world-writable. The runner's rule — which also refuses group-write — is the right one for
+    // the artifact about to be executed, and the staged copy is held to it below after its modes
+    // are canonicalized. It is the wrong one for a source tree: a `git clone` under the common
+    // `umask 002` is group-writable throughout, so applying it here would refuse a plugin checked
+    // out of its own repository. What stays refused is the case that is actually dangerous —
+    // an executable *anyone* on the machine can rewrite between reading it and installing it.
     if expect.is_none() {
-        probe
-            .check_exec()
-            .map_err(|why| format!("the plugin's executable {} is {why}", probe.exec.display()))?;
+        verdict_source(&probe.exec)?;
     }
 
     let name = probe.name.clone();
@@ -519,27 +689,50 @@ fn install_inner(
     ensure_owner_only(&plugins_dir)?;
 
     let dest = plugins_dir.join(&name);
-    if dest.exists() {
-        return Err(format!(
-            "a plugin named `{name}` is already installed — remove it first with \
-             `sbx plugins rm {name}`"
-        ));
+    if dest.exists() && placement == Placement::Fresh {
+        let held = origin::read(layout, &name);
+        // The same source again is a re-install — what a user reaches for when a store's listing
+        // has moved past the version they hold — so it earns the two-step way forward rather than
+        // a bare collision message. A *different* source is the two-stores-one-name case: name the
+        // holder, because "already installed" alone leaves the user guessing which they have.
+        return Err(if held.same_source_as(&origin) {
+            format!(
+                "a plugin named `{name}` is already installed from {} — to replace it, remove it \
+                 first with `sbx plugins rm {name}`, then install it again",
+                held.short()
+            )
+        } else {
+            format!(
+                "a plugin named `{name}` is already installed (from {}) — remove it first with \
+                 `sbx plugins rm {name}`",
+                held.short()
+            )
+        });
     }
 
     // Refuse a scheme another installed plugin already claims: placing it would make the registry
-    // drop *both* as ambiguous, so the install would "succeed" into a silently dead plugin. This
-    // guards against a *cleanly resolving* prior claimant; a scheme already claimed by two or more
-    // plugins resolves to nothing, so this lets a further claimant in — that scheme is already
-    // broken and the user must `sbx plugins rm` the duplicates regardless (the next `list`/`info`
-    // explains the conflict).
+    // drop *both* as ambiguous, so the install would "succeed" into a silently dead plugin. Both
+    // states are refused — a scheme claimed by one plugin, and a scheme already ambiguous — so an
+    // install never adds a claimant to a namespace that is broken or about to be.
     let mut warnings = Vec::new();
     let installed = PluginRegistry::load_with(&plugins_dir, &exp, &mut warnings);
+    if let Some(claimants) = installed.conflict(&probe.scheme) {
+        return Err(format!(
+            "scheme `{}://` is claimed by more than one installed plugin ({}) — they are all \
+             disabled; remove all but one with `sbx plugins rm <name>` first",
+            probe.scheme,
+            quoted_list(claimants)
+        ));
+    }
     if let Some(other) = installed.resolver(&probe.scheme) {
         if other.dir != dest {
+            let holder = other.dir_name();
             return Err(format!(
-                "scheme `{}://` is already claimed by the installed plugin `{}` — remove it first \
-                 with `sbx plugins rm {}`",
-                probe.scheme, other.name, other.name
+                "scheme `{}://` is already claimed by the installed plugin `{}` (from {}) — \
+                 remove it first with `sbx plugins rm {holder}`",
+                probe.scheme,
+                other.name,
+                origin::read(layout, holder).short()
             ));
         }
     }
@@ -555,17 +748,14 @@ fn install_inner(
         let _ = std::fs::remove_dir_all(&stage);
         return Err(e);
     }
-    // A store checkout inherits its file modes from the fetch's umask, while git records only the
-    // executable bit (already pinned by the catalogue's content hash). Canonicalize the staged copy
-    // so an installed store plugin's permissions are deterministic and owner-clean — an executable
-    // file `0755`, the rest `0644` — rather than carrying a group/other-write bit the runner's
-    // executable check would refuse. A local install keeps its source modes (the up-front check
-    // already passed them).
-    if expect.is_some() {
-        if let Err(e) = canonicalize_modes(&stage) {
-            let _ = std::fs::remove_dir_all(&stage);
-            return Err(e);
-        }
+    // A source tree carries whatever modes produced it — a `git clone` or a checkout under the
+    // caller's umask — while git records only the executable bit. Canonicalize the staged copy so
+    // an installed plugin's permissions are deterministic and owner-clean (an executable file
+    // `0755`, everything else `0644`), whatever the source looked like. The distinction that
+    // matters is preserved, and the strict check below runs on the result.
+    if let Err(e) = canonicalize_modes(&stage) {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(e);
     }
     // The staged copy is the real artifact: validate it, not just the source.
     let staged_ok = load_one(&stage, &exp)
@@ -580,13 +770,69 @@ fn install_inner(
         return Err(e);
     }
 
+    // A replacement moves the old tree aside first — `rename` cannot overwrite a non-empty
+    // directory — and keeps it until the new one is in place. If the swap fails, the old plugin is
+    // moved back: a failed upgrade must be a non-event, never the "removed, then failed to
+    // install" hole that doing this with `rm` + install leaves.
+    let displaced = if placement == Placement::Replace && dest.exists() {
+        let aside =
+            layout
+                .data_dir()
+                .join(format!(".plugin-old-{}-{}", std::process::id(), unique()));
+        if let Err(e) = std::fs::rename(&dest, &aside) {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(format!("could not set the installed plugin aside: {e}"));
+        }
+        Some(aside)
+    } else {
+        None
+    };
+
     match std::fs::rename(&stage, &dest) {
-        Ok(()) => Ok(Installed {
-            name,
-            scheme: probe.scheme,
-        }),
+        Ok(()) => {
+            if let Some(aside) = &displaced {
+                let _ = std::fs::remove_dir_all(aside);
+            }
+            // Record the provenance only once the plugin is in place: a record without a plugin
+            // would be inherited by a later install of that name, so a wrong origin is worse than
+            // no origin. A failure here does not fail the install — the plugin is installed and
+            // usable; only the listing loses a detail — but it is never silent.
+            //
+            // The digest is of the tree *as placed*, not of the source: the staged copy had its
+            // modes canonicalized, so only what was actually installed can later be compared
+            // against it. A tree that cannot be hashed leaves no digest rather than a wrong one.
+            let origin = origin.with_digest(
+                catalogue::dir_digest(&dest)
+                    .ok()
+                    .map(|d| catalogue::to_hex(&d)),
+            );
+            if let Err(why) = origin::record(layout, &name, &origin) {
+                crate::diag::warn(&format!(
+                    "plugin `{name}` is installed, but its origin could not be recorded \
+                     ({why}) — `sbx plugins list` will show it as unknown"
+                ));
+            }
+            Ok(Installed {
+                name,
+                scheme: probe.scheme,
+            })
+        }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&stage);
+            // Put the displaced plugin back before reporting: the caller asked for a newer tree,
+            // not for the loss of the one they had.
+            if let Some(aside) = &displaced {
+                if let Err(why) = std::fs::rename(aside, &dest) {
+                    return Err(format!(
+                        "could not place the new plugin ({e}), and the installed one could not be \
+                         restored ({why}) — it is at {}",
+                        aside.display()
+                    ));
+                }
+                return Err(format!(
+                    "could not place the new plugin ({e}) — the installed one is untouched"
+                ));
+            }
             // A non-empty dest (ENOTEMPTY) means a plugin of that name appeared between the check
             // and the rename — refuse rather than overwrite.
             if dest.exists() {
@@ -598,6 +844,40 @@ fn install_inner(
                 Err(format!("could not place the plugin: {e}"))
             }
         }
+    }
+}
+
+/// Whether an installed plugin's tree still hashes to what was recorded when it was placed.
+///
+/// This is **drift detection, not a security control**, and the distinction is load-bearing: the
+/// record lives in the same owner-only tree as the plugin, so anything able to rewrite the plugin
+/// can rewrite the record too. What it catches is the accident — a plugin edited in place to debug
+/// it and forgotten, a careless third-party process — which is exactly the case a silent registry
+/// would leave a user guessing about. It is never consulted on the launch path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Integrity {
+    /// The tree hashes to the digest recorded at install.
+    Intact,
+    /// It does not: the tree changed after it was placed.
+    Modified,
+    /// No digest is recorded — installed before sbx recorded one, or placed by hand. Distinct from
+    /// `Intact`: nothing was checked, so nothing is attested.
+    Unrecorded,
+    /// The tree could not be hashed at all (a symlink appeared in it, a file became unreadable),
+    /// which is itself a change worth naming rather than swallowing.
+    Unreadable(String),
+}
+
+/// Compare an installed plugin's tree against the digest its origin record holds. `dir_name` is the
+/// plugin's directory name — the token `rm` takes — not the manifest's `name`.
+pub(crate) fn integrity(layout: &crate::store::Layout, dir_name: &str) -> Integrity {
+    let Some(recorded) = origin::read(layout, dir_name).digest().map(str::to_string) else {
+        return Integrity::Unrecorded;
+    };
+    match catalogue::dir_digest(&layout.plugins_dir().join(dir_name)) {
+        Err(why) => Integrity::Unreadable(why),
+        Ok(digest) if catalogue::to_hex(&digest) == recorded => Integrity::Intact,
+        Ok(_) => Integrity::Modified,
     }
 }
 
@@ -628,6 +908,10 @@ pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), St
         .join(format!(".plugin-rm-{}-{}", std::process::id(), unique()));
     std::fs::rename(&dest, &trash).map_err(|e| format!("cannot remove `{name}`: {e}"))?;
     let _ = std::fs::remove_dir_all(&trash);
+    // The provenance record outlives the tree it describes (it is deliberately stored outside it),
+    // so drop it here — otherwise a later install of that name would start with a stale origin
+    // until it writes its own.
+    origin::forget(layout, name);
     Ok(())
 }
 
@@ -760,145 +1044,6 @@ fn unique() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-// The default resolver-plugin store, embedded in the binary by `build.rs`: each entry is
-// (plugin directory name, path relative to that directory, file bytes). The store ships inside
-// the binary so a built-in install needs no fetch, network, or signature — trust is the binary.
-include!(concat!(env!("OUT_DIR"), "/store_plugin_files.rs"));
-
-/// One plugin in the built-in store, for `sbx plugins store list`. `name` is the token
-/// `sbx plugins install` takes; a build-time check keeps it equal to the manifest `name`, so the
-/// install (which keys on the manifest name) lands where `store list` says it will.
-pub(crate) struct StoreEntry {
-    pub(crate) name: String,
-    pub(crate) scheme: Option<String>,
-    pub(crate) version: Option<String>,
-    pub(crate) description: Option<String>,
-}
-
-/// The distinct plugin names in the built-in store, sorted.
-pub(crate) fn embedded_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = STORE_FILES.iter().map(|(name, _, _)| *name).collect();
-    names.sort_unstable();
-    names.dedup();
-    names
-}
-
-/// The built-in store entries with their manifest metadata, for `sbx plugins store list`.
-pub(crate) fn embedded_listing() -> Vec<StoreEntry> {
-    embedded_names()
-        .into_iter()
-        .map(|name| {
-            let raw = embedded_manifest(name);
-            StoreEntry {
-                name: name.to_string(),
-                scheme: raw.as_ref().and_then(|r| r.scheme.clone()),
-                version: raw.as_ref().and_then(|r| r.version.clone()),
-                description: raw.as_ref().and_then(|r| r.description.clone()),
-            }
-        })
-        .collect()
-}
-
-/// Parse the embedded `plugin.toml` of the built-in plugin `name`, if present and well-formed.
-/// A built-in manifest is always valid (a build-time test enforces it), so a `None` here means an
-/// unknown name; the lenient parse keeps `store list` from panicking on a hypothetical bad embed.
-fn embedded_manifest(name: &str) -> Option<RawManifest> {
-    let bytes = STORE_FILES
-        .iter()
-        .find(|(n, rel, _)| *n == name && *rel == "plugin.toml")
-        .map(|(_, _, bytes)| *bytes)?;
-    let text = std::str::from_utf8(bytes).ok()?;
-    toml::from_str(text).ok()
-}
-
-/// Install a resolver plugin from the built-in store by name. The bundled files are extracted to a
-/// private staging tree, the one executable the manifest names is made runnable (embedded bytes
-/// carry no file mode), and the tree is handed to [`install`] — so a built-in install runs through
-/// exactly the same validation, scheme-collision guard, and atomic placement as a local-directory
-/// install. An unknown name is refused, fail-closed.
-pub(crate) fn install_embedded(
-    layout: &crate::store::Layout,
-    name: &str,
-) -> Result<Installed, String> {
-    let files: Vec<(&str, &[u8])> = STORE_FILES
-        .iter()
-        .filter(|(n, _, _)| *n == name)
-        .map(|(_, rel, bytes)| (*rel, *bytes))
-        .collect();
-    if files.is_empty() {
-        return Err(format!(
-            "no built-in plugin named `{name}` (see `sbx plugins store list`)"
-        ));
-    }
-
-    ensure_owner_only(layout.data_dir())?;
-    // The extraction tree is removed on drop — on the success path (after `install` has copied it
-    // into place) and on any early return below.
-    let extract = TempTree(layout.data_dir().join(format!(
-        ".plugin-embed-{}-{}",
-        std::process::id(),
-        unique()
-    )));
-    let _ = std::fs::remove_dir_all(&extract.0);
-    write_embedded_tree(&extract.0, &files)?;
-
-    // The embedded bytes carry no mode, so the executable lands non-executable. Make exactly the
-    // manifest's `exec` runnable before handing the tree to `install` (which re-validates it in
-    // full) — the single step a built-in install adds over a local one, so a test asserts the bit
-    // directly on the placed file. The manifest is parsed leniently here, only to locate the
-    // executable and without expanding any `allow_paths`; `install`'s own `load_one` is the
-    // authoritative validation.
-    let raw = embedded_manifest(name)
-        .ok_or_else(|| format!("built-in plugin `{name}` has a malformed manifest"))?;
-    let exec_rel = raw
-        .exec
-        .ok_or_else(|| format!("built-in plugin `{name}` declares no `exec`"))?;
-    set_executable(&resolve_exec(&extract.0, &exec_rel)?)?;
-
-    install(layout, &extract.0)
-}
-
-/// Write an embedded plugin's files under `root` (created owner-only, as are any subdirectories).
-fn write_embedded_tree(root: &Path, files: &[(&str, &[u8])]) -> Result<(), String> {
-    use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
-    let owner_only = |dir: &Path| {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))
-    };
-    owner_only(root)?;
-    for (rel, bytes) in files {
-        let dest = root.join(rel);
-        if let Some(parent) = dest.parent() {
-            owner_only(parent)?;
-        }
-        std::fs::write(&dest, bytes)
-            .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
-    }
-    Ok(())
-}
-
-/// Make a file executable (and not group/other-writable): mode `0755`, the bit the runner requires
-/// and an embedded byte blob lacks.
-fn set_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("cannot make {} executable: {e}", path.display()))
-}
-
-/// An extraction directory removed when it goes out of scope, so a built-in install never leaks its
-/// staging tree — on success (after the files are copied into place) or on any error path.
-struct TempTree(PathBuf);
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,12 +1155,14 @@ mod tests {
     }
 
     #[test]
-    fn a_colliding_scheme_drops_both_plugins() {
+    fn a_colliding_scheme_drops_both_plugins_and_names_them_by_directory() {
         let root = crate::testutil::TmpDir::new();
+        // The first calls itself something else in its manifest: the remedy is
+        // `sbx plugins rm <directory>`, so that is what a conflict must name.
         write_plugin(
             root.path(),
             "a-vault",
-            "type = \"resolver\"\nscheme = \"vault\"\nexec = \"resolve\"\n",
+            "name = \"vault-one\"\ntype = \"resolver\"\nscheme = \"vault\"\nexec = \"resolve\"\n",
         );
         write_plugin(
             root.path(),
@@ -1027,16 +1174,21 @@ mod tests {
             reg.resolver("vault").is_none(),
             "an ambiguous scheme must resolve to nothing"
         );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("both `a-vault` and `b-vault`")),
-            "{warnings:?}"
+        assert_eq!(
+            reg.conflict("vault"),
+            Some(&["a-vault".to_string(), "b-vault".to_string()][..])
         );
+        assert!(
+            warnings.is_empty(),
+            "a conflict is state, not a per-plugin validation warning: {warnings:?}"
+        );
+        let text = reg.conflict_warnings();
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("`a-vault`, `b-vault`"), "{text:?}");
     }
 
     #[test]
-    fn three_plugins_one_scheme_all_dropped() {
+    fn three_plugins_one_scheme_all_dropped_and_all_named() {
         let root = crate::testutil::TmpDir::new();
         for n in ["a", "b", "c"] {
             write_plugin(
@@ -1047,6 +1199,38 @@ mod tests {
         }
         let (reg, _warnings) = load(root.path());
         assert!(reg.resolver("dup").is_none());
+        // The third claimant is recorded too — a report listing only the first two would leave the
+        // user removing one plugin and still holding a conflict.
+        assert_eq!(
+            reg.conflict("dup"),
+            Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])
+        );
+        let text = reg.conflict_warnings();
+        assert_eq!(text.len(), 1, "one line per scheme, not per pair: {text:?}");
+        assert!(text[0].contains("`a`, `b`, `c`"), "{text:?}");
+    }
+
+    #[test]
+    fn the_text_form_of_load_relays_the_conflict() {
+        // A caller that only relays diagnostics (a launch, a config load) must still hear about an
+        // ambiguous scheme — it silently disables a plugin the project's config may depend on.
+        let root = crate::testutil::TmpDir::new();
+        for n in ["one", "two"] {
+            write_plugin(
+                root.path(),
+                n,
+                "type = \"resolver\"\nscheme = \"vault\"\nexec = \"resolve\"\n",
+            );
+        }
+        let mut warnings = Vec::new();
+        let reg = PluginRegistry::load(root.path(), &mut warnings);
+        assert!(reg.resolver("vault").is_none());
+        assert!(
+            warnings.iter().any(
+                |w| w.contains("claimed by more than one plugin") && w.contains("`one`, `two`")
+            ),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -1215,6 +1399,16 @@ mod tests {
 
     /// Build a source plugin directory (a `plugin.toml` and an owner-owned `resolve` executable at
     /// `mode`) under `root`, returning its path — the kind of directory `sbx plugins install` takes.
+    /// The provenance a store install carries, for the tests that exercise the store path. The
+    /// store subsystem builds the real one from the configured store and the catalogue entry.
+    fn store_origin() -> origin::Origin {
+        origin::Origin::Store {
+            store: "mine".to_string(),
+            url: Some("https://example.invalid/plugins.git".to_string()),
+            sha256: Some("b".repeat(64)),
+        }
+    }
+
     fn source_plugin(root: &Path, dirname: &str, manifest: &str, exec_mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = root.join(dirname);
@@ -1300,22 +1494,37 @@ mod tests {
     }
 
     #[test]
-    fn install_refuses_a_group_writable_executable() {
+    fn install_refuses_a_world_writable_executable_but_places_a_group_writable_one_owner_only() {
         let data = crate::testutil::TmpDir::new();
         let src_root = crate::testutil::TmpDir::new();
         let layout = crate::store::Layout::under(data.path());
-        let source = source_plugin(
-            src_root.path(),
-            "pass",
-            "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n",
-            0o775,
+        let manifest = "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n";
+
+        // World-writable: anyone on the machine could swap the program between reading it and
+        // installing it. Refused, and nothing is placed.
+        let open = source_plugin(src_root.path(), "open", manifest, 0o777);
+        let err = install(&layout, &open).unwrap_err();
+        assert!(err.contains("writable by anyone"), "{err}");
+        assert!(err.contains("chmod o-w"), "the fix is named: {err}");
+        assert!(!layout.plugins_dir().join("open").exists());
+
+        // Group-writable is what a checkout under the common `umask 002` looks like, so a plugin
+        // must install from its own repository. What lands is owner-only regardless of the source.
+        use std::os::unix::fs::PermissionsExt;
+        let shared = source_plugin(src_root.path(), "shared", manifest, 0o775);
+        install(&layout, &shared).expect("a group-writable source installs");
+        // The manifest names no `name`, so it installs under its source directory name.
+        let placed = layout.plugins_dir().join("shared/resolve");
+        let mode = std::fs::metadata(&placed).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "the placed executable is canonicalized, whatever the source mode was"
         );
-        let err = install(&layout, &source).unwrap_err();
-        assert!(err.contains("group or other"), "{err}");
-        assert!(
-            !layout.plugins_dir().join("pass").exists(),
-            "a non-runnable source must place nothing"
-        );
+        // ...and it passes the runner's own, stricter check — the one that governs execution.
+        let mut warnings = Vec::new();
+        let reg = PluginRegistry::load(&layout.plugins_dir(), &mut warnings);
+        assert!(reg.resolver("pass").unwrap().check_exec().is_ok());
     }
 
     #[test]
@@ -1383,6 +1592,43 @@ mod tests {
         );
         let err = install(&layout, &b).unwrap_err();
         assert!(err.contains("already installed"), "{err}");
+        // Both are local installs — the same source — so the refusal offers the way to replace it
+        // rather than only naming the collision.
+        assert!(err.contains("then install it again"), "{err}");
+    }
+
+    #[test]
+    fn a_collision_with_a_different_source_names_the_holder() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        // A store placed `vault`; a local directory then claims that name. The refusal has to say
+        // who holds it, since the user has two plausible sources in mind.
+        let from_store = source_plugin(
+            src_root.path(),
+            "checkout",
+            "name=\"vault\"\ntype=\"resolver\"\nscheme=\"secret-store\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        install_from_store(
+            &layout,
+            &from_store,
+            "vault",
+            "secret-store",
+            store_origin(),
+        )
+        .expect("install from the store");
+        let local = source_plugin(
+            src_root.path(),
+            "mine",
+            "name=\"vault\"\ntype=\"resolver\"\nscheme=\"other\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        let err = install(&layout, &local).unwrap_err();
+        assert!(
+            err.contains("already installed (from store 'mine')"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1421,6 +1667,43 @@ mod tests {
     }
 
     #[test]
+    fn install_refuses_a_scheme_that_is_already_in_conflict() {
+        // The only way into a conflict is a hand-placed tree, so stage one: two directories under
+        // the plugins dir claiming one scheme. Neither resolves, so a guard that only asked "does
+        // this scheme resolve?" would wave a third claimant in and deepen the breakage.
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        for n in ["one", "two"] {
+            let src = source_plugin(
+                src_root.path(),
+                n,
+                &format!("name=\"{n}\"\ntype=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n"),
+                0o755,
+            );
+            copy_tree(&src, &layout.plugins_dir().join(n)).expect("hand-place");
+        }
+        let third = source_plugin(
+            src_root.path(),
+            "three",
+            "name=\"three\"\ntype=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        let err = install(&layout, &third).unwrap_err();
+        assert!(
+            err.contains("claimed by more than one installed plugin (`one`, `two`)"),
+            "{err}"
+        );
+        assert!(!layout.plugins_dir().join("three").exists());
+
+        // And the way out works: with one claimant left, the scheme resolves again.
+        remove(&layout, "two").expect("remove one claimant");
+        let (reg, _warnings) = load(&layout.plugins_dir());
+        assert_eq!(reg.resolver("vault").map(|p| p.name.as_str()), Some("one"));
+        assert!(reg.conflict("vault").is_none());
+    }
+
+    #[test]
     fn install_from_store_installs_when_the_advertised_identity_matches() {
         let data = crate::testutil::TmpDir::new();
         let src_root = crate::testutil::TmpDir::new();
@@ -1434,7 +1717,8 @@ mod tests {
             0o755,
         );
         let installed =
-            install_from_store(&layout, &source, "pass", "secret-store").expect("install");
+            install_from_store(&layout, &source, "pass", "secret-store", store_origin())
+                .expect("install");
         assert_eq!(installed.name, "pass");
         assert_eq!(installed.scheme, "secret-store");
         assert!(layout.plugins_dir().join("pass").exists());
@@ -1452,7 +1736,8 @@ mod tests {
             0o755,
         );
         // the catalogue listed this as `other`, but the manifest declares `pass`
-        let err = install_from_store(&layout, &source, "other", "secret-store").unwrap_err();
+        let err = install_from_store(&layout, &source, "other", "secret-store", store_origin())
+            .unwrap_err();
         assert!(err.contains("lists this plugin as `other`"), "{err}");
         assert!(!layout.plugins_dir().join("pass").exists());
         assert!(!layout.plugins_dir().join("other").exists());
@@ -1470,7 +1755,8 @@ mod tests {
             0o755,
         );
         // the catalogue advertised `vault://`, but the plugin's manifest claims `secret-store://`
-        let err = install_from_store(&layout, &source, "pass", "vault").unwrap_err();
+        let err =
+            install_from_store(&layout, &source, "pass", "vault", store_origin()).unwrap_err();
         assert!(err.contains("advertises scheme `vault://`"), "{err}");
         assert!(!layout.plugins_dir().join("pass").exists());
     }
@@ -1503,6 +1789,229 @@ mod tests {
     }
 
     #[test]
+    fn each_install_path_records_where_the_plugin_came_from() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+
+        // A local directory records its canonical path, so a listing names a stable location.
+        let source = source_plugin(
+            src_root.path(),
+            "kp",
+            "type=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        install(&layout, &source).expect("install");
+        let placed = catalogue::to_hex(
+            &catalogue::dir_digest(&layout.plugins_dir().join("kp")).expect("hash the placed tree"),
+        );
+        assert_eq!(
+            origin::read(&layout, "kp"),
+            origin::Origin::Local {
+                path: Some(
+                    std::fs::canonicalize(&source)
+                        .unwrap()
+                        .display()
+                        .to_string()
+                ),
+                // The digest is of the tree as installed — the staged copy had its modes
+                // canonicalized, so only that tree can later be compared against it.
+                sha256: Some(placed),
+            }
+        );
+
+        // A store install records the store, not the checkout it was copied from — and the digest
+        // of what it placed, so both install paths are equally verifiable afterwards.
+        let from_store = source_plugin(
+            src_root.path(),
+            "checkout",
+            "name=\"pass\"\ntype=\"resolver\"\nscheme=\"secret-store\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        install_from_store(&layout, &from_store, "pass", "secret-store", store_origin())
+            .expect("install");
+        let recorded = origin::read(&layout, "pass");
+        assert!(recorded.is_store("mine"), "{recorded:?}");
+        assert_eq!(
+            recorded.digest(),
+            Some(
+                catalogue::to_hex(
+                    &catalogue::dir_digest(&layout.plugins_dir().join("pass")).unwrap()
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn a_replacement_swaps_the_tree_and_re_records_its_digest() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let manifest = "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n";
+        let first = source_plugin(src_root.path(), "v1", manifest, 0o755);
+        install_from_store(&layout, &first, "kp", "kp", store_origin()).expect("install");
+        assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
+
+        // A second tree under the same name: a fresh install refuses it, a replacement is what the
+        // upgrade verb needs.
+        let second = source_plugin(src_root.path(), "v2", manifest, 0o755);
+        fs::write(second.join("resolve"), "#!/bin/sh\necho newer\n").unwrap();
+        let err = install_from_store(&layout, &second, "kp", "kp", store_origin()).unwrap_err();
+        assert!(err.contains("already installed"), "{err}");
+        replace_from_store(&layout, &second, "kp", "kp", store_origin()).expect("replace");
+
+        // The placed tree is the new one, and the record follows it — otherwise the next `verify`
+        // would call a correctly-upgraded plugin modified.
+        let placed = fs::read_to_string(layout.plugins_dir().join("kp/resolve")).unwrap();
+        assert!(placed.contains("newer"), "{placed}");
+        assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
+        // Nothing is left behind in the data dir by the swap.
+        let leaked: Vec<_> = fs::read_dir(data.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(".plugin-old-") || n.starts_with(".plugin-stage-")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "a swap temp leaked: {leaked:?}");
+    }
+
+    #[test]
+    fn a_refused_replacement_leaves_the_installed_plugin_in_place() {
+        // The property the verb exists for: `rm` followed by an install deletes first, so a failure
+        // after it leaves nothing. A replacement must be a non-event when it cannot complete.
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let good = source_plugin(
+            src_root.path(),
+            "v1",
+            "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        install_from_store(&layout, &good, "kp", "kp", store_origin()).expect("install");
+
+        // A candidate whose manifest disagrees with the catalogue's advertised identity — the same
+        // reconciliation an install runs, refused just as hard.
+        let bad = source_plugin(
+            src_root.path(),
+            "v2",
+            "name=\"impostor\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        let err = replace_from_store(&layout, &bad, "kp", "kp", store_origin()).unwrap_err();
+        assert!(err.contains("refusing the mismatch"), "{err}");
+
+        // Still installed, still the tree that was there, still matching its record.
+        let (reg, _w) = load(&layout.plugins_dir());
+        assert_eq!(reg.resolver("kp").map(|p| p.name.as_str()), Some("kp"));
+        assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
+    }
+
+    #[test]
+    fn integrity_reports_intact_then_modified_then_intact_again() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_plugin(
+            src_root.path(),
+            "kp",
+            "type=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        install(&layout, &source).expect("install");
+        assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
+
+        // The manifest is the sharpest case: it carries the sandbox grant, so editing it in place
+        // is a privilege change the registry would otherwise honor without a word.
+        let manifest = layout.plugins_dir().join("kp/plugin.toml");
+        fs::write(
+            &manifest,
+            "type=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n[sandbox]\nnetwork=true\n",
+        )
+        .unwrap();
+        assert_eq!(integrity(&layout, "kp"), Integrity::Modified);
+
+        // Reinstalling restores a known tree, and with it a matching record.
+        remove(&layout, "kp").expect("remove");
+        install(&layout, &source).expect("reinstall");
+        assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
+    }
+
+    #[test]
+    fn integrity_separates_unrecorded_and_unhashable_from_modified() {
+        let data = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        // Hand-placed: no record, so nothing was ever attested. That is not the same answer as
+        // "this changed", and it must not be reported as one.
+        let dir = layout.plugins_dir().join("handmade");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("plugin.toml"),
+            "type=\"resolver\"\nscheme=\"hm\"\nexec=\"resolve\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("resolve"), "#!/bin/sh\n").unwrap();
+        assert_eq!(integrity(&layout, "handmade"), Integrity::Unrecorded);
+
+        // A tree that cannot be hashed at all is named as such, never silently passed: a symlink
+        // appearing inside an installed plugin is itself a change.
+        let src_root = crate::testutil::TmpDir::new();
+        let source = source_plugin(
+            src_root.path(),
+            "kp",
+            "type=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        install(&layout, &source).expect("install");
+        std::os::unix::fs::symlink("/etc/passwd", layout.plugins_dir().join("kp/leak")).unwrap();
+        assert!(matches!(integrity(&layout, "kp"), Integrity::Unreadable(_)));
+    }
+
+    #[test]
+    fn removing_a_plugin_drops_its_origin_record() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_plugin(
+            src_root.path(),
+            "pass",
+            "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        install(&layout, &source).expect("install");
+        assert!(matches!(
+            origin::read(&layout, "pass"),
+            origin::Origin::Local { .. }
+        ));
+        remove(&layout, "pass").expect("remove");
+        // The record lives outside the tree that was removed, so it has to be dropped explicitly —
+        // otherwise a later local install of that name would inherit the stale provenance.
+        assert_eq!(origin::read(&layout, "pass"), origin::Origin::Unknown);
+    }
+
+    #[test]
+    fn the_origin_records_are_invisible_to_discovery() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_plugin(
+            src_root.path(),
+            "pass",
+            "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        install(&layout, &source).expect("install");
+        // The records sit in a dot-prefixed directory *under* the plugins directory, which the
+        // registry must skip silently — not warn about, and certainly not load.
+        let (reg, warnings) = load(&layout.plugins_dir());
+        assert_eq!(reg.resolvers().count(), 1);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
     fn remove_refuses_an_unsafe_name() {
         let data = crate::testutil::TmpDir::new();
         let layout = crate::store::Layout::under(data.path());
@@ -1531,142 +2040,42 @@ mod tests {
         assert!(stray.exists(), "a non-plugin directory must be left intact");
     }
 
+    /// Every plugin directory shipped in the repository actually installs: the manifest loads, the
+    /// directory name matches the name it installs under, and the executable it names is a real
+    /// program. They are examples users install by path, so a broken one is a repository bug that
+    /// fails here rather than at someone's first install.
+    ///
+    /// The source is copied to a throwaway tree first, with the modes an install requires. The
+    /// checkout's own modes depend on the umask that produced it (a `umask 002` clone is
+    /// group-writable), which is a fact about the machine rather than about the plugin — the
+    /// install refuses that case on purpose, and says how to fix it.
     #[test]
-    fn the_built_in_store_lists_the_bundled_plugins() {
-        let names = embedded_names();
-        assert!(names.contains(&"pass"), "the store ships `pass`: {names:?}");
-        assert!(
-            names.contains(&"vault"),
-            "the store ships `vault`: {names:?}"
-        );
-        // the listing surfaces each plugin's scheme/version/description for `store list`
-        let listing = embedded_listing();
-        let pass = listing
-            .iter()
-            .find(|e| e.name == "pass")
-            .expect("pass in the listing");
-        assert_eq!(pass.scheme.as_deref(), Some("pass"));
-        assert_eq!(pass.version.as_deref(), Some("0.1.0"));
-        assert!(pass.description.is_some());
-    }
-
-    /// The load-bearing invariant: `install` keys on the manifest `name`, but `store list` and the
-    /// user key on the directory name. They coincide for the shipped plugins; this fails the build
-    /// the day a bundled plugin's directory and manifest name diverge — when `install <dir>` would
-    /// silently land under the manifest name and `rm <dir>` would miss it.
-    #[test]
-    fn every_built_in_plugin_dir_name_equals_its_manifest_name() {
-        for name in embedded_names() {
-            let raw = embedded_manifest(name)
-                .unwrap_or_else(|| panic!("built-in plugin `{name}` has no parseable manifest"));
-            assert_eq!(
-                raw.name.as_deref(),
-                Some(name),
-                "built-in plugin directory `{name}` must declare `name = \"{name}\"`"
-            );
-        }
-    }
-
-    /// Every bundled plugin must be *installable*, not merely parseable — extract it, run the same
-    /// validation the registry applies, then make its `exec` runnable and run the very `check_exec`
-    /// the install (and the runner) enforces. This is the regression net the built-in store
-    /// advertises: a malformed manifest, a missing/renamed `exec`, or a non-runnable executable in a
-    /// bundled plugin is a build-time bug that fails CI here, not the user's `sbx plugins install`.
-    /// It covers `pass` too (the install-path integration test uses `vault` to dodge `$XDG_RUNTIME_DIR`).
-    #[test]
-    fn every_built_in_plugin_is_installable() {
-        // A fixed expansion so a plugin referencing `$XDG_RUNTIME_DIR` (such as `pass`) validates
-        // regardless of the test environment; `check_exec` does not expand paths.
-        let exp = Expansion {
-            home: Some(PathBuf::from("/home/u")),
-            runtime: Some(PathBuf::from("/run/user/1000")),
-        };
-        for name in embedded_names() {
-            let files: Vec<(&str, &[u8])> = STORE_FILES
-                .iter()
-                .filter(|(n, _, _)| *n == name)
-                .map(|(_, rel, bytes)| (*rel, *bytes))
-                .collect();
-            let tmp = crate::testutil::TmpDir::new();
-            let root = tmp.path().join(name);
-            write_embedded_tree(&root, &files).unwrap();
-            let plugin = load_one(&root, &exp)
-                .unwrap_or_else(|e| panic!("built-in plugin `{name}` failed validation: {e}"))
-                .unwrap_or_else(|| panic!("built-in plugin `{name}` has no manifest"));
-            assert_eq!(plugin.name, name);
-            // the step install adds, then the check install (and the runner) gates on: this fails on
-            // a bundled plugin whose `exec` is missing or renamed (`set_executable` ENOENT) or not a
-            // runnable owner-only regular file (`check_exec`).
-            set_executable(&plugin.exec).unwrap();
-            plugin
-                .check_exec()
-                .unwrap_or_else(|e| panic!("built-in plugin `{name}` is not installable: {e}"));
-        }
-    }
-
-    #[test]
-    fn install_embedded_places_a_built_in_plugin_and_makes_it_runnable() {
-        let data = crate::testutil::TmpDir::new();
-        let layout = crate::store::Layout::under(data.path());
-        // `vault` has no `allow_paths`, so the install validates with no environment dependency.
-        let installed = install_embedded(&layout, "vault").expect("install the built-in vault");
-        assert_eq!(installed.name, "vault");
-        assert_eq!(installed.scheme, "vault");
-
-        let dest = layout.plugins_dir().join("vault");
-        assert!(dest.join("plugin.toml").is_file());
-        // the executable bit was restored on extraction and survived the copy into place — the one
-        // step a built-in install adds, asserted directly (the embedded bytes carried no mode).
+    fn every_plugin_shipped_in_the_repository_is_installable() {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dest.join("resolve"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755, "the executable bit must be set");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        let mut checked = 0;
+        for entry in fs::read_dir(&root).expect("the repository's plugins directory") {
+            let dir = entry.unwrap().path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let name = dir.file_name().and_then(OsStr::to_str).unwrap().to_string();
+            let staging = crate::testutil::TmpDir::new();
+            let source = staging.path().join(&name);
+            copy_tree(&dir, &source).unwrap_or_else(|e| panic!("copying plugin `{name}`: {e}"));
+            canonicalize_modes(&source).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
 
-        // the live registry surfaces it, runnable, with no warnings
-        let mut warnings = Vec::new();
-        let reg = PluginRegistry::load(&layout.plugins_dir(), &mut warnings);
-        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        let p = reg.resolver("vault").expect("the built-in plugin resolves");
-        assert!(
-            p.check_exec().is_ok(),
-            "the placed executable stays runnable"
-        );
-
-        // no extraction temp was left behind
-        assert!(!leaked_embed_temp(data.path()), "an extraction temp leaked");
-    }
-
-    #[test]
-    fn install_embedded_refuses_an_unknown_name() {
-        let data = crate::testutil::TmpDir::new();
-        let layout = crate::store::Layout::under(data.path());
-        let err = install_embedded(&layout, "nope").unwrap_err();
-        assert!(err.contains("no built-in plugin named `nope`"), "{err}");
-    }
-
-    #[test]
-    fn install_embedded_cleans_up_when_the_install_fails() {
-        let data = crate::testutil::TmpDir::new();
-        let layout = crate::store::Layout::under(data.path());
-        install_embedded(&layout, "vault").expect("first install");
-        // a second install of the same name fails (already installed) — the extraction temp must
-        // still be cleaned up on that failure path, not only on success.
-        let err = install_embedded(&layout, "vault").unwrap_err();
-        assert!(err.contains("already installed"), "{err}");
-        assert!(
-            !leaked_embed_temp(data.path()),
-            "an extraction temp leaked on the failure path"
-        );
-    }
-
-    /// Whether any `.plugin-embed-` extraction temp survives under the data directory.
-    fn leaked_embed_temp(data: &Path) -> bool {
-        fs::read_dir(data).unwrap().flatten().any(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(".plugin-embed-")
-        })
+            let data = crate::testutil::TmpDir::new();
+            let layout = crate::store::Layout::under(data.path());
+            let installed = install(&layout, &source)
+                .unwrap_or_else(|e| panic!("plugin `{name}` does not install: {e}"));
+            assert_eq!(
+                installed.name, name,
+                "a plugin installs under its manifest name, so the directory must match it"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "the repository ships no plugin to check");
     }
 }

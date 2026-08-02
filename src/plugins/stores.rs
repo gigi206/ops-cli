@@ -51,11 +51,12 @@ pub(crate) struct Added {
     pub(crate) tofu: bool,
 }
 
-/// How an add learns the key it pins: a key the user supplied out of band (the strong form), or
-/// trust on first use — accept the key the store ships and pin it, verifying the catalogue against
-/// that very key. TOFU has no first-fetch authenticity (a malicious author controls both the key
-/// and the catalogue); its value is establishing the pin that every later `update` then enforces.
-enum TrustChoice {
+/// How an add — or a rotation — learns the key it pins: a key the user supplied out of band (the
+/// strong form), or trust on first use, accepting the key the store ships and pinning it, verifying
+/// the catalogue against that very key. TOFU has no first-fetch authenticity (a malicious author
+/// controls both the key and the catalogue); its value is establishing the pin that every later
+/// `update` then enforces.
+pub(crate) enum TrustChoice {
     Pinned([u8; 32]),
     Tofu,
 }
@@ -196,6 +197,89 @@ fn read_repo_pubkey(checkout: &Path) -> Result<[u8; 32], String> {
         }
     })?;
     decode_key(&hex)
+}
+
+/// What [`verify_key`] found: either the store's key was confirmed against one the user supplied
+/// from elsewhere (and its record now says so), or it had been supplied out of band all along and
+/// there was nothing left to confirm.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Verified {
+    /// The supplied key matched the pinned one, which is no longer marked as merely accepted.
+    Confirmed,
+    /// The store was already configured from a key the user supplied — an idempotent no-op.
+    AlreadyPinned,
+}
+
+/// Confirm a store's pinned key against one the user obtained elsewhere, closing the open end of
+/// trust-on-first-use: the key was accepted from the store itself, and only a second source can say
+/// it is the author's.
+///
+/// This changes **no** enforcement — the pinned key is unchanged, and a fetch already verifies the
+/// catalogue against it either way. It records that the key has been confirmed, so the standing
+/// caution stops being shown. That matters because a caution with no way out is one a user learns
+/// to ignore.
+///
+/// A mismatch is refused loudly and changes nothing: the store is not the one the supplied key
+/// belongs to. No fetch and no network — only the owner-only cache is read and rewritten.
+pub(crate) fn verify_key(
+    layout: &crate::store::Layout,
+    name: &str,
+    supplied: [u8; 32],
+) -> Result<Verified, String> {
+    let cfg = read_configured(layout, name)?;
+    if !cfg.tofu {
+        return Ok(Verified::AlreadyPinned);
+    }
+    if cfg.pubkey != supplied {
+        return Err(format!(
+            "the key pinned for store `{name}` is not the one you supplied — this store is not \
+             the one that key belongs to, and nothing was changed\n  pinned:   {}\n  \
+             supplied: {}",
+            crate::plugins::catalogue::to_hex(&cfg.pubkey),
+            crate::plugins::catalogue::to_hex(&supplied)
+        ));
+    }
+
+    // `store.toml` carries the trust anchor: a partial write would leave the store unreadable
+    // (a missing or malformed one is a hard failure, deliberately). Write a private temp file and
+    // rename over it, so a reader sees the old record or the new one and never a torn file.
+    let dir = layout.store_path(name);
+    let tmp = dir.join(format!(".store-toml-{}-{}", std::process::id(), unique()));
+    let _ = std::fs::remove_file(&tmp);
+    write_file(&tmp, store_toml(&cfg.url, &cfg.pubkey, false).as_bytes())?;
+    if let Err(e) = std::fs::rename(&tmp, dir.join(STORE_TOML)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot record the confirmation: {e}"));
+    }
+    Ok(Verified::Confirmed)
+}
+
+/// The public key a store repository ships, fetched and then thrown away — what `store add`
+/// reports when no trust anchor was supplied, so the user can see the key *before* deciding what
+/// to do with it rather than after pinning it.
+///
+/// No store is configured and the fetch does not persist: the clone lands in a private staging
+/// directory the guard removes on every exit path, and no `store.toml` is written. The data
+/// directory itself is created if missing, as it is by any verb that stages under it. Reading a key
+/// this way proves nothing about the store — whoever controls the URL controls the key it ships —
+/// so this is a display aid for a decision the user still has to make, never a trust decision.
+pub(crate) fn shipped_pubkey(
+    layout: &crate::store::Layout,
+    url: &str,
+    git: &Path,
+) -> Result<[u8; 32], String> {
+    validate_url(url)?;
+    ensure_owner_only(layout.data_dir())?;
+    let stage = Stage(layout.data_dir().join(format!(
+        ".store-probe-{}-{}",
+        std::process::id(),
+        unique()
+    )));
+    let _ = std::fs::remove_dir_all(&stage.0);
+    ensure_owner_only(&stage.0)?;
+    let checkout = stage.0.join(CHECKOUT);
+    clone(git, url, &checkout)?;
+    read_repo_pubkey(&checkout)
 }
 
 /// What a successful publish produced: the public key the catalogue is now signed with (to be
@@ -562,6 +646,30 @@ pub(crate) fn install_plugin(
     store_name: &str,
     plugin_name: &str,
 ) -> Result<crate::plugins::Installed, String> {
+    place_plugin(layout, store_name, plugin_name, false)
+}
+
+/// Replace an installed plugin with what the store's catalogue lists now — `sbx plugins upgrade`.
+/// Every gate an install runs is run again here (the checkout must be a real directory, its content
+/// must reproduce the signed `sha256`, and its manifest must agree with the catalogue's advertised
+/// name and scheme), because an upgrade installs code exactly as an install does. The only
+/// difference is that the name being taken is the point rather than a refusal — and the swap keeps
+/// the installed plugin until the new one is in place.
+pub(crate) fn upgrade_plugin(
+    layout: &crate::store::Layout,
+    store_name: &str,
+    plugin_name: &str,
+) -> Result<crate::plugins::Installed, String> {
+    place_plugin(layout, store_name, plugin_name, true)
+}
+
+/// The shared body: verify a store's listed plugin and place it, replacing an existing one or not.
+fn place_plugin(
+    layout: &crate::store::Layout,
+    store_name: &str,
+    plugin_name: &str,
+    replace: bool,
+) -> Result<crate::plugins::Installed, String> {
     crate::plugins::validate_install_name(store_name)?;
     if !layout.store_path(store_name).exists() {
         return Err(format!(
@@ -605,7 +713,110 @@ pub(crate) fn install_plugin(
     // bytes about to be installed are exactly what was listed and signed.
     crate::plugins::catalogue::verify_entry(entry, &plugin_dir)?;
 
-    crate::plugins::install_from_store(layout, &plugin_dir, plugin_name, &entry.scheme)
+    // The store's URL is carried into the record so a later listing still names where the plugin
+    // came from after the store itself is removed; a store whose configuration cannot be read is
+    // no reason to refuse an install whose content gate has already passed.
+    let url = read_configured(layout, store_name).ok().map(|c| c.url);
+    let origin = crate::plugins::origin::Origin::Store {
+        store: store_name.to_string(),
+        url,
+        sha256: Some(entry.sha256.clone()),
+    };
+    if replace {
+        crate::plugins::replace_from_store(layout, &plugin_dir, plugin_name, &entry.scheme, origin)
+    } else {
+        crate::plugins::install_from_store(layout, &plugin_dir, plugin_name, &entry.scheme, origin)
+    }
+}
+
+/// What a successful [`rekey`] replaced: the key that was pinned, the one now pinned, and how the
+/// new one was obtained — so the report can be as explicit as the act deserves.
+#[derive(Debug)]
+pub(crate) struct Rekeyed {
+    pub(crate) name: String,
+    pub(crate) old_pubkey: [u8; 32],
+    pub(crate) new_pubkey: [u8; 32],
+    pub(crate) tofu: bool,
+    pub(crate) rev: u64,
+    pub(crate) catalogue: crate::plugins::catalogue::Catalogue,
+}
+
+/// Replace the key pinned for a configured store, for the case a store legitimately rotates its
+/// signing key — which `update` otherwise refuses, correctly and permanently.
+///
+/// It is a **separate verb on purpose**: an existing `update` in a script must never start
+/// accepting a new signing identity because a repository decided to ship one. The caller is
+/// responsible for the warning and the confirmation; this performs the exchange, and only when the
+/// new key actually verifies the fetched catalogue.
+///
+/// The rollback floor is carried over: a new key does not reopen the door to a superseded
+/// catalogue. A key identical to the pinned one is refused — nothing would rotate, and treating it
+/// as a success would hide whatever else made `update` fail.
+pub(crate) fn rekey(
+    layout: &crate::store::Layout,
+    name: &str,
+    trust: TrustChoice,
+    git: &Path,
+) -> Result<Rekeyed, String> {
+    let cfg = read_configured(layout, name)?;
+
+    ensure_owner_only(layout.data_dir())?;
+    let stage = Stage(layout.data_dir().join(format!(
+        ".store-stage-{}-{}",
+        std::process::id(),
+        unique()
+    )));
+    let _ = std::fs::remove_dir_all(&stage.0);
+    ensure_owner_only(&stage.0)?;
+    let checkout = stage.0.join(CHECKOUT);
+    clone(git, &cfg.url, &checkout)?;
+
+    let (pubkey, tofu) = match trust {
+        TrustChoice::Pinned(k) => (k, false),
+        TrustChoice::Tofu => (read_repo_pubkey(&checkout)?, true),
+    };
+    if pubkey == cfg.pubkey {
+        return Err(format!(
+            "store `{name}` is already pinned to that key — nothing to rotate"
+        ));
+    }
+
+    // The new key must actually verify what the store now serves; otherwise the rotation would
+    // leave a store pinned to a key that signs nothing it holds.
+    let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
+    let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
+    let catalogue =
+        crate::plugins::catalogue::verified_catalogue(&catalogue_bytes, &signature, &pubkey)
+            .map_err(|why| {
+                format!("{why} — the key you supplied does not sign this store's catalogue")
+            })?;
+    if catalogue.rev < cfg.locked_rev {
+        return Err(format!(
+            "refusing to roll back store `{name}`: the fetched catalogue is revision {} but \
+             revision {} was already accepted",
+            catalogue.rev, cfg.locked_rev
+        ));
+    }
+
+    let _ = std::fs::remove_dir_all(checkout.join(".git"));
+    write_file(
+        &stage.0.join(STORE_TOML),
+        store_toml(&cfg.url, &pubkey, tofu).as_bytes(),
+    )?;
+    write_file(
+        &stage.0.join(CATALOGUE_LOCK),
+        format!("{}\n", catalogue.rev).as_bytes(),
+    )?;
+    swap_into_place(&stage.0, &layout.store_path(name))?;
+
+    Ok(Rekeyed {
+        name: name.to_string(),
+        old_pubkey: cfg.pubkey,
+        new_pubkey: pubkey,
+        tofu,
+        rev: catalogue.rev,
+        catalogue,
+    })
 }
 
 /// What a successful [`update`] changed: a revision moves forward only, so the report names the
@@ -649,7 +860,25 @@ pub(crate) fn update(
     let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
     let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
     let catalogue =
-        crate::plugins::catalogue::verified_catalogue(&catalogue_bytes, &signature, &cfg.pubkey)?;
+        crate::plugins::catalogue::verified_catalogue(&catalogue_bytes, &signature, &cfg.pubkey)
+            .map_err(|why| {
+                // The verifier is deliberately an opaque "it did not verify" (no oracle). But the single
+                // likeliest cause is one this side *can* name without weakening that: the store now ships a
+                // different key than the one pinned. Saying so turns an unactionable failure into a
+                // decision — a rotation the author announced, or a store that is no longer the same one.
+                match read_repo_pubkey(&checkout) {
+                    Ok(shipped) if shipped != cfg.pubkey => format!(
+                "the catalogue is no longer signed by the key pinned for store `{name}` — the \
+                 key this store ships has CHANGED\n  pinned: {}\n  now:    {}\n  an \
+                 announced rotation is legitimate; an unannounced one is what a takeover looks \
+                 like. Confirm the new key from a source this store does not control, then:\n    \
+                 sbx plugins store rekey {name} --key <the new key you obtained>",
+                crate::plugins::catalogue::to_hex(&cfg.pubkey),
+                crate::plugins::catalogue::to_hex(&shipped)
+            ),
+                    _ => why,
+                }
+            })?;
 
     if catalogue.rev < cfg.locked_rev {
         return Err(format!(
@@ -1571,7 +1800,10 @@ mod tests {
         ship_pubkey(repo.path(), &pubkey_of(&attacker));
         commit_all(&git, repo.path(), "re-key");
         let err = update(&layout, "acme", &git).unwrap_err();
-        assert!(err.contains("signature"), "{err}");
+        // The refusal *is* the TOFU property. The message names why — the key this store ships
+        // changed — which is what lets a user tell an announced rotation from this takeover.
+        assert!(err.contains("has CHANGED"), "{err}");
+        assert!(err.contains("store rekey acme"), "{err}");
         assert_eq!(read_lock(&layout, "acme"), 5);
         assert!(!leaked_stage(data.path()));
     }
@@ -1665,6 +1897,208 @@ mod tests {
             reg.resolver("secret-store").is_some(),
             "the installed plugin resolves under its advertised scheme"
         );
+
+        // The provenance a listing later reports: which store it came from, where that store is
+        // fetched from (so the answer survives `store rm`), and the content hash the catalogue
+        // pinned at install time.
+        let catalogue = cached_catalogue(&layout, "default").expect("cached catalogue");
+        assert_eq!(
+            crate::plugins::origin::read(&layout, "pass"),
+            crate::plugins::origin::Origin::Store {
+                store: "default".to_string(),
+                url: Some(url.clone()),
+                sha256: Some(catalogue.plugins["pass"].sha256.clone()),
+            }
+        );
+    }
+
+    #[test]
+    fn two_stores_listing_one_name_the_second_install_names_the_holder() {
+        let Some(git) = git_or_skip() else { return };
+        let data = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        // Two independently-signed stores that happen to list a plugin of the same name — the
+        // install namespace is flat, so only one of them can hold it.
+        let first_repo = crate::testutil::TmpDir::new();
+        let first_key = build_signed_store(first_repo.path(), 1);
+        let first_url = commit_repo(&git, first_repo.path());
+        add(&layout, "first", &first_url, first_key, &git).expect("add the first store");
+        let second_repo = crate::testutil::TmpDir::new();
+        let second_key = build_signed_store(second_repo.path(), 1);
+        let second_url = commit_repo(&git, second_repo.path());
+        add(&layout, "second", &second_url, second_key, &git).expect("add the second store");
+
+        install_plugin(&layout, "first", "pass").expect("install from the first store");
+        // The second store's copy is refused, and the refusal says which store holds the name —
+        // otherwise "already installed" leaves the user with no way to tell the two apart.
+        let err = install_plugin(&layout, "second", "pass").unwrap_err();
+        assert!(
+            err.contains("already installed (from store 'first')"),
+            "{err}"
+        );
+        assert_eq!(
+            crate::plugins::origin::read(&layout, "pass"),
+            crate::plugins::origin::Origin::Store {
+                store: "first".to_string(),
+                url: Some(first_url),
+                sha256: Some(
+                    cached_catalogue(&layout, "first").unwrap().plugins["pass"]
+                        .sha256
+                        .clone()
+                ),
+            },
+            "the failed second install must not rewrite the first store's provenance"
+        );
+    }
+
+    #[test]
+    fn verify_key_confirms_a_tofu_pin_and_refuses_a_key_that_does_not_match() {
+        let Some(git) = git_or_skip() else { return };
+        let repo = crate::testutil::TmpDir::new();
+        let data = crate::testutil::TmpDir::new();
+        let kp = keypair();
+        sign_store(repo.path(), 1, &kp);
+        ship_pubkey(repo.path(), &pubkey_of(&kp));
+        let url = commit_repo(&git, repo.path());
+        let layout = crate::store::Layout::under(data.path());
+        add_tofu(&layout, "hub", &url, &git).expect("add on first use");
+        assert!(read_configured(&layout, "hub").unwrap().tofu);
+
+        // A key from somewhere else that is NOT this store's: the caution stands, untouched.
+        let other = pubkey_of(&keypair());
+        let err = verify_key(&layout, "hub", other).unwrap_err();
+        assert!(err.contains("is not the one you supplied"), "{err}");
+        assert!(
+            read_configured(&layout, "hub").unwrap().tofu,
+            "a mismatch must leave the record exactly as it was"
+        );
+
+        // The real key, obtained out of band: the pin is confirmed and the caution ends.
+        assert_eq!(
+            verify_key(&layout, "hub", pubkey_of(&kp)).unwrap(),
+            Verified::Confirmed
+        );
+        let cfg = read_configured(&layout, "hub").unwrap();
+        assert!(!cfg.tofu);
+        // Confirming records only that: the key, the URL, and the revision floor are untouched, so
+        // nothing about what a later fetch enforces has changed.
+        assert_eq!(cfg.pubkey, pubkey_of(&kp));
+        assert_eq!(cfg.url, url);
+        assert_eq!(cfg.locked_rev, 1);
+
+        // Idempotent: a store whose key was supplied out of band has nothing left to confirm.
+        assert_eq!(
+            verify_key(&layout, "hub", pubkey_of(&kp)).unwrap(),
+            Verified::AlreadyPinned
+        );
+        // No torn-write temp survives the rewrite of the file that carries the trust anchor.
+        let leaked: Vec<_> = std::fs::read_dir(layout.store_path("hub"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".store-toml-"))
+            .collect();
+        assert!(leaked.is_empty(), "a temp record leaked: {leaked:?}");
+    }
+
+    #[test]
+    fn a_changed_store_key_is_named_by_update_and_rotated_only_on_purpose() {
+        let Some(git) = git_or_skip() else { return };
+        let repo = crate::testutil::TmpDir::new();
+        let data = crate::testutil::TmpDir::new();
+        let first = keypair();
+        sign_store(repo.path(), 1, &first);
+        let url = commit_repo(&git, repo.path());
+        let layout = crate::store::Layout::under(data.path());
+        add(&layout, "hub", &url, pubkey_of(&first), &git).expect("add");
+
+        // The store re-signs with a different identity, as a real rotation would.
+        let second = keypair();
+        sign_store(repo.path(), 2, &second);
+        ship_pubkey(repo.path(), &pubkey_of(&second));
+        commit_all(&git, repo.path(), "rotate");
+
+        // `update` still refuses — but it now says *why*, which an opaque signature failure could
+        // not: the user has to be able to tell a rotation from a takeover.
+        let err = update(&layout, "hub", &git).unwrap_err();
+        assert!(err.contains("has CHANGED"), "{err}");
+        assert!(err.contains(&to_hex(&pubkey_of(&first))), "{err}");
+        assert!(err.contains(&to_hex(&pubkey_of(&second))), "{err}");
+        assert!(err.contains("store rekey hub"), "{err}");
+        assert_eq!(
+            read_configured(&layout, "hub").unwrap().pubkey,
+            pubkey_of(&first),
+            "a refused update must leave the pin untouched"
+        );
+
+        // A rotation to a key that does not sign this store is refused: the pin would end up on a
+        // key that verifies nothing the store holds.
+        let unrelated = pubkey_of(&keypair());
+        let err = rekey(&layout, "hub", TrustChoice::Pinned(unrelated), &git).unwrap_err();
+        assert!(err.contains("does not sign this store"), "{err}");
+        assert_eq!(
+            read_configured(&layout, "hub").unwrap().pubkey,
+            pubkey_of(&first)
+        );
+
+        // Rotating to the key already pinned is not a rotation, and must not read as success —
+        // whatever made `update` fail would otherwise be papered over.
+        let err = rekey(&layout, "hub", TrustChoice::Pinned(pubkey_of(&first)), &git).unwrap_err();
+        assert!(err.contains("already pinned to that key"), "{err}");
+
+        // The real new key: the pin moves, the floor is carried over, and the store works again.
+        let done = rekey(
+            &layout,
+            "hub",
+            TrustChoice::Pinned(pubkey_of(&second)),
+            &git,
+        )
+        .expect("rotate to the announced key");
+        assert_eq!(done.old_pubkey, pubkey_of(&first));
+        assert_eq!(done.new_pubkey, pubkey_of(&second));
+        assert!(!done.tofu, "a supplied key is pinned, not accepted");
+        let cfg = read_configured(&layout, "hub").unwrap();
+        assert_eq!(cfg.pubkey, pubkey_of(&second));
+        assert_eq!(cfg.locked_rev, 2);
+        update(&layout, "hub", &git).expect("the store verifies against the new key");
+    }
+
+    #[test]
+    fn a_rotation_never_reopens_the_rollback_floor() {
+        let Some(git) = git_or_skip() else { return };
+        let repo = crate::testutil::TmpDir::new();
+        let data = crate::testutil::TmpDir::new();
+        let first = keypair();
+        sign_store(repo.path(), 5, &first);
+        let url = commit_repo(&git, repo.path());
+        let layout = crate::store::Layout::under(data.path());
+        add(&layout, "hub", &url, pubkey_of(&first), &git).expect("add at rev 5");
+
+        // A new key signing an *older* catalogue is exactly how a rotation could be used to replay
+        // a withdrawn one. The floor outlives the key it was recorded under.
+        let second = keypair();
+        sign_store(repo.path(), 4, &second);
+        ship_pubkey(repo.path(), &pubkey_of(&second));
+        commit_all(&git, repo.path(), "rotate to an older catalogue");
+        let err = rekey(
+            &layout,
+            "hub",
+            TrustChoice::Pinned(pubkey_of(&second)),
+            &git,
+        )
+        .unwrap_err();
+        assert!(err.contains("refusing to roll back"), "{err}");
+        assert_eq!(
+            read_configured(&layout, "hub").unwrap().pubkey,
+            pubkey_of(&first)
+        );
+    }
+
+    #[test]
+    fn verify_key_refuses_a_store_that_is_not_configured() {
+        let data = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let err = verify_key(&layout, "ghost", [0u8; 32]).unwrap_err();
+        assert!(err.contains("no store named `ghost`"), "{err}");
     }
 
     #[test]

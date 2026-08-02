@@ -118,18 +118,140 @@ pub(crate) fn render_removed(label: Option<&str>, name: &str, pal: &style::Palet
     }
 }
 
-/// The trust-on-first-use caution for a freshly added store — yellow, since it pinned a key sbx
-/// could not pre-verify. The pinned key is highlighted for an out-of-band comparison; the
-/// follow-up hint is dimmed. Goes to stderr, so its palette is decided from stderr's stream.
+/// The trust-on-first-use caution for a freshly added store — yellow, since it pinned a key
+/// nothing outside the store confirms. Three parts, deliberately separated: what happened, the key
+/// itself on its own line, and the **next action** with the command it needs. The action is not
+/// dimmed — a step the user is expected to take, rendered as grey prose between two other grey
+/// sentences, reads as boilerplate and is skipped. The command carries `<the key you obtained>`
+/// rather than the key just printed: pre-filling it would turn confirmation into a paste of what
+/// the store itself supplied. Goes to stderr, so its palette is decided from stderr's stream.
 pub(crate) fn render_store_tofu(pubkey_hex: &str, name: &str, pal: &style::Palette) -> String {
     let (warn, n, r) = (pal.warn, pal.name, pal.reset);
     format!(
-        "{warn}⚠ trust-on-first-use: pinned the key this store ships, unverified{r}\n  \
-         pinned key: {n}{pubkey_hex}{r}\n  {}",
+        "{warn}⚠ pinned the key this store ships — nothing outside the store confirms it{r}\n\n  \
+         pinned key: {n}{pubkey_hex}{r}\n\n  \
+         next: get that key from a source this store does not control — its author, a release\n        \
+         page, a channel you already trust — compare the two, then run:\n\n    \
+         {n}sbx plugins store verify {name} --key <the key you obtained>{r}\n\n  {}\n",
         style::dim_prose(
-            &format!("verify it out of band; re-shown by `sbx plugins store info {name}`"),
+            "until then the store works normally, and a later key change is refused.",
             pal
         )
+    )
+}
+
+/// The confirmation that a store's key was matched against one supplied from elsewhere: `verified`
+/// in green over the name, then what changed and what did not, dimmed. It names the flag exactly as
+/// the listing shows it (`unconfirmed`), since a confirmation that describes the flag it clears
+/// under some other name leaves the user unsure which one was cleared. `already` is the idempotent
+/// case: the key was supplied out of band when the store was added.
+pub(crate) fn render_store_verified(name: &str, already: bool, pal: &style::Palette) -> String {
+    let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    if already {
+        return format!(
+            "{ok}verified{r} store '{n}{name}{r}' {}",
+            style::dim_prose(
+                "— its key was supplied out of band when it was added; nothing to confirm",
+                pal
+            )
+        );
+    }
+    format!(
+        "{ok}verified{r} store '{n}{name}{r}' — the pinned key is the one you supplied\n  {}",
+        style::dim_prose(
+            "it is no longer flagged as unconfirmed. The key is unchanged, so every fetch \
+             enforces exactly what it did before",
+            pal
+        )
+    )
+}
+
+/// What `store add` says when no trust anchor was supplied: the key the store *ships*, shown
+/// prominently, and the two commands that act on it — one pinning it, one accepting it unverified.
+/// Nothing has been configured at this point; the key is shown so the decision is made with it in
+/// view rather than after the fact.
+///
+/// It leads with what the key is worth: a key the store ships cannot authenticate the store,
+/// because whoever controls the URL controls the key too. That is the whole difference between the
+/// two commands below it, so it is stated before either.
+pub(crate) fn render_store_needs_key(
+    name: &str,
+    url: &str,
+    pubkey_hex: &str,
+    pal: &style::Palette,
+) -> String {
+    let (warn, n, r) = (pal.warn, pal.name, pal.reset);
+    format!(
+        "{warn}this store needs a trust anchor{r} — it ships this key:\n\n    \
+         {n}{pubkey_hex}{r}\n\n  {}\n\n  {}\n    sbx plugins store add --name {name} --url {url} \
+         --key {n}{pubkey_hex}{r}\n\n  {}\n    sbx plugins store add --name {name} --url {url} \
+         --trust\n",
+        style::dim_prose(
+            "a key the store ships confirms nothing: whoever controls the URL controls the key \
+             and the signature over the catalogue alike. Accepting it only detects a LATER key \
+             change.",
+            pal
+        ),
+        style::dim_prose("if you verified this key out of band, pin it:", pal),
+        style::dim_prose("to accept it unverified on first use (weaker):", pal),
+    )
+}
+
+/// The alert shown before a key rotation, and the report shown after it — the same facts, in the
+/// tense the moment calls for. A rotation is the one operation that makes a store's whole history
+/// of signatures irrelevant and hands that authority to a new key, so both keys are shown in full
+/// and what an unannounced rotation means is stated rather than implied.
+pub(crate) fn render_store_rekey_alert(
+    name: &str,
+    old_hex: &str,
+    new_hex: &str,
+    pal: &style::Palette,
+) -> String {
+    let (warn, n, r) = (pal.warn, pal.name, pal.reset);
+    format!(
+        "{warn}⚠ SECURITY — you are about to change the signing identity of store \
+         '{n}{name}{r}{warn}'{r}\n\n  \
+         pinned now: {n}{old_hex}{r}\n  \
+         replacing with: {n}{new_hex}{r}\n\n  {}\n",
+        style::dim_prose(
+            "everything signed by the old key stops being accepted, and everything the new key \
+             signs starts being. A rotation the author announced is routine; an unannounced one \
+             is indistinguishable from someone else taking over the repository.",
+            pal
+        )
+    )
+}
+
+/// The report of a completed rotation: `rotated` in green over the name, the key now in force, the
+/// one it replaced (so the change is on the record where it happened, not only in the alert that
+/// preceded it), and — when the new key was taken from the store itself — that it carries the same
+/// unconfirmed status a first-use acceptance does.
+pub(crate) fn render_store_rekeyed(
+    name: &str,
+    old_hex: &str,
+    new_hex: &str,
+    tofu: bool,
+    rev: u64,
+    plugins: usize,
+    pal: &style::Palette,
+) -> String {
+    let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    let tail = if tofu {
+        style::dim_prose(
+            "it was taken from the store itself, so it is flagged as unconfirmed until a second \
+             source confirms it",
+            pal,
+        )
+    } else {
+        style::dim_prose("the previous key is no longer accepted", pal)
+    };
+    format!(
+        "{ok}rotated{r} the key of store '{n}{name}{r}' {}(rev {rev}, {plugins} plugin{}){}\n  \
+         now pinned: {n}{new_hex}{r}\n  {}\n  {tail}",
+        pal.dim,
+        if plugins == 1 { "" } else { "s" },
+        r,
+        style::dim_prose(&format!("previously:  {old_hex}"), pal)
     )
 }
 
@@ -254,9 +376,53 @@ mod tests {
         );
         assert_eq!(
             render_store_tofu("ab12", "hub", &p),
-            "⚠ trust-on-first-use: pinned the key this store ships, unverified\n  \
-             pinned key: ab12\n  \
-             verify it out of band; re-shown by `sbx plugins store info hub`"
+            "⚠ pinned the key this store ships — nothing outside the store confirms it\n\n  \
+             pinned key: ab12\n\n  \
+             next: get that key from a source this store does not control — its author, a release\n        \
+             page, a channel you already trust — compare the two, then run:\n\n    \
+             sbx plugins store verify hub --key <the key you obtained>\n\n  \
+             until then the store works normally, and a later key change is refused.\n"
+        );
+        assert_eq!(
+            render_store_verified("hub", true, &p),
+            "verified store 'hub' — its key was supplied out of band when it was added; \
+             nothing to confirm"
+        );
+        assert_eq!(
+            render_store_verified("hub", false, &p),
+            "verified store 'hub' — the pinned key is the one you supplied\n  \
+             it is no longer flagged as unconfirmed. The key is unchanged, so every fetch \
+             enforces exactly what it did before"
+        );
+        assert_eq!(
+            render_store_rekey_alert("hub", "ab12", "cd34", &p),
+            "⚠ SECURITY — you are about to change the signing identity of store 'hub'\n\n  \
+             pinned now: ab12\n  replacing with: cd34\n\n  \
+             everything signed by the old key stops being accepted, and everything the new key \
+             signs starts being. A rotation the author announced is routine; an unannounced one \
+             is indistinguishable from someone else taking over the repository.\n"
+        );
+        assert_eq!(
+            render_store_rekeyed("hub", "ab12", "cd34", false, 7, 2, &p),
+            "rotated the key of store 'hub' (rev 7, 2 plugins)\n  now pinned: cd34\n  \
+             previously:  ab12\n  the previous key is no longer accepted"
+        );
+        assert_eq!(
+            render_store_rekeyed("hub", "ab12", "cd34", true, 7, 1, &p),
+            "rotated the key of store 'hub' (rev 7, 1 plugin)\n  now pinned: cd34\n  \
+             previously:  ab12\n  it was taken from the store itself, so it is flagged as \
+             unconfirmed until a second source confirms it"
+        );
+        assert_eq!(
+            render_store_needs_key("hub", "https://example.invalid/s.git", "ab12", &p),
+            "this store needs a trust anchor — it ships this key:\n\n    ab12\n\n  \
+             a key the store ships confirms nothing: whoever controls the URL controls the key \
+             and the signature over the catalogue alike. Accepting it only detects a LATER key \
+             change.\n\n  \
+             if you verified this key out of band, pin it:\n    \
+             sbx plugins store add --name hub --url https://example.invalid/s.git --key ab12\n\n  \
+             to accept it unverified on first use (weaker):\n    \
+             sbx plugins store add --name hub --url https://example.invalid/s.git --trust\n"
         );
         assert_eq!(
             render_store_configured("hub", 3, &[("vault", "vault", "1.0"), ("pass", "pass", "")], &p),
@@ -334,6 +500,31 @@ mod tests {
             "the tofu caution must ride the warn hue:\n{tofu}"
         );
         assert!(tofu.contains(&format!("{}ab12{}", p.name, p.reset)));
+
+        let needs = render_store_needs_key("hub", "https://example.invalid/s.git", "ab12", &p);
+        assert!(
+            needs.contains(p.warn),
+            "the missing-anchor line must ride the warn hue:\n{needs}"
+        );
+        // The key is the one thing the user has to look at, on its own indented line and in the
+        // name hue — both where it is shown and where it is pasted into the pinning command.
+        assert_eq!(
+            needs.matches(&format!("{}ab12{}", p.name, p.reset)).count(),
+            2,
+            "the key must stand out in the display and in the --key command:\n{needs}"
+        );
+        assert!(needs.contains(&format!("\n\n    {}ab12{}\n\n", p.name, p.reset)));
+
+        let alert = render_store_rekey_alert("hub", "ab12", "cd34", &p);
+        assert!(
+            alert.contains(p.warn),
+            "a key rotation must ride the warn hue:\n{alert}"
+        );
+        // Both keys stand out: the whole decision is comparing them.
+        assert!(alert.contains(&format!("{}ab12{}", p.name, p.reset)));
+        assert!(alert.contains(&format!("{}cd34{}", p.name, p.reset)));
+        let rekeyed = render_store_rekeyed("hub", "ab12", "cd34", false, 7, 2, &p);
+        assert!(rekeyed.contains(&format!("{}rotated{}", p.ok, p.reset)));
 
         let configured = render_store_configured("hub", 3, &[("vault", "vault", "1.0")], &p);
         assert!(configured.contains(&format!("{}configured store{}", p.ok, p.reset)));

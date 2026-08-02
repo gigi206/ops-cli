@@ -28,7 +28,10 @@ pub(crate) fn app_cmd(args: Vec<OsString>) -> ExitCode {
         Some("import") => app_import(&args[1..]),
         Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(&args[1..]),
-        Some("list" | "ls") => app_list(),
+        Some("list" | "ls") => match crate::cli::reject_extra(&["app", "list"], &args[1..]) {
+            Err(code) => code,
+            Ok(()) => app_list(),
+        },
         Some("show") => app_show(&args[1..]),
         Some("prune") => app_prune(&args[1..]),
         // No valid subcommand: a bare `sbx app`, an unknown token, a leading flag, or a non-UTF-8

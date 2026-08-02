@@ -181,8 +181,13 @@ fn transactional_confirmations_are_plain_when_captured() {
     assert!(removed.status.success(), "app rm must succeed");
     assert_no_ansi(&removed, "app rm");
 
-    // plugins: install a built-in by name (compiled in, no network), then remove it.
-    let pinstall = run(&["plugins", "install", "vault"], home.path(), cwd.path());
+    // plugins: install one of the repository's own plugin directories (no network), then remove it.
+    let plugin_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/vault");
+    let pinstall = run(
+        &["plugins", "install", plugin_dir.to_str().unwrap()],
+        home.path(),
+        cwd.path(),
+    );
     assert!(
         pinstall.status.success(),
         "plugin install must succeed:\n{}",

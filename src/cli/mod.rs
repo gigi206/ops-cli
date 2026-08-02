@@ -28,6 +28,28 @@ use crate::diag;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+/// Refuse an argument a verb does not take, rather than ignoring it. Silently dropping one is worse
+/// than not supporting it: `sbx plugins store ls --installed` would print the whole listing, which
+/// reads as a filtered result and quietly answers a different question than the one asked — and a
+/// mistyped flag would look like it worked. Names the offending token and prints the verb's own
+/// usage. Shared by every family, so the behavior is one rule rather than a per-verb habit.
+pub(crate) fn reject_extra(path: &[&str], extra: &[OsString]) -> Result<(), ExitCode> {
+    let Some(tok) = extra.first() else {
+        return Ok(());
+    };
+    diag::error(&format!(
+        "sbx: {} takes no {}",
+        path.join(" "),
+        match tok.to_str() {
+            Some(t) if t.starts_with('-') => format!("option '{t}'"),
+            Some(t) => format!("argument '{t}'"),
+            None => "such argument".to_string(),
+        }
+    ));
+    eprintln!("sbx: usage: {}", crate::help::synopsis_of(path));
+    Err(ExitCode::from(2))
+}
+
 /// Route a resolved command name to its handler. `main` has already peeled off the help paths
 /// (`sbx --help`, `sbx <cmd> --help`) and the no-command usage error, so every name that reaches
 /// here is a concrete command plus its remaining arguments; each family owns its parsing from this
@@ -45,10 +67,13 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // reports itself online, then execs the real `bwrap …` command. Never invoked by a user
         // directly. `rest` is `[bwrap, bwrap-args…]`; it never returns.
         "__netns-holder" => crate::sandbox::run_holder(&rest),
-        "doctor" => doctor::doctor(),
+        "doctor" => match reject_extra(&["doctor"], &rest) {
+            Err(code) => code,
+            Ok(()) => doctor::doctor(),
+        },
         "session" | "sessions" => session::session_cmd(rest),
         "trust" => trust::trust_cmd(rest),
-        "untrust" => trust::untrust_cmd(rest.into_iter().next()),
+        "untrust" => trust::untrust_cmd(rest),
         "config" => config::config_cmd(rest),
         "upgrade" => upgrade::upgrade_cmd(rest),
         "gc" => gc::run(rest),

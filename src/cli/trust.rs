@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{style, trust};
+use crate::{diag, help, style, trust};
 
 /// The config path an `sbx trust`/`untrust` invocation targets: the given path,
 /// or the project `.sbx.toml` in the current directory by default.
@@ -127,8 +127,25 @@ fn render_trust_verdict(path: &Path, state: trust::TrustState, pal: &style::Pale
 
 /// `sbx untrust [path]`: revoke a project config's trust, so its security-relevant
 /// fields stop applying until it is trusted again.
-pub(crate) fn untrust_cmd(arg: Option<OsString>) -> ExitCode {
-    let path = config_path_arg(arg);
+pub(crate) fn untrust_cmd(args: Vec<OsString>) -> ExitCode {
+    // `untrust` takes at most one path and defines no flag, so a leading `-` is a typo rather than
+    // a relative path. Read as a path it would revoke nothing and *report success*, which is the
+    // one answer a revocation must never give when it did not happen.
+    if let Some(bad) = args
+        .first()
+        .filter(|a| a.to_string_lossy().starts_with('-'))
+    {
+        diag::error(&format!(
+            "sbx: untrust takes no option '{}'",
+            bad.to_string_lossy()
+        ));
+        eprintln!("sbx: usage: {}", help::synopsis_of(&["untrust"]));
+        return ExitCode::from(2);
+    }
+    if let Err(code) = crate::cli::reject_extra(&["untrust"], args.get(1..).unwrap_or_default()) {
+        return code;
+    }
+    let path = config_path_arg(args.into_iter().next());
     let store_dir = match trust_store_dir() {
         Ok(d) => d,
         Err(code) => return code,

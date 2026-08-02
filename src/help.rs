@@ -2138,7 +2138,10 @@ const PAGES: &[Page] = &[
         summary: "list installed resolver plugins and built-in schemes",
         options: &[],
         details: "Shows the reserved built-in schemes and every installed resolver plugin — its\n\
-            scheme, name, version, network grant, and whether it is runnable.",
+            scheme, name, version, network grant, whether it is runnable, and where it came\n\
+            from (a named store, or a local directory by path). A scheme claimed by more than\n\
+            one plugin resolves to nothing: every claimant is listed as disabled, and stays so\n\
+            until all but one are removed.",
     },
     Page {
         path: &["plugins", "info"],
@@ -2146,25 +2149,20 @@ const PAGES: &[Page] = &[
         summary: "show a plugin's manifest and sandbox grant",
         options: &[("<scheme>", "the resolver scheme to detail")],
         details:
-            "A built-in scheme is reported as such; an unknown scheme is a non-zero miss, with\n\
-            the load warnings re-emitted (so a dropped plugin explains itself).",
+            "Includes where the plugin came from. A built-in scheme is reported as such; a\n\
+            scheme several plugins claim is a non-zero miss that names every claimant (all\n\
+            disabled until one remains); any other miss re-emits the load warnings, so a\n\
+            plugin dropped as malformed explains itself.",
     },
     Page {
         path: &["plugins", "install"],
-        synopsis: "sbx plugins install <name|dir>",
-        summary: "install a built-in or local resolver plugin",
-        options: &[
-            (
-                "<name>",
-                "a built-in store plugin name (bundled in the binary)",
-            ),
-            (
-                "<dir>",
-                "a local plugin directory (./dir, /abs/dir) to copy",
-            ),
-        ],
+        synopsis: "sbx plugins install <dir>",
+        summary: "install a resolver plugin from a local directory",
+        options: &[("<dir>", "the plugin directory to copy in")],
         details: "A deliberate user act (an agent in the cage cannot run it). The staged copy is\n\
-            validated exactly as the launcher will and refused, fail-closed, on any flaw.",
+            validated exactly as the launcher will and refused, fail-closed, on any flaw. The\n\
+            other way in is `sbx plugins store install`, which adds a signature and a content\n\
+            hash to the same placement.",
     },
     Page {
         path: &["plugins", "rm"],
@@ -2175,6 +2173,45 @@ const PAGES: &[Page] = &[
             "the installed plugin to remove (the token `list` shows)",
         )],
         details: "",
+    },
+    Page {
+        path: &["plugins", "upgrade"],
+        synopsis: "sbx plugins upgrade [name] [--dry-run]",
+        summary: "replace installed plugins with what their store lists now",
+        options: &[
+            (
+                "[name]",
+                "the plugin to upgrade (the token `rm` takes); every store-installed one when omitted",
+            ),
+            ("--dry-run", "report what would change, install nothing"),
+        ],
+        details: "What decides is the **digest**, not the version string: a store's catalogue pins\n\
+            the tree it offers and an install records the tree it placed, so \"you already\n\
+            have this\" is a fact — and a republish under an unchanged version is still seen.\n\
+            Version numbers only phrase the difference, and only when they can be ordered.\n\
+            \n\
+            The new tree is staged and verified exactly as an install verifies it, then\n\
+            swapped in; the installed plugin is kept until that succeeds, so an upgrade that\n\
+            fails leaves what you had. Comparisons read the *cached* catalogue — run\n\
+            `sbx plugins store update` first for a fresh answer.",
+    },
+    Page {
+        path: &["plugins", "verify"],
+        synopsis: "sbx plugins verify [name]",
+        summary: "check installed plugins against the digest recorded at install",
+        options: &[(
+            "[name]",
+            "the plugin's install name (the token `rm` takes); every one when omitted",
+        )],
+        details: "Re-hashes each plugin's tree and compares it against the digest its origin\n\
+            record holds. Exit 1 means a tree changed — and only that; a name that names no\n\
+            installed plugin is a usage error (2), and a plugin with no recorded digest is\n\
+            reported plainly without failing the command.\n\
+            \n\
+            This detects drift — a plugin edited in place and forgotten, a careless third\n\
+            party — not an attacker: the record lives in the same owner-only directory as\n\
+            the plugin, so whatever can rewrite one can rewrite the other. It reads every\n\
+            file of every plugin, so it is a verb you run, never part of a launch.",
     },
     Page {
         path: &["plugins", "store"],
@@ -2188,11 +2225,16 @@ const PAGES: &[Page] = &[
     // ---- plugins store subcommands ------------------------------------------------
     Page {
         path: &["plugins", "store", "list"],
-        synopsis: "sbx plugins store list  (alias: sbx plugins store ls)",
-        summary: "list the built-in store and configured remote stores",
-        options: &[],
-        details: "The resolver plugins bundled in the binary, then every configured remote store\n\
-            with its accepted revision and plugin count. No fetch, no network.",
+        synopsis: "sbx plugins store list [--installed]  (alias: sbx plugins store ls)",
+        summary: "list the configured plugin stores and what they offer",
+        options: &[(
+            "--installed",
+            "only the entries already installed from each store",
+        )],
+        details: "Every configured store with its accepted revision and the plugins it lists.\n\
+            Each entry is marked [installed] when it is the one in place, or names what holds\n\
+            its name or scheme otherwise — two stores can list a plugin of the same name, but\n\
+            only one can hold it. No fetch, no network.",
     },
     Page {
         path: &["plugins", "store", "add"],
@@ -2213,7 +2255,8 @@ const PAGES: &[Page] = &[
         details:
             "Exactly one of --key or --trust is required: a store with no verifying key would\n\
             be unsigned, refused fail-closed. With --trust the pinned key's fingerprint is\n\
-            printed for out-of-band verification.",
+            printed for out-of-band verification. With neither, sbx fetches the store into a\n\
+            throwaway clone, shows the key it ships, and stops without configuring anything.",
     },
     Page {
         path: &["plugins", "store", "publish"],
@@ -2259,13 +2302,51 @@ const PAGES: &[Page] = &[
             verifies that hash and places it exactly as a local install would. No network.",
     },
     Page {
+        path: &["plugins", "store", "verify"],
+        synopsis: "sbx plugins store verify <name> --key <hex|@file>",
+        summary: "confirm a store's key against one obtained elsewhere",
+        options: &[
+            ("<name>", "the configured store whose key to confirm"),
+            (
+                "--key <hex|@file>",
+                "the key you obtained from a source the store does not control",
+            ),
+        ],
+        details:
+            "The way out of trust-on-first-use: a key accepted from the store itself is flagged\n\
+            until a second source confirms it. This changes no enforcement — the pinned key is\n\
+            untouched — it records that you compared them, so the caution stops being shown. A\n\
+            key that does not match is refused and changes nothing. No fetch, no network.",
+    },
+    Page {
+        path: &["plugins", "store", "rekey"],
+        synopsis: "sbx plugins store rekey <name> (--key <hex|@file> | --trust) [--yes]",
+        summary: "replace the key pinned for a store that rotated its signing key",
+        options: &[
+            ("<name>", "the configured store whose key to replace"),
+            ("--key <hex|@file>", "the new key, obtained out of band"),
+            (
+                "--trust",
+                "re-accept whatever key the store now ships (weaker — flagged afterwards)",
+            ),
+            ("--yes", "confirm without a terminal (for an intentional scripted rotation)"),
+        ],
+        details:
+            "A store that rotates its signing key makes `update` fail, correctly — a pinned key\n\
+            is the point. This is the deliberate way through: it names both keys, states what an\n\
+            unannounced rotation means, and asks a terminal to confirm. The rollback floor is\n\
+            carried over, and the new key must actually sign the fetched catalogue.",
+    },
+    Page {
         path: &["plugins", "store", "info"],
         synopsis: "sbx plugins store info <name>",
         summary: "detail a configured remote store",
         options: &[("<name>", "the configured store to detail")],
         details:
-            "Its origin URL, the pinned public key, the accepted revision, and each plugin it\n\
-            lists. Reads only the owner-only cache: no fetch, no network.",
+            "Its origin URL, the pinned public key, whether that key was supplied or merely\n\
+            accepted on first use, the accepted revision, and each plugin it lists, marked as\n\
+            installed from this store or blocked by what holds the name or scheme. Reads only\n\
+            the owner-only cache: no fetch, no network.",
     },
     Page {
         path: &["plugins", "store", "rm"],

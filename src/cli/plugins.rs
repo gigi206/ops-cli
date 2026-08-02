@@ -11,7 +11,8 @@ use std::process::ExitCode;
 
 use crate::cli::confirm::{
     render_plugin_installed, render_publish_key_warning, render_published, render_removed,
-    render_store_configured, render_store_tofu, render_store_updated,
+    render_store_configured, render_store_needs_key, render_store_rekey_alert,
+    render_store_rekeyed, render_store_tofu, render_store_updated, render_store_verified,
 };
 use crate::plugins::{catalogue, stores};
 use crate::{diag, help, plugins, store, style};
@@ -22,10 +23,37 @@ use crate::{diag, help, plugins, store, style};
 /// inspection verbs and names them on anything else (no inert stubs).
 pub(crate) fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
-        Some("list") | Some("ls") => plugins_list(),
-        Some("info") => plugins_info(args.get(1).and_then(|a| a.to_str())),
-        Some("install") => plugins_install(args.get(1)),
-        Some("rm") => plugins_remove(args.get(1).and_then(|a| a.to_str())),
+        Some("list") | Some("ls") => {
+            match crate::cli::reject_extra(&["plugins", "list"], &args[1..]) {
+                Err(code) => code,
+                Ok(()) => plugins_list(),
+            }
+        }
+        Some("info") => {
+            match crate::cli::reject_extra(&["plugins", "info"], args.get(2..).unwrap_or(&[])) {
+                Err(code) => code,
+                Ok(()) => plugins_info(args.get(1).and_then(|a| a.to_str())),
+            }
+        }
+        Some("install") => {
+            match crate::cli::reject_extra(&["plugins", "install"], args.get(2..).unwrap_or(&[])) {
+                Err(code) => code,
+                Ok(()) => plugins_install(args.get(1)),
+            }
+        }
+        Some("rm") => {
+            match crate::cli::reject_extra(&["plugins", "rm"], args.get(2..).unwrap_or(&[])) {
+                Err(code) => code,
+                Ok(()) => plugins_remove(args.get(1).and_then(|a| a.to_str())),
+            }
+        }
+        Some("upgrade") => plugins_upgrade(&args[1..]),
+        Some("verify") => {
+            match crate::cli::reject_extra(&["plugins", "verify"], args.get(2..).unwrap_or(&[])) {
+                Err(code) => code,
+                Ok(()) => plugins_verify(args.get(1).and_then(|a| a.to_str())),
+            }
+        }
         Some("store") => plugins_store(&args[1..]),
         // Unknown or no subcommand: name the mistake (if any), then print the full page so its
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
@@ -40,13 +68,260 @@ pub(crate) fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
 }
 
 /// Resolve the registry of installed resolver plugins from the data directory, or report why it
-/// could not be located. Shared by `list` and `info`; the load warnings are returned so the
-/// caller can surface them (the diagnostic for a plugin that was discovered but dropped).
-fn load_plugin_registry() -> Option<(plugins::PluginRegistry, Vec<String>)> {
+/// could not be located. Shared by `list` and `info`; the layout is returned alongside so a caller
+/// can also read each plugin's recorded origin, and the validation warnings so it can surface them
+/// (the diagnostic for a plugin that was discovered but dropped as malformed).
+fn load_plugin_registry() -> Option<(store::Layout, plugins::PluginRegistry, Vec<String>)> {
     let layout = store::Layout::from_env()?;
     let mut warnings = Vec::new();
-    let registry = plugins::PluginRegistry::load(&layout.plugins_dir(), &mut warnings);
-    Some((registry, warnings))
+    // The quiet form: a scheme conflict is rendered from the registry itself here (naming every
+    // claimant and the way out), so relaying it as a warning too would say it twice.
+    let registry = plugins::PluginRegistry::load_quiet(&layout.plugins_dir(), &mut warnings);
+    Some((layout, registry, warnings))
+}
+
+/// What is installed right now, in the two shapes a store listing has to answer: which install
+/// *names* are taken (and by which origin), and which *schemes* are claimed. Both matter, because
+/// an install refuses on either — so a listing that only knew about names would still let a user
+/// pick an entry that cannot be installed.
+struct InstalledIndex {
+    /// Every plugin directory under `<data>/plugins`, keyed by its directory name — the name an
+    /// install would take. A directory whose manifest is malformed is included: it holds the name
+    /// regardless, so a listing must report it as taken.
+    by_name: std::collections::BTreeMap<String, InstalledPlugin>,
+    /// Scheme → the directory name claiming it, for the plugins the registry actually resolved.
+    by_scheme: std::collections::BTreeMap<String, String>,
+    /// Scheme → every directory name claiming it, when more than one does. An ambiguous scheme
+    /// resolves to nothing, so it is absent from `by_scheme` — but an install is refused on it all
+    /// the same, so a listing that stayed silent here would offer an entry that cannot be placed.
+    conflicts: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Order two version strings when — and only when — both are plainly ordered: dot-separated
+/// numbers with an optional pre-release suffix after a `-`. A manifest's `version` is free-form,
+/// and a store's is whatever it published, so anything else (a date, a git describe, a letter, an
+/// overflowing component) yields `None` and the caller says "differs" instead of inventing a
+/// direction. Guessing here would be the one failure mode that matters: telling a user they are
+/// up to date when they are not.
+fn version_order(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    /// `(numeric components, pre-release)`, or `None` when the core is not plainly numeric.
+    fn split(v: &str) -> Option<(Vec<u64>, Option<&str>)> {
+        let v = v.trim().strip_prefix('v').unwrap_or(v.trim());
+        let (core, pre) = match v.split_once('-') {
+            Some((core, pre)) if !pre.is_empty() => (core, Some(pre)),
+            Some(_) => return None,
+            None => (v, None),
+        };
+        if core.is_empty() {
+            return None;
+        }
+        let nums: Option<Vec<u64>> = core.split('.').map(|c| c.parse::<u64>().ok()).collect();
+        nums.filter(|n| !n.is_empty()).map(|n| (n, pre))
+    }
+    let (a_nums, a_pre) = split(a)?;
+    let (b_nums, b_pre) = split(b)?;
+    // `1.8` against `1.8.2`: a missing component is zero, so the shorter one sorts first.
+    for i in 0..a_nums.len().max(b_nums.len()) {
+        let (x, y) = (
+            a_nums.get(i).copied().unwrap_or(0),
+            b_nums.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return Some(x.cmp(&y));
+        }
+    }
+    match (a_pre, b_pre) {
+        // A release outranks a pre-release of the same core (`1.2.0` over `1.2.0-rc1`).
+        (None, None) => Some(std::cmp::Ordering::Equal),
+        (None, Some(_)) => Some(std::cmp::Ordering::Greater),
+        (Some(_), None) => Some(std::cmp::Ordering::Less),
+        // Two pre-releases: identical is equal, and anything else is not ours to rank
+        // (`rc2` vs `beta` has no numeric answer).
+        (Some(x), Some(y)) if x == y => Some(std::cmp::Ordering::Equal),
+        (Some(_), Some(_)) => None,
+    }
+}
+
+/// How to phrase an installed build the store no longer lists. The *fact* is always the digest
+/// difference; the version strings only name it, and only as far as they can be ordered — an
+/// unorderable pair says the two differ rather than which is newer, and a republish under the same
+/// version string says exactly that.
+fn drift_wording(have: &str, listed: &str) -> String {
+    if have.is_empty() || listed.is_empty() {
+        return "installed, the store lists a different build".to_string();
+    }
+    if have == listed {
+        return format!("installed v{have}, the store lists a different build of v{listed}");
+    }
+    match version_order(have, listed) {
+        Some(std::cmp::Ordering::Less) => format!("update available: v{have} → v{listed}"),
+        Some(std::cmp::Ordering::Greater) => {
+            format!("ahead of the store: installed v{have}, listed v{listed}")
+        }
+        // Equal-but-different strings (`1.0` vs `1.0.0`) are still a different build.
+        Some(std::cmp::Ordering::Equal) => {
+            format!("installed v{have}, the store lists a different build (v{listed})")
+        }
+        None => format!("installed v{have}, the store lists v{listed}"),
+    }
+}
+
+/// One installed plugin, as a store listing needs it: where it came from, the version its own
+/// manifest declares (absent when the manifest did not load or declares none), and the scheme it
+/// is disabled over, if any.
+struct InstalledPlugin {
+    origin: plugins::origin::Origin,
+    version: Option<String>,
+    /// The digest recorded when this plugin was placed, when there is one — the installed side of
+    /// the comparison against a catalogue's pinned `sha256`.
+    digest: Option<String>,
+    /// The ambiguous scheme this plugin claims, when it is one of several claimants — the plugin
+    /// is in place but disabled, which a bare `[installed]` marker would hide.
+    disabled_over: Option<String>,
+}
+
+impl InstalledIndex {
+    /// Scan the plugins directory: the directory names (with their recorded origins) and the
+    /// schemes the registry resolved.
+    fn scan(layout: &store::Layout) -> Self {
+        let mut warnings = Vec::new();
+        let plugins_dir = layout.plugins_dir();
+        let registry = plugins::PluginRegistry::load_quiet(&plugins_dir, &mut warnings);
+        // Key the manifest data by *directory* name, which is what an install collides on — a
+        // hand-placed plugin may declare a manifest `name` that differs from its directory.
+        let mut versions = std::collections::BTreeMap::new();
+        let mut by_scheme = std::collections::BTreeMap::new();
+        for p in registry.resolvers() {
+            versions.insert(p.dir_name().to_string(), p.version.clone());
+            by_scheme.insert(p.scheme.clone(), p.dir_name().to_string());
+        }
+        // A conflict's claimants are disabled, so they carry no manifest data here — only the
+        // scheme that disabled them, which is what their marker has to say.
+        let mut conflicts = std::collections::BTreeMap::new();
+        let mut disabled = std::collections::BTreeMap::new();
+        for (scheme, claimants) in registry.conflicts() {
+            for dir_name in claimants {
+                disabled.insert(dir_name.clone(), scheme.to_string());
+            }
+            conflicts.insert(scheme.to_string(), claimants.to_vec());
+        }
+
+        let mut by_name = std::collections::BTreeMap::new();
+        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+            for e in entries.flatten() {
+                if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let Ok(name) = e.file_name().into_string() else {
+                    continue;
+                };
+                // Dot-prefixed entries are sbx's own bookkeeping (the origin records, a staging
+                // tree caught mid-install), never a plugin: an install name may not begin with a
+                // dot.
+                if name.starts_with('.') {
+                    continue;
+                }
+                let version = versions.get(&name).cloned().flatten();
+                let origin = plugins::origin::read(layout, &name);
+                let disabled_over = disabled.get(&name).cloned();
+                let digest = origin.digest().map(str::to_string);
+                by_name.insert(
+                    name,
+                    InstalledPlugin {
+                        origin,
+                        version,
+                        digest,
+                        disabled_over,
+                    },
+                );
+            }
+        }
+        InstalledIndex {
+            by_name,
+            by_scheme,
+            conflicts,
+        }
+    }
+
+    /// Whether the installed plugin of this name came from *this* store — the single fact behind
+    /// both the `[installed]` marker and the `--installed` filter, so the two can never disagree
+    /// about what "installed" means.
+    fn installed_from(&self, name: &str, store: &str) -> bool {
+        self.by_name
+            .get(name)
+            .is_some_and(|p| p.origin.is_store(store))
+    }
+
+    /// The trailing marker for one entry of a store's listing: whether it is installed from this
+    /// very store, or blocked because its name or scheme is already taken by something else. An
+    /// entry a user can simply install carries no marker.
+    fn marker(
+        &self,
+        name: &str,
+        scheme: &str,
+        listed_version: Option<&str>,
+        listed_sha256: Option<&str>,
+        store: &str,
+        pal: &style::Palette,
+    ) -> String {
+        let r = pal.reset;
+        if let Some(installed) = self.by_name.get(name) {
+            if !self.installed_from(name, store) {
+                // The two-stores-one-name case (and the local-install-shadows-a-store case): the
+                // name is taken, so installing this entry would be refused. Name the holder rather
+                // than claiming the entry is installed — it is not *this* plugin that is.
+                return format!(
+                    "  {}[name taken by {}]{r}",
+                    pal.warn,
+                    installed.origin.short()
+                );
+            }
+            // In place, but claiming a scheme someone else claims too: it resolves nothing, so a
+            // bare `[installed]` would read as working.
+            if let Some(over) = &installed.disabled_over {
+                return format!(
+                    "  {}[installed, disabled: scheme {over}:// in conflict]{r}",
+                    pal.err
+                );
+            }
+            // Is what is installed the artifact this store lists *now*? The digests answer that
+            // exactly — the catalogue pins the tree it offers, and the install recorded the tree it
+            // placed — so this is a fact, not the guess a version comparison would make. It also
+            // catches the case versions cannot: a republish under the same version string.
+            let listed = listed_version.unwrap_or("").trim();
+            let have = installed.version.as_deref().unwrap_or("").trim();
+            if let (Some(theirs), Some(ours)) = (listed_sha256, installed.digest.as_deref()) {
+                if theirs != ours {
+                    return format!("  {}[{}]{r}", pal.warn, drift_wording(have, listed));
+                }
+                return format!("  {}[installed]{r}", pal.ok);
+            }
+            // No digest on one side (a record predating them, or a source that pins none): fall
+            // back to reporting the version strings without claiming a direction.
+            if !listed.is_empty() && !have.is_empty() && listed != have {
+                return format!("  {}[installed v{have}, listed v{listed}]{r}", pal.warn);
+            }
+            return format!("  {}[installed]{r}", pal.ok);
+        }
+        // The name is free, but a scheme is claimed by exactly one plugin — an install would be
+        // refused for the scheme instead, which is far from obvious from a listing.
+        if let Some(other) = self.by_scheme.get(scheme) {
+            return format!(
+                "  {}[scheme {scheme}:// taken by the installed plugin '{other}']{r}",
+                pal.warn
+            );
+        }
+        // The name is free and nothing *resolves* that scheme — but several plugins claim it, and
+        // an install is refused on that too.
+        if let Some(claimants) = self.conflicts.get(scheme) {
+            return format!(
+                "  {}[scheme {scheme}:// in conflict between {}]{r}",
+                pal.err,
+                plugins::quoted_list(claimants)
+            );
+        }
+        String::new()
+    }
 }
 
 /// `sbx plugins list`: the reserved built-in schemes (never claimable by a plugin) and every
@@ -56,7 +331,7 @@ fn load_plugin_registry() -> Option<(plugins::PluginRegistry, Vec<String>)> {
 /// "discovered" and "runnable" is visible. Discovery warnings (a malformed manifest, an ambiguous
 /// scheme) go to stderr. No nix, no network, no launch.
 fn plugins_list() -> ExitCode {
-    let Some((registry, warnings)) = load_plugin_registry() else {
+    let Some((layout, registry, warnings)) = load_plugin_registry() else {
         diag::error(
             "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
@@ -70,7 +345,16 @@ fn plugins_list() -> ExitCode {
         plugins::builtin_schemes().join(", ")
     );
     if registry.is_empty() {
-        println!("{h}installed resolver plugins:{r} (none)");
+        // "none" means none that *resolve*: a plugin contesting a scheme is installed but
+        // disabled, so point at the section that accounts for it rather than imply an empty tree.
+        // Deliberately not a claim about *every* plugin present — one may have been dropped as
+        // malformed, which is a different reason reported on a different stream.
+        let why = if registry.conflicts().next().is_some() {
+            " (none resolving — see the scheme conflicts below)"
+        } else {
+            " (none)"
+        };
+        println!("{h}installed resolver plugins:{r}{why}");
     } else {
         println!("{h}installed resolver plugins:{r}");
         for p in registry.resolvers() {
@@ -87,25 +371,82 @@ fn plugins_list() -> ExitCode {
             if let Err(why) = p.check_exec() {
                 print!("  {err}[not runnable: {why}]{r}");
             }
+            // Drift since the install, from the digest recorded then. Only the two states that
+            // say something is wrong are shown: a plugin that matches, or one that never had a
+            // digest, would otherwise add a column of noise to every line.
+            match plugins::integrity(&layout, p.dir_name()) {
+                plugins::Integrity::Modified => print!("  {err}[modified since install]{r}"),
+                plugins::Integrity::Unreadable(_) => {
+                    print!("  {err}[cannot be hashed]{r}");
+                }
+                plugins::Integrity::Intact | plugins::Integrity::Unrecorded => {}
+            }
             println!();
             if let Some(desc) = &p.description {
                 println!("    {dim}{desc}{r}");
             }
+            // Where it came from: a manifest is identical whatever the source, so this is the only
+            // place the answer exists. The directory name is what the install (and the origin
+            // record) keys on, which may differ from the manifest's `name` for a hand-placed tree.
+            println!(
+                "    {dim}from: {}{r}",
+                plugins::origin::read(&layout, p.dir_name()).label()
+            );
         }
         println!("{dim}(remove one with: sbx plugins rm <name>){r}");
     }
-    println!("{dim}(browse the built-in store with: sbx plugins store list){r}");
+    print_scheme_conflicts(&layout, &registry, None, &pal);
+    println!("{dim}(browse the configured stores with: sbx plugins store list){r}");
     for w in &warnings {
         diag::warn(w);
     }
     ExitCode::SUCCESS
 }
 
-/// `sbx plugins install <name | dir>`: place a resolver plugin into the data dir, where it becomes
-/// trusted by location. A bare `name` installs a plugin from the built-in store (bundled in the
-/// binary); a path-like argument (`./dir`, `/abs/dir`) copies a local directory. A deliberate user
-/// act (an agent in the cage cannot run it); either way the staged copy is validated exactly as the
-/// launcher will and refused, fail-closed, on any flaw. No fetch, no network, no signature.
+/// The ambiguous schemes, if any: a scheme claimed by more than one installed plugin resolves to
+/// nothing and every claimant is disabled. Reported on stdout, beside the plugins that *do*
+/// resolve, because it is the state of the installed set — not a passing diagnostic — and it stays
+/// until the user removes all but one claimant. `only` narrows the report to a single scheme, for
+/// the caller that was asked about that one.
+fn print_scheme_conflicts(
+    layout: &store::Layout,
+    registry: &plugins::PluginRegistry,
+    only: Option<&str>,
+    pal: &style::Palette,
+) {
+    let (n, dim, err, r) = (pal.name, pal.dim, pal.err, pal.reset);
+    let mut any = false;
+    for (scheme, claimants) in registry.conflicts() {
+        if only.is_some_and(|want| want != scheme) {
+            continue;
+        }
+        if !any {
+            println!("{err}scheme conflicts{r} (every claimant below is disabled):");
+            any = true;
+        }
+        println!(
+            "  {n}{scheme}://{r}  {err}claimed by {} plugins{r}",
+            claimants.len()
+        );
+        for dir_name in claimants {
+            println!(
+                "    {n}{dir_name}{r}  {dim}from: {}{r}",
+                plugins::origin::read(layout, dir_name).label()
+            );
+        }
+    }
+    if any {
+        println!(
+            "{dim}(a scheme must be unique: remove all but one with sbx plugins rm <name>){r}"
+        );
+    }
+}
+
+/// `sbx plugins install <dir>`: copy a local plugin directory into the data dir, where it becomes
+/// trusted by location. A deliberate user act (an agent in the cage cannot run it); the staged copy
+/// is validated exactly as the launcher will and refused, fail-closed, on any flaw. The other way
+/// in is `sbx plugins store install <store> <plugin>`, which adds a signature and a content hash to
+/// the same placement. No fetch, no network.
 fn plugins_install(source: Option<&OsString>) -> ExitCode {
     let Some(source) = source else {
         diag::error(&format!(
@@ -120,20 +461,7 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    // The rule is syntactic, not based on what exists on disk, so the command's meaning never
-    // depends on the current directory's contents: a path-like argument is a local directory, a
-    // bare token is a built-in store name.
-    let result = if is_path_like(source) {
-        plugins::install(&layout, Path::new(source))
-    } else if let Some(name) = source.to_str() {
-        plugins::install_embedded(&layout, name)
-    } else {
-        diag::error(
-            "sbx: a built-in plugin name must be valid UTF-8 (use ./<dir> for a local path)",
-        );
-        return ExitCode::from(2);
-    };
-    match result {
+    match plugins::install(&layout, Path::new(source)) {
         Ok(installed) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
@@ -149,30 +477,36 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
     }
 }
 
-/// Whether an install argument names a local path rather than a built-in store plugin: it begins
-/// with `.` (`./dir`, `../dir`) or contains a `/` (`/abs/dir`, `sub/dir`). A bare `name` is looked
-/// up in the built-in store. Syntactic by design — the dispatch must not depend on the cwd.
-fn is_path_like(arg: &OsStr) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = arg.as_bytes();
-    bytes.first() == Some(&b'.') || bytes.contains(&b'/')
-}
-
 /// `sbx plugins store <subcommand>`: the plugin stores. `list` shows the built-in (embedded)
 /// store and every configured remote store; `add` configures and fetches a remote signed store
 /// (a git repository whose catalogue is verified against a public key); `update` re-fetches one
 /// or all configured stores (re-verifying against the pinned key and refusing a revision that
-/// would roll back); `install` installs a plugin a configured store lists; `info` details one
-/// configured store; `rm` removes one.
+/// would roll back); `install` installs a plugin a configured store lists; `verify` confirms a
+/// store's key against one obtained elsewhere; `info` details one configured store; `rm` removes
+/// one.
 fn plugins_store(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
-        Some("list") | Some("ls") => plugins_store_list(),
+        Some("list") | Some("ls") => plugins_store_list_cmd(&args[1..]),
         Some("add") => plugins_store_add(&args[1..]),
         Some("publish") => plugins_store_publish(&args[1..]),
         Some("update") => plugins_store_update(&args[1..]),
         Some("install") => plugins_store_install(&args[1..]),
-        Some("info") => plugins_store_info(args.get(1).and_then(|a| a.to_str())),
-        Some("rm") => plugins_store_remove(args.get(1).and_then(|a| a.to_str())),
+        Some("verify") => plugins_store_verify(&args[1..]),
+        Some("rekey") => plugins_store_rekey(&args[1..]),
+        Some("info") => match crate::cli::reject_extra(
+            &["plugins", "store", "info"],
+            args.get(2..).unwrap_or(&[]),
+        ) {
+            Err(code) => code,
+            Ok(()) => plugins_store_info(args.get(1).and_then(|a| a.to_str())),
+        },
+        Some("rm") => match crate::cli::reject_extra(
+            &["plugins", "store", "rm"],
+            args.get(2..).unwrap_or(&[]),
+        ) {
+            Err(code) => code,
+            Ok(()) => plugins_store_remove(args.get(1).and_then(|a| a.to_str())),
+        },
         // Unknown or no subcommand: name the mistake (if any), then print the full page so its
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {
@@ -233,14 +567,6 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if key.is_none() && !trust {
-        diag::error(
-            "sbx: supply --key <hex|@file> to pin a known key, or --trust to accept the key the \
-             store ships on first use",
-        );
-        return ExitCode::from(2);
-    }
-
     let Some(layout) = store::Layout::from_env() else {
         diag::error(
             "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
@@ -251,6 +577,14 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
         diag::error("sbx: git is not on PATH — a remote plugin store is a git repository");
         return ExitCode::FAILURE;
     };
+
+    // No trust anchor: refuse, but refuse *usefully*. A store that ships a key is fetched into a
+    // throwaway staging clone so the key can be shown before any decision — naming the two flags
+    // without showing what `--trust` would pin put the key in front of the user only after it had
+    // been trusted. No store is configured here: the fetch is discarded and the exit is non-zero.
+    if key.is_none() && !trust {
+        return report_missing_trust_anchor(&layout, name, url, &git);
+    }
 
     let result = match key {
         Some(key) => {
@@ -290,6 +624,9 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
                 "{}",
                 render_store_configured(&added.name, cat.rev, &plugins, &pal)
             );
+            if added.tofu {
+                offer_verification(&layout, &added.name);
+            }
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -297,6 +634,102 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Ask, right after a trust-on-first-use add, whether the user already holds the store's key from
+/// somewhere else — and confirm it on the spot if so, saving a second command. Only on a terminal
+/// (both stdin and stderr): a scripted or piped run behaves exactly as it did, and the printed
+/// `next:` step is the whole instruction there.
+///
+/// The question is deliberately about *where the key came from*, and it never offers the key just
+/// printed as an answer: the point of confirming is a second source, so a prompt that invited a
+/// paste of the store's own key would only make the caution disappear without making it false.
+/// Declining is the default and costs nothing — the same command remains available later.
+fn offer_verification(layout: &store::Layout, name: &str) {
+    use std::io::{BufRead, Write};
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return;
+    }
+    let pal = style::Palette::for_stream(true);
+    let (dim, r) = (pal.dim, pal.reset);
+    eprint!("\n  do you have this key from a source this store does not control? {dim}[y/N]{r} ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return;
+    }
+    if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return;
+    }
+    eprint!("  paste it {dim}(hex, or @file — empty to skip){r}: ");
+    let _ = std::io::stderr().flush();
+    let mut key = String::new();
+    if std::io::stdin().lock().read_line(&mut key).is_err() {
+        return;
+    }
+    let key = key.trim();
+    if key.is_empty() {
+        return;
+    }
+    let pubkey = match stores::parse_pubkey_arg(key) {
+        Ok(k) => k,
+        Err(why) => {
+            diag::error(&format!("sbx: invalid key: {why}"));
+            diag::hint(
+                "     the store is configured; confirm it later with `sbx plugins store verify`",
+            );
+            return;
+        }
+    };
+    match stores::verify_key(layout, name, pubkey) {
+        Ok(outcome) => eprintln!(
+            "{}",
+            render_store_verified(name, outcome == stores::Verified::AlreadyPinned, &pal)
+        ),
+        // A mismatch does not undo the add: a mistyped paste is far likelier than a substituted
+        // store, and the resulting state (configured, still flagged) is exactly the one the add
+        // produced. What it must not do is stay quiet about which way the disagreement could go.
+        Err(why) => {
+            diag::error(&format!("sbx: {why}"));
+            diag::hint(&format!(
+                "     if that key is the one this store should have, it is not this store — \
+                 remove it with `sbx plugins store rm {name}`"
+            ));
+        }
+    }
+}
+
+/// The refusal for `store add` with no `--key` and no `--trust`, made actionable: fetch the key the
+/// store ships (into a staging clone that is thrown away) and print it with the two commands that
+/// act on it. Always non-zero, and no store is configured whatever the probe finds — the fetch's
+/// only trace is the data directory itself, created if missing as any staging verb would.
+///
+/// A store that ships no key, an unreachable URL, or an unusable repository each fall back to
+/// naming the two flags: the probe is a convenience, so its failure must not obscure the actual
+/// requirement (its reason is still reported, since it is usually the real problem).
+fn report_missing_trust_anchor(
+    layout: &store::Layout,
+    name: &str,
+    url: &str,
+    git: &Path,
+) -> ExitCode {
+    match stores::shipped_pubkey(layout, url, git) {
+        Ok(pubkey) => {
+            let pal = style::Palette::for_stream(std::io::stderr().is_terminal());
+            eprint!(
+                "{}",
+                render_store_needs_key(name, url, &catalogue::to_hex(&pubkey), &pal)
+            );
+        }
+        Err(why) => {
+            diag::error(&format!("sbx: {why}"));
+            diag::error(
+                "sbx: supply --key <hex|@file> to pin a known key, or --trust to accept the key \
+                 the store ships on first use",
+            );
+        }
+    }
+    ExitCode::from(2)
 }
 
 /// `sbx plugins store publish <dir> --key <key-file> [--rev <n>]`: sign a directory of resolver
@@ -516,33 +949,238 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
     println!("{h}store{r} {n}'{}'{r}", cfg.name);
     println!("  url:      {}", cfg.url);
     println!("  key:      {}", catalogue::to_hex(&cfg.pubkey));
-    println!(
-        "  trust:    {}",
-        if cfg.tofu {
-            "trust-on-first-use (verify the key out of band)"
-        } else {
-            "pinned key (supplied out of band)"
-        }
-    );
+    if cfg.tofu {
+        // Three facts a user has to hold together, so none is left implied: the catalogue *is*
+        // checked, that check cannot establish whose key it is, and the pin still has teeth.
+        println!("  trust:    the key this store shipped, accepted on first use");
+        println!("            the catalogue verifies against it on every fetch, but nothing");
+        println!("            outside this store confirms the key is its author's");
+        println!("            (a later key change is still refused)");
+        println!(
+            "            {dim}confirm it with: sbx plugins store verify {name} \
+             --key <the key you obtained>{r}"
+        );
+    } else {
+        println!("  trust:    a key you supplied out of band, pinned");
+    }
     println!("  revision: {}", cfg.locked_rev);
     match stores::cached_catalogue(&layout, name) {
         Ok(cat) if cat.plugins.is_empty() => println!("  plugins:  (none)"),
         Ok(cat) => {
+            // The same rows `store list` prints, including which are already in place and what
+            // holds the name or scheme of those that are not — the catalogue alone cannot say.
+            let installed = InstalledIndex::scan(&layout);
             println!("  plugins:");
-            for (pname, entry) in &cat.plugins {
-                print!("    {n}{pname}{r}  {dim}({}://){r}", entry.scheme);
-                if !entry.version.is_empty() {
-                    print!("  v{}", entry.version);
-                }
-                println!();
-                if !entry.description.is_empty() {
-                    println!("      {dim}{}{r}", entry.description);
-                }
-            }
+            print_listed(
+                &listed_from_catalogue(&cat),
+                name,
+                Some(&installed),
+                false,
+                "    ",
+                &pal,
+            );
+            println!("  {dim}(install one with: sbx plugins store install {name} <plugin>){r}");
         }
         Err(why) => diag::warn(&format!("cannot read the cached catalogue: {why}")),
     }
     ExitCode::SUCCESS
+}
+
+/// `sbx plugins store verify <name> --key <hex|@file>`: confirm a configured store's pinned key
+/// against one obtained from a source the store does not control. It is the way out of the
+/// trust-on-first-use caution, which otherwise stands forever — a warning that can never be
+/// resolved is one a user stops reading.
+///
+/// It changes no enforcement: the pinned key is untouched, and a fetch verifies the catalogue
+/// against it either way. A mismatch is refused and changes nothing. No fetch, no network.
+fn plugins_store_verify(args: &[OsString]) -> ExitCode {
+    let usage = format!(
+        "sbx: usage: {}",
+        help::synopsis_of(&["plugins", "store", "verify"])
+    );
+    let (mut name, mut key) = (None, None);
+    let mut it = args.iter();
+    while let Some(tok) = it.next() {
+        match tok.to_str() {
+            Some("--key") => key = it.next().and_then(|v| v.to_str()),
+            Some(other) if !other.starts_with("--") && name.is_none() => name = Some(other),
+            other => {
+                diag::error(&format!(
+                    "sbx: unexpected argument '{}'",
+                    other.unwrap_or("(non-UTF-8)")
+                ));
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(name), Some(key)) = (name, key) else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let Some(layout) = store::Layout::from_env() else {
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
+        );
+        return ExitCode::FAILURE;
+    };
+    let pubkey = match stores::parse_pubkey_arg(key) {
+        Ok(k) => k,
+        Err(why) => {
+            diag::error(&format!("sbx: invalid --key: {why}"));
+            return ExitCode::from(2);
+        }
+    };
+    match stores::verify_key(&layout, name, pubkey) {
+        Ok(outcome) => {
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!(
+                "{}",
+                render_store_verified(name, outcome == stores::Verified::AlreadyPinned, &pal)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            diag::error(&format!("sbx: {why}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `sbx plugins store rekey <name> (--key <hex|@file> | --trust) [--yes]`: replace the key pinned
+/// for a configured store, for a store that legitimately rotated its signing key — which `update`
+/// refuses, correctly, since a pinned key is the whole point.
+///
+/// Loud by construction: the alert names both keys and what the exchange means, and a terminal is
+/// asked to confirm. Without a terminal it refuses unless `--yes` says the operator meant it, so
+/// nothing rotates a signing identity unattended by accident. `--trust` re-accepts whatever the
+/// store now ships, which is the weak form and is flagged as such afterwards.
+fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
+    let usage = format!(
+        "sbx: usage: {}",
+        help::synopsis_of(&["plugins", "store", "rekey"])
+    );
+    let (mut name, mut key) = (None, None);
+    let (mut trust, mut yes) = (false, false);
+    let mut it = args.iter();
+    while let Some(tok) = it.next() {
+        match tok.to_str() {
+            Some("--key") => key = it.next().and_then(|v| v.to_str()),
+            Some("--trust") => trust = true,
+            Some("--yes") => yes = true,
+            Some(other) if !other.starts_with('-') && name.is_none() => name = Some(other),
+            other => {
+                diag::error(&format!(
+                    "sbx: unexpected argument '{}'",
+                    other.unwrap_or("(non-UTF-8)")
+                ));
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(name) = name else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    if key.is_some() && trust {
+        diag::error(
+            "sbx: --key and --trust are mutually exclusive: --key pins a key you supply, \
+             --trust re-accepts the one the store now ships",
+        );
+        return ExitCode::from(2);
+    }
+    if key.is_none() && !trust {
+        diag::error(
+            "sbx: supply --key <hex|@file> with the new key, or --trust to re-accept the one \
+             the store now ships (weaker)",
+        );
+        return ExitCode::from(2);
+    }
+    let Some(layout) = store::Layout::from_env() else {
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(git) = store::resolve_git() else {
+        diag::error("sbx: git is not on PATH — a remote plugin store is a git repository");
+        return ExitCode::FAILURE;
+    };
+    let cfg = match stores::read_configured(&layout, name) {
+        Ok(cfg) => cfg,
+        Err(why) => {
+            diag::error(&format!("sbx: {why}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let choice = match key {
+        Some(k) => match stores::parse_pubkey_arg(k) {
+            Ok(k) => stores::TrustChoice::Pinned(k),
+            Err(why) => {
+                diag::error(&format!("sbx: invalid --key: {why}"));
+                return ExitCode::from(2);
+            }
+        },
+        None => stores::TrustChoice::Tofu,
+    };
+
+    // The alert precedes the fetch: what it describes — replacing this store's signing identity —
+    // is decided here, whatever the new key turns out to be.
+    let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
+    let new_shown = match &choice {
+        stores::TrustChoice::Pinned(k) => catalogue::to_hex(k),
+        stores::TrustChoice::Tofu => "(whatever key the store now ships)".to_string(),
+    };
+    eprint!(
+        "{}",
+        render_store_rekey_alert(name, &catalogue::to_hex(&cfg.pubkey), &new_shown, &epal)
+    );
+    if !yes && !confirm_rotation() {
+        diag::error("sbx: not rotating the store's key");
+        return ExitCode::FAILURE;
+    }
+
+    match stores::rekey(&layout, name, choice, &git) {
+        Ok(done) => {
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!(
+                "{}",
+                render_store_rekeyed(
+                    &done.name,
+                    &catalogue::to_hex(&done.old_pubkey),
+                    &catalogue::to_hex(&done.new_pubkey),
+                    done.tofu,
+                    done.rev,
+                    done.catalogue.plugins.len(),
+                    &pal
+                )
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            diag::error(&format!("sbx: cannot rotate the store's key: {why}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Ask a terminal to confirm a key rotation. Without a terminal there is nobody to ask, and an
+/// unattended run must not rotate a signing identity on its own — `--yes` is how a script says it
+/// meant to. Anything but an explicit yes is a no.
+fn confirm_rotation() -> bool {
+    use std::io::{BufRead, Write};
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        diag::hint("     pass --yes if this rotation is intentional (no terminal to confirm at)");
+        return false;
+    }
+    eprint!("  rotate this store's key? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// `sbx plugins store rm <name>`: remove a configured remote store from the cache. Host-level,
@@ -574,63 +1212,197 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
     }
 }
 
-/// `sbx plugins store list`: the resolver plugins bundled in the binary, each with its scheme,
-/// version, description, and whether it is already installed, followed by every configured
-/// remote store with its accepted revision and plugin count. No fetch, no network.
-fn plugins_store_list() -> ExitCode {
-    let layout = store::Layout::from_env();
-    let installed_dir = layout.as_ref().map(|l| l.plugins_dir());
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
-    println!("{h}built-in plugin store{r} (install one with: sbx plugins install <name>):");
-    for entry in plugins::embedded_listing() {
-        let scheme = entry.scheme.as_deref().unwrap_or("?");
-        print!("  {n}{}{r}  {dim}({scheme}://){r}", entry.name);
-        if let Some(v) = &entry.version {
-            print!("  v{v}");
-        }
-        let is_installed = installed_dir
-            .as_ref()
-            .is_some_and(|d| d.join(&entry.name).is_dir());
-        if is_installed {
-            print!("  {}[installed]{r}", pal.ok);
-        }
-        println!();
-        if let Some(desc) = &entry.description {
-            println!("    {dim}{desc}{r}");
+/// `sbx plugins store list`: every configured store with its accepted revision, expanded to the
+/// plugins it lists — each with its scheme, version, description, and whether it is already
+/// installed from that store. No fetch, no network.
+fn plugins_store_list_cmd(args: &[OsString]) -> ExitCode {
+    let mut only_installed = false;
+    for a in args {
+        match a.to_str() {
+            Some("--installed") => only_installed = true,
+            other => {
+                diag::error(&format!(
+                    "sbx: unexpected argument '{}'",
+                    other.unwrap_or("(non-UTF-8)")
+                ));
+                eprintln!(
+                    "sbx: usage: {}",
+                    help::synopsis_of(&["plugins", "store", "list"])
+                );
+                return ExitCode::from(2);
+            }
         }
     }
+    plugins_store_list(only_installed)
+}
 
-    // Configured remote stores, read from their owner-only caches (trusted by location).
-    if let Some(layout) = &layout {
-        let names = stores::list(layout);
-        if !names.is_empty() {
-            println!(
-                "{h}configured remote stores{r} (update with: sbx plugins store update <name>):"
+/// One listed plugin: the shape `store list` and `store info` both reduce a catalogue to.
+/// Rendering them through one function keeps the two listings identical in what they show and in
+/// what `--installed` means.
+struct Listed<'a> {
+    name: &'a str,
+    scheme: &'a str,
+    version: Option<&'a str>,
+    description: Option<&'a str>,
+    /// The digest the catalogue pins for this entry, when it comes from one. It is the exact
+    /// artifact the store lists, so comparing it against what an install recorded answers "is what
+    /// I have the build this store offers" without reading a version string at all.
+    sha256: Option<&'a str>,
+}
+
+/// Print one source's entries at `indent`, keeping only the installed ones when asked, and return
+/// how many were shown — so the caller can say a source has nothing installed rather than leaving a
+/// bare heading. Every entry carries the marker that says whether it is in place, or what holds its
+/// name or scheme.
+fn print_listed(
+    entries: &[Listed],
+    store: &str,
+    installed: Option<&InstalledIndex>,
+    only_installed: bool,
+    indent: &str,
+    pal: &style::Palette,
+) -> usize {
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    let mut shown = 0;
+    for e in entries {
+        if only_installed && !installed.is_some_and(|i| i.installed_from(e.name, store)) {
+            continue;
+        }
+        shown += 1;
+        print!("{indent}{n}{}{r}  {dim}({}://){r}", e.name, e.scheme);
+        if let Some(v) = e.version.filter(|v| !v.is_empty()) {
+            print!("  v{v}");
+        }
+        if let Some(i) = installed {
+            print!(
+                "{}",
+                i.marker(e.name, e.scheme, e.version, e.sha256, store, pal)
             );
-            for name in &names {
-                match stores::read_configured(layout, name) {
-                    Ok(cfg) => {
-                        let detail = match stores::cached_catalogue(layout, name) {
-                            Ok(cat) => {
-                                let count = cat.plugins.len();
-                                format!("{count} plugin{}", if count == 1 { "" } else { "s" })
-                            }
-                            Err(_) => "catalogue unreadable".to_string(),
-                        };
-                        let marker = if cfg.tofu {
-                            format!("  {}[tofu]{r}", pal.warn)
-                        } else {
-                            String::new()
-                        };
-                        println!(
-                            "  {n}{name}{r}  {dim}(rev {}, {detail}){r}{marker}",
-                            cfg.locked_rev
-                        );
-                    }
-                    Err(why) => diag::warn(&format!("store '{name}': {why}")),
-                }
+        }
+        println!();
+        if let Some(d) = e.description.filter(|d| !d.is_empty()) {
+            println!("{indent}  {dim}{d}{r}");
+        }
+    }
+    shown
+}
+
+/// The line closing a source's block: how to install from it, or — under `--installed`, with
+/// nothing shown — that nothing from it is in place. One of the two always prints, so a source is
+/// never left as a heading with no explanation.
+fn print_source_footer(
+    shown: usize,
+    only_installed: bool,
+    indent: &str,
+    what: &str,
+    install_cmd: &str,
+    pal: &style::Palette,
+) {
+    let (dim, r) = (pal.dim, pal.reset);
+    if !only_installed {
+        println!("{indent}{dim}(install one with: {install_cmd}){r}");
+    } else if shown == 0 {
+        println!("{indent}{dim}(nothing from {what} is installed){r}");
+    }
+}
+
+/// The entries a remote catalogue lists, in the shared shape.
+fn listed_from_catalogue(cat: &catalogue::Catalogue) -> Vec<Listed<'_>> {
+    cat.plugins
+        .iter()
+        .map(|(name, e)| Listed {
+            name,
+            scheme: &e.scheme,
+            version: Some(&e.version),
+            description: Some(&e.description),
+            sha256: Some(&e.sha256),
+        })
+        .collect()
+}
+
+/// The body of `store list`. `only_installed` keeps just the entries in place from the source being
+/// listed, for answering "what do I actually have from here" without reading past everything on
+/// offer. The sources themselves are still all shown: a store with nothing installed says so,
+/// rather than vanishing and leaving the user unsure whether it is configured at all.
+fn plugins_store_list(only_installed: bool) -> ExitCode {
+    let layout = store::Layout::from_env();
+    // Without a data directory nothing is installed as far as this listing can tell, so every entry
+    // renders unmarked rather than the command failing on an inspection verb.
+    let installed = layout.as_ref().map(InstalledIndex::scan);
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+
+    // Configured stores, read from their owner-only caches (trusted by location). Each is expanded
+    // down to its plugins: a bare count would say a store has something to offer without saying
+    // what, which is the one question this command exists to answer.
+    let names = layout.as_ref().map(stores::list).unwrap_or_default();
+    if names.is_empty() {
+        println!("{h}configured plugin stores:{r} (none)");
+        println!(
+            "  {dim}(add one with: sbx plugins store add --name <n> --url <git-url> \
+             --key <hex>){r}"
+        );
+        return ExitCode::SUCCESS;
+    }
+    let Some(layout) = layout.as_ref() else {
+        return ExitCode::SUCCESS;
+    };
+    println!("{h}configured plugin stores{r} (update with: sbx plugins store update <name>):");
+    for name in &names {
+        let cfg = match stores::read_configured(layout, name) {
+            Ok(cfg) => cfg,
+            Err(why) => {
+                diag::warn(&format!("store '{name}': {why}"));
+                continue;
             }
+        };
+        let catalogue = stores::cached_catalogue(layout, name);
+        let detail = match &catalogue {
+            Ok(cat) => {
+                let count = cat.plugins.len();
+                format!("{count} plugin{}", if count == 1 { "" } else { "s" })
+            }
+            Err(_) => "catalogue unreadable".to_string(),
+        };
+        // What is missing is a *second source* for the key, not verification as such: the catalogue
+        // is signature-checked against this key on every fetch. The marker states the gap; the line
+        // under it names the command that closes it, because a flag with no way out is one a user
+        // learns to scroll past. A key the user supplied needs neither.
+        let marker = if cfg.tofu {
+            format!("  {}[key not confirmed elsewhere]{r}", pal.warn)
+        } else {
+            String::new()
+        };
+        println!(
+            "  {n}{name}{r}  {dim}(rev {}, {detail}){r}{marker}",
+            cfg.locked_rev
+        );
+        if cfg.tofu {
+            println!(
+                "    {dim}(confirm its key with: sbx plugins store verify {name} \
+                 --key <the key you obtained>){r}"
+            );
+        }
+        match &catalogue {
+            Ok(cat) => {
+                let shown = print_listed(
+                    &listed_from_catalogue(cat),
+                    name,
+                    installed.as_ref(),
+                    only_installed,
+                    "    ",
+                    &pal,
+                );
+                print_source_footer(
+                    shown,
+                    only_installed,
+                    "    ",
+                    "this store",
+                    &format!("sbx plugins store install {name} <plugin>"),
+                    &pal,
+                );
+            }
+            Err(why) => diag::warn(&format!("store '{name}': {why}")),
         }
     }
     ExitCode::SUCCESS
@@ -665,6 +1437,277 @@ fn plugins_remove(name: Option<&str>) -> ExitCode {
     }
 }
 
+/// What an installed plugin's store says about it now — the one comparison `upgrade` and the store
+/// listings both make. Everything is read from the *cached* catalogue, so it is only as current as
+/// the last `sbx plugins store update`; the revision travels with the verdict so no output can
+/// claim currency without saying against what.
+struct StoreVerdict {
+    store: String,
+    rev: u64,
+    listed_version: String,
+    /// `false` when the catalogue pins a different tree than the one that was installed.
+    current: bool,
+    /// Why no comparison was possible, when none was.
+    unknown: Option<String>,
+}
+
+/// Ask a plugin's origin store what it lists for it now.
+fn store_verdict(
+    layout: &store::Layout,
+    dir_name: &str,
+    installed: &InstalledPlugin,
+) -> Option<StoreVerdict> {
+    let plugins::origin::Origin::Store { store: name, .. } = &installed.origin else {
+        return None;
+    };
+    let unknown = |why: String| {
+        Some(StoreVerdict {
+            store: name.clone(),
+            rev: 0,
+            listed_version: String::new(),
+            current: false,
+            unknown: Some(why),
+        })
+    };
+    let catalogue = match stores::cached_catalogue(layout, name) {
+        Ok(c) => c,
+        Err(why) => return unknown(format!("its store's catalogue cannot be read ({why})")),
+    };
+    let Some(entry) = catalogue.plugins.get(dir_name) else {
+        return unknown(format!(
+            "store '{name}' no longer lists a plugin named `{dir_name}`"
+        ));
+    };
+    let Some(ours) = installed.digest.as_deref() else {
+        return unknown(
+            "no digest was recorded when it was installed — reinstall it to make it comparable"
+                .to_string(),
+        );
+    };
+    Some(StoreVerdict {
+        store: name.clone(),
+        rev: catalogue.rev,
+        listed_version: entry.version.clone(),
+        current: entry.sha256 == ours,
+        unknown: None,
+    })
+}
+
+/// `sbx plugins upgrade [<name>] [--dry-run]`: replace installed plugins with what their store
+/// lists now. Bare, it considers every plugin installed from a store, like `store update`.
+///
+/// The decision is the **digest**, not the version string: the catalogue pins the tree it offers
+/// and the install recorded the tree it placed, so "you already have this" is a fact rather than a
+/// version comparison's guess — and a republish under an unchanged version is still seen.
+///
+/// The replacement keeps the installed plugin until the new tree is in place, so an upgrade that
+/// fails leaves what was there. That is the whole reason this is a verb and not documentation
+/// telling a user to `rm` and install again: `rm` deletes first, and a failure after it leaves
+/// nothing installed.
+fn plugins_upgrade(args: &[OsString]) -> ExitCode {
+    let mut name: Option<&str> = None;
+    let mut dry_run = false;
+    for a in args {
+        match a.to_str() {
+            Some("--dry-run") => dry_run = true,
+            Some(tok) if !tok.starts_with('-') && name.is_none() => name = Some(tok),
+            other => {
+                diag::error(&format!(
+                    "sbx: plugins upgrade: unexpected argument {:?}",
+                    other.unwrap_or("(not utf-8)")
+                ));
+                diag::note(&format!(
+                    "usage: {}",
+                    help::synopsis_of(&["plugins", "upgrade"])
+                ));
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(layout) = store::Layout::from_env() else {
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
+        );
+        return ExitCode::FAILURE;
+    };
+    let index = InstalledIndex::scan(&layout);
+    let targets: Vec<String> = match name {
+        Some(one) => {
+            if !index.by_name.contains_key(one) {
+                diag::error(&format!("sbx: no installed plugin named `{one}`"));
+                return ExitCode::from(2);
+            }
+            vec![one.to_string()]
+        }
+        None => index.by_name.keys().cloned().collect(),
+    };
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (n, dim, ok, warn, r) = (pal.name, pal.dim, pal.ok, pal.warn, pal.reset);
+
+    let mut stale: Vec<(String, StoreVerdict)> = Vec::new();
+    for dir_name in &targets {
+        let Some(installed) = index.by_name.get(dir_name) else {
+            continue;
+        };
+        match store_verdict(&layout, dir_name, installed) {
+            // Not from a store: there is nothing to upgrade *from*. Named only when it was asked
+            // for by name, so a bare run is not a list of things it will never do.
+            None => {
+                if name.is_some() {
+                    println!(
+                        "  {n}{dir_name}{r}  {dim}installed from {} — no store to upgrade from{r}",
+                        installed.origin.short()
+                    );
+                }
+            }
+            Some(v) if v.unknown.is_some() => {
+                println!(
+                    "  {n}{dir_name}{r}  {warn}cannot be compared{r} {dim}({}){r}",
+                    v.unknown.as_deref().unwrap_or_default()
+                );
+            }
+            Some(v) if v.current => {
+                println!(
+                    "  {n}{dir_name}{r}  {ok}already the build store '{}' lists{r} {dim}(rev {}){r}",
+                    v.store, v.rev
+                );
+            }
+            Some(v) => stale.push((dir_name.clone(), v)),
+        }
+    }
+
+    if stale.is_empty() {
+        // The claim is only ever about the cached catalogue, so it says so rather than implying a
+        // freshness nothing checked.
+        println!("{dim}(compared against the cached catalogues — `sbx plugins store update` re-fetches them){r}");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut failed = 0usize;
+    for (dir_name, v) in &stale {
+        let have = index
+            .by_name
+            .get(dir_name)
+            .and_then(|p| p.version.as_deref())
+            .unwrap_or("")
+            .trim();
+        let wording = drift_wording(have, v.listed_version.trim());
+        if dry_run {
+            println!(
+                "  {n}{dir_name}{r}  {warn}{wording}{r} {dim}(store '{}', rev {}){r}",
+                v.store, v.rev
+            );
+            continue;
+        }
+        match stores::upgrade_plugin(&layout, &v.store, dir_name) {
+            // Past tense needs its own sentence: the pending wording ("update available: …") reads
+            // as a thing still to do once it has been done.
+            Ok(_) => {
+                let listed = v.listed_version.trim();
+                let moved = if have.is_empty() || listed.is_empty() {
+                    format!("from store '{}'", v.store)
+                } else if have == listed {
+                    format!("to a new build of v{listed}")
+                } else {
+                    format!("v{have} → v{listed}")
+                };
+                println!("  {n}{dir_name}{r}  {ok}upgraded{r} {dim}({moved}){r}");
+            }
+            Err(why) => {
+                failed += 1;
+                diag::error(&format!("sbx: cannot upgrade `{dir_name}`: {why}"));
+            }
+        }
+    }
+    if dry_run {
+        println!(
+            "{dim}(run without --dry-run to apply; compared against the cached catalogues){r}"
+        );
+    }
+    if failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `sbx plugins verify [<name>]`: re-hash one installed plugin's tree — or every one — and compare
+/// it against the digest recorded when it was placed. On demand only: it reads every file of every
+/// plugin, which is why it is a verb of its own and never runs on the launch path.
+///
+/// Exit is non-zero when a tree **changed**. A plugin with no recorded digest is reported plainly
+/// and does not fail the command: nothing was attested, which is a different answer from "this was
+/// tampered with" and calls for a different action (reinstall, which records one).
+fn plugins_verify(name: Option<&str>) -> ExitCode {
+    let Some(layout) = store::Layout::from_env() else {
+        diag::error(
+            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
+        );
+        return ExitCode::FAILURE;
+    };
+    let index = InstalledIndex::scan(&layout);
+    let names: Vec<String> = match name {
+        Some(one) => {
+            if !index.by_name.contains_key(one) {
+                // A usage exit, not a verification failure: this command promises that non-zero
+                // *one* means "a tree changed", so a name that names nothing must not be able to
+                // impersonate that answer for a script branching on the status.
+                diag::error(&format!("sbx: no installed plugin named `{one}`"));
+                return ExitCode::from(2);
+            }
+            vec![one.to_string()]
+        }
+        None => index.by_name.keys().cloned().collect(),
+    };
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (n, dim, ok, warn, err, r) = (pal.name, pal.dim, pal.ok, pal.warn, pal.err, pal.reset);
+    if names.is_empty() {
+        println!("no installed resolver plugins to verify");
+        return ExitCode::SUCCESS;
+    }
+    let mut changed = 0usize;
+    for dir_name in &names {
+        let verdict = plugins::integrity(&layout, dir_name);
+        let line = match &verdict {
+            plugins::Integrity::Intact => {
+                format!("{ok}unchanged since install{r}")
+            }
+            plugins::Integrity::Modified => {
+                changed += 1;
+                format!("{err}MODIFIED since install{r}")
+            }
+            plugins::Integrity::Unrecorded => format!(
+                "{warn}no digest recorded{r} {dim}(installed before sbx recorded one, or placed \
+                 by hand — reinstall to record one){r}"
+            ),
+            plugins::Integrity::Unreadable(why) => {
+                changed += 1;
+                format!("{err}cannot be hashed{r} {dim}({why}){r}")
+            }
+        };
+        println!("  {n}{dir_name}{r}  {line}");
+        if verdict == plugins::Integrity::Modified {
+            println!(
+                "    {dim}from: {}{r}",
+                plugins::origin::read(&layout, dir_name).label()
+            );
+        }
+    }
+    if changed == 0 {
+        return ExitCode::SUCCESS;
+    }
+    // What this does and does not mean, stated where the user reads the bad news — an integrity
+    // indicator mistaken for a boundary is worse than none.
+    diag::error(&format!(
+        "sbx: {changed} plugin{} no longer match{} what was installed — reinstall to restore a \
+         known tree (`sbx plugins rm <name>`, then install it again). This detects drift, not an \
+         attacker: the record lives in the same owner-only directory as the plugin",
+        if changed == 1 { "" } else { "s" },
+        if changed == 1 { "es" } else { "" },
+    ));
+    ExitCode::FAILURE
+}
+
 /// `sbx plugins info <scheme>`: the full manifest and sandbox grant of the plugin claiming
 /// `scheme`. A built-in scheme is reported as such (not an error); an unknown scheme is a
 /// non-zero "no such plugin". Like `list`, host-level and side-effect-free.
@@ -680,17 +1723,27 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         println!("{scheme}: a built-in resolver (compiled into sbx, not a plugin)");
         return ExitCode::SUCCESS;
     }
-    let Some((registry, warnings)) = load_plugin_registry() else {
+    let Some((layout, registry, warnings)) = load_plugin_registry() else {
         diag::error(
             "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let Some(p) = registry.resolver(scheme) else {
-        // A scheme can be absent because nothing claims it — or because it was *dropped* (two
-        // plugins claimed it, or its manifest is malformed). That reason lives in the load
-        // warnings, and `info <scheme>` is exactly the command a user runs to learn why their
-        // plugin is not picked up, so re-emit them before the generic miss.
+        // A scheme can be absent for three different reasons, and `info <scheme>` is exactly the
+        // command a user runs to learn which: nothing claims it, several plugins do (the answer is
+        // the conflict itself, so it is reported in full), or the one that does is malformed (that
+        // reason lives in the load warnings, re-emitted here).
+        if let Some(claimants) = registry.conflict(scheme) {
+            print_scheme_conflicts(&layout, &registry, Some(scheme), &pal);
+            diag::error(&format!(
+                "sbx: the scheme '{scheme}' is claimed by {} installed plugins and resolves to \
+                 nothing until exactly one remains",
+                claimants.len()
+            ));
+            return ExitCode::FAILURE;
+        }
         for w in &warnings {
             diag::warn(w);
         }
@@ -699,7 +1752,6 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         ));
         return ExitCode::FAILURE;
     };
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
     println!("{h}resolver plugin:{r} {n}{}{r}", p.name);
     println!("  scheme:      {n}{}://{r}", p.scheme);
@@ -710,6 +1762,24 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     println!(
         "  description: {}",
         p.description.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "  origin:      {}",
+        plugins::origin::read(&layout, p.dir_name()).label()
+    );
+    // Unlike `list`, every state is named here: `info` is the detail view, and "this matches what
+    // was installed" is exactly the reassurance a user opens it for.
+    println!(
+        "  integrity:   {}",
+        match plugins::integrity(&layout, p.dir_name()) {
+            plugins::Integrity::Intact => "unchanged since install".to_string(),
+            plugins::Integrity::Modified =>
+                format!("{err}MODIFIED since install{r} (verify with: sbx plugins verify)"),
+            plugins::Integrity::Unrecorded =>
+                "no digest recorded (installed before sbx recorded one, or placed by hand)"
+                    .to_string(),
+            plugins::Integrity::Unreadable(why) => format!("{err}cannot be hashed{r} ({why})"),
+        }
     );
     print!("  exec:        {}", p.exec.display());
     match p.check_exec() {
@@ -743,5 +1813,323 @@ fn print_grant_env(label: &str, keys: &[String]) {
         println!("    {label}:    (none)");
     } else {
         println!("    {label}:    {}", keys.join(", "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::origin::Origin;
+    use std::collections::BTreeMap;
+
+    /// An index describing exactly what a test needs installed, without touching a data directory.
+    fn index(entries: &[(&str, &str, Origin, Option<&str>)]) -> InstalledIndex {
+        let mut by_name = BTreeMap::new();
+        let mut by_scheme = BTreeMap::new();
+        for (name, scheme, origin, version) in entries {
+            by_name.insert(
+                (*name).to_string(),
+                InstalledPlugin {
+                    origin: origin.clone(),
+                    version: version.map(str::to_string),
+                    digest: origin.digest().map(str::to_string),
+                    disabled_over: None,
+                },
+            );
+            by_scheme.insert((*scheme).to_string(), (*name).to_string());
+        }
+        InstalledIndex {
+            by_name,
+            by_scheme,
+            conflicts: BTreeMap::new(),
+        }
+    }
+
+    /// An index whose only installed plugins are the claimants of one ambiguous scheme: in place,
+    /// resolving nothing. The scheme is deliberately absent from `by_scheme` — that is exactly what
+    /// the registry does with it.
+    fn conflicted_index(scheme: &str, claimants: &[&str], origin: Origin) -> InstalledIndex {
+        let mut by_name = BTreeMap::new();
+        for name in claimants {
+            by_name.insert(
+                (*name).to_string(),
+                InstalledPlugin {
+                    origin: origin.clone(),
+                    version: None,
+                    digest: None,
+                    disabled_over: Some(scheme.to_string()),
+                },
+            );
+        }
+        InstalledIndex {
+            by_name,
+            by_scheme: BTreeMap::new(),
+            conflicts: BTreeMap::from([(
+                scheme.to_string(),
+                claimants.iter().map(|c| (*c).to_string()).collect(),
+            )]),
+        }
+    }
+
+    fn plain() -> style::Palette {
+        style::Palette::for_stream(false)
+    }
+
+    #[test]
+    fn a_plugin_installed_from_this_store_reads_installed() {
+        let idx = index(&[(
+            "kp",
+            "kp",
+            Origin::Store {
+                store: "mine".to_string(),
+                url: None,
+                sha256: None,
+            },
+            Some("1.0.0"),
+        )]);
+        assert_eq!(
+            idx.marker("kp", "kp", Some("1.0.0"), None, "mine", &plain()),
+            "  [installed]"
+        );
+    }
+
+    #[test]
+    fn two_stores_listing_one_name_name_the_holder_instead_of_claiming_installed() {
+        // Only one plugin can hold a name: an install from the second store would be refused, so
+        // its listing must say who holds it rather than showing a misleading `[installed]`.
+        let idx = index(&[(
+            "kp",
+            "kp",
+            Origin::Store {
+                store: "mine".to_string(),
+                url: None,
+                sha256: None,
+            },
+            None,
+        )]);
+        assert_eq!(
+            idx.marker("kp", "kp", None, None, "other", &plain()),
+            "  [name taken by store 'mine']"
+        );
+        // The same rule across sources: a local install shadows a store's entry, and a built-in
+        // shadows both.
+        let idx = index(&[(
+            "kp",
+            "kp",
+            Origin::Local {
+                path: None,
+                sha256: None,
+            },
+            None,
+        )]);
+        assert_eq!(
+            idx.marker("kp", "kp", None, None, "mine", &plain()),
+            "  [name taken by a local install]"
+        );
+        // A plugin installed before origins were recorded holds the name just as firmly.
+        let idx = index(&[("kp", "kp", Origin::Unknown, None)]);
+        assert_eq!(
+            idx.marker("kp", "kp", None, None, "mine", &plain()),
+            "  [name taken by an unknown source]"
+        );
+    }
+
+    #[test]
+    fn a_free_name_whose_scheme_is_taken_says_so() {
+        // The install would be refused on the scheme, not the name — invisible from a catalogue.
+        let idx = index(&[(
+            "other",
+            "kp",
+            Origin::Local {
+                path: None,
+                sha256: None,
+            },
+            None,
+        )]);
+        assert_eq!(
+            idx.marker("kp", "kp", None, None, "mine", &plain()),
+            "  [scheme kp:// taken by the installed plugin 'other']"
+        );
+    }
+
+    #[test]
+    fn a_scheme_claimed_twice_blocks_the_entry_and_names_every_claimant() {
+        // Nothing resolves the scheme, yet an install is refused on it — so the entry is not
+        // offered, and the marker says who has to be removed for it to become installable.
+        let idx = conflicted_index(
+            "kp",
+            &["one", "two"],
+            Origin::Local {
+                path: None,
+                sha256: None,
+            },
+        );
+        assert_eq!(
+            idx.marker("kp", "kp", None, None, "mine", &plain()),
+            "  [scheme kp:// in conflict between `one`, `two`]"
+        );
+    }
+
+    #[test]
+    fn a_claimant_of_a_conflicted_scheme_is_not_reported_as_working() {
+        // It is installed from this very store, so the name path would have said `[installed]` —
+        // which for a plugin that resolves nothing is the most misleading answer available.
+        let store = Origin::Store {
+            store: "mine".to_string(),
+            url: None,
+            sha256: None,
+        };
+        let idx = conflicted_index("kp", &["kp", "kp-fork"], store);
+        assert_eq!(
+            idx.marker("kp", "kp", Some("1.0.0"), None, "mine", &plain()),
+            "  [installed, disabled: scheme kp:// in conflict]"
+        );
+    }
+
+    #[test]
+    fn an_installable_entry_carries_no_marker() {
+        let idx = index(&[(
+            "other",
+            "vault",
+            Origin::Local {
+                path: None,
+                sha256: None,
+            },
+            None,
+        )]);
+        assert_eq!(
+            idx.marker("kp", "kp", Some("1.0.0"), None, "mine", &plain()),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_version_that_drifted_from_the_listing_reports_both() {
+        // With no digest on either side there is nothing to compare but the strings, so neither is
+        // called newer — the fallback for a record predating digests.
+        let store = |v: Option<&str>| {
+            index(&[(
+                "kp",
+                "kp",
+                Origin::Store {
+                    store: "mine".to_string(),
+                    url: None,
+                    sha256: None,
+                },
+                v,
+            )])
+        };
+        assert_eq!(
+            store(Some("1.0.0")).marker("kp", "kp", Some("2.0.0"), None, "mine", &plain()),
+            "  [installed v1.0.0, listed v2.0.0]"
+        );
+        // A version missing on either side is not a drift, just less to say.
+        assert_eq!(
+            store(None).marker("kp", "kp", Some("2.0.0"), None, "mine", &plain()),
+            "  [installed]"
+        );
+    }
+
+    /// An installed plugin from store 'mine' pinning `digest`, at `version`.
+    fn store_index(digest: &str, version: &str) -> InstalledIndex {
+        index(&[(
+            "kp",
+            "kp",
+            Origin::Store {
+                store: "mine".to_string(),
+                url: None,
+                sha256: Some(digest.to_string()),
+            },
+            Some(version),
+        )])
+    }
+
+    #[test]
+    fn the_digest_decides_whether_a_listing_offers_an_upgrade() {
+        // Same tree: nothing to do, whatever the version strings would suggest.
+        let idx = store_index(&"a".repeat(64), "1.0.0");
+        assert_eq!(
+            idx.marker(
+                "kp",
+                "kp",
+                Some("1.0.0"),
+                Some(&"a".repeat(64)),
+                "mine",
+                &plain()
+            ),
+            "  [installed]"
+        );
+        // A different tree with an ordered pair of versions: a direction can be named.
+        assert_eq!(
+            idx.marker(
+                "kp",
+                "kp",
+                Some("1.1.0"),
+                Some(&"b".repeat(64)),
+                "mine",
+                &plain()
+            ),
+            "  [update available: v1.0.0 → v1.1.0]"
+        );
+        // The case a version comparison cannot see at all: a republish under the same version.
+        assert_eq!(
+            idx.marker(
+                "kp",
+                "kp",
+                Some("1.0.0"),
+                Some(&"b".repeat(64)),
+                "mine",
+                &plain()
+            ),
+            "  [installed v1.0.0, the store lists a different build of v1.0.0]"
+        );
+        // A store that rolled back is not an upgrade, and saying so is the point of ordering.
+        assert_eq!(
+            idx.marker(
+                "kp",
+                "kp",
+                Some("0.9.0"),
+                Some(&"b".repeat(64)),
+                "mine",
+                &plain()
+            ),
+            "  [ahead of the store: installed v1.0.0, listed v0.9.0]"
+        );
+    }
+
+    #[test]
+    fn version_order_refuses_to_guess_what_it_cannot_order() {
+        use std::cmp::Ordering;
+        assert_eq!(version_order("1.0.0", "1.1.0"), Some(Ordering::Less));
+        assert_eq!(version_order("2", "1.9.9"), Some(Ordering::Greater));
+        // A missing component is zero, so a shorter version sorts before a longer one.
+        assert_eq!(version_order("1.8", "1.8.2"), Some(Ordering::Less));
+        assert_eq!(version_order("1.8", "1.8.0"), Some(Ordering::Equal));
+        assert_eq!(version_order("v1.2.3", "1.2.3"), Some(Ordering::Equal));
+        // A release outranks its own pre-release; two different pre-releases have no numeric answer.
+        assert_eq!(version_order("1.2.0", "1.2.0-rc1"), Some(Ordering::Greater));
+        assert_eq!(
+            version_order("1.2.0-rc1", "1.2.0-rc1"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(version_order("1.2.0-rc2", "1.2.0-beta"), None);
+        // Free-form strings: a manifest's `version` is not constrained, so these must not be
+        // ranked. Claiming "up to date" from a bad guess is the failure that matters.
+        assert_eq!(version_order("2026-08-01", "2026-08-02"), None);
+        assert_eq!(version_order("1.0.0a", "1.0.1"), None);
+        assert_eq!(version_order("latest", "1.0.0"), None);
+        assert_eq!(version_order("", "1.0.0"), None);
+    }
+
+    #[test]
+    fn drift_wording_states_a_difference_when_it_cannot_state_a_direction() {
+        assert_eq!(
+            drift_wording("2026-08-01", "2026-08-02"),
+            "installed v2026-08-01, the store lists v2026-08-02"
+        );
+        assert_eq!(
+            drift_wording("", "1.0.0"),
+            "installed, the store lists a different build"
+        );
     }
 }

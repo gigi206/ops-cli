@@ -254,11 +254,23 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     }
 
     // Attach and have the shell drop a marker into its $HOME.
-    let log = drive_attach(
-        pid,
-        data.path(),
-        b"printf done > \"$HOME/ATTACH_OK\"\nexit\n",
-    );
+    //
+    // A session record appears as soon as the launch registers it, but a cage only becomes
+    // *enterable* once a process is running inside its namespaces — and the app's first launch
+    // provisions its toolset before it ever reaches `sleep`. That gap is startup, not a defect, so
+    // retry across it — and only across it: any other attach failure still fails on the first try.
+    let attachable_by = Instant::now() + Duration::from_secs(60);
+    let log = loop {
+        let log = drive_attach(
+            pid,
+            data.path(),
+            b"printf done > \"$HOME/ATTACH_OK\"\nexit\n",
+        );
+        if !log.contains("has no live process to enter") || Instant::now() >= attachable_by {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
 
     let app_home_marker = data.path().join("sbx/apps/probe/home/ATTACH_OK");
     // Allow a brief window for the in-cage write to become observable on the host-bound home after

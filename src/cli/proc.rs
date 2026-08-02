@@ -356,12 +356,10 @@ fn proc_pending(args: &[OsString]) -> ExitCode {
 
 /// List every parked `execve` across the live observed sessions.
 fn proc_pending_list(args: &[OsString]) -> ExitCode {
-    if let Some(a) = args
-        .iter()
-        .find(|a| a.to_str().is_none_or(|s| s.starts_with('-')))
-    {
-        diag::error(&format!("sbx: proc pending: unexpected argument {a:?}"));
-        return ExitCode::from(2);
+    // Every argument, not just the flag-shaped ones: a stray positional was silently dropped, so
+    // `proc pending <something>` printed the full list and read as if it had been filtered by it.
+    if let Err(code) = crate::cli::reject_extra(&["proc", "pending"], args) {
+        return code;
     }
     let Some(layout) = store::Layout::from_env() else {
         diag::error(

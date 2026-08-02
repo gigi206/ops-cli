@@ -21,7 +21,11 @@ pub(crate) fn session_cmd(args: Vec<OsString>) -> ExitCode {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {
-        Some("ls") | Some("list") => list_sessions(),
+        Some("ls") | Some("list") => match crate::cli::reject_extra(&["session", "ls"], &args[1..])
+        {
+            Err(code) => code,
+            Ok(()) => list_sessions(),
+        },
         Some("logs") | Some("log") => logs_cmd(&args[1..]),
         Some("attach") => attach_cmd(args[1..].to_vec()),
         Some("stop") => stop_cmd(args[1..].to_vec()),

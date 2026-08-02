@@ -1577,12 +1577,26 @@ fn plugins_list_shows_installed_plugins_builtins_and_drop_warnings() {
     );
     // the ambiguous scheme dropped both, and the malformed manifest was dropped — explained
     assert!(
-        !stdout.contains("vault://"),
+        !stdout.contains("installed resolver plugins:\n  vault://"),
         "an ambiguous scheme must resolve to nothing:\n{stdout}"
     );
+    // the conflict is state of the installed set, so it is reported in the listing itself, naming
+    // every plugin that has to go
     assert!(
-        stderr.contains("claimed by both") && stderr.contains("invalid plugin.toml"),
-        "drops must be explained on stderr:\n{stderr}"
+        stdout.contains("scheme conflicts")
+            && stdout.contains("vault://")
+            && stdout.contains("claimed by 2 plugins")
+            && stdout.contains("\n    v1")
+            && stdout.contains("\n    v2"),
+        "the conflict must be shown with its claimants:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("invalid plugin.toml"),
+        "a malformed manifest must be explained on stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("claimed by more than one"),
+        "the conflict is rendered on stdout — saying it twice is noise:\n{stderr}"
     );
 }
 
@@ -1650,7 +1664,7 @@ fn plugins_info_reports_builtin_unknown_and_a_plugin() {
 fn plugins_info_explains_a_dropped_conflicting_scheme() {
     // `info <scheme>` is the command a user runs to learn why their plugin is not picked up. When
     // two plugins claim one scheme, both are dropped — so the registry has no entry for it, and the
-    // miss must be *explained* (the conflict warning), not a bare "no plugin claims it".
+    // answer is the conflict itself (with the plugins to remove), not a bare "no plugin claims it".
     let fx = Fixture::new();
     fx.write_plugin(
         "v1",
@@ -1660,16 +1674,31 @@ fn plugins_info_explains_a_dropped_conflicting_scheme() {
         "v2",
         "type=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
     );
+    // an unrelated conflict must not be dragged into an answer about `vault`
+    fx.write_plugin("k1", "type=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n");
+    fx.write_plugin("k2", "type=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n");
 
     let out = fx.run(&["plugins", "info", "vault"]);
     assert!(
         !out.status.success(),
         "info on a dropped scheme must be non-zero"
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("claimed by both") && stderr.contains("vault"),
-        "the conflict must be explained, not hidden behind a bare miss:\n{stderr}"
+        stdout.contains("vault://")
+            && stdout.contains("\n    v1")
+            && stdout.contains("\n    v2")
+            && stdout.contains("sbx plugins rm"),
+        "the conflict and the way out must be shown:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("kp://"),
+        "only the scheme that was asked about:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("claimed by 2 installed plugins") && stderr.contains("vault"),
+        "the failure must name the conflict, not a bare miss:\n{stderr}"
     );
 }
 
@@ -1762,64 +1791,55 @@ fn plugins_install_refuses_a_colliding_scheme_through_the_binary() {
 }
 
 #[test]
-fn plugins_store_list_then_install_a_builtin_then_remove() {
+fn plugins_install_from_a_directory_then_remove() {
     let fx = Fixture::new();
 
-    // the built-in store lists the bundled plugins, none installed yet
+    // Nothing installed, and no store configured — both stated rather than left blank.
+    let out = fx.run(&["plugins", "list"]);
+    assert!(out.status.success(), "list must succeed");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("installed resolver plugins: (none)"));
     let out = fx.run(&["plugins", "store", "list"]);
-    assert!(out.status.success(), "store list must succeed");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("vault  (vault://)") && stdout.contains("pass  (pass://)"),
-        "the built-in store must list its plugins:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("[installed]"),
-        "nothing is installed yet:\n{stdout}"
-    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("configured plugin stores: (none)"));
 
-    // install one by bare name (no path separator) — `vault` declares no allow_paths, so the
-    // install needs no environment beyond the redirected data dir
-    let out = fx.run(&["plugins", "install", "vault"]);
+    // The repository's own `vault` plugin: it declares no allow_paths, so the install needs no
+    // environment beyond the redirected data dir.
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/vault");
+    let out = fx.run(&["plugins", "install", source.to_str().unwrap()]);
     assert!(
         out.status.success(),
-        "installing a built-in by name must succeed:\n{}",
+        "installing a plugin directory must succeed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("installed 'vault'"));
 
-    // it now reads as installed in both the store list and the installed list
-    let out = fx.run(&["plugins", "store", "list"]);
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("[installed]"),
-        "the store list must mark it installed"
-    );
+    // It resolves, and the listing names where it came from.
     let out = fx.run(&["plugins", "list"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("vault://"), "{stdout}");
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("vault://"),
-        "the installed list must surface it"
+        stdout.contains(&format!("from: local directory {}", source.display())),
+        "{stdout}"
     );
     assert!(
         !String::from_utf8_lossy(&out.stderr).contains("warning"),
-        "a built-in install must load cleanly"
+        "a fresh install must load cleanly"
     );
 
-    // rm removes it, and the store list shows it uninstalled again
     assert!(fx.run(&["plugins", "rm", "vault"]).status.success());
-    let out = fx.run(&["plugins", "store", "list"]);
-    assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("[installed]"),
-        "the store list must show it uninstalled again"
-    );
+    let out = fx.run(&["plugins", "list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("installed resolver plugins: (none)"));
 }
 
 #[test]
-fn plugins_install_an_unknown_builtin_name_is_refused() {
+fn plugins_install_refuses_a_path_that_is_not_a_plugin() {
     let fx = Fixture::new();
     let out = fx.run(&["plugins", "install", "nope"]);
-    assert!(!out.status.success(), "an unknown built-in name must fail");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no built-in plugin named `nope`"),
+        !out.status.success(),
+        "a path that is not a plugin must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nope"),
         "the refusal must name it:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );

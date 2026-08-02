@@ -60,6 +60,11 @@ impl Drop for KillOnDrop {
 
 struct TmpDir(PathBuf);
 
+/// How much of a fixture's tag survives into its directory name. With the prefix, a pid and the
+/// counter, this keeps a fixture directory at 25 bytes or so — inside the budget an `…/sbx` data
+/// dir has under a checkout at a normal depth.
+const TAG_MAX: usize = 10;
+
 impl TmpDir {
     fn new(tag: &str) -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -69,6 +74,12 @@ impl TmpDir {
         // data dir (`…/<dir>/sbx/egress/proxy-<pid>.sock`), and `sun_path` caps the whole path
         // at 108 bytes. A longer prefix plus a 7-digit pid (counted twice — here and in the
         // socket name) tips a deep checkout over the limit, so keep this terse.
+        //
+        // The tag is a fixture label, not an identity — the counter alone makes the name unique —
+        // so it is capped here rather than trusted. A test that picks a descriptive tag would
+        // otherwise push its own data dir past the budget and fail with sbx's "path too long"
+        // refusal, which reads as a product bug rather than as a fixture that named itself.
+        let tag: String = tag.chars().take(TAG_MAX).collect();
         d.push(format!("r-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
@@ -1696,9 +1707,10 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
     // relay; without it the name is unowned, as the in-cage portal serves only the portal), and
     // `GetServerInformation` on it must return the HOST daemon's info (a forward can only succeed if
     // the relay bridged the private bus to the host). A retry absorbs the startup race — the relay
-    // attaches within milliseconds when the host is idle, but the window is generous (~20s) so a
-    // host-side relay that is merely slow to be scheduled under heavy parallel load is not mistaken
-    // for one that never attached. `gdbus` comes from the project's own `nix:glib.bin`. It exits the
+    // attaches within milliseconds when the host is idle, but the window is deliberately long (600
+    // polls, a minute or so) so a host-side relay that is merely slow to be scheduled is not
+    // mistaken for one that never attached. Twenty seconds was not enough: a full parallel suite
+    // provisions from the binary cache while this runs, and the relay lost the race for the CPU. `gdbus` comes from the project's own `nix:glib.bin`. It exits the
     // loop the instant the name has an owner, so a healthy run is unaffected. Skips (never fails) when
     // the host cannot sandbox,
     // has no compositor, no session bus, or the cache is unreachable.
@@ -1748,13 +1760,17 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
 
     // Retry GetNameOwner until the relay has claimed the name (the startup race), then read the
     // forwarded server information. `--session` is the private bus (the portal env points it there).
-    let script = "for _ in $(seq 1 200); do \
+    // The poll count is what the window is made of, and it reports how many it used: a failure that
+    // says only "the relay did not attach" cannot be told apart from one that was still waiting,
+    // and this test's whole failure mode is a host-side process slow to be scheduled.
+    let script = "for i in $(seq 1 600); do \
            owner=$(gdbus call --session --dest org.freedesktop.DBus \
              --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.GetNameOwner \
              org.freedesktop.Notifications 2>&1); \
            case \"$owner\" in *NameHasNoOwner*|*Error*) sleep 0.1;; *) break;; esac; \
          done; \
          echo \"OWNER: $owner\"; \
+         echo \"WAITED: $i polls\"; \
          gdbus call --session --dest org.freedesktop.Notifications \
            --object-path /org/freedesktop/Notifications \
            --method org.freedesktop.Notifications.GetServerInformation 2>&1 | sed 's/^/SERVERINFO: /'";
@@ -4125,7 +4141,8 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
     // only this install writes there.
     assert!(
         project_home_mise_installed(data.path(), "nix-jq"),
-        "mise did not install jq into the project home's pool through the allowlist: {log}"
+        "mise did not install jq into the project home's pool through the allowlist.\n{}\n{log}",
+        describe_mise_pools(data.path())
     );
     // Control: a tool that was never asked for must not be reported as installed, so the check
     // above is discriminating rather than something that answers yes to anything.
@@ -5130,33 +5147,101 @@ fn project_store_dir(data: &Path) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 /// Whether mise installed `tool` (its backend-munged directory name, e.g. `nix-jq`) into the
-/// project home's own pool, with at least one concrete version directory rather than a bare
+/// project home's own pool, with at least one concrete version entry rather than a bare
 /// placeholder. The filesystem answer to "did the self-equip actually install", which no wording in
 /// a tool's own log can give: mise says "installed" in messages that mean the opposite, and the
-/// project store is no witness either — a tool that is *also* in the base userland (jq is) sits
-/// there whether or not mise ever ran.
+/// project store is no witness on its own either — a tool that is *also* in the base userland (jq
+/// is) sits there whether or not mise ever ran. Taken together they are: the pool entry proves mise
+/// ran, and its target being in *this project's* store proves what it installed landed there.
 fn project_home_mise_installed(data: &Path, tool: &str) -> bool {
     let projects = data.join("sbx").join("projects");
     for entry in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
-        let installs = entry
-            .path()
-            .join("home/.local/share/mise/installs")
-            .join(tool);
-        let versioned = std::fs::read_dir(&installs)
-            .map(|es| {
-                es.flatten().any(|e| {
-                    e.path().is_dir()
-                        && e.file_name()
-                            .to_string_lossy()
-                            .starts_with(|c: char| c.is_ascii_digit())
-                })
-            })
-            .unwrap_or(false);
-        if versioned {
-            return true;
+        let project = entry.path();
+        let installs = project.join("home/.local/share/mise/installs").join(tool);
+        let Ok(versions) = std::fs::read_dir(&installs) else {
+            continue;
+        };
+        for v in versions.flatten() {
+            if !v
+                .file_name()
+                .to_string_lossy()
+                .starts_with(|c: char| c.is_ascii_digit())
+            {
+                continue;
+            }
+            // A `nix:` tool's version entry is a **symlink into the cage's `/nix`**, which is the
+            // project's own store bound there — so it dangles when read from the host, and asking
+            // `is_dir()` (which follows it) would answer "not installed" on any host whose real
+            // `/nix/store` happens not to hold that exact derivation. Resolve it the way the
+            // layout actually works: read the link and look for its basename in the project store.
+            let target = match std::fs::read_link(v.path()) {
+                // A plain directory (a non-nix backend installs into the pool itself) is the
+                // artifact, with nothing to cross-check.
+                Err(_) if v.path().is_dir() => return true,
+                Err(_) => continue,
+                Ok(t) => t,
+            };
+            // `1`, `1.8` and `latest` point at the version entry beside them; only the absolute
+            // store path is the artifact.
+            if !target.is_absolute() {
+                continue;
+            }
+            if in_store(&project.join("store"), &target) {
+                return true;
+            }
         }
     }
     false
+}
+
+/// Every mise install pool under `data`, with what is in it — for the failure message of a
+/// [`project_home_mise_installed`] check. A bare "did not install" says nothing about *where* it
+/// landed instead, which is the only question worth asking when a tool reports success and the
+/// pool is empty: a wrong scope (the app-global pool) and a wrong version name look identical
+/// through a boolean.
+fn describe_mise_pools(data: &Path) -> String {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<String>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.file_name().is_some_and(|n| n == "installs") {
+                // One level past the pool: the check is for a *version* directory under the tool,
+                // so a tool directory that exists but holds no version is the interesting failure
+                // and a listing that stopped at the pool could not tell it from a missing tool.
+                let listed: Vec<String> = std::fs::read_dir(&p)
+                    .map(|es| {
+                        es.flatten()
+                            .map(|c| {
+                                let versions: Vec<String> = std::fs::read_dir(c.path())
+                                    .map(|vs| {
+                                        vs.flatten()
+                                            .map(|v| v.file_name().to_string_lossy().into_owned())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                format!("{}{versions:?}", c.file_name().to_string_lossy())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push(format!("  {} -> {listed:?}", p.display()));
+            } else if p.is_dir() {
+                walk(&p, depth - 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&data.join("sbx"), 12, &mut out);
+    if out.is_empty() {
+        format!("no mise install pool anywhere under {}", data.display())
+    } else {
+        format!("mise install pools found:\n{}", out.join("\n"))
+    }
 }
 
 /// Whether `path` (a logical `/nix/store/<hash>-name`) is physically present in `store_dir`.

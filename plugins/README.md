@@ -10,37 +10,52 @@ A plugin lives in its own directory under the sbx data dir, `<data>/plugins/<nam
 (`<data>` is `$XDG_DATA_HOME/sbx` or `~/.local/share/sbx`). The directory being owner-only
 is what makes a plugin trusted by location — a project cannot plant one.
 
-A curated set of resolver plugins is **built into the binary** (the default store). List what is
-available and install one by name:
+There are exactly two ways in, and a listing always says which one a plugin came through:
 
-    sbx plugins store list      # the resolver plugins bundled in the binary
-    sbx plugins install <name>  # place a built-in plugin (e.g. `sbx plugins install pass`)
+    sbx plugins install <dir>                      # copy a local directory in
+    sbx plugins store install <store> <plugin>     # from a configured signed store
+    sbx plugins rm <name>                          # remove an installed plugin
 
-Or install your own from a local source directory, and remove by name:
+The plugins in *this* directory are the first kind: they are ordinary plugin directories, carried
+in the repository as working examples rather than embedded in the binary. Install one straight
+from a checkout:
 
-    sbx plugins install <dir>   # copy a local plugin directory in (e.g. `sbx plugins install ./mine`)
-    sbx plugins rm <name>       # remove an installed plugin
+    sbx plugins install ./plugins/pass
 
-`install` reads its argument syntactically: a bare `name` is a built-in store plugin, while a
-path-like argument (one that contains a `/` or starts with `.`, such as `./mine` or `/abs/mine`)
-is a local directory — so the command never depends on the current directory's contents. Either
-way it is a deliberate user act (an agent inside the cage cannot run it). It copies the whole tree
-(refusing symlinks or special files), validates the staged copy exactly as the launcher will — a
-sound manifest, an owner-only regular-file executable — and refuses, without placing anything, if
-the manifest is bad, the executable is not runnable, a plugin of that name already exists, or
-another installed plugin already claims the scheme. The plugin is placed under its manifest `name`
-(not the source directory name). The built-in store needs no fetch, network, or signature — trust
-is the binary itself; a remote, signed store (catalogue + signature verification + `update`) comes
-later. (A plugin may also still be staged by hand into `<data>/plugins/<name>/`.)
+Both paths do the same placement. It is a deliberate user act (an agent inside the cage cannot run
+it): the whole tree is copied (symlinks and special files refused), the staged copy is validated
+exactly as the launcher will — a sound manifest, an owner-only regular-file executable — and the
+install refuses, without placing anything, if the manifest is bad, the executable is not runnable,
+a plugin of that name is already installed, or another installed plugin already claims the scheme.
+The plugin is placed under its manifest `name`, not the source directory name.
+
+A **store** install adds two things a local one cannot have: the catalogue is verified against the
+store's pinned Ed25519 key, and the plugin's directory must reproduce the content hash that
+catalogue pins. See [the guide](../docs/guide/secrets/plugins.md) for adding, verifying, and
+rotating a store's key. To publish these examples (or your own) as a store:
+
+    sbx plugins store publish <dir> --key <key-file>
+
+(A plugin may also still be staged by hand into `<data>/plugins/<name>/`.)
 
 Inspect what is installed:
 
     sbx plugins list            # the built-in schemes and every installed resolver plugin
-    sbx plugins info <scheme>   # one plugin's manifest and sandbox grant
+    sbx plugins info <scheme>   # one plugin's manifest, sandbox grant, and origin
+    sbx plugins verify [name]   # re-hash installed plugins against the digest recorded at install
+    sbx plugins upgrade [name]  # replace with what the store lists now (the digest decides)
 
-`list` flags a plugin whose executable the runner would refuse (not owner-only, not a regular
-file) and explains, on stderr, any plugin that was discovered but dropped (a malformed
-manifest, or two plugins claiming one scheme).
+Both name where each plugin came from — a store (with its URL) or a local directory (with its
+path) — which the manifest cannot say, since it is identical whatever the source. `list` also
+flags a plugin whose executable the runner would refuse (not owner-only, not a regular file),
+explains on stderr any plugin dropped as malformed, and reports in the listing itself any scheme
+claimed by more than one plugin, naming the claimants to remove.
+
+Every install records the digest of the tree it placed, and `verify` re-hashes and compares —
+a plugin edited in place (its script *or* its manifest, which carries the sandbox grant) reads
+`[modified since install]`. This is drift detection, not a security control: the record sits in
+the same owner-only directory as the plugin. The boundary is that the directory is never mounted
+into the cage.
 
 ## Contract
 
@@ -96,5 +111,7 @@ sbx's structural `HOME`/`PATH` take precedence over any the manifest names.
 
 The built-in schemes `env`, `file`, and `sops` can never be claimed by a plugin — they always
 win. A scheme claimed by more than one installed plugin is ambiguous, so **every** plugin
-claiming it is dropped (fail-closed, never an arbitrary winner); the scheme is the namespace, so
-a second implementation must use a different one.
+claiming it is dropped (fail-closed, never an arbitrary winner) and the conflict is reported by
+`plugins list` and `plugins info <scheme>` until all but one claimant is removed; the scheme is
+the namespace, so a second implementation must use a different one. Installing is refused on a
+scheme that is claimed *or* contested, so only a hand-placed directory can create a conflict.
