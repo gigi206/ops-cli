@@ -84,8 +84,47 @@ const config: Config = {
       ],
     },
     footer: {
-      style: 'dark',
-      copyright: `Copyright © ${new Date().getFullYear()} gigi206.`,
+      style: 'light',
+      logo: {
+        alt: 'sbx',
+        src: 'assets/logo.svg',
+        srcDark: 'assets/logo-dark.svg',
+        width: 22,
+        height: 22,
+      },
+      links: [
+        {
+          title: 'Docs',
+          items: [
+            { label: 'Install', to: '/docs/getting-started/installation' },
+            { label: 'sbx doctor', to: '/docs/cli/doctor' },
+            { label: 'Security model', to: '/docs/concepts/security-model' },
+            { label: 'App profiles', to: '/docs/apps/' },
+          ],
+        },
+        {
+          title: 'Reference',
+          items: [
+            { label: 'CLI verbs', to: '/docs/cli/' },
+            { label: '.sbx.toml', to: '/docs/configuration/' },
+            { label: 'Trust model', to: '/docs/concepts/trust' },
+            { label: 'Networking', to: '/docs/networking/' },
+          ],
+        },
+        {
+          title: 'Project',
+          items: [
+            { label: 'GitHub', href: 'https://github.com/gigi206/ops-cli' },
+            { label: 'Releases', href: 'https://github.com/gigi206/ops-cli/releases' },
+            {
+              label: 'Threat model',
+              href: 'https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-threat-model-and-binds.md',
+            },
+            { label: 'License', href: 'https://github.com/gigi206/ops-cli/blob/ops-v2/LICENSE' },
+          ],
+        },
+      ],
+      copyright: `A sandbox launcher for tools and encapsulated AI agents. © ${new Date().getFullYear()} gigi206.`,
     },
     prism: {
       // One theme for both colour modes: the code surface is the same stone in
