@@ -1049,9 +1049,11 @@ html[data-theme='dark']:root .home {
   font-size: 1rem;
 }
 
-.home__aside code,
-.home__arrows code,
-.home__profile code {
+/* The :not(pre) guard is load-bearing: without it the chip's tint lands on the
+   <code> inside a code block too, washing the whole sample in accent. */
+.home__aside :not(pre) > code,
+.home__arrows :not(pre) > code,
+.home__profile :not(pre) > code {
   background: var(--keep-chip-bg);
   border: 1px solid var(--keep-chip-border);
   border-radius: 4px;
