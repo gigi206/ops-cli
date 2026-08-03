@@ -722,7 +722,7 @@ pre {
    ========================================================================== */
 
 .home {
-  --home-measure: 68rem;
+  --home-measure: 77.5rem;
   --home-glow: rgba(180, 85, 47, 0.14);
   --home-shadow: rgba(28, 26, 23, 0.1);
   --home-card-sheen: rgba(255, 255, 255, 0.55);
@@ -849,8 +849,8 @@ html[data-theme='dark']:root .home {
   /* Above the video and its veil, which are the hero's own pseudo-layers. */
   z-index: 2;
   display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
-  gap: 2.5rem;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+  gap: 3rem;
   align-items: center;
 }
 
@@ -862,8 +862,8 @@ html[data-theme='dark']:root .home {
 
 .home__mark {
   flex: none;
-  width: 5rem;
-  height: 5rem;
+  width: 11rem;
+  height: 11rem;
 }
 
 /* A bordered pill with a small accent square, as the design has it: sentence
@@ -895,10 +895,10 @@ html[data-theme='dark']:root .home {
 
 .home__title {
   margin: 0;
-  font-size: clamp(1.875rem, 3.2vw, 2.75rem);
+  font-size: clamp(2.25rem, 4.4vw, 3.875rem);
   font-weight: 700;
-  letter-spacing: -0.035em;
-  line-height: 1.08;
+  letter-spacing: -0.04em;
+  line-height: 1;
   color: var(--keep-ink);
 }
 
@@ -909,10 +909,10 @@ html[data-theme='dark']:root .home {
 }
 
 .home__lede {
-  max-width: 34rem;
+  max-width: 35rem;
   margin: 1.5rem 0 0;
-  font-size: 1.0625rem;
-  line-height: 1.6;
+  font-size: 1.25rem;
+  line-height: 1.55;
   color: var(--keep-body);
   text-wrap: pretty;
 }
@@ -1026,12 +1026,14 @@ html[data-theme='dark']:root .home {
 
 .terminal__body {
   margin: 0;
-  padding: 1.125rem 1.25rem;
+  padding: 1.125rem;
   overflow-x: auto;
   background: transparent;
   font-family: var(--ifm-font-family-monospace);
-  font-size: 0.6875rem;
-  line-height: 1.75;
+  /* Sized to the narrower column the design gives this side, so the quoted
+     output never clips. */
+  font-size: 0.625rem;
+  line-height: 1.8;
   color: var(--keep-code-fg);
   white-space: pre;
 }
