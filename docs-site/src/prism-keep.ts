@@ -16,20 +16,22 @@ const prismKeep: PrismTheme = {
       style: { color: '#7F7565', fontStyle: 'italic' },
     },
     {
+      // Bracket and separator carry the body colour, so `[table]` reads as one
+      // token rather than an accent word between two grey marks.
       types: ['punctuation', 'operator', 'entity'],
-      style: { color: '#A89D8E' },
+      style: { color: '#E4DACB' },
     },
     {
       types: ['property', 'key', 'attr-name', 'variable', 'symbol'],
-      style: { color: '#C9BFAF' },
+      style: { color: '#CFC3B2' },
     },
     {
       types: ['string', 'char', 'attr-value', 'url', 'inserted', 'regex'],
-      style: { color: '#B7C98A' },
+      style: { color: '#E8C34A' },
     },
     {
       types: ['number', 'boolean', 'constant', 'date'],
-      style: { color: '#B7C98A' },
+      style: { color: '#E8C34A' },
     },
     {
       types: ['keyword', 'atrule', 'selector', 'tag', 'table', 'section', 'important'],
