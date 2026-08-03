@@ -679,31 +679,90 @@ pre {
    ========================================================================== */
 
 .home {
-  --home-measure: 60rem;
-  padding: 0 1.75rem 5rem;
+  --home-measure: 62rem;
+  --home-glow: rgba(180, 85, 47, 0.14);
+  --home-shadow: rgba(28, 26, 23, 0.1);
+  --home-card-sheen: rgba(255, 255, 255, 0.55);
 }
 
-.home__hero,
-.home__section {
+html[data-theme='dark']:root .home {
+  --home-glow: rgba(240, 147, 104, 0.17);
+  --home-shadow: rgba(0, 0, 0, 0.45);
+  --home-card-sheen: rgba(255, 255, 255, 0.035);
+}
+
+.home__inner {
   max-width: var(--home-measure);
   margin: 0 auto;
+  padding: 0 1.75rem;
 }
+
+/* Full-width bands: the tinted ones set the rhythm, and a hairline gradient
+   keeps the seam between them soft rather than ruled. */
+.home__section {
+  position: relative;
+  padding: 3.5rem 0;
+}
+
+.home__section--tint {
+  background: var(--keep-surface);
+}
+
+.home__section::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--keep-border) 18%,
+    var(--keep-border) 82%,
+    transparent
+  );
+}
+
+/* Hero
+   ------------------------------------------------------------------------ */
 
 .home__hero {
-  padding: 4.5rem 0 3.5rem;
-  border-bottom: 1px solid var(--keep-border);
+  position: relative;
+  overflow: hidden;
+  padding: 4.75rem 0 4rem;
 }
 
-/* The mark leads the page, at a size where its gate is legible. */
+/* A warm bloom behind the mark, dissolving before it reaches the text. */
+.home__hero::before {
+  content: '';
+  position: absolute;
+  top: -14rem;
+  left: -8rem;
+  right: -8rem;
+  height: 36rem;
+  background: radial-gradient(46% 58% at 26% 48%, var(--home-glow), transparent 70%);
+  pointer-events: none;
+}
+
+.home__hero .home__inner {
+  position: relative;
+}
+
+.home__hero-head {
+  display: flex;
+  align-items: center;
+  gap: 1.875rem;
+}
+
 .home__mark {
-  display: block;
-  width: 5rem;
-  height: 5rem;
-  margin-bottom: 1.5rem;
+  flex: none;
+  width: 6.25rem;
+  height: 6.25rem;
 }
 
 .home__eyebrow {
-  margin: 0 0 1.25rem;
+  margin: 0 0 0.625rem;
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.75rem;
   letter-spacing: 0.14em;
@@ -712,18 +771,18 @@ pre {
 }
 
 .home__title {
-  max-width: 50rem;
+  max-width: 34rem;
   margin: 0;
-  font-size: clamp(2.25rem, 5.5vw, 3.625rem);
+  font-size: clamp(2rem, 4vw, 3.125rem);
   font-weight: 700;
   letter-spacing: -0.035em;
-  line-height: 1.05;
+  line-height: 1.06;
   color: var(--keep-ink);
 }
 
 .home__lede {
-  max-width: 41rem;
-  margin: 1.375rem 0 0;
+  max-width: 42rem;
+  margin: 2rem 0 0;
   font-size: 1.1875rem;
   line-height: 1.6;
   color: var(--keep-body);
@@ -739,16 +798,19 @@ pre {
 }
 
 .home__cta {
-  padding: 0.8125rem 1.375rem;
-  border-radius: 9px;
-  background: var(--keep-accent);
+  padding: 0.8125rem 1.5rem;
+  border-radius: 10px;
+  background: linear-gradient(180deg, var(--ifm-color-primary-light), var(--keep-accent));
+  box-shadow: 0 8px 20px var(--home-glow);
   color: var(--keep-bg);
   font-size: 0.96875rem;
   font-weight: 600;
+  transition: transform 160ms ease, box-shadow 160ms ease;
 }
 
 .home__cta:hover {
-  background: var(--ifm-color-primary-darker);
+  transform: translateY(-1px);
+  box-shadow: 0 12px 26px var(--home-glow);
   color: var(--keep-bg);
   text-decoration: none;
 }
@@ -756,23 +818,35 @@ pre {
 .home__command {
   padding: 0.75rem 1.125rem;
   border: 1px solid var(--keep-border-strong);
-  border-radius: 9px;
+  border-radius: 10px;
   background: transparent;
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.875rem;
   color: var(--keep-body);
 }
 
-.home__section {
-  padding-top: 3rem;
-}
+/* Sections
+   ------------------------------------------------------------------------ */
 
 .home__section-label {
-  margin: 0 0 1.125rem;
+  position: relative;
+  margin: 0 0 1.25rem;
+  padding-left: 0.875rem;
   font-size: 1.375rem;
   font-weight: 600;
   letter-spacing: -0.02em;
   color: var(--keep-ink);
+}
+
+.home__section-label::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.16em;
+  bottom: 0.16em;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--keep-accent);
 }
 
 .home__grid {
@@ -781,44 +855,50 @@ pre {
   gap: 0.875rem;
 }
 
-/* Three short cards should not stretch to half the page each. */
 .home__grid--three {
   grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
 }
 
-.home__section--split {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
-  gap: 2rem;
-  align-items: start;
-}
-
-.home__split-text .home__aside {
-  margin-top: 0;
-}
-
-.home__split-code [class*='codeBlockContainer'] {
-  margin-bottom: 0;
-}
-
-@media (max-width: 900px) {
-  .home__section--split {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 1.25rem;
-  }
-}
-
 .home__card {
+  position: relative;
   display: block;
-  padding: 1rem 1.0625rem;
+  overflow: hidden;
+  padding: 1.0625rem 1.125rem;
   border: 1px solid var(--keep-border);
-  border-radius: var(--ifm-global-radius);
-  background: var(--ifm-background-surface-color);
+  border-radius: 12px;
+  background: linear-gradient(180deg, var(--home-card-sheen), transparent 55%),
+    var(--ifm-background-surface-color);
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+/* On a tinted band the card steps back to the page colour, so it still reads
+   as a card rather than merging into the band. */
+.home__section--tint .home__card {
+  background: linear-gradient(180deg, var(--home-card-sheen), transparent 55%),
+    var(--keep-bg);
+}
+
+.home__card--link::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--keep-accent), transparent 75%);
+  opacity: 0;
+  transition: opacity 160ms ease;
 }
 
 .home__card--link:hover {
+  transform: translateY(-2px);
   border-color: var(--keep-accent);
+  box-shadow: 0 12px 26px var(--home-shadow);
   text-decoration: none;
+}
+
+.home__card--link:hover::after {
+  opacity: 1;
 }
 
 .home__card-name {
@@ -836,11 +916,16 @@ pre {
 }
 
 .home__aside {
-  margin: 1.125rem 0 0;
+  margin: 1.25rem 0 0;
   font-size: 0.9375rem;
   line-height: 1.6;
   color: var(--keep-muted);
   text-wrap: pretty;
+}
+
+.home__aside--lead {
+  max-width: 44rem;
+  margin: 0 0 1.5rem;
 }
 
 .home__aside code {
@@ -850,6 +935,56 @@ pre {
   padding: 0.08em 0.34em;
   font-size: 0.86em;
   color: var(--keep-chip-ink);
+}
+
+/* The two config layers, side by side. */
+.home__configs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+  gap: 1rem;
+  align-items: stretch;
+}
+
+/* Both layers read as one pair, so the shorter file's card still reaches the
+   bottom of the taller one. */
+.home__configs [class*='codeBlockContainer'] {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  margin-bottom: 0;
+}
+
+.home__configs [class*='codeBlockContent'] {
+  flex: 1;
+}
+
+@media (max-width: 720px) {
+  .home__hero-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1.25rem;
+  }
+
+  .home__mark {
+    width: 4.5rem;
+    height: 4.5rem;
+  }
+
+  .home__lede {
+    margin-top: 1.5rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home__card,
+  .home__cta {
+    transition: none;
+  }
+
+  .home__card--link:hover,
+  .home__cta:hover {
+    transform: none;
+  }
 }
 
 /* ==========================================================================
