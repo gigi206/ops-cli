@@ -50,14 +50,9 @@ export default function SearchBar(): ReactNode {
   } = useDocusaurusContext();
   const wrapperRef = useRef<HTMLDivElement>(null);
   const mountRef = useRef<HTMLDivElement>(null);
-  const [hint, setHint] = useState<string | null>(null);
   const [filled, setFilled] = useState(false);
   const [open, setOpen] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
-
-  useEffect(() => {
-    setHint(/Mac|iPhone|iPad|iPod/.test(navigator.platform) ? '⌘K' : 'Ctrl K');
-  }, []);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -151,7 +146,14 @@ export default function SearchBar(): ReactNode {
           <input className="pagefind-ui__search-input" placeholder="Search (build only)" disabled />
         </form>
       )}
-      {hint && !unavailable && <span className="navbar__search-hint">{hint}</span>}
+      {/* The badge is the design's ⌘K on every platform. Ctrl+K is what actually
+          fires outside macOS, so the glyph is decorative: aria-hidden keeps a
+          screen reader from announcing a chord that does not exist there. */}
+      {!unavailable && (
+        <span className="navbar__search-hint" aria-hidden="true">
+          ⌘K
+        </span>
+      )}
     </div>
   );
 }
