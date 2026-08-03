@@ -97,7 +97,7 @@ source. sbx's own state (its data, trust, and config directories) is protected e
 way: a read-write bind aimed at or inside one of them is forced read-only with a
 warning, while a broad read-write bind that merely contains them (e.g. `mode = "rw"`
 on your whole home) stays read-write with those directories pinned read-only in place
-— the rest of the tree is writable, but the agent still cannot alter what sbx runs or
+and the rest of the tree is writable, but the agent still cannot alter what sbx runs or
 trusts.
 
 An edit that changes a trusted file re-arms its trust gate; `--trust` re-trusts as

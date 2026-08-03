@@ -7,7 +7,7 @@ run the [Model-B egress proxy](architecture) and honor the
 
 ```toml
 # the two simple postures
-network = "none"     # empty network namespace — nothing reaches out
+network = "none"     # empty network namespace: nothing reaches out
 network = "shared"   # the host network, unfiltered (the default)
 
 # the three filtering postures (string form: no carve-outs yet)
@@ -104,8 +104,8 @@ agent and watch, in real time, what it tries to reach, deciding as you go.
 ```toml
 [network]
 mode  = "ask"
-allow = ["api.anthropic.com"]   # never asked — always allowed
-deny  = ["telemetry.example.com"] # never asked — always denied
+allow = ["api.anthropic.com"]   # never asked: always allowed
+deny  = ["telemetry.example.com"] # never asked: always denied
 # everything else parks until you answer
 ```
 
@@ -154,7 +154,7 @@ restating the posture, and lets an app narrow the baseline's rule set:
 mode  = "deny"
 allow = ["*.nixos.org"]
 
-# project .sbx.toml — no `mode`, inherits "deny", adds a host
+# project .sbx.toml: no `mode`, inherits "deny", adds a host
 [network]
 allow = ["api.anthropic.com"]
 ```

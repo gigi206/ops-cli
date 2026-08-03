@@ -4,21 +4,21 @@ The **observability stack** lets you inspect and stream the activity of a runnin
 agent's cage: its process tree, every executable the agent spawns, and every write to
 its project tree. It is host-side, read-only, unprivileged, and entirely separate from
 the security boundary (the namespaces, capabilities, seccomp denylist, the bind
-layout — those still bound what an agent can do; observability only **sees** what it
+layout: those still bound what an agent can do; observability only **sees** what it
 does).
 
 There are two lenses, both enabled for the lifetime of a single supervised launch:
 
-- **the exec lens** — polls `/proc` for newly-spawned processes under the cage's root
+- **the exec lens**: polls `/proc` for newly-spawned processes under the cage's root
   every 300 ms and pushes each new entry (excluding `bwrap` / `systemd-run` /
   `socat` plumbing) into a per-session **exec ring**.
-- **the filesystem lens** — inotify-watches the project tree and pushes every write
+- **the filesystem lens**: inotify-watches the project tree and pushes every write
   into a per-session **fs ring**.
 
 Both rings are private memmap'd ring buffers: the supervisor writes, the host-side
 [`sbx proc logs`](../cli/proc) and [`sbx fs logs`](../cli/fs) readers attach
 out-of-band, no rewriting of the cage. Each lens is best-effort and degrades
-independently — a failure to stand up the filesystem lens warns and leaves the exec
+independently: a failure to stand up the filesystem lens warns and leaves the exec
 lens running; the launch never fails for it.
 
 See also: [`sbx proc ls`](../cli/proc) · [`sbx proc logs`](../cli/proc) ·
@@ -33,13 +33,13 @@ sbx run --observe -- rg pattern /path   # foreground non-tty: rings + inline `[s
 sbx run --observe --detach --agent     # detached: rings only, no inline echo
 ```
 
-`--observe` forces the launch onto a **supervised path** — sbx stays alive across the
-cage's lifetime — the only path that owns the per-session rings and control sockets.
+`--observe` forces the launch onto a **supervised path**: sbx stays alive across the
+cage's lifetime, the only path that owns the per-session rings and control sockets.
 An interactive `sbx run` (a shell or an interactive command) already supervises; the
 flag has the same effect.
 
 A launch that is **enforcing** exec policy (`[proc] mode = "enforce"` or
-`"ask"`) does not enable the exec poll — the seccomp user-notification supervisor is
+`"ask"`) does not enable the exec poll: the seccomp user-notification supervisor is
 the exec source then, and it owns the proc control socket. The filesystem lens still
 runs.
 
@@ -65,7 +65,7 @@ on the project root; subdirectories are watched recursively by default.
 
 Only **writes** (and directory creations / moves / chmod / … that change the tree)
 are recorded; pure reads do not fire inotify. A noisy editor (a `git pull`, a build
-that rebuilds a 10 000-file `target/`) emits a lot — the read interfaces (`sbx fs
+that rebuilds a 10 000-file `target/`) emits a lot, and the read interfaces (`sbx fs
 logs --tail`, `--follow`, `--path` filters) are designed to filter that down.
 
 The filesystem feed is **never inlined** to the run's stderr: it is far too chatty
@@ -104,27 +104,27 @@ sbx proc logs <pid> --path src/     # fs lens only: filter by path prefix
 ```
 
 with `--json` for a machine-readable tree. It reads host-side `/proc/<pid>/stat` and
-walks the cage's descendant set in host pid-space — the same vantage point the exec
+walks the cage's descendant set in host pid-space, the same vantage point the exec
 lens uses.
 
 ## Honest limits
 
-- Right now, **the polling rather than per-`execve` capture** — a command that exits
+- Right now, **the polling rather than per-`execve` capture**: a command that exits
   in under one tick is missed. The seccomp user-notification path that closes this is
   a later increment.
-- The filesystem lens is **inotify-based, not recursive across filesystems** — a
+- The filesystem lens is **inotify-based, not recursive across filesystems**: a
   `bind`-mounted sub-tree with a different device is its own watch.
 - A cage that is no longer alive cannot be observed: the rings are torn down with
   the supervisor.
-- The observation paths expand **what an operator can see** — they do not change
+- The observation paths expand **what an operator can see**: they do not change
   what the agent can do. The posture is: same-uid, same-uid's read of `/proc`, which
   needs nothing the agent does not already need on its own host. So they are not a
   new attack surface; they are a lens on the existing one.
 
 ## See also
 
-- [`sbx run --observe`](../cli/run) — enabling observation on a launch
-- [`sbx proc`](../cli/proc) — `ls`, `logs`, `logs --follow --json`
-- [`sbx fs`](../cli/fs) — `logs` (the filesystem lens reader)
-- [The trust gate](trust) — observation is a host-side lens, not a security field
+- [`sbx run --observe`](../cli/run): enabling observation on a launch
+- [`sbx proc`](../cli/proc): `ls`, `logs`, `logs --follow --json`
+- [`sbx fs`](../cli/fs): `logs` (the filesystem lens reader)
+- [The trust gate](trust): observation is a host-side lens, not a security field
 - Design rationale is recorded in this page (process tree + filesystem lens, host-side only, no new attack surface) and in [`bwrap-architecture.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-architecture).

@@ -121,7 +121,7 @@ command is run via the cage's own `bash` so it resolves on the cage `PATH`, and 
 positionally: no argument is ever interpreted as shell syntax.
 
 A `-- command` runs in the agent's **environment as the cage was launched**: its `PATH`, proxy,
-and CA settings, read from the live agent process — the same path the interactive shell inherits,
+and CA settings, read from the live agent process, the same path the interactive shell inherits,
 shell it does not carry any host secret). Unlike the interactive shell, it does **not** source the
 in-cage rc, so it does not re-run `mise activate`; declared tools and the base toolset are on the
 launch `PATH` and resolve, but a tool the agent activated purely at runtime may not be.

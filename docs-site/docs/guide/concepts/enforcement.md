@@ -184,7 +184,7 @@ This is the only documented mode: `--clearenv` is always emitted, the cage's
 environment is rebuilt from nothing on the descriptor, and the credentials, when
 present, are written first so a credential that took the name of the cage's own
 plumbing (`PATH`, `HOME`) loses to the plumbing. The skeleton bwrap argv is **pure**
-— same `SandboxSpec` in, same argv out, no I/O — and the impure step is exactly the
+(same `SandboxSpec` in, same argv out, no I/O), and the impure step is exactly the
 memfd write. A test rejects any name or value carrying a NUL, and asserts that
 credentials are spliced in declaration order ahead of plain environment entries.
 

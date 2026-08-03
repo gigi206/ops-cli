@@ -68,7 +68,7 @@ host-side [``__netns-holder` binary](https://github.com/gigi206/ops-cli/blob/ops
 interface (a kernel black hole, no peer, no route, drops everything) before exec'ing bwrap.
 Chromium/Electron decide `navigator.onLine` from the **presence of a non-loopback
 interface**, not from actual reachability, so a loopback-only cage reads as "no
-network" and a graphical app freezes on *"No internet — wait for reconnection"* even
+network" and a graphical app freezes on *"No internet"* even
 though egress works perfectly through the proxy. The dummy flips that to `true` without
 opening any egress: a direct `connect()` to any real host still finds no route and
 fails closed, and all real traffic still goes through the proxy on loopback. So:

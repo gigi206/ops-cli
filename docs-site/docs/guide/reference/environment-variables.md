@@ -57,7 +57,7 @@ requires an absolute base), and `sbx` falls back to `$HOME`.
 | `XDG_CONFIG_HOME` | the config dir (`sbx/sbx.toml`, `sbx/apps/`) | `$HOME/.config` |
 | `XDG_DATA_HOME` | the data dir (store, engines, sessions, …) | `$HOME/.local/share` |
 | `XDG_STATE_HOME` | the trust store (`sbx/trusted/`) | `$HOME/.local/state` |
-| `XDG_RUNTIME_DIR` | the Wayland socket (for `gui = "wayland"`) and the systemd user session | — |
+| `XDG_RUNTIME_DIR` | the Wayland socket (for `gui = "wayland"`) and the systemd user session | n/a |
 
 ### `SBX_DATA_DIR`
 

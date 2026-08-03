@@ -61,7 +61,7 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
 | Backend | On `sbx upgrade` | Lock file rewritten |
 |---|---|---|
 | `nix:` | re-resolves the channel (and floating `nix:` tool pins) | the base lock |
-| `mise:` | runs an in-cage `mise upgrade` per home | — (versions live in the home) |
+| `mise:` | runs an in-cage `mise upgrade` per home | none (versions live in the home) |
 | `flake:` | re-pins each declared flake ref (`nix flake metadata`) | `flake-packages.lock` |
 | `deb:` | re-resolves each source to its current `.deb` URL + content hash | `deb-packages.lock` |
 | `appimage:` | the same, for a prebuilt `.AppImage` | `appimage-packages.lock` |
@@ -85,7 +85,7 @@ profile sets `network = "none"` is skipped.
 `deb:`, `appimage:` and `tarball:` each accept a `resolve` form, for a vendor that offers a
 download API but no `latest`/apt/`github:` locator. On upgrade, `sbx` re-runs the package's
 `[deb.<name>]` / `[appimage.<name>]` / `[tarball.<name>]` `resolve` command **in a hermetic
-sandbox** to discover the current download URL — so those packages still roll forward. The
+sandbox** to discover the current download URL, so those packages still roll forward. The
 heavy artifact is re-fetched only when that URL actually changed.
 
 A direct `tarball:<url>` (no `resolve`) re-resolves the same URL, so a version-stamped one is

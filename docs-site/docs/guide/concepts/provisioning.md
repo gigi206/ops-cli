@@ -144,4 +144,4 @@ The two engines differ in how complete the independence is:
 - [Upgrading](../housekeeping/upgrade): how versions actually move
 - [`sbx mise` reference](../cli/mise) · [`sbx upgrade` reference](../cli/upgrade)
 - [Enforcement stack](enforcement): the always-on layers the cage runs behind
-- Design: [architecture](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-architecture) — the validated store layout, the trust-gated provisioning gate, and the dry-run preflight that determines fetch vs. build.
+- Design: [architecture](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-architecture): the validated store layout, the trust-gated provisioning gate, and the dry-run preflight that determines fetch vs. build.

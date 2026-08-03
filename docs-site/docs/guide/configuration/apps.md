@@ -63,7 +63,7 @@ tasks_max = 4096
 | `secret` | security | credentials for this app's egress |
 | `task` | security | this app's declared operations, `[app.<name>.task.<task>]`, unioned onto the baseline's (see [task](task)) |
 | `limits` | security | per-field override of the baseline cgroup limits |
-| `seccomp`, `devices`, `ssh_agent` | security | unioned onto the baseline's — which is how a deploy key is granted to *one* agent rather than every cage (see [seccomp](seccomp), [devices](devices), [ssh-agent](ssh-agent)) |
+| `seccomp`, `devices`, `ssh_agent` | security | unioned onto the baseline's, which is how a deploy key is granted to *one* agent rather than every cage (see [seccomp](seccomp), [devices](devices), [ssh-agent](ssh-agent)) |
 | `home_scope` | integrity-gated | `"global"` (default) or `"project"`: see [Per-app home](../apps/home) |
 
 ## Layering and gating

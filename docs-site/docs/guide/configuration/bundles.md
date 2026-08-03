@@ -17,7 +17,7 @@ allow    = [
 ```
 
 ```toml
-# an app profile names it — and states nothing about that tool itself
+# an app profile names it, and states nothing about that tool itself
 cmd = "orchestrate"
 use = ["claude-code"]
 
@@ -65,7 +65,7 @@ run with a credential the caller never holds, see [`[task.<name>]`](task)) carri
 it into any app that names the bundle, exactly as its packages and credentials do.
 Each folded operation is stamped with the bundle it came from, so the origin reads
 `bundle:<name>` in the `DECLARED IN` column of [`sbx task list`](../cli/task) (and
-in [`sbx task show`](../cli/task)) — the fold makes the entry look like the app's
+in [`sbx task show`](../cli/task)): the fold makes the entry look like the app's
 own, and the bundle is where a reader would go to change it.
 
 A bundle cannot name another bundle. There is no `use` field on a bundle, so nesting, and with it any cycle: is impossible by construction, exactly as a `[net.groups]`
@@ -156,14 +156,14 @@ The 26 shipped bundles, and what each carries:
 | `nova` | 2 (`mise:`, `nix:`) | 3 egress rules |
 | `openclaw` | 2 (`mise:`, `nix:`) | 2 egress rules, 1 env var |
 | `opencode` | 1 (`mise:`) | 3 egress rules |
-| `openfox` | 2 (`mise:`, `nix:`) | — |
+| `openfox` | 2 (`mise:`, `nix:`) | none |
 | `pi` | 1 (`mise:`) | 1 egress rule |
 | `qoder` | 3 (`mise:`, `nix:`) | 4 egress rules |
 | `qwen-code` | 2 (`mise:`, `nix:`) | 2 egress rules |
 | `sigit` | 2 (`mise:`, `nix:`) | 3 egress rules |
 | `snow` | 2 (`mise:`, `nix:`) | 1 egress rule |
 | `stakpak` | 1 (`mise:`) | 1 egress rule |
-| `vtcode` | 3 (`mise:`, `nix:`) | — |
+| `vtcode` | 3 (`mise:`, `nix:`) | none |
 
 None of them carries a `cmd` or a posture (`network` mode, `gui`, `gpu`, …): a bundle states
 what a tool *needs*, and the consuming app keeps its own command and its own posture. See

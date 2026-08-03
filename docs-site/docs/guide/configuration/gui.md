@@ -4,7 +4,7 @@ The sandbox's GUI posture: what a cage that draws is given. The three postures a
 ordered by host exposure: `none` < `offscreen` < `wayland`.
 
 ```toml
-gui = "none"        # the default — no display access
+gui = "none"        # the default: no display access
 # gui = "offscreen" # fonts + the proxy CA for a headless browser; no display
 # gui = "wayland"   # all of the above, plus the host's compositor socket (read-only)
 ```

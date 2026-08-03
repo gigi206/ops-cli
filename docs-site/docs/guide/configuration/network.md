@@ -15,7 +15,7 @@ See also: [Network modes](../networking/modes) · [Rule grammar](../networking/r
 `network` accepts either a **bare string** or a **table**.
 
 ```toml
-# string form — a bare posture
+# string form: a bare posture
 network = "none"
 # network = "shared"
 # network = "deny"
@@ -24,7 +24,7 @@ network = "none"
 ```
 
 ```toml
-# table form — a filtering mode plus carve-out lists
+# table form: a filtering mode plus carve-out lists
 [network]
 mode  = "deny"
 allow = ["api.github.com", "*.nixos.org", "@ci-hosts"]

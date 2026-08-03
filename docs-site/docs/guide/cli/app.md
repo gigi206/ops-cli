@@ -42,11 +42,11 @@ keep it.
 ### Learning an app's egress (`--net-learn`)
 
 `--net-learn` discovers an app's egress needs: it runs the app under its own (unchanged)
-posture — nothing is opened, so a request the allowlist refuses stays refused — and turns
+posture (nothing is opened, so a request the allowlist refuses stays refused), and turns
 each such refusal into the allow rule that would have admitted it, writing them to the
 app's profile (or, with `--dry-run`, only printing them). It needs a filtering posture
 (`mode` `allow`/`deny`/`ask`); a `shared`/`none` app logs no egress to learn from. Only a
-plain "not allowed yet" refusal is learned — a deliberate `deny` rule and a security
+plain "not allowed yet" refusal is learned: a deliberate `deny` rule and a security
 block (SSRF, host-mismatch, an outbound secret) are never turned into a rule. Run it
 again after adding rules to catch a host only reachable once an earlier one is allowed.
 
@@ -59,7 +59,7 @@ The level sets how wide each rule is:
 | `exact` | the one endpoint, e.g. `{POST} https://host/v1/chat` |
 
 The rules land in the project config by default (`--local`), or in the app's global
-profile with `-g` — which, for an app defined only inline in a project `sbx.toml`, writes
+profile with `-g`, which, for an app defined only inline in a project `sbx.toml`, writes
 a partial `apps/<name>.toml` the inline table then shadows on load; prefer `-g` for an
 app that is already an imported profile. It is foreground-only (not with `--detach`).
 

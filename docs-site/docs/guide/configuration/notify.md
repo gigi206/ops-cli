@@ -1,7 +1,7 @@
 # `[notify]`: being told when something was blocked
 
 ```toml
-notify = "always"        # off | once | always — the short form, one mode for everything
+notify = "always"        # off | once | always: the short form, one mode for everything
 
 # or, per event:
 [notify]

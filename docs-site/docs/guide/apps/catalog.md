@@ -12,7 +12,7 @@ See also: [Portable profiles](profiles) · [The app framework](/) · [Secrets](.
 
 The tables below list every shipped profile, grouped by **how you interact with it**: a
 terminal agent, a desktop window, or a UI served in your host browser. The per-profile
-packaging notes and the "not here yet — and why" triage live in
+packaging notes and the "not here yet, and why" triage live in
 [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/examples/).
 
 ## Terminal agents (31)
@@ -95,7 +95,7 @@ default (`home_scope = "global"`).
 ## Bundles: the shared pieces
 
 Beyond the app profiles, [`examples/bundle/`](https://github.com/gigi206/ops-cli/tree/ops-v2/examples/bundle/)
-ships **26 reusable tool bundles** — a named set of packages and egress rules that several
+ships **26 reusable tool bundles**: a named set of packages and egress rules that several
 profiles pull in with `use = [...]` instead of restating it. See
 [Bundles](../configuration/bundles) and [`sbx bundle`](../cli/bundle).
 
@@ -117,7 +117,7 @@ profiles pull in with `use = [...]` instead of restating it. See
 
 - **Account** (`freebuff`, `droid`, `copilot`, `codebuddy`, `amp`, `junie`, and most of the
   desktop profiles): the tool logs in to a service account and the token persists in the
-  app's **isolated** `$HOME` — inside the cage, never in the project shell. An account whose
+  app's **isolated** `$HOME`, inside the cage, never in the project shell. An account whose
   token *is* a header value takes the injected path instead, so the secret still never enters
   the cage: `stakpak` (a Stakpak API key), `qoder` (a personal access token), `nova` (a
   Compass key).
@@ -142,7 +142,7 @@ The `mise:` prefix means a tool is equipped **in-cage from upstream directly**, 
 the **latest upstream** version: not whatever nixpkgs packaged. A `mise:` (or `flake:`)
 tool **fetches at first launch**, so a profile's *first* launch in a given project needs
 the network; a `nix:` tool is seeded and reusable offline. The `deb:`, `appimage:` and
-`tarball:` backends fetch a published upstream artifact the same way — see
+`tarball:` backends fetch a published upstream artifact the same way; see
 [Packages](../configuration/packages). Advancing an already-installed version via
 `sbx upgrade` is supported: see [Upgrading](../housekeeping/upgrade).
 
@@ -171,5 +171,5 @@ The profiles **import and resolve** cleanly (covered by a test), and each tool i
 end-to-end is the **credential step**: for BYOK profiles, the CLI authenticating
 through the proxy-injected key; for account profiles, completing the login inside the
 cage. See the repository [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/examples/) for the
-per-tool status and the "not here yet — and why" triage (tools that are not a runnable
+per-tool status and the "not here yet, and why" triage (tools that are not a runnable
 agent, or whose provenance is not established).

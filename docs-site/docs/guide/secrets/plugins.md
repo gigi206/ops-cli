@@ -26,7 +26,7 @@ its owner-only data directory (`<data>/plugins/<name>/`) and builds a
 ```toml
 name        = "vault"          # optional; defaults to the directory name
 type        = "resolver"       # required; only "resolver" is supported today
-scheme      = "vault"          # the scheme:// this plugin claims — unique in the registry
+scheme      = "vault"          # the scheme:// this plugin claims; unique in the registry
 exec        = "bin/resolve"    # directory-relative, traversal-free path to the executable
 version     = "1.2.0"          # optional, display-only
 description = "Generic KV-store resolver"   # optional, display-only
@@ -178,7 +178,7 @@ lists) restores it immediately.
 
 The repository ships two working resolver plugins under
 [`plugins/`](https://github.com/gigi206/ops-cli/tree/ops-v2/plugins/). They are not installed
-by default — a plugin is trusted by *location*, so it only counts once it sits in
+by default: a plugin is trusted by *location*, so it only counts once it sits in
 `<data>/plugins/<name>/`:
 
 ```sh

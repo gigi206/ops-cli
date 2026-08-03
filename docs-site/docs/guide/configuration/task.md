@@ -143,11 +143,11 @@ nothing.
 [task.shell]
 cmd     = ["bash", "-c", "{script}"]
 params  = { script = "(?s).*" }
-stdout  = "hide"                     # the widest channel — and the only one that
+stdout  = "hide"                     # the widest channel, and the only one that
 stderr  = "hide"                     # returns the whole value in a single call
 network = ["api.example.com"]        # one host, not the project's posture
 # `output` is deliberately absent (it defaults to off). A declared one is a directory
-# the *calling* cage reads, so a value written there needs no encoding at all — it is
+# the *calling* cage reads, so a value written there needs no encoding at all: it is
 # the shortest path of the lot, shorter than the output streams this hides.
 
 [task.shell.secret]

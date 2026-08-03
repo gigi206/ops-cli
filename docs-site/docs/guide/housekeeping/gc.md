@@ -45,12 +45,12 @@ leaves the config.
 never displaces the older one. So old base-channel revisions, rebuilt tools, rolled-forward
 `flake:` builds (each [`sbx upgrade flake`](upgrade) re-points the name-keyed out-link,
 leaving the old build) and rolled-forward GUI app builds (multiple
-`chromium`/`electron`/desktop versions) pile up — and a plain sweep, seeing them all rooted,
+`chromium`/`electron`/desktop versions) pile up, and a plain sweep, seeing them all rooted,
 frees nothing.
 
 The sweep therefore reconciles those seed roots against what the project's **current**
 out-links reference: it keeps the current version of each and collects the superseded ones.
-It is conservative — if the base or mise out-links for the current revision are missing it
+It is conservative: if the base or mise out-links for the current revision are missing it
 skips rather than risk dropping a live build, so an over-eager prune only ever costs a
 re-provision on the next launch.
 
@@ -81,7 +81,7 @@ the data [`sbx net stats`](../cli/net) aggregates (`sbx net stats --reset` is th
 ### Whole project trees
 
 Removing a whole per-project runtime tree is [`sbx projects rm`](../cli/projects); its
-store closures are then reclaimed by `sbx gc --all --prune` — or in one step,
+store closures are then reclaimed by `sbx gc --all --prune`, or in one step,
 `sbx projects rm <id> --gc`.
 
 ## Examples

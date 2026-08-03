@@ -70,7 +70,7 @@ Common tasks are wired through mise:
 ```sh
 mise run fmt             # cargo fmt --check
 mise run lint            # cargo clippy --all-targets -- -D warnings
-mise run test            # cargo test (unit only — fast, network-free)
+mise run test            # cargo test (unit only: fast, network-free)
 mise run coverage        # cargo-llvm-cov coverage report (pass --html for a browsable report)
 mise run ci              # fmt + lint + test, as CI runs them
 ```
@@ -82,7 +82,7 @@ mise run build-bundled   # release musl binary WITH the embedded nix + bwrap eng
 mise run lint-bundled    # compile + clippy the bundled-* feature paths (needs host nix)
 ```
 
-(The `static-nix` / `static-bwrap` steps those depend on are internal — hidden in `mise.toml`.)
+(The `static-nix` / `static-bwrap` steps those depend on are internal, hidden in `mise.toml`.)
 
 ## Building the documentation site
 
@@ -96,7 +96,7 @@ Mermaid diagrams render in the browser, from `@docusaurus/theme-mermaid`.
 mise run docs-install   # Node + the pinned npm packages, into docs-site/node_modules
 mise run docs           # local preview at http://localhost:3000 (live reload)
 mise run docs-build     # strict build into docs-site/build/ (a broken link fails it)
-mise run docs-serve     # build, then serve it — the only way to exercise search
+mise run docs-serve     # build, then serve it; the only way to exercise search
 ```
 
 Search is [Pagefind](https://pagefind.app/), which indexes the built HTML in a

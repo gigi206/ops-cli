@@ -75,11 +75,11 @@ a hard failure that wedges a launch.
 ## A worked example
 
 ```toml
-# extra environment (free — applies even untrusted)
+# extra environment (free: applies even untrusted)
 [env]
 RUST_LOG = "info"
 
-# tools from nixpkgs (security — needs trust)
+# tools from nixpkgs (security: needs trust)
 [packages]
 jq   = "nix:jq"
 node = "nix:nodejs_20"

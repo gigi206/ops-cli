@@ -205,7 +205,7 @@ You can edit the list from the CLI instead of the TOML, with the same scopes as
 config):
 
 ```bash
-sbx net mute   play.googleapis.com -a agy   # add — quiet a profile's telemetry host
+sbx net mute   play.googleapis.com -a agy   # add: quiet a profile's telemetry host
 sbx net unmute play.googleapis.com -a agy   # remove (idempotent)
 ```
 
@@ -277,7 +277,7 @@ flow, redrawn in place, watchable from another terminal:
 sbx net live               # every open tunnel, redrawn every 1s until Ctrl-C
 sbx net live -a claude     # only one app's sessions
 sbx net live -i 2          # redraw every 2 seconds
-sbx net live --json        # one snapshot object per tick (NDJSON) — for a pipe
+sbx net live --json        # one snapshot object per tick (NDJSON), for a pipe
 ```
 
 Each line is `host:port · transport · age · ↑up ↓down`, grouped by session (the PID

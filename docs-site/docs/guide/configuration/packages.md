@@ -325,12 +325,12 @@ never-trusted one):
 
 | Project config state | What `[packages]` does | The launch message |
 |---|---|---|
-| `Trusted` | the package is honoured (built / installed) | nothing — the pin was recorded |
+| `Trusted` | the package is honoured (built / installed) | nothing: the pin was recorded |
 | `Changed` (trusted before, edited since) | **the package is dropped, with a warning** | "`package <name>` withheld because `.sbx.toml` is untrusted — run `sbx trust` and retry" |
 | `Untrusted` (never trusted) | the package is dropped, with a warning | same wording as above |
 
 The `Changed` row is the one that surprises operators: a previously-trusted project's security
-fields **stop applying** on the first byte-edit (the gate is the direnv model — the whole file is
+fields **stop applying** on the first byte-edit (the gate is the direnv model: the whole file is
 hashed), so a `[packages]` declared there is silently absent from the next launch until you
 re-trust. A `config set`/`unset`/`edit` call with `--trust` re-blesses the file in one step:
 

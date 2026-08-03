@@ -96,7 +96,7 @@ is whether either is missing:
 | btrfs, ZFS, bcachefs | yes | yes | no, and nesting one copy-on-write filesystem in another only compounds fragmentation |
 | XFS | yes (`reflink=1`) | no | yes, for the compression |
 | ext2/3/4 | no | no | yes: and it relieves the fixed inode table too |
-| tmpfs | — | — | no: nothing here survives a reboot |
+| tmpfs | n/a | n/a | no: nothing here survives a reboot |
 | anything else | measured | unknown | only if it turns out not to share blocks |
 
 For a filesystem sbx does not recognize there is no table to consult, so it **measures** block

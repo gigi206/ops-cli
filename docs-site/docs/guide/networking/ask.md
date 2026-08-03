@@ -8,8 +8,8 @@ remembering the answer.
 ```toml
 [network]
 mode  = "ask"
-allow = ["api.anthropic.com"]    # never asked — always allowed
-deny  = ["telemetry.example.com"] # never asked — always denied
+allow = ["api.anthropic.com"]    # never asked: always allowed
+deny  = ["telemetry.example.com"] # never asked: always denied
 # everything else parks until you answer
 ```
 
