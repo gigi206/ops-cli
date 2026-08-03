@@ -1159,6 +1159,18 @@ html[data-theme='dark']:root .home {
   color: var(--keep-faint);
 }
 
+/* The one layer whose presence depends on the chosen posture says so, without
+   dropping out of the numbered run. */
+.home__layer-tag {
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.3125rem;
+  border: 1px solid var(--keep-chip-border);
+  border-radius: 4px;
+  background: var(--keep-chip-bg);
+  color: var(--keep-chip-ink);
+  letter-spacing: 0.08em;
+}
+
 .home__card-name {
   margin: 0 0 0.3125rem;
   font-family: var(--ifm-font-family-monospace);

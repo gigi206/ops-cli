@@ -56,7 +56,7 @@ const ABSENT = [
 
 // Three always-on layers (Landlock is a deferred option in this codebase, not a
 // layer that runs today), plus the egress firewall, which is opt-in by posture.
-const LAYERS: { n: string; name: string; detail: string; to?: string }[] = [
+const LAYERS: { n: string; tag?: string; name: string; detail: string; to?: string }[] = [
   {
     n: '01',
     name: 'bubblewrap',
@@ -73,7 +73,8 @@ const LAYERS: { n: string; name: string; detail: string; to?: string }[] = [
     detail: 'Memory, pids and CPU limits, best-effort.',
   },
   {
-    n: 'opt-in',
+    n: '04',
+    tag: 'opt-in',
     name: 'egress proxy',
     detail:
       'Deny by default, then allow by host, port, path, method or regex. A host-side MITM proxy is the only way out of an empty netns.',
@@ -250,7 +251,7 @@ export default function Home(): ReactNode {
         <section className="home__section">
           <div className="home__inner">
             <p className="home__kicker home__kicker--accent">02 · enforcement</p>
-            <h2 className="home__section-title">Three layers always on, one you switch on.</h2>
+            <h2 className="home__section-title">Four layers, three of them always on.</h2>
             <p className="home__aside home__aside--lead">
               Every launch goes through them, and none is a toggle. They require
               capability-bearing unprivileged user namespaces: without them{' '}
@@ -262,10 +263,13 @@ export default function Home(): ReactNode {
               cannot step around.
             </p>
             <div className="home__grid home__grid--three">
-              {LAYERS.map(({ n, name, detail, to }) => {
+              {LAYERS.map(({ n, tag, name, detail, to }) => {
                 const body = (
                   <>
-                    <p className="home__layer-n">{n === 'opt-in' ? 'opt-in' : `layer ${n}`}</p>
+                    <p className="home__layer-n">
+                      layer {n}
+                      {tag && <span className="home__layer-tag">{tag}</span>}
+                    </p>
                     <p className="home__card-name">{name}</p>
                     <p className="home__card-detail">{detail}</p>
                   </>
