@@ -1,1 +1,2 @@
+docs-site/static/assets/*.mp4 filter=lfs diff=lfs merge=lfs -text
 docs-site/static/assets/*.mp4 !text !filter !merge !diff

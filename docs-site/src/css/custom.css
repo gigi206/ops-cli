@@ -729,6 +729,9 @@ pre {
   --home-olive: #6f8b3a;
   --home-deep: #f4efe7;
   --home-rule: rgba(180, 85, 47, 0.07);
+  --home-veil: 251, 247, 241;
+  --home-hatch-a: #efe8dd;
+  --home-hatch-b: #f7f2ea;
 }
 
 html[data-theme='dark']:root .home {
@@ -738,6 +741,9 @@ html[data-theme='dark']:root .home {
   --home-olive: #b7c98a;
   --home-deep: #120f0c;
   --home-rule: rgba(232, 137, 95, 0.07);
+  --home-veil: 23, 20, 15;
+  --home-hatch-a: #211c16;
+  --home-hatch-b: #1a1611;
 }
 
 .home__inner {
@@ -786,22 +792,62 @@ html[data-theme='dark']:root .home {
   position: relative;
   overflow: hidden;
   padding: 4rem 0 4.25rem;
+  background-image: repeating-linear-gradient(90deg, var(--home-rule) 0 1px, transparent 1px 96px),
+    repeating-linear-gradient(0deg, var(--home-rule) 0 1px, transparent 1px 96px);
+  background-position: center top;
 }
 
-/* A warm bloom behind the mark, dissolving before it reaches the terminal. */
-.home__hero::before {
+/* Behind everything, dimmed hard and masked out towards the copy so the headline
+   keeps its contrast. The gradient over it is what makes the text readable, not
+   the video's own brightness. */
+.home__hero-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* Desaturated hard: the footage reads as texture in the theme's own palette
+     rather than a blue-and-ochre photograph behind the words. */
+  opacity: 0.38;
+  filter: saturate(0.35) contrast(1.05);
+  z-index: 0;
+  pointer-events: none;
+}
+
+.home__hero::after {
   content: '';
   position: absolute;
-  top: -16rem;
-  left: -10rem;
-  width: 70%;
-  height: 40rem;
-  background: radial-gradient(46% 55% at 30% 50%, var(--home-glow), transparent 70%);
+  inset: 0;
+  z-index: 1;
+  background:
+    linear-gradient(
+      to bottom,
+      rgba(var(--home-veil), 0) calc(100% - 220px),
+      rgb(var(--home-veil)) 100%
+    ),
+    rgba(var(--home-veil), 0.74);
+  pointer-events: none;
+}
+
+/* The hatch the design lays under the footage, so the hero has a texture even
+   before the video decodes. */
+.home__hero::before {
+  content: '';
+  z-index: 0;
+  position: absolute;
+  inset: 0;
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--home-hatch-a) 0 2px,
+    var(--home-hatch-b) 2px 9px
+  );
   pointer-events: none;
 }
 
 .home__hero-grid {
   position: relative;
+  /* Above the video and its veil, which are the hero's own pseudo-layers. */
+  z-index: 2;
   display: grid;
   grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
   gap: 2.5rem;
@@ -820,19 +866,31 @@ html[data-theme='dark']:root .home {
   height: 5rem;
 }
 
+/* A bordered pill with a small accent square, as the design has it: sentence
+   case, no tracking, the accent carried by the square rather than the words. */
 .home__eyebrow {
-  margin: 0 0 1rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.625rem;
+  margin: 0 0 1.25rem;
+  padding: 0.375rem 0.875rem 0.375rem 0.625rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 999px;
+  background: var(--ifm-background-surface-color);
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.75rem;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--keep-accent);
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--keep-body);
 }
 
 .home__eyebrow::before {
-  content: '● ';
-  font-size: 0.7em;
-  vertical-align: 0.15em;
+  content: '';
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  background: var(--keep-accent);
 }
 
 .home__title {
@@ -1435,6 +1493,10 @@ html[data-theme='dark']:root .home {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .home__hero-video {
+    display: none;
+  }
+
   .home__card,
   .home__cta,
   .home__verb,

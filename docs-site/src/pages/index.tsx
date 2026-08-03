@@ -182,6 +182,19 @@ export default function Home(): ReactNode {
     <Layout description={siteConfig.tagline}>
       <main className="home">
         <section className="home__hero">
+          {/* The keep in the morning fog, from the design's hero video slot. Muted,
+              looping, decorative: it carries no information the page needs, so it
+              is aria-hidden and CSS drops it under prefers-reduced-motion. */}
+          <video
+            className="home__hero-video"
+            src={useBaseUrl('/assets/hero-keep.mp4')}
+            autoPlay
+            muted
+            loop
+            playsInline
+            aria-hidden="true"
+            tabIndex={-1}
+          />
           <div className="home__inner home__hero-grid">
             <div className="home__hero-copy">
               <p className="home__eyebrow">single static Rust binary · Linux</p>
