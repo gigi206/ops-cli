@@ -91,10 +91,10 @@ carries neither `/etc/fonts` nor a font set, so text renders as boxes; without a
 the app falls back to software rendering or fails to start. See
 [gui](../configuration/gui) and [gpu](../configuration/gpu).
 
-## `mkdocs build` fails on a link
+## The docs build fails on a link
 
-Outside this binary, the docs site itself is validated with `mkdocs build --strict`, which
-treats a broken internal link as an error. Links that point at files **outside** `docs_dir`
-(the design documents, `README.md`, `mkdocs.yml`) must be full GitHub URLs, not relative
-paths. Run the build from the repo root and read the warning it prints — it names the file
-and the bad link.
+Outside this binary, the docs site itself is validated by `mise run docs-build`, which
+treats a broken internal link as an error and refuses to finish. Links that point at
+files **outside** the guide directory (the design documents, `README.md`, the build
+config) must be full GitHub URLs, not relative paths. Read the error it prints — it names
+the page and the link it could not resolve.

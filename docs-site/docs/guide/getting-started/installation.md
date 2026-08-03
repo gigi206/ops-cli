@@ -86,18 +86,23 @@ mise run lint-bundled    # compile + clippy the bundled-* feature paths (needs h
 
 ## Building the documentation site
 
-The user guide lives in [`docs/guide/`](https://github.com/gigi206/ops-cli/tree/ops-v2/docs/guide/) and is built with mkdocs +
-the Material theme. Mermaid diagrams in the guide render server-side as SVG at
-build time — the
-[`mkdocs-mermaid2-plugin`](https://github.com/fralau/mkdocs-mermaid2-plugin) is
-configured in [`mkdocs.yml`](https://github.com/gigi206/ops-cli/blob/ops-v2/mkdocs.yml) (see the comments alongside
-the entry for why no extra markdown-extension config is required).
+The user guide lives in
+[`docs-site/docs/guide/`](https://github.com/gigi206/ops-cli/tree/ops-v2/docs-site/docs/guide/)
+and is built with [Docusaurus](https://docusaurus.io/), configured in
+[`docusaurus.config.ts`](https://github.com/gigi206/ops-cli/blob/ops-v2/docs-site/docusaurus.config.ts).
+Mermaid diagrams render in the browser, from `@docusaurus/theme-mermaid`.
 
 ```sh
-mise run docs-install   # mkdocs + mkdocs-material + mkdocs-mermaid2-plugin
-mise run docs           # local preview at http://localhost:8000 (live reload)
-mise run docs-build     # strict build into ./site/ (CI uses this)
+mise run docs-install   # Node + the pinned npm packages, into docs-site/node_modules
+mise run docs           # local preview at http://localhost:3000 (live reload)
+mise run docs-build     # strict build into docs-site/build/ (a broken link fails it)
+mise run docs-serve     # build, then serve it — the only way to exercise search
 ```
+
+Search is [Pagefind](https://pagefind.app/), which indexes the built HTML in a
+`postbuild` step. There is therefore **no search index under `mise run docs`**:
+the field falls back to a disabled input, and `docs-serve` is what shows the real
+thing.
 
 A diagram is a fenced block labelled `mermaid`:
 

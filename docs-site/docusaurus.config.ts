@@ -36,7 +36,10 @@ const config: Config = {
           // project root), mirroring the old mkdocs docs_dir. `index.md` per
           // directory replaces the old README.md index pages.
           path: 'docs/guide',
-          routeBasePath: '/',
+          // The guide sits under /docs/ so the root can be the landing page
+          // (src/pages/index.tsx). Every in-guide link is relative, so none of
+          // them care where the tree is mounted.
+          routeBasePath: 'docs',
           sidebarPath: './sidebars.ts',
           editUrl:
             'https://github.com/gigi206/ops-cli/tree/ops-v2/docs-site/',

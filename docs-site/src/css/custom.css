@@ -73,8 +73,13 @@
 }
 
 /* Infima's own variables, mapped onto the tokens above. This block carries the
-   light values; only what changes is restated for dark. */
-:root {
+   light values; only what changes is restated for dark.
+
+   The `html` qualifier is load-bearing: Infima restates many of these in its own
+   html[data-theme='dark'] block, which a bare `:root` loses to — the page would
+   keep Infima's neutral grey background under a warm navbar. The dark block
+   below adds `:root` on top, so it still outranks this one. */
+html:root {
   --ifm-background-color: var(--keep-bg);
   --ifm-background-surface-color: var(--keep-surface);
   --ifm-font-color-base: var(--keep-body);
@@ -667,6 +672,140 @@ pre {
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.75rem;
   color: #8c8378;
+}
+
+/* ==========================================================================
+   Landing page
+   ========================================================================== */
+
+.home {
+  --home-measure: 60rem;
+  padding: 0 1.75rem 5rem;
+}
+
+.home__hero,
+.home__section {
+  max-width: var(--home-measure);
+  margin: 0 auto;
+}
+
+.home__hero {
+  padding: 4.5rem 0 3.5rem;
+  border-bottom: 1px solid var(--keep-border);
+}
+
+.home__eyebrow {
+  margin: 0 0 1.25rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--keep-accent);
+}
+
+.home__title {
+  max-width: 50rem;
+  margin: 0;
+  font-size: clamp(2.25rem, 5.5vw, 3.625rem);
+  font-weight: 700;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+  color: var(--keep-ink);
+}
+
+.home__lede {
+  max-width: 41rem;
+  margin: 1.375rem 0 0;
+  font-size: 1.1875rem;
+  line-height: 1.6;
+  color: var(--keep-body);
+  text-wrap: pretty;
+}
+
+.home__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.875rem;
+  margin-top: 2rem;
+}
+
+.home__cta {
+  padding: 0.8125rem 1.375rem;
+  border-radius: 9px;
+  background: var(--keep-accent);
+  color: var(--keep-bg);
+  font-size: 0.96875rem;
+  font-weight: 600;
+}
+
+.home__cta:hover {
+  background: var(--ifm-color-primary-darker);
+  color: var(--keep-bg);
+  text-decoration: none;
+}
+
+.home__command {
+  padding: 0.75rem 1.125rem;
+  border: 1px solid var(--keep-border-strong);
+  border-radius: 9px;
+  background: transparent;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.875rem;
+  color: var(--keep-body);
+}
+
+.home__section {
+  padding-top: 3rem;
+}
+
+.home__section-label {
+  margin: 0 0 1.125rem;
+  font-size: 1.375rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--keep-ink);
+}
+
+.home__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.875rem;
+}
+
+.home__card {
+  display: block;
+  padding: 1rem 1.0625rem;
+  border: 1px solid var(--keep-border);
+  border-radius: var(--ifm-global-radius);
+  background: var(--ifm-background-surface-color);
+}
+
+.home__card--link:hover {
+  border-color: var(--keep-accent);
+  text-decoration: none;
+}
+
+.home__card-name {
+  margin: 0 0 0.3125rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-accent);
+}
+
+.home__card-detail {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--keep-muted);
+}
+
+.home__aside {
+  margin: 1.125rem 0 0;
+  font-size: 0.9375rem;
+  line-height: 1.6;
+  color: var(--keep-muted);
+  text-wrap: pretty;
 }
 
 /* ==========================================================================
