@@ -730,6 +730,9 @@ pre {
   --home-deep: #f4efe7;
   --home-rule: rgba(180, 85, 47, 0.07);
   --home-veil: 251, 247, 241;
+  --home-video-opacity: 0.62;
+  --home-video-filter: saturate(0.3) contrast(1.08) brightness(0.92);
+  --home-veil-alpha: 0.55;
   --home-hatch-a: #efe8dd;
   --home-hatch-b: #f7f2ea;
 }
@@ -742,6 +745,9 @@ html[data-theme='dark']:root .home {
   --home-deep: #120f0c;
   --home-rule: rgba(232, 137, 95, 0.07);
   --home-veil: 23, 20, 15;
+  --home-video-opacity: 0.38;
+  --home-video-filter: saturate(0.35) contrast(1.05);
+  --home-veil-alpha: 0.74;
   --home-hatch-a: #211c16;
   --home-hatch-b: #1a1611;
 }
@@ -808,8 +814,8 @@ html[data-theme='dark']:root .home {
   object-fit: cover;
   /* Desaturated hard: the footage reads as texture in the theme's own palette
      rather than a blue-and-ochre photograph behind the words. */
-  opacity: 0.38;
-  filter: saturate(0.35) contrast(1.05);
+  opacity: var(--home-video-opacity);
+  filter: var(--home-video-filter);
   z-index: 0;
   pointer-events: none;
 }
@@ -825,7 +831,7 @@ html[data-theme='dark']:root .home {
       rgba(var(--home-veil), 0) calc(100% - 220px),
       rgb(var(--home-veil)) 100%
     ),
-    rgba(var(--home-veil), 0.74);
+    rgba(var(--home-veil), var(--home-veil-alpha));
   pointer-events: none;
 }
 
