@@ -45,22 +45,22 @@ on the host; only ciphertext (if any) and capabilities ever cross into the cage.
 
 ```mermaid
 flowchart LR
-    subgraph host_side["**<span style=\"color:#1b5e20\">host side</span>**"]
+    subgraph host_side["<b>host side</b>"]
         direction LR
-        R["**<b>resolver.fetch(ref)</b>**<br/><i>env · file · sops · plugin</i>"]
-        B["**<b>broker</b>**<br/><i>in sbx mem</i><br/><i>↳ header inject</i>"]
+        R["<b>resolver.fetch(ref)</b><br/><i>env · file · sops · plugin</i>"]
+        B["<b>broker</b><br/><i>in sbx mem</i><br/><i>↳ header inject</i>"]
         R -- "<b>plaintext</b>" --> B
     end
 
-    subgraph cage_side["**<span style=\"color:#bf360c\">cage · empty netns</span>**"]
+    subgraph cage_side["<b>cage · empty netns</b>"]
         direction LR
-        T["**<b>agent's tool</b>**<br/><i>curl · git · …</i>"]
+        T["<b>agent's tool</b><br/><i>curl · git · …</i>"]
     end
 
     B -- "<b>capability</b>" --> T
 
-    classDef hs fill:#e8f5e9,stroke:#2e7d32,stroke-width:1.5px,color:#1b5e20
-    classDef cs fill:#fff3e0,stroke:#e65100,stroke-width:1.5px,color:#bf360c
+    classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
+    classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
     class R,B hs
     class T cs
 ```

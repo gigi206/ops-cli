@@ -27,7 +27,7 @@ zig                             = "latest"
 # Docs site (Docusaurus) runs on Node. Its dependencies are pinned in
 # docs-site/package.json (the lockfile source of truth); `mise run docs-install`
 # materialises them into docs-site/node_modules via `npm install`. Keep the two in
-# sync when bumping a version.
+# sync when bumping a version. `pagefind` (the search indexer) is a dev dep too.
 node                            = "24.18.0"
 
 # ============================================================================
@@ -134,3 +134,8 @@ run = "npm --prefix docs-site run start"
 description = "Build the Docusaurus docs site into docs-site/build/ (broken links fail the build)"
 depends = ["docs-install"]
 run = "npm --prefix docs-site run build"
+
+[tasks.docs-serve]
+description = "Serve the built docs site from docs-site/build/ (http://localhost:3000) — search needs this, the index only exists after a build"
+depends = ["docs-build"]
+run = "npm --prefix docs-site run serve"

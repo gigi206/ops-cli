@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  Dark-mode twin of logo.svg: same geometry, the lighter accent so the mark keeps
+  its weight against a dark navbar.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="sbx">
+  <title>sbx</title>
+  <mask id="gate" maskUnits="userSpaceOnUse" x="0" y="0" width="48" height="48">
+    <rect width="48" height="48" fill="#ffffff"/>
+    <rect x="20" y="28" width="8" height="16" rx="4" fill="#000000"/>
+  </mask>
+  <g fill="#F09368" mask="url(#gate)">
+    <rect x="8" y="10" width="8" height="9"/>
+    <rect x="20" y="10" width="8" height="9"/>
+    <rect x="32" y="10" width="8" height="9"/>
+    <rect x="8" y="18" width="32" height="26"/>
+  </g>
+</svg>

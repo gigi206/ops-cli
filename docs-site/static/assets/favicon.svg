@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  Tab mark: the keep on its own tile, so it reads on light and dark browser
+  chrome alike. The gate is a hole, showing the tile through it.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="sbx">
+  <title>sbx</title>
+  <rect width="48" height="48" rx="10" fill="#221E19"/>
+  <mask id="gate" maskUnits="userSpaceOnUse" x="0" y="0" width="48" height="48">
+    <rect width="48" height="48" fill="#ffffff"/>
+    <rect x="20" y="28" width="8" height="16" rx="4" fill="#000000"/>
+  </mask>
+  <g fill="#F09368" mask="url(#gate)">
+    <rect x="9" y="11" width="7" height="8"/>
+    <rect x="20.5" y="11" width="7" height="8"/>
+    <rect x="32" y="11" width="7" height="8"/>
+    <rect x="9" y="18" width="30" height="25"/>
+  </g>
+</svg>

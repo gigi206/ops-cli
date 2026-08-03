@@ -1,12 +1,12 @@
-import { themes as prismThemes } from 'prism-react-renderer';
 import type { Config } from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import prismKeep from './src/prism-keep';
 
 const config: Config = {
   title: 'sbx',
   tagline:
     'a sandbox launcher that runs tools and encapsulated AI agents in a bubblewrap sandbox',
-  favicon: 'assets/logo-mark.svg',
+  favicon: 'assets/favicon.svg',
 
   url: 'https://gigi206.github.io',
   baseUrl: '/ops-cli/',
@@ -49,6 +49,11 @@ const config: Config = {
     ],
   ],
 
+  // Renders ```mermaid fences. Without it `markdown.mermaid` resolves the block
+  // to a theme component that does not exist, and the diagram vanishes from the
+  // page instead of failing the build.
+  themes: ['@docusaurus/theme-mermaid'],
+
   themeConfig: {
     colorMode: {
       defaultMode: 'dark',
@@ -59,9 +64,15 @@ const config: Config = {
       logo: {
         alt: 'sbx',
         src: 'assets/logo.svg',
+        srcDark: 'assets/logo-dark.svg',
+        width: 26,
+        height: 26,
       },
       items: [
         { type: 'docSidebar', sidebarId: 'guideSidebar', position: 'left', label: 'Docs' },
+        // The theme's own search slot, filled by src/theme/SearchBar. Declared
+        // before the repository link so the bar reads: search, repository, mode.
+        { type: 'search', position: 'right' },
         {
           href: 'https://github.com/gigi206/ops-cli',
           label: 'GitHub',
@@ -74,28 +85,40 @@ const config: Config = {
       copyright: `Copyright © ${new Date().getFullYear()} gigi206.`,
     },
     prism: {
-      theme: prismThemes.github,
-      darkTheme: prismThemes.dracula,
+      // One theme for both colour modes: the code surface is the same stone in
+      // light and dark, so a second palette would only fight the first.
+      theme: prismKeep,
+      darkTheme: prismKeep,
       additionalLanguages: ['toml', 'bash', 'rust'],
     },
     mermaid: {
-      theme: { light: 'neutral', dark: 'forest' },
+      theme: { light: 'neutral', dark: 'dark' },
+      options: {
+        fontFamily: "'JetBrains Mono Variable', ui-monospace, monospace",
+        // Labels wrap at 200px by default, which turns a two-word caption into
+        // a three-line column and stretches every diagram vertically.
+        flowchart: { wrappingWidth: 280, nodeSpacing: 40, rankSpacing: 45 },
+      },
     },
   } satisfies Preset.ThemeConfig,
 
   plugins: [
-    // Client-side full-text search, no external service. Equivalent to Pagefind
-    // (Starlight's engine) and to mkdocs-material's built-in search. Indexes
-    // every page on disk at build time, so content aggregated from remote repos
-    // (plugins, apps) must be assembled before `docusaurus build` runs.
-    [
-      '@easyops-cn/docusaurus-search-local',
-      {
-        indexBlog: false,
-        docsRouteBasePath: '/',
-        highlightSearchTermsOnTargetPage: true,
-      },
-    ],
+    // No server-side search plugin: Docusaurus 3.10's classic SearchBar is dead without
+    // Algolia. Pagefind (post-build step, see package.json "postbuild") replaces it, and
+    // src/theme/SearchBar fills the theme's search slot with it. Pagefind is
+    // framework-agnostic and indexes the static HTML, so content aggregated from remote
+    // repos (plugins, apps) is covered as long as it is assembled before the build runs.
+
+    // The mermaid theme guards its ELK-layout import behind a build-time flag, but the
+    // bundler still resolves the specifier and fails on the missing optional package.
+    // The guides only use the built-in layouts, so the module resolves to nothing rather
+    // than pulling a heavy graph-layout engine into the client bundle.
+    () => ({
+      name: 'mermaid-elk-layout-opt-out',
+      configureWebpack: () => ({
+        resolve: { alias: { '@mermaid-js/layout-elk': false } },
+      }),
+    }),
   ],
 };
 

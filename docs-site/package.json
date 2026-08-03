@@ -6,6 +6,7 @@
     "docusaurus": "docusaurus",
     "start": "docusaurus start",
     "build": "docusaurus build",
+    "postbuild": "pagefind --site build",
     "clear": "docusaurus clear",
     "serve": "docusaurus serve",
     "typecheck": "tsc"
@@ -14,7 +15,8 @@
     "@docusaurus/core": "3.10.2",
     "@docusaurus/preset-classic": "3.10.2",
     "@docusaurus/theme-mermaid": "3.10.2",
-    "@easyops-cn/docusaurus-search-local": "0.55.3",
+    "@fontsource-variable/instrument-sans": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "@mdx-js/react": "^3.1.0",
     "clsx": "^2.1.1",
     "prism-react-renderer": "^2.4.1",
@@ -22,6 +24,8 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@pagefind/default-ui": "1.5.2",
+    "pagefind": "1.5.2",
     "typescript": "^5.6.3"
   },
   "engines": {

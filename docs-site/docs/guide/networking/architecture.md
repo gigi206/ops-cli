@@ -11,27 +11,34 @@ spike that tested both architectures live). The decision is documented in the
 
 When the cage runs under `deny`, `allow`, or `ask`:
 
+```mermaid
+flowchart TB
+    subgraph cage_side["<b>cage · empty network namespace</b>"]
+        direction TB
+        TOOL["<b>tool</b><br/><i>curl · git · the agent</i>"]
+        FWD["<b>127.0.0.1:18043</b><br/><i>in-cage socat: TCP → UDS</i>"]
+        SOCK["<b>/…/proxy.sock</b><br/><i>the only thing bound in</i>"]
+        TOOL -- "HTTP(S)" --> FWD --> SOCK
+    end
+
+    SOCK -- "Unix-domain socket" --> PROXY["<b>host-side sbx MITM CONNECT proxy</b><br/><i>TLS · policy · DNS · secrets</i>"]
+
+    PROXY --> UP["<b>the real upstream</b>"]
+
+    classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
+    classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
+    class TOOL,FWD,SOCK cs
+    class PROXY,UP hs
 ```
-   ┌─────────────────────── cage (empty network namespace) ──────────────────────┐
-   │                                                                              │
-   │   tool  ──HTTP(S)──▶  127.0.0.1:18043                                        │
-   │                          │  (in-cage socat forwarder: TCP → UDS)             │
-   │                          ▼                                                   │
-   │                    /…/proxy.sock  ◀── the ONLY thing bound into the cage     │
-   └──────────────────────────┼───────────────────────────────────────────────────┘
-                              │ (Unix-domain socket)
-                              ▼
-        ┌──────────── host-side sbx MITM CONNECT proxy ────────────┐
-        │  • terminates TLS with a per-session, cage-only CA        │
-        │  • checks host / port / path / method / regex vs policy   │
-        │  • CONNECT authority == SNI == decrypted Host             │
-        │  • resolves DNS host-side; SSRF guard on the resolved IP  │
-        │  • validates the UPSTREAM cert vs the system trust store  │
-        │  • injects a [secret] header / redacts secret bytes       │
-        └──────────────────────────┬───────────────────────────────┘
-                                   ▼
-                           the real upstream
-```
+
+What the host-side proxy does with each request:
+
+- terminates TLS with a per-session, cage-only CA;
+- checks host / port / path / method / regex against the policy;
+- requires `CONNECT` authority == SNI == decrypted `Host`;
+- resolves DNS host-side, with an SSRF guard on the resolved IP;
+- validates the **upstream** certificate against the system trust store;
+- injects a `[secret]` header, and redacts secret bytes.
 
 The cage has an **empty network namespace**: loopback and nothing else (with one
 nuanced exception, the GUI `dummy0` black-hole interface, described below). The one

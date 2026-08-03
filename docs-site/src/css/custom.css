@@ -1,44 +1,846 @@
 /**
- * sbx docs theme — dark-first cockpit look, carried over from the old
- * mkdocs-material palette (slate scheme, cyan primary, lime accent).
+ * sbx docs theme — "The Keep": stone and ink.
+ *
+ * Warm paper in light mode, banked embers in dark mode, terracotta as the single
+ * accent. The page is quiet so the prose and the TOML carry the weight.
+ *
+ * Fonts are self-hosted (no third-party request at page load): Instrument Sans
+ * for prose, JetBrains Mono for code, labels and anything the CLI would print.
  */
 
+@import '@fontsource-variable/instrument-sans/wght.css';
+@import '@fontsource-variable/instrument-sans/wght-italic.css';
+@import '@fontsource-variable/jetbrains-mono/wght.css';
+
+/* ==========================================================================
+   Tokens
+   ========================================================================== */
+
 :root {
-  --ifm-color-primary: #22d3ee;
-  --ifm-color-primary-dark: #16b8d1;
-  --ifm-color-primary-darker: #12a3ba;
-  --ifm-color-primary-darkest: #0f879a;
-  --ifm-color-primary-light: #3fdbf1;
-  --ifm-color-primary-lighter: #5ce0f3;
-  --ifm-color-primary-lightest: #84e8f6;
-  --ifm-color-secondary: #84cc16;
-  --ifm-code-font-size: 95%;
-  --ifm-font-family-base: 'Inter', system-ui, -apple-system, sans-serif;
-  --ifm-font-family-monospace: 'JetBrains Mono', 'SFMono-Regular', monospace;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  /* Terracotta on warm paper. */
+  --keep-accent: #b4552f;
+  --keep-accent-soft: #f4e4da;
+  --keep-bg: #fbf7f1;
+  --keep-surface: #ffffff;
+  --keep-border: #e6ddd1;
+  --keep-border-strong: #d8d4cc;
+  --keep-ink: #1c1a17;
+  --keep-body: #4a443c;
+  --keep-muted: #6b6257;
+  --keep-faint: #8c8378;
+  --keep-code-header: #f4efe7;
+
+  /* The code surface is the one constant across both modes: ink on stone. */
+  --keep-code-bg: #221e19;
+  --keep-code-fg: #e6ddd1;
+
+  /* Inline code chip, and the table row under the pointer. */
+  --keep-chip-bg: rgba(180, 85, 47, 0.09);
+  --keep-chip-border: rgba(180, 85, 47, 0.16);
+  --keep-chip-ink: #8e4526;
+  --keep-row-hover: rgba(180, 85, 47, 0.06);
+
+  --ifm-color-primary: #b4552f;
+  --ifm-color-primary-dark: #a24c2a;
+  --ifm-color-primary-darker: #994826;
+  --ifm-color-primary-darkest: #7e3b1f;
+  --ifm-color-primary-light: #c55f36;
+  --ifm-color-primary-lighter: #cb6b44;
+  --ifm-color-primary-lightest: #d68a6a;
+  --ifm-color-secondary: var(--keep-border);
+
+  --ifm-font-family-base: 'Instrument Sans Variable', system-ui, -apple-system, sans-serif;
+  --ifm-font-family-monospace: 'JetBrains Mono Variable', ui-monospace, 'SFMono-Regular', monospace;
+  --ifm-heading-font-family: var(--ifm-font-family-base);
+
+  --ifm-font-size-base: 16px;
+  --ifm-line-height-base: 1.65;
+  --ifm-heading-font-weight: 700;
+  --ifm-h1-font-size: 2.625rem;
+  --ifm-h2-font-size: 1.5625rem;
+  --ifm-h3-font-size: 1.25rem;
+  --ifm-h4-font-size: 1.0625rem;
+  --ifm-heading-line-height: 1.15;
+
+  --ifm-global-radius: 10px;
+  --ifm-navbar-height: 3.875rem;
+  --ifm-navbar-padding-horizontal: 1.75rem;
+  --ifm-navbar-item-padding-horizontal: 0;
+  --ifm-navbar-shadow: none;
+  --ifm-toc-padding-vertical: 0.4rem;
+
+  --docusaurus-highlighted-code-line-bg: rgba(240, 147, 104, 0.14);
 }
 
-[data-theme='dark'] {
-  --ifm-color-primary: #22d3ee;
-  --ifm-color-primary-dark: #16b8d1;
-  --ifm-color-primary-darker: #12a3ba;
-  --ifm-color-primary-darkest: #0f879a;
-  --ifm-color-primary-light: #3fdbf1;
-  --ifm-color-primary-lighter: #5ce0f3;
-  --ifm-color-primary-lightest: #84e8f6;
-  --ifm-color-secondary: #84cc16;
-  --ifm-background-color: #0f172a;
-  --ifm-background-surface-color: #1e293b;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+/* Infima's own variables, mapped onto the tokens above. This block carries the
+   light values; only what changes is restated for dark. */
+:root {
+  --ifm-background-color: var(--keep-bg);
+  --ifm-background-surface-color: var(--keep-surface);
+  --ifm-font-color-base: var(--keep-body);
+  --ifm-heading-color: var(--keep-ink);
+  --ifm-link-color: var(--keep-accent);
+  --ifm-link-hover-color: var(--ifm-color-primary-darker);
+
+  --ifm-color-emphasis-200: var(--keep-border);
+  --ifm-color-emphasis-300: var(--keep-border);
+  --ifm-color-emphasis-400: var(--keep-border-strong);
+  --ifm-color-emphasis-600: var(--keep-faint);
+  --ifm-color-emphasis-700: var(--keep-muted);
+  --ifm-color-content-secondary: var(--keep-muted);
+
+  --ifm-navbar-background-color: var(--keep-bg);
+  --ifm-navbar-link-color: var(--keep-muted);
+  --ifm-navbar-link-hover-color: var(--keep-ink);
+  --ifm-toc-border-color: var(--keep-border);
+  --ifm-hr-background-color: var(--keep-border);
+  --ifm-blockquote-color: var(--keep-muted);
+  --ifm-blockquote-border-color: var(--keep-border);
+
+  --ifm-menu-color: var(--keep-body);
+  --ifm-menu-color-active: var(--keep-accent);
+  --ifm-menu-color-background-active: var(--keep-accent-soft);
+  --ifm-menu-color-background-hover: rgba(180, 85, 47, 0.07);
+
+  --ifm-table-border-color: var(--keep-border);
+  --ifm-table-head-background: var(--keep-code-header);
+  --ifm-table-stripe-background: rgba(180, 85, 47, 0.03);
+  --ifm-card-background-color: var(--keep-surface);
+  --ifm-dropdown-background-color: var(--keep-surface);
+  --ifm-breadcrumb-color-active: var(--keep-accent);
+  --ifm-breadcrumb-item-background-active: transparent;
 }
 
-[data-theme='light'] {
-  --ifm-color-primary: #0891b2;
-  --ifm-color-primary-dark: #0781a0;
-  --ifm-color-primary-darker: #06748f;
-  --ifm-color-primary-darkest: #055f76;
-  --ifm-color-primary-light: #0aa0c4;
-  --ifm-color-primary-lighter: #0babcf;
-  --ifm-color-primary-lightest: #0cc0e8;
-  --ifm-color-secondary: #65a30d;
+/* `:root` on top of the attribute is deliberate: it outranks Infima's own
+   html[data-theme='dark'] block whatever order the bundler emits them in — it
+   groups rules that share a selector, so source order cannot be relied on. */
+html[data-theme='dark']:root {
+  --keep-accent: #f09368;
+  --keep-accent-soft: #2c2119;
+  --keep-bg: #17140f;
+  --keep-surface: #201c16;
+  --keep-border: #302a23;
+  --keep-border-strong: #3a332b;
+  --keep-ink: #f5efe7;
+  --keep-body: #c8beaf;
+  --keep-muted: #a89d8e;
+  --keep-faint: #7f7565;
+  --keep-code-header: #241f19;
+
+  --keep-chip-bg: rgba(240, 147, 104, 0.13);
+  --keep-chip-border: rgba(240, 147, 104, 0.2);
+  --keep-chip-ink: #f3a784;
+  --keep-row-hover: rgba(240, 147, 104, 0.07);
+
+  --ifm-color-primary: #f09368;
+  --ifm-color-primary-dark: #ed7f4c;
+  --ifm-color-primary-darker: #eb753f;
+  --ifm-color-primary-darkest: #e45a1b;
+  --ifm-color-primary-light: #f3a784;
+  --ifm-color-primary-lighter: #f5b191;
+  --ifm-color-primary-lightest: #facab4;
+
+  --ifm-menu-color-background-hover: rgba(240, 147, 104, 0.08);
+  --ifm-table-stripe-background: rgba(240, 147, 104, 0.03);
+}
+
+/* ==========================================================================
+   Prose
+   ========================================================================== */
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+.markdown h1 {
+  letter-spacing: -0.03em;
+}
+
+h2,
+h3,
+h4 {
+  letter-spacing: -0.02em;
+}
+
+.markdown h2 {
+  font-weight: 600;
+  margin-top: 2.6rem;
+}
+
+.markdown h3 {
+  font-weight: 600;
+  margin-top: 2rem;
+}
+
+.markdown > p,
+.markdown > ul,
+.markdown > ol {
+  font-size: 1.09375rem;
+  line-height: 1.65;
+  text-wrap: pretty;
+}
+
+.markdown a {
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
+/* Inline code carries a faint chip so a field name stands out inside a dense
+   sentence. The :not(pre) guard keeps this off the code inside a code block. */
+.markdown :not(pre) > code {
+  background: var(--keep-chip-bg);
+  border: 1px solid var(--keep-chip-border);
+  border-radius: 4px;
+  padding: 0.08em 0.34em;
+  font-size: 0.86em;
+  font-weight: 450;
+  color: var(--keep-chip-ink);
+}
+
+/* A link keeps its own colour; the chip only backs it. */
+.markdown a code {
+  color: inherit;
+}
+
+/* At heading sizes the chip becomes a slab — the face alone carries it there. */
+.markdown :is(h1, h2, h3, h4, h5, h6) code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+}
+
+/* Chrome outside the prose: the face is enough to read it as code. */
+.menu code,
+.table-of-contents code,
+.breadcrumbs code,
+.pagination-nav__label code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 0.9em;
+  font-weight: 450;
+}
+
+.markdown blockquote {
+  border-left-width: 3px;
+  border-radius: 0 var(--ifm-global-radius) var(--ifm-global-radius) 0;
+  background: var(--ifm-background-surface-color);
+  padding: 0.9rem 1.25rem;
+}
+
+/* Stays a scroll container (display:block) so a wide table never pushes the
+   page sideways on a narrow screen. */
+.markdown table {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: var(--ifm-global-radius);
+  border: 1px solid var(--keep-border);
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.markdown table thead tr {
+  border-bottom: 1px solid var(--keep-border);
+}
+
+.markdown table th {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  text-align: left;
+  color: var(--keep-muted);
+  border: none;
+}
+
+.markdown table td {
+  border: none;
+  border-top: 1px solid var(--keep-border);
+  font-size: 0.94rem;
+}
+
+/* Tracks the row being read across a wide option table. */
+.markdown table tbody tr {
+  transition: background-color var(--ifm-transition-fast) ease;
+}
+
+.markdown table tbody tr:hover {
+  background-color: var(--keep-row-hover);
+}
+
+.markdown img {
+  border-radius: var(--ifm-global-radius);
+}
+
+/* ==========================================================================
+   Navbar
+   ========================================================================== */
+
+.navbar {
+  border-bottom: 1px solid var(--keep-border);
+}
+
+.navbar__title {
+  font-size: 1.1875rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--keep-ink);
+}
+
+.navbar__logo {
+  height: 1.625rem;
+  width: 1.625rem;
+  margin-right: 0.625rem;
+}
+
+.navbar__items .navbar__link {
+  font-size: 0.9375rem;
+  margin: 0 0.75rem;
+  padding-bottom: 3px;
+  border-bottom: 2px solid transparent;
+}
+
+.navbar__items .navbar__link--active {
+  color: var(--keep-ink);
+  font-weight: 500;
+  border-bottom-color: var(--keep-accent);
+}
+
+/* The GitHub entry reads as a control, matching the search field next to it. */
+.navbar__items--right .navbar__link[href*='github.com'] {
+  display: flex;
+  align-items: center;
+  gap: 0.4375rem;
+  height: 2rem;
+  margin: 0 0 0 0.5rem;
+  padding: 0 0.6875rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 8px;
+  background: var(--ifm-background-surface-color);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  color: var(--keep-body);
+}
+
+.navbar__items--right .navbar__link[href*='github.com']::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--keep-accent);
+}
+
+.navbar__items--right .navbar__link[href*='github.com']:hover {
+  border-color: var(--keep-accent);
+  color: var(--keep-ink);
+}
+
+.navbar-sidebar {
+  background: var(--ifm-background-color);
+}
+
+/* Colour mode: a three-segment control (Auto · Light · Dark) rather than a
+   cycling button. The pressed segment is driven by the data-theme-choice
+   attribute the theme writes on <html> before hydration, so it is correct on
+   the very first paint. */
+.theme-toggle {
+  display: flex;
+  height: 2rem;
+  margin-left: 0.5rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 8px;
+  background: var(--ifm-background-surface-color);
+  overflow: hidden;
+}
+
+.theme-toggle__option {
+  display: flex;
+  align-items: center;
+  padding: 0 0.625rem;
+  border-radius: 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  line-height: 1;
+  color: var(--keep-faint);
+  transition: color var(--ifm-transition-fast), background var(--ifm-transition-fast);
+}
+
+.theme-toggle__option:hover:not(:disabled) {
+  color: var(--keep-ink);
+}
+
+.theme-toggle__option:disabled {
+  cursor: not-allowed;
+}
+
+[data-theme-choice='system'] .theme-toggle__option--system,
+[data-theme-choice='light'] .theme-toggle__option--light,
+[data-theme-choice='dark'] .theme-toggle__option--dark {
+  background: var(--keep-accent-soft);
+  color: var(--keep-accent);
+  font-weight: 500;
+}
+
+/* In the sliding mobile menu the control sits on its own line. */
+.navbar-sidebar__brand .theme-toggle {
+  margin-left: auto;
+}
+
+/* ==========================================================================
+   Doc sidebar
+   ========================================================================== */
+
+.theme-doc-sidebar-container {
+  border-right: 1px solid var(--keep-border) !important;
+}
+
+.menu {
+  padding: 1.625rem 1.25rem !important;
+  font-weight: 400;
+}
+
+.menu__list .menu__list {
+  margin-top: 0.25rem;
+}
+
+.menu__link {
+  font-size: 0.90625rem;
+  line-height: 1.45;
+  padding: 0.3125rem 0.625rem;
+  border-radius: 7px;
+}
+
+.menu__link--active:not(.menu__link--sublist) {
+  font-weight: 600;
+}
+
+/* Top-level categories are section labels, not links. */
+.theme-doc-sidebar-item-category-level-1 > .menu__list-item-collapsible > .menu__link,
+.theme-doc-sidebar-item-category-level-1 > .menu__list-item-collapsible > .menu__link:hover {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+  background: transparent;
+  padding-left: 0.625rem;
+}
+
+.theme-doc-sidebar-item-category-level-1 {
+  margin-top: 1.375rem;
+}
+
+.theme-doc-sidebar-item-category-level-1:first-child {
+  margin-top: 0;
+}
+
+.menu__caret::before,
+.menu__link--sublist-caret::after {
+  opacity: 0.55;
+}
+
+.menu__list-item-collapsible:hover {
+  background: transparent;
+}
+
+/* ==========================================================================
+   Table of contents
+   ========================================================================== */
+
+.theme-doc-toc-desktop .table-of-contents {
+  border-left: none;
+  padding-left: 0;
+  font-size: 0.84375rem;
+}
+
+.theme-doc-toc-desktop > .table-of-contents::before {
+  content: 'On this page';
+  display: block;
+  margin: 0 0 0.6875rem 0.6875rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+.table-of-contents__link {
+  display: block;
+  padding: 0.1875rem 0 0.1875rem 0.6875rem;
+  border-left: 2px solid var(--keep-border);
+  color: var(--keep-muted);
+}
+
+.table-of-contents__link:hover {
+  color: var(--keep-ink);
+}
+
+.table-of-contents__link--active,
+.table-of-contents__link--active code {
+  color: var(--keep-accent);
+  border-left-color: var(--keep-accent);
+}
+
+.table-of-contents__left-border {
+  border: none;
+}
+
+/* ==========================================================================
+   Breadcrumbs, pagination, page footer
+   ========================================================================== */
+
+.breadcrumbs__item .breadcrumbs__link {
+  background: transparent;
+  padding: 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  color: var(--keep-faint);
+}
+
+.breadcrumbs__item:not(:last-child)::after {
+  opacity: 0.5;
+}
+
+.breadcrumbs__item--active .breadcrumbs__link {
+  color: var(--keep-muted);
+}
+
+.breadcrumbs__link:hover {
+  color: var(--keep-accent);
+}
+
+.pagination-nav__link {
+  border: 1px solid var(--keep-border);
+  border-radius: var(--ifm-global-radius);
+  background: var(--ifm-background-surface-color);
+  padding: 0.875rem 1rem;
+}
+
+.pagination-nav__link:hover {
+  border-color: var(--keep-accent);
+}
+
+.pagination-nav__sublabel {
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--keep-faint);
+  margin-bottom: 0.25rem;
+}
+
+.pagination-nav__label {
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--keep-accent);
+}
+
+.pagination-nav__label::before,
+.pagination-nav__label::after {
+  content: '';
+}
+
+.theme-doc-footer {
+  border-top: 1px solid var(--keep-border);
+  margin-top: 2.5rem;
+  padding-top: 1.25rem;
+}
+
+.theme-edit-this-page,
+.theme-last-updated {
+  font-size: 0.84375rem;
+}
+
+/* ==========================================================================
+   Admonitions
+   ========================================================================== */
+
+.theme-admonition {
+  border: none;
+  border-left: 3px solid var(--keep-accent);
+  border-radius: 0 var(--ifm-global-radius) var(--ifm-global-radius) 0;
+  background: var(--keep-accent-soft);
+  color: var(--keep-body);
+  padding: 1rem 1.25rem;
+  box-shadow: none;
+}
+
+.theme-admonition [class*='admonitionHeading'] {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--keep-accent);
+  margin-bottom: 0.375rem;
+}
+
+.theme-admonition [class*='admonitionIcon'] svg {
+  fill: var(--keep-accent);
+}
+
+.theme-admonition [class*='admonitionContent'] {
+  font-size: 0.96875rem;
+  line-height: 1.55;
+}
+
+.theme-admonition a {
+  color: var(--keep-accent);
+}
+
+/* ==========================================================================
+   Code blocks
+   ========================================================================== */
+
+[class*='codeBlockContainer'] {
+  /* The stone surface owns the whole card, so no light rim shows under the code. */
+  background: var(--keep-code-bg);
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  box-shadow: none;
+  margin-bottom: var(--ifm-spacing-vertical);
+}
+
+[class*='codeBlockTitle'] {
+  border-bottom: 1px solid var(--keep-border) !important;
+  background: var(--keep-code-header);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--keep-muted);
+  padding: 0.5625rem 0.9375rem;
+}
+
+/* Specific enough to beat the theme's own .codeBlockLines_* padding rule. */
+pre[class*='codeBlock'] code[class*='codeBlockLines'] {
+  font-size: 0.84375rem;
+  line-height: 1.75;
+  padding: 1.125rem 1.25rem;
+}
+
+[class*='codeBlockContent'] button[class*='copyButton'],
+[class*='codeBlockContent'] button[class*='wordWrapButton'] {
+  background: rgba(230, 221, 209, 0.08);
+  border: 1px solid rgba(230, 221, 209, 0.16);
+  color: var(--keep-code-fg);
+}
+
+[class*='codeBlockContent'] button[class*='copyButton']:hover {
+  background: rgba(230, 221, 209, 0.16);
+}
+
+/* Terminal transcripts and shell snippets get the same stone surface. */
+pre {
+  border-radius: 12px;
+}
+
+/* ==========================================================================
+   Mermaid
+   ========================================================================== */
+
+.docusaurus-mermaid-container {
+  margin: 1.5rem 0;
+  padding: 1.25rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--ifm-background-surface-color);
+  overflow-x: auto;
+}
+
+/* ==========================================================================
+   Site footer
+   ========================================================================== */
+
+.footer--dark {
+  --ifm-footer-background-color: var(--keep-code-bg);
+  --ifm-footer-color: var(--keep-code-fg);
+  --ifm-footer-link-color: var(--keep-muted);
+  border-top: 1px solid var(--keep-border);
+}
+
+.footer__copyright {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  color: #8c8378;
+}
+
+/* ==========================================================================
+   Search (Pagefind, in the theme's navbar search slot)
+   ========================================================================== */
+
+#pagefind-search-mount {
+  --pagefind-ui-scale: 0.75;
+  --pagefind-ui-primary: var(--keep-accent);
+  --pagefind-ui-text: var(--keep-body);
+  --pagefind-ui-background: var(--ifm-background-surface-color);
+  --pagefind-ui-border: var(--keep-border);
+  --pagefind-ui-tag: var(--keep-accent-soft);
+  --pagefind-ui-border-width: 1px;
+  --pagefind-ui-border-radius: 8px;
+  --pagefind-ui-font: var(--ifm-font-family-base);
+
+  position: relative;
+  margin-right: 0.75rem;
+}
+
+/* The field is a plain bordered box with the caption on the left and the
+   shortcut on the right — no magnifier glyph. */
+#pagefind-search-mount .pagefind-ui__form::before {
+  display: none;
+}
+
+#pagefind-search-mount .pagefind-ui__search-input {
+  /* The widget sets display:flex on the input, which stops the text from
+     centring on its line box; a block input behaves. */
+  display: block;
+  width: 13.125rem;
+  height: 2.125rem;
+  line-height: 2.125rem;
+  padding: 0 3.25rem 0 0.6875rem;
+  border-radius: 8px;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--keep-body);
+  background: var(--ifm-background-surface-color);
+}
+
+#pagefind-search-mount .pagefind-ui__search-input::placeholder {
+  color: var(--keep-faint);
+  opacity: 1;
+}
+
+/* The widget's reset reverts focus rings to the browser default. */
+#pagefind-search-mount .pagefind-ui__search-input:focus,
+#pagefind-search-mount .pagefind-ui__search-input:focus-visible {
+  outline: 2px solid var(--keep-accent);
+  outline-offset: -1px;
+  border-color: var(--keep-accent);
+}
+
+#pagefind-search-mount .pagefind-ui__search-clear {
+  top: 1px;
+  right: 1px;
+  height: 2rem;
+  background: transparent;
+  color: var(--keep-faint);
+  font-size: 0.6875rem;
+  padding: 0 0.625rem;
+}
+
+#pagefind-search-mount .pagefind-ui__search-clear:hover {
+  color: var(--keep-accent);
+}
+
+/* Keyboard hint, hidden as soon as the field is in use. */
+#pagefind-search-mount .navbar__search-hint {
+  position: absolute;
+  top: 50%;
+  right: 0.5rem;
+  transform: translateY(-50%);
+  border: 1px solid var(--keep-border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  color: var(--keep-faint);
+  pointer-events: none;
+}
+
+#pagefind-search-mount:focus-within .navbar__search-hint,
+#pagefind-search-mount.navbar__search--filled .navbar__search-hint {
+  display: none;
+}
+
+/* The result list floats over the page instead of stretching the navbar. It is
+   far wider than the field it hangs from: an excerpt needs the room, and the
+   viewport bound keeps it on screen on a narrow window. */
+#pagefind-search-mount .pagefind-ui__drawer {
+  position: absolute;
+  top: calc(100% + 0.5rem);
+  right: 0;
+  z-index: 100;
+  width: min(40rem, calc(100vw - 3rem));
+  max-height: 76vh;
+  overflow-y: auto;
+  padding: 0.25rem 1.25rem 1.25rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--ifm-background-color);
+  box-shadow: 0 12px 32px rgba(28, 26, 23, 0.18);
+}
+
+#pagefind-search-mount .pagefind-ui__drawer:empty,
+#pagefind-search-mount .pagefind-ui__drawer.pagefind-ui__hidden,
+#pagefind-search-mount.navbar__search--closed .pagefind-ui__drawer {
+  display: none;
+}
+
+#pagefind-search-mount .pagefind-ui__results-area {
+  margin-top: 0;
+}
+
+/* Same label voice as "On this page" and the sidebar section headings. */
+#pagefind-search-mount .pagefind-ui__message {
+  height: auto;
+  padding: 0.75rem 0 0.5rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+#pagefind-search-mount .pagefind-ui__result {
+  border-top: 1px solid var(--keep-border);
+  padding: 0.75rem 0;
+}
+
+#pagefind-search-mount .pagefind-ui__result-link {
+  font-weight: 600;
+  color: var(--keep-ink);
+}
+
+#pagefind-search-mount .pagefind-ui__result-excerpt {
+  font-size: 0.8125rem;
+  color: var(--keep-muted);
+}
+
+#pagefind-search-mount mark {
+  background: var(--keep-accent-soft);
+  color: var(--keep-accent);
+  padding: 0 2px;
+  border-radius: 3px;
+}
+
+@media (max-width: 996px) {
+  #pagefind-search-mount .pagefind-ui__search-input {
+    width: min(9rem, 38vw);
+  }
+
+  #pagefind-search-mount .pagefind-ui__drawer {
+    width: min(22rem, calc(100vw - 2rem));
+  }
+
+  #pagefind-search-mount .navbar__search-hint {
+    display: none;
+  }
+}
+
+/* Below this the navbar cannot hold the search field and the repository button
+   side by side; the button stays reachable from the sliding menu. */
+@media (max-width: 768px) {
+  .navbar__items--right .navbar__link[href*='github.com'] {
+    display: none;
+  }
+
+  #pagefind-search-mount {
+    margin-right: 0;
+  }
 }
