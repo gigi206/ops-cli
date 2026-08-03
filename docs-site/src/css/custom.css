@@ -1,0 +1,44 @@
+/**
+ * sbx docs theme — dark-first cockpit look, carried over from the old
+ * mkdocs-material palette (slate scheme, cyan primary, lime accent).
+ */
+
+:root {
+  --ifm-color-primary: #22d3ee;
+  --ifm-color-primary-dark: #16b8d1;
+  --ifm-color-primary-darker: #12a3ba;
+  --ifm-color-primary-darkest: #0f879a;
+  --ifm-color-primary-light: #3fdbf1;
+  --ifm-color-primary-lighter: #5ce0f3;
+  --ifm-color-primary-lightest: #84e8f6;
+  --ifm-color-secondary: #84cc16;
+  --ifm-code-font-size: 95%;
+  --ifm-font-family-base: 'Inter', system-ui, -apple-system, sans-serif;
+  --ifm-font-family-monospace: 'JetBrains Mono', 'SFMono-Regular', monospace;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #22d3ee;
+  --ifm-color-primary-dark: #16b8d1;
+  --ifm-color-primary-darker: #12a3ba;
+  --ifm-color-primary-darkest: #0f879a;
+  --ifm-color-primary-light: #3fdbf1;
+  --ifm-color-primary-lighter: #5ce0f3;
+  --ifm-color-primary-lightest: #84e8f6;
+  --ifm-color-secondary: #84cc16;
+  --ifm-background-color: #0f172a;
+  --ifm-background-surface-color: #1e293b;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+[data-theme='light'] {
+  --ifm-color-primary: #0891b2;
+  --ifm-color-primary-dark: #0781a0;
+  --ifm-color-primary-darker: #06748f;
+  --ifm-color-primary-darkest: #055f76;
+  --ifm-color-primary-light: #0aa0c4;
+  --ifm-color-primary-lighter: #0babcf;
+  --ifm-color-primary-lightest: #0cc0e8;
+  --ifm-color-secondary: #65a30d;
+}

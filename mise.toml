@@ -11,14 +11,6 @@
 
 min_version = "2024.12.0"
 
-# Mise-managed Python virtualenv: created automatically with the mise `python`
-# tool when missing, and its bin/ is prepended to PATH under `mise activate` /
-# `mise exec`. The docs-site packages (mkdocs, mkdocs-material) are installed
-# into it by `mise run docs-install` (pip; the pip: tool backend is not offered
-# by this mise version).
-[env]
-_.python.venv = { path = ".venv", create = true }
-
 [tools]
 rust                            = "latest"
 # The shipping binary is a static musl build; some dependencies carry C/asm, so
@@ -32,10 +24,11 @@ zig                             = "latest"
 # provisions the `llvm-tools-preview` rustup component (llvm-cov / llvm-profdata) itself, so
 # nothing else is needed. Run `mise run coverage`.
 "aqua:taiki-e/cargo-llvm-cov"      = "latest"
-# Docs site generation with the Material theme, inside the mise-managed venv
-# (see [env] below): mkdocs + the theme are pip-installed into .venv, whose
-# bin/ mise prepends to PATH.
-python                          = "latest"
+# Docs site (Docusaurus) runs on Node. Its dependencies are pinned in
+# docs-site/package.json (the lockfile source of truth); `mise run docs-install`
+# materialises them into docs-site/node_modules via `npm install`. Keep the two in
+# sync when bumping a version.
+node                            = "24.18.0"
 
 # ============================================================================
 # Tasks — invoked via `mise run <name>`. `mise run ci` is the full one-liner you
@@ -129,15 +122,15 @@ description = "Full local reproduction of the CI pipeline (fmt + lint + test)"
 depends = ["fmt", "lint", "test"]
 
 [tasks.docs-install]
-description = "Install the docs-site tooling (mkdocs + Material theme + Mermaid plugin) into the mise-managed venv"
-run = "pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin"
+description = "Install the Docusaurus docs-site dependencies into docs-site/node_modules (Node tool + pinned npm packages from [tools])"
+run = "npm --prefix docs-site install"
 
 [tasks.docs]
-description = "Serve the docs site locally with live reload (http://localhost:8000)"
+description = "Serve the Docusaurus docs site locally with live reload (http://localhost:3000)"
 depends = ["docs-install"]
-run = "mkdocs serve"
+run = "npm --prefix docs-site run start"
 
 [tasks.docs-build]
-description = "Build the docs site into site/ (strict: broken links fail the build)"
+description = "Build the Docusaurus docs site into docs-site/build/ (broken links fail the build)"
 depends = ["docs-install"]
-run = "mkdocs build --strict"
+run = "npm --prefix docs-site run build"
