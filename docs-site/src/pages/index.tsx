@@ -92,29 +92,30 @@ const VERBS = [
   { cmd: 'sbx session', detail: 'List, attach to or stop a session.', to: '/docs/cli/session' },
 ];
 
-const PROFILE_SAMPLE = `[packages]
-jq = "nix:jq"
+const PROFILE_SAMPLE = `[network]
+mode  = "deny"
+allow = ["api.anthropic.com", "crates.io"]
 
 [app.agent]
-cmd = "opencode"
+cmd     = "opencode"
 network = { mode = "deny", allow = ["api.anthropic.com"] }
 
 [secret."api.anthropic.com"]
-from = "env://ANTHROPIC_API_KEY"
-kind = "http-header"
+from   = "env://ANTHROPIC_API_KEY"
+kind   = "http-header"
 header = "x-api-key"
-type = "raw"`;
+type   = "raw"`;
 
 // The portable form: the same fields, at the top level, the filename being the
 // app name. Documented in configuration/apps.md.
-const PROFILE_FILE = `cmd = "opencode"
+const PROFILE_FILE = `cmd     = "opencode"
 network = { mode = "deny", allow = ["api.anthropic.com"] }
 
 [secret."api.anthropic.com"]
-from = "env://ANTHROPIC_API_KEY"
-kind = "http-header"
+from   = "env://ANTHROPIC_API_KEY"
+kind   = "http-header"
 header = "x-api-key"
-type = "raw"`;
+type   = "raw"`;
 
 function Transcript(): ReactNode {
   return (
@@ -311,7 +312,7 @@ export default function Home(): ReactNode {
                   <TabItem value="project" label=".sbx.toml" default>
                     <CodeBlock language="toml">{PROFILE_SAMPLE}</CodeBlock>
                   </TabItem>
-                  <TabItem value="profile" label="apps/agent.toml">
+                  <TabItem value="profile" label="agent.profile.toml">
                     <CodeBlock language="toml">{PROFILE_FILE}</CodeBlock>
                   </TabItem>
                 </Tabs>

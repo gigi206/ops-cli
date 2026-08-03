@@ -1334,11 +1334,16 @@ html[data-theme='dark']:root .home {
   background: var(--home-deep) !important;
 }
 
-/* The active tab continues that surface rather than sitting on it as a solid
-   block of accent, which read as a stray orange slab above the sample. */
+.home__profile-code code[class*='codeBlockLines'] {
+  padding: 1.375rem;
+  line-height: 1.8;
+}
+
+/* The active tab is the mock's: a solid accent chip carrying the filename. */
 .home__profile-code .tabs__item--active {
-  background: var(--home-deep);
-  color: var(--keep-accent);
+  background: var(--keep-accent);
+  color: var(--home-deep);
+  font-weight: 500;
   border-bottom: none;
 }
 

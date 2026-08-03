@@ -34,11 +34,13 @@ const prismKeep: PrismTheme = {
       style: { color: '#E8C34A' },
     },
     {
-      types: ['keyword', 'atrule', 'selector', 'tag', 'table', 'section', 'important'],
+      // `class-name` belongs here: Prism marks a TOML table as `table class-name`,
+      // and the later group would otherwise win and lighten it.
+      types: ['keyword', 'atrule', 'selector', 'tag', 'table', 'section', 'important', 'class-name'],
       style: { color: '#E8895F' },
     },
     {
-      types: ['function', 'class-name', 'builtin', 'title'],
+      types: ['function', 'builtin', 'title'],
       style: { color: '#F09368' },
     },
     {
