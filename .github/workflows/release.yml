@@ -1,0 +1,107 @@
+# Release — builds the self-contained (nix+bwrap bundled) static musl binary and
+# attaches it to a GitHub Release created from the pushed tag.
+#
+# Trigger: any tag matching v*.*.* (e.g. v2.0.0, v2.0.1-alpha.0 is NOT matched by
+# that glob — use v2.0.1-alpha0 style, or widen the pattern below if you want
+# pre-release tags to publish too).
+#
+# The bundled engines are pinned. Keep the nixpkgs REV and the expected_sha in
+# sync with build.rs / mise.toml when you bump them.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Static musl engines pinned in build.rs. Same nixpkgs rev as mise.toml.
+  NIXPKGS_REV: "89570f24e97e614aa34aa9ab1c927b6578a43775"
+
+jobs:
+  build:
+    name: build + publish release asset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (with the musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install zig (linker for the musl target)
+        uses: mlugg/setup-zig@v4
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_conf: |
+            experimental-features = nix-command flakes
+
+      - name: Realise the pinned static nix engine
+        id: nix
+        run: |
+          set -euo pipefail
+          ref="github:NixOS/nixpkgs/${NIXPKGS_REV}#pkgsStatic.nix"
+          for out in $(nix build "$ref" --no-link --print-out-paths); do
+            if [ -e "$out/bin/nix" ]; then
+              echo "path=$out/bin/nix" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "no bin/nix in the pkgsStatic.nix outputs" >&2; exit 1
+
+      - name: Realise the pinned static bwrap engine
+        id: bwrap
+        run: |
+          set -euo pipefail
+          ref="github:NixOS/nixpkgs/${NIXPKGS_REV}#pkgsStatic.bubblewrap"
+          for out in $(nix build "$ref" --no-link --print-out-paths); do
+            if [ -e "$out/bin/bwrap" ]; then
+              echo "path=$out/bin/bwrap" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "no bin/bwrap in the pkgsStatic.bubblewrap outputs" >&2; exit 1
+
+      # Sanity gate: the default-feature unit suite must pass before we spend
+      # minutes bundling engines. (The sandbox e2e skip on a hosted runner.)
+      - name: Unit tests (default features)
+        run: cargo test --bins
+
+      - name: Build the bundled static musl binary
+        env:
+          SBX_BUNDLED_NIX: ${{ steps.nix.outputs.path }}
+          SBX_BUNDLED_BWRAP: ${{ steps.bwrap.outputs.path }}
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --target x86_64-unknown-linux-musl \
+            --features bundled-nix,bundled-bwrap
+          cp target/x86_64-unknown-linux-musl/release/sbx sbx-linux-x86_64
+          sha256sum sbx-linux-x86_64 | cut -d' ' -f1 > sbx-linux-x86_64.sha256
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sbx-linux-x86_64
+            sbx-linux-x86_64.sha256
+          # A tag containing a hyphen (e.g. v2.0.0-alpha.0) is a pre-release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

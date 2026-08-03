@@ -1,0 +1,107 @@
+# CI — runs on every push and pull request.
+#
+# Mirrors `mise run ci` (fmt + clippy + test). Unlike the local full run, the
+# integration e2e that need userns + nix + network are skipped on a hosted
+# runner; here they are simply not selected unless their source file changed.
+#
+# Test selection is change-driven:
+#   - a core change (Cargo.toml/Cargo.lock/build.rs/src/**)  -> full suite
+#   - only tests/*.rs changed                               -> those files
+#   - otherwise                                             -> unit tests only
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (change-driven)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Select and run tests for the changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}" --depth=1
+            BASE="origin/${{ github.base_ref }}"
+          else
+            BASE="${{ github.event.before }}"
+            # github.event.before can be all-zeros on a first push; fall back to HEAD~1.
+            if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+              BASE="HEAD~1"
+            fi
+          fi
+
+          mapfile -t CHANGED < <(git diff --name-only "$BASE" HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock' 'build.rs' || true)
+
+          CORE_CHANGED=0
+          TESTS_CHANGED=()
+          for f in "${CHANGED[@]:-}"; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              Cargo.toml|Cargo.lock|build.rs|src/*)
+                CORE_CHANGED=1
+                ;;
+              tests/*.rs)
+                stem="${f#tests/}"
+                stem="${stem%.rs}"
+                TESTS_CHANGED+=("$stem")
+                ;;
+            esac
+          done
+
+          if [ "$CORE_CHANGED" -eq 1 ]; then
+            echo "::notice::core change detected — running the full test suite"
+            cargo test
+          else
+            echo "::notice::no core change — running unit tests (--bins) only"
+            cargo test --bins
+            if [ "${#TESTS_CHANGED[@]}" -gt 0 ]; then
+              echo "::notice::changed integration test files: ${TESTS_CHANGED[*]}"
+              for t in "${TESTS_CHANGED[@]}"; do
+                cargo test --test "$t"
+              done
+            fi
+          fi

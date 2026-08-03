@@ -1,0 +1,121 @@
+# Nightly — a rolling release that always tracks `main`.
+#
+# On every push to `main` we rebuild the self-contained (nix+bwrap bundled)
+# static musl binary and OVERWRITE the `nightly` release: the `nightly` git tag
+# is force-moved onto the current commit and the existing release (with its old
+# assets) is deleted and recreated as a pre-release. `make_latest` is disabled so
+# it never shadows a real versioned release.
+#
+# Consumers that want "always the latest main build" pin to the `nightly` tag.
+
+name: Nightly
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  # Do not cancel a run mid-flight: a half-finished overwrite would leave the
+  # nightly release in an inconsistent state (tag moved, assets not yet uploaded).
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  NIXPKGS_REV: "89570f24e97e614aa34aa9ab1c927b6578a43775"
+
+jobs:
+  build:
+    name: build + overwrite nightly release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust (with the musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install zig (linker for the musl target)
+        uses: mlugg/setup-zig@v4
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_conf: |
+            experimental-features = nix-command flakes
+
+      - name: Realise the pinned static nix engine
+        id: nix
+        run: |
+          set -euo pipefail
+          ref="github:NixOS/nixpkgs/${NIXPKGS_REV}#pkgsStatic.nix"
+          for out in $(nix build "$ref" --no-link --print-out-paths); do
+            if [ -e "$out/bin/nix" ]; then
+              echo "path=$out/bin/nix" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "no bin/nix in the pkgsStatic.nix outputs" >&2; exit 1
+
+      - name: Realise the pinned static bwrap engine
+        id: bwrap
+        run: |
+          set -euo pipefail
+          ref="github:NixOS/nixpkgs/${NIXPKGS_REV}#pkgsStatic.bubblewrap"
+          for out in $(nix build "$ref" --no-link --print-out-paths); do
+            if [ -e "$out/bin/bwrap" ]; then
+              echo "path=$out/bin/bwrap" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "no bin/bwrap in the pkgsStatic.bubblewrap outputs" >&2; exit 1
+
+      - name: Unit tests (default features)
+        run: cargo test --bins
+
+      - name: Build the bundled static musl binary
+        env:
+          SBX_BUNDLED_NIX: ${{ steps.nix.outputs.path }}
+          SBX_BUNDLED_BWRAP: ${{ steps.bwrap.outputs.path }}
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --target x86_64-unknown-linux-musl \
+            --features bundled-nix,bundled-bwrap
+          cp target/x86_64-unknown-linux-musl/release/sbx sbx-linux-x86_64
+          sha256sum sbx-linux-x86_64 | cut -d' ' -f1 > sbx-linux-x86_64.sha256
+
+      - name: Force-move the nightly tag onto this commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly
+          git push -f origin nightly
+
+      - name: Recreate the nightly release (overwrite)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release delete nightly --yes || true
+          NOTES="Rolling build of \`main\` @ ${GITHUB_SHA::8}."$'\n'"\n"$'\n'"Built from: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          gh release create nightly \
+            --prerelease \
+            --latest=false \
+            --title "nightly (rolling, tracks main)" \
+            --notes "$NOTES" \
+            sbx-linux-x86_64 \
+            sbx-linux-x86_64.sha256
