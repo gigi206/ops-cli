@@ -31,6 +31,10 @@ const TRANSCRIPT: { kind: 'cmd' | 'ok' | 'detail' | 'plain' | 'blank'; text?: st
   { kind: 'cmd', text: 'sbx trust' },
   { kind: 'plain', text: 'sbx: trusted .sbx.toml' },
   { kind: 'blank' },
+  { kind: 'cmd', text: 'sbx app import examples/app/opencode.toml' },
+  { kind: 'plain', text: "imported app profile 'opencode' -> ~/.config/sbx/apps/opencode.toml" },
+  { kind: 'detail', text: 'launch it with: sbx app run opencode' },
+  { kind: 'blank' },
   { kind: 'cmd', text: 'sbx app run opencode' },
 ];
 
@@ -50,9 +54,9 @@ const ABSENT = [
   'egress, under a filtering mode',
 ];
 
-// Three, not four: Landlock is a deferred defence-in-depth option in this
-// codebase, not a layer that runs today.
-const LAYERS = [
+// Three always-on layers (Landlock is a deferred option in this codebase, not a
+// layer that runs today), plus the egress firewall, which is opt-in by posture.
+const LAYERS: { n: string; name: string; detail: string; to?: string }[] = [
   {
     n: '01',
     name: 'bubblewrap',
@@ -67,6 +71,13 @@ const LAYERS = [
     n: '03',
     name: 'cgroup v2',
     detail: 'Memory, pids and CPU limits, best-effort.',
+  },
+  {
+    n: 'opt-in',
+    name: 'egress proxy',
+    detail:
+      'Deny by default, then allow by host, port, path, method or regex. A host-side MITM proxy is the only way out of an empty netns.',
+    to: '/docs/networking/',
   },
 ];
 
@@ -191,7 +202,9 @@ export default function Home(): ReactNode {
                 <Link className="home__cta" to="/docs/getting-started/quickstart">
                   Get started
                 </Link>
-                <code className="home__command">$ sbx app run opencode</code>
+                <code className="home__command">
+                  $ sbx app import opencode.toml{'\n'}$ sbx app run opencode
+                </code>
               </div>
               <ul className="home__badges">
                 <li>no OCI runtime</li>
@@ -236,23 +249,36 @@ export default function Home(): ReactNode {
         <section className="home__section">
           <div className="home__inner">
             <p className="home__kicker home__kicker--accent">02 · enforcement</p>
-            <h2 className="home__section-title">Three layers, always on.</h2>
+            <h2 className="home__section-title">Three layers always on, one you switch on.</h2>
             <p className="home__aside home__aside--lead">
               Every launch goes through them, and none is a toggle. They require
               capability-bearing unprivileged user namespaces: without them{' '}
               <Link to="/docs/cli/doctor">
                 <code>sbx doctor</code>
               </Link>{' '}
-              hard-fails, because there is no emulation fallback.
+              hard-fails, because there is no emulation fallback. The network posture is the
+              one you choose: the host network by default, or a filtered egress the cage
+              cannot step around.
             </p>
             <div className="home__grid home__grid--three">
-              {LAYERS.map(({ n, name, detail }) => (
-                <div className="home__card home__card--layer" key={n}>
-                  <p className="home__layer-n">layer {n}</p>
-                  <p className="home__card-name">{name}</p>
-                  <p className="home__card-detail">{detail}</p>
-                </div>
-              ))}
+              {LAYERS.map(({ n, name, detail, to }) => {
+                const body = (
+                  <>
+                    <p className="home__layer-n">{n === 'opt-in' ? 'opt-in' : `layer ${n}`}</p>
+                    <p className="home__card-name">{name}</p>
+                    <p className="home__card-detail">{detail}</p>
+                  </>
+                );
+                return to ? (
+                  <Link className="home__card home__card--link" to={to} key={n}>
+                    {body}
+                  </Link>
+                ) : (
+                  <div className="home__card" key={n}>
+                    {body}
+                  </div>
+                );
+              })}
             </div>
           </div>
         </section>
