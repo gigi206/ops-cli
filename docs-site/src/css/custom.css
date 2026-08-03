@@ -1323,10 +1323,26 @@ html[data-theme='dark']:root .home {
   color: var(--keep-faint);
 }
 
+/* On this band the sample sits on the deepest surface, as the mock does: the
+   standard code brown lands within a shade of the tinted band behind it, which
+   reads as one warm mass instead of a panel. The inline style Prism writes on
+   the <pre> is why this has to be forced. */
+.home__profile-code [class*='codeBlockContainer'],
+.home__profile-code pre[class*='codeBlock'] {
+  background: var(--home-deep) !important;
+}
+
+/* The active tab continues that surface rather than sitting on it as a solid
+   block of accent, which read as a stray orange slab above the sample. */
 .home__profile-code .tabs__item--active {
-  background: var(--keep-accent);
-  color: var(--keep-bg);
+  background: var(--home-deep);
+  color: var(--keep-accent);
   border-bottom: none;
+}
+
+.home__profile-code .tabs__item:not(.tabs__item--active):hover {
+  background: transparent;
+  color: var(--keep-body);
 }
 
 .home__profile-code [class*='codeBlockContainer'] {

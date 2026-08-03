@@ -92,10 +92,7 @@ network = { mode = "deny", allow = ["api.anthropic.com"] }
 from = "env://ANTHROPIC_API_KEY"
 kind = "http-header"
 header = "x-api-key"
-type = "raw"
-
-# security fields are ignored until:
-#   sbx trust`;
+type = "raw"`;
 
 // The portable form: the same fields, at the top level, the filename being the
 // app name. Documented in configuration/apps.md.
