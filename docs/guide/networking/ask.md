@@ -2,7 +2,7 @@
 
 `ask` is the **park-and-confirm** [egress posture](modes.md#ask). It is the
 discovery mode: run an agent and decide, in real time from another terminal, what it
-may reach — allowing or denying each new destination as it comes up, and optionally
+may reach, allowing or denying each new destination as it comes up, and optionally
 remembering the answer.
 
 ```toml
@@ -14,7 +14,7 @@ deny  = ["telemetry.example.com"] # never asked — always denied
 ```
 
 Under `ask`, a request whose destination matches an `allow` rule auto-passes and one
-matching a `deny` rule auto-fails — exactly as under `deny`/`allow` mode. Any
+matching a `deny` rule auto-fails: exactly as under `deny`/`allow` mode. Any
 **undecided** request (matching neither list, and not a
 [built-in self-equip host](modes.md#the-built-in-self-equip-set)) **parks**: it
 blocks inside the cage while it waits for your live decision.
@@ -27,7 +27,7 @@ blocks inside the cage while it waits for your live decision.
    **park notice** is printed announcing the parked destination and its id (silence
    it with `ask_notice = false`).
 
-2. **List what is parked** — from any other terminal:
+2. **List what is parked**: from any other terminal:
 
    ```bash
    sbx net pending
@@ -67,10 +67,10 @@ sbx net pending watch -a claude    # one app's sessions
 ```
 
 `watch` polls the same live control sockets and redraws the listing in place
-(top-style — your scrollback is preserved), so a newly-parked request shows up on
+(top-style, your scrollback is preserved), so a newly-parked request shows up on
 the next refresh. Answer it from another shell with `sbx net pending allow|deny
 <id>`; the watch picks up the change on the next tick. Ctrl-C quits. `watch` needs a
-terminal — for a pipe or a script, use the one-shot listing with `--json`.
+terminal, for a pipe or a script, use the one-shot listing with `--json`.
 
 ---
 
@@ -106,7 +106,7 @@ The persisted rules a session remembered from `--session` answers are visible wi
 ## Deciding a host *before* it parks (and outside `ask`)
 
 `sbx net pending allow|deny <id> --session` reacts to a request that **already** parked.
-To pre-decide a host you know is coming — without editing your config — load a rule into
+To pre-decide a host you know is coming, without editing your config, load a rule into
 the live session's overlay ahead of time:
 
 ```bash
@@ -116,7 +116,7 @@ sbx net deny  ads.example.com --session --all    # every reachable session, this
 ```
 
 The proxy folds the overlay into its effective policy, so this works on **any** filtering
-posture — not just `ask`. On an **allowlist** agent (the common case for a running
+posture, not just `ask`. On an **allowlist** agent (the common case for a running
 [`sbx app`](../cli/app.md)), `sbx net allow <host> --session` opens a host the allowlist
 omits, and `sbx net deny <host> --session` cuts one it permits (deny wins), all without
 relaunching. It writes no file and dies with the session. See
@@ -141,7 +141,7 @@ still waits. It reports per session, so a cross-agent grant is visible.
 `--all` composes with `--save`, with a deliberate safety rule about scope:
 
 - `--all --save` (default `--local`) drains only the **current project's** sessions
-  and saves each host to the **project** config — never machine-wide, so one
+  and saves each host to the **project** config: never machine-wide, so one
   project's requests can never leak into another's config. A `--local` save
   pre-flights the trust gate before the (irreversible) drain.
 - `--all --save --global` drains across sessions and saves to the global config.
@@ -159,13 +159,13 @@ ask_timeout  = "90s"    # a parked request times out to a deny after this long
 ask_notice   = false    # silence the inline stderr park alert
 ```
 
-- **`ask_timeout`** — a duration (`"90s"`, `"5m"`, …) bounding how long a parked
+- **`ask_timeout`**, a duration (`"90s"`, `"5m"`, …) bounding how long a parked
   request waits before it times out to a **deny**. Absent means wait indefinitely
   until answered. Useful when an agent runs unattended and you do not want it wedged
   forever on an unanswered park.
-- **`ask_notice`** — `true` by default. When a request parks, a notice is printed to
+- **`ask_notice`**, `true` by default. When a request parks, a notice is printed to
   the launch's stderr. Set `false` to silence that inline alert; the request still
-  parks (answer it with `sbx net pending`) — you have just chosen to watch via
+  parks (answer it with `sbx net pending`): you have just chosen to watch via
   `sbx net pending watch` instead of inline notices.
 
 Both are [trusted-only](modes.md#security-gated) and inherit across layers (a layer
@@ -175,10 +175,10 @@ that omits them leaves the inherited value unchanged).
 
 ## See also
 
-- [Network modes](modes.md#ask) — where `ask` sits among the five postures.
-- [Rule grammar](rules.md) — what `allow`/`deny` entries decide *before* a request
+- [Network modes](modes.md#ask): where `ask` sits among the five postures.
+- [Rule grammar](rules.md): what `allow`/`deny` entries decide *before* a request
   reaches the park.
-- [Observability](observability.md) — `sbx net rules --source session` (the rules a
+- [Observability](observability.md): `sbx net rules --source session` (the rules a
   session remembered), `sbx net logs` (watch every decision live).
 - [`sbx net pending` CLI reference](../cli/net.md)
-- [The trust gate](../concepts/trust.md) — what `--save` re-trusts.
+- [The trust gate](../concepts/trust.md): what `--save` re-trusts.

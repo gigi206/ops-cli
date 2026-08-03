@@ -7,7 +7,7 @@ sbx session attach <id> [-- command [args...]]
 sbx session stop <id>...|--all [--delay <secs>]
 ```
 
-Inspect and control the **live sandbox sessions** — the running cages. `sbx session ls`
+Inspect and control the **live sandbox sessions**: the running cages. `sbx session ls`
 lists them, `sbx session logs` shows a detached one's output, `sbx session attach` runs a shell
 or a command inside one, and `sbx session stop` ends them.
 Host-side: reads the on-disk session registry (daemonless), launches nothing. `sbx sessions`
@@ -22,7 +22,7 @@ sbx session ls
 ```
 
 List the live sandbox sessions from the on-disk registry. Reading the registry
-**re-validates and prunes dead records**, so the list is always current — a crashed or
+**re-validates and prunes dead records**, so the list is always current: a crashed or
 killed session self-heals rather than lingering. An app session shows its app name, so you
 can tell which sessions are agents.
 
@@ -45,7 +45,7 @@ The `PID` column is the `<id>` used by `sbx session attach <id>`, `sbx session l
 
 | `MODE` | Launched with | Its output |
 |---|---|---|
-| `detached` | `--detach` | redirected to a log — read it with [`logs`](#logs) |
+| `detached` | `--detach` | redirected to a log: read it with [`logs`](#logs) |
 | `foreground` | no `--detach` | on the terminal that started it |
 
 ## `logs`
@@ -56,7 +56,7 @@ sbx session logs <id> [-f] [-n <N>] [--all]
 
 Show a **detached** session's output. A session started with `--detach` has no terminal, so
 its stdout and stderr are redirected to `<data>/logs/<id>.log`; this reads that file back. A
-foreground session has no log — its output is on the terminal that started it — and the
+foreground session has no log, its output is on the terminal that started it, and the
 [`MODE` column](#ls) says which is which.
 
 | Operand / flag | Meaning |
@@ -68,7 +68,7 @@ foreground session has no log — its output is on the terminal that started it 
 
 The id is **required** and is resolved straight to the log file, never through the session
 registry. That is deliberate: the registry drops a record the moment its process dies, so a
-lookup would fail in exactly the case this command exists for — finding out why a background
+lookup would fail in exactly the case this command exists for: finding out why a background
 agent stopped. Reading an exited session works the same as reading a running one.
 
 ```sh
@@ -89,11 +89,11 @@ Logs are keyed by PID and appended to, so a PID the kernel later reuses writes i
 file. A header line separates the sessions and only the most recent one is shown; pass `--all`
 for the whole file.
 
-> **Note.** Nothing prunes `<data>/logs` yet — neither [`sbx gc`](gc.md) nor session teardown.
+> **Note.** Nothing prunes `<data>/logs` yet: neither [`sbx gc`](gc.md) nor session teardown.
 > A long-lived install accumulates one small file per detached launch; remove them by hand if
 > they add up.
 
-If you lose the id, the launch message is the only place it is reported — `sbx session ls` can
+If you lose the id, the launch message is the only place it is reported: `sbx session ls` can
 only show sessions that are still alive. Failing that, list the directory:
 `ls ~/.local/share/sbx/logs` (or see [`sbx path`](path.md) for your data directory).
 
@@ -103,10 +103,10 @@ only show sessions that are still alive. Failing that, list the directory:
 sbx session attach <id> [-- command [args...]]
 ```
 
-Join a **running** session's cage — the agent's live processes, its real `/tmp`, and its
-network — the way `docker exec` does. This is a real join of the running cage (via `setns`),
+Join a **running** session's cage: the agent's live processes, its real `/tmp`, and its
+the real-time cage state: the host-side join of the running cage (via `setns`)
 not a fresh cage that merely shares the home. With no command it opens an **interactive shell**
-(like `docker exec -it`); with `-- command` it **runs that command** inside the cage.
+(an interactive attach); with `-- command` it **runs that command** inside the cage.
 
 | Operand | Meaning |
 |---|---|
@@ -118,22 +118,22 @@ a terminal it runs through a **pty** (interactive tools keep job control and res
 or script through **inherited stdio** (bytes pass through clean in both directions, so it composes
 with pipes and redirection). The command's exit status becomes sbx's, so it scripts cleanly. The
 command is run via the cage's own `bash` so it resolves on the cage `PATH`, and it is passed
-positionally — no argument is ever interpreted as shell syntax.
+positionally: no argument is ever interpreted as shell syntax.
 
-A `-- command` runs in the agent's **environment as the cage was launched** — its `PATH`, proxy,
-and CA settings, read from the live agent process (like `docker exec`, and like the interactive
+A `-- command` runs in the agent's **environment as the cage was launched**: its `PATH`, proxy,
+and CA settings, read from the live agent process — the same path the interactive shell inherits,
 shell it does not carry any host secret). Unlike the interactive shell, it does **not** source the
 in-cage rc, so it does not re-run `mise activate`; declared tools and the base toolset are on the
 launch `PATH` and resolve, but a tool the agent activated purely at runtime may not be.
 
 `attach` provisions nothing and reads no config: it enters namespaces the cage already built.
-The joined shell or command **re-applies the cage's confinement** — the same seccomp denylist,
-`no_new_privs`, and dropped capabilities (none of that is inherited across `setns`) — so
+The joined shell or command **re-applies the cage's confinement**: the same seccomp denylist,
+`no_new_privs`, and dropped capabilities (none of that is inherited across `setns`): so
 attaching never opens a wider hole than the agent already has. The one thing it does **not**
 share is the cage's cgroup resource limits (memory/task caps): an inspection shell runs in
 its own scope, so it is not bounded by the agent's OOM ceiling. It needs a live session; if
 the session has exited, `attach` says so (run `sbx session ls` to list live ones). Type
-`exit` to leave a bare shell — the agent keeps running.
+`exit` to leave a bare shell: the agent keeps running.
 
 ```sh
 sbx session ls                        # find the id
@@ -148,7 +148,7 @@ sbx session attach 12345 -- python3   # interactive tool through a pty
 
 Everything runs from the agent's own view of the filesystem, so `attach` is a tool for
 **inspecting and interacting with a running agent**, not a pristine environment. The shell or
-command binary comes from the cage's mount namespace (as with any `docker exec`-style entry);
+command binary comes from the cage's mount namespace (so any path the agent could resolve, the join passes through);
 the re-applied confinement bounds what it can do.
 
 ## `stop`

@@ -1,4 +1,4 @@
-# `[seccomp]` — relaxing the syscall denylist
+# `[seccomp]`: relaxing the syscall denylist
 
 Every cage runs behind a mandatory **seccomp denylist** that refuses a set of syscalls
 with no legitimate in-cage use and a history of kernel privilege-escalation (the whole
@@ -11,8 +11,8 @@ so a tool that genuinely needs it can run.
 allow = ["ptrace", "perf_event_open", "clone:newns"]
 ```
 
-`[seccomp]` is a **security field** — honored from the global config or a trusted
-project, ignored from an untrusted one — because re-permitting a denied syscall reduces
+`[seccomp]` is a **security field**: honored from the global config or a trusted
+project, ignored from an untrusted one: because re-permitting a denied syscall reduces
 the kernel-attack-surface control. An empty or absent `allow` leaves the full mandatory
 denylist (identical to a cage with no `[seccomp]` config).
 
@@ -34,7 +34,7 @@ re-permit the syscall they need:
 ## The grammar
 
 The grammar is **uniform**: a bare syscall name lifts the **whole** syscall; `clone`
-and `ioctl` — the two *argument-filtered* entries in the denylist — additionally accept
+and `ioctl`, the two *argument-filtered* entries in the denylist, additionally accept
 a `:selector` that lifts only one sub-rule and leaves the rest denied.
 
 | Token | Effect |
@@ -47,7 +47,7 @@ a `:selector` that lifts only one sub-rule and leaves the rest denied.
 | `"ioctl:tiocsti"` / `"ioctl:tioclinux"` | lift only that one request |
 
 A rule is **a name, not `:selector`** for everything except `clone`/`ioctl` (the only
-argument-filtered entries) — a `:selector` on any other syscall is rejected.
+argument-filtered entries): a `:selector` on any other syscall is rejected.
 
 ### Comma lists
 
@@ -62,7 +62,7 @@ allow = ["ptrace, unshare", "clone:newns"]
 ### Unknown or malformed entries
 
 An entry that names a syscall `sbx` does not deny, or a bad/superfluous `:selector`, is
-**dropped with a warning** (fail-closed — it loosens nothing). It never fails the launch.
+**dropped with a warning** (fail-closed: it loosens nothing). It never fails the launch.
 
 ## Cautions
 
@@ -71,8 +71,8 @@ allowed (you are the trusted operator), but `sbx` prints a **caution** naming wh
 opened:
 
 - **`clone`, `clone:newuser`, `clone3`** → reopens unprivileged **user-namespace
-  creation**. (`clone3` cannot be argument-filtered — its flags live behind a struct
-  pointer a cBPF filter cannot read — so lifting it reopens *unfiltered* namespace
+  creation**. (`clone3` cannot be argument-filtered: its flags live behind a struct
+  pointer a cBPF filter cannot read: so lifting it reopens *unfiltered* namespace
   creation. Prefer `clone:newns` unless you truly need `clone3`.)
 - **`ioctl`, `ioctl:tiocsti`, `ioctl:tioclinux`** → reopens **terminal input injection**
   (writing into the controlling terminal's input queue).
@@ -81,7 +81,7 @@ opened:
   code could unmount a pin and defeat a control-plane protection. Lift it only when you
   understand that interaction.
 
-Cautions are informational — the token is still applied.
+Cautions are informational: the token is still applied.
 
 ## Why it stays surface-reduction, not a boundary
 
@@ -92,15 +92,14 @@ drops all capabilities and runs a single-uid user namespace, so a nested user na
 is already neutered (`unshare(CLONE_NEWUSER)` succeeds but the `uid_map` write is
 refused). Lifting a syscall is your informed, trusted-only choice.
 
-Re-permitting the mount/namespace family does **not** re-enable nix's own build sandbox
-— `sbx` still runs in-cage `nix build` with `sandbox = false` (see
+Re-permitting the mount/namespace family does **not** re-enable nix's own build sandbox, `sbx` still runs in-cage `nix build` with `sandbox = false` (see
 [Enforcement stack](../concepts/enforcement.md)).
 
 ## Per-app relaxation
 
 An `[app.<name>.seccomp]` table (or a `[seccomp]` table in an imported profile) relaxes
 the denylist **for that app's launches**, **unioned** onto the baseline and gated the
-same way. An untrusted project's app `[seccomp]` is dropped — so a globally-declared
+same way. An untrusted project's app `[seccomp]` is dropped: so a globally-declared
 app's relaxation cannot be widened by an untrusted project (an agent runs *on* untrusted
 code without that code widening the app's syscall surface).
 
@@ -117,7 +116,7 @@ sbx config show --app dbg  # an app's effective relaxation, tagged inherited or 
 ```
 
 The tokens render **canonically** (sorted, `:selector` form where narrow), derived from
-the same tables the parser uses — so what `sbx config show` prints is exactly what the
+the same tables the parser uses: so what `sbx config show` prints is exactly what the
 cage enforces.
 
 ## Scope
@@ -125,10 +124,10 @@ cage enforces.
 `[seccomp]` is a config-file field (global, project, or an app overlay). It is
 also a one-shot [override](overrides.md): `--seccomp <token[,token…]>` (repeatable) and
 `SBX_SECCOMP` relax the denylist for a single launch, following the same `allow` grammar.
-An override is **trusted by invocation** — the person running `sbx` outranks any config
-layer — so it may declare exactly the relaxation a *trusted* config already can, even though
+An override is **trusted by invocation**: the person running `sbx` outranks any config
+layer, so it may declare exactly the relaxation a *trusted* config already can, even though
 an untrusted project's `[seccomp]` is dropped (parity with the trusted config, not a new
 axis). Note a relaxation re-permits a syscall whose only containment was the filter, widening
-the in-cage kernel attack surface — so a stale `SBX_SECCOMP` is worth checking (its ambient
+the in-cage kernel attack surface: so a stale `SBX_SECCOMP` is worth checking (its ambient
 use prints a notice). A bad token is warned and skipped (less relaxation, fail-closed), never
 fatal.

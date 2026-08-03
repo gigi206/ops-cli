@@ -1,19 +1,21 @@
 # ops-cli — repo conventions (bwrap rewrite)
 
-> ⚠️ You are on the **`ops-v2`** branch: the clean rewrite of `ops` onto a
-> **bubblewrap + daemonless nix** substrate. The old conventions (bash `ops.sh`
+> ⚠️ You are on the **`ops-v2`** branch: the clean rewrite of the original
+> `ops` tool (now `sbx`) onto a **bubblewrap + daemonless nix** substrate. The old conventions (bash `ops.sh`
 > release cutting, container image builds) **no longer apply** here.
 
-## What `ops` is (this branch)
+## What `sbx` is (this branch)
 
-`ops` is a **sandbox launcher** (a static Rust binary) that runs tools — including
+`sbx` is a **sandbox launcher** (a static Rust binary) that runs tools — including
 **encapsulated AI agents** — inside a bubblewrap sandbox where they can install a
 project's full dependency set via **single-user daemonless nix** **without
-mutating the host OS**. It is **not** an OCI container manager: no
-docker/podman/nerdctl, no image build.
+mutating the host OS**. It is **not** a container manager: no OCI runtime
+wrapping, no image build, no kernel-shared container engine.
 
-Reference class: nono.sh / greywall.io / landrun (sandboxes), **not**
-flox/devbox/devenv (mere env managers that isolate nothing).
+Reference class: bubblewrap-based sandbox launchers — security-first tools
+that run programs under capability-bearing namespaces, **not** environment
+managers that only set variables (which isolate nothing), and not container
+managers that share the host kernel.
 
 ## Branch topology
 
@@ -26,17 +28,16 @@ flox/devbox/devenv (mere env managers that isolate nothing).
 
 ## Design documents (read before coding)
 
-1. [`docs/bwrap-spike-2026-06-14.md`](docs/bwrap-spike-2026-06-14.md) — feasibility, proven live.
-2. [`docs/bwrap-threat-model-and-binds.md`](docs/bwrap-threat-model-and-binds.md) — threat model + bind layout + decisions.
-3. [`docs/bwrap-architecture.md`](docs/bwrap-architecture.md) — Rust modules, CLI surface, milestones (M0→M7).
-4. [`docs/bwrap-security-stack.md`](docs/bwrap-security-stack.md) — the enforcement building blocks (bwrap/seccomp/Landlock/cgroups) and when each lands.
+1. [`docs/bwrap-threat-model-and-binds.md`](docs/bwrap-threat-model-and-binds.md) — threat model + bind layout + decisions.
+2. [`docs/bwrap-architecture.md`](docs/bwrap-architecture.md) — Rust modules, CLI surface, milestones (M0→M7).
+3. [`docs/bwrap-security-stack.md`](docs/bwrap-security-stack.md) — the enforcement building blocks (bwrap/seccomp/Landlock/cgroups) and when each lands.
 
 ## Security model (the essentials)
 
 - **Two actor modes**: **A** = interactive shell (user, semi-trusted); **B** =
   autonomous agent (actions untrusted) → **B is the default**.
 - **Hard requirement**: **capability-bearing unprivileged user namespaces**.
-  Without them there is no security boundary → `ops doctor` **hard-fails**, never
+  Without them there is no security boundary → `sbx doctor` **hard-fails**, never
   a silent fallback (proot = emulation = no boundary). Note: on restricted
   Ubuntu 24.04+, `unshare(CLONE_NEWUSER)` can succeed yet be stripped of
   capabilities — `doctor` checks for the capability-bearing case specifically.
@@ -48,7 +49,7 @@ flox/devbox/devenv (mere env managers that isolate nothing).
   capabilities + `--new-session`) · **seccomp** denylist · **Landlock** (FS) as
   defense-in-depth · **cgroups v2** limits (anti-DoS). Network (egress allowlist)
   is handled **last**.
-- An **untrusted** project `.ops.toml` cannot touch security-relevant fields
+- An **untrusted** project `.sbx.toml` cannot touch security-relevant fields
   (binds/network/hooks/sources); the trust gate is the validation, bound to a
   **content hash** (direnv model).
 
@@ -70,24 +71,39 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 - **Always write the cleanest possible code**, following coding and security
   best practices: least privilege, fail-closed, validate inputs, no unsafe
   shortcuts. The security model above is the baseline, not the ceiling.
+- **Documentation is co-shipped with every code change.** A change that touches
+  user-visible behaviour — a public CLI verb, a config field, an env var, an
+  enforcement rule, a security invariant, a resolver/broker flow, or the
+  observability surface — lands together with the corresponding doc update:
+  - `docs/guide/`: the user-facing reference for every verb, every config
+    field, and every codified invariant. Update the page(s) that document the
+    touched surface; touch `docs/guide/README.md` only on a cross-cutting
+    notion shift.
+  - `docs/bwrap-*.md`: the design rationale when an architectural decision
+    moves (a milestone landing, a security boundary moving, an invariant
+    re-framed). One append or one revised section, named after what changed.
+
+  A diff that touches `src/**` without a corresponding `docs/**` change is
+  **incomplete**; the commit is the gate. Reasoning lives in the commit
+  message, not in `// see docs/…` inline comments — those rot.
 - **Every increment ships with tests** (unit + integration, green), is then
   **reviewed by the advisor**, and finally **validated with the user** before
   moving to the next — incremental, collaborative cadence, no barreling ahead.
 - **Current status — the bwrap rewrite is far along: M2 through the main M6 slices have shipped;
   the genuinely-remaining pieces are blocked on the user.** **Provisioning (M3) complete through
   M3.5** — the per-project writable store + the Mode-B `/nix` read-write inversion, nix-in-cage
-  self-equip, `ops mise` passthrough + tool activation, `ops upgrade [nix|mise|flake]`, hermetic
-  TLS + a curated base toolset, and `ops search`. **Enforcement (M4) complete** — seccomp denylist
+  self-equip, `sbx mise` passthrough + tool activation, `sbx upgrade [nix|mise|flake]`, hermetic
+  TLS + a curated base toolset, and `sbx search`. **Enforcement (M4) complete** — seccomp denylist
   (Posture A, now trusted-relaxable via `[seccomp] allow`) + cgroup v2 resource limits + a trusted
   `[devices]` host-device grant into the cage's minimal `/dev` (Landlock-FS
-  is a deferred defense-in-depth option, not a gap). **Housekeeping (M5) complete** — `ops gc [--all] [--prune]` (session + per-project +
-  shared-store collection, including the stale rev-keyed flake out-link residual), `ops attach
-  <id>`, `ops stop <id>… | --all`, and a `--detach` background-agent path; the **one open M5 parity
+  is a deferred defense-in-depth option, not a gap). **Housekeeping (M5) complete** — `sbx gc [--all] [--prune]` (session + per-project +
+  shared-store collection, including the stale rev-keyed flake out-link residual), `sbx attach
+  <id>`, `sbx stop <id>… | --all`, and a `--detach` background-agent path; the **one open M5 parity
   hole is ssh-agent forwarding** (`$SSH_AUTH_SOCK`, a scoped trusted-only opt-in, deferred — the
   `container socket` row is N/A on this branch). **Network + secrets (M6) largely shipped** —
   Model-B egress (empty netns + an in-cage forwarder → a host MITM allowlisting proxy), host-side
   credential injection with outbound/inbound redaction, and the resolver / plugin / signed-store
-  layer. **The `ops app` framework + 48 importable profiles and 26 bundles shipped** — named agent launchers with a
+  layer. **The `sbx app` framework + 48 importable profiles and 26 bundles shipped** — named agent launchers with a
   per-app isolated `$HOME`, export/import, and `nix:` / `mise:` / `flake:` package backends. **The
   two genuinely-remaining pieces are blocked on the user:** the flagship live-auth e2e (a real API
   key, never the assistant's) and the signed-store *distribution* of profiles (a hosting URL + a

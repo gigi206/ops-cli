@@ -13,17 +13,17 @@ See also: [`[tools]` (mise)](../configuration/tools.md) · [`packages`](../confi
 
 - The in-cage mise builds a `nix:` tool into the **per-project** writable store (never
   the host), or installs any other mise backend.
-- **Open by design** — `sbx mise` works whether or not the project is trusted (the
+- **Open by design**: `sbx mise` works whether or not the project is trusted (the
   documented Mode-B self-equip inversion), unlike `sbx run`'s host-side `nix:`
   provisioning which is trusted-only.
 - For mise's own help, run `sbx mise help`.
 
 ## Install vs activate
 
-- `sbx mise install <token>` — builds/installs the tool. A bare install (not
+- `sbx mise install <token>`: builds/installs the tool. A bare install (not
   activated) stays reachable via `mise exec`/`mise which`; with shims on `PATH` it
   reports `No version is set`, pointing you to `mise use`.
-- `sbx mise use -g <token>` — **activates** the tool, so it is auto-on-`PATH` in later
+- `sbx mise use -g <token>`, **activates** the tool, so it is auto-on-`PATH` in later
   launches (via shims for `sbx run`, `mise activate` for an interactive `sbx run`).
 
 ## Examples

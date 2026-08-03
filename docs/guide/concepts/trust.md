@@ -22,7 +22,7 @@ The config schema is split by the trust gate, not by two schemas:
 where the user owns them, and referenced (`@group`, `use`) from anywhere.
 
 The `env` field is *free* because an untrusted project setting an environment
-variable can only harm itself inside the cage — with one exception: a **reserved-key
+variable can only harm itself inside the cage: with one exception: a **reserved-key
 denylist** blocks loader-control variables (`LD_*`, `NIX_LD`, `GCONV_PATH`, `PATH`,
 `HOME`, the proxy-control variables, …) so an untrusted project cannot subvert your
 later interactive sessions. See [`env`](../configuration/env.md).
@@ -48,13 +48,13 @@ There are two ways a config is trusted:
 launch loads the config, it recomputes the hash of the exact bytes it parses and
 compares:
 
-- **Trusted** — the hash matches; security fields apply.
-- **Changed** — a trust record exists but the file's bytes differ; security fields
+- **Trusted**: the hash matches; security fields apply.
+- **Changed**, a trust record exists but the file's bytes differ; security fields
   are dropped, with a warning distinct from the untrusted one (so you know a
   previously-trusted file was edited).
-- **Untrusted** — no trust record; security fields are dropped.
+- **Untrusted**: no trust record; security fields are dropped.
 
-Because the hash covers the *whole file*, any edit — even to a free field — re-arms
+Because the hash covers the *whole file*, any edit, even to a free field, re-arms
 the gate. This is deliberate: after editing a trusted file, its security fields stop
 applying until you run `sbx trust` again.
 

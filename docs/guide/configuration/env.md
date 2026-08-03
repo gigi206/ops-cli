@@ -1,4 +1,4 @@
-# `env` — environment variables
+# `env`: environment variables
 
 Extra environment variables for the sandbox.
 
@@ -23,7 +23,7 @@ structural (set by sbx)  <  passthrough (TERM/LANG)  <  sbx-injected  <  config 
 ```
 
 So a trusted config `env` value wins over `sbx`'s own structural defaults. (An
-untrusted config's `env` has already lost its reserved keys — see below — so it
+untrusted config's `env` has already lost its reserved keys, see below, so it
 cannot override those.) An app's `[app.<name>.env]` overlays the baseline `env`, the
 app winning on a key collision.
 
@@ -49,7 +49,7 @@ police the already-in-cage agent.
 ## Environment overrides for a single launch
 
 To set a cage variable for one launch without editing the file, use the one-shot
-override — `--env KEY=VALUE` (repeatable) or `SBX_ENV_<KEY>`:
+override: `--env KEY=VALUE` (repeatable) or `SBX_ENV_<KEY>`:
 
 ```sh
 sbx run --env RUST_LOG=debug -- cargo test
@@ -61,7 +61,7 @@ See [One-shot overrides](overrides.md).
 ## What the cage inherits
 
 The cage does **not** inherit your host environment. Only a small structural set
-(`TERM`, `LANG`, the paths `sbx` sets, and whatever `env` declares) reaches it — part
+(`TERM`, `LANG`, the paths `sbx` sets, and whatever `env` declares) reaches it: part
 of [confidentiality by absence](../concepts/security-model.md). So a variable a tool
 needs must be declared in `env` (or injected as a [secret](secret.md) if it is a
-credential — a credential should **not** go in `env`, which is visible in the cage).
+credential, a credential should **not** go in `env`, which is visible in the cage).

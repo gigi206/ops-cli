@@ -11,8 +11,8 @@ See also: [What sbx is](../concepts/overview.md) · [Configuration overview](../
 sbx doctor
 ```
 
-This verifies the [runtime requirements](doctor.md) — capability-bearing user
-namespaces, the bubblewrap engine, and nix — and reports the store location and
+This verifies the [runtime requirements](doctor.md): capability-bearing user
+namespaces, the bubblewrap engine, and nix: and reports the store location and
 channel revision. A missing requirement is a hard failure with a remediation hint,
 never a silent fallback.
 
@@ -23,7 +23,7 @@ sbx run -- id
 ```
 
 You should see a synthetic identity (`uid=1000(sandbox)`), not your host user. The
-host home and the rest of the host filesystem are **absent** from the cage — the
+host home and the rest of the host filesystem are **absent** from the cage: the
 [security model](../concepts/security-model.md) is confidentiality by absence. The
 command's exit status is propagated.
 
@@ -82,7 +82,7 @@ sbx config show
 ```
 
 Prints the layered, trust-gated configuration a launch would use, with each value
-tagged by where it came from — `(default)`, `(global)`, or `(project)`. Add
+tagged by where it came from: `(default)`, `(global)`, or `(project)`. Add
 `--details` to expand app overlays, or `--json` for tooling. See
 [`sbx config`](../cli/config.md).
 

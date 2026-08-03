@@ -2,7 +2,7 @@
 
 A project is configured by an optional `.sbx.toml` in its root. There is also a
 **global** config at [`~/.config/sbx/sbx.toml`](../concepts/directory-layout.md). Both
-use the **same schema** — the difference is only how they are trusted.
+use the **same schema**: the difference is only how they are trusted.
 
 See also: [The trust gate](../concepts/trust.md) · [Directory layout](../concepts/directory-layout.md) · [One-shot overrides](overrides.md).
 
@@ -23,9 +23,9 @@ tagged by the layer it came from.
 
 The schema is split by the [trust gate](../concepts/trust.md), not by two schemas:
 
-- **Free field** — [`env`](env.md) — applies from any project (minus a reserved-key
+- **Free field**, [`env`](env.md), applies from any project (minus a reserved-key
   denylist).
-- **Security fields** — everything else — apply only from a **trusted** source (the
+- **Security fields**, everything else, apply only from a **trusted** source (the
   global config, an app profile, or a project you have run [`sbx trust`](../cli/trust.md)
   on).
 
@@ -39,7 +39,8 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `env` | free | [env](env.md) |
 | `binds` | security | [binds](binds.md) |
 | `packages` | security | [packages](packages.md) |
-| `[flakes.<name>]` | security | [packages](packages.md#flakes--an-inline-nix-flake) |
+| `[flakes.<name>]` | security | [packages](packages.md#flakes-an-inline-nix-flake) |
+| `[tarball.<name>]`, `[deb.<name>]`, `[appimage.<name>]` (auto-upgrade resolvers) | security | [packages](packages.md#tarball-a-prebuilt-application-tarball) |
 | `nixpkgs` | security | [nixpkgs](nixpkgs.md) |
 | `[limits]` | security | [limits](limits.md) |
 | `[seccomp]` | security | [seccomp](seccomp.md) |
@@ -50,6 +51,8 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `audio` | security | [audio](audio.md) |
 | `dbus` | security | [dbus](dbus.md) |
 | `network` | security | [network](network.md) |
+| `[proc]` | security | [proc](proc.md) |
+| `forward` | security | [forward](../networking/forward.md) |
 | `[notify]` | security | [notify](notify.md) |
 | `[secret]` | security | [secret](secret.md) |
 | `[task.<name>]` | security | [task](task.md) |
@@ -58,13 +61,13 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[bundle.<name>]` | security (global-only) | [bundles](bundles.md) |
 | `use` | security | [bundles](bundles.md) |
 
-A project's mise files (`[tools]`, `.tool-versions`) are a related input — see
+A project's mise files (`[tools]`, `.tool-versions`) are a related input: see
 [`[tools]`](tools.md).
 
 ## Forward compatibility
 
 The schema is **additive**: every field is optional, and unknown fields are ignored.
-A config written for a newer `sbx` still loads on an older one — a new field is
+A config written for a newer `sbx` still loads on an older one: a new field is
 skipped rather than failing the parse. A malformed TOML file (or one that fails the
 [safety gate](../concepts/trust.md#the-safety-gate)) is dropped with a warning, never
 a hard failure that wedges a launch.
@@ -101,10 +104,10 @@ sbx app run review        # launch the agent with its own posture
 
 ## Editing the config
 
-- [`sbx config show`](../cli/config.md) — the resolved, trust-gated view.
-- [`sbx config set`/`unset`/`get`](../cli/config.md) — a single scalar key.
-- [`sbx config edit`](../cli/config.md) — open the file for array/table fields.
-- [`sbx config path`](../cli/config.md) — where the files are.
+- [`sbx config show`](../cli/config.md): the resolved, trust-gated view.
+- [`sbx config set`/`unset`/`get`](../cli/config.md): a single scalar key.
+- [`sbx config edit`](../cli/config.md): open the file for array/table fields.
+- [`sbx config path`](../cli/config.md): where the files are.
 
 Editing a trusted project file re-arms its [trust gate](../concepts/trust.md); pass
 `--trust` to re-trust in one step.

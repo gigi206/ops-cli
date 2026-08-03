@@ -1,7 +1,7 @@
-# `gui` — the display posture
+# `gui`: the display posture
 
 The sandbox's GUI posture: what a cage that draws is given. The three postures are
-ordered by host exposure — `none` < `offscreen` < `wayland`.
+ordered by host exposure: `none` < `offscreen` < `wayland`.
 
 ```toml
 gui = "none"        # the default — no display access
@@ -9,13 +9,13 @@ gui = "none"        # the default — no display access
 # gui = "wayland"   # all of the above, plus the host's compositor socket (read-only)
 ```
 
-`gui` is a **security field** — honored from the global config or a trusted project,
-ignored from an untrusted one — because exposing a compositor socket is a
+`gui` is a **security field**: honored from the global config or a trusted project,
+ignored from an untrusted one: because exposing a compositor socket is a
 confidentiality and integrity choice (clipboard access, and on some compositors screen
 capture or input injection). `offscreen` grants no host access at all, but rides the same
 gate so the postures stay one ordered field.
 
-See also: [Security model](../concepts/security-model.md) · [`[app.<name>]`](apps.md) · design doc [`bwrap-gui-wayland-spike-2026-06-22.md`](../../bwrap-gui-wayland-spike-2026-06-22.md).
+See also: [Security model](../concepts/security-model.md) · [`[app.<name>]`](apps.md).
 
 ## `none` (default)
 
@@ -24,14 +24,14 @@ posture for a headless agent or a CLI tool.
 
 ## `offscreen`
 
-For a cage that runs a **browser engine but never maps a window** — a headless Chromium
+For a cage that runs a **browser engine but never maps a window**: a headless Chromium
 driving page automation, as an agent's browser toolset does. It exposes **nothing** of the
 host; it provisions, inside the cage, the two things such an engine cannot work without:
 
 - **fonts + a fontconfig**, without which the engine starts but dies the moment it renders
   a real page;
 - under a [filtering egress posture](../networking/modes.md), the **egress proxy's CA
-  imported into the cage's NSS database** — Chromium ignores the CA-file environment
+  imported into the cage's NSS database**, Chromium ignores the CA-file environment
   variables `sbx` sets and reads its own store, so without this every page fails with
   `ERR_CERT_AUTHORITY_INVALID`.
 
@@ -53,12 +53,12 @@ chromium = "nix:chromium"
 ## `wayland`
 
 `sbx` binds the host's Wayland compositor socket **read-only** into the cage (the
-socket *file*, `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` — never `$XDG_RUNTIME_DIR` itself,
+socket *file*, `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`: never `$XDG_RUNTIME_DIR` itself,
 which holds other agents' sockets), sets `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`, and
 provisions fonts + a fontconfig so text renders. A graphical app can then map a window
 on the host compositor.
 
-The GUI hole composes with a [network allowlist](../networking/modes.md) — a desktop
+The GUI hole composes with a [network allowlist](../networking/modes.md): a desktop
 agent can have a display *and* filtered egress at once.
 
 ### Why Wayland only, never X11
@@ -70,7 +70,7 @@ isolation prevents on a well-behaved compositor.
 ### App argv, not GUI state
 
 A Chromium/Electron app needs its own flags (`--no-sandbox --ozone-platform=wayland
---disable-gpu --disable-dev-shm-usage`) to run under the cage — `--no-sandbox` is
+--disable-gpu --disable-dev-shm-usage`) to run under the cage: `--no-sandbox` is
 mandatory and acceptable because bubblewrap + seccomp + the empty netns *is* the
 boundary. These are the app's command arguments (in a profile's `cmd`), not part of the
 `gui` posture.

@@ -7,19 +7,19 @@ ignored, as the spec requires, and `sbx` falls back to `$HOME`.
 
 See also: [The trust gate](trust.md) · [Provisioning](provisioning.md) · [Configuration overview](../configuration/README.md).
 
-## Config — what you declare
+## Config: what you declare
 
 `$XDG_CONFIG_HOME/sbx/` (else `$HOME/.config/sbx/`):
 
 | Path | Contents |
 |---|---|
-| `sbx.toml` | the **global** config — [trusted by location](trust.md) |
-| `apps/<name>.toml` | imported **app profiles** — trusted by location |
+| `sbx.toml` | the **global** config: [trusted by location](trust.md) |
+| `apps/<name>.toml` | imported **app profiles**: trusted by location |
 
 A project's `.sbx.toml` lives in the project directory itself, not here, and is
 [trusted by content](trust.md).
 
-## Data — what sbx provisions and runs
+## Data: what sbx provisions and runs
 
 `$SBX_DATA_DIR`, else a volume adopted with [`sbx storage use`](../cli/storage.md), else
 `$XDG_DATA_HOME/sbx/` (else `$HOME/.local/share/sbx/`). Owner-only.
@@ -38,7 +38,7 @@ The important subtrees:
 | `engine/` | the bundled `nix` / `bwrap` engines a self-contained release materializes |
 | `gcroots/` | gcroots keeping provisioned closures alive (base, mise, gui, per-project) |
 | `projects/<id>/` | the **per-project** writable store and its locks |
-| `projects/<id>/apps/<name>/mise/` | a global app's **per-project mise pool** — its `nix:`-via-mise self-equips, kept `/nix`-aligned |
+| `projects/<id>/apps/<name>/mise/` | a global app's **per-project mise pool**: its `nix:`-via-mise self-equips, kept `/nix`-aligned |
 | `apps/<name>/home/` | an app's persistent isolated `$HOME` (`home_scope = "global"`) |
 | `sessions/` | the daemonless session registry ([`sbx session ls`](../housekeeping/sessions.md)) |
 | `egress/` | per-launch egress proxy sockets and CA material |
@@ -49,20 +49,19 @@ The important subtrees:
 | `mise-engine.lock` | the mise engine revision, independent of the base channel |
 
 The **per-project** directory `projects/<id>/` holds the project's own writable nix
-store (seeded from the shared store) plus its resolution locks —
-`nixpkgs.lock` (a project pin), `tools.lock` (resolved `nix:` mise tools), and
-`flake-packages.lock` (pinned `flake:` packages) — and, under `apps/<name>/mise/`, a
+store (seeded from the shared store) plus its resolution locks, `nixpkgs.lock` (a project pin), `tools.lock` (resolved `nix:` mise tools), and
+`flake-packages.lock` (pinned `flake:` packages): and, under `apps/<name>/mise/`, a
 global app's [per-project mise pool](../apps/home.md#two-mise-pools-keep-a-global-apps-self-equips-aligned)
 (its `nix:`-via-mise self-equips, kept aligned with this project's store). See
 [Provisioning](provisioning.md) for how the per-project store works.
 
-## State — the trust records
+## State: the trust records
 
 `$XDG_STATE_HOME/sbx/trusted/` (else `$HOME/.local/state/sbx/trusted/`): one marker
 per trusted project config, holding the SHA-256 of the file's contents, keyed by the
 config's canonical path. See [The trust gate](trust.md).
 
-The trust store dir is required to be an **absolute** path — a relative base would
+The trust store dir is required to be an **absolute** path: a relative base would
 let a cloned repository pre-approve itself.
 
 ## Why the control plane is under `$HOME`

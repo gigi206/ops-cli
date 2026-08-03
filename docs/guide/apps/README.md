@@ -1,6 +1,6 @@
 # The app framework
 
-An **app** is a named, reusable agent launcher — the flagship surface of `sbx`. It
+An **app** is a named, reusable agent launcher: the flagship surface of `sbx`. It
 bundles a command with a security and tooling overlay so you can run an autonomous
 agent *on* untrusted code, safely and repeatably.
 
@@ -29,12 +29,12 @@ overlay, as the final word.
 
 An app is the locked-down [agent posture](../concepts/overview.md#the-two-actor-modes):
 
-- Its own **persistent isolated `$HOME`** — the agent's config, login state, and
+- Its own **persistent isolated `$HOME`**: the agent's config, login state, and
   history never bleed into your project shell or another app. See [Per-app home](home.md).
-- **Read-by-default egress** — an app's allow rules default to `{GET,HEAD}`, so an
+- **Read-by-default egress**: an app's allow rules default to `{GET,HEAD}`, so an
   agent reads but does not write unless a rule opts a host out. See
   [`default_methods`](../configuration/network.md#default_methods-apps).
-- **Host-side credential injection** — the API key is read on the host and injected on
+- **Host-side credential injection**: the API key is read on the host and injected on
   the wire by the [egress proxy](../secrets/injection.md); it never enters the cage.
 
 ## The flagship property
@@ -52,16 +52,16 @@ under the app's posture), nor flip a trusted app's [`home_scope`](home.md) from
 
 ## Declaring an app
 
-- **Inline** — a `[app.<name>]` table in a project `.sbx.toml` (or the global
+- **Inline**, a `[app.<name>]` table in a project `.sbx.toml` (or the global
   `sbx.toml`, though a *global* app is best kept as a profile file). See
   [`[app.<name>]`](../configuration/apps.md).
-- **A profile file** — a standalone `apps/<name>.toml`, imported with
+- **A profile file**: a standalone `apps/<name>.toml`, imported with
   [`sbx app import`](../cli/app.md). This is the portable form. See
   [Portable profiles](profiles.md).
 
 ## Where to go next
 
-- [Per-app isolated `$HOME`](home.md) — persistence and the `home_scope` choice.
-- [Portable profiles](profiles.md) — import, export, and the trust act.
-- [Profile catalog](catalog.md) — the agent profiles shipped in this repository.
-- [Secrets](../secrets/README.md) — how a credential is injected without entering the cage.
+- [Per-app isolated `$HOME`](home.md): persistence and the `home_scope` choice.
+- [Portable profiles](profiles.md): import, export, and the trust act.
+- [Profile catalog](catalog.md): the agent profiles shipped in this repository.
+- [Secrets](../secrets/README.md): how a credential is injected without entering the cage.

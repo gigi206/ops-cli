@@ -1,7 +1,7 @@
-# Redaction — the secret tripwires
+# Redaction: the secret tripwires
 
 The never-in-cage invariant keeps a secret's plaintext on the host. But a secret
-`sbx` injects on the wire could, in principle, leak back the other way — an agent
+`sbx` injects on the wire could, in principle, leak back the other way: an agent
 that somehow *already* holds a token could try to re-send it, or a cooperating
 allowed upstream could reflect an injected header into its response body. `sbx`
 adds two byte-exact tripwires, one per direction, as **backstops**. Be clear on
@@ -12,7 +12,7 @@ boundary**.
 
 When a request leaves the cage, the proxy scans the **decrypted request head**
 for any configured secret value. If a secret appears verbatim, the proxy
-**refuses the whole request** — it blocks, it does not strip:
+**refuses the whole request**: it blocks, it does not strip:
 
 - category **`outbound-secret`**, HTTP **`403`**;
 - scanned on the **pre-injection** client bytes, so `sbx`'s own injection never
@@ -34,7 +34,7 @@ use secrets of reasonable length (real tokens already are).
 ### Head-only, by design
 
 Only the request **head** is scanned. The body is streamed, and a clean
-block-not-strip on the body would need to buffer it — a cap that either
+block-not-strip on the body would need to buffer it: a cap that either
 fails-closed on large uploads or is beaten by padding. Scanning the head covers
 where a leaked credential naturally lands (a header, a query string); the body is
 left to the structural boundary below.
@@ -42,44 +42,44 @@ left to the structural boundary below.
 ## Inbound: mask a secret a target reflects back
 
 The one place a configured secret can legitimately re-enter the cage is a
-response **from an injection-target host** — a cooperating or misconfigured
+response **from an injection-target host**: a cooperating or misconfigured
 upstream that echoes the header `sbx` injected. For those responses only, the
 proxy **masks** every verbatim occurrence of the secret value as it streams the
 response back, replacing it with an **equal-length run of `*`**:
 
-- **mask, not block** — unlike the outbound case, the response also carries
+- **mask, not block**: unlike the outbound case, the response also carries
   legitimate content the agent needs, so `sbx` masks the secret in place rather
   than dropping the whole response;
-- **equal-length** — the `*` run is the same byte length as the secret, so
+- **equal-length**: the `*` run is the same byte length as the secret, so
   `Content-Length`/chunked framing stays intact and `*` never introduces a
   `CR`/`LF`;
-- **streaming-safe** — the proxy carries the trailing bytes of each chunk so a
+- **streaming-safe**: the proxy carries the trailing bytes of each chunk so a
   value straddling two reads is still caught.
 
 ### Scoped to injection-target responses only
 
 Inbound masking runs **only** on responses from a host `sbx` injects a secret
-into — the only place a configured secret can reflect. The always-on nix-cache
+into, the only place a configured secret can reflect. The always-on nix-cache
 lane and every non-target response stream through untouched, so a coincidental
 byte match in unrelated traffic cannot corrupt it. The trade-off: masking mutates
 the stream, so a coincidental collision *within* a target host's response would
-be masked too — entropy and the 8-byte floor make that vanishingly unlikely, and
+be masked too, entropy and the 8-byte floor make that vanishingly unlikely, and
 it is confined to the one host.
 
 ## Honest scope: these are backstops, not the boundary
 
 Both tripwires are **byte-exact**. They catch a secret sent or reflected
-*verbatim*. They do **not** catch a secret that is re-encoded first — base64,
+*verbatim*. They do **not** catch a secret that is re-encoded first: base64,
 gzip, chunk-splitting, or any transform defeats a byte-exact scan. `sbx` does not
 pretend otherwise.
 
 The actual guarantee is structural, and it is the trio you should rely on:
 
-1. **Empty netns** — the cage has no route of its own; its only egress is the
+1. **Empty netns**: the cage has no route of its own; its only egress is the
    host proxy.
-2. **The egress allowlist** — the cage can only reach the hosts the policy
+2. **The egress allowlist**: the cage can only reach the hosts the policy
    permits. See [../networking/modes.md](../networking/modes.md).
-3. **Host/`to` bounding** — a credential is injected only toward its one concrete
+3. **Host/`to` bounding**: a credential is injected only toward its one concrete
    destination host, never anywhere else.
 
 The tripwires reduce the *naive verbatim* leak in both directions; the three
@@ -89,12 +89,12 @@ if it does leak. See the resolver guidance in [resolvers.md](resolvers.md).
 
 ## See also
 
-- [injection.md](injection.md) — the broker whose injected header these tripwires
+- [injection.md](injection.md): the broker whose injected header these tripwires
   guard, and the reflecting-upstream residual.
-- [README.md](README.md) — the never-in-cage invariant and least-privilege at the
+- [README.md](README.md): the never-in-cage invariant and least-privilege at the
   source.
-- [../networking/modes.md](../networking/modes.md) — the empty-netns + allowlist
+- [../networking/modes.md](../networking/modes.md): the empty-netns + allowlist
   boundary the tripwires sit behind.
-- [../../bwrap-secrets-architecture.md](../../bwrap-secrets-architecture.md) — the
+- [https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture.md](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture.md): the
   design's honest residuals (reflecting upstream, encoding-evasion, masking's
   limits).

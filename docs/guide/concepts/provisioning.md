@@ -1,8 +1,8 @@
 # Provisioning
 
 `sbx` runs tools inside a hermetic cage that has **no host `/usr`** and **no host
-`/nix`**. Everything the cage needs — the base userland, the tools a project
-declares, and the tools an agent installs for itself — is provisioned by
+`/nix`**. Everything the cage needs: the base userland, the tools a project
+declares, and the tools an agent installs for itself: is provisioned by
 **daemonless [nix](https://nixos.org/)** into a store `sbx` owns, and bound into the
 cage. This page explains that store model and how it stays reproducible.
 
@@ -25,7 +25,7 @@ lock; a launch reads the lock that `upgrade` wrote. See
 
 ## The shared store
 
-`sbx` drives nix **daemonlessly** — no host `/nix`, no `nix-daemon`, no multi-user
+`sbx` drives nix **daemonlessly**: no host `/nix`, no `nix-daemon`, no multi-user
 setup. It provisions the base userland (glibc, gcc, bash, coreutils, and more) into
 its own user-owned store at `<data>/store/nix/store`, keeps each output alive with a
 gcroot, and binds that store **read-only** into a cage as `/nix`.
@@ -41,20 +41,20 @@ cache-substituted path is safe to share across projects; the only unsigned paths
 
 A read-only shared store cannot host an agent that installs its own tools. So each
 project also gets its **own real nix store** under `<data>/projects/<id>/`, and the
-cage's `/nix` is a **read-write bind of that per-project store** — the Mode-B
+cage's `/nix` is a **read-write bind of that per-project store**: the Mode-B
 inversion. This is **default-on and never a configurable field**: an untrusted
 project cannot keep the shared store mounted or widen its access.
 
 The per-project store is **seeded from the shared store** by reflink-or-copy
 (`FICLONE`): copy-on-write where the filesystem supports it (near-free), a full copy
 on ext4. Each seeded path is a **physically independent inode**. A hard link was
-deliberately rejected — a same-uid write through a hard link would poison the shared
-base for every other project — so the seed gives each project a private copy that an
+deliberately rejected, a same-uid write through a hard link would poison the shared
+base for every other project: so the seed gives each project a private copy that an
 in-cage write can only affect locally.
 
 **Disk cost, in practice.** On a copy-on-write filesystem (btrfs, or xfs with
 reflinks) the seed shares blocks with the shared store, so a project's store costs
-almost nothing on disk until the cage writes into it — many projects seeded from the
+almost nothing on disk until the cage writes into it: many projects seeded from the
 same base together take roughly one copy of it. On **ext4** (no reflinks) each
 project's store is a full, byte-for-byte copy of its closure, so *N* projects that
 share a base each carry their own copy of it. Reclaim a project's store with
@@ -66,12 +66,11 @@ The net effect:
 > An agent that self-equips writes **only** into its project's own store. The shared
 > store stays immutable, and one project's installs never touch another's.
 
-The per-project directory also holds that project's resolution locks —
-`nixpkgs.lock` (a project channel pin), `tools.lock` (resolved `nix:` mise tools),
+The per-project directory also holds that project's resolution locks, `nixpkgs.lock` (a project channel pin), `tools.lock` (resolved `nix:` mise tools),
 and `flake-packages.lock` (pinned `flake:` packages). See
 [Directory layout](../concepts/directory-layout.md).
 
-## nix and mise in the cage — the agent self-equips
+## nix and mise in the cage: the agent self-equips
 
 The base userland carries **nix and [mise](https://mise.jdx.dev/) themselves**, so
 an agent can equip a project's toolchain from inside the cage, building into the
@@ -91,15 +90,15 @@ A tool installed with `mise use` is auto-on-PATH in later launches; a bare
 
 The cage has no host `/etc/ssl`, so `sbx` provisions its **own** CA certificate
 bundle (`cacert`) into the base userland and binds it read-only at **both**
-conventional certificate paths — `ca-bundle.crt` (nix's libcurl default) and
+conventional certificate paths: `ca-bundle.crt` (nix's libcurl default) and
 `ca-certificates.crt` (the OpenSSL / reqwest spelling). Both are needed because the
 two TLS clients in the cage disagree on where the bundle lives. In-cage TLS
 therefore never depends on the host having a CA bundle.
 
 ## A curated base toolset
 
-The base userland ships a small everyday CLI set — `curl`, `git`, `less`, `grep`,
-`sed`, `awk`, `find`, `which` — provisioned into `sbx`'s store and **sharing the
+The base userland ships a small everyday CLI set: `curl`, `git`, `less`, `grep`,
+`jq`, `sed`, `awk`, `find`, `which`: provisioned into `sbx`'s store and **sharing the
 base glibc**. An agent gets the ordinary tools without declaring them (and the
 in-cage mise plugin, which shells out to `find` / `which`, has them available).
 
@@ -123,9 +122,9 @@ The default build is unchanged and uses the host engines.
 
 The two engines differ in how complete the independence is:
 
-- **nix — total.** When the bundled engine is present, `sbx` uses it in preference
+- **nix, total.** When the bundled engine is present, `sbx` uses it in preference
   to a host nix.
-- **bwrap — partial.** On a host where
+- **bwrap: partial.** On a host where
   `kernel.apparmor_restrict_unprivileged_userns` is set, only a binary carrying an
   AppArmor profile that allows `userns` may create an unprivileged user namespace,
   and that profile is attached by path to the host's `/usr/bin/bwrap`. So on a
@@ -138,11 +137,11 @@ The two engines differ in how complete the independence is:
 
 ## See also
 
-- [Directory layout](../concepts/directory-layout.md) — where the stores and locks live
-- [`packages` configuration](../configuration/packages.md) — declaring `nix:` / `mise:` / `flake:` tools
-- [`nixpkgs` configuration](../configuration/nixpkgs.md) — pinning the channel
-- [`tools` configuration](../configuration/tools.md) — mise `[tools]` and self-equip
-- [Upgrading](../housekeeping/upgrade.md) — how versions actually move
+- [Directory layout](../concepts/directory-layout.md): where the stores and locks live
+- [`packages` configuration](../configuration/packages.md): declaring `nix:` / `mise:` / `flake:` tools
+- [`nixpkgs` configuration](../configuration/nixpkgs.md): pinning the channel
+- [`tools` configuration](../configuration/tools.md): mise `[tools]` and self-equip
+- [Upgrading](../housekeeping/upgrade.md): how versions actually move
 - [`sbx mise` reference](../cli/mise.md) · [`sbx upgrade` reference](../cli/upgrade.md)
-- [Enforcement stack](enforcement.md) — the always-on layers the cage runs behind
-- Design docs: [store de-risk](../../bwrap-store-derisk-2026-06-15.md) · [architecture](../../bwrap-architecture.md)
+- [Enforcement stack](enforcement.md): the always-on layers the cage runs behind
+- Design: [architecture](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-architecture.md) — the validated store layout, the trust-gated provisioning gate, and the dry-run preflight that determines fetch vs. build.

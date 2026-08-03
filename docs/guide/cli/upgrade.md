@@ -25,7 +25,7 @@ See also: [Upgrading toolchains](../housekeeping/upgrade.md) · [Provisioning](.
 
 ## Behavior
 
-`sbx upgrade` is **context-aware** — it re-resolves the source the target directory
+`sbx upgrade` is **context-aware**: it re-resolves the source the target directory
 tracks and rewrites *that* lock (a trusted project pin → the per-project lock, else the
 global one). This is the only way a *channel* pin (`nixos-23.11`) advances within
 itself. Lock writes are atomic (a reader sees old-or-new, never torn).
@@ -44,7 +44,7 @@ misconfiguration: mise's `aqua:` backend reads the GitHub API, whose anonymous c
 ### Targeting another project
 
 By default a roll acts on the project in the current directory. `--project <path>` runs
-the whole command against another project instead — identical to `cd <path> && sbx
+the whole command against another project instead: identical to `cd <path> && sbx
 upgrade`, with the same trust gate, pin, and per-project locks. The path must be an
 existing directory. This matters for the per-project backends (`flake:`, `deb:`,
 `appimage:`, `tarball:`, the `nix:` tools, and the in-cage `mise:` roll): an app's pins

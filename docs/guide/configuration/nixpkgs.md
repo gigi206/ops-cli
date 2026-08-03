@@ -1,4 +1,4 @@
-# `nixpkgs` — pin the channel or revision
+# `nixpkgs`: pin the channel or revision
 
 Override the nixpkgs reference the base userland and tools resolve against.
 
@@ -7,17 +7,17 @@ nixpkgs = "nixos-23.11"                                   # a branch/channel
 # nixpkgs = "3e0ce8c5d4a1...40-hex-revision..."          # an exact revision
 ```
 
-`nixpkgs` is a **security field** — honored from the global config or a trusted
-project, ignored from an untrusted one — because the source of your toolchain is a
+`nixpkgs` is a **security field**: honored from the global config or a trusted
+project, ignored from an untrusted one: because the source of your toolchain is a
 supply-chain-relevant choice.
 
 See also: [Provisioning](../concepts/provisioning.md) · [`sbx upgrade`](../housekeeping/upgrade.md) · [`packages`](packages.md).
 
 ## What it accepts
 
-- A **branch/channel** name — e.g. `nixos-23.11`, `nixos-unstable` (the default when
+- A **branch/channel** name: e.g. `nixos-23.11`, `nixos-unstable` (the default when
   unset).
-- A **40-hex revision** under `NixOS/nixpkgs` — an exact, immutable pin.
+- A **40-hex revision** under `NixOS/nixpkgs`: an exact, immutable pin.
 
 The value is charset-validated before it reaches a flake reference. Forks and
 arbitrary flake refs are not accepted.
@@ -40,13 +40,13 @@ their glibc aligned.
 
 (An exception: `nix:` tools declared in a [`[tools]`](tools.md) mise file each resolve
 to their own revision and run via the [nix-ld shim](../concepts/provisioning.md), which
-handles the skew. The coarse `nixpkgs` field stays channel-wide by design — it is the
+handles the skew. The coarse `nixpkgs` field stays channel-wide by design: it is the
 OS-substrate layer.)
 
 ## Source-aware locks
 
 The resolved revision is recorded in a lock so versions do not move on an `sbx` binary
-update — only on an explicit [`sbx upgrade`](../housekeeping/upgrade.md):
+update, only on an explicit [`sbx upgrade`](../housekeeping/upgrade.md):
 
 - A **global** override records to the shared `<data>/nixpkgs.lock`.
 - A trusted **project** pin records to a per-project
@@ -59,7 +59,7 @@ source stays fixed. A first launch of a pinned project downloads its own base cl
 ## Rolling a channel forward
 
 A **channel** pin (`nixos-23.11`) advances *within itself* only via `sbx upgrade` run
-in that project — a global upgrade would not touch a project's own pin. A **revision**
+in that project, a global upgrade would not touch a project's own pin. A **revision**
 pin refreshes to itself (a no-op). See [Upgrading](../housekeeping/upgrade.md).
 
 ## Viewing the effective channel

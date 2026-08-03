@@ -1,6 +1,6 @@
-# `binds` — extra host paths
+# `binds`: extra host paths
 
-Extra host paths to expose inside the sandbox — **read-only by default**, or
+Extra host paths to expose inside the sandbox, **read-only by default**, or
 read-write with the table form.
 
 ```toml
@@ -26,7 +26,7 @@ See also: [Security model](../concepts/security-model.md) · [The trust gate](..
 - A **read-write** bind additionally lets the cage write through to the host path.
 
 Remember the [same-uid model](../concepts/security-model.md): a read-only bind
-protects **integrity**, not **confidentiality** — the process inside runs as your
+protects **integrity**, not **confidentiality**: the process inside runs as your
 uid, so it can *read* whatever is bound. To keep a secret out of the cage, do not
 bind it at all; bind read-only only what the tool may read but must not modify.
 
@@ -38,7 +38,7 @@ bind it at all; bind read-only only what the tool may read but must not modify.
   best-effort bind), so a portable config referencing an optional path still works.
 - A leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` is expanded from your environment, so
   a portable config need not hard-code an absolute home path. **Any other `$VAR` is
-  refused** — no arbitrary environment interpolation.
+  refused**: no arbitrary environment interpolation.
 
 ## Editing binds
 
@@ -54,7 +54,7 @@ sbx config edit --trust  # and re-trust in one step
 ## Layering with the structural mounts
 
 A config bind is emitted **before** `sbx`'s structural mounts (`/nix`, the synthetic
-identity, the project), so a colliding entry is **shadowed** — a bind cannot displace
+identity, the project), so a colliding entry is **shadowed**: a bind cannot displace
 `/nix` or the synthetic `/etc`.
 
 One known nuance: a config bind that **nests** with a structural mount (rather than
@@ -66,14 +66,13 @@ bind's destination nests with a structural mount.
 
 ## The control plane is protected
 
-`sbx`'s own state — its data, trust, and config directories, all under your `$HOME` —
-is protected regardless of what a bind requests:
+`sbx`'s own state, its data, trust, and config directories, all under your `$HOME`: is protected regardless of what a bind requests:
 
 - A read-write bind aimed **at or inside** one of `sbx`'s directories is **forced
   read-only**, with a warning.
 - A broad read-write bind that merely **contains** them (e.g. `mode = "rw"` on your
   whole `$HOME`) **stays read-write**, but each `sbx` root is **pinned read-only in
-  place** — so the rest of the tree is writable while the agent still cannot alter
+  place**, so the rest of the tree is writable while the agent still cannot alter
   what `sbx` runs or trusts.
 
 This closes an escalation where a writable parent directory would let the agent

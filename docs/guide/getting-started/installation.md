@@ -10,12 +10,12 @@ See also: [`sbx doctor` and prerequisites](doctor.md) · [Quick start](quickstar
 
 Before `sbx` can launch anything it needs:
 
-- **Capability-bearing unprivileged user namespaces** — the security boundary
+- **Capability-bearing unprivileged user namespaces**: the security boundary
   everything rests on. Without them there is no boundary, so `sbx doctor`
   **hard-fails** rather than falling back to a weaker mechanism.
-- **The bubblewrap engine** (`bwrap`) — the sandbox itself. A release can embed its
+- **The bubblewrap engine** (`bwrap`): the sandbox itself. A release can embed its
   own static `bwrap`; otherwise the host's is used.
-- **The `nix` binary** — drives the user-owned store. A release can embed its own
+- **The `nix` binary**: drives the user-owned store. A release can embed its own
   static `nix`; otherwise the host's is used.
 
 Run [`sbx doctor`](doctor.md) to check all of these at once. On a restricted
@@ -61,15 +61,51 @@ cargo build && cargo fmt --check && cargo clippy --all-targets -- -D warnings &&
 ```
 
 The heavy sandbox end-to-end tests skip (rather than fail) when the host lacks user
-namespaces, nix, or network — so the suite is green on a constrained CI runner.
+namespaces, nix, or network: so the suite is green on a constrained CI runner.
 
 ## Development tasks
 
 Common tasks are wired through mise:
 
 ```sh
-mise run fmt     # cargo fmt --check
-mise run lint    # cargo clippy --all-targets -- -D warnings
-mise run test    # cargo test
-mise run ci      # all of the above
+mise run fmt             # cargo fmt --check
+mise run lint            # cargo clippy --all-targets -- -D warnings
+mise run test            # cargo test (unit only — fast, network-free)
+mise run coverage        # cargo-llvm-cov coverage report (pass --html for a browsable report)
+mise run ci              # fmt + lint + test, as CI runs them
+```
+
+The self-contained build has its own pair of tasks:
+
+```sh
+mise run build-bundled   # release musl binary WITH the embedded nix + bwrap engines (needs host nix)
+mise run lint-bundled    # compile + clippy the bundled-* feature paths (needs host nix)
+```
+
+(The `static-nix` / `static-bwrap` steps those depend on are internal — hidden in `mise.toml`.)
+
+## Building the documentation site
+
+The user guide lives in [`docs/guide/`](https://github.com/gigi206/ops-cli/tree/ops-v2/docs/guide/) and is built with mkdocs +
+the Material theme. Mermaid diagrams in the guide render server-side as SVG at
+build time — the
+[`mkdocs-mermaid2-plugin`](https://github.com/fralau/mkdocs-mermaid2-plugin) is
+configured in [`mkdocs.yml`](https://github.com/gigi206/ops-cli/blob/ops-v2/mkdocs.yml) (see the comments alongside
+the entry for why no extra markdown-extension config is required).
+
+```sh
+mise run docs-install   # mkdocs + mkdocs-material + mkdocs-mermaid2-plugin
+mise run docs           # local preview at http://localhost:8000 (live reload)
+mise run docs-build     # strict build into ./site/ (CI uses this)
+```
+
+A diagram is a fenced block labelled `mermaid`:
+
+```mermaid
+flowchart LR
+    config["config"]
+    trust["trust gate"]
+    sandbox["SandboxSpec"]
+    bwrap["bwrap argv"]
+    config --> trust --> sandbox --> bwrap
 ```

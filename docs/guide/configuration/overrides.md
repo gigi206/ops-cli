@@ -2,14 +2,14 @@
 
 A one-shot override changes **any** configuration field for a **single launch**,
 without editing a file. It is carried on the command line (or the environment) and is
-the **authoritative final word** — it beats a trusted project config *and* an app's own
+the **authoritative final word**: it beats a trusted project config *and* an app's own
 posture.
 
 See also: [Configuration overview](README.md) · [`sbx run`](../cli/run.md) · [`sbx app`](../cli/app.md) · [Environment variables](../reference/environment-variables.md).
 
 ## Why it is authoritative (trusted by invocation)
 
-An override comes from the **invoker** — whoever runs `sbx` — whose authority over the
+An override comes from the **invoker**, whoever runs `sbx`, whose authority over the
 host process's argv and environment no lower-trust context can reach. So it is
 **trusted by invocation** (it touches no trust marker) and beats even a trusted project
 config or a named app's overlay. This is distinct from the direnv content-trust of a
@@ -17,7 +17,7 @@ project config.
 
 ## The two surfaces
 
-### Whole-schema blob — `--config` / `SBX_CONFIG`
+### Whole-schema blob: `--config` / `SBX_CONFIG`
 
 Inline TOML (or `@<file>`) shaped exactly like an `sbx.toml`, so it can set **any**
 field. Repeatable (later wins).
@@ -29,7 +29,7 @@ SBX_CONFIG='[limits]
 tasks_max = 4096' sbx run -- ./build.sh
 ```
 
-### Typed flags — one field each
+### Typed flags: one field each
 
 Ergonomic shorthands for a single field, each with an `SBX_*` environment equivalent:
 
@@ -48,6 +48,7 @@ Ergonomic shorthands for a single field, each with an `SBX_*` environment equiva
 | `--seccomp <token[,token…]>` | `SBX_SECCOMP` | relax the syscall denylist ([`[seccomp]`](seccomp.md) grammar); repeatable |
 | `--device <path>` | `SBX_DEVICE` | grant a host device node ([`[devices]`](devices.md)); repeatable |
 | `--gpu[=true\|false]` | `SBX_GPU` | the [GPU](gpu.md) posture (bare `--gpu` means `true`) |
+| `--audio[=true\|false]` | `SBX_AUDIO` | the [audio](audio.md) posture: microphone and playback (bare `--audio` means `true`) |
 | `--dbus[=true\|false]` | `SBX_DBUS` | the in-cage [desktop portal](dbus.md) (bare `--dbus` means `true`) |
 
 ```sh
@@ -58,19 +59,19 @@ sbx run --device /dev/kvm -- ./vm.sh      # grant a device for one run
 SBX_NET=none SBX_BIND=/opt/data:ro sbx run
 ```
 
-#### `--seccomp` / `--device` — relaxing the cage for one launch
+#### `--seccomp` / `--device`: relaxing the cage for one launch
 
 A config file gates [`[seccomp]`](seccomp.md) and [`[devices]`](devices.md)
 **trusted-only** (an untrusted project's is dropped). A one-shot override is **trusted by
-invocation** — the person running `sbx` already commands the host process's argv and
+invocation**, the person running `sbx` already commands the host process's argv and
 environment, and so **outranks any config layer**. So `--seccomp`/`--device` *may* relax the
 denylist and grant a device: exactly the relaxation/grant a *trusted config* can already
-declare, extended to the more-trusted invoker (parity with the trusted config — not the
+declare, extended to the more-trusted invoker (parity with the trusted config: not the
 `--net`/`--bind` axis). Note relaxing the denylist re-permits a syscall whose only
-containment was the filter, widening the **in-cage kernel attack surface** — so a stale
+containment was the filter, widening the **in-cage kernel attack surface**: so a stale
 `SBX_SECCOMP` matters more than a stale `SBX_NET` (both print an ambient-source notice).
 `--device` takes one path per flag (not comma-split). A bad token or a non-`/dev/` path is
-warned and skipped (less relaxation/no device — fail-closed), never fatal. Granting a device
+warned and skipped (less relaxation/no device: fail-closed), never fatal. Granting a device
 node exposes it; it does not confer a Linux capability, so a device that needs one (a VPN
 tun) is not made *usable* this way.
 
@@ -79,25 +80,25 @@ no `--ssh-agent`, but a `--config` blob's `[ssh_agent] allow` is honored for one
 unions onto the configured grant, like `--device`. An unmatchable entry is warned and
 skipped, never fatal.
 
-#### `--proc` — the exec posture for one launch
+#### `--proc`: the exec posture for one launch
 
 `--proc` sets only the [exec](proc.md) **mode** (`off`/`observe`/`enforce`/`ask`), the bare-string
 form of the `proc` field. Because an override is trusted by invocation, it may raise, lower, or
-**disable** enforcement for one run regardless of the config or app layers — so `--proc off`
+**disable** enforcement for one run regardless of the config or app layers: so `--proc off`
 turns off a trusted project's `enforce` for a single launch (top authority, the same as
 `--gpu=false`), and `--proc enforce` stands enforcement up where a project set none. A mistyped
 mode is a **hard error** (like `--gui`/`--net`): keeping the baseline could leave *less*
 enforcement than you asked for, a fail-open a security posture must not have.
 
-The one-shot **allow/deny lists** are not on this flag — set them in a `--config` blob's `[proc]`
+The one-shot **allow/deny lists** are not on this flag: set them in a `--config` blob's `[proc]`
 table (`sbx run --config '[proc]\nmode="enforce"\ndeny=["curl"]' -- …`), or add them live to a
 running session with [`sbx proc allow`/`deny --session`](proc.md). A bare `--proc <mode>` **replaces
 the whole policy** (mode *and* any lists), so put the mode and its lists **together in one `--config`
-blob** — do **not** split them across `--proc enforce` + `--config '[proc] deny=[…]'`, as the typed
+blob**: do **not** split them across `--proc enforce` + `--config '[proc] deny=[…]'`, as the typed
 `--proc` beats the blob wholesale and would silently discard the deny list (leaving you with
 enforce-*nothing*, a fail-open).
 
-#### `--notify` — how loudly one launch speaks
+#### `--notify`: how loudly one launch speaks
 
 `--notify` sets one [notification](notify.md) **mode** (`off`/`once`/`always`) for **every**
 event, the bare-string form of the `notify` field. It is the flag for the two moments the
@@ -107,7 +108,7 @@ config has gone quiet. A mistyped mode is a **hard error**, like `--proc`: falli
 baseline could run the launch *quieter* than you asked, and a refusal nobody hears is what this
 feature exists to prevent.
 
-The **per-event table** and `repeat_after` are not on this flag — set them in a `--config` blob's
+The **per-event table** and `repeat_after` are not on this flag: set them in a `--config` blob's
 `[notify]` table:
 
 ```bash
@@ -119,7 +120,7 @@ task = "off"' -- ./agent
 ```
 
 A bare `--notify <mode>` sets **every event's mode** and says nothing about the period, so a
-`repeat_after` configured in a file below is **kept** — turning the announcements up for one launch
+`repeat_after` configured in a file below is **kept**: turning the announcements up for one launch
 does not silently remove the spacing that made them bearable.
 
 Within the override itself the ordinary rule still applies: the typed flag replaces a `--config`
@@ -134,15 +135,15 @@ DSL builds the common one-shot egress shapes:
 - `allow=h1,h2` → a default-**deny** allowlist (only `h1,h2` reach).
 - `deny=h1,h2` → a default-**allow** denylist (everything except `h1,h2`).
 
-A bare `allow`/`deny` (no `=`) is **refused as ambiguous** — it reads like the list
+A bare `allow`/`deny` (no `=`) is **refused as ambiguous**: it reads like the list
 forms but would mean the opposite wide-open posture.
 
 #### The `--bind` mode
 
 The mode is the suffix after the **last** `:`, and only when it is exactly `ro` or
-`rw` — so `/my:dir` is not mis-parsed as a mode. Read-only by default.
+`rw`, so `/my:dir` is not mis-parsed as a mode. Read-only by default.
 
-## Precedence — four tiers
+## Precedence: four tiers
 
 Lowest to highest:
 
@@ -160,7 +161,7 @@ One uniform rule across all four tiers:
 - **Scalars** (`nixpkgs`, `network`, `gui`, `proc`, `notify`) are **replaced** by the highest
   tier that sets them.
 - **Collections** (`env`, `packages`, `binds`, `forward`, `limits`, `seccomp`,
-  `devices`) are **unioned**, the higher tier winning per key/entry — so `--bind` *adds*
+  `devices`) are **unioned**, the higher tier winning per key/entry: so `--bind` *adds*
   to whatever the blobs bound, and `--limit tasks_max=…` tunes one limit without dropping
   a blob's `memory_max`.
 
@@ -171,19 +172,19 @@ posture:
 
 - A **set-but-invalid** security value (a `--net nonee` typo, a `--gui bogus`, a
   `--proc enfroce`, a `--notify alwyas`, a bad `[limits]` value, a bad `nixpkgs`) is a
-  **hard error — exit 2, no launch**. Silently keeping the baseline could leave a *wider*
-  posture — or, for `--notify`, a *quieter* one — than the mistyped intent.
+  **hard error, exit 2, no launch**. Silently keeping the baseline could leave a *wider*
+  posture, or, for `--notify`, a *quieter* one, than the mistyped intent.
 - A **structural** error (a `--limit` with no `=`, a `--bind` with an empty path, a bad
   `--net` keyword, an unknown limit key) is likewise a hard error.
 - The **additive** fields (`env`/`binds`/`packages`/`forward`/`seccomp`/`devices`) fail
   *closed* by dropping a bad entry (a missing bind or tool, an unknown syscall token, a
-  malformed device path — less capability/relaxation, never a wider posture), so they
+  malformed device path: less capability/relaxation, never a wider posture), so they
   warn and skip.
 
 ## Environment footgun notice
 
 The environment *can* set security fields, but each security field sourced from the
-**environment** prints a stderr notice — guarding against a stale `SBX_NET=shared` in
+**environment** prints a stderr notice: guarding against a stale `SBX_NET=shared` in
 your shell rc silently widening every launch. The command line is silent (it is
 explicit per-invocation).
 

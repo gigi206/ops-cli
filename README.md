@@ -1,15 +1,16 @@
 # sbx — a sandbox launcher for tools and AI agents
 
-[![tests](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml/badge.svg)](https://github.com/gigi206/ops-cli/actions/workflows/tests.yml)
+[![CI](https://github.com/gigi206/ops-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/gigi206/ops-cli/actions/workflows/ci.yml)
 
 `sbx` is a **sandbox launcher**: a single static Rust binary that runs tools —
 including **encapsulated AI agents** — inside a [bubblewrap](https://github.com/containers/bubblewrap)
 sandbox where they can install a project's full dependency set via single-user,
 daemonless [Nix](https://nixos.org/) **without mutating the host OS**.
 
-It is **not** a container manager — there is no docker/podman, no image to build.
-The reference class is sandboxes (nono.sh, landrun), not environment managers
-(devbox, devenv) that isolate nothing.
+It is **not** a container manager — no OCI runtime wrapping, no image to build,
+no shared host kernel. The reference class is bubblewrap-based sandboxes —
+tools whose job is isolation under namespace boundaries — not environment
+managers that only set variables and isolate nothing.
 
 ## Why
 

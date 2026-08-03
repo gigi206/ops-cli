@@ -11,15 +11,15 @@ sbx task stop <invocation>|<operation> [--session <id>]
 sbx task logs [<invocation>|<operation>] [--session <id>]
 ```
 
-Use the **declared operations** a session offers — fixed commands sbx runs on a caller's behalf, in
+Use the **declared operations** a session offers: fixed commands sbx runs on a caller's behalf, in
 an ephemeral sibling cage, with a credential the caller never holds. Declared as
-[`[task.<name>]`](../configuration/task.md).
+[`[task.<name>]`](../configuration/task.md). `sbx tasks` is an alias.
 
 `list`, `secrets` and `run` work **both inside the cage** (where the agent uses them, through the
 socket sbx binds there) **and on the host**, so an operation is testable exactly as the agent sees
 it. `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
 rather than by check: they live on a second socket that is never bound into a cage. The record is not
-for the recorded party to read, and an invocation id is per session — a cage able to stop one could
+for the recorded party to read, and an invocation id is per session: a cage able to stop one could
 stop the invocation *you* started, and same-uid leaves no way to tell the two callers apart. Starting
 a detached invocation is on that socket for the same reason: it is only reachable through those
 verbs, so a caller that could start one without being able to watch or end it would be creating
@@ -28,8 +28,7 @@ invocations nobody owns.
 ## How an agent finds them
 
 A declared operation the agent never learns about is worth exactly as much as one you never
-declared. So when a session offers any, they are written into the contract the cage already reads —
-`/opt/sbx/egress-contract.md`, named by `$SBX_EGRESS_CONTRACT` — beside the network posture:
+declared. So when a session offers any, they are written into the contract the cage already reads, `/opt/sbx/egress-contract.md`, named by `$SBX_EGRESS_CONTRACT`: beside the network posture:
 
 ```markdown
 ## Declared operations
@@ -51,7 +50,7 @@ It is the same file rather than a second one on purpose: another file would only
 process that already knew to look for it, which is the problem being solved.
 
 This discloses nothing new. Every line of it is what [`list`](#list) and [`secrets`](#secrets)
-already answer to anyone in the cage — names, descriptions, parameter bounds, and the **names** of
+already answer to anyone in the cage: names, descriptions, parameter bounds, and the **names** of
 the credentials an operation carries. Never a value, and never a source locator: a `sops://` path
 would be a disclosure the socket itself refuses to make.
 
@@ -60,7 +59,7 @@ The listing is written at launch; `sbx task list` stays the live view (it is whe
 
 ## What the cage actually holds
 
-Inside the sandbox `sbx` is **not the sbx binary** — it is a small generated client that speaks the
+Inside the sandbox `sbx` is **not the sbx binary**: it is a small generated client that speaks the
 task plane's protocol and understands nothing else. `sbx task list`, `secrets` and `run` read
 exactly as they do here; every other word is refused:
 
@@ -69,8 +68,8 @@ $ sbx config show          # inside the cage
 sbx: only the task plane is exposed inside the sandbox — try `sbx task list`
 ```
 
-This is deliberate. The socket has to cross into the cage — an agent that cannot reach it cannot
-invoke an operation at all — but nothing else needs to. A binary able to act on sbx's own state
+This is deliberate. The socket has to cross into the cage: an agent that cannot reach it cannot
+invoke an operation at all, but nothing else needs to. A binary able to act on sbx's own state
 would have been safe only for as long as none of sbx's state happened to be mounted, which is a
 property nothing could check. A client that cannot express the request is a property you can read.
 
@@ -87,7 +86,7 @@ sbx task list [<operation>] [--session <id>]
 ```
 
 One row per operation. The line above the table says which session answered and what project it runs
-in — with two sessions open, the rows alone cannot tell you.
+in: with two sessions open, the rows alone cannot tell you.
 
 ```
 $ sbx task list
@@ -111,16 +110,16 @@ sbx: note: an operation marked OUTPUT writes into /opt/sbx/task-out/<operation>
 ```
 
 A `RUNNING` column joins them while something is running, holding **how many** invocations of that
-operation are live — several at once is ordinary, and [`status`](#status) shows them individually.
+operation are live, several at once is ordinary, and [`status`](#status) shows them individually.
 It is host-side only: a cage cannot reach the socket that knows.
 
-A column that reads the same on every line is not information — it is the noise that makes a listing
+A column that reads the same on every line is not information: it is the noise that makes a listing
 unreadable. `MISSING TOOLS` appears when an operation declares
 [`packages`](../configuration/task.md#the-task-tool-pool) the pool does not hold: that operation will
 fail at exec, and the pool is filled best-effort, so this is where you find out before invoking it.
 
 **`DECLARED IN` says which config holds each operation's `[task.<name>]` block**, and appears by the
-same rule — only when they do not all agree. One session can be offered operations by four different
+same rule, only when they do not all agree. One session can be offered operations by four different
 places at once: your global `sbx.toml`, the project's `.sbx.toml`, the app profile you launched, and
 each [bundle](../configuration/bundles.md) that profile names in `use`. The name alone does not say
 which, and the answer is where you go to change it:
@@ -134,7 +133,7 @@ gh-issue   repo        30s  bundle:gh    List a repository's issues
 deploy     env         5m   app:agent    Roll the staging deployment
 ```
 
-The values are `global`, `project`, `app:<name>` and `bundle:<name>` — the `kind:name` spelling
+The values are `global`, `project`, `app:<name>` and `bundle:<name>`: the `kind:name` spelling
 [`sbx session ls`](session.md) already uses in its `KIND` column. A bundle keeps its own name even
 though its entries fold into the app that names them: "which app" and "which tool the app pulled
 it in with" are different answers, and the second is the one that tells you which file to open.
@@ -145,8 +144,7 @@ no bundle. The two never overlap: the rows disagree exactly when more than one s
 which is exactly when knowing the session's app and project cannot tell you which of them declared a
 given operation. Where one source explains everything, the column is not shown.
 
-It claims where the *block* is, and nothing more. An operation is genuinely composed of two layers —
-its own block, plus whatever [`[task.defaults]`](../configuration/task.md) it inherits — and those
+It claims where the *block* is, and nothing more. An operation is genuinely composed of two layers, its own block, plus whatever [`[task.defaults]`](../configuration/task.md) it inherits: and those
 can be different files. [`show`](#show) is where that is spelled out.
 
 **With several sessions, all of them are listed** and a `SESSION` column says which row came from
@@ -163,10 +161,10 @@ SESSION  NAME        PARAMS  TIMEOUT  RUNNING  DESCRIPTION
 ```
 
 `--session <id>` narrows it to one. Reading across sessions is harmless, which is why it is the
-default here — [`run`](#run) and [`stop`](#stop) still make you name one, because guessing which
+default here, [`run`](#run) and [`stop`](#stop) still make you name one, because guessing which
 session to *run* in would use the wrong credential.
 
-Name an operation to show only that one. Inside the cage the session is implicit — a caller may only
+Name an operation to show only that one. Inside the cage the session is implicit: a caller may only
 reach its own.
 
 ## `secrets`
@@ -176,7 +174,7 @@ sbx task secrets [<operation>] [--session <id>]
 ```
 
 The credentials the operations carry: the variable name, the operation it belongs to, the encoding it
-is rendered with, and its description. **Never a value, and never a source locator** — what a caller
+is rendered with, and its description. **Never a value, and never a source locator**: what a caller
 needs to know is which credentials an operation carries, not where they come from.
 
 ```
@@ -219,16 +217,16 @@ id
 **Exit codes.** The command's own exit code is returned, so an operation composes in a script like
 the program it wraps. A **refusal** is exit **125** and runs nothing: an unknown operation, a value
 outside its declared bound, a variable not in `env_allow`, or an exhausted session quota. 125 rather
-than 2 so it stays distinguishable from the wrapped command exiting 2 itself — the same convention
-`env` and `docker` use.
+than 2 so it stays distinguishable from the wrapped command exiting 2 itself: the same convention
+`env` and the like.
 
 **Output.** stdout and stderr come back only if the declaration shows them, and every credential
 value found in either is replaced by `${NAME}` first. sbx reports, on stderr, when the output was
 truncated at `max_output`, when the timeout fired, when [`stop`](#stop) ended it, and how many values
-were substituted — that count is host-side, which is what makes it trustworthy (a `${NAME}` in the
+were substituted, that count is host-side, which is what makes it trustworthy (a `${NAME}` in the
 text could have been printed by the command itself).
 
-**`--json`.** One document on stdout and nothing else — the streams travel *inside* it, so a command
+**`--json`.** One document on stdout and nothing else: the streams travel *inside* it, so a command
 that writes to stdout cannot interleave with it, and everything sbx says as prose otherwise becomes a
 field:
 
@@ -253,13 +251,13 @@ $ sbx task run db-query --param sql="SELECT id FROM users" --json
 ```
 
 A stream the declaration **withholds** is `null`; one that ran and printed nothing is `""`. `redacted`
-is the substitution count **over the streams you received** — a withheld stream's substitutions are
+is the substitution count **over the streams you received**: a withheld stream's substitutions are
 recorded in `sbx task logs` and are not reported here, because a count over output that was never
 handed over is a number the command could choose and you could read. `refused` lists what
-[`spawn`](../configuration/task.md) blocked — its paths
+[`spawn`](../configuration/task.md) blocked: its paths
 are substituted exactly as the output is, so a credential a command spelled into a program name comes
-back named rather than in the clear — and `output` is
-`{"path": …, "bytes": …}` when the operation declares one. A refusal is a document too — `error` says
+back named rather than in the clear: and `output` is
+`{"path": …, "bytes": …}` when the operation declares one. A refusal is a document too: `error` says
 why and `exit` is `null`, because nothing ran; the exit code is still 125. `id` is `null` only when
 the plane declined before admitting the request (an exhausted quota), where no invocation exists to
 name.
@@ -282,12 +280,11 @@ wrote 41822 rows
 Everything you could act on is still decided **before** the id comes back: an unknown operation, a
 value outside its bound, a variable not in `env_allow`, or an [output directory](../configuration/task.md)
 another invocation of the same operation is already using. So an id means it is running. What can
-only fail once it is under way — a credential that will not resolve, a proxy that will not start —
-is held and reported by [`result`](#result), not lost.
+only fail once it is under way, a credential that will not resolve, a proxy that will not start: is held and reported by [`result`](#result), not lost.
 
 **Host-side only.** A detached invocation is watched with `status`, ended with `stop`, and collected
 with `result`, and all three are host-only. A cage that could start one would be creating invocations
-it can neither see nor end — and could hold several at once, which having to wait for each is exactly
+it can neither see nor end, and could hold several at once, which having to wait for each is exactly
 what prevents.
 
 **At most four run at once.** Separate from the session's call quota, which bounds how many
@@ -298,7 +295,7 @@ already a limit of one.
 **It dies with its session.** The plane that runs a detached invocation is part of the session
 process, so closing the session ends it. Detaching frees the *terminal*, not the session.
 
-With `--json` the start is its own small document — nothing has run yet, so there is no exit code to
+With `--json` the start is its own small document: nothing has run yet, so there is no exit code to
 report:
 
 ```
@@ -317,13 +314,13 @@ $ sbx task run nightly-dump --detach --json
 sbx task result <invocation> [--session <id>] [--json]
 ```
 
-What a detached invocation produced — host-only.
+What a detached invocation produced: host-only.
 
 The output is **identical** to what a foreground `run` would have printed, down to the exit code:
 detaching changes when a result arrives, not what it is. The streams are already substituted and
 truncated exactly as they would have been, and `--json` prints the same document as `run --json`.
 
-It takes an **invocation id**, never an operation name — a result belongs to one run, and a name
+It takes an **invocation id**, never an operation name: a result belongs to one run, and a name
 would name several.
 
 Reading a result does not consume it: a session holds the last **32**, so collecting one twice is
@@ -337,7 +334,7 @@ they call for different things:
 | `its result is no longer held` | it finished, but 32 newer ones have since replaced it |
 | `no invocation 7` | this session has never seen that id |
 
-An invocation that ran in the **foreground** is named as such — its result went to the caller that
+An invocation that ran in the **foreground** is named as such: its result went to the caller that
 waited for it, and was never kept here.
 
 ## `status`
@@ -346,7 +343,7 @@ waited for it, and was never kept here.
 sbx task status [<invocation>|<operation>] [--session <id>]
 ```
 
-What the session is running **right now** — host-only.
+What the session is running **right now**: host-only.
 
 ```
 $ sbx task status
@@ -357,7 +354,7 @@ ID  OPERATION      ELAPSED      PID  STATE
 
 | Column | Meaning |
 |---|---|
-| `ID` | the **invocation id** — what `stop` takes, and what its log line will carry |
+| `ID` | the **invocation id**: what `stop` takes, and what its log line will carry |
 | `OPERATION` | which operation it is |
 | `ELAPSED` | how long it has been running |
 | `PID` | the cage's process, for `ps` and `systemd-cgls` |
@@ -365,13 +362,13 @@ ID  OPERATION      ELAPSED      PID  STATE
 
 Every session offering operations is shown, with a `SESSION` column when there is more than one.
 Narrow it with an invocation id, an operation name, or `--session`. A caller blocked on its own
-`sbx task run` cannot see this — it is waiting for the answer. This is the view from another terminal, which is also
+`sbx task run` cannot see this, it is waiting for the answer. This is the view from another terminal, which is also
 the only place a stop can come from, and where a [detached](#--detach) invocation is watched from
 start to finish.
 
 **The verbs share one number.** The id `status` shows is the id `stop` takes, the id `result`
 collects a detached one by, the id `logs` carries once the invocation is over, and the id a stopped
-`run` names in its report — so `sbx task status 7` while it runs and `sbx task logs 7` afterwards are
+`run` names in its report, so `sbx task status 7` while it runs and `sbx task logs 7` afterwards are
 the same invocation.
 
 ## `show`
@@ -380,7 +377,7 @@ the same invocation.
 sbx task show <invocation>|<operation> [--session <id>]
 ```
 
-Everything about **one** of them — host-only. The listings answer "what is there" a line at a time;
+Everything about **one** of them, host-only. The listings answer "what is there" a line at a time;
 this answers "what is *that*".
 
 ```
@@ -405,13 +402,12 @@ network      tcp://db.staging.internal:5432
 output       /opt/sbx/task-out/nightly-dump
 ```
 
-For an invocation that is over it reports what the log kept — how it ended, when, what it cost — and
+For an invocation that is over it reports what the log kept, how it ended, when, what it cost, and
 then the same declaration, because an invocation *is* its declaration plus what one run of it did.
 Naming an operation rather than an id gives the declaration alone.
 
 A [detached](#--detach) invocation reads as `state detached` while it runs, and once it is over its
-state is how it *ended* (`finished`, `stopped`, `timed out`) with a separate `detached yes` line —
-detaching is orthogonal to how an invocation ends, and that line is what says its result went to
+state is how it *ended* (`finished`, `stopped`, `timed out`) with a separate `detached yes` line, detaching is orthogonal to how an invocation ends, and that line is what says its result went to
 [`result`](#result) rather than to a caller.
 
 **`declared in` is always here**, unlike the [listing's column](#list) which appears only when the
@@ -419,8 +415,7 @@ rows disagree: a reader asking about *one* operation is often asking exactly tha
 
 **A value the operation did not set itself says where it came from**, in parentheses beside it. An
 operation is composed of its own `[task.<name>]` block plus whatever
-[`[task.defaults]`](../configuration/task.md) it inherits, and those can live in different files —
-`declared in project` with a ceiling from your global `sbx.toml` is an ordinary situation, and being
+[`[task.defaults]`](../configuration/task.md) it inherits, and those can live in different files, `declared in project` with a ceiling from your global `sbx.toml` is an ordinary situation, and being
 told only the block would send you to edit a file that does not contain the value you are reading:
 
 ```
@@ -429,12 +424,12 @@ timeout      1m30s  (global [task.defaults])
 max_output   65536  (sbx default)
 ```
 
-Nothing in parentheses means the operation's own block set it — the case a reader already assumes.
+Nothing in parentheses means the operation's own block set it: the case a reader already assumes.
 
 **Never an environment value.** A task's credentials are resolved for one invocation and held nowhere
 this can reach, so their absence is structural rather than a filter that could be forgotten; what is
 shown is their names, which is what a substituted value is reported as anyway. The `command` line is
-the task's own, with this invocation's parameters substituted in — a credential never travels there.
+the task's own, with this invocation's parameters substituted in: a credential never travels there.
 
 A field with nothing to say is left out rather than printed blank.
 
@@ -444,7 +439,7 @@ A field with nothing to say is left out rather than printed blank.
 sbx task stop <invocation|operation> [--session <id>]
 ```
 
-End one running invocation — named by the id `status` shows, or by the operation's own name when
+End one running invocation, named by the id `status` shows, or by the operation's own name when
 only one of its invocations is running. A number is read as an id first, and a name matching several
 running invocations is an error listing them rather than a guess at which to end.
 
@@ -454,7 +449,7 @@ stopped invocation 7
 ```
 
 The cage is torn down, so nothing the operation started outlives it. The caller gets its result with
-whatever the command produced up to that point, marked **stopped** — which stays distinct from the
+whatever the command produced up to that point, marked **stopped**: which stays distinct from the
 `timed_out` that ends an invocation the same way: one is the declaration's ceiling firing, the other
 is you deciding.
 
@@ -478,7 +473,7 @@ as the stopped command left it: partial, and only the next invocation clears it.
 sbx task logs [<invocation>|<operation>] [--session <id>]
 ```
 
-The session's invocation log — **host-only**, because the recorded party does not get to read the
+The session's invocation log, **host-only**, because the recorded party does not get to read the
 record.
 
 ```
@@ -492,7 +487,7 @@ ID  TIME      OPERATION  EXIT   TOOK  NOTE
 
 | Column | Meaning |
 |---|---|
-| `ID` | the **invocation id** — the one `sbx task status` showed while it ran |
+| `ID` | the **invocation id**: the one `sbx task status` showed while it ran |
 | `TIME` | local time of day when the invocation finished |
 | `OPERATION` | the operation's name |
 | `EXIT` | the command's exit code, or `-` when nothing ran |
@@ -501,7 +496,7 @@ ID  TIME      OPERATION  EXIT   TOOK  NOTE
 
 The id is drawn when an invocation **starts** and its line is written when it **ends**, so two
 overlapping invocations appear in the order they finished and their ids can read out of order. A
-blank id marks a request refused before it was admitted at all — the session's quota was exhausted,
+blank id marks a request refused before it was admitted at all: the session's quota was exhausted,
 so no invocation exists for an id to name.
 
 Name an operation to see only its invocations, or an invocation id to see just that one.

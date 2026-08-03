@@ -1,4 +1,4 @@
-# `[net.groups]` — reusable egress groups
+# `[net.groups]`: reusable egress groups
 
 A `[net.groups]` group is a named set of egress entries declared once in the **global**
 config and referenced from a `[network]` allow/deny list with `@<name>`, so a set of
@@ -22,14 +22,14 @@ See also: [Network modes](../networking/modes.md) · [Rule grammar](../networkin
 
 ## Global-only
 
-Groups are a security-relevant input — they expand to egress rules — so they are
+Groups are a security-relevant input, they expand to egress rules, so they are
 honored **only from the global config** (trusted by location). A project's
 `[net.groups]` is ignored. This is why the group commands have no scope flag: they
 always read the global config.
 
 ## Group entries
 
-A group entry is **any egress rule string** the `allow`/`deny` lists accept — an IP,
+A group entry is **any egress rule string** the `allow`/`deny` lists accept: an IP,
 a host, `*.domain`, an exact URL, a `re:` regex, or a `tcp://` L4 target, with an
 optional `{VERB,…}` method prefix. See the [rule grammar](../networking/rules.md).
 
@@ -38,7 +38,7 @@ group's entries at launch.
 
 ## Undefined references fail closed
 
-An `@<name>` that names no defined group is a **fail-closed** error — the rule does
+An `@<name>` that names no defined group is a **fail-closed** error: the rule does
 not silently become "allow nothing" or "allow everything"; the reference is refused. A
 group entry that will not resolve (malformed or nested) is flagged.
 

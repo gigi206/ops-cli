@@ -1,15 +1,15 @@
 # Portable profiles
 
 An app **profile** is a standalone, portable file that defines one app. `sbx` ships
-**no built-in apps** — every profile is a separate artifact you import deliberately, so
+**no built-in apps**, every profile is a separate artifact you import deliberately, so
 importing is a conscious trust act.
 
 See also: [The app framework](README.md) · [Profile catalog](catalog.md) · [`sbx app`](../cli/app.md) · [`[app.<name>]`](../configuration/apps.md).
 
 ## The profile file shape
 
-A profile is a TOML file shaped as a **top-level app** — the app's fields directly, with
-**no `[app.<name>]` wrapper** — and its **filename is the app name**:
+A profile is a TOML file shaped as a **top-level app**: the app's fields directly, with
+**no `[app.<name>]` wrapper**: and its **filename is the app name**:
 
 ```toml
 # my-agent.toml  →  the app is named "my-agent"
@@ -31,7 +31,7 @@ type   = "bearer"
 
 Imported profiles live under
 [`~/.config/sbx/apps/<name>.toml`](../concepts/directory-layout.md) and are **trusted by
-location** — honored even when the project you launch in is untrusted (the point: run an
+location**, honored even when the project you launch in is untrusted (the point: run an
 agent *on* untrusted code, safely).
 
 ## Import
@@ -40,10 +40,10 @@ agent *on* untrusted code, safely).
 sbx app import <file> [--as <name>] [--force]
 ```
 
-- The **deliberate command is the consent** — an agent in the cage cannot run it, and
+- The **deliberate command is the consent**: an agent in the cage cannot run it, and
   the profile stays **inert until `sbx app run <name>`** launches it.
 - The **granted posture is printed** (command, home scope, packages, binds, network, each
-  credential by destination + source — never a plaintext value — and every grant that widens
+  credential by destination + source, never a plaintext value, and every grant that widens
   what the cage reaches of the host: `devices`, `seccomp allow`, and
   [`ssh_agent`](../configuration/ssh-agent.md), the one that asks your own agent to sign).
 - The file must have a `cmd` (an empty parse is the tell-tale of a wrongly
@@ -58,10 +58,10 @@ sbx app import <file> [--as <name>] [--force]
 sbx app export <name> [--out <file>]
 ```
 
-Writes a named app out as a portable profile — to **stdout** by default (composable and
+Writes a named app out as a portable profile: to **stdout** by default (composable and
 clobber-safe), or `--out <file>`. An imported profile is emitted **verbatim**; an inline
 `[app.<name>]` is serialized to a minimal profile, **as authored** (security fields and
-all — import is the trust act, not export). The exported file re-imports identically.
+all, import is the trust act, not export). The exported file re-imports identically.
 
 ```sh
 sbx app export claude-code > my-claude.toml
@@ -81,7 +81,7 @@ For the full resolved app set (inline, project, and profile apps with their gati
 
 ## The trust act
 
-Importing is where trust happens, not export — a profile is exported *as authored*,
+Importing is where trust happens, not export: a profile is exported *as authored*,
 security fields and all, regardless of trust, because the person importing it is the one
 who decides to trust it. Since an imported profile is trusted by location, it keeps its
 posture even under an untrusted project (the [flagship property](README.md#the-flagship-property)).

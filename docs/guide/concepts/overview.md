@@ -1,7 +1,6 @@
 # What sbx is (and is not)
 
-`sbx` is a **sandbox launcher**: a single static Rust binary that runs tools —
-including **encapsulated AI agents** — inside a [bubblewrap](https://github.com/containers/bubblewrap)
+`sbx` is a **sandbox launcher**: a single static Rust binary that runs tools, including **encapsulated AI agents**, inside a [bubblewrap](https://github.com/containers/bubblewrap)
 sandbox where they can install a project's full dependency set via single-user,
 daemonless [Nix](https://nixos.org/) **without mutating the host OS**.
 
@@ -11,7 +10,7 @@ See also: [Security model](security-model.md) · [Provisioning](provisioning.md)
 
 Running an autonomous coding agent on a project means letting untrusted code install
 dependencies and execute. `sbx` gives that agent a real boundary: it runs as your
-user, but the **bind layout is the security control** — the host filesystem and your
+user, but the **bind layout is the security control**: the host filesystem and your
 secrets are absent from the cage unless explicitly and trustedly granted. The agent
 self-equips a per-project Nix store it cannot use to escape, behind an always-on
 [seccomp filter](enforcement.md) and best-effort resource limits; egress is the host
@@ -19,13 +18,13 @@ network by default and can be narrowed to a [deny-by-default allowlist](../netwo
 
 ## What it is not
 
-`sbx` is **not** an OCI container manager. There is no docker/podman/nerdctl, no
+`sbx` is **not** a container manager. There is no OCI runtime wrapping, no
 image to build, no registry.
 
-The reference class is **sandboxes** (nono.sh, landrun) — tools whose job is
-isolation — **not** environment managers (devbox, devenv, flox) that assemble a
-toolchain but isolate nothing. `sbx` does both: it provisions a project's toolchain
-*and* confines it.
+The reference class is **sandboxes**: tools whose job is isolation under
+capability-bearing namespaces, **not** environment managers that assemble a
+toolchain but isolate nothing. `sbx` does both: it provisions a project's
+toolchain *and* confines it.
 
 | | `sbx` | container manager | env manager |
 |---|---|---|---|
@@ -40,9 +39,9 @@ toolchain but isolate nothing. `sbx` does both: it provisions a project's toolch
 `sbx` distinguishes two ways a sandbox is used, and the *default* is the locked-down
 one:
 
-- **Mode A — interactive shell** (`sbx run`): a semi-trusted user at a
+- **Mode A: interactive shell** (`sbx run`): a semi-trusted user at a
   keyboard. Network egress rules stay all-verbs; the human is the trust anchor.
-- **Mode B — autonomous agent** (`sbx app run <name>`): actions are untrusted. **This is
+- **Mode B, autonomous agent** (`sbx app run <name>`): actions are untrusted. **This is
   the default posture.** An app's egress allowlist defaults to read-only verbs
   (`GET`/`HEAD`) unless a rule opts a host out, credentials are injected host-side
   and never enter the cage, and the app gets its own isolated home.
@@ -53,7 +52,7 @@ code. See [the app framework](../apps/README.md).
 ## The essentials
 
 - The default posture is the **locked-down agent**, not the interactive shell.
-- **Capability-bearing unprivileged user namespaces are a hard requirement** — no
+- **Capability-bearing unprivileged user namespaces are a hard requirement**: no
   boundary, no launch (see [`sbx doctor`](../getting-started/doctor.md)).
 - The cage runs **as your uid** (same-uid), so a secret is protected by being
   **absent**, not merely read-only.

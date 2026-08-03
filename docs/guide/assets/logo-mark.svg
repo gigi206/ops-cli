@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="sbx mark">
+  <title>sbx — mark</title>
+  <!-- Rounded dark tile (visible on white tabs and dark tabs alike) -->
+  <rect width="64" height="64" rx="12" ry="12" fill="#0f172a"/>
+
+  <!-- Hexagonal cage outline -->
+  <polygon points="32,9 54,22 54,42 32,55 10,42 10,22"
+           fill="none"
+           stroke="#22d3ee"
+           stroke-width="3"
+           stroke-linejoin="round"
+           stroke-linecap="round"/>
+
+  <!-- Single wrap stripe (bubblewrap clue, keeps identity at 16×16) -->
+  <line x1="18" y1="32" x2="46" y2="32"
+        stroke="#a3e635"
+        stroke-width="3"
+        stroke-linecap="round"/>
+
+  <!-- Tiny terminal cursor (top-right) -->
+  <rect x="51" y="9" width="4" height="2" rx="0.5" ry="0.5" fill="#a3e635"/>
+</svg>

@@ -47,6 +47,7 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 | [`sbx task`](task.md) | list and invoke a session's declared operations |
 | [`sbx secret`](secret.md) | the credential inventory this configuration declares |
 | [`sbx projects`](projects.md) | list and remove per-project runtime trees |
+| [`sbx path`](path.md) | where the config, data, and state roots live |
 | [`sbx storage`](storage.md) | manage a compressed, self-growing volume for the data directory |
 | [`sbx store`](store.md) | report what sbx occupies on disk, subtree by subtree |
 | [`sbx gc`](gc.md) | reclaim nix store space |
@@ -60,8 +61,8 @@ See also: [Configuration overview](../configuration/README.md) · [Exit codes](.
 
 ## Help
 
-- `sbx help` / `sbx --help` — the top-level command list.
-- `sbx help <command> [subcommand...]` — the page for a command path.
-- `sbx <command> --help` — the same page.
+- `sbx help` / `sbx --help`: the top-level command list.
+- `sbx help <command> [subcommand...]`: the page for a command path.
+- `sbx <command> --help`: the same page.
 - A `--` ends `sbx`'s own flags, so `sbx app run <name> -- --help` passes `--help` to the
   launched command.

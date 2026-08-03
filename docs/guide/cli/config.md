@@ -25,10 +25,10 @@ See also: [Configuration overview](../configuration/README.md) · [The trust gat
 sbx config show [--json] [--details] [-a|--app <name>] [-g|--global|-l|--local|-d|--default]
 ```
 
-Prints the resolved configuration — the layered global and project environment, binds,
+Prints the resolved configuration: the layered global and project environment, binds,
 packages, tools, network, GUI, secrets, and app profiles, after the trust gate has
 dropped anything an untrusted project may not set. Each value is tagged with where it
-came from — `(default)`, `(global)`, or `(project)` — colored by level. Warnings
+came from, `(default)`, `(global)`, or `(project)`, colored by level. Warnings
 explain what was dropped and why. No launch, no nix, no network.
 
 | Option | Meaning |
@@ -83,11 +83,25 @@ and for locating the global config).
 sbx config edit [-l|-g|-c <file>] [--trust]
 ```
 
-Opens the target file in `$VISUAL` / `$EDITOR` (falling back to `vi`) — the way to edit
+Opens the target file in `$VISUAL` / `$EDITOR` (falling back to `vi`): the way to edit
 fields `set` does not handle as a single value: [`binds`](../configuration/binds.md),
 an [allowlist](../configuration/network.md), [secrets](../configuration/secret.md), or
-[app](../configuration/apps.md) tables. An edit that changes a trusted file re-arms its
-trust gate; `--trust` re-trusts as the editor closes.
+[app](../configuration/apps.md) tables.
+
+A `binds` entry is an absolute host path, bound read-only by default; write it as a
+table `{ path = "/abs/path", mode = "rw" }` to bind it read-write (the cage writes
+through to the host path). A leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` is expanded
+from your environment, so a portable config need not hard-code an absolute home path;
+any other `$VAR` is refused. `binds` is a security field, honored only from a trusted
+source. sbx's own state (its data, trust, and config directories) is protected either
+way: a read-write bind aimed at or inside one of them is forced read-only with a
+warning, while a broad read-write bind that merely contains them (e.g. `mode = "rw"`
+on your whole home) stays read-write with those directories pinned read-only in place
+— the rest of the tree is writable, but the agent still cannot alter what sbx runs or
+trusts.
+
+An edit that changes a trusted file re-arms its trust gate; `--trust` re-trusts as
+the editor closes.
 
 ## Examples
 

@@ -6,7 +6,7 @@ sbx doctor
 
 `doctor` verifies the load-bearing runtime requirements **before** anything can run,
 and reports the store location and channel revision. A missing requirement is a
-**hard failure with a remediation hint** — never a silent fallback to a weaker
+**hard failure with a remediation hint**: never a silent fallback to a weaker
 engine, because a weaker engine would mean no security boundary.
 
 See also: [Installation](installation.md) · [Security model](../concepts/security-model.md) · [Enforcement stack](../concepts/enforcement.md).
@@ -24,7 +24,7 @@ See also: [Installation](installation.md) · [Security model](../concepts/securi
   specifically, so it will not pass a host where the namespace exists but is inert.
 
 - **The bubblewrap engine.** The sandbox itself. `doctor` reports which `bwrap` it
-  would use and why — the bundled static engine, or one found on `PATH`, with an
+  would use and why: the bundled static engine, or one found on `PATH`, with an
   AppArmor note where relevant (see [Provisioning](../concepts/provisioning.md)).
 
 - **The nix binary.** Drives the user-owned store. Reported the same way (bundled or
@@ -32,7 +32,7 @@ See also: [Installation](installation.md) · [Security model](../concepts/securi
 
 - **Best-effort resource limiting.** Whether the cage can run inside a transient
   systemd user scope carrying cgroup v2 limits. This is *not* the boundary, so a
-  host that cannot provide it gets a warning, not a failure — the launch still runs,
+  host that cannot provide it gets a warning, not a failure: the launch still runs,
   just without the anti-DoS limits. See [Enforcement stack](../concepts/enforcement.md).
 
 - **The store location and channel revision.** Where `sbx`'s user-owned store lives

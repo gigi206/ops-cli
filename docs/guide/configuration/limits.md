@@ -1,4 +1,4 @@
-# `[limits]` — cgroup resource limits
+# `[limits]`: cgroup resource limits
 
 Override the cage's cgroup v2 resource limits (the anti-DoS control), which otherwise
 use `sbx`'s built-in defaults.
@@ -10,8 +10,8 @@ memory_max  = "16G"
 tasks_max   = 8192
 ```
 
-`[limits]` is a **security field** — honored from the global config or a trusted
-project, ignored from an untrusted one — because loosening a limit (a higher
+`[limits]` is a **security field**: honored from the global config or a trusted
+project, ignored from an untrusted one: because loosening a limit (a higher
 `tasks_max`, an unbounded ceiling) reduces the anti-DoS protection.
 
 See also: [Enforcement stack](../concepts/enforcement.md) · [The trust gate](../concepts/trust.md) · [`[app.<name>]`](apps.md).
@@ -25,7 +25,7 @@ See also: [Enforcement stack](../concepts/enforcement.md) · [The trust gate](..
 | `tasks_max` | process/thread cap (fork-bomb guard) | 16384 | a count, or `infinity` |
 
 Each field is independent and falls back to its default when unset. The three fields
-**layer per field** across config layers — a global `tasks_max` and a project
+**layer per field** across config layers: a global `tasks_max` and a project
 `memory_max` compose, neither reverting the other to a constant.
 
 ## Value syntax
@@ -35,15 +35,15 @@ inside a `systemd-run` scope and a rejected value would fail the launch. A malfo
 value is **dropped with a warning** (falling back to the default) rather than reaching
 `systemd-run`:
 
-- **Memory** — `infinity`, a percentage `N%` in `(0, 100]`, or a byte size: a decimal
+- **Memory**, `infinity`, a percentage `N%` in `(0, 100]`, or a byte size: a decimal
   number with an **uppercase** `K`/`M`/`G`/`T`/`P`/`E` suffix. No lowercase, no `B`
   suffix, no `i` (so `16G`, not `16GiB` or `16g`).
-- **Tasks** — `infinity`, or a positive integer (`0` is rejected). A percentage is
+- **Tasks**, `infinity`, or a positive integer (`0` is rejected). A percentage is
   **not** accepted for tasks (systemd rejects `TasksMax=100%`).
 
 ### The bare-number footgun
 
-A **bare** memory number is *bytes*, so `memory_max = 90` means 90 **bytes** — a
+A **bare** memory number is *bytes*, so `memory_max = 90` means 90 **bytes**: a
 percentage written without its `%`, below the kernel floor, which would brick every
 launch. `sbx` catches a bare small memory integer (< 1 MiB) at config time, dropping it
 with a `did you mean "90%"?` hint and falling back to the default. (A bare `tasks_max`
@@ -54,7 +54,7 @@ integer is a valid task count, not bytes.)
 The cage runs inside a transient systemd user scope
 (`systemd-run --user --scope`) carrying these as cgroup v2 properties. This is
 **best-effort**: on a host with no cgroup v2, no reachable systemd user session, or no
-delegated controller, the cage launches **without** limits rather than failing — the
+delegated controller, the cage launches **without** limits rather than failing: the
 limits are hardening, never the boundary. See [Enforcement stack](../concepts/enforcement.md).
 
 The memory ceiling is honestly **per-cage**, not host-global (N concurrent cages can

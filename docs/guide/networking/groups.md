@@ -23,7 +23,7 @@ deny  = ["@telemetry"]
 ```
 
 At resolution each `@name` expands to the group's classified entries. A group entry
-is **any egress rule** the `allow`/`deny` lists accept — an IP, host, `*.domain`,
+is **any egress rule** the `allow`/`deny` lists accept: an IP, host, `*.domain`,
 exact URL, `re:` regex, or `tcp://` L4 target, with an optional `{VERB}` method
 prefix. (See the [rule grammar](rules.md).)
 
@@ -31,7 +31,7 @@ prefix. (See the [rule grammar](rules.md).)
 
 ## Global-only
 
-Groups are a security-relevant input — they expand into egress rules — so they are
+Groups are a security-relevant input, they expand into egress rules, so they are
 honored **only from the global config** (trusted by its location). A project's
 `[net.groups]` is **ignored** with a warning; a project may *reference* a
 global group with `@name`, but it cannot *define* one. This is why the
@@ -46,8 +46,8 @@ An `@name` reference to a group that does not exist is **dropped with a loud
 warning**. The direction of the failure depends on the list:
 
 - In an **`allow`** list, dropping the reference means those hosts are **not
-  allowed** — the safe (fail-closed) direction.
-- In a **`deny`** list, dropping the reference means a carve-out is **lost** — the
+  allowed**: the safe (fail-closed) direction.
+- In a **`deny`** list, dropping the reference means a carve-out is **lost**: the
   host is no longer blocked. This is the one case where a typo fails open *in
   intent*, which is exactly why the warning is loud and un-ignorable: an undefined
   reference must never pass unnoticed.
@@ -55,7 +55,7 @@ warning**. The direction of the failure depends on the list:
 Always check `sbx config` (or [`sbx net rules`](observability.md)) after editing
 groups so an undefined reference is caught before a launch.
 
-A group is a **flat list** — a group entry may **not** itself be a `@other`
+A group is a **flat list**: a group entry may **not** itself be a `@other`
 reference. A nested reference is rejected with a warning (the offending entry is
 dropped). This makes an unbounded or cyclic expansion impossible by construction.
 
@@ -71,7 +71,7 @@ sbx net groups anthropic --json
 
 `sbx net groups` reads the global config only. A malformed or nested entry in a
 group is flagged. To see a group *expanded inline* within an effective policy, use
-[`sbx net rules --expand`](observability.md) — a rule that came from a group shows
+[`sbx net rules --expand`](observability.md): a rule that came from a group shows
 its `@name` origin.
 
 ---
@@ -96,7 +96,7 @@ sbx net groups import groups.toml --force  # overwrite a name that already exist
 
 `import` merges the fragment's groups into the global config, preserving every
 existing group and its comments. The global config is trusted by location, so the
-deliberate command *is* the consent — an agent inside a cage cannot run it — and
+deliberate command *is* the consent, an agent inside a cage cannot run it, and
 there is no interactive prompt. A name that already exists is **refused** unless
 `--force`, and the merge is all-or-nothing. A group carrying an entry that will not
 resolve (malformed or nested) is flagged after the import; inspect it with
@@ -124,9 +124,9 @@ See [Observability](observability.md#persisting-rules) for the write scopes.
 
 ## See also
 
-- [Rule grammar](rules.md) — what a group entry may contain, and how `@name` is
+- [Rule grammar](rules.md): what a group entry may contain, and how `@name` is
   parsed within a list.
-- [Network modes](modes.md) — where the referencing `allow`/`deny` lists live.
-- [Observability](observability.md) — `sbx net groups`, `sbx net rules --expand`.
+- [Network modes](modes.md): where the referencing `allow`/`deny` lists live.
+- [Observability](observability.md): `sbx net groups`, `sbx net rules --expand`.
 - [`[net.groups]` configuration reference](../configuration/net-groups.md)
 - [`sbx net` CLI reference](../cli/net.md)

@@ -10,18 +10,18 @@ sbx proc deny    <rule> [-l|-g] [-a <app>] [--session [--all]]
 sbx proc rules   [-a <app>] [--all]
 ```
 
-Observe — and, under [`[proc]`](../configuration/proc.md) enforcement, **block** — what a running
+Observe, and, under [`[proc]`](../configuration/proc.md) enforcement, **block**, what a running
 sandbox is doing **inside its cage**, the process/exec sibling of [`sbx net`](net.md). `sbx proc ls`
 snapshots a session's **process tree** (the programs the agent has spawned) and `sbx proc live`
-watches it redraw in real time — both always available, reading `/proc` with no privilege and no
+watches it redraw in real time, both always available, reading `/proc` with no privilege and no
 cooperation from the cage, launching nothing. `sbx proc logs` is the **exec-event feed**: the
 processes the agent spawns, in order, each with its enforcement verdict when the session is
-enforcing. `sbx proc pending` lists — and decides — the `execve`s an `ask`-mode session has parked.
+enforcing. `sbx proc pending` lists, and decides, the `execve`s an `ask`-mode session has parked.
 `sbx proc allow`/`deny` persist an exec rule to a config file's [`[proc]`](../configuration/proc.md)
-list — the sibling of [`sbx net allow`/`deny`](net.md).
+list: the sibling of [`sbx net allow`/`deny`](net.md).
 
 To set the posture for a **single launch** without editing a config, use the one-shot
-[`--proc <mode>` / `SBX_PROC`](../configuration/overrides.md) override — e.g. `sbx run --proc off`
+[`--proc <mode>` / `SBX_PROC`](../configuration/overrides.md) override: e.g. `sbx run --proc off`
 disables a trusted project's enforcement for one run, and a `--config` blob's `[proc]` table carries
 one-shot allow/deny lists.
 
@@ -33,8 +33,8 @@ See also: [`sbx fs`](fs.md) (the file-write sibling) · [`sbx net`](net.md) · [
 sbx proc ls [<id>] [--json]
 ```
 
-Snapshot the process tree of a running session. The launcher process — or bubblewrap itself on
-the [`sbx run`](run.md) exec path — is the root, and every process the agent spawned is one of
+Snapshot the process tree of a running session. The launcher process: or bubblewrap itself on
+the [`sbx run`](run.md) exec path: is the root, and every process the agent spawned is one of
 its descendants in host pid-space, so a plain `/proc` walk from that root shows the whole tree.
 
 | Operand / option | Meaning |
@@ -58,7 +58,7 @@ sbx proc ls                    # only one session live → no id needed
 sbx proc ls --json 12345 | jq .tree   # machine-readable
 ```
 
-Reading `/proc` needs **no privilege** — unlike kernel-tracing observability it requires no
+Reading `/proc` needs **no privilege**: unlike kernel-tracing observability it requires no
 `CAP_BPF` or root. `ls` is a **snapshot**; for a continuously updating view use
 [`live`](#live). The pids shown are host-side.
 
@@ -76,7 +76,7 @@ processes in real time**.
 |---|---|
 | `<id>` | the PID [`sbx session ls`](session.md) shows; omit it when only one session is live |
 | `-i`, `--interval <secs>` | redraw interval in seconds (default 1) |
-| `--json` | emit one snapshot object per tick (NDJSON) — for a pipe, not a terminal |
+| `--json` | emit one snapshot object per tick (NDJSON): for a pipe, not a terminal |
 
 ```sh
 sbx proc live 12345            # watch the agent's process tree update every second
@@ -85,7 +85,7 @@ sbx proc live --json 12345 | jq .tree   # one snapshot object per tick
 ```
 
 The human view **requires a terminal** (the frame redraws in place); use `--json` to script it.
-Like `ls` it is read-only, host-side, and unprivileged — it just polls `/proc` on each tick.
+Like `ls` it is read-only, host-side, and unprivileged: it just polls `/proc` on each tick.
 
 ## `logs`
 
@@ -93,10 +93,10 @@ Like `ls` it is read-only, host-side, and unprivileged — it just polls `/proc`
 sbx proc logs [<id>] [-f|--follow] [--json]
 ```
 
-The **exec-event feed** — the processes an agent spawns inside its cage, in order, each stamped
+The **exec-event feed**, the processes an agent spawns inside its cage, in order, each stamped
 with the time it was first seen. Where `ls`/`live` snapshot the *current* tree of any session,
 `logs` reads a recorded event stream, so the session must have been launched with **observation
-on**: [`sbx run --observe`](run.md#observing-a-run-observe) or
+on**: [`sbx run --observe`](run.md#observing-a-run---observe) or
 [`sbx app run <name> --observe`](app.md). A session without it is reported as *unobserved*, not
 shown empty.
 
@@ -104,7 +104,7 @@ shown empty.
 |---|---|
 | `<id>` | the PID [`sbx session ls`](session.md) shows; omit it when only one session is live |
 | `-f`, `--follow` | stream new events until the session ends (`Ctrl-C` to stop) |
-| `--json` | emit one object per event (NDJSON) — works in a pipe |
+| `--json` | emit one object per event (NDJSON): works in a pipe |
 
 ```sh
 sbx run --detach --observe -- claude   # a background agent, observed
@@ -117,17 +117,17 @@ sbx proc logs 12345 -f                  # …watch what it spawns, from here
 sbx proc logs 12345 --json | jq .command   # machine-readable
 ```
 
-This is the way to watch an observed session **from another terminal** — and the **only** way to
+This is the way to watch an observed session **from another terminal**: and the **only** way to
 watch a [detached](run.md) (`--detach`) one, which has no terminal for the inline `[sbx:exec]`
 feed. The events are held in the supervisor's memory for the session's lifetime, read over a
 per-session control socket that is never exposed inside the cage; nothing is written to disk or
 kept after the session exits.
 
 Under a non-enforcing `--observe` run the feed is populated by a short-interval `/proc` poll, so a
-process that starts and exits within one tick can be missed — and each line's verdict reads
+process that starts and exits within one tick can be missed: and each line's verdict reads
 `observe` (it records what ran, not a decision). Under [`[proc] mode = enforce`/`ask`](../configuration/proc.md)
 the feed comes from the seccomp user-notification supervisor instead: **every** `execve` is captured
-exactly, and each carries its real verdict — `allow`, `deny`, `ask`, or `absent`.
+exactly, and each carries its real verdict: `allow`, `deny`, `ask`, or `absent`.
 
 ```
 #   14:02:11  deny     12346  /nix/store/…/bin/curl
@@ -137,7 +137,7 @@ exactly, and each carries its real verdict — `allow`, `deny`, `ask`, or `absen
 
 `absent` is a refusal of a file that was not there. Looking up a program by name issues one `execve`
 per `PATH` entry until one succeeds, so a program found in the fourth directory leaves three of
-these behind it — nothing was kept from the run, and the same lines would appear with no policy at
+these behind it, nothing was kept from the run, and the same lines would appear with no policy at
 all. They are shown because the feed shows every `execve`, and set apart because `deny` is the one
 that stopped something.
 
@@ -148,14 +148,14 @@ sbx proc pending [allow|deny <id>]
 ```
 
 Under [`[proc] mode = "ask"`](../configuration/proc.md), an `execve` that matches neither the
-`allow` nor the `deny` list is **parked** — the process is blocked in the syscall — awaiting your
+`allow` nor the `deny` list is **parked**, the process is blocked in the syscall, awaiting your
 decision. `sbx proc pending` lists every parked `execve` across the live sessions; `sbx proc pending
 allow <id>` lets it run (the syscall continues), `deny <id>` refuses it (the syscall returns
 `EPERM`, never running).
 
 | Operand | Meaning |
 |---|---|
-| *(none)* | list every parked `execve` — `<session-pid>.<notif-id>`, the cage pid, how long parked, and the exec path |
+| *(none)* | list every parked `execve`, `<session-pid>.<notif-id>`, the cage pid, how long parked, and the exec path |
 | `allow <id>` / `deny <id>` | decide one parked `execve` by its `<session-pid>.<notif-id>` id |
 | `allow <pid>.*` / `deny <pid>.*` | decide **every** parked `execve` in session `<pid>` at once |
 
@@ -168,7 +168,7 @@ sbx proc pending deny 12345.4211      # refuse it (EPERM)
 
 A parked `execve` that is not decided within the ask timeout is auto-denied (fail-closed), so a
 process tree never hangs indefinitely on a stalled decision. Because a coding agent spawns
-constantly, `ask` is meant to run against a populated `allow` list — see
+constantly, `ask` is meant to run against a populated `allow` list: see
 [`[proc]`](../configuration/proc.md).
 
 ## `allow` / `deny`
@@ -178,8 +178,7 @@ sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--a
 sbx proc deny  <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
 ```
 
-Persist an exec rule to a config file's [`[proc]`](../configuration/proc.md) `allow`/`deny` list —
-the sibling of [`sbx net allow`/`deny`](net.md). The `<rule>` is an exec-target glob (`*`/`?`):
+Persist an exec rule to a config file's [`[proc]`](../configuration/proc.md) `allow`/`deny` list, the sibling of [`sbx net allow`/`deny`](net.md). The `<rule>` is an exec-target glob (`*`/`?`):
 without a `/` it matches the **basename** (`curl` blocks any `curl` on `PATH`), with a `/` it matches
 the **full exec path** (`/usr/bin/*`, `/nix/store/*/bin/git`). `deny` always wins over `allow`.
 
@@ -193,7 +192,7 @@ the **full exec path** (`/usr/bin/*`, `/nix/store/*/bin/git`). `deny` always win
 | `--all` | with `--session`, widen the live load to every reachable session (all projects) |
 
 The posture guard matches `[proc]`'s denylist-by-default. On a fresh project a `deny` **bootstraps**
-`mode = "enforce"` (a denylist) so it takes effect at once; an `allow` requires `mode = "ask"` — under
+`mode = "enforce"` (a denylist) so it takes effect at once; an `allow` requires `mode = "ask"`: under
 `enforce` everything not denied already runs, so an allow there is inert and is refused. A rule added
 to an `off`/`observe` mode is likewise refused (it would do nothing).
 
@@ -207,10 +206,10 @@ Writing the project `.sbx.toml` **re-trusts** it (it must be absent or already t
 rule takes effect on the next launch; the global config and app profiles are trusted by location.
 Removing a rule is done by editing the config ([`sbx config edit`](config.md)).
 
-### `--session` — load a rule into a running session
+### `--session`: load a rule into a running session
 
 `--session` loads the rule into the **live overlay** of the running enforcing session(s) instead of a
-config file — the proactive sibling of [`pending`](#pending), and the analogue of
+config file, the proactive sibling of [`pending`](#pending), and the analogue of
 [`sbx net allow`/`deny --session`](net.md). The supervisor folds the overlay into every decision
 (deny wins over any allow), so it takes effect **immediately** and dies with the session:
 
@@ -222,7 +221,7 @@ sbx proc allow git --session -a claude-code   # un-park `git` in that app's ask 
 It writes **no config** (so, unlike a config write, it never re-trusts the project) and scopes to the
 current project by default; `-a <app>` / `--all` widen it, and the config-scope flags (`-l`/`-g`) do
 not apply. A `--session allow` only loads into an `ask` session (it is inert under `enforce`, and is
-reported as such). It governs **future** execs — it does not un-park (`allow`) or retroactively
+reported as such). It governs **future** execs: it does not un-park (`allow`) or retroactively
 refuse (`deny`) an `execve` already parked; decide those with [`pending`](#pending).
 
 ## `rules`
@@ -231,7 +230,7 @@ refuse (`deny`) an `execve` already parked; decide those with [`pending`](#pendi
 sbx proc rules [-a|--app <name>] [--all]
 ```
 
-List the live `--session` rule overlay of the running enforcing session(s) — the rules loaded with
+List the live `--session` rule overlay of the running enforcing session(s): the rules loaded with
 `sbx proc allow`/`deny --session`, which nothing else surfaces (the config-file `[proc]` rules are
 shown by [`sbx config show`](config.md)). Scopes to the current project by default; `-a <app>`/`--all`
 widen it.
@@ -242,7 +241,7 @@ sbx proc rules
 #   479989  deny  curl
 ```
 
-Honest limit: exec-blocking is a **guardrail, not a containment boundary** — it catches every
+Honest limit: exec-blocking is a **guardrail, not a containment boundary**: it catches every
 `execve`, but an agent can still do harmful work *in-process* (in its own interpreter) without
 spawning. It adds visibility and a veto, on top of the cage's real boundaries (confinement by
 absence, the read-only store, the network allowlist).

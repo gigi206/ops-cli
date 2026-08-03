@@ -15,10 +15,23 @@ beats the environment; a security field set from the environment prints a stderr
 | `SBX_ENV_<KEY>` | `--env KEY=…` | one cage environment variable |
 | `SBX_NET` | `--net` | the network posture (`none`/`shared`/`ask`/`allow=…`/`deny=…`) |
 | `SBX_GUI` | `--gui` | the display posture (`none`/`offscreen`/`wayland`) |
+| `SBX_PROC` | `--proc` | the [process/exec](../configuration/proc.md) posture (`off`/`observe`/`enforce`/`ask`) |
+| `SBX_NOTIFY` | `--notify` | how loudly a refusal is [announced](../configuration/notify.md) (`off`/`once`/`always`) |
 | `SBX_NIXPKGS` | `--nixpkgs` | the nixpkgs channel or revision |
 | `SBX_BIND` | `--bind` | a host bind (`/path[:ro\|:rw]`) |
+| `SBX_FORWARD` | `--forward` | host loopback TCP port(s) into the cage, a comma-list (`SBX_FORWARD=1455,8080`) |
 | `SBX_LIMIT_<key>` | `--limit key=…` | a cgroup limit (`SBX_LIMIT_tasks_max=…`) |
 | `SBX_PACKAGE_<name>` | `--package name=…` | a package (`SBX_PACKAGE_hello=nix:hello`) |
+| `SBX_SECCOMP` | `--seccomp` | relax the syscall denylist, a comma-list of [`[seccomp]`](../configuration/seccomp.md) tokens (`SBX_SECCOMP=ptrace,unshare`) |
+| `SBX_DEVICE` | `--device` | grant one host [device node](../configuration/devices.md) (`SBX_DEVICE=/dev/kvm`) |
+| `SBX_GPU` | `--gpu` | the [GPU](../configuration/gpu.md) posture (`true`/`false`) |
+| `SBX_AUDIO` | `--audio` | the [audio](../configuration/audio.md) posture (`true`/`false`) |
+| `SBX_DBUS` | `--dbus` | the in-cage [desktop portal](../configuration/dbus.md) (`true`/`false`) |
+
+`SBX_GPU`, `SBX_AUDIO` and `SBX_DBUS` accept only `true` or `false`; any other value is a
+structural error and the launch is refused (exit 2), like a mistyped flag. `SBX_BIND` and
+`SBX_DEVICE` each carry exactly one value (a list is a `--config`/`SBX_CONFIG` concern),
+while `SBX_SECCOMP` and `SBX_FORWARD` take a comma-separated list in a single value.
 
 Precedence, lowest to highest:
 `SBX_CONFIG < SBX_* typed < --config < --* typed`.
@@ -52,7 +65,7 @@ requires an absolute base), and `sbx` falls back to `$HOME`.
 |---|---|---|
 | `SBX_DATA_DIR` | the data directory itself | a volume adopted with [`sbx storage use`](../cli/storage.md), else `$XDG_DATA_HOME/sbx` |
 
-The data directory is the one sbx tree that grows without bound — the shared nix store,
+The data directory is the one sbx tree that grows without bound: the shared nix store,
 the per-project runtime trees and the app homes all live there, and it is routinely tens
 of gigabytes across hundreds of thousands of inodes ([`sbx store`](../cli/store.md)
 reports both). `SBX_DATA_DIR` puts it on a filesystem of your choosing.
@@ -60,23 +73,22 @@ reports both). `SBX_DATA_DIR` puts it on a filesystem of your choosing.
 It differs from `XDG_DATA_HOME` in two ways, because it is sbx's own variable rather than
 a base shared with every application:
 
-- It names the directory **itself** — nothing is appended. `SBX_DATA_DIR=/vol/sbx` uses
+- It names the directory **itself**: nothing is appended. `SBX_DATA_DIR=/vol/sbx` uses
   `/vol/sbx`, where `XDG_DATA_HOME=/vol` would use `/vol/sbx`.
 - A **relative** value is **refused**, not ignored: sbx reports the error and stops. A
   relative path would resolve against whatever directory sbx was launched from, so falling
   back quietly would put your projects and apps somewhere you never look. Unset or empty
   reads as absent, so clearing the variable restores the default.
 
-It also has a **length limit — 74 bytes**, and a longer path is refused with that figure in
+It also has a **length limit, 74 bytes**, and a longer path is refused with that figure in
 the message. Egress filtering, the D-Bus filter, port forwarding and exec enforcement each
 bind a Unix-domain socket *under* the data directory, and the kernel caps a socket path at
 108 bytes. Without the check those features would fail at launch, reporting a socket
 problem rather than the directory that caused it.
 
-The **same limit applies to the directory sbx derives** when you set no `SBX_DATA_DIR` — a very
+The **same limit applies to the directory sbx derives** when you set no `SBX_DATA_DIR`: a very
 long `$HOME` or `$XDG_DATA_HOME` can push `$HOME/.local/share/sbx` past it. sbx then stops with
-the same message: set `SBX_DATA_DIR` to a shorter path, or adopt a [storage volume](../cli/storage.md)
-— its mount point under `/run` is short, so it clears the limit on its own. `sbx storage` keeps
+the same message: set `SBX_DATA_DIR` to a shorter path, or adopt a [storage volume](../cli/storage.md), its mount point under `/run` is short, so it clears the limit on its own. `sbx storage` keeps
 working while the plain directory is over the limit, so the volume remedy is always reachable.
 
 It also **overrides an adopted volume**, so it stays the way to run one-off against another
@@ -85,8 +97,8 @@ better route: it needs no variable at all and mounts the volume by itself.
 
 Pointing it at a filesystem that shares storage between files (copy-on-write) is worth
 knowing about: sbx seeds each per-project store from the shared one by cloning, which on
-such a filesystem shares blocks instead of copying them, and compression — where the
-filesystem offers it — applies on top. `sbx store` reports which case your filesystem is.
+such a filesystem shares blocks instead of copying them, and compression: where the
+filesystem offers it, applies on top. `sbx store` reports which case your filesystem is.
 
 See [Directory layout](../concepts/directory-layout.md).
 
@@ -122,15 +134,15 @@ cage. The one worth knowing:
 |---|---|
 | `MISE_MINIMUM_RELEASE_AGE` | overrides mise's built-in 24 h fresh-release hold; `"0"` installs the newest upstream release immediately. See [Upgrading toolchains](../housekeeping/upgrade.md#installing-the-newest-release-immediately). |
 
-Set it in the **global** config to apply to every app — edit `sbx/sbx.toml` or run
+Set it in the **global** config to apply to every app: edit `sbx/sbx.toml` or run
 `sbx config set --global env.MISE_MINIMUM_RELEASE_AGE 0` (`--local` for one project). A
-host `export` does **not** reach the cage, and `sbx upgrade` takes no override flags — a
+host `export` does **not** reach the cage, and `sbx upgrade` takes no override flags: a
 config `env` entry is the only channel.
 
 ## Credential variables (host, user-defined)
 
 An app [profile](../apps/catalog.md) references a provider key by
-[`from = "env://VAR"`](../secrets/resolvers.md) — e.g. `ANTHROPIC_API_KEY`,
+[`from = "env://VAR"`](../secrets/resolvers.md): e.g. `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, `OPENROUTER_API_KEY`. You export these on the host; the
 [egress proxy injects](../secrets/injection.md) them on the wire, so they **never enter
 the cage**.

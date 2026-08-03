@@ -22,12 +22,12 @@ See also: [The trust gate](../concepts/trust.md) · [`sbx untrust`](untrust.md) 
 keyed by the config's canonical path. A launch then compares the hash of the exact
 bytes it parses:
 
-- **Trusted** — the hash matches; security fields apply.
-- **Changed** — a record exists but the bytes differ; security fields are dropped
+- **Trusted**: the hash matches; security fields apply.
+- **Changed**, a record exists but the bytes differ; security fields are dropped
   (distinct from untrusted).
-- **Untrusted** — no record; security fields are dropped.
+- **Untrusted**: no record; security fields are dropped.
 
-The global config and app profiles are **trusted by location** — they need no `sbx
+The global config and app profiles are **trusted by location**: they need no `sbx
 trust`. Only a project `.sbx.toml` uses content trust. See
 [The trust gate](../concepts/trust.md).
 
@@ -39,5 +39,5 @@ sbx trust --show          # report the state
 sbx trust path/to/.sbx.toml
 ```
 
-After editing a trusted file, run `sbx trust` again — or use `sbx config set/edit
+After editing a trusted file, run `sbx trust` again: or use `sbx config set/edit
 --trust` to re-trust in one step. Revoke with [`sbx untrust`](untrust.md).

@@ -1,12 +1,12 @@
-# `[secret]` — credential injection
+# `[secret]`: credential injection
 
 Credentials the [egress proxy](../networking/architecture.md) injects into matching
 outbound requests, keyed by destination host. This page documents the **config
 shape**; for the architecture (the never-in-cage invariant, resolvers, redaction) see
 the [Secrets](../secrets/README.md) section.
 
-`[secret]` is a **security field** — honored from the global config or a trusted
-project, ignored from an untrusted one — and **effective only under a filtering
+`[secret]` is a **security field**: honored from the global config or a trusted
+project, ignored from an untrusted one: and **effective only under a filtering
 network posture** (`deny`/`allow`/`ask`), because the filtering proxy is what performs
 the injection.
 
@@ -21,7 +21,7 @@ enters the sandbox. So a credential belongs in `[secret]`, **not** in
 
 ## Keyed by host
 
-`secret` is a TOML *table* keyed by destination host, not an array — the host is the
+`secret` is a TOML *table* keyed by destination host, not an array: the host is the
 section, so a credential's destination reads at a glance:
 
 ```toml
@@ -56,12 +56,12 @@ type = "raw"
 | `prefix` | override the type's default prefix (`Bearer ` / `Basic ` / empty) |
 
 A secret must have **exactly one** of `key` or `from`. It must have a `header` and a
-`type`, either on itself or from `[secret.defaults]` — a secret that names neither is
+`type`, either on itself or from `[secret.defaults]`: a secret that names neither is
 an **explicit error**, never a silent (and likely wrong) default.
 
 `name` and `description` are what [`sbx secret list`](../cli/secret.md) prints, and the name matters
 for more than tidiness: it is what a substituted value is reported as (`${NAME}`) if a credential ever
-reaches a [task's](task.md) output. Two credentials sharing a name are both kept but warned about — a
+reaches a [task's](task.md) output. Two credentials sharing a name are both kept but warned about: a
 reader could not tell which one was withheld. Keep a name non-sensitive: it is a label, and it is
 shown to the caller. Its character set is narrow (letters, digits, `_`, `-`, `.`) precisely because it
 is rendered into output.
@@ -95,9 +95,9 @@ Because `defaults` is reserved, a host cannot be named `defaults`.
 
 ## The source: `key` vs `from`
 
-- **`from`** is explicit — one resolver ref (`from = "env://VAR"`) or a fallback chain
+- **`from`** is explicit: one resolver ref (`from = "env://VAR"`) or a fallback chain
   (`from = ["env://VAR", "sops://f#k"]`, tried in order, first to resolve wins).
-- **`key`** is terse — a bare key expanded through the `[secret.defaults] order` and
+- **`key`** is terse, a bare key expanded through the `[secret.defaults] order` and
   per-resolver bindings, optionally pinned to a resolver with `key@resolver`.
 
 Built-in resolvers are `env://`, `file://`, `sops://`; more come from
@@ -106,7 +106,7 @@ Built-in resolvers are `env://`, `file://`, `sops://`; more come from
 ## Worked example: authenticating the GitHub API
 
 The one most installations end up needing. mise's `aqua:` backend reads the GitHub API to
-resolve a tool's release, and **anonymously that is 60 requests an hour per IP** — which a
+resolve a tool's release, and **anonymously that is 60 requests an hour per IP**: which a
 couple of [`sbx upgrade mise`](../cli/upgrade.md) runs across several apps exhausts. The
 symptom is a roll that fails mid-way:
 
@@ -117,7 +117,7 @@ mise ERROR Failed to install aqua:owner/tool@latest: HTTP status client error
        github rate limit: 0/60 (core)
 ```
 
-`github auth: no` is not a misconfiguration — a cage inherits **three** variables from the
+`github auth: no` is not a misconfiguration: a cage inherits **three** variables from the
 host (`TERM`, `LANG`, `LC_ALL`) and nothing else, so a `GITHUB_TOKEN` set in your shell is
 correctly invisible inside it. The fix is not to let it in, but to inject it on the wire:
 
@@ -128,7 +128,7 @@ header = "Authorization"
 type   = "bearer"
 ```
 
-`env://` is read **host-side**, from sbx's own environment — where your token already is.
+`env://` is read **host-side**, from sbx's own environment: where your token already is.
 The authenticated ceiling is 5000/hour, and it is a *separate* counter from the anonymous
 one, so this takes effect immediately rather than at the next hourly reset. Verify it from
 inside a cage:
@@ -138,7 +138,7 @@ $ sbx run -- curl -sS https://api.github.com/rate_limit
 {"resources":{"core":{"limit":5000,"used":0,"remaining":5000, …
 ```
 
-`"limit": 5000` means the header arrived; `60` means it did not — check that the cage is
+`"limit": 5000` means the header arrived; `60` means it did not: check that the cage is
 under a filtering `network` posture (the proxy is what injects) and that its allowlist
 reaches `api.github.com`.
 
