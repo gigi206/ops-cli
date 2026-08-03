@@ -1150,6 +1150,25 @@ html[data-theme='dark']:root .home {
     var(--keep-bg);
 }
 
+/* The layer cards are links, but they do not lift or grow a rule the way the
+   navigation cards do: on a row of four, that reads as jitter. The border takes
+   the accent and a thin wash rises from the bottom; the name keeps its own. */
+.home__card--layer {
+  transition: border-color 200ms ease, background 200ms ease;
+}
+
+.home__card--layer:hover {
+  border-color: var(--keep-accent);
+  background: linear-gradient(0deg, var(--keep-chip-bg), transparent 60%),
+    var(--ifm-background-surface-color);
+  text-decoration: none;
+}
+
+.home__section--tint .home__card--layer:hover {
+  background: linear-gradient(0deg, var(--keep-chip-bg), transparent 60%),
+    var(--keep-bg);
+}
+
 .home__layer-n {
   margin: 0 0 0.5rem;
   font-family: var(--ifm-font-family-monospace);

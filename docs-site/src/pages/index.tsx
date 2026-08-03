@@ -61,16 +61,19 @@ const LAYERS: { n: string; tag?: string; name: string; detail: string; to?: stri
     n: '01',
     name: 'bubblewrap',
     detail: 'All namespaces, no_new_privs, capabilities dropped.',
+    to: '/docs/concepts/enforcement',
   },
   {
     n: '02',
     name: 'seccomp',
     detail: 'A two-filter syscall denylist, applied unconditionally.',
+    to: '/docs/configuration/seccomp',
   },
   {
     n: '03',
     name: 'cgroup v2',
     detail: 'Memory, pids and CPU limits, best-effort.',
+    to: '/docs/configuration/limits',
   },
   {
     n: '04',
@@ -274,14 +277,10 @@ export default function Home(): ReactNode {
                     <p className="home__card-detail">{detail}</p>
                   </>
                 );
-                return to ? (
-                  <Link className="home__card home__card--link" to={to} key={n}>
+                return (
+                  <Link className="home__card home__card--layer" to={to!} key={n}>
                     {body}
                   </Link>
-                ) : (
-                  <div className="home__card" key={n}>
-                    {body}
-                  </div>
                 );
               })}
             </div>
