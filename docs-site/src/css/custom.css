@@ -1010,8 +1010,8 @@ html[data-theme='dark']:root .home {
 .home__kicker {
   margin: 0 0 0.75rem;
   font-family: var(--ifm-font-family-monospace);
-  font-size: 0.6875rem;
-  letter-spacing: 0.16em;
+  font-size: 0.75rem;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--keep-faint);
 }
@@ -1195,16 +1195,19 @@ html[data-theme='dark']:root .home {
 
 .home__arrows li {
   display: flex;
-  gap: 0.625rem;
+  gap: 0.75rem;
   padding: 0.4375rem 0;
-  font-size: 0.9375rem;
+  font-size: 0.96875rem;
   line-height: 1.5;
   color: var(--keep-body);
 }
 
+/* The arrow is a monospace glyph in the design: wider, and it holds the accent
+   better than the proportional one. */
 .home__arrows li::before {
   content: '→';
   flex: none;
+  font-family: var(--ifm-font-family-monospace);
   color: var(--keep-accent);
 }
 
