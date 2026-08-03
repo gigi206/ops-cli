@@ -691,7 +691,11 @@ pre {
   color: var(--keep-accent);
 }
 
+/* The mark sits beside the line, not above it. */
 .footer__bottom {
+  display: flex;
+  align-items: center;
+  gap: 0.6875rem;
   max-width: 68rem;
   margin: 0 auto;
   padding-top: 1.5rem;
@@ -699,8 +703,13 @@ pre {
   text-align: left;
 }
 
+.footer__bottom > div:first-child {
+  display: flex;
+  margin-bottom: 0 !important;
+}
+
 .footer__logo {
-  margin: 0 0 0.625rem;
+  margin: 0;
 }
 
 .footer__copyright {

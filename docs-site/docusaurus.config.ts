@@ -124,7 +124,7 @@ const config: Config = {
           ],
         },
       ],
-      copyright: `A sandbox launcher for tools and encapsulated AI agents. © ${new Date().getFullYear()} gigi206.`,
+      copyright: 'A sandbox launcher for tools and encapsulated AI agents.',
     },
     prism: {
       // One theme for both colour modes: the code surface is the same stone in
