@@ -162,6 +162,17 @@ more than 64 are held at once (4 per host and credential set), so reuse never tu
 unbounded set of open sockets. The count is the guarantee; the delay only decides what is
 still fresh enough to hand over.
 
+### What it does move
+
+One thing, said here because the list above reads as an exhaustive one. A connection that is
+handed over travels to the address that was validated when it was opened, not to a fresh
+resolution of the name. The address guard still runs on every request, so a name that starts
+resolving to a disallowed address is refused before any connection is taken, and the
+certificate was validated for the name, so a reused connection still reaches a server
+authenticated for exactly it. What persists is the choice among the addresses a name
+legitimately has, for at most the ten seconds above. [`dns_cache_ttl`](#dns-resolution-dns_cache_ttl)
+already does the same for sixty by default.
+
 ### The residual
 
 A server may close a waiting connection at any moment. The proxy checks before it hands one
