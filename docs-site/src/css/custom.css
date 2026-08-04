@@ -320,6 +320,14 @@ body:has(.home__hero).is-past-hero .navbar {
   border-bottom-color: var(--keep-border);
 }
 
+/* A backdrop filter makes its element the containing block for the fixed
+   descendants under it, which collapses the sliding menu to the height of the
+   bar and spills its links onto the page. The menu covers the bar while it is
+   open, so there is nothing to frost until it closes. */
+body:has(.home__hero) .navbar.navbar-sidebar--show {
+  backdrop-filter: none;
+}
+
 /* The brand and the nav links are the only bare text in the bar; every control
    beside them has its own surface. Over the footage the muted link colour falls
    under 2:1, so here they take the ink colour and a scrim. Light mode already
