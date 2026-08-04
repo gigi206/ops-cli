@@ -987,6 +987,29 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 // construction, which is what let it take a parked connection at all.
                 Err(_) => {}
             }
+            // The parked connection is gone. Sending the request again is safe for a method whose
+            // effect does not depend on how many times it lands; for one that does, the honest reply
+            // is the refusal, and the client keeps the decision it alone can make.
+            if !idempotent_method(&imethod) {
+                ctx.push_log(
+                    super::control::Proto::Https,
+                    &connect_host,
+                    port,
+                    Some(&imethod),
+                    Some(&itarget),
+                    super::control::LogVerdict::Error,
+                    "upstream-closed",
+                );
+                return respond_refusal_tls(
+                    &mut br,
+                    "502 Bad Gateway",
+                    "upstream-closed",
+                    &format!(
+                        "`{connect_host}` closed the reused connection before answering, and \
+                         `{imethod}` is not safe to send a second time"
+                    ),
+                );
+            }
             let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &connect_host) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -2222,6 +2245,27 @@ fn handle_https_forward(
                 Err(e) if !from_pool => return Err(e),
                 Err(_) => {}
             }
+            // Same rule as the tunneled path: replay what may be replayed, refuse the rest plainly.
+            if !idempotent_method(method) {
+                ctx.push_log(
+                    super::control::Proto::Https,
+                    &host,
+                    port,
+                    Some(method),
+                    Some(&path),
+                    super::control::LogVerdict::Error,
+                    "upstream-closed",
+                );
+                return write_refusal(
+                    &mut client,
+                    "502 Bad Gateway",
+                    "upstream-closed",
+                    &format!(
+                        "`{host}` closed the reused connection before answering, and `{method}` \
+                         is not safe to send a second time"
+                    ),
+                );
+            }
             let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &host) {
                 Ok(pair) => pair,
                 Err(e) => return refuse_upstream(&mut client, ctx, &host, port, method, &path, e),
@@ -2434,6 +2478,25 @@ fn refuse_upstream<W: Write>(
         reason,
     );
     write_refusal(w, "502 Bad Gateway", reason, &detail)
+}
+
+/// Whether a method may be sent a second time after a parked connection turns out to be dead.
+///
+/// The retry runs only when the upstream said nothing at all, which from a live server means it
+/// never saw the request. But a server that took the request and died before answering looks exactly
+/// the same from here, so replaying a method whose effect is not idempotent could apply it twice.
+/// The methods RFC 9110 §9.2.2 defines as idempotent are replayed; `POST` and `PATCH` are not, and
+/// the request that loses its connection gets the `502` instead. That is not a worse answer, it is
+/// the honest one: whether such a request may be sent again is the client's to decide, and the
+/// client is the only layer that knows.
+///
+/// Compared exactly, so a non-canonical spelling is simply not replayed — an unknown method is one
+/// whose effect is unknown too.
+fn idempotent_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
+    )
 }
 
 /// Whether the upstream has anything at all to say on this connection, by a peek that leaves it
@@ -5566,6 +5629,48 @@ mod tests {
             upstream.connections(),
             2,
             "the second request cannot have ridden the connection that was reset"
+        );
+    }
+
+    /// The retry cannot tell a server that never saw the request from one that took it and died
+    /// before answering. For a `GET` the distinction does not matter. For a `POST` it decides
+    /// whether an effect lands once or twice, so that request is not sent again: it gets the `502`,
+    /// and the client keeps a decision only the client can make.
+    ///
+    /// The upstream here stops reading after the first request, so the second one always finds a
+    /// connection that will not answer — no race to schedule, and removing the method check turns
+    /// this red (the `POST` would be replayed on a second connection and answered).
+    #[test]
+    fn a_post_that_loses_its_reused_connection_is_refused_rather_than_sent_again() {
+        let (addr, upstream_ca, upstream) = spawn_upstream_that_resets_after_one(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        );
+        let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+        let got = through_proxy_repeatedly(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            &[
+                b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                b"POST /two HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 0\r\n\r\n",
+            ],
+        )
+        .unwrap();
+        assert!(
+            got[0].ends_with("hello"),
+            "the first request is served normally: {:?}",
+            got[0]
+        );
+        assert!(
+            got[1].contains("502 Bad Gateway") && got[1].contains("upstream-closed"),
+            "the POST must be refused, naming what happened: {:?}",
+            got[1]
+        );
+        assert_eq!(
+            upstream.connections(),
+            1,
+            "and it must not have been sent a second time on a fresh connection"
         );
     }
 

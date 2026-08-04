@@ -185,14 +185,21 @@ already does the same for sixty by default.
 
 ### The residual
 
-A server may close a waiting connection at any moment. The proxy checks before it hands one
-over, which catches this whenever the close has already arrived, and it retries once on a
-fresh connection when it can. The window it cannot close is the one between that check and
-the write, measured in microseconds against a wait measured in seconds. A request that loses
-that race gets a `502` named `upstream-closed` rather than a silent empty response.
+A server may close a waiting connection at any moment. Only a request the proxy still holds
+whole is given one, which is what makes the answer to that simple: it is sent again on a
+fresh connection. That covers a connection closed cleanly, where the send succeeds and the
+silence follows, and one torn down with a reset, where the send itself fails.
 
-That residual is why `pool` is off by default. Turn it on when a workload's cost is
-per-request rather than per-byte.
+**With one deliberate exception.** The retry cannot tell a server that never saw the request
+from one that took it and died before answering. For a `GET` that makes no difference. For a
+`POST` it decides whether an effect lands once or twice, so a non-idempotent method is not
+sent again: it gets a `502` named `upstream-closed`, and whether to repeat it stays the
+client's decision, which is the only layer that can make it. Idempotent methods (`GET`,
+`HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`) are replayed.
+
+So the residual is narrow: a `POST` that loses the connection it was given, and an upstream
+that fails on a fresh connection too, which would have failed without reuse anyway. `pool`
+is off by default for now, which is a conservative default rather than a warning.
 
 ## HTTP/2 and gRPC
 
