@@ -1,4 +1,4 @@
-import React, { useEffect, useState, type ReactNode } from 'react';
+import React, { useEffect, useRef, useState, type ReactNode } from 'react';
 import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import CodeBlock from '@theme/CodeBlock';
@@ -240,6 +240,76 @@ function useCinematic(): void {
   }, []);
 }
 
+// The hero's footage: "Castle, Mist, Forest" by HelpUkraine, published on
+// Pixabay on 30 June 2022 and served from static/assets/hero-keep.mp4.
+//
+//   source:  https://pixabay.com/videos/castle-mist-forest-nature-mountain-122406/
+//   licence: https://pixabay.com/service/license-summary/
+//
+// The Pixabay Content License allows commercial use, modification, and requires
+// no attribution; this note is here so the provenance of a binary in the tree is
+// answerable without a trip through the git log. Both files are hosted here
+// rather than hotlinked: the page contacts no third party at load, and their
+// terms do not offer their CDN as an origin for other people's sites.
+//
+// The four renditions the source offers, measured rather than guessed:
+//
+//   tiny    640x360    2.2 MB   .../122406-725513242_tiny.mp4
+//   small   960x540    4.7 MB   .../122406-725513242_small.mp4   <- in the tree
+//   medium  1280x720   7.4 MB   .../122406-725513242_medium.mp4
+//   large   1920x1080  15.5 MB  .../122406-725513242_large.mp4
+//
+// all under https://cdn.pixabay.com/video/2022/06/28/
+//
+// `small` is the one that ships. The hero draws the footage across 1440px and
+// wider, so `tiny` is magnified past two-to-one and its battlements go soft
+// where this one holds its edges. Above `small` the gain lands on detail the
+// veil over the footage swallows, at 1.6x then 3.3x the weight.
+//
+// The poster is the first frame of `large`, re-encoded to 1280px of WebP: 12 KB,
+// and the only thing a reader gets when the video is declined.
+const HERO_VIDEO = '/assets/hero-keep.mp4';
+const HERO_POSTER = '/assets/hero-keep.webp';
+
+/**
+ * The hero's footage is decorative, and it weighs more than everything else the
+ * page loads put together. So it is fetched only once the browser has said it is
+ * welcome: never under reduced motion, never under Save-Data, and not over a
+ * connection the browser itself calls slow. Declining it costs the reader
+ * nothing but the movement: the poster is in the markup, so the hero carries its
+ * picture either way.
+ *
+ * Where a browser reports nothing the footage loads. Safari and Firefox expose
+ * no Network Information API at all, so silence has to mean the full page
+ * rather than a degraded one; every read here is optional for that reason.
+ *
+ * The source is attached from here rather than written into the markup on
+ * purpose: an `src` in the served HTML starts the download before any of this
+ * can be consulted, which is what made a reduced-motion reader pay for footage
+ * that CSS then refused to show.
+ */
+function useHeroVideo(src: string): React.RefObject<HTMLVideoElement | null> {
+  const video = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const el = video.current;
+    if (!el) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    const link = (
+      navigator as Navigator & {
+        connection?: { saveData?: boolean; effectiveType?: string };
+      }
+    ).connection;
+    if (link?.saveData) return;
+    if (link?.effectiveType && link.effectiveType !== '4g') return;
+
+    el.src = src;
+  }, [src]);
+
+  return video;
+}
+
 function Command(): ReactNode {
   const [copied, setCopied] = useState(false);
 
@@ -332,6 +402,7 @@ function Transcript(): ReactNode {
 
 export default function Home(): ReactNode {
   const { siteConfig } = useDocusaurusContext();
+  const heroVideo = useHeroVideo(useBaseUrl(HERO_VIDEO));
   useCinematic();
 
   return (
@@ -346,7 +417,8 @@ export default function Home(): ReactNode {
           <div className="home__hero-media" id="home-hero-media">
             <video
               className="home__hero-video"
-              src={useBaseUrl('/assets/hero-keep.mp4')}
+              ref={heroVideo}
+              poster={useBaseUrl(HERO_POSTER)}
               autoPlay
               muted
               loop

@@ -1775,9 +1775,10 @@ html[data-theme='dark']:root .home {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .home__hero-video {
-    display: none;
-  }
+  /* The hero video is not hidden here: under this preference the script never
+     attaches a source, so nothing moves and nothing is fetched, and the element
+     stays to show its poster. Hiding it would take the picture away too, which
+     is more than the preference asks for. */
 
   .home__card,
   .home__cta,
