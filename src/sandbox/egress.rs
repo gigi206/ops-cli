@@ -648,9 +648,15 @@ pub(crate) fn start(
     // the base root bundle (`ca_bundle`, the same Mozilla roots sbx binds at /etc/ssl): every allowed
     // egress is MITM'd and so presents the MITM CA, but a bundle of a single cert is unusual and trips
     // tools that heuristically reject a "too small" CA file (e.g. a client that sanity-checks
-    // `certifi`), so pairing it with the normal roots keeps the file a full, ordinary bundle. The
-    // extra roots are inert for egress (the empty netns permits no un-proxied TLS) — the MITM CA is
-    // what verifies the wire.
+    // `certifi`), so pairing it with the normal roots keeps the file a full, ordinary bundle.
+    //
+    // The extra roots authenticate nothing here: the MITM CA is what verifies the wire, and the
+    // empty netns permits no un-proxied TLS. They are not free, though, and reading otherwise sends
+    // the next reader looking for this cost somewhere else. The file runs to ~460 KB and 120
+    // certificates, and a client that loads its store per connection pays for all of it — measured
+    // in a cage, `curl` spends ~13 ms in its TLS phase against ~1.4 ms when pointed at the MITM CA
+    // alone. Trimming it would be a trade rather than a fix: a `tcp://` rule and a shared-network
+    // launch both end TLS at the real server, where these roots are what verifies it.
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
