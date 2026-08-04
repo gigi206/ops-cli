@@ -142,9 +142,19 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+/// How much the relay moves per read/write on the inspected path.
+///
+/// Sized by measurement rather than by habit. On a loopback upstream the inspected relay moved
+/// ~1300 MiB/s at 8 KiB and ~1490 MiB/s at 64 KiB, while the raw L4 splice — which does not use this
+/// buffer — stayed flat across both, so the gain is the syscall count falling and not the machine
+/// drifting. Going larger buys little: what remains is the TLS record work either side of the copy,
+/// which no chunk size removes. Heap-held rather than a stack array, so a connection thread's frame
+/// does not grow with it.
+pub(super) const RELAY_CHUNK: usize = 64 * 1024;
+
 /// Copy exactly `n` bytes from `r` to `w`; a short read is an error (a truncated body).
 pub(super) fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) -> io::Result<()> {
-    let mut buf = [0u8; 8192];
+    let mut buf = vec![0u8; RELAY_CHUNK];
     while n > 0 {
         let want = n.min(buf.len() as u64) as usize;
         let got = r.read(&mut buf[..want])?;

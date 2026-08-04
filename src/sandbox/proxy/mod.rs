@@ -2422,7 +2422,7 @@ fn finish_tls(stream: &mut StreamOwned<ServerConnection, UnixStream>) {
 /// Stream `r` to `w` until end of input. A peer that drops the TLS connection without a
 /// `close_notify` surfaces as an unexpected EOF, which ends the stream normally rather than erroring.
 fn pump_to_eof<R: Read, W: Write>(r: &mut R, w: &mut W) -> io::Result<()> {
-    let mut buf = [0u8; 8192];
+    let mut buf = vec![0u8; RELAY_CHUNK];
     loop {
         match r.read(&mut buf) {
             Ok(0) => break,
@@ -2461,8 +2461,11 @@ fn pump_redacting<R: Read, W: Write>(
         .max()
         .unwrap_or(0);
     let keep = max_len.saturating_sub(1);
-    let mut carry: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 8192];
+    // One window, reused for the whole stream: the carry sits at its head and each read is appended
+    // behind it, so a body of any length costs the two allocations below and no more. Draining the
+    // emitted prefix shifts only the carry, which is shorter than the longest needle.
+    let mut window: Vec<u8> = Vec::with_capacity(keep + RELAY_CHUNK);
+    let mut buf = vec![0u8; RELAY_CHUNK];
     loop {
         let n = match r.read(&mut buf) {
             Ok(0) => break,
@@ -2470,17 +2473,16 @@ fn pump_redacting<R: Read, W: Write>(
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         };
-        let mut window = std::mem::take(&mut carry);
         window.extend_from_slice(&buf[..n]);
         redact_in_place(&mut window, needles);
         // Hold back the last `keep` bytes — a secret could begin there and complete in the next
         // read; emit everything before them.
         let split = window.len().saturating_sub(keep);
         w.write_all(&window[..split])?;
-        carry = window[split..].to_vec();
+        window.drain(..split);
     }
     // The trailing carry was already scanned in its final window (a needle cannot extend past EOF).
-    w.write_all(&carry)?;
+    w.write_all(&window)?;
     w.flush().ok();
     Ok(())
 }
@@ -4641,9 +4643,11 @@ mod tests {
     #[test]
     fn a_large_response_body_relays_intact_past_the_status_peek() {
         use crate::sandbox::control::{LogRing, LOG_RING_CAP};
-        // 20 000 bytes > the 64-byte peek read AND the 8192-byte pump chunk, so the relay must read
-        // from `upstream` well past the cursor. A leaked static slice satisfies `spawn_upstream`.
-        let body = vec![b'x'; 20_000];
+        // Larger than the 64-byte peek read AND than one pump chunk, so the relay must read from
+        // `upstream` well past the cursor. Derived from the chunk constant rather than written as a
+        // literal, so growing the chunk cannot quietly cost this test its teeth. A leaked static
+        // slice satisfies `spawn_upstream`.
+        let body = vec![b'x'; RELAY_CHUNK * 2 + 1_000];
         let mut resp =
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
         resp.extend_from_slice(&body);
@@ -4678,12 +4682,16 @@ mod tests {
         .unwrap();
         up.join().unwrap();
 
-        // The full 20k body survived the prefix→upstream chain, byte-identical.
+        // The whole body survived the prefix→upstream chain, byte-identical.
         let sep = got
             .find("\r\n\r\n")
             .expect("the relayed response has a head/body separator");
         let relayed_body = &got[sep + 4..];
-        assert_eq!(relayed_body.len(), 20_000, "the whole body relayed intact");
+        assert_eq!(
+            relayed_body.len(),
+            RELAY_CHUNK * 2 + 1_000,
+            "the whole body relayed intact"
+        );
         assert!(
             relayed_body.bytes().all(|b| b == b'x'),
             "the body bytes are unaltered across the chain seam"
