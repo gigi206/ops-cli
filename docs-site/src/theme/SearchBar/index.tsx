@@ -105,6 +105,9 @@ export default function SearchBar(): ReactNode {
     function onKeyDown(event: KeyboardEvent) {
       const input = mountRef.current?.querySelector('input');
       if (!input) return;
+      // The sliding menu takes the field out of the page for as long as it is
+      // open; claiming the shortcut then would swallow it and focus nothing.
+      if (input.checkVisibility?.({ visibilityProperty: true }) === false) return;
       if (event.key === 'k' && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();
         input.focus();
