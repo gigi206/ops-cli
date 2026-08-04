@@ -32,7 +32,7 @@
 #
 # DISPLAY + GPU + DBUS. `gui = "wayland"` binds the host Wayland socket (read-only) and provisions
 # fonts so the window maps (X11 is never offered; isolation is compositor-dependent — Mutter/GNOME is
-# safe, wlroots exposes screen-capture/input-injection, see docs/guide/configuration/gui.md).
+# safe, wlroots exposes screen-capture/input-injection, see docs-site/docs/guide/configuration/gui.md).
 # `gpu = true` opens hardware-accelerated rendering (mesa into sbx's store + the `/dev/dri` render node
 # + the minimal `/sys` DRM subtree); a Chromium/Electron app on Wayland with no working GL often
 # produces no buffer and NO window maps. mesa covers Intel/AMD/nouveau; an NVIDIA-only machine falls
@@ -43,7 +43,7 @@
 # flags: `--no-sandbox` is mandatory and acceptable (bwrap + seccomp + the empty netns IS the boundary,
 # replacing Chromium's own redundant sandbox); `--ozone-platform=wayland` selects the Wayland backend;
 # `--disable-dev-shm-usage` avoids the small cage `/dev/shm`. (`audio` is NOT enabled — add `audio =
-# true` only if you use a voice feature; see docs/guide/configuration/audio.md.)
+# true` only if you use a voice feature; see docs-site/docs/guide/configuration/audio.md.)
 #
 # CREDENTIAL POSTURE — account / Google OAuth, NOT a header-injectable API key. Antigravity signs in
 # with **Google Sign-In**; Google does not support a bring-your-own Gemini API key here. There is

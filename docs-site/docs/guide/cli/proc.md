@@ -25,7 +25,7 @@ To set the posture for a **single launch** without editing a config, use the one
 disables a trusted project's enforcement for one run, and a `--config` blob's `[proc]` table carries
 one-shot allow/deny lists.
 
-See also: [`sbx fs`](fs) (the file-write sibling) · [`sbx net`](net) · [`sbx session`](session).
+See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx fs`](fs) (the file-write sibling) · [`sbx net`](net) · [`sbx session`](session).
 
 ## `ls`
 
@@ -33,8 +33,8 @@ See also: [`sbx fs`](fs) (the file-write sibling) · [`sbx net`](net) · [`sbx s
 sbx proc ls [<id>] [--json]
 ```
 
-Snapshot the process tree of a running session. The launcher process: or bubblewrap itself on
-the [`sbx run`](run) exec path: is the root, and every process the agent spawned is one of
+Snapshot the process tree of a running session. The launcher process (or bubblewrap itself
+on the [`sbx run`](run) exec path) is the root, and every process the agent spawned is one of
 its descendants in host pid-space, so a plain `/proc` walk from that root shows the whole tree.
 
 | Operand / option | Meaning |
@@ -117,14 +117,14 @@ sbx proc logs 12345 -f                  # …watch what it spawns, from here
 sbx proc logs 12345 --json | jq .command   # machine-readable
 ```
 
-This is the way to watch an observed session **from another terminal**: and the **only** way to
+This is the way to watch an observed session **from another terminal**, and the **only** way to
 watch a [detached](run) (`--detach`) one, which has no terminal for the inline `[sbx:exec]`
 feed. The events are held in the supervisor's memory for the session's lifetime, read over a
 per-session control socket that is never exposed inside the cage; nothing is written to disk or
 kept after the session exits.
 
 Under a non-enforcing `--observe` run the feed is populated by a short-interval `/proc` poll, so a
-process that starts and exits within one tick can be missed: and each line's verdict reads
+process that starts and exits within one tick can be missed, and each line's verdict reads
 `observe` (it records what ran, not a decision). Under [`[proc] mode = enforce`/`ask`](../configuration/proc)
 the feed comes from the seccomp user-notification supervisor instead: **every** `execve` is captured
 exactly, and each carries its real verdict: `allow`, `deny`, `ask`, or `absent`.

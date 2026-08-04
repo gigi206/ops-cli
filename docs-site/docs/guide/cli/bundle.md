@@ -92,6 +92,45 @@ in `use`.
 An app *profile* is a different artifact: import that with
 [`sbx app import`](app); the error message says so if you mix them up.
 
+## Examples
+
+The full round trip: inspect what a bundle would bring in, use it from an app, then
+move it to another machine.
+
+```sh
+sbx bundle                             # what is declared, and how much each brings
+sbx bundle claude-code                 # one in full: packages, env keys, egress, credentials
+sbx bundle --json | jq -r '.bundles[].name'
+```
+
+A bundle is inert until an app names it, and the naming is what grants its egress and
+credentials:
+
+```toml
+# ~/.config/sbx/sbx.toml
+[app.my-agent]
+cmd = ["claude"]
+use = ["claude-code"]                  # folds in its packages, env, egress rules, secret
+```
+
+```sh
+sbx net rules -a my-agent              # the egress the bundle contributed, now effective
+sbx secret list -a my-agent            # …and the credentials it carries
+sbx app run my-agent
+```
+
+Moving it:
+
+```sh
+sbx bundle export claude-code --out claude-code.toml   # on the source machine
+sbx bundle import claude-code.toml                     # on the target
+sbx bundle import claude-code.toml --force             # …overwriting an existing name
+sbx bundle claude-code                                 # inspect before an app uses it
+```
+
+An import that would grant egress or a credential says so in its output; that warning
+is the moment to run `sbx bundle <name>` before wiring it into an app.
+
 ## Exit codes
 
 | Code | Meaning |

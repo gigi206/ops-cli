@@ -54,7 +54,9 @@ or log apply.
 `shared` is also the documented **escape hatch**: set `network = "shared"` in your
 global config to make open networking the default for every project, overriding
 whatever `sbx`'s built-in default becomes. An untrusted project still cannot reach
-this posture (see [the security gate](#security-gated)).
+this posture (see [the security gate](#security-gated)). For how it compares with the
+two filtering ways to let everything through, see
+[Opening the network wide](#opening-the-network-wide).
 
 ## `deny`
 
@@ -121,6 +123,106 @@ The full workflow is on the [ask mode](ask) page.
 
 ---
 
+## Opening the network wide
+
+Three spellings are used to "let everything through", and they are **not**
+equivalent. Only `shared` removes the proxy; the other two keep every byte flowing
+through it and merely widen what the policy permits:
+
+```bash
+sbx run --net shared -- ./x.sh                   # no proxy at all: the host's network
+sbx run --net 'allow=re:.*' -- ./x.sh            # deny mode, one catch-all rule
+sbx run --config 'network = "allow"' -- ./x.sh   # allow-by-default, an empty denylist
+```
+
+|  | `--net shared` | `--net 'allow=re:.*'` | `--config 'network = "allow"'` |
+|---|---|---|---|
+| the proxy | **none**: no `http_proxy` in the cage | MITM proxy | MITM proxy |
+| the network namespace | the host's own | empty | empty |
+| public `https://`, any port | direct | allowed | allowed |
+| cleartext `http://` | works | **refused (403)** | **refused (403)** |
+| raw `tcp://` (ssh, a database) | works | never spliced | never spliced |
+| host loopback and LAN | **reachable** | out of reach | out of reach |
+| DNS and any other non-HTTP traffic | direct, like on the host | nothing leaves the namespace | nothing leaves the namespace |
+| `[secret]` header injection | **dropped, with a warning** | injected | injected |
+| `sbx net rules` / `logs` / `stats` / `capture` | nothing to show | full | full |
+| [`--net-learn`](../cli/app#learning-an-apps-egress---net-learn) | refused (needs a filtering posture) | accepted, learns nothing | accepted, learns nothing |
+
+`--net-learn` turns each refusal into a rule, so under a posture where nothing is
+refused it has nothing to write: learn an app's egress under its **own** posture, not
+under one of these.
+
+### Why only `shared` is a real bypass
+
+`shared` puts the cage in **your** network namespace, so there is nothing to filter
+with: no proxy is started, no `http_proxy`/`https_proxy` is set, and a tool connects
+out exactly as it would on the host. That includes your **host loopback** (a database
+on `127.0.0.1`, a local model server, a dev server) and your **LAN**, which no
+filtering posture ever exposes.
+
+Three consequences are worth knowing before reaching for it:
+
+- **Credential injection stops.** `[secret]` HTTP headers are injected *by the proxy*,
+  so with no proxy there is nowhere to inject them. They are dropped with a loud
+  warning rather than silently ignored (see [`[secret]`](../configuration/secret)).
+- **Nothing is observable.** No rules, and no [decision log, stats, or
+  capture](observability): the traffic never passes through sbx.
+- **`forward` becomes a no-op** (noticed at launch): the cage's loopback already *is*
+  the host's, so there is nothing to bridge.
+
+### What the two filtering spellings still refuse
+
+A catch-all rule and an allow-by-default posture only move the *verdict*; the
+proxy's structural guards are untouched, so three refusals survive both:
+
+- **Cleartext is opt-in.** `http://` needs an explicit `http://host` allow rule; the
+  default action is never consulted for it, and a regex never opens it. A plain
+  `http://` request answers `403` under either spelling.
+- **Raw TCP is opt-in.** A `tcp://` splice happens only when an explicit
+  `tcp://host:port` allow rule matches. Everything else takes the inspected HTTPS
+  path, which a non-HTTP protocol cannot satisfy, so ssh and a database client stay
+  blocked. See [rules](rules).
+- **Private addresses stay out of reach.** The [SSRF guard](architecture#the-ssrf-guard)
+  admits a private or loopback address only when the *deciding rule names that exact
+  host*: a regex never does, and an allow-by-default verdict has no deciding rule at
+  all. Under a filtering posture the cage cannot even route to them (its namespace is
+  empty), and the host-side proxy answers `403` at CONNECT time. Note that
+  [`sbx test net`](../cli/test) reports the *policy* verdict, so under either of these
+  two spellings it answers `ALLOWED` on a private address where the live proxy refuses
+  at CONNECT time. (With an exact-host rule, the one the guard admits, the two agree.)
+
+To reach one internal host on purpose, name it exactly (`allow = ["db.internal"]`,
+`allow = ["tcp://db.internal:5432"]`), which is the deliberate act the guard is
+waiting for.
+
+### Which of the two filtering forms to prefer
+
+`network = "allow"` is the readable one: it is a posture, it reads as "everything
+except my `deny` list", and a `deny` entry keeps working on top of it. The catch-all
+`re:.*` is a `deny` posture wearing a disguise; prefer it only when you want each
+allowed request to carry a *visible deciding rule* in [`sbx net logs`](observability)
+rather than an `allowed-by-default` verdict.
+
+Two practical notes on the catch-all form:
+
+- `--net allow=…` splits its value on **commas**, so a regex containing one (a
+  `{n,m}` quantifier, an alternation list) must go through
+  `--config '[network] allow = ["re:…"]'` instead.
+- In an **app profile**, a bare `allow = ["re:.*"]` inherits the app
+  [read-by-default posture](#default_methods-apps-only) and resolves to
+  `{GET,HEAD} re:.*`, so a POST is still refused. Write `allow = ["{*} re:.*"]` (or
+  `default_methods = ["*"]`) to mean every verb. A `--net` override on the command
+  line is not affected: an override posture is Mode A and carries all verbs.
+
+### It is still trust-gated
+
+All three are `network` values, so the [security gate](#security-gated) applies: an
+untrusted project cannot reach any of them from its `.sbx.toml`. A one-shot `--net` /
+`--config` on the command line is trusted by invocation, which is what makes it the
+practical escape hatch when a filtering posture blocks a legitimate tool.
+
+---
+
 ## The built-in self-equip set
 
 Under any filtering posture, one set of read-only (`{GET,HEAD}`) hosts is always
@@ -130,7 +232,7 @@ allowed so a project can provision its toolchain even when untrusted:
 - `*.nixos.org`: channels, releases, tarballs
 - `github.com`, `api.github.com`, `codeload.github.com`: nixpkgs GitHub sources
 - `*.githubusercontent.com`: raw content and release assets
-- `hub.nixos.org`: the upstream nixpkgs metadata endpoint the nix resolver queries (overridable via the per-toolkit resolver plugin)
+- `search.devbox.sh`: the Nixhub metadata endpoint the nix resolver queries (overridable via the per-toolkit resolver plugin)
 - `mise-versions.jdx.dev`: mise's version index
 
 These are the *version-resolution and nix-source* hosts both self-equip front-ends
@@ -200,8 +302,8 @@ this app default.
 ## Security-gated
 
 `network` is a **security field**. Narrowing or widening the network is a
-confidentiality choice an untrusted project may not make, so the posture: and its
-rules, groups, `ask_timeout`, `stats`, and `default_methods`: is honored **only**
+confidentiality choice an untrusted project may not make, so the posture (and its
+rules, groups, `ask_timeout`, `stats`, and `default_methods`) is honored **only**
 from:
 
 - the **global** config (trusted by its location), or

@@ -1,0 +1,81 @@
+# omp — a high-capability, multi-provider (BYOK) terminal coding agent forked from Pi, sandboxed by sbx.
+#
+#   sbx app import examples/app/omp.toml
+#   sbx app run omp
+#
+# omp (site https://omp.sh) is can1357's fork of Pi (earendil-works/pi, profiled alongside it
+# as `pi`): the same unified, multi-provider agent, plus a heavier in-process harness — hashline
+# content-hash edits, LSP and DAP servers, persistent Python/JS eval kernels, in-process
+# ripgrep/glob, and a catalogue of seventy-plus model providers.
+#
+# The tool ships ONE standalone `omp` binary per platform. It is a single Bun-compiled
+# executable (Bun is embedded, not a runtime dependency — `ldd` shows only glibc), so the cage
+# needs no package beyond that glibc: the same shape as `pi`.
+#
+# It is equipped from upstream at the latest release by mise's `github:` backend. The registry's
+# `oh-my-pi` entry resolves to `github:can1357/oh-my-pi` — the profile's `[packages]` line below
+# is exactly it — and it is provisioned at the latest upstream version on the first launch in a
+# project. mise picks the platform release asset (`omp-linux-x64` here) and installs it as `omp`,
+# verifying the release's GitHub artifact attestations and SLSA provenance before installing.
+# Advance an already-installed version with `sbx upgrade mise`. (The first-launch fetch from
+# GitHub rides sbx's built-in nix-cache allow-set, so github.com needs no `allow` entry.)
+#
+# CREDENTIAL — omp is BYOK and multi-provider like `pi`. This template is set up for Anthropic;
+# any header-injectable provider works the same way: swap the allowlist and the `[secret]` block
+# for your provider — OpenAI (`api.openai.com`, OPENAI_API_KEY), OpenRouter (`openrouter.ai`,
+# OPENROUTER_API_KEY), xAI (`api.x.ai`, XAI_API_KEY), or another from omp's catalogue. The real
+# key is read on the HOST and injected by the egress proxy, never entering the cage. A provider
+# omp signs in to via OAuth / a coding plan has no header for the proxy to fill, so prefer a
+# header-injectable (BYOK) provider in this sandbox. If a host is refused, `sbx net log -a omp`
+# names it; check a URL's verdict ahead of time with `sbx test net <url>`.
+#
+# omp's /collab session relay (`my.omp.sh`) stays refused unless you opt in; uncomment its allow
+# entry below to join a session.
+cmd = "omp"
+
+# AUDIO — omp's voice feature (speaks the assistant's output as it streams) opens the default
+# speaker through miniaudio (backends: PulseAudio/ALSA/Jack). A hermetic cage without audio has
+# neither the socket nor the client libraries, so the open fails with `MA_NO_BACKEND` and the
+# vocal portion is silently lost. `audio = true` provisions the PulseAudio client + the
+# ALSA->PulseAudio shim and binds the host socket, so the voice plays. A security field,
+# trusted-only: the PulseAudio bus exposes the microphone AND all system-audio output.
+audio = true
+
+# Your host omp config, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# `omp` read and write these host files (agent config, models, memory bank). Uncomment to share your
+# host omp setup with the cage instead of the app's isolated home (the default). omp keeps its
+# config under ~/.omp.
+#binds = [
+#    { path = "~/.omp", mode = "rw" },
+#]
+
+[packages]
+omp = "mise:github:can1357/oh-my-pi"
+
+# An app is read-by-default ({GET,HEAD}); the API host the agent POSTs to is opened with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # The tool's own site. The runtime MODEL host is added below for the provider you key it to,
+    # exactly like `pi`; GitHub install traffic rides sbx's built-in nix-cache allow-set.
+    "{GET} https://omp.sh",
+    # Anthropic BYOK — uncomment together with the [secret] block below.
+    #"{*} https://api.anthropic.com",
+    # Direct-OpenRouter BYOK — uncomment together with the [secret] block below.
+    #"{*} https://openrouter.ai",
+    # omp's /collab relay — refused by default (opt-in sessions); uncomment to join one.
+    #"{*} https://my.omp.sh",
+]
+
+# The real API key is read on the HOST and injected by the egress proxy — never in the cage.
+# Provide it on the host as $ANTHROPIC_API_KEY (or point `from` at a resolver, e.g.
+# sops://secrets.yaml#anthropic). The in-cage placeholder lets omp start and issue its request;
+# the proxy strips it and substitutes the real key on the wire to api.anthropic.com.
+[env]
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "Authorization"
+#type = "bearer"

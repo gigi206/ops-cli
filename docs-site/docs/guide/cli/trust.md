@@ -39,5 +39,5 @@ sbx trust --show          # report the state
 sbx trust path/to/.sbx.toml
 ```
 
-After editing a trusted file, run `sbx trust` again: or use `sbx config set/edit
+After editing a trusted file, run `sbx trust` again, or use `sbx config set/edit
 --trust` to re-trust in one step. Revoke with [`sbx untrust`](untrust).

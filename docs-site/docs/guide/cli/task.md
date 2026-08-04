@@ -115,7 +115,7 @@ It is host-side only: a cage cannot reach the socket that knows.
 
 A column that reads the same on every line is not information: it is the noise that makes a listing
 unreadable. `MISSING TOOLS` appears when an operation declares
-[`packages`](../configuration/task#the-task-tool-pool) the pool does not hold: that operation will
+[`packages`](../tasks/execution#the-task-tool-pool) the pool does not hold: that operation will
 fail at exec, and the pool is filled best-effort, so this is where you find out before invoking it.
 
 **`DECLARED IN` says which config holds each operation's `[task.<name>]` block**, and appears by the
@@ -144,7 +144,7 @@ no bundle. The two never overlap: the rows disagree exactly when more than one s
 which is exactly when knowing the session's app and project cannot tell you which of them declared a
 given operation. Where one source explains everything, the column is not shown.
 
-It claims where the *block* is, and nothing more. An operation is genuinely composed of two layers, its own block, plus whatever [`[task.defaults]`](../configuration/task) it inherits: and those
+It claims where the *block* is, and nothing more. An operation is genuinely composed of two layers, its own block, plus whatever [`[task.defaults]`](../configuration/task) it inherits, and those
 can be different files. [`show`](#show) is where that is spelled out.
 
 **With several sessions, all of them are listed** and a `SESSION` column says which row came from
@@ -217,8 +217,8 @@ id
 **Exit codes.** The command's own exit code is returned, so an operation composes in a script like
 the program it wraps. A **refusal** is exit **125** and runs nothing: an unknown operation, a value
 outside its declared bound, a variable not in `env_allow`, or an exhausted session quota. 125 rather
-than 2 so it stays distinguishable from the wrapped command exiting 2 itself: the same convention
-`env` and the like.
+than 2 so it stays distinguishable from the wrapped command exiting 2 itself, the same
+convention `env` and `docker` use for that distinction.
 
 **Output.** stdout and stderr come back only if the declaration shows them, and every credential
 value found in either is replaced by `${NAME}` first. sbx reports, on stderr, when the output was
@@ -256,7 +256,7 @@ recorded in `sbx task logs` and are not reported here, because a count over outp
 handed over is a number the command could choose and you could read. `refused` lists what
 [`spawn`](../configuration/task) blocked: its paths
 are substituted exactly as the output is, so a credential a command spelled into a program name comes
-back named rather than in the clear: and `output` is
+back named rather than in the clear, and `output` is
 `{"path": …, "bytes": …}` when the operation declares one. A refusal is a document too: `error` says
 why and `exit` is `null`, because nothing ran; the exit code is still 125. `id` is `null` only when
 the plane declined before admitting the request (an exhausted quota), where no invocation exists to
@@ -464,7 +464,7 @@ returns:
 | `invocation <id> had already finished` | too late, and nothing to do | 0 |
 | `no invocation <id>` | this session never issued that id | 1 |
 
-An artifact in an [`output = true`](../configuration/task#producing-a-file-output) directory stays
+An artifact in an [`output = true`](../tasks/output#producing-a-file-output) directory stays
 as the stopped command left it: partial, and only the next invocation clears it.
 
 ## `logs`

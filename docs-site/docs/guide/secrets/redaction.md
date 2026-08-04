@@ -212,6 +212,5 @@ if it does leak. See the resolver guidance in [Resolvers](resolvers).
   source.
 - [Network modes](../networking/modes): the empty-netns + allowlist
   boundary the tripwires sit behind.
-- [`bwrap-secrets-architecture.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture.md): the
   design's honest residuals (reflecting upstream, encoding-evasion, masking's
   limits).

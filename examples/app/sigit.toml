@@ -21,7 +21,7 @@
 #
 # COST AND SPEED, stated plainly: the first launch pays a 1–2 GB download, and inference runs on
 # **your CPU** unless you have GPU offload configured (`gpu = true` opens the render node — see
-# `docs/guide/configuration/gpu.md` — but whether this build uses it is unproven here). A 4B model on
+# `docs-site/docs/guide/configuration/gpu.md` — but whether this build uses it is unproven here). A 4B model on
 # CPU is usable for focused edits, not for large refactors. Upstream also offers a hosted option at
 # `code.sigit.si` for people who would rather not run a model locally; that is a different posture
 # (a service account), not what this profile does.

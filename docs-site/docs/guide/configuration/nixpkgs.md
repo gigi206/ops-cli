@@ -11,7 +11,7 @@ nixpkgs = "nixos-23.11"                                   # a branch/channel
 project, ignored from an untrusted one: because the source of your toolchain is a
 supply-chain-relevant choice.
 
-See also: [Provisioning](../concepts/provisioning) · [`sbx upgrade`](../housekeeping/upgrade) · [`packages`](packages).
+See also: [Provisioning](../concepts/provisioning) · [`sbx upgrade`](../concepts/upgrade) · [`packages`](packages).
 
 ## What it accepts
 
@@ -29,7 +29,7 @@ coreutils, the curated base tools) **and** the `nix:` tools, from **one** effect
 channel:
 
 ```
-project pin  ??  global override  ??  default (nixos-unstable)
+project pin  >  global override  >  default (nixos-unstable)
 ```
 
 This is deliberate. The cage exports the base glibc on `LD_LIBRARY_PATH` for foreign
@@ -46,7 +46,7 @@ OS-substrate layer.)
 ## Source-aware locks
 
 The resolved revision is recorded in a lock so versions do not move on an `sbx` binary
-update, only on an explicit [`sbx upgrade`](../housekeeping/upgrade):
+update, only on an explicit [`sbx upgrade`](../concepts/upgrade):
 
 - A **global** override records to the shared `<data>/nixpkgs.lock`.
 - A trusted **project** pin records to a per-project
@@ -60,7 +60,7 @@ source stays fixed. A first launch of a pinned project downloads its own base cl
 
 A **channel** pin (`nixos-23.11`) advances *within itself* only via `sbx upgrade` run
 in that project, a global upgrade would not touch a project's own pin. A **revision**
-pin refreshes to itself (a no-op). See [Upgrading](../housekeeping/upgrade).
+pin refreshes to itself (a no-op). See [Upgrading](../concepts/upgrade).
 
 ## Viewing the effective channel
 
@@ -82,3 +82,50 @@ SBX_NIXPKGS=nixos-unstable sbx run
 `--nixpkgs` takes a branch/channel name or a 40-hex revision (same as the field). The
 command line beats the environment, and both beat the config file. See
 [One-shot overrides](overrides).
+
+## Examples
+
+Three postures, and what each costs.
+
+```toml
+# unset: nixos-unstable, and the shared store's base closure is already there
+```
+
+```toml
+# a channel, for a project that must not track unstable
+nixpkgs = "nixos-23.11"
+```
+
+```toml
+# an exact revision, for a build that must be byte-reproducible
+nixpkgs = "3e0ce8c5d4a1f5f6b8a1a1a1a1a1a1a1a1a1a1a1"
+```
+
+A pinned project downloads **its own** base closure on first launch, since the shared
+store's base is on the default channel. That is the whole cost, paid once, and only by
+pinned projects.
+
+Globally, for every project on the machine:
+
+```sh
+sbx config set --global nixpkgs nixos-23.11
+sbx config show                       # which layer the effective value came from
+sbx doctor                            # the revision actually realised on disk
+```
+
+For one launch, without touching either file:
+
+```sh
+sbx run --nixpkgs nixos-23.11 -- ./build.sh
+SBX_NIXPKGS=nixos-unstable sbx run -- ./build.sh
+```
+
+And when you do want the channel to move, which is never automatic:
+
+```sh
+sbx upgrade nix                       # re-resolve this project's channel and rewrite its lock
+sbx upgrade nix --project ~/src/other # …for another project, without cd-ing there
+```
+
+A revision pin refreshes to itself, so `upgrade` on it is a reported no-op rather than
+an error.

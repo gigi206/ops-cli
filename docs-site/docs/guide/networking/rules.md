@@ -304,7 +304,7 @@ and a non-loopback IP literal get no listener: reported at launch, since the rul
 proxy and only the convenience is missing.
 
 A **port below 1024** gets no listener either, for a reason that cannot be worked around: binding
-one needs `CAP_NET_BIND_SERVICE` and the cage holds no capability at all. That covers ssh: and for
+one needs `CAP_NET_BIND_SERVICE` and the cage holds no capability at all. That covers ssh, and for
 ssh sbx writes the way through itself. A `tcp://<host>:<port below 1024>` rule puts a `ProxyCommand`
 for that host in the cage's system-wide `/etc/ssh/ssh_config`, pointing at the cage's own `CONNECT`
 proxy, so the ordinary command works as written:

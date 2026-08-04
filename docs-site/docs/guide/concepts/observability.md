@@ -1,13 +1,50 @@
 # Observability
 
 The **observability stack** lets you inspect and stream the activity of a running
-agent's cage: its process tree, every executable the agent spawns, and every write to
-its project tree. It is host-side, read-only, unprivileged, and entirely separate from
+agent's cage. It is host-side, read-only, unprivileged, and entirely separate from
 the security boundary (the namespaces, capabilities, seccomp denylist, the bind
 layout: those still bound what an agent can do; observability only **sees** what it
 does).
 
-There are two lenses, both enabled for the lifetime of a single supervised launch:
+## The four lenses
+
+A session is watched through four independent lenses, each answering a different
+question and each read with the same `<id>`: the session's pid, as
+[`sbx session ls`](../cli/session) shows it.
+
+| Lens | Question | Reader | Needs |
+|---|---|---|---|
+| **exec** | what did it run? | [`sbx proc logs`](../cli/proc#logs), [`sbx proc ls`](../cli/proc#ls) | [`--observe`](../cli/run#observing-a-run---observe), or `[proc] mode = enforce`/`ask` |
+| **filesystem** | what did it write? | [`sbx fs logs`](../cli/fs#logs) | `--observe` |
+| **egress** | where did it go? | [`sbx net logs`](../cli/net#sbx-net-logs), [`sbx net live`](../cli/net#sbx-net-live) | a filtering network posture |
+| **ssh-agent** | what did it ask your keys to sign? | [`sbx ssh-agent logs`](../cli/ssh-agent#logs) | an [`[ssh_agent] allow`](../configuration/ssh-agent) grant |
+
+They compose into one account of a run, which is the point of the shared id:
+
+```sh
+sbx run --detach --observe -- claude   # the launch prints the session id
+sbx proc logs   12345 -f               # what it executed
+sbx fs   logs   12345 -f               # what it wrote
+sbx net  logs        -f                # where it went
+sbx ssh-agent logs 12345 -f            # what it signed
+```
+
+Three properties hold across all four. Each lives in the **supervisor's or the
+proxy's memory**, never on disk, and is gone when the session exits (the one exception
+is [`sbx net stats`](../cli/net#sbx-net-stats), a durable per-host counter). Each is
+read over a per-session control socket that is **never bound into the cage**, so the
+agent can neither read the record of what it did nor amend it. And each is a lens,
+not a fence: only the exec lens has an enforcing sibling
+([`[proc] mode`](../configuration/proc)), and only the egress one has a policy behind
+it ([`[network]`](../configuration/network)).
+
+The rest of this page covers the two lenses `--observe` turns on. The egress lens has
+[its own page](../networking/observability); the ssh-agent one is documented with
+[its grant](../configuration/ssh-agent).
+
+## The two `--observe` lenses
+
+Both are enabled for the lifetime of a single supervised launch:
 
 - **the exec lens**: polls `/proc` for newly-spawned processes under the cage's root
   every 300 ms and pushes each new entry (excluding `bwrap` / `systemd-run` /
@@ -109,9 +146,11 @@ lens uses.
 
 ## Honest limits
 
-- Right now, **the polling rather than per-`execve` capture**: a command that exits
-  in under one tick is missed. The seccomp user-notification path that closes this is
-  a later increment.
+- **The exec lens has two capture paths.** Under `[proc] mode = enforce|ask` the
+  seccomp user-notification supervisor captures *every* `execve` as it happens, so
+  nothing short-lived is missed. The cheap `/proc` poll (used by a non-enforcing
+  `observe` run) only sees a process that outlives a tick, so a command that exits in
+  under one tick is missed there.
 - The filesystem lens is **inotify-based, not recursive across filesystems**: a
   `bind`-mounted sub-tree with a different device is its own watch.
 - A cage that is no longer alive cannot be observed: the rings are torn down with
@@ -126,5 +165,8 @@ lens uses.
 - [`sbx run --observe`](../cli/run): enabling observation on a launch
 - [`sbx proc`](../cli/proc): `ls`, `logs`, `logs --follow --json`
 - [`sbx fs`](../cli/fs): `logs` (the filesystem lens reader)
+- [Egress observability](../networking/observability): the third lens, in full
+- [`sbx ssh-agent`](../cli/ssh-agent): the fourth, and what its record is worth
+- [Sessions](sessions): the registry the shared `<id>` comes from
 - [The trust gate](trust): observation is a host-side lens, not a security field
-- Design rationale is recorded in this page (process tree + filesystem lens, host-side only, no new attack surface) and in [`bwrap-architecture.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-architecture).
+- Design rationale is recorded in this page (process tree + filesystem lens, host-side only, no new attack surface).

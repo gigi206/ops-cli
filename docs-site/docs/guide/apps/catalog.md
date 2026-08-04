@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/ops-v2/examples/app/) directory ships **48 importable
+The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/) directory ships **49 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -8,14 +8,14 @@ sbx app import examples/app/claude-code.toml
 sbx app run claude-code
 ```
 
-See also: [Portable profiles](profiles) · [The app framework](/) · [Secrets](../secrets/) · the repository [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/examples/).
+See also: [Portable profiles](profiles) · [The app framework](../apps/) · [Secrets](../secrets/) · the repository [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/).
 
 The tables below list every shipped profile, grouped by **how you interact with it**: a
 terminal agent, a desktop window, or a UI served in your host browser. The per-profile
 packaging notes and the "not here yet, and why" triage live in
-[`examples/README.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/examples/).
+[`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/).
 
-## Terminal agents (31)
+## Terminal agents (32)
 
 The common case: a CLI or TUI that runs in the terminal you launched it from.
 
@@ -41,6 +41,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `kilocode` | `mise:github:Kilo-Org/kilocode` | provider-dependent (BYOK) |
 | `kimi` | `nix:nodejs` (+ `mise:npm:@moonshot-ai/kimi-code`) | `api.kimi.com` (`KIMI_API_KEY` / Moonshot account) |
 | `nova` | `nix:nodejs` (+ `mise:npm:@compass-ai/nova`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
+| `omp` | `mise:github:can1357/oh-my-pi` (a high-capability fork of Pi — this repo's `pi`) | provider-dependent (BYOK) |
 | `openclaw` | `nix:nodejs` (+ `mise:npm:openclaw`) | `api.openai.com` (BYOK) |
 | `opencode` | `mise:opencode` | provider-dependent (BYOK) |
 | `openfox` | `nix:nodejs` (+ `mise:npm:openfox`) | **none**: a local LLM you point it at |
@@ -94,7 +95,7 @@ default (`home_scope = "global"`).
 
 ## Bundles: the shared pieces
 
-Beyond the app profiles, [`examples/bundle/`](https://github.com/gigi206/ops-cli/tree/ops-v2/examples/bundle/)
+Beyond the app profiles, [`examples/bundle/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/bundle/)
 ships **26 reusable tool bundles**: a named set of packages and egress rules that several
 profiles pull in with `use = [...]` instead of restating it. See
 [Bundles](../configuration/bundles) and [`sbx bundle`](../cli/bundle).
@@ -144,7 +145,7 @@ tool **fetches at first launch**, so a profile's *first* launch in a given proje
 the network; a `nix:` tool is seeded and reusable offline. The `deb:`, `appimage:` and
 `tarball:` backends fetch a published upstream artifact the same way; see
 [Packages](../configuration/packages). Advancing an already-installed version via
-`sbx upgrade` is supported: see [Upgrading](../housekeeping/upgrade).
+`sbx upgrade` is supported: see [Upgrading](../concepts/upgrade).
 
 ## Adjusting the allowlist
 
@@ -170,6 +171,6 @@ The profiles **import and resolve** cleanly (covered by a test), and each tool i
 **provisioned fresh and runs** under its own allowlist. The one remaining *live*
 end-to-end is the **credential step**: for BYOK profiles, the CLI authenticating
 through the proxy-injected key; for account profiles, completing the login inside the
-cage. See the repository [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/examples/) for the
+cage. See the repository [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/) for the
 per-tool status and the "not here yet, and why" triage (tools that are not a runnable
 agent, or whose provenance is not established).

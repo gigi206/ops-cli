@@ -173,7 +173,7 @@ unlisted key does. Every decision, approved or not, lands in
 There is no timeout: an unanswered prompt leaves the cage's ssh client waiting, the same way
 `ssh-add -c` does.
 
-## There is no password to set: and that is the point
+## There is no password to set, and that is the point
 
 There is no field for one, in either direction:
 
@@ -219,7 +219,7 @@ to declare, a confirmation you give.
 
 ## It needs egress too
 
-The broker rides a Unix socket, so it is independent of the network posture: and equally,
+The broker rides a Unix socket, so it is independent of the network posture, and equally,
 it opens no network. A signature with nowhere to go is no use: under an allowlist posture
 the cage reaches ssh only through a raw `tcp://` rule.
 
@@ -300,7 +300,7 @@ $ sbx config show --app deployer
   ssh-agent: deploy@example, work@example (keys the cage may sign with) (app:global)
 ```
 
-A bundle cannot carry one. A `[bundle.<name>]` deliberately holds only what a *tool* needs, its packages, environment, egress and credential: and never anything that widens what the
+A bundle cannot carry one. A `[bundle.<name>]` deliberately holds only what a *tool* needs, its packages, environment, egress and credential, and never anything that widens what the
 cage exposes of the host; `ssh_agent`, `binds`, `devices` and `seccomp` are all excluded by
 the same rule, so using a bundle can never quietly grant a key.
 
@@ -325,7 +325,8 @@ ssh-agent feed — session 48213 [demo-agent] /home/you/project
   14:09:02  refuse   a signature with a key the grant does not name
 ```
 
-`-f`/`--follow` streams it from another terminal: the way to watch a `--detach`ed agent: and `--json` emits one NDJSON object per event, for a pipe.
+`-f`/`--follow` streams it from another terminal (the way to watch a `--detach`ed agent),
+and `--json` emits one NDJSON object per event, for a pipe.
 
 **The destination is there, with a caveat.** A signature request names a key and a session,
 never a host. But an ssh client binds the connection to the **server's host key** before

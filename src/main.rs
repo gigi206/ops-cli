@@ -11,6 +11,8 @@ mod allowlist;
 mod cli;
 mod config;
 mod diag;
+#[cfg(test)]
+mod docs_coverage;
 mod help;
 mod notify;
 mod observe;

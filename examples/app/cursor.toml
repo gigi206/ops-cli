@@ -40,14 +40,14 @@
 # DISPLAY + GPU + AUDIO + DBUS (identical to the other Electron profiles). `gui = "wayland"` binds the host
 # Wayland compositor socket (read-only) and provisions fonts so the window maps; X11 is never
 # offered; isolation is compositor-dependent (Mutter safe; wlroots exposes screen-capture/input —
-# see docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa in
+# see docs-site/docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa in
 # sbx's own store, the render node under `/dev/dri`, the minimal `/sys` DRM subtree) — without it a
 # Chromium/Electron app on Wayland often maps no window; mesa covers Intel/AMD/nouveau, NVIDIA-only
 # falls back to software. `audio = true` provisions the PulseAudio client library (`libpulse.so.0`,
 # absent from the app's own closure, which carries only ALSA) and binds the host PulseAudio socket
 # into the cage, so sound and the microphone reach Cursor (notification/accessibility sounds, any
 # voice input). It is trusted-only because the PulseAudio bus exposes the microphone AND every
-# system-audio `.monitor` source (recording all host output) — see docs/guide/configuration/audio.md.
+# system-audio `.monitor` source (recording all host output) — see docs-site/docs/guide/configuration/audio.md.
 # `dbus = true` gives the cage its OWN private desktop portal so Cursor's
 # file chooser (open folder / attach file) opens IN-CAGE and lists the cage filesystem, relays
 # notifications, and follows your host light/dark theme. The Electron flags: `--no-sandbox` is

@@ -41,13 +41,13 @@
 # DISPLAY + GPU + DBUS. `gui = "wayland"` binds the host Wayland socket (read-only) and
 # provisions fonts so the window maps (X11 is never offered; isolation is compositor-dependent —
 # Mutter/GNOME is safe, wlroots exposes screen-capture/input-injection, see
-# docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa into
+# docs-site/docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa into
 # sbx's store + `/dev/dri` + the minimal `/sys` DRM subtree); without it a Chromium/Electron app
 # on Wayland often produces no buffer and no window maps. mesa covers Intel/AMD/nouveau; an
 # NVIDIA-only machine falls back to software (still renders, slower). `dbus = true` gives the
 # cage its OWN private desktop portal so the app's FILE CHOOSER opens IN-CAGE (lists only the
 # cage FS), seeds your host light/dark theme at launch and follows it live, and relays desktop
-# notifications — the login keyring stays absent (see docs/guide/configuration/dbus.md).
+# notifications — the login keyring stays absent (see docs-site/docs/guide/configuration/dbus.md).
 # AUDIO is deliberately NOT enabled: the Goose desktop plays only notification sounds (output),
 # and `audio = true` would also expose the microphone AND every system-audio `.monitor` source —
 # a trusted-only cost not worth it for notification blips (parity with the opencode/droid

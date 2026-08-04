@@ -1,15 +1,23 @@
 import type { SidebarsConfig } from '@docusaurus/plugin-content-docs';
 
-// Replaces the hand-maintained `nav:` list from the old mkdocs.yml. Docusaurus
-// walks the guide/ tree and builds the section order from frontmatter `sidebar_position`,
-// so new pages join automatically instead of requiring a nav edit.
+// The navigation is listed explicitly rather than derived from the directory tree: the
+// guide's pages carry no frontmatter, and a section's order is a choice. Most sections
+// are ordered editorially, by reading order; `Command reference` alone is alphabetical,
+// since a reader arrives there already knowing the verb's name.
+// A new page therefore has to be listed here, or it ships reachable only by URL
+// and by search.
 const sidebars: SidebarsConfig = {
   guideSidebar: [
     'index',
     {
       type: 'category',
       label: 'Getting started',
-      items: ['getting-started/installation', 'getting-started/quickstart', 'getting-started/doctor'],
+      items: [
+        'getting-started/installation',
+        'getting-started/quickstart',
+        'getting-started/doctor',
+        'getting-started/troubleshooting',
+      ],
     },
     {
       type: 'category',
@@ -20,37 +28,75 @@ const sidebars: SidebarsConfig = {
         'concepts/trust',
         'concepts/enforcement',
         'concepts/observability',
+        'concepts/sessions',
         'concepts/provisioning',
+        'concepts/upgrade',
+        'concepts/gc',
         'concepts/directory-layout',
       ],
     },
+    // Configuration and Command reference carry roughly half the guide between them, so
+    // each is grouped rather than listed flat — on different principles, because they
+    // are read differently. Configuration groups by subject: a reader knows what they
+    // want the cage to do, not which field does it. The command reference is
+    // alphabetical: a reader already has the verb's name and wants its page. The
+    // thematic view of the verbs lives in `cli/index` instead, where it costs nothing.
     {
       type: 'category',
       label: 'Configuration',
       items: [
         'configuration/index',
-        'configuration/env',
-        'configuration/binds',
-        'configuration/packages',
-        'configuration/tools',
-        'configuration/nixpkgs',
-        'configuration/limits',
-        'configuration/seccomp',
-        'configuration/devices',
-        'configuration/ssh-agent',
-        'configuration/gui',
-        'configuration/gpu',
-        'configuration/audio',
-        'configuration/dbus',
-        'configuration/network',
-        'configuration/proc',
-        'configuration/notify',
-        'configuration/secret',
-        'configuration/task',
-        'configuration/apps',
-        'configuration/net-groups',
-        'configuration/bundles',
-        'configuration/overrides',
+        {
+          type: 'category',
+          label: "The cage's contents",
+          items: [
+            'configuration/env',
+            'configuration/binds',
+            'configuration/packages',
+            'configuration/tools',
+            'configuration/nixpkgs',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Enforcement and refusals',
+          items: [
+            'configuration/limits',
+            'configuration/seccomp',
+            'configuration/devices',
+            'configuration/proc',
+            'configuration/notify',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Desktop access',
+          items: [
+            'configuration/gui',
+            'configuration/gpu',
+            'configuration/audio',
+            'configuration/dbus',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Network and credentials',
+          items: [
+            'configuration/network',
+            'configuration/secret',
+            'configuration/ssh-agent',
+            'configuration/task',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Composition',
+          items: [
+            'configuration/apps',
+            'configuration/bundles',
+            'configuration/overrides',
+          ],
+        },
       ],
     },
     {
@@ -58,30 +104,31 @@ const sidebars: SidebarsConfig = {
       label: 'Command reference',
       items: [
         'cli/index',
-        'cli/doctor',
-        'cli/run',
         'cli/app',
-        'cli/mise',
-        'cli/search',
-        'cli/test',
         'cli/bundle',
-        'cli/net',
-        'cli/proc',
-        'cli/fs',
-        'cli/ssh-agent',
-        'cli/task',
-        'cli/secret',
-        'cli/plugins',
-        'cli/projects',
-        'cli/session',
-        'cli/trust',
-        'cli/untrust',
+        'cli/completion',
         'cli/config',
-        'cli/upgrade',
+        'cli/doctor',
+        'cli/fs',
         'cli/gc',
+        'cli/mise',
+        'cli/net',
+        'cli/path',
+        'cli/plugins',
+        'cli/proc',
+        'cli/projects',
+        'cli/run',
+        'cli/search',
+        'cli/secret',
+        'cli/session',
+        'cli/ssh-agent',
         'cli/storage',
         'cli/store',
-        'cli/path',
+        'cli/task',
+        'cli/test',
+        'cli/trust',
+        'cli/untrust',
+        'cli/upgrade',
       ],
     },
     {
@@ -105,6 +152,18 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Declared operations',
+      items: [
+        'tasks/index',
+        'tasks/parameters',
+        'tasks/credentials',
+        'tasks/execution',
+        'tasks/output',
+        'tasks/network',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Secrets',
       items: [
         'secrets/index',
@@ -112,12 +171,8 @@ const sidebars: SidebarsConfig = {
         'secrets/injection',
         'secrets/redaction',
         'secrets/plugins',
+        'secrets/stores',
       ],
-    },
-    {
-      type: 'category',
-      label: 'Housekeeping',
-      items: ['housekeeping/sessions', 'housekeeping/gc', 'housekeeping/upgrade'],
     },
     {
       type: 'category',

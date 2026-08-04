@@ -1657,7 +1657,7 @@ mod tests {
     fn apply_default_methods_rewrites_cleartext_allows() {
         // An `http://` allow rule is HTTP-inspected, so an app's read-by-default posture must narrow
         // it exactly like an `https://`/bare rule — else a cleartext rule silently escapes to
-        // all-verbs. The advisor-flagged bug: this must include L7Clear.
+        // all-verbs, which is why the narrowing must cover `L7Clear` and not `L7` alone.
         let mut p = allow(&["http://api.example.com"]);
         p.apply_default_methods(&Methods::Only(vec!["GET".into(), "HEAD".into()]));
         // POST is now denied purely by method (the rule was narrowed to GET/HEAD), GET is allowed.

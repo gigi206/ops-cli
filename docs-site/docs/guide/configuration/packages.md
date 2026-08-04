@@ -13,7 +13,7 @@ The **name** is a free label: the merge key across layers and the on-disk root n
 The **value carries a mandatory backend prefix**. `packages` is a **security field**:
 honored only from a trusted source (all three backends).
 
-See also: [Provisioning](../concepts/provisioning) · [`[tools]` (mise)](tools) · [`sbx search`](../cli/search) · [`sbx upgrade`](../housekeeping/upgrade).
+See also: [Provisioning](../concepts/provisioning) · [`[tools]` (mise)](tools) · [`sbx search`](../cli/search) · [`sbx upgrade`](../concepts/upgrade).
 
 ## The mandatory backend prefix
 
@@ -41,7 +41,7 @@ jq   = "nix:jq"
 Provisioned **host-side** from the pinned nixpkgs channel into `sbx`'s store, its
 `bin/` prepended to the cage `PATH`. Durable and offline-reusable (seeded into the
 per-project store). Use [`sbx search <query>`](../cli/search) to find attribute
-names. Advances with [`sbx upgrade nix`](../housekeeping/upgrade).
+names. Advances with [`sbx upgrade nix`](../concepts/upgrade).
 
 **Unfree packages are allowed here.** Some tools ship a proprietary (`unfree`) nixpkgs
 derivation, e.g. a vendor agent CLI whose upstream is closed-source. Because a
@@ -70,7 +70,7 @@ tool  = "mise:npm:some-cli"
 Equipped **in-cage** with `mise use -g <token>` at launch, fetched upstream-direct
 (so it is fresher than nixpkgs but the first launch needs network). Any mise backend
 works: `aqua:`, `github:`, `npm:`, `cargo:`, a plain registry token, etc. Advances
-with [`sbx upgrade mise`](../housekeeping/upgrade).
+with [`sbx upgrade mise`](../concepts/upgrade).
 
 Note: an `npm:` tool needs `/usr/bin/env` (the cage provides a synthetic one) and, if
 it is pure JS, a node runtime: declare `nodejs = "nix:nodejs"` alongside it.
@@ -103,11 +103,11 @@ config cannot aim the build at a host path. The build fetches its inputs over th
 network (not the cage allowlist), so a flake whose build self-fetches with its own HTTP
 client (e.g. `bun install`) builds fine: the cage allowlist governs only the app's
 **runtime** egress. Pins advance with
-[`sbx upgrade flake`](../housekeeping/upgrade).
+[`sbx upgrade flake`](../concepts/upgrade).
 
 ## `[flakes]`: an inline nix flake
 
-When a tool ships **only** as a flake you author yourself: or you want to package a
+When a tool ships **only** as a flake you author yourself, or you want to package a
 one-off build without hosting a separate repo: write the whole `flake.nix` **inline** in a
 `[flakes.<name>]` table instead of referencing an external `flake:<ref>`:
 

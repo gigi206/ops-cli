@@ -44,9 +44,12 @@ is the host network by default and can be narrowed to a deny-by-default allowlis
 ## Documentation
 
 The complete, task-oriented **user guide** lives in
-[`docs/guide/`](docs/guide/README.md) — split into small, cross-linked pages covering
-the concepts, the full `.sbx.toml` configuration reference, every command, apps and
-profiles, networking/egress, and secrets. Start there.
+[`docs-site/docs/guide/`](docs-site/docs/guide/index.md) — split into small,
+cross-linked pages covering the concepts, the full `.sbx.toml` configuration reference,
+every command, apps and profiles, networking/egress, and secrets. Start there.
+
+It is also a Docusaurus site: `mise run docs` serves it locally with live reload, and
+`mise run docs-serve` serves the built site, which is what the search index needs.
 
 For the design rationale and threat analysis, see the `docs/*.md` design documents (the
 architecture, threat model, and security stack), linked from the guide.

@@ -54,6 +54,18 @@ this way, `sbx doctor` reports which engine it would use and why. See
 [Provisioning](../concepts/provisioning) for how the engines are materialized and
 verified.
 
+## Shell completion
+
+`sbx` ships its own completion script, for bash and zsh:
+
+```sh
+source <(sbx completion bash)     # this shell only
+source <(sbx completion zsh)
+```
+
+To install it permanently, and for what does and does not complete, see
+[`sbx completion`](../cli/completion).
+
 ## Verifying prerequisites
 
 ```sh
@@ -70,7 +82,7 @@ Common tasks are wired through mise:
 ```sh
 mise run fmt             # cargo fmt --check
 mise run lint            # cargo clippy --all-targets -- -D warnings
-mise run test            # cargo test (unit only: fast, network-free)
+mise run test            # cargo test (the whole suite; the sandbox e2e skip where the host cannot sandbox)
 mise run coverage        # cargo-llvm-cov coverage report (pass --html for a browsable report)
 mise run ci              # fmt + lint + test, as CI runs them
 ```
@@ -87,9 +99,9 @@ mise run lint-bundled    # compile + clippy the bundled-* feature paths (needs h
 ## Building the documentation site
 
 The user guide lives in
-[`docs-site/docs/guide/`](https://github.com/gigi206/ops-cli/tree/ops-v2/docs-site/docs/guide/)
+[`docs-site/docs/guide/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/docs-site/docs/guide/)
 and is built with [Docusaurus](https://docusaurus.io/), configured in
-[`docusaurus.config.ts`](https://github.com/gigi206/ops-cli/blob/ops-v2/docs-site/docusaurus.config.ts).
+[`docusaurus.config.ts`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/docs-site/docusaurus.config.ts).
 Mermaid diagrams render in the browser, from `@docusaurus/theme-mermaid`.
 
 ```sh

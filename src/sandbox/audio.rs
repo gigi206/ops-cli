@@ -39,7 +39,7 @@
 //! microphone AND every `.monitor` source (record whatever is playing on the host), not only the
 //! microphone. That is why `audio = true` is trusted-only, like `gpu`/`dbus`.
 //!
-//! Unlike `dbus = true`, there is **no network-posture caveat** (no SEC-001 analog): audio has no
+//! Unlike `dbus = true`, there is **no network-posture caveat**: audio has no
 //! filtering proxy to bypass — the whole bus is the documented grant — and the socket is bound
 //! directly by path (filesystem-scoped), so `network = "shared"` exposes nothing beyond what
 //! `audio = true` already grants (unlike an abstract-namespace D-Bus socket reachable around a proxy

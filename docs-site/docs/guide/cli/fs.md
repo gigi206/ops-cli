@@ -10,7 +10,7 @@ running session, sibling of [`sbx proc`](proc) (processes) and [`sbx net`](net) 
 in order, for a session started with observation on
 ([`sbx run --observe`](run#observing-a-run---observe)).
 
-See also: [`sbx proc`](proc) · [`sbx net`](net) · [`sbx session`](session).
+See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx proc`](proc) · [`sbx net`](net) · [`sbx session`](session).
 
 ## `logs`
 
@@ -53,11 +53,38 @@ sbx fs logs 12345 -f                    # …watch what it writes, from here
 sbx fs logs 12345 --json | jq .path     # machine-readable
 ```
 
-This is the way to watch an observed session **from another terminal**: and, like
+This is the way to watch an observed session **from another terminal**, and, like
 [`sbx proc logs`](proc#logs), the **only** way to watch a [detached](run) (`--detach`) one.
 The events are held in the supervisor's memory for the session's lifetime, read over a per-session
 control socket that is never exposed inside the cage; nothing is written to disk or kept after the
 session exits.
+
+### Examples
+
+Each event is `{session_pid, seq, at_epoch_ms, kind, path}`, so the feed answers
+questions a scrollback cannot:
+
+```sh
+sbx fs logs -f                                   # the only live session, streamed
+sbx fs logs 12345                                # what it has written so far
+sbx fs logs 12345 --json | jq -r 'select(.kind=="remove") | .path'   # what it deleted
+sbx fs logs 12345 --json | jq -r .path | sort -u                     # every file touched
+sbx fs logs 12345 --json | jq -r 'select(.path|test("^src/")) | "\(.kind)\t\(.path)"'
+sbx fs logs 12345 --json > run.ndjson &          # keep a record; nothing is written to disk otherwise
+```
+
+The four lenses share one session id, so they compose into a single account of what a
+run did:
+
+```sh
+sbx run --detach --observe -- claude    # prints the session id
+sbx fs logs   12345 -f                  # what it wrote
+sbx proc logs 12345 -f                  # what it executed
+sbx net logs        -f                  # where it went
+```
+
+Watching a **detached** session is exactly what these are for: it has no terminal, so
+the feed is the only account of it.
 
 ### Scope
 

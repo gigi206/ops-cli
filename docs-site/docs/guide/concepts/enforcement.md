@@ -17,6 +17,31 @@ smoke: goes through the same three always-on layers:
 2. **seccomp**: a two-filter syscall denylist (Posture A).
 3. **cgroup v2**: resource limits to bound denial-of-service, best-effort.
 
+```mermaid
+flowchart TB
+    PRIMARY["<b>the bind layout</b><br/><i>a secret is absent, not merely unreadable</i>"]
+
+    subgraph always["<b>always on, every launch</b>"]
+        direction TB
+        L1["<b>1 · bubblewrap</b><br/><i>all namespaces · no_new_privs · cap-drop ALL</i>"]
+        L2["<b>2 · seccomp denylist</b><br/><i>two cBPF filters, Posture A</i>"]
+        L3["<b>3 · cgroup v2 limits</b><br/><i>memory and task caps, best-effort</i>"]
+        L1 --> L2 --> L3
+    end
+
+    OPT["<b>4 · exec enforcement</b><br/><i>opt-in, trusted-only: [proc] enforce / ask</i><br/><i>vetoes what the agent spawns</i>"]
+
+    PRIMARY --> always --> OPT
+
+    classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
+    classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
+    class PRIMARY hs
+    class L1,L2,L3,OPT cs
+```
+
+The order matters in one direction only: the layers below do not *replace* the bind
+layout, they bound what a mistake in it can become.
+
 Plus one **opt-in, trusted-only** layer: **exec enforcement** via
 [`[proc] mode = "enforce"`/`"ask"`](../configuration/proc): a seccomp
 user-notification gate that blocks a denied `execve` before it runs. It is a
@@ -134,7 +159,7 @@ the cage. The grammar is uniform (a bare name lifts the whole syscall; `clone`/`
 also accept a `:selector` that lifts one sub-rule); loosening is trusted-only (an
 untrusted project's relaxation is dropped), and each token that reopens a real escape
 surface is surfaced with a caution. This reduces the surface reduction above: never the
-namespace/capability boundary itself: and does **not** re-enable nix's inner sandbox.
+namespace/capability boundary itself, and does **not** re-enable nix's inner sandbox.
 
 ### Carve-outs kept allowed
 
@@ -242,8 +267,7 @@ read-only subdirectory (`.git/`, lockfiles) *inside* the read-write project tree
 ancestor rule, so a child rule can only add access, never carve it out. Landlock can
 whitelist which trees are writable and restrict per-operation rights (deny delete /
 symlink / rename), but it cannot protect a subtree of a directory the agent is meant
-to write; see [`bwrap-security-stack.md` §4](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-security-stack) for the
-posture rationale.
+to write.
 
 ## GUI exposure is Wayland-only
 
@@ -264,4 +288,3 @@ spike for the residuals.)
 - [`limits` configuration](../configuration/limits): overriding the cgroup profile
 - [Networking](../networking/): the egress allowlist and host-side proxy
 - [Provisioning](provisioning): the store and in-cage self-equip these layers wrap
-- Design docs: [security stack](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-security-stack) (covers seccomp denylist + cgroup v2)

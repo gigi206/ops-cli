@@ -18,8 +18,27 @@ fn sbx(args: &[&str]) -> Output {
 
 /// Every top-level command `main` dispatches.
 const TOP_LEVEL: &[&str] = &[
-    "doctor", "run", "mise", "app", "search", "test", "net", "proc", "fs", "plugins", "session",
-    "trust", "untrust", "config", "upgrade", "gc", "projects", "storage", "store", "bundle",
+    "doctor",
+    "run",
+    "mise",
+    "app",
+    "search",
+    "test",
+    "net",
+    "proc",
+    "fs",
+    "plugins",
+    "session",
+    "trust",
+    "untrust",
+    "config",
+    "upgrade",
+    "gc",
+    "projects",
+    "storage",
+    "store",
+    "bundle",
+    "completion",
 ];
 
 /// Every command path the dispatchers accept (top-level commands and their subcommands). Keep
@@ -27,6 +46,7 @@ const TOP_LEVEL: &[&str] = &[
 const PATHS: &[&[&str]] = &[
     &["doctor"],
     &["run"],
+    &["completion"],
     &["mise"],
     &["app"],
     &["search"],
@@ -151,7 +171,7 @@ fn every_command_and_verb_has_a_page() {
 #[test]
 fn a_subcommand_help_details_its_options() {
     // `sbx app import --help` must reach the import page (not the parent app page) and list its
-    // options — the explicit ask ("détaille correctement les options").
+    // own options, so a subcommand's flags are discoverable without reading the parent page.
     let out = sbx(&["app", "import", "--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);

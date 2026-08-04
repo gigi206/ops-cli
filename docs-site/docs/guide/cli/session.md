@@ -13,7 +13,7 @@ or a command inside one, and `sbx session stop` ends them.
 Host-side: reads the on-disk session registry (daemonless), launches nothing. `sbx sessions`
 is an alias.
 
-See also: [Sessions](../housekeeping/sessions) · [`sbx projects`](projects) · [`sbx gc`](gc).
+See also: [Sessions](../concepts/sessions) · [`sbx projects`](projects) · [`sbx gc`](gc).
 
 ## `ls`
 
@@ -29,7 +29,7 @@ can tell which sessions are agents.
 Sessions are created by [`sbx run --detach`](run), [`sbx app run --detach`](app), and
 interactive [`sbx run`](run) / [`sbx app`](app) launches. The registry is
 liveness-validated by `(pid, start_time)` to defeat pid reuse. See
-[Sessions](../housekeeping/sessions).
+[Sessions](../concepts/sessions).
 
 ```sh
 sbx session ls
@@ -63,7 +63,7 @@ foreground session has no log, its output is on the terminal that started it, an
 |---|---|
 | `<id>` | the PID reported when the session was detached (required) |
 | `-f`, `--follow` | keep streaming until the session exits |
-| `-n <N>` | show only the last N lines of the initial listing |
+| `-n, --lines <N>` | show only the last N lines of the initial listing |
 | `--all` | show every session that wrote to this log, not just the most recent |
 
 The id is **required** and is resolved straight to the log file, never through the session
@@ -172,4 +172,37 @@ the whole cage subtree. Either ids or `--all` is required, not both.
 sbx session stop 12345
 sbx session stop 12345 12377 --delay 3
 sbx session stop --all
+```
+
+## Examples: the life of a background agent
+
+The four subcommands are one workflow. Launch it, find it, watch it, look inside it,
+end it:
+
+```sh
+sbx app run claude-code --detach --observe   # start it; the launch prints the id
+sbx session ls                               # …or find it later, by app name
+
+sbx session logs 12345 -f                    # its output, as it comes
+sbx fs logs   12345 -f                       # what it writes (needs --observe)
+sbx proc logs 12345 -f                       # what it executes (needs --observe)
+sbx net logs -f                              # where it goes
+
+sbx session attach 12345                     # step inside the running cage
+sbx session attach 12345 -- ps aux           # …or just ask it one question
+
+sbx session stop 12345                       # SIGTERM, then SIGKILL after 10s
+```
+
+Two things worth separating: `logs` reads what the agent *printed*, which survives on
+disk for a detached session; `fs`/`proc`/`net logs` read what it *did*, which lives in
+the supervisor's memory and is gone when the session exits. If a run needs a durable
+record of its actions, pipe the `--json` feed to a file while it runs.
+
+Ending everything at once, for instance before a machine goes to sleep:
+
+```sh
+sbx session ls                               # see what is live first
+sbx session stop --all --delay 3             # interactive shells included
+sbx gc --all --prune                         # …then reclaim what they left
 ```

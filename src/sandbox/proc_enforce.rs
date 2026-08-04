@@ -49,12 +49,12 @@
 //! kernel, verified empirically:
 //!
 //! - **A compat-ABI `execve`** (a 64-bit process issuing the i386 `int 0x80` `execve`, whose number is
-//!   not the native one this filter matches) does not slip through: the mandatory M4.1 seccomp denylist
+//!   not the native one this filter matches) does not slip through: the mandatory seccomp denylist
 //!   is compiled by `seccompiler`, which prepends an architecture check that **kills the process**
 //!   (`SECCOMP_RET_KILL_PROCESS`, the highest-precedence action) for any `seccomp_data.arch` that is
 //!   not the native one. So a foreign-ABI `execve` traps that guard and dies rather than running
 //!   untrapped. (The narrow exception is the x32 ABI, which shares x86-64's `arch` value with distinct
-//!   syscall numbers — a blind spot shared with the M4.1 denylist itself, and the base toolset is
+//!   syscall numbers — a blind spot shared with the denylist itself, and the base toolset is
 //!   x86-64.)
 //! - **Installing its own notification filter** to capture and auto-`CONTINUE` its own `execve`s does
 //!   not work: the kernel permits only one seccomp notification listener per process, so a second

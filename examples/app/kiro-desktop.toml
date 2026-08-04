@@ -43,7 +43,7 @@
 # DISPLAY + GPU + DBUS (identical to the other Electron profiles). `gui = "wayland"` binds the host
 # Wayland compositor socket (read-only) and provisions fonts so the window maps; X11 is never offered;
 # isolation is compositor-dependent (Mutter safe; wlroots exposes screen-capture/input — see
-# docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa in sbx's
+# docs-site/docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa in sbx's
 # own store, the render node under `/dev/dri`, the minimal `/sys` DRM subtree) — without it a
 # Chromium/Electron app on Wayland often maps no window; mesa covers Intel/AMD/nouveau, NVIDIA-only
 # falls back to software. `dbus = true` gives the cage its OWN private desktop portal so Kiro's file

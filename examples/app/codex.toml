@@ -42,7 +42,7 @@ forward = [1455]
 # It captures the microphone through the `cpal` crate → the ALSA API, which does not itself speak
 # PulseAudio. `audio = true` provisions the PulseAudio client + the ALSA→PulseAudio compatibility
 # shim (alsa-plugins + an asound.conf routing `default` → pulse), so an ALSA capture reaches the host
-# microphone — see docs/guide/configuration/audio.md. A security field, trusted-only: the PulseAudio
+# microphone — see docs-site/docs/guide/configuration/audio.md. A security field, trusted-only: the PulseAudio
 # bus exposes the microphone AND all system-audio output. Comment it out if you never use voice.
 audio = true
 

@@ -309,3 +309,8 @@ SBX_NET=shared sbx run
 is refused as ambiguous). The command line beats the environment, and both beat the
 config file. For the full grammar and the four-tier precedence, see
 [One-shot overrides](overrides).
+
+To open the network wide for one launch (`--net shared`, `--net 'allow=re:.*'`, or
+`--config 'network = "allow"'`), and for what each of the three actually opens (only
+`shared` drops the proxy), see
+[Opening the network wide](../networking/modes#opening-the-network-wide).

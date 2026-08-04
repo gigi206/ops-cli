@@ -4,6 +4,7 @@
 
 pub(crate) mod app;
 pub(crate) mod bundle;
+pub(crate) mod completion;
 pub(crate) mod config;
 pub(crate) mod confirm;
 pub(crate) mod doctor;
@@ -67,6 +68,11 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // reports itself online, then execs the real `bwrap …` command. Never invoked by a user
         // directly. `rest` is `[bwrap, bwrap-args…]`; it never returns.
         "__netns-holder" => crate::sandbox::run_holder(&rest),
+        // Internal: the oracle the emitted completion scripts call on every completion
+        // request. Answers with the candidates for the words typed so far and nothing
+        // else — never invoked by a user directly, so it carries no page of its own.
+        "__complete" => completion::complete_cmd(rest),
+        "completion" => completion::completion_cmd(rest),
         "doctor" => match reject_extra(&["doctor"], &rest) {
             Err(code) => code,
             Ok(()) => doctor::doctor(),

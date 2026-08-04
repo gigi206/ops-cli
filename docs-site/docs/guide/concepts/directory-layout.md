@@ -40,17 +40,17 @@ The important subtrees:
 | `projects/<id>/` | the **per-project** writable store and its locks |
 | `projects/<id>/apps/<name>/mise/` | a global app's **per-project mise pool**: its `nix:`-via-mise self-equips, kept `/nix`-aligned |
 | `apps/<name>/home/` | an app's persistent isolated `$HOME` (`home_scope = "global"`) |
-| `sessions/` | the daemonless session registry ([`sbx session ls`](../housekeeping/sessions)) |
+| `sessions/` | the daemonless session registry ([`sbx session ls`](../concepts/sessions)) |
 | `egress/` | per-launch egress proxy sockets and CA material |
 | `mise/`, `mise-plugin/` | the host-side mise home and the embedded `nix:` backend plugin |
 | `plugins/` | installed [resolver plugins](../secrets/plugins) |
 | `stores/<name>/` | cached, verified remote [plugin stores](../secrets/plugins) |
-| `nixpkgs.lock` | the global base channel revision (see [Upgrading](../housekeeping/upgrade)) |
+| `nixpkgs.lock` | the global base channel revision (see [Upgrading](../concepts/upgrade)) |
 | `mise-engine.lock` | the mise engine revision, independent of the base channel |
 
 The **per-project** directory `projects/<id>/` holds the project's own writable nix
 store (seeded from the shared store) plus its resolution locks, `nixpkgs.lock` (a project pin), `tools.lock` (resolved `nix:` mise tools), and
-`flake-packages.lock` (pinned `flake:` packages): and, under `apps/<name>/mise/`, a
+`flake-packages.lock` (pinned `flake:` packages), and, under `apps/<name>/mise/`, a
 global app's [per-project mise pool](../apps/home#two-mise-pools-keep-a-global-apps-self-equips-aligned)
 (its `nix:`-via-mise self-equips, kept aligned with this project's store). See
 [Provisioning](provisioning) for how the per-project store works.

@@ -12,7 +12,7 @@ MY_SETTING = "value"
 a reserved-key denylist, below). An untrusted project setting a variable can only
 affect the process inside its own cage, so it is not gated.
 
-See also: [The trust gate](../concepts/trust) · [Configuration overview](/) · [One-shot overrides](overrides).
+See also: [The trust gate](../concepts/trust) · [Configuration overview](../configuration/) · [One-shot overrides](overrides).
 
 ## Precedence
 
@@ -36,10 +36,20 @@ few structural keys:
 - Loader control: `LD_*` (e.g. `LD_PRELOAD`, `LD_LIBRARY_PATH`), `NIX_LD`,
   `NIX_LD_LIBRARY_PATH`, `GCONV_PATH`, `GLIBC_TUNABLES`, `LOCPATH`, `NLSPATH`,
   `RESOLV_HOST_CONF`, `HOSTALIASES`.
-- Shell/exec hooks: `BASH_ENV`, `ENV`, `IFS`.
+- Shell/exec hooks: `BASH_ENV`, `ENV`, `IFS`, and the interactive-prompt hooks
+  `PROMPT_COMMAND` and `PS1` (bash evaluates `$(...)` in both before each prompt).
 - Structural: `HOME`, `PATH`.
-- The nix-config injection set (`NIX_CONFIG`, `NIX_USER_CONF_FILES`, `NIX_CONF_DIR`)
-  and the proxy-control variables (`http_proxy`/`https_proxy`/`all_proxy`/`no_proxy`).
+- The nix-config injection set (`NIX_CONFIG`, `NIX_USER_CONF_FILES`, `NIX_CONF_DIR`).
+- Proxy control, matched case-insensitively: `http_proxy`/`https_proxy`/`all_proxy`/
+  `no_proxy` and their WebSocket siblings `ws_proxy`/`wss_proxy` (which sbx sets so a
+  WS client routes through the proxy too).
+- CA-bundle keys, matched case-insensitively: `NIX_SSL_CERT_FILE`, `SSL_CERT_FILE`,
+  `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
+  `PIP_CERT`, `npm_config_cafile` (a nonstandard tool reading a lowercase variant must
+  not slip a swapped CA past the gate).
+- GPU driver-load paths: `LIBGL_DRIVERS_PATH`, `GBM_BACKENDS_PATH`,
+  `__EGL_VENDOR_LIBRARY_DIRS` (mesa's libgbm/libEGL `dlopen` a `<driver>_dri.so` /
+  gbm backend from these).
 
 The denylist is **untrusted-only** by design: a *trusted* config overriding `PATH` or
 `LD_PRELOAD` harms only itself, so the schema stays symmetric. The denylist's job is
@@ -57,6 +67,59 @@ SBX_ENV_RUST_LOG=debug sbx run -- cargo test
 ```
 
 See [One-shot overrides](overrides).
+
+## Examples
+
+The four scopes a variable can come from, from the widest to the narrowest, each
+beating the one before it:
+
+```toml
+# ~/.config/sbx/sbx.toml: every project on this machine
+[env]
+MISE_MINIMUM_RELEASE_AGE = "0"
+```
+
+```toml
+# ./.sbx.toml: this project
+[env]
+RUST_LOG    = "info"
+RUST_BACKTRACE = "1"
+DATABASE_URL = "postgres://127.0.0.1:5432/demo"   # a tunnelled service, not a credential
+
+# …and this one app inside it, which wins on a key collision
+[app.my-agent.env]
+RUST_LOG = "debug"
+```
+
+```sh
+sbx run --env RUST_LOG=trace -- cargo test   # the final word, for one launch
+```
+
+Checking what a launch would actually carry, rather than reasoning about the layering:
+
+```sh
+sbx config show                    # each value tagged with where it came from
+sbx config show --app my-agent     # …with that app's overlay folded in
+sbx run -- env | sort              # what the cage really holds
+```
+
+Two things `env` is **not** for:
+
+```toml
+[env]
+API_TOKEN = "sk-live-…"      # NO: readable by anything in the cage
+```
+
+```toml
+# yes: the value stays on the host and is added to the request on the wire
+[secret."api.example.com"]
+from   = "env://API_TOKEN"
+header = "Authorization"
+type   = "bearer"
+```
+
+A host `export API_TOKEN=…` does not reach the cage on its own, which is why the
+`env://` resolver reads it *host-side*: the variable is sbx's input, never the agent's.
 
 ## What the cage inherits
 

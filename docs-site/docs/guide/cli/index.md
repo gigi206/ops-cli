@@ -20,13 +20,13 @@ See also: [Configuration overview](../configuration/) · [Exit codes](../referen
 | [`sbx config`](config) | inspect and edit the configuration |
 | [`sbx search`](search) | discover `nix:` tools via nixhub |
 | [`sbx test`](test) | check whether an access would be allowed |
+| [`sbx bundle`](bundle) | list, export and import reusable [tool bundles](../configuration/bundles) |
 | [`sbx trust`](trust) / [`sbx untrust`](untrust) | vouch for / revoke a project config |
 
 ## Networking
 
 | Command | Purpose |
 |---|---|
-| [`sbx bundle`](bundle) | list, export and import reusable tool bundles |
 | [`sbx net`](net) | inspect the egress policy, its rules, and parked `ask` requests |
 | [`sbx test net`](test) | test one URL against the resolved policy |
 
@@ -34,9 +34,10 @@ See also: [Configuration overview](../configuration/) · [Exit codes](../referen
 
 | Command | Purpose |
 |---|---|
+| [`sbx secret`](secret) | the credential inventory this configuration declares |
 | [`sbx plugins`](plugins) | manage resolver plugins and signed plugin stores |
 
-## Sessions and housekeeping
+## Sessions and lifecycle
 
 | Command | Purpose |
 |---|---|
@@ -44,8 +45,7 @@ See also: [Configuration overview](../configuration/) · [Exit codes](../referen
 | [`sbx proc`](proc) | observe a running session's process tree |
 | [`sbx fs`](fs) | observe the files a running session writes in its project |
 | [`sbx ssh-agent`](ssh-agent) | what a running session asked your ssh keys to sign |
-| [`sbx task`](task) | list and invoke a session's declared operations |
-| [`sbx secret`](secret) | the credential inventory this configuration declares |
+| [`sbx task`](task) | list and invoke a session's [declared operations](../tasks/) |
 | [`sbx projects`](projects) | list and remove per-project runtime trees |
 | [`sbx path`](path) | where the config, data, and state roots live |
 | [`sbx storage`](storage) | manage a compressed, self-growing volume for the data directory |
@@ -58,6 +58,12 @@ See also: [Configuration overview](../configuration/) · [Exit codes](../referen
 | Command | Purpose |
 |---|---|
 | [`sbx doctor`](doctor) | verify the runtime prerequisites |
+
+## Shell integration
+
+| Command | Purpose |
+|---|---|
+| [`sbx completion`](completion) | print the bash or zsh completion script |
 
 ## Help
 

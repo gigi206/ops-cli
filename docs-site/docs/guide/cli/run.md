@@ -4,11 +4,11 @@
 sbx run [--detach] [--observe] [override flags] [--] [command [args...]]
 ```
 
-Run `<command>` inside the project sandbox and propagate its exit status: or, with no
+Run `<command>` inside the project sandbox and propagate its exit status, or, with no
 command, open the project's sandboxed shell. A `--` separates `sbx`'s flags from the
 command's, so `sbx run -- --detach` runs the literal `--detach`.
 
-See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [One-shot overrides](../configuration/overrides) · [Sessions](../housekeeping/sessions).
+See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [One-shot overrides](../configuration/overrides) · [Sessions](../concepts/sessions).
 
 ## Options
 
@@ -18,7 +18,7 @@ See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [O
 | `--observe` | record what the command does, its processes ([`sbx proc logs`](proc#logs)) and file writes ([`sbx fs logs`](fs#logs)); see [Observing a run](#observing-a-run---observe) |
 | `--config <toml\|@file>` | one-shot config override (any field); repeatable, later wins |
 | `--env KEY=VALUE` | one-shot override of a single cage environment variable; repeatable |
-| `--net <posture>` | one-shot network posture: `none` \| `shared` \| `ask` \| `allow=h1,h2` \| `deny=h1,h2` |
+| `--net <posture>` | one-shot network posture: `none` \| `shared` \| `ask` \| `allow=h1,h2` \| `deny=h1,h2`; to open everything see [Opening the network wide](../networking/modes#opening-the-network-wide) |
 | `--gui <none\|offscreen\|wayland>` | one-shot display posture |
 | `--nixpkgs <ref>` | one-shot nixpkgs channel or revision |
 | `--bind <path[:ro\|:rw]>` | one-shot host bind (read-only by default); repeatable |
@@ -110,6 +110,7 @@ sbx run -- id                          # a synthetic identity
 sbx run -- cargo test
 echo 'rg --version' | sbx run          # a non-interactive shell reading stdin
 sbx run --net none -- ./offline-build.sh
+sbx run --net shared -- ./x.sh         # open everything: no proxy at all
 sbx run --bind /opt/data:rw -- ./process.sh
 sbx run --observe -- ./build.sh        # stream a [sbx:exec] feed of what it spawns
 sbx run --detach -- ./long-task.sh     # background; see `sbx session ls`

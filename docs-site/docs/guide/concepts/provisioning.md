@@ -1,12 +1,12 @@
 # Provisioning
 
 `sbx` runs tools inside a hermetic cage that has **no host `/usr`** and **no host
-`/nix`**. Everything the cage needs: the base userland, the tools a project
-declares, and the tools an agent installs for itself: is provisioned by
+`/nix`**. Everything the cage needs (the base userland, the tools a project
+declares, and the tools an agent installs for itself) is provisioned by
 **daemonless [nix](https://nixos.org/)** into a store `sbx` owns, and bound into the
 cage. This page explains that store model and how it stays reproducible.
 
-See also: [Directory layout](../concepts/directory-layout) · [`packages`](../configuration/packages) · [Upgrading](../housekeeping/upgrade).
+See also: [Directory layout](../concepts/directory-layout) · [`packages`](../configuration/packages) · [Upgrading](../concepts/upgrade).
 
 ## nix as a rolling OS on a channel
 
@@ -21,7 +21,7 @@ The consequence is the property the design calls **"seeded, not baked"**:
 
 `sbx upgrade [all|nix|mise|flake]` re-resolves the relevant channel and rewrites its
 lock; a launch reads the lock that `upgrade` wrote. See
-[Upgrading](../housekeeping/upgrade) and the [`sbx upgrade` reference](../cli/upgrade).
+[Upgrading](../concepts/upgrade) and the [`sbx upgrade` reference](../cli/upgrade).
 
 ## The shared store
 
@@ -60,6 +60,29 @@ project's store is a full, byte-for-byte copy of its closure, so *N* projects th
 share a base each carry their own copy of it. Reclaim a project's store with
 [`sbx gc`](../cli/gc); if per-project duplication matters on your host, putting
 `<data>` on a CoW filesystem makes every new per-project seed near-free.
+
+```mermaid
+flowchart LR
+    subgraph hostside["<b>host side, outside the cage</b>"]
+        direction TB
+        NIX["<b>nix, daemonless</b><br/><i>builds with its own sandbox on</i>"]
+        SHARED["<b>shared store</b><br/><i>&lt;data&gt;/store · immutable · gcrooted</i>"]
+        NIX --> SHARED
+    end
+
+    P1["<b>project A's store</b><br/><i>&lt;data&gt;/projects/&lt;id&gt;/</i>"]
+    P2["<b>project B's store</b>"]
+
+    SHARED -- "<b>seed: reflink or copy</b><br/><i>never a hard link</i>" --> P1
+    SHARED -- "<b>seed</b>" --> P2
+
+    P1 -- "<b>read-write bind as /nix</b>" --> CAGE["<b>cage · project A</b><br/><i>the agent self-equips here</i>"]
+
+    classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
+    classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
+    class NIX,SHARED,P1,P2 hs
+    class CAGE cs
+```
 
 The net effect:
 
@@ -141,7 +164,6 @@ The two engines differ in how complete the independence is:
 - [`packages` configuration](../configuration/packages): declaring `nix:` / `mise:` / `flake:` tools
 - [`nixpkgs` configuration](../configuration/nixpkgs): pinning the channel
 - [`tools` configuration](../configuration/tools): mise `[tools]` and self-equip
-- [Upgrading](../housekeeping/upgrade): how versions actually move
+- [Upgrading](../concepts/upgrade): how versions actually move
 - [`sbx mise` reference](../cli/mise) · [`sbx upgrade` reference](../cli/upgrade)
 - [Enforcement stack](enforcement): the always-on layers the cage runs behind
-- Design: [architecture](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-architecture): the validated store layout, the trust-gated provisioning gate, and the dry-run preflight that determines fetch vs. build.

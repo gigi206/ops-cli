@@ -56,7 +56,8 @@ A render node and the sysfs device tree are a kernel attack surface, GPU drivers
 classic local-privilege-escalation vector, and exposing the device makes that driver
 reachable from in-cage code. That is a choice only a trusted operator makes, so an untrusted
 project's `gpu` posture is dropped, and a globally-declared app keeps its GPU posture even
-under an untrusted project (an agent runs *on* untrusted code without that code opening: or closing: the app's GPU access).
+under an untrusted project (an agent runs *on* untrusted code without that code opening,
+or closing, the app's GPU access).
 
 ## Per-app posture
 

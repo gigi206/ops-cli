@@ -147,7 +147,7 @@ fn path_enumerates_per_project_per_app_and_per_profile_entries() {
     // Each enumerated child appears indented under its parent.
     assert!(s.contains("    abcdef"), "project id enumerated:\n{s}");
     // A markerless project (no `project` file) is annotated with its state, and the line carries a
-    // YYYY-MM-DD date — the "is this stale?" signal the user asked for.
+    // YYYY-MM-DD date, the "is this stale?" signal a cleanup decision rests on.
     assert!(
         s.contains("(markerless)"),
         "markerless state shown for a project:\n{s}"

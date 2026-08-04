@@ -42,10 +42,10 @@
 # DISPLAY + GPU. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and
 # provisions fonts, so the Electron window maps on your compositor. X11 is never offered. Isolation
 # is compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose
-# screen-capture/input-injection to ordinary clients (see docs/guide/configuration/gui.md).
+# screen-capture/input-injection to ordinary clients (see docs-site/docs/guide/configuration/gui.md).
 # `gpu = true` opens hardware-accelerated rendering: sbx provisions mesa's drivers into its own
 # store, grants the render node under `/dev/dri`, and read-only-binds the minimal `/sys` DRM subtree
-# the driver needs (see docs/guide/configuration/gpu.md). Without it a Chromium/Electron app on
+# the driver needs (see docs-site/docs/guide/configuration/gpu.md). Without it a Chromium/Electron app on
 # Wayland often fails to produce a buffer and no window maps, so it is on by default here. mesa
 # covers Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (still renders, slower).
 # The Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp + the

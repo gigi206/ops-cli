@@ -3,8 +3,8 @@
 `sbx` controls what the sandbox can reach on the network. This is the
 *confidentiality-and-integrity* half of running an untrusted agent: the cage
 already cannot read your host filesystem (secrets are absent, not merely
-read-only), and the egress control decides which hosts: and, for HTTP, which
-paths and methods: an in-cage tool may talk to. A **gRPC** service (HTTP/2) is
+read-only), and the egress control decides which hosts (and, for HTTP, which
+paths and methods) an in-cage tool may talk to. A **gRPC** service (HTTP/2) is
 supported too: list its host under [`http2`](../configuration/network#http2-and-grpc)
 and each RPC is inspected and filtered by `:path` (`/package.Service/Method`) like any HTTP request.
 
@@ -88,9 +88,7 @@ that ride the same proxy) are a separate subsystem: see
 ## See also
 
 - [`network` configuration reference](../configuration/network): the field itself.
-- [`[net.groups]` configuration reference](../configuration/net-groups): the group table.
 - [Secrets](../secrets/): credential injection over the egress proxy.
 - [Security model](../concepts/security-model): why the bind layout, not the
   network alone, is the boundary.
 - [`sbx net` CLI reference](../cli/net) · [`sbx test` CLI reference](../cli/test)
-- Design: [threat model and binds](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-threat-model-and-binds)

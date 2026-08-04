@@ -12,9 +12,9 @@ locks. `sbx projects list` shows them; `sbx projects show` details one; `sbx pro
 removes them. Bare `sbx projects` prints this page. `sbx project` is an alias.
 
 Removing a tree is host-side only (no sandbox, no nix). Its nix store closures are left for
-[`sbx gc`](gc) to reclaim: or add `--gc` to do both at once.
+[`sbx gc`](gc) to reclaim, or add `--gc` to do both at once.
 
-See also: [`sbx gc`](gc) · [`sbx path`](path) · [Garbage collection](../housekeeping/gc) · [Directory layout](../concepts/directory-layout).
+See also: [`sbx gc`](gc) · [`sbx path`](path) · [Garbage collection](../concepts/gc) · [Directory layout](../concepts/directory-layout).
 
 ## `list`
 
@@ -39,7 +39,7 @@ Each tree's **state**:
 
 - its **state** and **size**, broken down `store` / `home` / `other`;
 - the **nixpkgs** channel or per-project pin it resolves against;
-- the **store roots** built in its store, grouped by backend (`nix`, `deb`, `appimage`), a host-side `flake:` build is provisioned like a `nix:` one, so it appears under `nix`; the
+- the **store roots** built in its store, grouped by backend (`nix`, `deb`, `appimage`), a host-side `flake:` build is provisioned like a `nix:` one, so it appears under `nix`; a `tarball:` build's gcroot likewise lands under `nix` — only `deb-`/`appimage-` gcroots get their own group. The
   store is **shared** by the project and every app launched in it, so the roots include
   app packages;
 - the **mise tools** in the project's own home;

@@ -34,8 +34,8 @@ A secret declaration composes two orthogonal halves, and **both run host-side**:
 
 | Layer | Role | Question it answers | Documented in |
 |---|---|---|---|
-| **Resolver** (SOURCE) | fetch the plaintext | *where does the value come from?* | [resolvers.md](resolvers) |
-| **Broker** (SINK) | expose only a capability to the cage | *how does the agent use it without seeing it?* | [injection.md](injection) |
+| **Resolver** (SOURCE) | fetch the plaintext | *where does the value come from?* | [Resolvers](resolvers) |
+| **Broker** (SINK) | expose only a capability to the cage | *how does the agent use it without seeing it?* | [Injection](injection) |
 
 The resolver fetches the plaintext into `sbx`'s own host process (from an
 environment variable, a file, a SOPS-encrypted store, or a resolver plugin). The
@@ -66,7 +66,7 @@ flowchart LR
 ```
 
 The two layers compose freely: any source with any broker. Resolvers are the
-open-ended, pluggable half (see [plugins.md](plugins)); the broker touches the
+open-ended, pluggable half (see [Resolver plugins](plugins)); the broker touches the
 security boundary, so it stays first-party.
 
 ## Injection is effective only under a filtering network
@@ -87,8 +87,8 @@ that the cause was a missing filtering posture. Likewise, a secret's destination
 host must itself be reachable under the policy (present in the `allow` list, or
 not denied), or the request is refused *before* injection.
 
-See [../networking/modes.md](../networking/modes) and
-[../configuration/network.md](../configuration/network) for the posture that
+See [Network modes](../networking/modes) and
+[`[network]`](../configuration/network) for the posture that
 makes secrets live.
 
 ## `[secret]` is a security field
@@ -98,14 +98,14 @@ config or a **trusted** project, and dropped from an untrusted one: the same
 gate that governs `binds`, `network`, and `nixpkgs`. An untrusted project can
 declare a `[secret]` section all it likes; the whole section is discarded before
 any resolver scheme is even looked up. See
-[../concepts/security-model.md](../concepts/security-model) and
-[../concepts/trust.md](../concepts/trust).
+[Security model](../concepts/security-model) and
+[The trust gate](../concepts/trust).
 
 The section is a TOML **table keyed by destination host** (not an array), with a
 reserved `defaults` sub-table. The full schema: the terse `key` form, the
 verbose `from` refs, `header`/`type`/`prefix`: is documented in
-[injection.md](injection) and [resolvers.md](resolvers), and mirrored in
-[../configuration/secret.md](../configuration/secret).
+[Injection](injection) and [Resolvers](resolvers), and mirrored in
+[`[secret]`](../configuration/secret).
 
 ## Backstops, and their honest limits
 
@@ -115,26 +115,25 @@ masks a secret that a cooperating upstream reflects back. They are **backstops,
 not the boundary**: any encoding (base64, gzip) evades a byte-exact scan. The
 real guarantee is structural: empty netns, the egress allowlist, and the fact
 that a credential is bound to *one* destination host. See
-[redaction.md](redaction) for both tripwires and their scope.
+[Redaction](redaction) for both tripwires and their scope.
 
 ## Where to go next
 
-- [resolvers.md](resolvers): the SOURCE layer: `env://`, `file://`,
+- [Resolvers](resolvers): the SOURCE layer: `env://`, `file://`,
   `sops://`, terse keys, and fallback chains.
-- [injection.md](injection): the HTTP-header broker: how a credential lands
+- [Injection](injection): the HTTP-header broker: how a credential lands
   on the wire.
-- [redaction.md](redaction): the outbound and inbound secret tripwires.
-- [plugins.md](plugins): resolver plugins and signed plugin stores.
+- [Redaction](redaction): the outbound and inbound secret tripwires.
+- [Resolver plugins](plugins): resolver plugins and signed plugin stores.
 
 ## See also
 
-- [../configuration/secret.md](../configuration/secret): the `[secret]`
+- [`[secret]`](../configuration/secret): the `[secret]`
   config reference.
-- [../configuration/network.md](../configuration/network) and
-  [../networking/modes.md](../networking/modes): the filtering posture that
+- [`[network]`](../configuration/network) and
+  [Network modes](../networking/modes): the filtering posture that
   makes injection effective.
-- [../concepts/security-model.md](../concepts/security-model): where the
+- [Security model](../concepts/security-model): where the
   never-in-cage invariant sits among `sbx`'s hard lines.
-- [../concepts/trust.md](../concepts/trust): the trust gate that admits a
+- [The trust gate](../concepts/trust): the trust gate that admits a
   project's `[secret]` section.
-- [https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture.md](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture), the authoritative design (resolver × broker, the exposure lattice, residuals).

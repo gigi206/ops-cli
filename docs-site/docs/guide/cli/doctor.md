@@ -21,4 +21,16 @@ reboot.
 For the full explanation of each check, see
 [`sbx doctor` and prerequisites](../getting-started/doctor).
 
+## Examples
+
+```sh
+sbx doctor                     # the preflight, before anything else
+sbx doctor && sbx run -- ./ci.sh   # gate a script on a usable host
+```
+
+`doctor` exits non-zero when a load-bearing requirement is missing, so the second
+form is the way to make a CI job fail on the preflight rather than mid-launch. A
+run through the [sample output](../getting-started/doctor#a-passing-host) shows what
+each line asserts.
+
 See also: [Installation](../getting-started/installation) · [Security model](../concepts/security-model) · [Enforcement stack](../concepts/enforcement).

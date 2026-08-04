@@ -26,7 +26,7 @@ mode  = "deny"
 allow = ["{*} https://orchestrator.example.com"]
 ```
 
-See also: [Apps](apps) · [`[packages]`](packages) · [`[net.groups]`](net-groups) · [`sbx bundle`](../cli/bundle).
+See also: [Apps](apps) · [`[packages]`](packages) · [`[net.groups]`](../networking/groups) · [`sbx bundle`](../cli/bundle).
 
 ## What it is for
 
@@ -42,7 +42,7 @@ egress entries, which are list items a `@<name>` reference can expand into;
 `packages` and `env` are **maps**, with no slot for such a reference: so a bundle is
 the map-side companion, and it carries the egress along.
 
-## What a bundle may carry: and what it may not
+## What a bundle may carry, and what it may not
 
 | Carries | Deliberately not |
 | --- | --- |
@@ -126,8 +126,8 @@ dropped silently. Nothing was lost.
 ## The shipped bundles
 
 The repository ships one bundle per agent CLI under
-[`examples/bundle/`](https://github.com/gigi206/ops-cli/tree/ops-v2/examples/bundle/), each derived from the agent profile of
-the same name in [`examples/app/`](https://github.com/gigi206/ops-cli/tree/ops-v2/examples/app/): a test pins the two
+[`examples/bundle/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/bundle/), each derived from the agent profile of
+the same name in [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/): a test pins the two
 together, so they cannot drift apart:
 
 ```sh

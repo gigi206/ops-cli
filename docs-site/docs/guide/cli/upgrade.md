@@ -11,7 +11,7 @@ advance **only here**, never on an `sbx` binary update.
 |---|---|
 | `all` | every managed channel (the default) |
 | `nix` | the nixpkgs channel (base userland + native `nix:` packages) |
-| `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the [task tool pool](../configuration/task#the-task-tool-pool) |
+| `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the [task tool pool](../tasks/execution#the-task-tool-pool) |
 | `flake` | the project's and apps' `flake:` packages |
 | `deb` | the project's and apps' `deb:` packages |
 | `appimage` | the project's and apps' `appimage:` packages |
@@ -21,7 +21,7 @@ advance **only here**, never on an `sbx` binary update.
 |---|---|
 | `--project <path>` | roll another project instead of the current directory |
 
-See also: [Upgrading toolchains](../housekeeping/upgrade) · [Provisioning](../concepts/provisioning) · [`nixpkgs`](../configuration/nixpkgs) · [`packages`](../configuration/packages).
+See also: [Upgrading toolchains](../concepts/upgrade) · [Provisioning](../concepts/provisioning) · [`nixpkgs`](../configuration/nixpkgs) · [`packages`](../configuration/packages).
 
 ## Behavior
 
@@ -62,5 +62,5 @@ sbx upgrade --project ~/work/api   # roll everything for another project
 sbx upgrade deb --project ~/work/api   # just its deb: packages
 ```
 
-See [Upgrading toolchains](../housekeeping/upgrade) for the lock model and the
+See [Upgrading toolchains](../concepts/upgrade) for the lock model and the
 "seeded not baked" contract.

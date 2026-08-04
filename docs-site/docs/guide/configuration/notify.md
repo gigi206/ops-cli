@@ -12,6 +12,9 @@ proc    = "once"         # the first of each blocked program
 task    = "off"          # never
 ```
 
+See also: [`[network]`](network) · [`[proc]`](proc) · [Declared operations](../tasks/) ·
+[Observability](../concepts/observability) · [One-shot overrides](overrides#--notify-how-loudly-one-launch-speaks).
+
 A refusal is invisible by design. When the network policy turns a request down, the agent gets a
 `403` it is under no obligation to mention; when the exec policy stops a program, the `execve`
 simply fails. The boundary did its job and **you** heard nothing: which reads exactly like a
@@ -45,7 +48,7 @@ sbx blocked a network request · kiro@ops-cli[48213]
   that [`sbx attach`](../cli/session) and [`sbx stop`](../cli/session) take.
 
 It rides the summary rather than the body because with two or three sandboxes running at once,
-"which one was that?" is the first question a toast has to answer: and the summary is the part read
+"which one was that?" is the first question a toast has to answer, and the summary is the part read
 first and never truncated. The pid is what makes it actionable: from the toast you can go straight to
 `sbx attach <pid>` or `sbx net logs` for that session.
 
@@ -136,7 +139,7 @@ mean "never told about this", which is the exact failure this field exists to pr
 ## What is *not* notified
 
 - **A file the cage cannot reach.** The sandbox blocks files structurally: an unbound path simply
-  does not exist inside the cage, a read-only bind refuses a write: and the kernel answers those
+  does not exist inside the cage, a read-only bind refuses a write, and the kernel answers those
   *inside* the mount namespace. No call reaches sbx, so there is nothing to report. Same for a
   syscall the mandatory [seccomp](seccomp) filter refuses: the kernel returns the errno directly.
   What sbx can announce is what sbx itself decided.
@@ -158,7 +161,7 @@ was carrying your token out of the cage* would be advice that opens the hole the
 
 `[notify]` is a **security field**: honored from the global config or a trusted project, dropped
 (with a warning) from an untrusted one. A `.sbx.toml` able to silence these notifications could hide
-precisely what the boundary exists to surface: and would do so from the side the boundary exists to
+precisely what the boundary exists to surface, and would do so from the side the boundary exists to
 contain. Set it globally (trusted by its location) and it applies everywhere.
 
 It can also be set per app ([`[app.<name>.notify]`](apps)); an app's policy replaces the

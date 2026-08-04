@@ -4,8 +4,6 @@
 (same-uid), so **the bind layout is the security control**. This page explains what
 that means and what it protects.
 
-For the full threat analysis and the exact bind zones, see the design document
-[`bwrap-threat-model-and-binds.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-threat-model-and-binds).
 
 See also: [The trust gate](trust) · [Enforcement stack](enforcement) · [`binds`](../configuration/binds).
 
@@ -60,6 +58,38 @@ project's own binds cannot displace `sbx`'s structural mounts:
   code.
 - **Explicitly granted paths**: whatever a *trusted* [`binds`](../configuration/binds)
   declares, read-only by default.
+
+```mermaid
+flowchart LR
+    subgraph host["<b>host</b>"]
+        direction TB
+        HOME["<b>$HOME</b><br/><i>keys · browser profiles · other projects</i>"]
+        CP["<b>sbx's own roots</b><br/><i>data · config · trust store</i>"]
+        PROJ["<b>the project directory</b>"]
+        GRANT["<b>a trusted [binds] path</b>"]
+    end
+
+    subgraph cage["<b>cage</b>"]
+        direction TB
+        FHS["<b>hermetic FHS</b><br/><i>/bin/sh · /usr/bin/env · /nix · synthetic /etc</i>"]
+        CWD["<b>the project</b><br/><i>read-write, at its own host path</i>"]
+        RO["<b>granted paths</b><br/><i>read-only by default</i>"]
+    end
+
+    PROJ --> CWD
+    GRANT --> RO
+    HOME -. "<b>absent</b>" .-> cage
+    CP -. "<b>pinned read-only</b>" .-> cage
+
+    classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
+    classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
+    class HOME,CP,PROJ,GRANT hs
+    class FHS,CWD,RO cs
+```
+
+The dotted edges are the ones that carry the model: what is **absent** cannot be read
+whatever the agent does, and what is **pinned** stays read-only even inside a broad
+read-write bind.
 
 A config bind is emitted *before* the structural mounts, so a colliding entry is
 shadowed rather than overriding `/nix` or the synthetic identity. (One known nuance:

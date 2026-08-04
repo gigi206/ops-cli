@@ -11,8 +11,8 @@ use crate::fold_app_overlay;
 use crate::{allowlist, config, diag, help, sandbox, style};
 
 /// `sbx test <kind> <target>`: probe whether an access would be allowed and explain why —
-/// a diagnostic surface meant to grow with sbx's access controls (the network egress
-/// allowlist now; filesystem/Landlock access later). No launch, no nix, no network.
+/// a diagnostic surface meant to grow with sbx's access controls (currently the network
+/// egress allowlist). No launch, no nix, no network.
 pub(crate) fn test_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("net") => net_test(&args[1..]),

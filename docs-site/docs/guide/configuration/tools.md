@@ -6,7 +6,7 @@ This is distinct from the trusted-only [`[packages]`](packages) field: `[tools]`
 is the **open, local, self-equip** path, the way an agent equips a project's tools
 from inside the cage.
 
-See also: [`packages`](packages) · [Provisioning](../concepts/provisioning) · [`sbx mise`](../cli/mise) · [`sbx upgrade mise`](../housekeeping/upgrade).
+See also: [`packages`](packages) · [Provisioning](../concepts/provisioning) · [`sbx mise`](../cli/mise) · [`sbx upgrade mise`](../concepts/upgrade).
 
 ## The `nix:` prefix: an exact, pinned dev toolchain
 
@@ -84,3 +84,50 @@ sbx mise use -g aqua:BurntSushi/ripgrep # activate (auto-on-PATH next launch)
 A tool the agent **activates** (`mise use`) is auto-on-`PATH` in later launches; a
 bare `mise install` (not activated) stays reachable via `mise exec`/`mise which`. See
 [`sbx mise`](../cli/mise) and [Provisioning](../concepts/provisioning).
+
+## Examples
+
+A polyglot project, mixing the two backends deliberately: `nix:` where the version
+must be exact and reproducible offline, a registry backend where freshness matters
+more.
+
+```toml
+# .mise.toml
+[tools]
+"nix:nodejs"              = "20"        # pinned, host-provisioned, offline-reusable
+"nix:python"              = "3.12"
+"nix:jq"                  = "latest"
+"aqua:BurntSushi/ripgrep" = "latest"    # auto-equipped in-cage at launch
+"npm:prettier"            = "3"
+```
+
+```sh
+sbx run -- node --version      # the toolchain is already on PATH
+sbx run -- rg --version
+sbx config show                # what survived the trust gate
+```
+
+Untrusted, the same file behaves differently, and visibly so: the `nix:` tools are
+withheld by name, while the others are declared but cannot be fetched unless egress is
+open (which an untrusted project cannot open either).
+
+```sh
+sbx trust                      # …then the nix: tools are provisioned
+```
+
+Equipping a tool from inside the cage, which is the path this field exists for:
+
+```sh
+sbx mise install nix:jq                   # build it into this project's own store
+sbx mise use -g aqua:BurntSushi/ripgrep   # activate it: on PATH from the next launch
+sbx mise ls                               # what this project has
+sbx mise exec -- jq --version             # run one that is installed but not activated
+```
+
+And the upgrade path, which is a separate verb because a binary update does not move
+a pinned toolchain:
+
+```sh
+sbx upgrade mise               # move the non-nix: tools to their newest release
+sbx upgrade nix                # move the base userland's channel
+```

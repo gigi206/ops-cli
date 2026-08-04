@@ -31,7 +31,7 @@ The plugin is placed under its manifest `name`, not the source directory name.
 
 A **store** install adds two things a local one cannot have: the catalogue is verified against the
 store's pinned Ed25519 key, and the plugin's directory must reproduce the content hash that
-catalogue pins. See [the guide](../docs/guide/secrets/plugins.md) for adding, verifying, and
+catalogue pins. See [the guide](../docs-site/docs/guide/secrets/stores.md) for adding, verifying, and
 rotating a store's key. To publish these examples (or your own) as a store:
 
     sbx plugins store publish <dir> --key <key-file>

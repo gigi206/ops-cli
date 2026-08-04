@@ -6,7 +6,7 @@ shape**; for the architecture (the never-in-cage invariant, resolvers, redaction
 the [Secrets](../secrets/) section.
 
 `[secret]` is a **security field**: honored from the global config or a trusted
-project, ignored from an untrusted one: and **effective only under a filtering
+project, ignored from an untrusted one, and **effective only under a filtering
 network posture** (`deny`/`allow`/`ask`), because the filtering proxy is what performs
 the injection.
 
@@ -67,7 +67,7 @@ shown to the caller. Its character set is narrow (letters, digits, `_`, `-`, `.`
 is rendered into output.
 
 For a credential a *declared operation* reads from its environment, see
-[`[task.<name>.secret]`](task#credentials): there the key **is** the variable, so the reported name
+[`[task.<name>.secret]`](../tasks/credentials): there the key **is** the variable, so the reported name
 is the variable's own.
 
 ## `[secret.defaults]`

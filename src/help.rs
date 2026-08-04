@@ -54,6 +54,30 @@ const PAGES: &[Page] = &[
             channel revision.",
     },
     Page {
+        path: &["completion"],
+        synopsis: "sbx completion <bash|zsh>",
+        summary: "print the shell completion script for a shell",
+        options: &[
+            ("bash", "the bash completion script"),
+            ("zsh", "the zsh completion script"),
+        ],
+        details:
+            "Writes a completion script to stdout. The shell is required, and one that is not\n\
+            supported is refused by name rather than guessed at.\n\n\
+            The script holds no copy of the command tree: it forwards the words typed so far to\n\
+            sbx, which answers from the same table that renders these help pages — so completion\n\
+            cannot drift from the CLI, and a command added tomorrow completes with no script to\n\
+            regenerate. Command and subcommand names complete at every depth, option names once\n\
+            a word begins with `-`. Values are left to the shell's own file completion, and\n\
+            everything after a `--` belongs to the launched command, so `sbx run -- ls <TAB>`\n\
+            completes files rather than sbx's verbs.\n\n\
+            Load it into the current shell with `source <(sbx completion bash)` (or `zsh`), or\n\
+            install it once: bash reads\n\
+            `~/.local/share/bash-completion/completions/sbx`, zsh reads an `_sbx` file on its\n\
+            `$fpath`. zsh needs its completion system initialised — `autoload -U compinit &&\n\
+            compinit` in `~/.zshrc` — before either form works.",
+    },
+    Page {
         path: &["run"],
         synopsis: "sbx run [--detach] [--observe] [override flags] [--] [command [args...]]",
         summary: "run a command inside the project sandbox, or open its shell",
@@ -200,7 +224,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "run"],
-        synopsis: "sbx app run <name> [--detach] [--observe] [--net-learn[=level] [-g|--local] \
+        synopsis: "sbx app run <name> [--detach] [--observe] [--net-learn[=level] [--global|--local] \
                    [--dry-run]] [override flags] [-- <args>...]",
         summary: "launch a named application profile in the project sandbox",
         options: &[
@@ -685,7 +709,7 @@ const PAGES: &[Page] = &[
             or end it would be creating invocations nobody owns, several at once.\n\
             \n\
             A task's program must come from a tree no cage can write. Every host-side package backend\n\
-            (`nix:`, a remote `flake:`, `deb:`, `appimage:`, `tarball:`, `prebuilt:`) already is one.\n\
+            (`nix:`, a remote `flake:`, `deb:`, `appimage:`, `tarball:`) already is one.\n\
             A `mise:` tool is not — it installs in-cage under a writable home — so a task declares it\n\
             in its own `packages` and sbx fills a per-project pool host-side, mounted read-only.",
     },
@@ -970,7 +994,10 @@ const PAGES: &[Page] = &[
         options: &[
             ("<id>", "the PID reported when the session was detached"),
             ("-f, --follow", "keep streaming until the session exits"),
-            ("-n <N>", "show only the last N lines of the initial listing"),
+            (
+                "-n, --lines <N>",
+                "show only the last N lines of the initial listing",
+            ),
             (
                 "--all",
                 "show every session that wrote to this log, not just the most recent",
@@ -1313,7 +1340,7 @@ const PAGES: &[Page] = &[
                 "actually reclaim (default is a dry run that touches nothing)",
             ),
             (
-                "--optimise",
+                "--optimise, --optimize",
                 "deduplicate the store afterwards: replace identical files by hardlinks to one\n\
                  copy. Applies immediately — asking for it is the consent — and reports the bytes\n\
                  and inodes freed. Covers this project's store, and the shared store under --all.",
@@ -1612,7 +1639,9 @@ const PAGES: &[Page] = &[
         details:
             "The realized-on-disk detail for one per-project runtime tree: its state and size (broken\n\
             down store / home / other), the nixpkgs channel or pin it resolves against, the store\n\
-            roots built in its (shared) store grouped by backend — `nix`, `deb`, `appimage` — the\n\
+            roots built in its (shared) store grouped by backend — `nix`, `deb`, `appimage` (a\n\
+            host-side `flake:` or `tarball:` build is provisioned like a `nix:` one, so it appears\n\
+            under `nix`; only `deb-`/`appimage-` gcroots get their own group) — the\n\
             mise tools in its own home, and, when the project directory still exists, the project's\n\
             declared packages/tools that are **not** built yet (an untrusted one flagged `withheld`,\n\
             distinct from a trusted one simply not equipped yet). The store is shared by the project\n\
@@ -2442,6 +2471,36 @@ pub fn is_command(name: &str) -> bool {
     find(&[name]).is_some()
 }
 
+/// Whether a full command path is a known command or subcommand, e.g.
+/// `is_command_path(&["plugins", "store", "add"])`. The empty path is the command root.
+pub fn is_command_path(path: &[&str]) -> bool {
+    path.is_empty() || find(path).is_some()
+}
+
+/// The names one level below `path`, each with its one-line summary, alphabetically. The
+/// empty path yields the top-level commands, so one call covers every depth. Shell
+/// completion renders these as the candidates for the next word.
+pub fn subcommands_of(path: &[&str]) -> Vec<(&'static str, &'static str)> {
+    children(path)
+        .into_iter()
+        .map(|p| (*p.path.last().unwrap(), p.summary))
+        .collect()
+}
+
+/// Every command path the table declares, in declaration order. Exists for the guard tests,
+/// which assert their properties over the whole surface rather than over a sample of it.
+#[cfg(test)]
+pub fn all_paths() -> Vec<&'static [&'static str]> {
+    PAGES.iter().map(|p| p.path).collect()
+}
+
+/// The raw option rows a command path documents, as written in the page. The tokens are
+/// human-formatted grammar (`-a, --app <name>`, `--gpu[=true|false]`, a bare `<file>`
+/// operand), not completable flags — a caller that needs flag names normalizes them itself.
+pub fn options_of(path: &[&str]) -> &'static [Opt] {
+    find(path).map_or(&[], |p| p.options)
+}
+
 /// One aligned `  flag    description` line, the flag painted in `color`.
 fn item(out: &mut String, color: &str, reset: &str, key: &str, width: usize, desc: &str) {
     if desc.is_empty() {
@@ -2675,7 +2734,7 @@ mod tests {
     /// Count the ANSI styling in a rendered string and assert it is balanced: every color span
     /// is closed by a reset (opens == resets), at least one span exists, and the output never
     /// ends mid-span. A captured test stream is never a TTY, so this is the only place the
-    /// *colored* branch — the feature the user asked for — is actually exercised.
+    /// *colored* branch is actually exercised.
     fn assert_balanced(s: &str) {
         assert!(s.contains("\x1b["), "expected color");
         let escapes = s.matches("\x1b[").count();

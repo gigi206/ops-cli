@@ -128,5 +128,4 @@ See [Observability](observability#persisting-rules) for the write scopes.
   parsed within a list.
 - [Network modes](modes): where the referencing `allow`/`deny` lists live.
 - [Observability](observability): `sbx net groups`, `sbx net rules --expand`.
-- [`[net.groups]` configuration reference](../configuration/net-groups)
 - [`sbx net` CLI reference](../cli/net)

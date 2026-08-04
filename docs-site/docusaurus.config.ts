@@ -32,9 +32,9 @@ const config: Config = {
       'classic',
       {
         docs: {
-          // The migrated user guide lives under docs/guide/ (relative to the
-          // project root), mirroring the old mkdocs docs_dir. `index.md` per
-          // directory replaces the old README.md index pages.
+          // The user guide lives under docs/guide/ (relative to this directory,
+          // not the repository root), one directory per section, each with an
+          // `index.md` serving as its landing page.
           path: 'docs/guide',
           // The guide sits under /docs/ so the root can be the landing page
           // (src/pages/index.tsx). Every in-guide link is relative, so none of
@@ -42,7 +42,7 @@ const config: Config = {
           routeBasePath: 'docs',
           sidebarPath: './sidebars.ts',
           editUrl:
-            'https://github.com/gigi206/ops-cli/tree/ops-v2/docs-site/',
+            'https://github.com/gigi206/ops-cli/tree/docs/docusaurus/docs-site/',
         },
         blog: false,
         theme: {
@@ -116,11 +116,7 @@ const config: Config = {
           items: [
             { label: 'GitHub', href: 'https://github.com/gigi206/ops-cli' },
             { label: 'Releases', href: 'https://github.com/gigi206/ops-cli/releases' },
-            {
-              label: 'Threat model',
-              href: 'https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-threat-model-and-binds.md',
-            },
-            { label: 'License', href: 'https://github.com/gigi206/ops-cli/blob/ops-v2/LICENSE' },
+            { label: 'License', href: 'https://github.com/gigi206/ops-cli/blob/docs/docusaurus/LICENSE' },
           ],
         },
       ],

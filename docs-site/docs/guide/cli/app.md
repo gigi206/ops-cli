@@ -1,7 +1,7 @@
 # `sbx app`
 
 ```
-sbx app run <name> [--detach] [--observe] [--net-learn[=level] [-g|--local] [--dry-run]] [override flags] [-- <args>...]
+sbx app run <name> [--detach] [--observe] [--net-learn[=level] [--global|--local] [--dry-run]] [override flags] [-- <args>...]
 sbx app import <file> [--as <name>] [--force]
 sbx app export <name> [--out <file>]
 sbx app rm <name> [--purge] [--gc]

@@ -45,7 +45,7 @@ environment:
 Each is passed through **only when set** in sbx's environment. That is how a resolver receives its
 own credential without it travelling anywhere another user could read it — see [the cage's
 environment is not readable by other
-users](../../docs/guide/concepts/security-model.md#the-cages-environment-is-not-readable-by-other-users).
+users](../../docs-site/docs/guide/concepts/security-model.md#the-cages-environment-is-not-readable-by-other-users).
 
 `network = true` means the **host** network, not a cage's egress allowlist: a resolver runs
 host-side, outside the agent's sandbox, so its reachability is not governed by a project's

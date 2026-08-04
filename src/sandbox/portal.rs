@@ -38,8 +38,8 @@
 //! confined to the cage's mount/network namespaces), and the only host resource in the cage is the
 //! Wayland socket, which `gui = "wayland"` already bound. So the compositor-dependent isolation
 //! caveat for the Wayland socket (Mutter safe; wlroots exposes screen-capture/input-injection —
-//! see `docs/guide/configuration/gui.md`) governs these interfaces too; the in-cage portal adds no
-//! reach beyond the socket the display hole already grants.
+//! see `docs-site/docs/guide/configuration/gui.md`) governs these interfaces too; the
+//! in-cage portal adds no reach beyond the socket the display hole already grants.
 
 use crate::store::{self, Layout};
 use std::ffi::OsString;

@@ -36,6 +36,47 @@ while `SBX_SECCOMP` and `SBX_FORWARD` take a comma-separated list in a single va
 Precedence, lowest to highest:
 `SBX_CONFIG < SBX_* typed < --config < --* typed`.
 
+### Examples
+
+One field at a time, for one launch:
+
+```sh
+SBX_NET=none sbx run -- ./build.sh                    # cut egress
+SBX_NET=allow=api.example.com sbx run -- ./deploy.sh  # a one-shot allowlist
+SBX_GUI=wayland sbx app run some-editor               # a display for one run
+SBX_PROC=enforce sbx run -- ./untrusted.sh            # stand exec enforcement up
+SBX_ENV_RUST_LOG=debug sbx run -- cargo test          # one cage variable
+SBX_BIND=/opt/data:ro sbx run -- ./ingest.sh          # one read-only bind
+SBX_LIMIT_tasks_max=8192 sbx run -- ./many-procs.sh
+SBX_PACKAGE_jq=nix:jq sbx run -- ./report.sh
+SBX_SECCOMP=ptrace sbx run -- gdb ./a.out             # relax the denylist for a debug run
+SBX_DEVICE=/dev/kvm sbx run -- ./vm.sh
+```
+
+Combining them, and the whole-schema form for anything the typed variables do not
+cover:
+
+```sh
+SBX_NET=none SBX_GUI=offscreen SBX_NOTIFY=off sbx run -- ./ci.sh
+
+SBX_CONFIG='[limits]
+tasks_max = 4096' sbx run -- ./build.sh
+
+SBX_CONFIG=@ci-override.toml sbx run -- ./build.sh    # from a file
+```
+
+Two behaviours to keep in mind, both of which exist to stop a stale shell variable
+from quietly widening a posture:
+
+```sh
+export SBX_NET=shared          # every later launch prints a stderr notice about it
+sbx run --net none -- ./x.sh   # the command line wins: the flag beats the variable
+export SBX_NET=nonee           # a typo is a hard error, exit 2, no launch
+```
+
+A variable exported in a shell rc is the case the notice is for: it applies to every
+launch from that shell, long after you have forgotten it.
+
 ## Engine override variables (host)
 
 | Variable | Meaning |
@@ -46,6 +87,19 @@ Precedence, lowest to highest:
 These take precedence over the bundled engine and the host `PATH`. A resolved engine
 must still pass an ownership/permission gate before it is executed. See
 [Provisioning](../concepts/provisioning).
+
+Two more are read **at build time**, not at run time, and only when the matching
+[self-contained feature](../getting-started/installation#self-contained-engines-optional)
+is on. Each supplies the static binary to embed, and the build verifies its SHA-256
+against the pinned expectation, so a drifted engine fails the build loudly:
+
+| Variable | Supplies | Required by |
+|---|---|---|
+| `SBX_BUNDLED_NIX` | the static `nix` to embed | the `bundled-nix` feature |
+| `SBX_BUNDLED_BWRAP` | the static `bwrap` to embed | the `bundled-bwrap` feature |
+
+`mise run build-bundled` sets both from the pinned engine builds; you never set them by
+hand for an ordinary build.
 
 ## Directory variables (host)
 
@@ -119,6 +173,21 @@ including:
 | `no_proxy`/`NO_PROXY` | set to `localhost,127.0.0.1,::1` so in-cage loopback does not route through the egress proxy |
 | `HOME`, `PATH`, `TERM`, `LANG` | the synthetic identity's home, the tool paths, and the two passthrough values |
 
+A configuration that declares a [task](../tasks/) adds two more, so an in-cage caller
+finds the operation plane without being told where it is:
+
+| Variable | Meaning |
+|---|---|
+| `SBX_TASK_CLI` | the in-cage path of the task client (`/opt/sbx/bin/sbx`), a [generated script](../cli/task#what-the-cage-actually-holds) that speaks the plane's protocol and refuses every other word |
+| `SBX_TASK_SOCKET` | the in-cage path of the plane's socket (`/tmp/sbx-task.sock`), which is also how `sbx task` knows it is running inside a cage |
+
+Inside a **task** cage (the ephemeral sibling an invocation runs in) the set is different:
+
+| Variable | Meaning |
+|---|---|
+| `SBX_TASK` | the name of the operation being run. A task is never interactive, so a tool that would otherwise prompt can fail fast instead of hanging until the timeout |
+| `SBX_TASK_OUT` | the writable [output directory](../tasks/output#producing-a-file-output) (`/opt/sbx/out`), set only when the declaration carries `output = true`. The calling cage reads the same artifacts at `/opt/sbx/task-out/<task>/` |
+
 Under a [filtering network posture](../networking/modes), `sbx` also sets the proxy
 variables (`http_proxy`/`https_proxy`) and the CA-bundle variables so in-cage tools
 trust the egress proxy's per-session CA. These are managed by `sbx`; a trusted
@@ -132,7 +201,7 @@ cage. The one worth knowing:
 
 | Variable | Effect |
 |---|---|
-| `MISE_MINIMUM_RELEASE_AGE` | overrides mise's built-in 24 h fresh-release hold; `"0"` installs the newest upstream release immediately. See [Upgrading toolchains](../housekeeping/upgrade#installing-the-newest-release-immediately). |
+| `MISE_MINIMUM_RELEASE_AGE` | overrides mise's built-in 24 h fresh-release hold; `"0"` installs the newest upstream release immediately. See [Upgrading toolchains](../concepts/upgrade#installing-the-newest-release-immediately). |
 
 Set it in the **global** config to apply to every app: edit `sbx/sbx.toml` or run
 `sbx config set --global env.MISE_MINIMUM_RELEASE_AGE 0` (`--local` for one project). A

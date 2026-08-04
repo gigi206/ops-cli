@@ -1,7 +1,7 @@
 //! Integration tests for the session registry and `sbx session ls`.
 //!
 //! Two properties: `sbx session ls` reports cleanly when there is nothing to show
-//! (no sandbox needed), and — the M1.4 headline — a second sandbox launched in
+//! (no sandbox needed), and a second sandbox launched in
 //! the same project shares the first's persistent `$HOME`, i.e. "a 2nd terminal
 //! in the same env". The shared-env test is skipped, not failed, where the host
 //! cannot sandbox.

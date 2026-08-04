@@ -114,7 +114,7 @@ forward = [17573]
 # needs it — you can type or paste a working-folder path instead.  So if your compositor is
 # wlroots-based, or you simply do not want the native chooser, comment out this line and the `zenity`
 # package below; everything else in Open Design keeps working.  See
-# docs/guide/configuration/gui.md.
+# docs-site/docs/guide/configuration/gui.md.
 gui = "wayland"
 
 # The Open Design checkout and its state are deliberately global: downloading and compiling the

@@ -1100,11 +1100,11 @@ pub(crate) struct NetworkTable {
     /// (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture: Option<String>,
-    /// The per-body capture cap in KiB, meaningful only with `capture = "bodies"` (it is ignored,
-    /// with a warning, otherwise). Absent means the default (8); the value is clamped to the
-    /// ceiling (1024) rather than refused, since asking for more retains fewer exchanges rather
-    /// than more bytes. The head side has its own independent bound, so a header flood cannot eat
-    /// the body budget.
+    /// The per-body capture cap in KiB, meaningful only with `capture = "bodies"`. It is ignored
+    /// otherwise, with a warning when `capture` is absent. Absent means the default (8); the value
+    /// is clamped to the ceiling (1024) rather than refused, since asking for more retains fewer
+    /// exchanges rather than more bytes. The head side has its own independent bound, so a header
+    /// flood cannot eat the body budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_max_kb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

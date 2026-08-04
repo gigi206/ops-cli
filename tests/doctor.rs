@@ -161,7 +161,7 @@ fn doctor_proves_the_boundary_by_a_real_launch_where_supported() {
 
 #[test]
 fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
-    // The crux of M1.5: a capability-bearing namespace plus a failed launch means
+    // The crux: a capability-bearing namespace plus a failed launch means
     // the *engine* is at fault, so doctor must blame bubblewrap and surface its
     // stderr — never the namespace. Force it with a stub bwrap that always fails.
     // Gate on a real sandbox working first (with the unmodified PATH), so the

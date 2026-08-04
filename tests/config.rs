@@ -1357,7 +1357,7 @@ fn config_shows_the_locked_revision_once_resolved() {
 
 #[test]
 fn upgrade_in_a_trusted_pinned_project_rolls_the_per_project_lock() {
-    // The headline of M3.2d's context-awareness: `sbx upgrade` rolls the lock the
+    // Context-awareness in one property: `sbx upgrade` rolls the lock the
     // current directory resolves against — a trusted pin's own per-project lock, not
     // the global one. A 40-hex revision pin resolves to itself, so this needs no nix
     // call (only nix on PATH, which `upgrade` gates on); skipped if nix is absent.

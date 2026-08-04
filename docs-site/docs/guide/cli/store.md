@@ -50,6 +50,31 @@ the `btrfs volume` line is the *real* figure: the same `on host` number
 `--json` emits the same data as a document, with the raw `bytes` and `inodes` alongside the
 rendered size; on a volume it carries a `volume` object (`image`, `host_bytes`, `host_size`).
 
+## Examples
+
+```sh
+sbx store                        # every subtree, largest first
+sbx store --json                 # the same, machine-readable
+sbx store --json | jq -r '.size, .inodes'                       # the totals alone
+sbx store --json | jq -r '.subtrees[] | "\(.size)\t\(.label)"'  # a two-column report
+sbx store --json | jq '.volume'  # the real host cost, on a storage volume (null otherwise)
+```
+
+Two questions this answers that no other verb does:
+
+```sh
+# Is the inode count a problem on this filesystem?
+sbx store --json | jq .inodes ; df -i "$(sbx path --json | jq -r .bases[0].root)"
+
+# How much of the total is the shared store, before deciding to gc?
+sbx store --json | jq -r '.subtrees[] | select(.label=="store/") | .size'
+sbx gc --all                     # …then see what of it is actually reclaimable
+```
+
+`sbx store` reports what **is** on disk; [`sbx gc`](gc) reports what is
+**reclaimable**. They are different numbers, which is why `gc` defaults to a dry run:
+it tells you how much of the size reported here a sweep would actually return.
+
 ## Why inodes are reported
 
 A filesystem can run out of **inodes while it still has free space**, and a nix store is
@@ -77,7 +102,7 @@ the report says which case yours is:
 - Where the filesystem does **not** share storage between files, each file's blocks are its own and
   the sizes are **exact**.
 - Where it **does** (copy-on-write), a per-project store reports its full size even though it was
-  seeded by a clone that shares most of its storage with the store it came from: and the real
+  seeded by a clone that shares most of its storage with the store it came from, and the real
   footprint is smaller still where the filesystem compresses. No per-file measurement can see
   either saving (`du` has the same blind spot), so the sizes are honest **upper bounds**: the true
   on-disk total is smaller, and can be well below what the report shows.

@@ -11,6 +11,46 @@ engine, because a weaker engine would mean no security boundary.
 
 See also: [Installation](installation) · [Security model](../concepts/security-model) · [Enforcement stack](../concepts/enforcement).
 
+## A passing host
+
+```console
+$ sbx doctor
+sbx doctor — runtime preflight
+
+  [ ok ] bubblewrap        /usr/bin/bwrap
+         · host PATH
+  [ ok ] sandbox           bubblewrap launched a hardened process
+         · user namespaces: capability-bearing — proven by the launch
+         · no_new_privs set, every capability dropped
+         · host $HOME absent — the bind layout did not leak it
+         · kernel.apparmor_restrict_unprivileged_userns = 0
+         · kernel.unprivileged_userns_clone = 1
+  [ ok ] resource limits   cage capped via a systemd scope (MemoryHigh=80%, MemoryMax=90%, TasksMax=16384)
+  [ ok ] nix               /nix/var/nix/profiles/default/bin/nix
+         · nix (Nix) 2.34.5
+  [ ok ] git               /usr/bin/git
+         · optional — needed only for `sbx plugins store`, not to run a sandbox
+  [ ok ] store             ~/.local/share/sbx/store (present)
+  [ ok ] channel           nixos-unstable @ 0954f7e (locked)
+  [ ok ] storage           type: directory (ext4) at ~/.local/share/sbx
+
+sbx: prerequisites OK.
+```
+
+Every line is a check; the indented `·` lines are the evidence behind it. The
+`sandbox` block is the one that matters most: it is not a probe of kernel flags but
+the report of a real bubblewrap launch, which is why it can assert that the host
+`$HOME` was absent from inside the cage.
+
+On a host that has [adopted a volume](../cli/storage), the last two lines read
+differently, and the store moves into it:
+
+```console
+  [ ok ] store             /run/media/you/sbx-storage/store (present)
+  [ ok ] storage           type: volume (btrfs) at /run/media/you/sbx-storage
+         · compression zstd; the data directory costs the host a single inode
+```
+
 ## What it checks
 
 - **Capability-bearing unprivileged user namespaces.** This is the security

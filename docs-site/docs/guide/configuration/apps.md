@@ -109,3 +109,92 @@ sbx config show                 # a compact per-app roster
 sbx config show --details       # each app's env, binds, packages, rules, credentials
 sbx config show --app review    # one app's effective config, each field tagged inherited or set
 ```
+
+## Examples by posture
+
+**A terminal agent, reaching one API.** The common case: an isolated home, a
+read-by-default allowlist, and a credential the cage never holds.
+
+```toml
+[app.review]
+cmd = "claude"
+
+[app.review.packages]
+claude = "mise:aqua:anthropics/claude-code"
+
+[app.review.network]
+mode  = "deny"
+allow = ["api.anthropic.com"]
+
+[app.review.secret."api.anthropic.com"]
+from   = "env://ANTHROPIC_API_KEY"
+header = "x-api-key"
+type   = "raw"
+```
+
+**An agent that must write somewhere, and push.** Egress needs the verbs spelled out
+(the app default is read-only), the ssh grant is unioned onto the baseline so it
+belongs to this one app, and the limits keep a runaway build off the host.
+
+```toml
+[app.builder]
+cmd        = ["claude", "--dangerously-skip-permissions"]
+home_scope = "project"          # one home per project, not one shared home
+
+[app.builder.network]
+mode  = "deny"
+allow = ["api.anthropic.com", "{*} https://api.github.com", "tcp://github.com:22"]
+
+[app.builder.ssh_agent]
+allow   = ["deploy@example"]
+confirm = true
+
+[app.builder.limits]
+memory_max = "8G"
+tasks_max  = 4096
+```
+
+**A desktop application.** The display, GPU and portal holes are each trusted-only and
+each off unless named.
+
+```toml
+[app.editor]
+cmd   = "some-editor"
+gui   = "wayland"
+gpu   = true
+dbus  = true
+
+[app.editor.packages]
+some-editor = "appimage:https://example.invalid/editor-1.2.3.AppImage"
+```
+
+**An agent under observation, with the operations it may invoke.** The task is the
+credential-bearing half; the agent holds only the right to ask for it.
+
+```toml
+[app.reviewer]
+cmd  = "claude"
+proc = "enforce"
+
+[app.reviewer.task.fmt-check]
+cmd   = ["cargo", "fmt", "--check"]
+spawn = []
+```
+
+**Reusing a shared piece instead of rewriting it.** `use` folds a bundle's packages,
+env, egress and credentials in; it must sit above the first `[table]` header.
+
+```toml
+[app.my-agent]
+cmd = "claude"
+use = ["claude-code"]
+```
+
+Then, whichever shape it is, the same three questions before launching it:
+
+```sh
+sbx config show --app my-agent   # its effective config, each field tagged
+sbx net rules -a my-agent        # the egress it would actually get
+sbx secret list -a my-agent      # the credentials it would carry
+sbx app run my-agent
+```

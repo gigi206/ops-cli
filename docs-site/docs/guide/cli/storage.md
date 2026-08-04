@@ -95,12 +95,12 @@ is whether either is missing:
 |---|---|---|---|
 | btrfs, ZFS, bcachefs | yes | yes | no, and nesting one copy-on-write filesystem in another only compounds fragmentation |
 | XFS | yes (`reflink=1`) | no | yes, for the compression |
-| ext2/3/4 | no | no | yes: and it relieves the fixed inode table too |
+| ext2/3/4 | no | no | yes, and it relieves the fixed inode table too |
 | tmpfs | n/a | n/a | no: nothing here survives a reboot |
 | anything else | measured | unknown | only if it turns out not to share blocks |
 
 For a filesystem sbx does not recognize there is no table to consult, so it **measures** block
-sharing by attempting one in the data directory: and offers a volume only on a definite "cannot",
+sharing by attempting one in the data directory, and offers a volume only on a definite "cannot",
 rather than guessing about compression. Set
 [`SBX_DATA_DIR`](../reference/environment-variables#sbx_data_dir) and the offer is skipped
 entirely: that is the invoker's explicit choice.
@@ -225,7 +225,7 @@ check it yourself.
 
 That last point is worth spelling out, because btrfs itself counts differently. It writes every
 metadata block twice, the `DUP` profile, its default on a single device, so a block that goes bad
-is repaired from its twin instead of taking a part of the filesystem with it: and reports the pair
+is repaired from its twin instead of taking a part of the filesystem with it, and reports the pair
 as one. `inside` counts them as they are written, which is why it can exceed what you think you
 stored. A nix store's metadata runs on the order of 8% of its data, so expect that much overhead
 and no surprise in it. **Compression is not visible here**: `used` is
@@ -293,6 +293,61 @@ makes this happen without asking.
 
 Do not judge the result by what `fstrim -v` prints: it reports the range it walked as free,
 including parts already punched out of the image, so its total over-states the gain. The honest
-measure is `on host` before and after: or `du --block-size=1` on the image. A `sudo btrfs balance`
+measure is `on host` before and after, or `du --block-size=1` on the image. A `sudo btrfs balance`
 is a different matter again: it addresses the long-term fragmentation of partly-emptied chunks, not
 ordinary deletes.
+
+## Examples
+
+The whole life cycle of a volume, in the order you meet the commands.
+
+Starting fresh, with nothing yet in the data directory:
+
+```sh
+sbx storage init                  # create the image (200 GiB logical, sparse)
+sbx storage init --size 500G      # …or a different ceiling; it costs nothing until filled
+sbx storage init --image /mnt/ssd/sbx.btrfs   # …on another disk
+sbx storage use                   # adopt it; mounted automatically from now on
+```
+
+Starting with an installation that already has a store, projects, or app homes: `use`
+refuses, and `migrate` is the command that moves them:
+
+```sh
+sbx session stop --all            # nothing may be running from the data directory
+sbx storage migrate               # copy, verify, then switch over
+```
+
+`migrate` keeps the original authoritative for the whole copy and sets it aside under a
+dated name rather than deleting it, so an interruption before the switch leaves the
+installation exactly as it was.
+
+Living with it:
+
+```sh
+sbx storage status                # where it stands, and what it costs the host
+sbx storage status --json | jq '.host_bytes, .reclaimable_bytes, .state'
+sbx store                         # what is inside it, subtree by subtree
+sbx doctor                        # the `storage` line reports the posture
+```
+
+Releasing it, temporarily or for good:
+
+```sh
+sbx storage down                  # unmount now (refuses while a sandbox runs from it)
+sbx storage up                    # mount it now, rather than at the next command
+sbx storage unuse                 # go back to the ordinary data directory, volume untouched
+```
+
+`down` is temporary while the volume is adopted: the next sbx command mounts it again.
+`unuse` is the deliberate reversal, and it deletes nothing.
+
+For a one-off run somewhere else entirely, bypass the whole mechanism:
+
+```sh
+SBX_DATA_DIR=/tmp/sbx-scratch sbx run -- ./build.sh
+```
+
+That also suppresses the first-launch suggestion: an explicit
+[`SBX_DATA_DIR`](../reference/environment-variables#sbx_data_dir) is the invoker's own
+choice about where data lives.

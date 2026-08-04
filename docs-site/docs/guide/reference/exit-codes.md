@@ -11,6 +11,7 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 | `0` | success |
 | `1` | a runtime failure, an operation that ran but did not succeed (e.g. `sbx config get` on an unset key, a store/network operation that failed) |
 | `2` | a **usage or fail-closed** error, a bad argument, a missing operand, or a rejected [one-shot override](../configuration/overrides) value |
+| `125` | [`sbx task run`](../cli/task#run) **refused** the invocation and ran nothing |
 | *other* | for a launch verb, the **launched command's** own exit status |
 
 ## Launch verbs propagate the command's status
@@ -34,6 +35,13 @@ value (a `--net nonee` typo, a bad `[limits]` value, a bad `nixpkgs`) or a **str
 error (a `--limit` with no `=`, a `--bind` with an empty path) is a **hard error, exit 2,
 no launch**, because silently keeping the baseline could leave a wider posture than the
 mistyped intent. See [One-shot overrides](../configuration/overrides#fail-closed-on-an-invalid-value).
+
+## A refused operation exits 125
+
+[`sbx task run`](../cli/task#run) exits **125** when it refuses the invocation and runs
+nothing: an unknown operation, a value outside its declared bound, a variable not in
+`env_allow`, or an exhausted session quota. 125 rather than 2, so a refusal stays
+distinguishable from the wrapped command exiting 2 on its own.
 
 ## `sbx doctor` fails hard on a missing prerequisite
 

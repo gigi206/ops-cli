@@ -1,9 +1,9 @@
 # Architecture: Model B
 
-This page explains how a [filtering egress posture](modes) works under the hood, the design called **Model B**: and why it was chosen. It is the *why* behind the
-[modes](modes) and [rules](rules) pages. For the full evidence (a throwaway
-spike that tested both architectures live). The decision is documented in the
-**M6/M7 surge** alongside the egress design (see the threat model's egress section).
+This page explains how a [filtering egress posture](modes) works under the hood, the
+design called **Model B**, and why it was chosen. It is the *why* behind the
+[modes](modes) and [rules](rules) pages. The full evidence, a throwaway spike that
+tested both architectures live, is recorded in the threat model's egress section.
 
 ---
 
@@ -64,7 +64,7 @@ curl https://1.2.3.4/        → Could not connect
 
 The one **GUI-only nuance**: under `gui = "offscreen"` or `gui = "wayland"`,
 [`configuration/gui.md#offscreen`](../configuration/gui#offscreen) shows how a small
-host-side [``__netns-holder` binary](https://github.com/gigi206/ops-cli/blob/ops-v2/src/sandbox/netns.rs) adds a `dummy0`
+host-side [``__netns-holder` binary](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/src/sandbox/netns.rs) adds a `dummy0`
 interface (a kernel black hole, no peer, no route, drops everything) before exec'ing bwrap.
 Chromium/Electron decide `navigator.onLine` from the **presence of a non-loopback
 interface**, not from actual reachability, so a loopback-only cage reads as "no
@@ -111,9 +111,9 @@ and *then* filters. The spike settled it decisively against P:
 
 Model B, by contrast, gets all of that isolation: no route, no DNS, no metadata, no
 host-loopback, **for free**, and a misconfiguration fails closed. That is why it was
-chosen (and confirmed with the user). The CVE-2026-47128 incident (in the namespace-free, Landlock-first cohort we surveyed): a no-namespace
-setup escaping via `systemd-run --user`: is a live validation of the all-namespaces,
-empty-netns approach.
+chosen. The CVE-2026-47128 incident (in the namespace-free, Landlock-first cohort we
+surveyed), a no-namespace setup escaping via `systemd-run --user`, is a live validation
+of the all-namespaces, empty-netns approach.
 
 ---
 
@@ -282,10 +282,10 @@ A connection is offered to another request only when all of these hold:
 | the response announced no close, and no `NTLM`/`Negotiate` | those bind an identity to the connection itself |
 
 Anything else closes. What is held is bounded by **count**, not by a clock: 64 waiting
-connections in total, 4 per host, the same stance the rest of the proxy takes toward
-held resources. The clock answers a different question, which is how stale a connection
-may be and still be handed over: one that has waited more than 10 seconds is dropped
-rather than reused.
+connections in total, 4 per host and credential set, the same stance the rest of the
+proxy takes toward held resources. The clock answers a different question, which is how
+stale a connection may be and still be handed over: one that has waited more than 10
+seconds is dropped rather than reused.
 
 The residual is a server closing a waiting connection in the microseconds between the
 proxy's check and its write. That request gets a `502 upstream-closed`, never a silent
@@ -324,7 +324,7 @@ without weakening the chain.
 ### Credential injection and redaction
 
 Because the L7 path decrypts the request, it is also where a
-[`[secret]` credential is injected](../secrets/injection) into an allowed request, host-side, after the verdict, so the plaintext never enters the cage: and where the
+[`[secret]` credential is injected](../secrets/injection) into an allowed request, host-side, after the verdict, so the plaintext never enters the cage, and where the
 [outbound and inbound secret tripwires](../secrets/redaction) run. These are a
 separate subsystem documented under [Secrets](../secrets/); they ride the
 same proxy the egress policy runs on, which is why they are inert on a `tcp://` splice
@@ -371,7 +371,7 @@ network alone, is what keeps host secrets out of the cage.
 
 ## See also
 
-- [Egress overview](/): the one-paragraph summary and the mode table.
+- [Egress overview](../networking/): the one-paragraph summary and the mode table.
 - [Network modes](modes): the postures this architecture serves.
 - [Rule grammar](rules): L7 vs L4, and what the MITM path enforces.
 - [Observability](observability): the `blocked`/`error` verdicts and reason
@@ -379,4 +379,3 @@ network alone, is what keeps host secrets out of the cage.
 - [Secrets architecture](../secrets/): injection and redaction over this
   same proxy.
 - [Security model](../concepts/security-model) · [Enforcement stack](../concepts/enforcement) · [Configuration: `gui`](../configuration/gui) (the GUI dummy0 nuance above)
-- Design: [threat model and binds](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-threat-model-and-binds) (the full Model-B-vs-P evidence: the egress section above)

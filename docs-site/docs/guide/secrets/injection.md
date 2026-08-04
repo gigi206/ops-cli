@@ -16,8 +16,8 @@ is no proxy on the wire and a `[secret]` **injects nothing**: `sbx` warns rather
 than silently sending an unauthenticated request. The destination host must also
 be reachable under the policy (in the `allow` list, or not denied); a request to
 a host the policy blocks is refused *before* injection. See
-[../networking/modes.md](../networking/modes) and
-[../configuration/network.md](../configuration/network).
+[Network modes](../networking/modes) and
+[`[network]`](../configuration/network).
 
 ## The `[secret]` table, keyed by destination host
 
@@ -42,15 +42,15 @@ allowlist.
 `[secret]` is a **security field**: honored from the global config or a trusted
 project, dropped from an untrusted one. It is a *table*, never an array (the one
 reserved key, `defaults`, holds the resolver settings: so a host cannot be named
-`defaults`). See [README.md](/) and
-[../concepts/security-model.md](../concepts/security-model).
+`defaults`). See [Secrets architecture](../secrets/) and
+[Security model](../concepts/security-model).
 
 ## Per-secret fields
 
 | Field | Meaning |
 |---|---|
 | `kind` | The broker kind. Optional; defaults to `"http-header"`, the only kind today. |
-| `key` **or** `from` | The SOURCE, exactly one. Terse `key` (expanded through `[secret.defaults]`) or a verbose `from` ref/chain. See [resolvers.md](resolvers). |
+| `key` **or** `from` | The SOURCE, exactly one. Terse `key` (expanded through `[secret.defaults]`) or a verbose `from` ref/chain. See [Resolvers](resolvers). |
 | `header` | The header name to set, e.g. `Authorization`. |
 | `type` | How to shape the value: `bearer`, `basic`, or `raw`. |
 | `prefix` | Optional override of the type's default prefix. |
@@ -139,20 +139,19 @@ brokers the credential onto the wire. No MCP, no agent cooperation.
 multi-tenant host the agent can write to. The structural guarantee is that the
 agent cannot exfiltrate the credential to an *arbitrary* host (concrete-host
 scope + empty netns + tight egress), not that it can never observe it against a
-cooperating destination. The inbound tripwire in [redaction.md](redaction)
+cooperating destination. The inbound tripwire in [Redaction](redaction)
 masks the naive verbatim reflection; the real lever remains least privilege at
 the source and a tight allowlist.
 
 ## See also
 
-- [resolvers.md](resolvers): the SOURCE that produces the value injected
+- [Resolvers](resolvers): the SOURCE that produces the value injected
   here.
-- [redaction.md](redaction): the outbound/inbound tripwires around this
+- [Redaction](redaction): the outbound/inbound tripwires around this
   broker.
-- [README.md](/): the never-in-cage invariant and the two-layer model.
-- [../networking/modes.md](../networking/modes) /
-  [../configuration/network.md](../configuration/network): the filtering
+- [Secrets architecture](../secrets/): the never-in-cage invariant and the two-layer model.
+- [Network modes](../networking/modes) /
+  [`[network]`](../configuration/network): the filtering
   posture that makes injection live.
-- [../configuration/secret.md](../configuration/secret): the full config
+- [`[secret]`](../configuration/secret): the full config
   reference.
-- [https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture.md](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture): the broker design and the exposure lattice.

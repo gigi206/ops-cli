@@ -4,12 +4,12 @@ An app **profile** is a standalone, portable file that defines one app. `sbx` sh
 **no built-in apps**, every profile is a separate artifact you import deliberately, so
 importing is a conscious trust act.
 
-See also: [The app framework](/) · [Profile catalog](catalog) · [`sbx app`](../cli/app) · [`[app.<name>]`](../configuration/apps).
+See also: [The app framework](../apps/) · [Profile catalog](catalog) · [`sbx app`](../cli/app) · [`[app.<name>]`](../configuration/apps).
 
 ## The profile file shape
 
 A profile is a TOML file shaped as a **top-level app**: the app's fields directly, with
-**no `[app.<name>]` wrapper**: and its **filename is the app name**:
+**no `[app.<name>]` wrapper**, and its **filename is the app name**:
 
 ```toml
 # my-agent.toml  →  the app is named "my-agent"

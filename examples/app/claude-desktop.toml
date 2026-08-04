@@ -40,7 +40,7 @@
 # DISPLAY + GPU + AUDIO + DBUS — `gui = "wayland"` binds the host Wayland
 # socket (read-only) and provisions fonts so the window maps (X11 is never offered; isolation is
 # compositor-dependent — Mutter/GNOME is safe, wlroots exposes screen-capture/input-injection, see
-# docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa's
+# docs-site/docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering (mesa's
 # drivers into sbx's store + the `/dev/dri` render node + the minimal `/sys` DRM subtree); without
 # it a Chromium/Electron app on Wayland often produces no buffer and no window maps. mesa covers
 # Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (still renders, slower).
@@ -48,7 +48,7 @@
 # own closure, which carries only ALSA) and binds the host PulseAudio socket into the cage, so the
 # microphone and sound work (voice input). It is trusted-only because the PulseAudio bus exposes the
 # microphone AND every system-audio `.monitor` source (recording all host output), see
-# docs/guide/configuration/audio.md.
+# docs-site/docs/guide/configuration/audio.md.
 # `dbus = true` gives the cage its OWN private desktop portal (a `dbus-daemon` +
 # `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER opens
 # IN-CAGE and lists only the cage filesystem (a host-privileged file manager over the host bus would

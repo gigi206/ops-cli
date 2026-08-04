@@ -1172,7 +1172,7 @@ mod tests {
     #[test]
     fn get_strips_a_trailing_comment_from_a_non_string_scalar() {
         let tmp = crate::testutil::TmpDir::new();
-        let p = doc_at(tmp.path(), "[limits]\ntasks_max = 4096 # per advisor\n");
+        let p = doc_at(tmp.path(), "[limits]\ntasks_max = 4096 # tuned\n");
         assert_eq!(
             get(&p, "limits.tasks_max").unwrap().as_deref(),
             Some("4096")

@@ -43,7 +43,7 @@ One bundle per agent CLI: its package, the environment it reads, and the hosts i
 must reach — and **nothing about the shape of the cage** (no `cmd`, no `binds`, no
 `gui`/`gpu`/`audio`/`dbus`, no network mode). Each is derived from the agent profile
 of the same name in [`app/`](app/), and a test pins the two together so they cannot
-drift apart. See [`[bundle.<name>]`](../docs/guide/configuration/bundles.md).
+drift apart. See [`[bundle.<name>]`](../docs-site/docs/guide/configuration/bundles.md).
 
 Not every agent has one: `cursor-agent` is a bootstrap download rather than a
 package, so there is nothing for a bundle to carry. `amp`, `junie` and `cortex` have none for a
@@ -70,6 +70,7 @@ step is skipped for its `@vscode/ripgrep` dependency, yet it needs no wrapper �
 | `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
 | `claude-desktop`  | `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | `api.anthropic.com` / `claude.ai` (account) |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
+| `omp`            | `mise:github:can1357/oh-my-pi` (can1357's complement to `pi`: the same multi-provider agent with a heavier in-process harness — one Bun-built standalone `omp` binary, glibc only; mise verifies the release's attestations + SLSA) | provider-dependent (BYOK) |
 | `qwen-code`       | `mise:npm:@qwen-code/qwen-code` (+ `nix:nodejs`) | `dashscope.aliyuncs.com` (Dashscope / Alibaba BYOK; OpenRouter/Anthropic/OpenAI/Gemini documented) |
 | `hermes`          | `flake:…/hermes-agent#default` (built host-side) | `openrouter.ai` (BYOK) / Nous account |
 | `hermes-webui`    | `flake:…/nesquena/hermes-webui#default` + `…/hermes-agent#default` (community web UI + `forward`) | `openrouter.ai` (BYOK) / Nous account |
@@ -162,7 +163,7 @@ type   = "bearer"
 
 Global (in `sbx.toml`) authenticates every cage that can reach that host, as you; in one app
 profile it stays that app's. The full reasoning, the verification, and the scope trade-off are
-in [the worked example](../docs/guide/configuration/secret.md#worked-example-authenticating-the-github-api).
+in [the worked example](../docs-site/docs/guide/configuration/secret.md#worked-example-authenticating-the-github-api).
 
 > **Status:** the profiles import and resolve cleanly (covered by a test), and the
 > tool is **provisioned fresh and runs** under the profile's own allowlist — proven
@@ -328,6 +329,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `opencode-desktop` | `deb:github:anomalyco/opencode` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side — tracks the repo's newest release (`sbx upgrade deb`) |
 | `claude-desktop` | `deb:apt:…/apt/stable/dists/stable/main/binary-amd64/Packages` | Anthropic's official prebuilt `.deb` (Electron), autoPatchelf'd host-side — tracks the apt index's newest version (`sbx upgrade deb`) |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
+| `omp`         | `mise:github:can1357/oh-my-pi`                | can1357's GitHub release binary (Bun-built single file; mise verifies the release's artifact attestations + SLSA) |
 | `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix + node front-ends), built host-side |
 | `hermes-webui`| `flake:github:nesquena/hermes-webui#default` (+ `…/hermes-agent#default`) | the community WebUI's own upstream flake, plus the same agent flake it runs in-process — both built host-side |
 | `vibe`        | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`) | Mistral PyPI wheel (via uv) |
@@ -412,7 +414,7 @@ When the flake is one you author yourself, write the whole `flake.nix` **inline*
 `[flakes.<name>]` table instead of hosting a separate repo. Unlike a remote `flake:` ref, an inline
 flake builds **in-cage** (its source is local content), so that first build does run under the
 cage's egress posture; the out-link is keyed by the source's content hash, so editing the flake
-in the profile rebuilds. See [inline flakes](../docs/guide/configuration/packages.md). An inline
+in the profile rebuilds. See [inline flakes](../docs-site/docs/guide/configuration/packages.md). An inline
 flake floats, so pin its inputs inside the `flake.nix`.
 
 A fourth backend, **`deb:<url>`**, packages a GUI/desktop app distributed **only as a prebuilt

@@ -156,14 +156,14 @@ before the cage exists. The plaintext lives briefly in host memory, is consumed
 by the broker, and is discarded. It is never an argument to a cage process, never
 a cage file, never a cage variable. A resolver *plugin* also runs host-side (in
 the trusted computing base, sandboxed under bubblewrap): see
-[plugins.md](plugins).
+[Resolver plugins](plugins).
 
 ## See also
 
-- [README.md](/): the never-in-cage invariant and the resolver × broker
+- [Secrets architecture](../secrets/): the never-in-cage invariant and the resolver × broker
   split.
-- [injection.md](injection): the broker that consumes the resolved value.
-- [plugins.md](plugins): additional resolver schemes from signed plugins.
-- [../configuration/secret.md](../configuration/secret): the full `[secret]`
+- [Injection](injection): the broker that consumes the resolved value.
+- [Resolver plugins](plugins): additional resolver schemes from installed plugins.
+- [Signed plugin stores](stores): where those plugins can come from.
+- [`[secret]`](../configuration/secret): the full `[secret]`
   config reference.
-- [https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture.md](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture): the SOURCE × SINK design and the resolver-plugin contract.

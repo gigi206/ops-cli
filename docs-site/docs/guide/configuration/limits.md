@@ -94,3 +94,78 @@ The key is one of `memory_high` / `memory_max` / `tasks_max` (the `SBX_LIMIT_` s
 is case-insensitive). A one-shot limit tunes that field without dropping the others.
 The command line beats the environment, and both beat the config file. See
 [One-shot overrides](overrides).
+
+## Examples
+
+Three postures, each of which is really one question: what should this workload be
+allowed to consume before the host suffers?
+
+```toml
+# a heavy parallel build: many processes, a generous but finite memory ceiling
+[limits]
+memory_high = "70%"
+memory_max  = "24G"
+tasks_max   = 32768
+```
+
+```toml
+# an untrusted agent: a tight fork-bomb guard, throttled well before the host notices
+[limits]
+memory_high = "40%"
+memory_max  = "50%"
+tasks_max   = 2048
+```
+
+```toml
+# a measurement run where the limits would distort the result
+[limits]
+memory_high = "infinity"
+memory_max  = "infinity"
+tasks_max   = "infinity"
+```
+
+The third one removes the anti-DoS control this field exists for: an `infinity`
+`tasks_max` is a cage a fork bomb can take the host down from. It is a deliberate
+posture for a benchmark you are watching, not a baseline, and it is the reason
+`[limits]` is a trusted-only field.
+
+Per app, layered per field over whichever of those is the baseline:
+
+```toml
+[app.build.limits]
+tasks_max = 4096          # memory_high / memory_max keep the baseline's values
+
+[app.review.limits]
+memory_max = "4G"
+```
+
+And for one launch, without editing anything:
+
+```sh
+sbx run --limit tasks_max=8192 -- ./build.sh
+sbx run --limit memory_max=8G --limit tasks_max=1024 -- ./untrusted.sh
+SBX_LIMIT_MEMORY_MAX=16G sbx run -- ./build.sh
+```
+
+Values that are refused, and what they should have been:
+
+| Written | Why it is dropped | Write instead |
+|---|---|---|
+| `memory_max = 90` | a bare memory number is **bytes**: 90 bytes | `memory_max = "90%"` |
+| `memory_max = "16GiB"` | no `i`, no `B` suffix | `memory_max = "16G"` |
+| `memory_max = "16g"` | the suffix is uppercase | `memory_max = "16G"` |
+| `tasks_max = "100%"` | systemd rejects a percentage for tasks | `tasks_max = 16384` |
+| `tasks_max = 0` | a positive integer, or `infinity` | `tasks_max = 1` |
+
+Each is dropped with a warning and falls back to its default, which is why
+`sbx config show` is worth a look after editing: a `limits:` line appears only for a
+field that actually took effect.
+
+```sh
+sbx config show            # what survived, and from which layer
+sbx doctor                 # whether this host can apply limits at all
+```
+
+On a host with no cgroup v2 or no reachable systemd user session, the cage launches
+**without** limits rather than failing. That is deliberate (they are hardening, never
+the boundary), and `doctor` is where you see it.

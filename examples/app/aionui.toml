@@ -48,7 +48,7 @@
 # DISPLAY + GPU. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and
 # provisions fonts, so the Electron window maps. X11 is never offered. Isolation is
 # compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose
-# screen-capture/input-injection to ordinary clients (see docs/guide/configuration/gui.md).
+# screen-capture/input-injection to ordinary clients (see docs-site/docs/guide/configuration/gui.md).
 # `gpu = true` opens hardware-accelerated rendering (mesa provisioned into sbx's own store, the
 # render node under `/dev/dri`, the minimal `/sys` DRM subtree the driver needs) — without it a
 # Chromium/Electron app on Wayland often produces no buffer and no window maps, so it is on here.

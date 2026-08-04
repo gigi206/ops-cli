@@ -12,7 +12,7 @@ sbx doctor
 ```
 
 This verifies the [runtime requirements](doctor): capability-bearing user
-namespaces, the bubblewrap engine, and nix: and reports the store location and
+namespaces, the bubblewrap engine, and nix, and reports the store location and
 channel revision. A missing requirement is a hard failure with a remediation hint,
 never a silent fallback.
 
@@ -75,7 +75,43 @@ sbx app run claude-code
 The agent runs in the cage with a persistent identity that never bleeds into your
 project shell. See [the app framework](../apps/).
 
-## 6. Inspect the resolved configuration
+The profile authenticates through the tool's own interactive login by default. If you
+would rather use an API key, the profile ships the declaration for it, commented out:
+
+```toml
+[secret."api.anthropic.com"]
+from   = "env://ANTHROPIC_API_KEY"
+header = "x-api-key"
+type   = "raw"
+```
+
+Uncomment that block and the `ANTHROPIC_API_KEY` placeholder beside it in `[env]`, then
+`export ANTHROPIC_API_KEY=…` **on the host**. The key still never enters the cage:
+`from` names a *source*, not a value, so `sbx` reads it host-side and the egress proxy
+swaps it onto the wire. What the agent holds in its environment is the placeholder; the
+real key exists only in `sbx`'s host process. See [Injection](../secrets/injection).
+
+## 6. See what it is allowed to reach, and what it reached
+
+The two commands that make the previous step's posture visible:
+
+```sh
+sbx net rules -a claude-code    # what the allowlist admits, before launching
+sbx secret list -a claude-code  # which credentials it carries, by name and never by value
+```
+
+And, from a second terminal while the agent runs:
+
+```sh
+sbx net logs -f                 # every egress decision, as it is made
+```
+
+Everything outside that allowlist is refused, by construction rather than by policy:
+the cage has an **empty network namespace**, so its only route out is the host proxy
+that just decided. See [Network modes](../networking/modes) and
+[Architecture](../networking/architecture).
+
+## 7. Inspect the resolved configuration
 
 ```sh
 sbx config show

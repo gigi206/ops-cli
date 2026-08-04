@@ -9,7 +9,7 @@ Inspect and manage **resolver plugins** and **plugin stores**. Host-level: reads
 data directory, not a project's config. A resolver plugin declares a `scheme://`
 `sbx` can route a secret [`from`](../configuration/secret) reference to.
 
-See also: [Resolver plugins and stores](../secrets/plugins) · [Resolvers](../secrets/resolvers) · [Secrets architecture](../secrets/).
+See also: [Resolver plugins](../secrets/plugins) · [Signed plugin stores](../secrets/stores) · [Resolvers](../secrets/resolvers) · [Secrets architecture](../secrets/).
 
 ## Plugins
 
@@ -32,7 +32,7 @@ reads as unknown.
 Every install records the **digest of the tree it placed**. `verify` re-hashes and
 compares, `list` marks a changed plugin `[modified since install]`, and `info` states
 it on an `integrity:` line. This is **drift detection, not a security control**: see
-[Resolver plugins and stores](../secrets/plugins#a-plugin-edited-after-it-was-installed).
+[Resolver plugins](../secrets/plugins#a-plugin-edited-after-it-was-installed).
 
 A `scheme://` belongs to **one** plugin. Every install path refuses a scheme that is
 already claimed, so the only way to two claimants is to place a plugin directory by
@@ -82,7 +82,7 @@ ordered) when the catalogue pins a **different tree** than the one installed,
 `[name taken by …]` or `[scheme x:// taken by …]` when something else holds the
 name or the scheme (two stores may list a plugin of the same name, but only one can
 hold it), `[… in conflict …]` when the scheme is contested: the entry cannot be
-installed, and an installed claimant resolves nothing: and nothing at all when it
+installed, and an installed claimant resolves nothing, and nothing at all when it
 simply installs.
 
 What decides is the digest the catalogue pins against the one the install
@@ -93,4 +93,101 @@ tree is in place. Comparisons read the *cached* catalogue: run
 
 `publish` is the producing counterpart of `add`; the signing key is the store's secret
 and never leaves the operator's host. See
-[Resolver plugins and stores](../secrets/plugins).
+[Signed plugin stores](../secrets/stores).
+
+## Examples
+
+### Install a plugin from a local directory
+
+The shortest path: one of the two plugins the repository ships, then the `from`
+reference it unlocks.
+
+```sh
+sbx plugins install plugins/pass       # the local directory is copied in
+sbx plugins list                       # built-in schemes + what is now installed
+sbx plugins info pass                  # its manifest, sandbox grant, and origin
+```
+
+```toml
+# now usable in a trusted config
+[secret."api.github.com"]
+from   = "pass://github/token"
+header = "Authorization"
+type   = "bearer"
+```
+
+### Install from a signed store
+
+The strong form pins the key out of band, so the store cannot vouch for itself:
+
+```sh
+sbx plugins store add --name mine --url https://git.example.com/plugins.git --key @store.pub
+sbx plugins store list                 # what it offers, each entry marked
+sbx plugins store install mine kp      # pinned by content hash; no network
+sbx plugins list                       # kp:// now present, origin: store 'mine'
+```
+
+Trust-on-first-use instead, then close the gap when you can get the key elsewhere:
+
+```sh
+sbx plugins store add --name mine --url https://git.example.com/plugins.git --trust
+# listing shows: [key not confirmed elsewhere]
+sbx plugins store verify mine --key 3f8a…   # a key obtained from a source the store does not control
+```
+
+Or inspect before committing to anything: with **neither** `--key` nor `--trust`,
+`add` fetches into a throwaway clone, prints the key the store ships, and configures
+nothing.
+
+```sh
+sbx plugins store add --name mine --url https://git.example.com/plugins.git
+```
+
+### Keep them current
+
+```sh
+sbx plugins store update               # re-fetch every store (refuses a rollback)
+sbx plugins upgrade --dry-run          # what would change, installing nothing
+sbx plugins upgrade                    # …apply it
+sbx plugins upgrade kp                 # one plugin only
+```
+
+`upgrade` compares the **digest**, not the version string, and reads the *cached*
+catalogue: hence `store update` first. The installed tree is kept until the new one
+verifies, so a failed upgrade leaves what you had.
+
+### Audit and clean up
+
+```sh
+sbx plugins verify                     # every plugin, against the digest recorded at install
+sbx plugins verify kp                  # one; exit 1 means its tree changed
+sbx plugins rm kp                      # remove the plugin
+sbx plugins store rm mine              # remove the store (installed plugins stay)
+```
+
+A `verify` failure is **drift**, not an attack signal: the digest record lives in the
+same owner-only directory as the plugin, so whatever can rewrite one can rewrite the
+other. It catches a plugin edited in place and forgotten.
+
+### Resolve a scheme conflict
+
+Two plugins claiming one scheme disable **both**, and the scheme resolves to nothing:
+
+```sh
+sbx plugins list                       # reports it under `scheme conflicts`
+sbx plugins info pass                  # names every claimant, exits non-zero
+sbx plugins rm pass-old                # removing all but one restores the scheme
+```
+
+Every install path already refuses a claimed scheme, so this state only arises from a
+plugin directory placed by hand.
+
+### Publish a store (operator side)
+
+```sh
+sbx plugins store publish ./my-plugins --key ~/.sbx/store-key
+sbx plugins store publish ./my-plugins --key ~/.sbx/store-key --rev 7
+```
+
+The signing key is the store's secret and never leaves the operator's host;
+publishing the resulting git repository is the operator's own step.

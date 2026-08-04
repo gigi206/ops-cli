@@ -54,6 +54,25 @@ compares:
   previously-trusted file was edited).
 - **Untrusted**: no trust record; security fields are dropped.
 
+```mermaid
+flowchart TB
+    LOAD["<b>a launch loads .sbx.toml</b>"] --> GATE{"<b>safety gate</b><br/><i>plain · owner-owned · not world-writable</i>"}
+    GATE -- "fails" --> CLOSED["<b>fail-closed</b><br/><i>unverifiable, reported</i>"]
+    GATE -- "passes" --> HASH["<b>SHA-256 of the whole file</b><br/><i>with the mise files, if any</i>"]
+    HASH --> REC{"<b>a trust record?</b>"}
+    REC -- "no" --> UNTRUSTED["<b>untrusted</b><br/><i>security fields dropped</i>"]
+    REC -- "yes, bytes differ" --> CHANGED["<b>changed</b><br/><i>dropped, with its own warning</i>"]
+    REC -- "yes, hash matches" --> TRUSTED["<b>trusted</b><br/><i>security fields apply</i>"]
+
+    classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
+    classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
+    class TRUSTED cs
+    class CLOSED,UNTRUSTED,CHANGED hs
+```
+
+Only the `trusted` outcome applies a security field. The free `env` field applies on
+all three, minus its reserved keys under the two that are not trusted.
+
 Because the hash covers the *whole file*, any edit, even to a free field, re-arms
 the gate. This is deliberate: after editing a trusted file, its security fields stop
 applying until you run `sbx trust` again.

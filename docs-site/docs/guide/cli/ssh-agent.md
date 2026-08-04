@@ -11,7 +11,7 @@ A cage granted a key with [`[ssh_agent] allow`](../configuration/ssh-agent) neve
 asks a **filtering broker**, which asks your own agent. `sbx ssh-agent logs` is the record of those
 asks.
 
-See also: [`[ssh_agent]`](../configuration/ssh-agent) · [`sbx session`](session) ·
+See also: [The four lenses](../concepts/observability#the-four-lenses) · [`[ssh_agent]`](../configuration/ssh-agent) · [`sbx session`](session) ·
 [`sbx net`](net).
 
 ## `logs`
@@ -45,6 +45,41 @@ sbx ssh-agent logs 12345 -f             # …watch what it signs, from here
 
 sbx ssh-agent logs 12345 --json | jq 'select(.kind=="sign")'
 ```
+
+### Examples
+
+The feed only exists once a grant does, so the two halves belong together. Name the key
+by either spelling `ssh-add -l` prints, in a trusted config:
+
+```toml
+[ssh_agent]
+allow   = ["deploy@example"]   # or its SHA256:… fingerprint
+confirm = true                 # ask, on the host, before every signature
+```
+
+```sh
+ssh-add -l                              # what your agent holds, and how to name it
+sbx run --detach -- claude              # launch: sbx prints which keys the cage may use
+sbx ssh-agent logs 12345 -f             # every ask, as it happens
+```
+
+Then the questions the record answers:
+
+```sh
+sbx ssh-agent logs 12345 --json | jq 'select(.kind=="sign")'      # what was signed
+sbx ssh-agent logs 12345 --json | jq 'select(.kind=="refuse")'    # what was turned away
+sbx ssh-agent logs 12345 --json | jq -r 'select(.kind=="sign") | .at_epoch_ms' | wc -l
+sbx ssh-agent logs                                                # the sole live session
+```
+
+A `refuse` line is not an incident by itself: an ssh client routinely offers keys it does
+not end up using. What is worth reading is a refusal naming a key the grant does not
+include, or an attempt to *modify* your agent, both of which mean something in the cage
+tried more than signing.
+
+Two states read differently, on purpose: a session whose config grants no key has **no
+broker at all** and says so, which is distinct from a broker that was simply never asked
+for anything.
 
 ### The destination, and what it is worth
 

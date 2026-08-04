@@ -39,10 +39,50 @@ Two kinds appear:
 
 - **wire**, a [`[secret."host"]`](../configuration/secret) credential, injected into a matching
   request by the egress proxy. The value never enters the cage at all.
-- **env of task `<name>`**, a [`[task.<name>.secret]`](../configuration/task#credentials)
+- **env of task `<name>`**, a [`[task.<name>.secret]`](../tasks/credentials)
   credential, handed to that operation's command in its own cage. The parenthesis is the `encode`.
   A task's wire-injected credential shows as **wire of task `<name>`**.
 
 Set `name` and `description` on a `[secret."host"]` entry to make this listing legible: a credential
 with no name is listed under its destination host. The name is also what a substituted value is
 reported as (`${NAME}`) in a task's output, so keep names non-sensitive.
+
+## The declaration behind a listing
+
+The two rows above come from these two declarations:
+
+```toml
+# a wire injection: the value never enters the cage
+[secret."api.github.com"]
+name        = "gh_token"
+description = "read-only GitHub API token"
+from        = "sops://secrets.enc.yaml#github.token"
+header      = "Authorization"
+type        = "bearer"
+
+# a task credential: handed to that one command, in its own cage
+[task.db-query.secret]
+PGPASSWORD = { from = "env://DEMO_DB_PASSWORD", description = "staging database password" }
+```
+
+Which is why the listing is worth reading before a launch: it is the answer to
+"what will this configuration hand out, and to whom", derived from the same
+declarations the launch uses, without resolving a single value.
+
+## Examples
+
+```sh
+sbx secret list                        # what this project declares
+sbx secret ls                          # the alias
+sbx secret list --sources              # …and where each value would come from
+sbx secret list -a claude-code         # what `sbx app run claude-code` would carry
+sbx secret list -a claude-code --sources
+```
+
+`--sources` prints locators, never values: a variable name, a file path plus its
+key. It is the flag for "why is this credential empty" (the variable is unset on the
+host) without ever making sbx decrypt anything.
+
+An app's overlay can add credentials the project alone does not have, so `-a` and the
+bare form legitimately differ. To see the same inventory as an in-cage caller sees it,
+restricted to what a declared operation may use, see [`sbx task secrets`](task#secrets).

@@ -783,7 +783,7 @@ mod tests {
     }
 
     /// Per-project trees are classified by liveness (`idle`/`dead`/`markerless`) and carry a
-    /// last-used date — the annotation the user asked for. A live one needs a running session
+    /// last-used date, the annotation a cleanup decision rests on. A live one needs a running session
     /// record, which is covered by the gc cross-project test instead.
     #[test]
     fn projects_are_classified_with_state_and_date() {

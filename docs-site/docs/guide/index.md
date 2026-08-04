@@ -19,13 +19,15 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [Installation](getting-started/installation): build the static binary, or a dev build.
 - [Quick start](getting-started/quickstart): your first sandboxed command in five minutes.
 - [`sbx doctor` and prerequisites](getting-started/doctor): the runtime requirements and how to check them.
+- [Troubleshooting](getting-started/troubleshooting): the symptoms you may hit first, and the page that owns each fix.
 
 ## Concepts
 
 - [What sbx is (and is not)](concepts/overview): the reference class, the two actor modes.
 - [Security model](concepts/security-model): same-uid, confidentiality by absence, the bind layout.
 - [The trust gate](concepts/trust): the direnv content-hash model, free vs security fields.
-- [Enforcement stack](concepts/enforcement): bubblewrap, seccomp, cgroups, Landlock.
+- [Enforcement stack](concepts/enforcement): bubblewrap, seccomp, cgroups (and why Landlock is not a layer).
+- [Observability](concepts/observability): the process and filesystem lenses on a running cage.
 - [Provisioning model](concepts/provisioning): the rolling nix channel, the per-project store, self-equip.
 - [Directory layout](concepts/directory-layout): where the config, data, and trust state live.
 
@@ -49,10 +51,10 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`[proc]`](configuration/proc): observe or block what the agent execs (trusted-only).
 - [`[notify]`](configuration/notify): be told when something was blocked (trusted-only).
 - [`[secret]`](configuration/secret): credential injection (links to [Secrets](secrets/)).
-- [`[task.<name>]`](configuration/task): declared operations: a fixed command sbx runs with a
-  credential the caller never holds (trusted-only).
+- [`[task.<name>]`](configuration/task): the field reference for a declared operation,
+  trusted-only (links to [Declared operations](tasks/)).
 - [`[app.<name>]`](configuration/apps): named launch profiles (links to [Apps](apps/)).
-- [`[net.groups]`](configuration/net-groups): reusable egress groups.
+- [`[net.groups]`](networking/groups): reusable egress groups.
 - [`[bundle.<name>]`](configuration/bundles): reusable tool bundles an app names with `use`.
 - [One-shot overrides](configuration/overrides): `--config`/`--env`/`--net`/… and `SBX_*`.
 
@@ -96,11 +98,22 @@ rationale and threat analysis behind each subsystem, each section links out to t
 ## Networking (egress)
 
 - [Egress overview](networking/): the Model-B architecture (empty netns + host proxy).
+- [Architecture: Model B](networking/architecture): how a filtering posture works under the hood.
 - [Network modes](networking/modes): `none` / `shared` / `deny` / `allow` / `ask`.
 - [Rule grammar](networking/rules): hosts, `*.domain`, URLs, `re:`, `tcp://`, ports, `{VERB}`.
 - [Egress groups](networking/groups): reusable `[net.groups]` referenced by `@name`.
 - [Ask mode](networking/ask): park-and-confirm requests with `sbx net pending`.
+- [Inbound forwarding](networking/forward): `forward`, host loopback ports into the cage.
 - [Observability](networking/observability): `sbx net rules` / `stats` / `logs` / `live`, `sbx test net`.
+
+## Declared operations
+
+- [Declared operations](tasks/): a fixed command run with a credential the caller never holds.
+- [Parameters](tasks/parameters): `params`, the bounds that hold a caller, and `env_allow`.
+- [Credentials](tasks/credentials): `secret`, `encode`, and wire-injected credentials.
+- [What a task may run](tasks/execution): `spawn`, `[exec.<program>]`, and the task tool pool.
+- [What a task returns](tasks/output): substitution, and the `output` directory.
+- [Reaching a non-HTTP service](tasks/network): `tcp://` rules, in-cage listeners, ssh.
 
 ## Secrets
 
@@ -108,13 +121,14 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [Resolvers](secrets/resolvers): the source layer: `env://` / `file://` / `sops://`.
 - [Injection](secrets/injection): the http-header broker.
 - [Redaction](secrets/redaction): the outbound and inbound tripwires.
-- [Resolver plugins and stores](secrets/plugins): third-party resolvers, signed stores.
+- [Resolver plugins](secrets/plugins): third-party resolver schemes.
+- [Signed plugin stores](secrets/stores): distributing and installing them from a verified remote.
 
 ## Housekeeping
 
-- [Sessions](housekeeping/sessions): `ls`, `attach`, `stop`, and `--detach`.
-- [Garbage collection](housekeeping/gc): `sbx gc`.
-- [Upgrading toolchains](housekeeping/upgrade): `sbx upgrade` and the lock model.
+- [Sessions](concepts/sessions): `ls`, `attach`, `stop`, and `--detach`.
+- [Garbage collection](concepts/gc): `sbx gc`.
+- [Upgrading toolchains](concepts/upgrade): `sbx upgrade` and the lock model.
 
 ## Reference
 
@@ -131,7 +145,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
   [Network modes](networking/modes) → [Secrets](secrets/).
 - **"I want to give my project a reproducible toolchain."**
   [Provisioning](concepts/provisioning) → [`packages`](configuration/packages) /
-  [`[tools]`](configuration/tools) → [`sbx upgrade`](housekeeping/upgrade).
+  [`[tools]`](configuration/tools) → [`sbx upgrade`](concepts/upgrade).
 - **"I want to lock down what a tool can reach on the network."**
   [Network modes](networking/modes) → [Rule grammar](networking/rules) →
   [Ask mode](networking/ask) → [Observability](networking/observability).

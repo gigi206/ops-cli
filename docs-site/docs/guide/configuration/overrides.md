@@ -5,7 +5,7 @@ without editing a file. It is carried on the command line (or the environment) a
 the **authoritative final word**: it beats a trusted project config *and* an app's own
 posture.
 
-See also: [Configuration overview](/) · [`sbx run`](../cli/run) · [`sbx app`](../cli/app) · [Environment variables](../reference/environment-variables).
+See also: [Configuration overview](../configuration/) · [`sbx run`](../cli/run) · [`sbx app`](../cli/app) · [Environment variables](../reference/environment-variables).
 
 ## Why it is authoritative (trusted by invocation)
 
@@ -153,6 +153,26 @@ SBX_CONFIG  <  SBX_* typed (env)  <  --config (cli blob)  <  --* typed (cli)
 
 The **command line always beats the environment**, and a **typed flag beats the
 blob**. Within that, an override beats the trusted project config and the app overlay.
+
+```mermaid
+flowchart LR
+    D["<b>built-in defaults</b>"] --> G["<b>global sbx.toml</b><br/><i>trusted by location</i>"]
+    G --> P["<b>project .sbx.toml</b><br/><i>security fields only if trusted</i>"]
+    P --> A["<b>app overlay</b><br/><i>[app.name] or a profile</i>"]
+    A --> E1["<b>SBX_CONFIG</b><br/><i>env blob</i>"]
+    E1 --> E2["<b>SBX_* typed</b><br/><i>env</i>"]
+    E2 --> C1["<b>--config</b><br/><i>cli blob</i>"]
+    C1 --> C2["<b>--* typed</b><br/><i>cli</i>"]
+
+    classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
+    classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
+    class D,G,P,A cs
+    class E1,E2,C1,C2 hs
+```
+
+The four highlighted tiers are the override itself, trusted by invocation. Each arrow
+means "beats", and what "beating" does depends on the field: a scalar is **replaced**,
+a collection is **unioned** (see below).
 
 ## The merge rule
 

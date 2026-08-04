@@ -1,7 +1,7 @@
 # `[devices]`: exposing host device nodes
 
 Every cage gets a **minimal, hostless `/dev`**: `null`, `zero`, `full`, `random`,
-`urandom`, `tty`, `ptmx`/`pts`, `shm`, and the standard descriptor symlinks: and nothing
+`urandom`, `tty`, `ptmx`/`pts`, `shm`, and the standard descriptor symlinks, and nothing
 else. No real host device is present, so a tool that needs the GPU, a VPN tunnel, hardware
 virtualization, or a userspace filesystem cannot reach one. `[devices] allow` lets a
 **trusted** config bind a specific host device node into the cage.

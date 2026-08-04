@@ -55,9 +55,9 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `forward` | security | [forward](../networking/forward) |
 | `[notify]` | security | [notify](notify) |
 | `[secret]` | security | [secret](secret) |
-| `[task.<name>]` | security | [task](task) |
+| `[task.<name>]` | security | [task](task), and [Declared operations](../tasks/) |
 | `[app.<name>]` | security overlay | [apps](apps) |
-| `[net.groups]` | security (global-only) | [net-groups](net-groups) |
+| `[net.groups]` | security (global-only) | [Egress groups](../networking/groups) |
 | `[bundle.<name>]` | security (global-only) | [bundles](bundles) |
 | `use` | security | [bundles](bundles) |
 
