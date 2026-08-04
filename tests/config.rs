@@ -676,6 +676,71 @@ fn network_http2_is_trusted_gated_and_surfaced_in_config_show() {
 }
 
 #[test]
+fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
+    // `[network] pool` and `dns_cache_ttl` change how the proxy reaches upstream — connection reuse
+    // and how long a resolved address stands — so both ride the whole-`[network]` trust gate, and
+    // both must be *visible* once trusted. The rendering rule is asymmetric on purpose: reuse is the
+    // default, so only its absence is printed, while a DNS cache is not, so any setting prints.
+    let fx = Fixture::new();
+    fx.write_project(
+        "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n\
+         pool = false\ndns_cache_ttl = 30\n",
+    );
+
+    // Untrusted: the whole `[network]` is dropped, so neither transport line is reachable.
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("connection reuse") && !stdout.contains("dns cache"),
+        "an untrusted project's network transport settings must be dropped:\n{stdout}"
+    );
+
+    // Trust it → both settings apply and both are surfaced.
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("connection reuse: off"),
+        "a trusted `pool = false` must be visible in `config show`:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dns cache: 30s"),
+        "a trusted `dns_cache_ttl` must be visible in `config show`:\n{stdout}"
+    );
+
+    // The default posture prints nothing: reuse is on, so there is no exception to report, and an
+    // unset cache has no line either. This is what keeps the two lines meaningful.
+    let fx2 = Fixture::new();
+    fx2.write_project("[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n");
+    assert!(fx2.run(&["trust", ".sbx.toml"]).status.success());
+    let out = fx2.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("api.example.com"),
+        "the trusted allowlist must render (else the assertions below prove nothing):\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("connection reuse") && !stdout.contains("dns cache"),
+        "the default transport posture must print no line:\n{stdout}"
+    );
+
+    // `dns_cache_ttl = 0` is a *setting*, not an absence: it must say the cache is off rather than
+    // fall silent like an unset field.
+    let fx3 = Fixture::new();
+    fx3.write_project(
+        "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\ndns_cache_ttl = 0\n",
+    );
+    assert!(fx3.run(&["trust", ".sbx.toml"]).status.success());
+    let out = fx3.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dns cache: off"),
+        "`dns_cache_ttl = 0` must render as an explicit off:\n{stdout}"
+    );
+}
+
+#[test]
 fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
     // A trusted bind of `/etc` is an ancestor of the cage's synthetic `/etc/passwd`, so the cage
     // layers its own files over part of it — the bind will not behave as a naive reading suggests.
