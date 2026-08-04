@@ -56,7 +56,7 @@ for the full semantics.
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
 | `stats` | `false` turns off the per-host decision counters ([`sbx net stats`](../networking/observability)) |
 | `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
-| `pool` | `true` lets the proxy carry a request over an upstream connection an earlier request left behind (default `false`): see below |
+| `pool` | `false` stops the proxy carrying a request over an upstream connection an earlier request left behind (default `true`): see below |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"` |
@@ -120,31 +120,31 @@ dns_cache_ttl = 60   # seconds (0 = resolve every request)
 
 ## Reusing upstream connections (`pool`)
 
-By default every permitted request opens its own connection to the real server and validates
-its certificate before a byte is forwarded. That is one TLS handshake per request, and on a
-workload of many small fetches (a `nix` build pulling thousands of paths from
-`cache.nixos.org`) it is where most of the time goes. Setting `pool = true` lets a request
-that has finished hand its connection to the next one instead of closing it.
+A request that has finished hands its connection to the next one going to the same place,
+instead of closing it, so that next request pays no TLS handshake. **This is on by
+default.** Without it every permitted request opens and validates its own connection, which
+on a workload of many small fetches (a `nix` build pulling thousands of paths from
+`cache.nixos.org`) is where most of the time goes.
 
 ```toml
 [network]
 mode  = "deny"
 allow = ["cache.nixos.org", "api.example.com"]
-pool  = true
+pool  = false   # every request opens its own connection
 ```
 
 Measured on loopback, with the client side unchanged, a small request costs about **470 µs**
-with reuse against **730 µs** without it: roughly a third of the per-request cost. Against a
-real host the saving is far larger, because each avoided handshake also avoids its round
-trips. Measured against a CDN on paired runs: **7.6 ms per request with reuse against 25.9 ms
-without**, where the same request costs 6.0 ms from the host with no sandbox at all. Reuse is
-most of what separates a filtered launch from an unfiltered one: about a millisecond and a
-half of overhead with it, about twenty without. Those are one link on one machine, so read
-them as a shape rather than a promise.
+with reuse against **730 µs** without it. Against a real host the saving is far larger,
+because each avoided handshake also avoids its round trips: two thousand requests to a CDN
+took **15.1 s with reuse against 48.9 s without**, or 7.4 ms against 24.5 ms each, on a
+request the host serves in 6.0 ms with no sandbox at all. Reuse is most of what separates a
+filtered launch from an unfiltered one: about a millisecond and a half of overhead with it,
+about twenty without. Those are one link on one machine, so read them as a shape rather than
+a promise.
 
 Like the rest of the table this is trusted and global-only, so a global config can set it for
-a project that has no way to observe it: nothing in the cage can tell that a connection was
-reused. Whenever a layer set it, [`sbx config`](../cli/config) says so.
+a project that has no way to observe it: nothing in the cage can tell whether a connection
+was reused. Whenever a layer turns it off, [`sbx config`](../cli/config) says so.
 
 ### What it does not change
 
@@ -198,8 +198,10 @@ client's decision, which is the only layer that can make it. Idempotent methods 
 `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`) are replayed.
 
 So the residual is narrow: a `POST` that loses the connection it was given, and an upstream
-that fails on a fresh connection too, which would have failed without reuse anyway. `pool`
-is off by default for now, which is a conservative default rather than a warning.
+that fails on a fresh connection too, which would have failed without reuse anyway. That is
+why reuse is on by default. It was not at first, and what changed the default was measuring
+what refusing it cost: 12 300 requests across a burst of four thousand and a ten-minute pass
+of one every two seconds, on one CDN over one link, produced no failure of any kind.
 
 ## HTTP/2 and gRPC
 

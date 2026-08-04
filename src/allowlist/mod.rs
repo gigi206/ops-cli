@@ -788,7 +788,7 @@ pub(crate) struct EgressPolicy {
     /// clamps it to its own ceiling. Read via [`Self::capture_body_kb`].
     capture_body_kb: Option<u64>,
     /// Whether the proxy may carry a permitted request over an upstream connection a previous
-    /// request left behind (`[network] pool`). Off by default, and never a verdict — it changes how
+    /// request left behind (`[network] pool`). On by default, and never a verdict — it changes how
     /// a request that is already allowed is carried, not whether it is. Read via [`Self::pool`].
     pool: bool,
 }
@@ -808,7 +808,7 @@ impl EgressPolicy {
             http2: Vec::new(),
             capture: crate::sandbox::control::CaptureLevel::Off,
             capture_body_kb: None,
-            pool: false,
+            pool: true,
         }
     }
 

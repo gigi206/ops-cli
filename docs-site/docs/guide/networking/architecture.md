@@ -259,7 +259,7 @@ from the end of a socket has to close the socket to know it is done. Once it can
 finished connection to the real server is a validated TLS session the next request
 could use instead of paying for another handshake. With
 [`[network] pool = true`](../configuration/network#reusing-upstream-connections-pool)
-it does. The setting is off by default.
+it does, and it is on by default. `pool = false` turns it off.
 
 Reuse never touches the verdict. Every request is checked in full, exactly as it is
 without it: the allowlist, the `Host`/SNI agreement, the address guard, the secret

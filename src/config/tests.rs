@@ -1086,7 +1086,7 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
 /// ride, so it belongs to the same trusted `[network]` table as the rest: an untrusted project's
 /// table is dropped whole, and its `pool` with it.
 #[test]
-fn the_pool_toggle_defaults_off_and_is_gated_trusted_only() {
+fn the_pool_toggle_defaults_on_and_is_gated_trusted_only() {
     let pool_table = |pool: Option<bool>| {
         NetworkField::Table(NetworkTable {
             mute: vec![],
@@ -1110,22 +1110,21 @@ fn the_pool_toggle_defaults_off_and_is_gated_trusted_only() {
         _ => panic!("a filtering posture is expected"),
     };
 
-    // Unset, and explicitly off, are the same posture: no connection is ever reused.
-    for value in [None, Some(false)] {
+    // Unset, and explicitly on, are the same posture: a finished connection carries the next
+    // request.
+    for value in [None, Some(true)] {
         let got = validate_network(&mut w, GLOBAL_CONFIG, pool_table(value)).unwrap();
-        assert!(
-            !pool_of(&got),
-            "reuse is off unless it is asked for: {value:?}"
-        );
+        assert!(pool_of(&got), "reuse is the default posture: {value:?}");
     }
-    let on = validate_network(&mut w, GLOBAL_CONFIG, pool_table(Some(true))).unwrap();
-    assert!(pool_of(&on), "a trusted layer turns reuse on");
+    let off = validate_network(&mut w, GLOBAL_CONFIG, pool_table(Some(false))).unwrap();
+    assert!(!pool_of(&off), "a trusted layer can turn reuse off");
     assert!(w.is_empty(), "valid values warn nothing: {w:?}");
 
-    // An untrusted project cannot: its whole `[network]` table is dropped before this field is ever
-    // read, so the launch keeps the posture the trusted layer gave it.
+    // An untrusted project can do neither, in the direction that matters now that reuse is the
+    // default: its whole `[network]` table is dropped before this field is ever read, so it cannot
+    // move a launch off the posture the trusted layer gave it.
     let project = || RawConfig {
-        network: Some(pool_table(Some(true))),
+        network: Some(pool_table(Some(false))),
         ..RawConfig::default()
     };
     let global = || RawConfig {
@@ -1134,12 +1133,12 @@ fn the_pool_toggle_defaults_off_and_is_gated_trusted_only() {
     };
     let trusted = resolve_no_plugins(global(), Some((project(), TrustState::Trusted)));
     assert!(
-        pool_of(&trusted.network),
-        "a trusted project may turn reuse on"
+        !pool_of(&trusted.network),
+        "a trusted project may turn reuse off"
     );
     let untrusted = resolve_no_plugins(global(), Some((project(), TrustState::Untrusted)));
     assert!(
-        !pool_of(&untrusted.network),
+        pool_of(&untrusted.network),
         "an untrusted project's whole `[network]` table drops, its `pool` included"
     );
 }

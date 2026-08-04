@@ -1078,15 +1078,16 @@ pub(crate) struct NetworkTable {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dns_cache_ttl: Option<u64>,
     /// Whether the egress proxy may carry a request over an upstream connection an earlier request
-    /// left behind, instead of opening and validating a new one every time. Off by default. It
-    /// changes nothing about which requests are permitted: a reused connection is offered only to a
-    /// request going to the same host and port **and** carrying the same injected credentials, and
-    /// only after a response that ended exactly where its framing said it would. What it buys is the
-    /// TLS handshake, which dominates the cost of a small request — a build that fetches from one
-    /// host thousands of times pays for one handshake instead of thousands. The residual it accepts:
-    /// an upstream may close a reusable connection at any moment, and a request that loses that race
-    /// gets a `502` (`upstream-closed`) instead of a response. Trusted/global-only like the rest of
-    /// the table.
+    /// left behind, instead of opening and validating a new one every time. **On by default**; set
+    /// it to `false` to make every request open and validate its own. It changes nothing about which
+    /// requests are permitted: a reused connection is offered only to a request going to the same
+    /// host and port **and** carrying the same injected credentials, and only after a response that
+    /// ended exactly where its framing said it would. What it buys is the TLS handshake, which
+    /// dominates the cost of a small request: measured in a cage against a CDN, 7.4 ms per request
+    /// against 24.5 ms without it, over two thousand. The residual it accepts: an upstream may close
+    /// a reusable connection at any moment, and a request the proxy must not send a second time (a
+    /// `POST`, a `PATCH`) gets a `502` (`upstream-closed`) instead of a response, leaving the choice
+    /// to repeat it with the client. Trusted/global-only like the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pool: Option<bool>,
     /// How much of each permitted exchange the egress proxy retains for `sbx net logs

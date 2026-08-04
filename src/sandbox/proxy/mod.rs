@@ -4528,10 +4528,14 @@ mod tests {
                 .with_no_client_auth(),
         );
         let ctx = Arc::new(
-            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
-                .unwrap()
-                .with_upstream(upstream_cfg)
-                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+            // Reuse off, so the forwarded head carries the `close` this test is about.
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["host.test:*"]).with_pool(false),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         let request = format!(
             "POST https://host.test:{}/oauth/token HTTP/1.1\r\nHost: host.test\r\n\
@@ -7217,9 +7221,11 @@ mod tests {
         assert!(!p.permits("example.com", 443, "/"));
     }
 
-    /// The proxy must force `Connection: close` on the request it forwards even when the client
-    /// sent no `Connection` header — otherwise a keep-alive upstream never closes and the read
-    /// blocks until the timeout. The capturing upstream reports the head it received.
+    /// With reuse off, the proxy must force `Connection: close` on the request it forwards even when
+    /// the client sent no `Connection` header: nothing is going to come back for that connection, so
+    /// leaving it open would hold an upstream socket for a launch that will never use it. The policy
+    /// says so explicitly here, since reuse is otherwise the default. The capturing upstream reports
+    /// the head it received.
     #[test]
     fn the_forwarded_request_forces_connection_close() {
         let (addr, upstream_ca, rx) = spawn_upstream_capturing(
@@ -7235,7 +7241,7 @@ mod tests {
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
         let proxy_ca_der = proxy_ca.ca_cert_der();
         let ctx = Arc::new(
-            ProxyCtx::new(proxy_ca, policy(&["host.test:*"]))
+            ProxyCtx::new(proxy_ca, policy(&["host.test:*"]).with_pool(false))
                 .unwrap()
                 .with_upstream(upstream_cfg)
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),

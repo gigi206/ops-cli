@@ -327,13 +327,13 @@ fn write_net_transport(
     pal: &style::Palette,
 ) {
     use std::fmt::Write as _;
-    if pool {
+    if !pool {
         let _ = writeln!(
             o,
             "    {}",
             style::dim_prose(
-                "connection reuse: on (a request may ride an upstream connection an earlier one \
-                 left behind)",
+                "connection reuse: off (every request opens and validates its own upstream \
+                 connection)",
                 pal
             )
         );
@@ -2259,7 +2259,7 @@ mod tests {
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,
-                pool: false,
+                pool: true,
                 dns_cache_ttl: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
@@ -2438,8 +2438,8 @@ mod tests {
 
     /// `pool` and `dns_cache_ttl` decide how a permitted request is carried, and a trusted layer can
     /// set either one for a project that cannot observe it from inside the cage — no client sees
-    /// that its connection was reused, or how old the address it reached was. So each is shown when
-    /// a layer moved it, and stays out of the way when nothing did.
+    /// whether its connection was reused, or how old the address it reached was. So each is shown
+    /// when a layer moved it off the product default, and stays out of the way when nothing did.
     #[test]
     fn config_render_shows_the_network_transport_settings_only_when_a_layer_set_them() {
         use config::view::NetworkView;
@@ -2458,13 +2458,13 @@ mod tests {
             ..
         } = &mut view.network
         {
-            *pool = true;
+            *pool = false;
             *dns_cache_ttl = Some(30);
         }
         let out = render_config(&view, &plain, false);
         assert!(
-            out.contains("connection reuse: on"),
-            "a launch that reuses upstream connections must say so:\n{out}"
+            out.contains("connection reuse: off"),
+            "a launch that gave up reuse must say so:\n{out}"
         );
         assert!(
             out.contains("dns cache: 30s"),
@@ -2507,7 +2507,7 @@ mod tests {
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,
-                pool: false,
+                pool: true,
                 dns_cache_ttl: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
