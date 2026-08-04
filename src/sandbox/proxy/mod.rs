@@ -969,11 +969,23 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // like a dead connection), and a healthy connection reaches the relay untouched. Only the
         // attempt that survives is counted on the flow.
         loop {
-            upstream.write_all(req)?;
-            upstream.flush().ok();
-            begin_response_stream(&upstream.sock);
-            if !from_pool || upstream_spoke(&upstream.sock) {
-                break;
+            match upstream.write_all(req) {
+                Ok(()) => {
+                    upstream.flush().ok();
+                    begin_response_stream(&upstream.sock);
+                    if !from_pool || upstream_spoke(&upstream.sock) {
+                        break;
+                    }
+                }
+                // A fresh connection that will not take the request is a real error and stays one.
+                Err(e) if !from_pool => return Err(e),
+                // A parked one that will not is the same event as one that takes the request and
+                // then answers nothing: the far side is gone. It surfaces here rather than at the
+                // peek when the close arrived as a reset instead of a clean shutdown, and letting
+                // it out would drop the client's connection without even the `502` the other shape
+                // produces. Fall through to the retry below — the request is replayable by
+                // construction, which is what let it take a parked connection at all.
+                Err(_) => {}
             }
             let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &connect_host) {
                 Ok(pair) => pair,
@@ -2196,11 +2208,19 @@ fn handle_https_forward(
         // Exactly one retry, and only for a connection that came from the pool — see the tunneled
         // path for why the peek, and why the read bound is lifted before it.
         loop {
-            upstream.write_all(req)?;
-            upstream.flush().ok();
-            begin_response_stream(&upstream.sock);
-            if !from_pool || upstream_spoke(&upstream.sock) {
-                break;
+            match upstream.write_all(req) {
+                Ok(()) => {
+                    upstream.flush().ok();
+                    begin_response_stream(&upstream.sock);
+                    if !from_pool || upstream_spoke(&upstream.sock) {
+                        break;
+                    }
+                }
+                // The same two cases as the tunneled path, for the same reasons: a fresh connection
+                // that refuses the write is a real error, a parked one is a far side that is gone
+                // and reached us as a reset rather than at the peek.
+                Err(e) if !from_pool => return Err(e),
+                Err(_) => {}
             }
             let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &host) {
                 Ok(pair) => pair,
@@ -5427,6 +5447,126 @@ mod tests {
             ctx.with_injections(injections)
         };
         (Arc::new(ctx), proxy_ca_der)
+    }
+
+    /// An upstream that serves one request, waits for its connection to be parked, then destroys it
+    /// with a reset rather than a clean shutdown. `SO_LINGER` at zero is what turns the close into a
+    /// `RST`: the shape a peer produces when it tears a connection down rather than closing it, and
+    /// the one a `read` probe cannot always see coming.
+    fn spawn_upstream_that_resets_after_one(
+        response: &'static [u8],
+    ) -> (SocketAddr, CertificateDer<'static>, UpstreamWitness) {
+        use std::os::unix::io::AsRawFd;
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = accepted.clone();
+        let seen = heads.clone();
+        thread::spawn(move || {
+            let mut nth = 0usize;
+            while let Ok((sock, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::Relaxed);
+                nth += 1;
+                let config = server_config.clone();
+                let seen = seen.clone();
+                thread::spawn(move || {
+                    let Ok(conn) = ServerConnection::new(config) else {
+                        return;
+                    };
+                    let mut tls = StreamOwned::new(conn, sock);
+                    loop {
+                        let mut head = Vec::new();
+                        let mut one = [0u8; 1];
+                        loop {
+                            match tls.read(&mut one) {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => head.push(one[0]),
+                            }
+                            if head.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        seen.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&head).into_owned());
+                        if tls.write_all(response).is_err() || tls.flush().is_err() {
+                            return;
+                        }
+                        // Only the first connection is destroyed, so the retry has somewhere to go.
+                        // The wait lets the proxy finish relaying and park it: a reset arriving
+                        // before that is simply a connection the pool never accepts, which is not
+                        // the case under test.
+                        if nth == 1 {
+                            thread::sleep(Duration::from_millis(80));
+                            let linger = libc::linger {
+                                l_onoff: 1,
+                                l_linger: 0,
+                            };
+                            unsafe {
+                                libc::setsockopt(
+                                    tls.sock.as_raw_fd(),
+                                    libc::SOL_SOCKET,
+                                    libc::SO_LINGER,
+                                    std::ptr::addr_of!(linger).cast(),
+                                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                                );
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, ca_der, UpstreamWitness { accepted, heads })
+    }
+
+    /// A parked connection the far side destroyed must never cost the request that finds it. Two
+    /// guards stand between the two: the probe at checkout, and — when the close arrives as a reset
+    /// the probe did not see — the write failing, which retries on a fresh connection exactly as a
+    /// connection that takes the request and answers nothing does.
+    ///
+    /// What this pins is the invariant, not which guard caught it, and the distinction is measured
+    /// rather than assumed: with the write-failure branch removed, this test still passes. Landing a
+    /// reset in the window between the probe and the write is a microsecond race no harness here can
+    /// schedule, and forcing it would mean a switch in the serving path that every other test in
+    /// this binary runs concurrently with. So the branch is covered by reasoning and this test
+    /// covers the promise: a destroyed parked connection is never what the cage sees.
+    #[test]
+    fn a_parked_connection_the_upstream_reset_does_not_fail_the_next_request() {
+        let (addr, upstream_ca, upstream) = spawn_upstream_that_resets_after_one(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        );
+        let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+        let got = through_proxy_repeatedly(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            &[
+                b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            ],
+        )
+        .unwrap();
+        for resp in &got {
+            assert!(
+                resp.ends_with("hello"),
+                "a destroyed parked connection must not reach the cage as a failure: {resp:?}"
+            );
+        }
+        assert_eq!(
+            upstream.connections(),
+            2,
+            "the second request cannot have ridden the connection that was reset"
+        );
     }
 
     /// The whole point of the increment: two requests to the same host, one TLS handshake. Nothing
