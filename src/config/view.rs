@@ -254,6 +254,13 @@ impl From<crate::allowlist::DefaultAction> for NetDefaultView {
 }
 
 /// The resolved network posture.
+//
+// The `Allowlist` variant runs to a few hundred bytes against two unit variants, which the size
+// lint flags. Boxing it would buy an allocation and a dereference on a value built once per render
+// and never moved in a loop, inside a view already carrying larger `Vec`s — and it would push every
+// reader through an indirection to reach fields whose whole purpose is to be read. The flat shape
+// stays.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize)]
 pub(crate) enum NetworkView {
     /// The host network (the default; no confidentiality guarantee yet).
@@ -285,6 +292,18 @@ pub(crate) enum NetworkView {
         /// says so in `sbx config` — a capture is never silent.
         capture: String,
         capture_max_kb: Option<u64>,
+        /// Whether a permitted request may ride an upstream connection an earlier one left behind
+        /// (`pool`). A transport choice like `http2`, orthogonal to the verdict, and surfaced for a
+        /// sharper version of the same reason: the whole `[network]` table is trusted/global-only,
+        /// and unlike `http2` — which announces itself by breaking a host that speaks HTTP/1.1 —
+        /// reuse is invisible from inside the cage. A global layer could otherwise set it for a
+        /// project with no way to see it.
+        pool: bool,
+        /// How long the proxy holds a resolved address, in seconds, when a layer set `dns_cache_ttl`
+        /// — `None` when none did and the built-in cache applies. Surfaced alongside `pool` and for
+        /// the same reason: it decides how long an address stands, and nothing in the cage observes
+        /// it.
+        dns_cache_ttl: Option<u64>,
         builtin: Vec<String>,
     },
 }
@@ -994,6 +1013,8 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
                 .capture_level()
                 .captures_bodies()
                 .then(|| a.capture_body_kb()),
+            pool: a.pool(),
+            dns_cache_ttl: a.dns_cache_ttl().map(|d| d.as_secs()),
             builtin: sandbox::builtin_allow_rules()
                 .iter()
                 .map(|r| r.to_string())
@@ -1554,6 +1575,8 @@ mod tests {
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,
+                pool: true,
+                dns_cache_ttl: Some(30),
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
@@ -1649,6 +1672,10 @@ mod tests {
         assert!(json["network"]["Allowlist"]["allow"][0] == "github.com");
         // The filtered-egress default action travels with the policy in the JSON contract.
         assert_eq!(json["network"]["Allowlist"]["default_action"], "Deny");
+        // The two transport settings a global layer can make invisibly for a project travel with
+        // it too, so a front-end can show what the cage cannot observe about its own egress.
+        assert_eq!(json["network"]["Allowlist"]["pool"], true);
+        assert_eq!(json["network"]["Allowlist"]["dns_cache_ttl"], 30);
         assert_eq!(json["gui"], "Wayland");
         // The scalar postures' provenance is part of the serialization contract — a value's origin
         // (default/global/project) travels with it.

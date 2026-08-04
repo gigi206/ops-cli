@@ -106,9 +106,10 @@ host's name. A long build (a `nix`/flake build fetching from `cache.nixos.org` t
 would otherwise re-resolve the same host on every request. The proxy therefore **caches** each host's
 address for `dns_cache_ttl` seconds (default 60; `0` disables it, resolving every request). The
 per-request SSRF address check still runs on the cached address: the cache only skips re-resolving,
-never the security check. It is trusted/global-only like the rest of the table. (There is no
-proxy-level retry: the client, `nix`/`git`/`curl`, already retries the whole request, which
-re-triggers resolution, so a retry here would be redundant.)
+never the security check. It is trusted/global-only like the rest of the table, and invisible from
+inside the cage in the same way, so [`sbx config`](../cli/config) names it whenever a layer set one.
+(There is no proxy-level retry: the client, `nix`/`git`/`curl`, already retries the whole request,
+which re-triggers resolution, so a retry here would be redundant.)
 
 ```toml
 [network]
@@ -135,6 +136,10 @@ pool  = true
 Measured on loopback, with the client side unchanged, a small request costs about **470 µs**
 with reuse against **730 µs** without it: roughly a third of the per-request cost. Against a
 real host the saving is larger, because each avoided handshake also avoids its round trips.
+
+Like the rest of the table this is trusted and global-only, so a global config can set it for
+a project that has no way to observe it: nothing in the cage can tell that a connection was
+reused. Whenever a layer set it, [`sbx config`](../cli/config) says so.
 
 ### What it does not change
 

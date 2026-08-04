@@ -312,6 +312,42 @@ fn bind_mode_tag(writable: bool, pal: &style::Palette) -> String {
     }
 }
 
+/// The two `[network]` settings that decide how a permitted request is carried rather than whether
+/// it is carried: connection reuse and the resolver cache. Written only when a layer moved one off
+/// its default, in the same spirit as the capture line — never a silent property of a launch.
+///
+/// They earn their line for a sharper reason than the other transport settings do. The whole table
+/// is trusted/global-only, and neither is observable from inside the cage: a client cannot see that
+/// its connection was reused, nor how old the address it reached was. `sbx config` is where a
+/// project learns that a trusted layer set them.
+fn write_net_transport(
+    o: &mut String,
+    pool: bool,
+    dns_cache_ttl: Option<u64>,
+    pal: &style::Palette,
+) {
+    use std::fmt::Write as _;
+    if pool {
+        let _ = writeln!(
+            o,
+            "    {}",
+            style::dim_prose(
+                "connection reuse: on (a request may ride an upstream connection an earlier one \
+                 left behind)",
+                pal
+            )
+        );
+    }
+    if let Some(secs) = dns_cache_ttl {
+        let shown = if secs == 0 {
+            "dns cache: off (every request re-resolves)".to_string()
+        } else {
+            format!("dns cache: {secs}s (a resolved address stands for that long)")
+        };
+        let _ = writeln!(o, "    {}", style::dim_prose(&shown, pal));
+    }
+}
+
 fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
     use config::view::{AppNetworkView, GuiView, LimitView, NetDefaultView, NetworkView};
     use std::fmt::Write as _;
@@ -468,6 +504,8 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             http2,
             capture,
             capture_max_kb,
+            pool,
+            dns_cache_ttl,
             builtin,
         } => {
             let _ = writeln!(
@@ -510,6 +548,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     )
                 );
             }
+            write_net_transport(&mut o, *pool, *dns_cache_ttl, pal);
             match default_action {
                 // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
                 NetDefaultView::Deny => {
@@ -1166,6 +1205,8 @@ fn render_app_detail(
             http2,
             capture,
             capture_max_kb,
+            pool,
+            dns_cache_ttl,
             builtin,
         } => {
             let _ = writeln!(
@@ -1203,6 +1244,7 @@ fn render_app_detail(
                     )
                 );
             }
+            write_net_transport(&mut o, *pool, *dns_cache_ttl, pal);
             if details {
                 for rule in allow {
                     let _ = writeln!(o, "    allow {n}{rule}{r}");
@@ -2217,6 +2259,8 @@ mod tests {
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,
+                pool: false,
+                dns_cache_ttl: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
@@ -2392,6 +2436,53 @@ mod tests {
         );
     }
 
+    /// `pool` and `dns_cache_ttl` decide how a permitted request is carried, and a trusted layer can
+    /// set either one for a project that cannot observe it from inside the cage — no client sees
+    /// that its connection was reused, or how old the address it reached was. So each is shown when
+    /// a layer moved it, and stays out of the way when nothing did.
+    #[test]
+    fn config_render_shows_the_network_transport_settings_only_when_a_layer_set_them() {
+        use config::view::NetworkView;
+        let plain = style::Palette::plain();
+
+        let out = render_config(&sample_config_view(), &plain, false);
+        assert!(
+            !out.contains("connection reuse") && !out.contains("dns cache"),
+            "neither earns a line at its default:\n{out}"
+        );
+
+        let mut view = sample_config_view();
+        if let NetworkView::Allowlist {
+            pool,
+            dns_cache_ttl,
+            ..
+        } = &mut view.network
+        {
+            *pool = true;
+            *dns_cache_ttl = Some(30);
+        }
+        let out = render_config(&view, &plain, false);
+        assert!(
+            out.contains("connection reuse: on"),
+            "a launch that reuses upstream connections must say so:\n{out}"
+        );
+        assert!(
+            out.contains("dns cache: 30s"),
+            "a layer-set resolver cache must name its duration:\n{out}"
+        );
+
+        // Zero is a decision, not an absent value: it turns the cache off. A render that showed it
+        // as `0s` would read as "cached for no time", which is the same thing said worse.
+        if let NetworkView::Allowlist { dns_cache_ttl, .. } = &mut view.network {
+            *dns_cache_ttl = Some(0);
+        }
+        let out = render_config(&view, &plain, false);
+        assert!(
+            out.contains("dns cache: off (every request re-resolves)"),
+            "a disabled resolver cache must read as disabled:\n{out}"
+        );
+    }
+
     #[test]
     fn render_app_detail_shows_effective_values_tagged_inherited_or_app_set() {
         use config::view::*;
@@ -2416,6 +2507,8 @@ mod tests {
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,
+                pool: false,
+                dns_cache_ttl: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Global,
