@@ -135,11 +135,12 @@ pool  = true
 
 Measured on loopback, with the client side unchanged, a small request costs about **470 µs**
 with reuse against **730 µs** without it: roughly a third of the per-request cost. Against a
-real host the saving is in milliseconds rather than microseconds, because each avoided
-handshake also avoids its round trips. Measured against a CDN it ran between **5 and 16 ms**
-per request across two runs of the same test. That spread is the link's rather than the
-proxy's, which is the useful thing to know about it: the setting is worth measuring on the
-workload you actually have, not assuming from a number here.
+real host the saving is far larger, because each avoided handshake also avoids its round
+trips. Measured against a CDN on paired runs: **7.6 ms per request with reuse against 25.9 ms
+without**, where the same request costs 6.0 ms from the host with no sandbox at all. Reuse is
+most of what separates a filtered launch from an unfiltered one: about a millisecond and a
+half of overhead with it, about twenty without. Those are one link on one machine, so read
+them as a shape rather than a promise.
 
 Like the rest of the table this is trusted and global-only, so a global config can set it for
 a project that has no way to observe it: nothing in the cage can tell that a connection was
