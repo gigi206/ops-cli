@@ -174,7 +174,7 @@ mod websocket;
 mod wire;
 use ca::upstream_server_name;
 pub(crate) use ca::Ca;
-use capture::CaptureReader;
+use capture::{CaptureGuard, CaptureReader};
 use ctx::effective_policy;
 pub(crate) use ctx::{builtin_allow_rules, union_with_builtin, ProxyCtx};
 pub(crate) use inject::{HeaderInjection, SecretNeedle};
@@ -989,40 +989,59 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // streamed completion), so lift the upstream read timeout for the relay below.
     begin_response_stream(&upstream.sock);
 
-    // 9b. Peek the response status line for the live log, best-effort. The bytes read here are NOT
-    //     consumed — they are chained back ahead of the rest of the response, so the relay (and its
-    //     redaction) still sees the whole stream unaltered. `set_status` amends the `allow` event
-    //     pushed above; on an L4 splice, a refusal, or an error there is no such amend (no response).
-    let prefix = read_status_prefix(&mut upstream);
-    // Record only a FINAL status (>= 200). An interim 1xx (`100 Continue`, `103 Early Hints`) is
-    // the first line here but is not the request's outcome, so recording it would mislabel the
-    // event; skip it (the log simply carries no status in that rare case) rather than log a 100.
-    if let Some(code) = parse_status_code(&prefix) {
-        if code >= 200 {
-            ctx.set_status(allow_seq, code);
-        }
-    }
-    // Count upstream→client (`down`) through the whole relayed response (the peeked prefix is chained
-    // back in, so it is counted too).
-    let response = CountingReader::new(
-        io::Cursor::new(prefix).chain(&mut upstream),
-        flow.down.clone(),
-    );
-
-    // 10. Response-side leak backstop: a configured secret can only re-enter the cage by being
+    // 9b. Response-side leak backstop: a configured secret can only re-enter the cage by being
     //     *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores
     //     and later returns the credential). So mask the reflected value out of the response — but
     //     only for a response from such a host. Every other response (notably the large built-in
     //     downloads) is streamed untouched, which both avoids the scan cost and confines the
-    //     mutate-on-match to the one host the reflection threat actually lives on.
+    //     mutate-on-match to the one host the reflection threat actually lives on. Decided here
+    //     because it covers the head as much as the body, and the head is relayed first.
     let masks_reflection = !ctx.redactions.is_empty()
         && ctx
             .injections
             .iter()
             .any(|inj| names_exact_host(&connect_host, Some(&inj.rule)));
-    // The response is teed on the way through, ahead of the reflection masking: the capture does its
-    // own masking at filing time (over whole buffers), so what is stored is masked either way, and
-    // what the cage receives is decided by `masks_reflection` alone.
+    let head_masking: &[SecretNeedle] = if masks_reflection {
+        &ctx.redactions
+    } else {
+        &[]
+    };
+
+    // 9c. Read the response head, relay it, and decide from it where the body ends, so the relay
+    //     stops at the end of the message instead of waiting for the upstream to close. Buffering is
+    //     what makes that possible and is also the hazard: the reader below already holds body bytes
+    //     pulled off the socket, so the body must be read from IT and never from the socket again.
+    //     `set_status` amends the `allow` event pushed above; on an L4 splice, a refusal, or an
+    //     error there is no such amend (no response).
+    let mut up_br = BufReader::new(upstream);
+    let (resp_head, complete) = relay_response_head(
+        &mut up_br,
+        br.get_mut(),
+        &flow.down,
+        capture.as_ref(),
+        head_masking,
+    )?;
+    // Record only a FINAL status (>= 200). Any interim 1xx was relayed and read past above, so what
+    // is left is the request's real outcome; a head cut short parses to nothing and simply leaves
+    // the event without a status.
+    if let Some(code) = parse_status_code(&resp_head) {
+        if code >= 200 {
+            ctx.set_status(allow_seq, code);
+        }
+    }
+    // A head the upstream never finished sending delimits nothing — relay the rest until it closes.
+    let framing = if complete {
+        response_framing(&resp_head, &imethod)
+    } else {
+        BodyFraming::ToEof
+    };
+    // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
+    let response = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
+
+    // 10. The body is teed on the way through, ahead of the reflection masking: the capture does its
+    //     own masking at filing time (over whole buffers), so what is stored is masked either way,
+    //     and what the cage receives is decided by `masks_reflection` alone (the head above was
+    //     masked under the same decision).
     let mut response: Box<dyn Read + '_> = match &capture {
         Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
         None => Box::new(response),
@@ -1036,34 +1055,6 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // end-of-stream, not a bare socket drop (the reported `without sending TLS close_notify`).
     finish_tls(br.get_mut());
     Ok(())
-}
-
-/// Read the first bytes of an upstream response — up to and including the first `\n` (the status
-/// line's terminator), a small cap, or the first read that returns nothing/errors — so the HTTP
-/// status can be parsed for the live log. **Best-effort and non-consuming in effect:** the returned
-/// bytes are chained back ahead of the rest of the response by the caller, so nothing is lost; a
-/// partial read (a slow or silent upstream) simply yields no status rather than blocking a second
-/// time (the caller's relay then surfaces the same condition as before this peek existed).
-fn read_status_prefix<R: Read>(r: &mut R) -> Vec<u8> {
-    // A status line is short; 512 bytes is ample and bounds a no-newline flood.
-    const STATUS_LINE_MAX: usize = 512;
-    let mut prefix = Vec::new();
-    let mut buf = [0u8; 64];
-    while prefix.len() < STATUS_LINE_MAX {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                prefix.extend_from_slice(&buf[..n]);
-                if prefix.contains(&b'\n') {
-                    break;
-                }
-            }
-            // Any read error/timeout: return what we have rather than blocking again — the caller's
-            // relay re-hits the upstream and reports the condition as it would have without the peek.
-            Err(_) => break,
-        }
-    }
-    prefix
 }
 
 /// Parse the numeric HTTP status code from a response's opening bytes (`HTTP/1.1 200 OK\r\n`): the
@@ -1627,21 +1618,25 @@ fn handle_cleartext(
     // lift the upstream read timeout for the relay below (same rationale as the tunneled path).
     begin_response_stream(&upstream);
 
-    // 9. Peek the status line for the live log (non-consuming — chained back), then stream the whole
-    //    response to the client and close. A cleartext host is never a credential-injection target, so
-    //    it can carry no *reflected* secret to mask — the response is relayed unredacted (there is
-    //    nothing this path could reflect that the tripwire above did not already refuse outbound).
-    let prefix = read_status_prefix(&mut upstream);
-    if let Some(code) = parse_status_code(&prefix) {
+    // 9. Relay the response head, then stream its framed body to the client and close. A cleartext
+    //    host is never a credential-injection target, so it can carry no *reflected* secret to mask —
+    //    the response is relayed unredacted (there is nothing this path could reflect that the
+    //    tripwire above did not already refuse outbound).
+    let mut up_br = BufReader::new(upstream);
+    let (resp_head, complete) =
+        relay_response_head(&mut up_br, &mut client, &flow.down, capture.as_ref(), &[])?;
+    if let Some(code) = parse_status_code(&resp_head) {
         if code >= 200 {
             ctx.set_status(allow_seq, code);
         }
     }
-    // Count upstream→client (`down`) through the whole relayed response (peeked prefix chained in).
-    let response = CountingReader::new(
-        io::Cursor::new(prefix).chain(&mut upstream),
-        flow.down.clone(),
-    );
+    let framing = if complete {
+        response_framing(&resp_head, method)
+    } else {
+        BodyFraming::ToEof
+    };
+    // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
+    let response = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
     let mut response: Box<dyn Read + '_> = match &capture {
         Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
         None => Box::new(response),
@@ -2153,24 +2148,40 @@ fn handle_https_forward(
     // The request is fully forwarded; the response may idle between bursts, so lift the read timeout.
     begin_response_stream(&upstream.sock);
 
-    // 10. Peek the status for the live log (non-consuming — chained back), then relay the whole
-    //     response to the plaintext client and close. Mask a reflected secret only for a response from
-    //     an injection-target host (every other response streams untouched).
-    let prefix = read_status_prefix(&mut upstream);
-    if let Some(code) = parse_status_code(&prefix) {
-        if code >= 200 {
-            ctx.set_status(allow_seq, code);
-        }
-    }
-    let response = CountingReader::new(
-        io::Cursor::new(prefix).chain(&mut upstream),
-        flow.down.clone(),
-    );
+    // 10. Relay the response head, then stream its framed body to the plaintext client and close.
+    //     Mask a reflected secret only for a response from an injection-target host (every other
+    //     response streams untouched) — decided before the head is read, because the masking covers
+    //     the head as much as the body and the head is relayed first.
     let masks_reflection = !ctx.redactions.is_empty()
         && ctx
             .injections
             .iter()
             .any(|inj| names_exact_host(&host, Some(&inj.rule)));
+    let head_masking: &[SecretNeedle] = if masks_reflection {
+        &ctx.redactions
+    } else {
+        &[]
+    };
+    let mut up_br = BufReader::new(upstream);
+    let (resp_head, complete) = relay_response_head(
+        &mut up_br,
+        &mut client,
+        &flow.down,
+        capture.as_ref(),
+        head_masking,
+    )?;
+    if let Some(code) = parse_status_code(&resp_head) {
+        if code >= 200 {
+            ctx.set_status(allow_seq, code);
+        }
+    }
+    let framing = if complete {
+        response_framing(&resp_head, method)
+    } else {
+        BodyFraming::ToEof
+    };
+    // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
+    let response = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
     // Teed ahead of the reflection masking — the capture masks its own buffers at filing time.
     let mut response: Box<dyn Read + '_> = match &capture {
         Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
@@ -2401,6 +2412,56 @@ fn begin_response_stream(upstream: &TcpStream) {
     let _ = upstream.set_read_timeout(None);
 }
 
+/// Read the upstream's response head and relay it to the client, returning the head **as the
+/// upstream sent it** with whether it was terminated. Bytes the buffered reader pulled past the head
+/// stay in it for the body relay.
+///
+/// `redactions` is the response-side reflection backstop, non-empty only for a host an injection
+/// targets: an echo or debug endpoint reflects the injected credential in a header of its own as
+/// readily as in a body, so the head is masked before it is written to the client. The masking is
+/// equal-length, so the framing the caller parses is unaffected either way — and it parses the
+/// upstream's own bytes, which is what the returned head is. The capture is handed those same
+/// unmasked bytes and does its own masking at filing time, exactly as it does for the body.
+///
+/// An interim `1xx` — `100 Continue`, or the `103 Early Hints` CDNs emit — is a complete message of
+/// its own that the real head follows, so it is relayed and read past rather than mistaken for the
+/// response. It is deliberately left out of the capture, which shows the response the request
+/// actually got; it is still counted, because those bytes did cross to the cage.
+///
+/// A head the upstream cuts short is relayed as far as it arrived and reported incomplete, never an
+/// error: the caller then delimits the rest by the close, which is what this path did throughout
+/// before it framed anything.
+fn relay_response_head<R: BufRead, W: Write>(
+    up: &mut R,
+    client: &mut W,
+    down: &AtomicU64,
+    capture: Option<&CaptureGuard>,
+    redactions: &[SecretNeedle],
+) -> io::Result<(Vec<u8>, bool)> {
+    loop {
+        let (head, complete) = read_response_head(up, HEAD_MAX);
+        if head.is_empty() {
+            return Ok((head, false));
+        }
+        if redactions.is_empty() {
+            client.write_all(&head)?;
+        } else {
+            let mut masked = head.clone();
+            redact_in_place(&mut masked, redactions);
+            client.write_all(&masked)?;
+        }
+        down.fetch_add(head.len() as u64, Ordering::Relaxed);
+        if complete && matches!(parse_status_code(&head), Some(c) if (100..200).contains(&c)) {
+            client.flush().ok();
+            continue;
+        }
+        if let Some(c) = capture {
+            c.push_response(&head);
+        }
+        return Ok((head, complete));
+    }
+}
+
 /// Cleanly shut down the interception TLS after a response is fully relayed: queue a `close_notify`
 /// and flush the connection's pending TLS records to the client socket. The sending half-close is
 /// the correct TLS teardown; without it the client sees a bare socket close after the last byte,
@@ -2439,8 +2500,9 @@ fn pump_to_eof<R: Read, W: Write>(r: &mut R, w: &mut W) -> io::Result<()> {
 /// configured secret value ([`SecretNeedle`]) with an equal-length run of `*` — the response-side
 /// reflection backstop. Equal-length replacement keeps the response framing intact (`Content-Length`
 /// or chunked sizes are unchanged) and `*` is printable so masking can never introduce a CR/LF; the
-/// scan is over the raw bytes, so a secret reflected in either a response header or the body is
-/// covered without parsing the response.
+/// scan is over the raw bytes, with no knowledge of the response's structure. This covers the
+/// **body**; a secret reflected in a response *header* is masked by [`relay_response_head`] under
+/// the same decision, since the head is relayed before this runs.
 ///
 /// Streaming-safe: a `carry` of the last `max_needle_len - 1` bytes is retained across reads, so a
 /// secret split across two reads is still caught — every emitted byte was scanned in a window that
@@ -4560,20 +4622,65 @@ mod tests {
     }
 
     #[test]
-    fn read_status_prefix_captures_the_status_line_and_loses_nothing() {
-        // It reads until it has seen the first `\n` (a chunk may carry bytes past it — those are kept,
-        // since the caller chains the whole prefix back ahead of the rest, so nothing is lost). The
-        // status line is present, so the code parses; any trailing head bytes are harmless.
-        let mut src = io::Cursor::new(b"HTTP/1.1 200 OK\r\nheader: v\r\n\r\nbody".to_vec());
-        let prefix = read_status_prefix(&mut src);
-        assert!(prefix.starts_with(b"HTTP/1.1 200 OK\r\n"), "{prefix:?}");
-        assert_eq!(parse_status_code(&prefix), Some(200));
-        // A stream cut before the code yields whatever it had (best-effort); with no code token there
-        // is nothing to parse, so the event simply records none.
-        let mut cut = io::Cursor::new(b"HTTP/1.".to_vec());
-        let partial = read_status_prefix(&mut cut);
-        assert_eq!(partial, b"HTTP/1.");
-        assert_eq!(parse_status_code(&partial), None);
+    fn read_response_head_stops_at_the_blank_line_and_leaves_the_body() {
+        // The head ends at the blank line and NOT one byte later: the body stays in the reader, which
+        // is what lets the framed relay read it without going back to the socket.
+        let mut src = io::BufReader::new(io::Cursor::new(
+            b"HTTP/1.1 200 OK\r\nheader: v\r\n\r\nbody".to_vec(),
+        ));
+        let (head, complete) = read_response_head(&mut src, HEAD_MAX);
+        assert!(complete, "a terminated head must report complete");
+        assert_eq!(head, b"HTTP/1.1 200 OK\r\nheader: v\r\n\r\n");
+        assert_eq!(parse_status_code(&head), Some(200));
+        let mut rest = Vec::new();
+        src.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"body", "the body must survive the head read");
+    }
+
+    #[test]
+    fn read_response_head_hands_back_a_head_the_upstream_cut_short() {
+        // A truncated head is a truncated relay, never an error: the caller writes what arrived and
+        // delimits the rest by the close. With no code token there is nothing to parse, so the event
+        // simply records no status.
+        let mut cut = io::BufReader::new(io::Cursor::new(b"HTTP/1.".to_vec()));
+        let (head, complete) = read_response_head(&mut cut, HEAD_MAX);
+        assert!(!complete, "an unterminated head must report incomplete");
+        assert_eq!(head, b"HTTP/1.");
+        assert_eq!(parse_status_code(&head), None);
+    }
+
+    /// The `down` byte total for `sbx net live` must equal what actually crossed to the cage — every
+    /// head, not just the last one. An interim `1xx` is the case that could drift: it is relayed but
+    /// then read past, so a counter placed only on the returned head would under-report it. Masking
+    /// is equal-length, so a masked head counts the same as the bytes the upstream sent.
+    #[test]
+    fn every_relayed_head_is_counted_including_an_interim_one() {
+        let wire = b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>\r\n\r\n\
+                     HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        for needles in [
+            Vec::new(),
+            vec![SecretNeedle::named("test-secret", b"</s.css>".to_vec())],
+        ] {
+            let mut up = io::BufReader::new(io::Cursor::new(wire.to_vec()));
+            let mut client = Vec::new();
+            let down = Arc::new(AtomicU64::new(0));
+            let (head, complete) =
+                relay_response_head(&mut up, &mut client, &down, None, &needles).unwrap();
+            assert!(complete);
+            assert_eq!(
+                parse_status_code(&head),
+                Some(200),
+                "the FINAL head is returned"
+            );
+            assert_eq!(
+                down.load(Ordering::Relaxed),
+                client.len() as u64,
+                "the counter must equal the bytes written to the client"
+            );
+            // Both heads crossed, so the count covers the interim one too.
+            let heads = wire.len() - b"ok".len();
+            assert_eq!(down.load(Ordering::Relaxed), heads as u64);
+        }
     }
 
     /// The live log captures the **upstream** HTTP status for a completed L7 request (the
@@ -4634,19 +4741,18 @@ mod tests {
         );
     }
 
-    /// The status peek must not eat the response: a body larger than both the peek's first read and a
-    /// pump chunk forces the relay to continue reading from `upstream` past the drained status-line
-    /// cursor (the `Cursor::new(prefix).chain(upstream)` seam). Teeth: the whole body arrives
+    /// Reading the head must not eat the response: the buffered reader that reads the head pulls
+    /// body bytes off the socket with it, and the body relay has to continue from THAT reader. A
+    /// body larger than one pump chunk forces the relay well past whatever the head read buffered,
+    /// so a mis-wired seam shows up as a short or corrupt body. Teeth: the whole body arrives
     /// byte-identical AND the status is still captured off the front of the same stream. A tiny-body
-    /// test cannot see this — the entire response fits in the first peek read, so `upstream` is never
-    /// touched.
+    /// test cannot see this — the entire response fits in the buffer, so the seam is never crossed.
     #[test]
-    fn a_large_response_body_relays_intact_past_the_status_peek() {
+    fn a_large_response_body_relays_intact_past_the_head_read() {
         use crate::sandbox::control::{LogRing, LOG_RING_CAP};
-        // Larger than the 64-byte peek read AND than one pump chunk, so the relay must read from
-        // `upstream` well past the cursor. Derived from the chunk constant rather than written as a
-        // literal, so growing the chunk cannot quietly cost this test its teeth. A leaked static
-        // slice satisfies `spawn_upstream`.
+        // Larger than one pump chunk, so the relay must read well past what the head read buffered.
+        // Derived from the chunk constant rather than written as a literal, so growing the chunk
+        // cannot quietly cost this test its teeth. A leaked static slice satisfies `spawn_upstream`.
         let body = vec![b'x'; RELAY_CHUNK * 2 + 1_000];
         let mut resp =
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
@@ -4682,7 +4788,7 @@ mod tests {
         .unwrap();
         up.join().unwrap();
 
-        // The whole body survived the prefix→upstream chain, byte-identical.
+        // The whole body survived the head-read seam, byte-identical.
         let sep = got
             .find("\r\n\r\n")
             .expect("the relayed response has a head/body separator");
@@ -4694,10 +4800,226 @@ mod tests {
         );
         assert!(
             relayed_body.bytes().all(|b| b == b'x'),
-            "the body bytes are unaltered across the chain seam"
+            "the body bytes are unaltered across the head-read seam"
         );
         // …and the status was still read off the front of that same stream.
         assert_eq!(log.snapshot(None, None, false).events[0].status, Some(200));
+    }
+
+    /// A one-shot loopback TLS upstream that sends `response` and then, instead of closing, **holds
+    /// the connection open** for as long as the test allows. Every relay in this file otherwise ends
+    /// on the upstream's EOF, so nothing here could tell "the proxy knew where the message ended"
+    /// apart from "the upstream happened to close". This upstream removes that confound: a relay
+    /// that finishes against it finished because the framing said so.
+    fn spawn_upstream_that_never_closes(
+        response: &'static [u8],
+    ) -> (
+        SocketAddr,
+        CertificateDer<'static>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = release.clone();
+        thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(conn) = ServerConnection::new(server_config) else {
+                return;
+            };
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut br = BufReader::new(&mut tls);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match br.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if line == "\r\n" || line == "\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = tls.write_all(response);
+            let _ = tls.flush();
+            // Hold the socket open. Released once the test has its answer, so the thread ends.
+            while !held.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        (addr, ca_der, release)
+    }
+
+    /// Run one request against an upstream that never closes, and require the relay to finish anyway.
+    /// Returns the relayed response. Panics with a clear message on the failure this guards: a proxy
+    /// that does not know where the message ends waits forever on a socket that will never EOF.
+    fn through_non_closing_upstream(response: &'static [u8], request: &'static [u8]) -> String {
+        let (addr, upstream_ca, release) = spawn_upstream_that_never_closes(response);
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let port = addr.port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let got = through_proxy(
+                ctx,
+                proxy_ca_der,
+                "upstream.test",
+                "upstream.test",
+                port,
+                request,
+            );
+            let _ = tx.send(got);
+        });
+        let got = rx.recv_timeout(Duration::from_secs(10));
+        release.store(true, Ordering::Relaxed);
+        got.expect(
+            "the relay must end at the end of the message, not wait for the upstream to close",
+        )
+        .expect("the relay failed")
+    }
+
+    /// The headline of response framing: the relay ends where the **message** ends, not where the
+    /// socket does. Every other relay test in this file is satisfied by an upstream that closes, so
+    /// none of them can tell the two apart. Here the upstream deliberately never closes, so a proxy
+    /// that still delimits by EOF hangs and the test times out.
+    #[test]
+    fn a_content_length_response_ends_without_waiting_for_the_upstream_to_close() {
+        let got = through_non_closing_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        );
+        assert!(got.contains("200 OK"), "{got:?}");
+        assert!(got.ends_with("hello"), "the whole body arrived: {got:?}");
+    }
+
+    /// The trap that makes framing worth doing carefully: a `304` (and a `204`, and any response to
+    /// `HEAD`) routinely carries a `Content-Length` describing the entity that *would* have been
+    /// sent. A proxy that believes that length waits forever for a body the server will never send —
+    /// and conditional GETs against a binary cache produce this shape constantly. The status wins.
+    #[test]
+    fn a_304_with_a_content_length_ends_at_its_head() {
+        let got = through_non_closing_upstream(
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 4096\r\nETag: \"v1\"\r\n\r\n",
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\nIf-None-Match: \"v1\"\r\n\r\n",
+        );
+        assert!(got.contains("304 Not Modified"), "{got:?}");
+        assert!(
+            got.ends_with("\r\n\r\n"),
+            "nothing follows the head: {got:?}"
+        );
+    }
+
+    /// A response to `HEAD` is bodiless whatever its head declares — the length describes the body a
+    /// `GET` would have returned. The method is what decides, so the framing has to be told it.
+    #[test]
+    fn a_head_response_ends_at_its_head_despite_its_declared_length() {
+        let got = through_non_closing_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n",
+            b"HEAD /p HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        );
+        assert!(got.contains("200 OK"), "{got:?}");
+        assert!(
+            got.ends_with("\r\n\r\n"),
+            "nothing follows the head: {got:?}"
+        );
+    }
+
+    /// A chunked response ends at its terminal chunk, and reaches the cage **verbatim** — size lines,
+    /// CRLFs and trailers included. The proxy learns where the body ends without rewriting a byte.
+    #[test]
+    fn a_chunked_response_ends_at_its_terminal_chunk_and_arrives_verbatim() {
+        let got = through_non_closing_upstream(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\n mo\r\n0\r\n\r\n",
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        );
+        let sep = got.find("\r\n\r\n").expect("head/body separator");
+        assert_eq!(
+            &got[sep + 4..],
+            "5\r\nhello\r\n3\r\n mo\r\n0\r\n\r\n",
+            "the chunked body must reach the cage byte-identical: {got:?}"
+        );
+    }
+
+    /// An interim `1xx` is a complete message of its own that the real response follows. `103 Early
+    /// Hints` is emitted by real CDNs, so the head read has to loop past it rather than mistake it
+    /// for the response — and both heads still reach the cage, which is what the client expects.
+    #[test]
+    fn an_interim_1xx_is_relayed_and_the_real_response_is_framed_after_it() {
+        let got = through_non_closing_upstream(
+            b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n\
+              HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        );
+        assert!(
+            got.contains("103 Early Hints"),
+            "the hint reaches the client: {got:?}"
+        );
+        assert!(
+            got.contains("200 OK"),
+            "the real response follows it: {got:?}"
+        );
+        assert!(
+            got.ends_with("hello"),
+            "the body is framed off the FINAL head, not the interim one: {got:?}"
+        );
+    }
+
+    /// The framing decides how long to read, never what to forward: a head this proxy cannot
+    /// delimit falls back to relaying until the upstream closes — exactly what this path did before
+    /// it framed anything. Teeth: the upstream declares BOTH framings (the classic desync
+    /// ambiguity) and then closes, and the body still arrives whole rather than being cut or refused.
+    #[test]
+    fn an_ambiguously_framed_response_still_relays_whole() {
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let got = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(got.ends_with("hello"), "the body relays whole: {got:?}");
     }
 
     /// The event log redacts a configured secret out of a request's path **before** it enters the
@@ -6851,6 +7173,42 @@ mod tests {
         assert!(
             resp.contains("sbx-secret-value"),
             "a non-injection host's response is streamed unmasked: {resp:?}"
+        );
+    }
+
+    /// The backstop covers the response **head**, not just its body. A debug or echo endpoint that
+    /// mirrors request headers reflects the injected credential in a header of its own — the shape
+    /// this masking exists for as much as a body echo. The head is masked before it is written to
+    /// the client, and equal-length replacement is what keeps the framing parsed off it valid.
+    #[test]
+    fn a_reflected_injected_secret_is_masked_in_a_response_header() {
+        let resp = run_reflecting(
+            vec![injection(
+                "host.test:*",
+                "Authorization",
+                "Bearer sbx-secret-value",
+            )],
+            &["sbx-secret-value"],
+            b"HTTP/1.1 200 OK\r\nX-Echo-Authorization: Bearer sbx-secret-value\r\n\
+              Content-Length: 2\r\nConnection: close\r\n\r\nok",
+            b"GET /echo HTTP/1.1\r\nHost: host.test\r\n\r\n",
+        );
+        assert!(resp.contains("200"), "the response still flows: {resp:?}");
+        assert!(
+            !resp.contains("sbx-secret-value"),
+            "a secret reflected in a response HEADER must be masked too: {resp:?}"
+        );
+        assert!(
+            resp.contains(&"*".repeat("sbx-secret-value".len())),
+            "the secret is replaced by an equal-length mask: {resp:?}"
+        );
+        assert!(
+            resp.contains("X-Echo-Authorization: Bearer "),
+            "the header around it survives: {resp:?}"
+        );
+        assert!(
+            resp.ends_with("ok"),
+            "the declared length still frames the body after masking: {resp:?}"
         );
     }
 

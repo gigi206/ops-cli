@@ -50,6 +50,9 @@ response back, replacing it with an **equal-length run of `*`**:
 - **mask, not block**: unlike the outbound case, the response also carries
   legitimate content the agent needs, so `sbx` masks the secret in place rather
   than dropping the whole response;
+- **head and body**: an echo or debug endpoint reflects the credential in a
+  header of its own (`X-Echo-Authorization`, a `Set-Cookie`) as readily as in a
+  body, so both are masked;
 - **equal-length**: the `*` run is the same byte length as the secret, so
   `Content-Length`/chunked framing stays intact and `*` never introduces a
   `CR`/`LF`;

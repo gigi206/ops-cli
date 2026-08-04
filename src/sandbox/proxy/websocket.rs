@@ -656,8 +656,11 @@ pub(super) fn relay_upgrade(
         if let Some(c) = capture {
             c.push_response(&resp_head);
         }
+        // Framed like any ordinary response, so the relay ends at the end of the message. The
+        // handshake was a `GET`, so no bodiless-method rule applies here.
+        let framing = response_framing(&resp_head, "GET");
         // Count the declined response body (`down`) as it streams back to the client.
-        let counted = CountingReader::new(&mut up_br, down.clone());
+        let counted = CountingReader::new(FramedBody::new(up_br, framing), down.clone());
         let mut body: Box<dyn Read + '_> = match capture {
             Some(c) => Box::new(CaptureReader::new(counted, c.response_sink())),
             None => Box::new(counted),

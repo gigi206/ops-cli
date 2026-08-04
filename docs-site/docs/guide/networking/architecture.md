@@ -195,6 +195,42 @@ An absolute-form **`http://`** request is a different thing: that one is genuine
 cleartext all the way to the origin server, and stays [strictly
 opt-in](rules#cleartext-http-http) behind an explicit `http://` rule.
 
+### Message framing (where a request and a response end)
+
+Terminating TLS means the proxy has to decide, for every message, where it ends. It
+does that from the message itself rather than from the socket, in both directions, and
+the two directions are deliberately not symmetric.
+
+**Outbound, the rule is fail-closed.** Ambiguous framing is the classic
+request-smuggling vector, so a request that carries a duplicated `Content-Length` or
+`Host`, or a `Transfer-Encoding` whose coding is anything but `chunked`, is refused
+outright (`400 bad-request`, sub-categorized in the logs). A well-formed `chunked`
+request is not refused: it is de-chunked into a bounded buffer and re-framed with a
+synthesized `Content-Length`, so exactly one unambiguous framing reaches the upstream.
+
+**Inbound, the rule is fail-open.** The proxy reads the response head, then applies the
+standard delimitation rules in order:
+
+| The head says | The body is |
+|---|---|
+| `1xx`, `204`, `304`, or the request was a `HEAD` | **empty**, whatever length it declares |
+| `Transfer-Encoding` ending in `chunked` | the chunks, to the terminal one |
+| `Content-Length: N` | exactly `N` bytes |
+| anything else, or anything ambiguous | whatever arrives until the upstream closes |
+
+The first row is the one that matters in practice: a `304` answering a conditional
+`GET` routinely carries a `Content-Length` describing the entity it did *not* send, and
+so does a response to `HEAD`. The status decides, not the length.
+
+The last row is the deliberate asymmetry. Where an ambiguous *request* is refused, an
+ambiguous *response* is relayed to the close. Cutting it would turn an upstream's
+framing bug into a truncation the tool in the cage would blame on sbx, and the proxy
+forces `Connection: close` upstream, so relaying to the close is correct. Framing can
+shorten the wait; it never shortens a response.
+
+A chunked response reaches the cage **verbatim**, size lines and trailers included. The
+proxy learns where the body ends without rewriting a byte of it.
+
 ### CONNECT authority == SNI == decrypted Host (anti-domain-fronting)
 
 Domain fronting is connecting to one host at the TCP/TLS layer while addressing a
@@ -248,6 +284,10 @@ never disclosed, so a global-config rule the cage cannot read does not leak),
 `outbound-secret`, and the transport-side `dns-failure`, `upstream-unreachable`, and
 `upstream-cert-rejected`. A genuine upstream status (a real `404`) is relayed
 verbatim with no such header.
+
+Every one of these is a **request-side** category: they describe requests the proxy
+declined to make. No response is ever refused for how it is framed, per the inbound
+rule above.
 
 ---
 

@@ -243,10 +243,18 @@ pub(super) fn read_chunk_size_line<R: BufRead>(r: &mut R) -> io::Result<u64> {
     if line.is_empty() {
         return Err(invalid("chunked body ended before a chunk size"));
     }
+    parse_chunk_size(&line)
+}
+
+/// Parse the size out of one already-read chunk-size line (hex, optionally followed by
+/// `;extensions`), requiring a CRLF/LF terminator so a line cut short by an EOF is a malformed-body
+/// error rather than a silent short read. Split out from [`read_chunk_size_line`] so a relay that
+/// must forward the line verbatim can parse the copy it already holds.
+pub(super) fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
     if !line.ends_with(b"\n") {
         return Err(invalid("chunk size line has no line terminator"));
     }
-    let s = strip_eol(&line);
+    let s = strip_eol(line);
     let size_field = match s.iter().position(|&b| b == b';') {
         Some(i) => &s[..i],
         None => s,
@@ -254,6 +262,279 @@ pub(super) fn read_chunk_size_line<R: BufRead>(r: &mut R) -> io::Result<u64> {
     let size_str =
         std::str::from_utf8(size_field).map_err(|_| invalid("chunk size is not ASCII"))?;
     u64::from_str_radix(size_str.trim(), 16).map_err(|_| invalid("chunk size is not hexadecimal"))
+}
+
+/// Read a response head from a buffered reader, **tolerantly**: like [`read_head_buffered`], but an
+/// upstream that closes, errors, or floods past `max` before the blank-line terminator yields what
+/// was read with `complete = false` instead of failing. The response path relays whatever the
+/// upstream managed to send and lets the relay end on the EOF that follows, so a truncated head must
+/// stay a truncated relay here and not become a hard error the client never sees the reason for.
+/// Bytes past the head stay in the reader.
+pub(super) fn read_response_head<R: BufRead>(r: &mut R, max: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    loop {
+        let start = buf.len();
+        // Cap each line at the remaining budget (+1 to detect overflow), for the reason
+        // `read_head_buffered` does: a bare `read_until` would buffer an arbitrarily long
+        // no-newline flood before any size check could run.
+        let budget = (max - start + 1) as u64;
+        match (&mut *r).take(budget).read_until(b'\n', &mut buf) {
+            // EOF, or a read error/timeout: hand back what arrived and let the caller relay it.
+            Ok(0) | Err(_) => return (buf, false),
+            Ok(_) => {}
+        }
+        if buf.len() > max {
+            return (buf, false);
+        }
+        if matches!(&buf[start..], b"\r\n" | b"\n") {
+            return (buf, true);
+        }
+    }
+}
+
+/// Where an HTTP/1.1 response body ends, decided from the response head (RFC 9112 §6.3).
+pub(super) enum BodyFraming {
+    /// The message has no body at all, whatever its head declares: a `1xx`, a `204` or a `304`, or
+    /// any response to a `HEAD`. Such a head routinely carries a `Content-Length` describing the
+    /// entity that *would* have been sent — reading that many bytes would block forever on a body
+    /// the server never sends, so the status wins over the length.
+    Empty,
+    /// Exactly this many bytes follow the head.
+    Length(u64),
+    /// The body is a chain of sized chunks ending at the terminal zero-size chunk and its trailers.
+    Chunked,
+    /// The end of the message cannot be determined from the head, so relay until the upstream
+    /// closes. Either the head genuinely delimits by close (no length, no coding), or it is
+    /// ambiguous: a duplicated or unparsable `Content-Length`, a final coding other than `chunked`,
+    /// or both framings at once. Ambiguity **degrades to this rather than failing** — the forced
+    /// `Connection: close` makes a close-delimited relay correct, and it is exactly what this path
+    /// did before it framed anything, so framing can shorten the wait but never truncate a response
+    /// it merely failed to understand.
+    ToEof,
+}
+
+/// Decide where a response body ends, from its head bytes and the method that asked for it.
+///
+/// The order is the specification's and the first match wins: a bodiless status, then
+/// `Transfer-Encoding`, then `Content-Length`, then close-delimited. Anything unparsable or
+/// ambiguous yields [`BodyFraming::ToEof`] — this decides how long to *read*, never what to
+/// forward, so an undecidable head costs a close-delimited relay and not a refusal.
+pub(super) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming {
+    let status = parse_status_code(head);
+    if request_method.eq_ignore_ascii_case("head")
+        || matches!(status, Some(204) | Some(304))
+        || matches!(status, Some(c) if (100..200).contains(&c))
+    {
+        return BodyFraming::Empty;
+    }
+    let Ok(parsed) = parse_head(head) else {
+        return BodyFraming::ToEof;
+    };
+    let te = parsed.count("transfer-encoding");
+    let cl = parsed.count("content-length");
+    if te > 0 {
+        // Both framings at once is the classic desync ambiguity, and more than one coding field
+        // leaves which one is final undetermined. Neither is decidable here.
+        if te > 1 || cl > 0 {
+            return BodyFraming::ToEof;
+        }
+        let final_coding = parsed
+            .header("transfer-encoding")
+            .unwrap_or("")
+            .rsplit(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return if final_coding.eq_ignore_ascii_case("chunked") {
+            BodyFraming::Chunked
+        } else {
+            BodyFraming::ToEof
+        };
+    }
+    if cl > 1 {
+        return BodyFraming::ToEof;
+    }
+    match parsed.header("content-length") {
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) => BodyFraming::Length(n),
+            Err(_) => BodyFraming::ToEof,
+        },
+        None => BodyFraming::ToEof,
+    }
+}
+
+/// The framing state machine's position inside a response body.
+enum BodyState {
+    /// Nothing to read: a bodiless response, or a framed one fully consumed.
+    Done,
+    /// This many declared bytes are still outstanding.
+    Length(u64),
+    /// At the start of a chunk-size line.
+    ChunkSize,
+    /// Inside a chunk's data, this many bytes from its end.
+    ChunkData(u64),
+    /// At the CRLF that closes a chunk's data.
+    ChunkCrlf,
+    /// Past the terminal zero chunk, reading trailer lines until the blank one.
+    ChunkTrailers,
+    /// Relay whatever comes until the upstream closes.
+    ToEof,
+}
+
+/// A reader over one response body that **ends where the message ends**.
+///
+/// It yields the upstream's bytes verbatim — chunk-size lines and trailers included — and simply
+/// reports EOF at the end of the framed message instead of waiting for the socket to close. So every
+/// consumer stacked on top of it (the byte counter, the capture tee, the reflection masking) is
+/// unchanged, and so is what the cage receives; only the moment the proxy stops reading moves.
+///
+/// Malformed framing discovered mid-body **degrades to [`BodyState::ToEof`]** rather than erroring:
+/// by then some bytes are already relayed, and cutting the response would turn an upstream's framing
+/// bug into a truncation the cage blames on sbx. The bytes that revealed the problem are relayed too,
+/// so the degraded path is byte-for-byte the close-delimited relay this code did before it framed.
+pub(super) struct FramedBody<R> {
+    inner: R,
+    state: BodyState,
+    /// Framing bytes read ahead of the caller's request that still have to be relayed verbatim: one
+    /// chunk-size line, one data-closing CRLF, or one trailer. Bounded by [`CHUNK_LINE_MAX`]; chunk
+    /// *data* never passes through here, so a large body costs nothing extra.
+    pending: Vec<u8>,
+    at: usize,
+}
+
+impl<R: BufRead> FramedBody<R> {
+    pub(super) fn new(inner: R, framing: BodyFraming) -> Self {
+        let state = match framing {
+            BodyFraming::Empty => BodyState::Done,
+            BodyFraming::Length(n) => BodyState::Length(n),
+            BodyFraming::Chunked => BodyState::ChunkSize,
+            BodyFraming::ToEof => BodyState::ToEof,
+        };
+        Self {
+            inner,
+            state,
+            pending: Vec::new(),
+            at: 0,
+        }
+    }
+
+    /// Read one framing line, returning its bytes whether or not it was terminated. An untermined
+    /// or over-long line is a malformed body, and the caller degrades — but it must still relay what
+    /// was consumed, so the bytes come back either way.
+    fn framing_line(&mut self) -> (Vec<u8>, bool) {
+        let mut line = Vec::new();
+        let complete = match (&mut self.inner)
+            .take(CHUNK_LINE_MAX + 1)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) | Err(_) => false,
+            Ok(_) => line.len() as u64 <= CHUNK_LINE_MAX && line.ends_with(b"\n"),
+        };
+        (line, complete)
+    }
+}
+
+impl<R: BufRead> Read for FramedBody<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            // Framing bytes always leave first, so the relay stays in wire order.
+            if self.at < self.pending.len() {
+                let n = (self.pending.len() - self.at).min(out.len());
+                out[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+                self.at += n;
+                if self.at == self.pending.len() {
+                    self.pending.clear();
+                    self.at = 0;
+                }
+                return Ok(n);
+            }
+            if out.is_empty() {
+                return Ok(0);
+            }
+            match self.state {
+                BodyState::Done => return Ok(0),
+                BodyState::ToEof => return self.inner.read(out),
+                BodyState::Length(0) => {
+                    self.state = BodyState::Done;
+                    return Ok(0);
+                }
+                BodyState::Length(n) => {
+                    let want = n.min(out.len() as u64) as usize;
+                    let got = self.inner.read(&mut out[..want])?;
+                    if got == 0 {
+                        // The upstream closed before its declared length. Ending here hands the cage
+                        // the bytes that did arrive followed by a clean close, which is what a
+                        // close-delimited relay did with the same truncation.
+                        self.state = BodyState::Done;
+                        return Ok(0);
+                    }
+                    self.state = BodyState::Length(n - got as u64);
+                    return Ok(got);
+                }
+                BodyState::ChunkSize => {
+                    let (line, complete) = self.framing_line();
+                    let size = complete.then(|| parse_chunk_size(&line).ok()).flatten();
+                    self.state = match size {
+                        Some(0) => BodyState::ChunkTrailers,
+                        Some(n) => BodyState::ChunkData(n),
+                        None if line.is_empty() => BodyState::Done,
+                        None => BodyState::ToEof,
+                    };
+                    self.pending = line;
+                }
+                BodyState::ChunkData(0) => self.state = BodyState::ChunkCrlf,
+                BodyState::ChunkData(n) => {
+                    let want = n.min(out.len() as u64) as usize;
+                    let got = self.inner.read(&mut out[..want])?;
+                    if got == 0 {
+                        self.state = BodyState::Done;
+                        return Ok(0);
+                    }
+                    self.state = BodyState::ChunkData(n - got as u64);
+                    return Ok(got);
+                }
+                BodyState::ChunkCrlf => {
+                    let mut crlf = [0u8; 2];
+                    let n = read_full(&mut self.inner, &mut crlf)?;
+                    self.state = if n == 2 && crlf == *b"\r\n" {
+                        BodyState::ChunkSize
+                    } else if n == 0 {
+                        BodyState::Done
+                    } else {
+                        BodyState::ToEof
+                    };
+                    self.pending = crlf[..n].to_vec();
+                }
+                BodyState::ChunkTrailers => {
+                    let (line, complete) = self.framing_line();
+                    if !complete {
+                        self.state = if line.is_empty() {
+                            BodyState::Done
+                        } else {
+                            BodyState::ToEof
+                        };
+                    } else if strip_eol(&line).is_empty() {
+                        self.state = BodyState::Done;
+                    }
+                    self.pending = line;
+                }
+            }
+        }
+    }
+}
+
+/// Fill `buf` as far as the reader allows, returning how many bytes arrived — a short count means
+/// the stream ended there. Unlike `read_exact`, a truncation is a fact to relay, not an error.
+fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    Ok(got)
 }
 
 /// Drop a trailing `\r\n` (or a lone `\n`) from a line read with `read_until(b'\n')`.
@@ -271,6 +552,210 @@ pub(super) fn strip_eol(line: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read a whole framed body, returning the bytes the relay would forward.
+    fn framed(head: &[u8], method: &str, wire: &[u8]) -> Vec<u8> {
+        let framing = response_framing(head, method);
+        let mut body = FramedBody::new(io::BufReader::new(io::Cursor::new(wire.to_vec())), framing);
+        let mut out = Vec::new();
+        body.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_bodiless_status_ends_at_the_head_whatever_length_it_declares() {
+        // The trap this exists for: `204`, `304` and a response to `HEAD` routinely carry a
+        // `Content-Length` describing the entity that *would* have been sent. Reading that many
+        // bytes waits forever on a body no server will send, so the status has to win. The wire
+        // below holds the NEXT message's bytes — if any of them are consumed, the rule did not hold.
+        for (head, method) in [
+            (
+                &b"HTTP/1.1 204 No Content\r\nContent-Length: 100\r\n\r\n"[..],
+                "GET",
+            ),
+            (
+                &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 4096\r\n\r\n"[..],
+                "GET",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"[..],
+                "HEAD",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"[..],
+                "head",
+            ),
+            (
+                &b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+                "GET",
+            ),
+        ] {
+            assert!(
+                matches!(response_framing(head, method), BodyFraming::Empty),
+                "{method} {}",
+                String::from_utf8_lossy(head)
+            );
+            assert_eq!(
+                framed(head, method, b"NOT-THE-BODY"),
+                b"",
+                "{method}: a bodiless response must consume nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_content_length_body_ends_at_the_declared_length() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        assert!(matches!(
+            response_framing(head, "GET"),
+            BodyFraming::Length(5)
+        ));
+        // Exactly the declared count is relayed and the trailing bytes — a smuggled second response
+        // on a socket the proxy would otherwise keep draining — are left untouched.
+        assert_eq!(framed(head, "GET", b"hello"), b"hello");
+        assert_eq!(
+            framed(head, "GET", b"helloHTTP/1.1 200 OK\r\n\r\nsmuggled"),
+            b"hello"
+        );
+        // An upstream that closes before its declared length hands over what did arrive, as a
+        // close-delimited relay did with the same truncation — not an error the cage cannot read.
+        assert_eq!(framed(head, "GET", b"hel"), b"hel");
+    }
+
+    #[test]
+    fn a_chunked_body_is_relayed_verbatim_and_ends_at_the_terminal_chunk() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(matches!(
+            response_framing(head, "GET"),
+            BodyFraming::Chunked
+        ));
+        // Verbatim: the size lines, the CRLFs and the trailers all reach the client unchanged — the
+        // proxy learns where the body ends without re-writing a byte of it.
+        let wire = b"5\r\nhello\r\n3\r\n mo\r\n0\r\nX-T: v\r\n\r\nAFTER";
+        assert_eq!(
+            framed(head, "GET", wire),
+            b"5\r\nhello\r\n3\r\n mo\r\n0\r\nX-T: v\r\n\r\n"
+        );
+        // No trailers is the common shape, and the terminal chunk still ends it.
+        assert_eq!(
+            framed(head, "GET", b"2\r\nhi\r\n0\r\n\r\nAFTER"),
+            b"2\r\nhi\r\n0\r\n\r\n"
+        );
+        // A chunk extension is part of the size line and rides along untouched.
+        assert_eq!(
+            framed(head, "GET", b"2;a=b\r\nhi\r\n0\r\n\r\n"),
+            b"2;a=b\r\nhi\r\n0\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn malformed_chunked_framing_degrades_to_the_close_rather_than_truncating() {
+        // The rule the increment turns on: framing decides how long to READ, never what to forward.
+        // A body that stops being decodable mid-stream falls back to relaying until the upstream
+        // closes — which is what this path did before it framed anything — so an upstream's framing
+        // bug can never become a truncation the cage blames on sbx.
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let wire = b"5\r\nhello\r\nNOTHEX\r\nrest of it";
+        assert_eq!(framed(head, "GET", wire), wire);
+        // Same for a chunk whose data is not followed by the CRLF the framing requires.
+        let wire = b"5\r\nhelloXXtail";
+        assert_eq!(framed(head, "GET", wire), wire);
+    }
+
+    #[test]
+    fn an_undecidable_head_relays_until_the_upstream_closes() {
+        // Every shape here leaves the end of the message undetermined, so each must relay to EOF —
+        // the pre-framing behaviour — instead of guessing a length.
+        for head in [
+            // Nothing declared at all: genuinely close-delimited.
+            &b"HTTP/1.1 200 OK\r\n\r\n"[..],
+            // Both framings at once is the classic desync ambiguity.
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            // Two codings: which one is final is undetermined.
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            // A final coding other than `chunked` delimits nothing.
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"[..],
+            // A duplicated or unparsable length is not a length.
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 9\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: not-a-number\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n"[..],
+        ] {
+            assert!(
+                matches!(response_framing(head, "GET"), BodyFraming::ToEof),
+                "{}",
+                String::from_utf8_lossy(head)
+            );
+            assert_eq!(
+                framed(head, "GET", b"everything until the close"),
+                b"everything until the close",
+                "{}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        // `chunked` as the final coding of a list still frames.
+        assert!(matches!(
+            response_framing(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+                "GET"
+            ),
+            BodyFraming::Chunked
+        ));
+    }
+
+    #[test]
+    fn a_head_this_proxy_cannot_parse_frames_nothing() {
+        // Non-UTF-8 header bytes relay fine today; deciding they are unframeable keeps them relaying.
+        let head = b"HTTP/1.1 200 OK\r\nX: \xff\xfe\r\n\r\n";
+        assert!(matches!(response_framing(head, "GET"), BodyFraming::ToEof));
+        assert_eq!(framed(head, "GET", b"body bytes"), b"body bytes");
+    }
+
+    #[test]
+    fn read_response_head_leaves_a_body_that_shared_the_head_s_read() {
+        // The wiring hazard of the whole change: the buffered reader pulls body bytes off the socket
+        // while reading the head, so the body must be read from IT. One `Cursor` hands the head and
+        // the body over in a single read, exactly as one TCP segment carrying both would.
+        let mut src = io::BufReader::new(io::Cursor::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world".to_vec(),
+        ));
+        let (head, complete) = read_response_head(&mut src, 16 * 1024);
+        assert!(complete);
+        let framing = response_framing(&head, "GET");
+        let mut out = Vec::new();
+        FramedBody::new(src, framing).read_to_end(&mut out).unwrap();
+        assert_eq!(
+            out, b"hello world",
+            "the body buffered alongside the head must not be lost"
+        );
+    }
+
+    #[test]
+    fn framing_survives_a_reader_that_dribbles_one_byte_at_a_time() {
+        // A socket splits where it likes: every state of the machine must survive being fed one byte
+        // per read, including mid-size-line and mid-trailer.
+        struct Dribble(io::Cursor<Vec<u8>>);
+        impl Read for Dribble {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if out.is_empty() {
+                    return Ok(0);
+                }
+                self.0.read(&mut out[..1])
+            }
+        }
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let mut src = io::BufReader::with_capacity(1, Dribble(io::Cursor::new(wire.to_vec())));
+        let (head, complete) = read_response_head(&mut src, 16 * 1024);
+        assert!(complete);
+        assert_eq!(
+            head,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+        let mut out = Vec::new();
+        FramedBody::new(src, response_framing(&head, "GET"))
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, b"5\r\nhello\r\n0\r\n\r\n");
+    }
 
     #[test]
     fn parse_head_rejects_a_non_utf8_or_empty_head() {

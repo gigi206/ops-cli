@@ -501,6 +501,35 @@ differentiator; **M6** closes confidentiality last (decision made).
 - **`--unshare-pid` always** (same-uid is only safe with it).
 - **Untrusted config never touches the security fields.**
 - **Store ro at consumption, rw only during sbx-mediated provisioning** (no overlay); installs route through sbx, never free agent writes to a ro `/nix`; per-project state = profile + a **plain** `$HOME` dir (cf. §7.4).
+- **The egress proxy frames both directions, fail-closed outbound and fail-open inbound.** A
+  request whose framing is ambiguous is a smuggling vector and is refused; a response whose
+  framing is ambiguous is relayed until the upstream closes. The asymmetry is deliberate: sbx
+  authors the request it forwards, so it can demand one unambiguous framing, but it only relays
+  the response, and cutting one it merely failed to parse would turn an upstream's bug into a
+  truncation the cage attributes to sbx. Framing decides how long to **read**, never what to
+  forward.
+
+### 6.1 Response framing, and what it unlocks
+
+The response path originally relayed to the upstream's EOF and depended on the forced
+`Connection: close` to get one. That was correct but load-bearing in a way worth naming: the
+proxy could not tell "the message ended" from "the socket ended", so a `304` or a `HEAD`
+response carrying a `Content-Length` for a body it never sends would have blocked forever if the
+socket had stayed open, and termination rested entirely on the peer honouring `close` (the read
+timeout is lifted for the whole response, so a streaming completion is not cut mid-flight).
+
+Framing the response removes that dependency: the relay now ends where the *message* ends. The
+user-visible rules are documented in
+[the networking architecture guide](../docs-site/docs/guide/networking/architecture.md).
+
+This is the **prerequisite** for reusing an upstream connection across requests, which the
+measurements put at a ~2.5x latency factor for a client that would otherwise keep-alive. It is
+not sufficient. Pooling additionally requires flipping the inbound rule from fail-open to
+fail-closed — a socket returns to the pool only if its response was unambiguously framed and
+fully consumed with zero residual bytes, partitioned by `(host, port)`, and **carried no
+injected credential** unless the next request receives the same injection (connection-bound auth
+schemes bind the credential to the socket, which is the trap specific to a proxy that injects
+secrets). Everything else closes. That flip is the pooling switch, and it is a separate change.
 
 ## 7. Design questions (item 4 resolved; 1–3 still open, to settle with the user)
 1. **Config noun model.** [[noun-inheritance-model]] locks
