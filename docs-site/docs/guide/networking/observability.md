@@ -9,7 +9,7 @@ policy and the live/recorded state:
 | [`sbx net rules`](#sbx-net-rules) | *what is the effective policy?* | before a launch: the static rules |
 | [`sbx test net <url>`](#sbx-test-net) | *would this exact request be allowed, and why?* | before a launch: a what-if against the policy |
 | [`sbx net stats`](#sbx-net-stats) | *how many requests did each host get allowed/denied/blocked?* | during and after: persisted counters |
-| [`sbx net logs`](#sbx-net-logs) | *what did the proxy decide, request by request, right now?* | **only while a session runs**: a live, zero-disk log |
+| [`sbx net logs`](#sbx-net-logs) | *what did the proxy decide, request by request, right now?* (and, with [`capture`](#seeing-the-traffic-network-capture) on, *what actually crossed*) | **only while a session runs**: a live, zero-disk log |
 | [`sbx net live`](#sbx-net-live) | *what tunnels are open right now, and how much is flowing?* | **only while a session runs**: a live, `top`-style view |
 
 They form a natural progression: `rules`/`test net` are the *static* view (the
@@ -150,6 +150,8 @@ sbx net logs -n 50                   # the most recent 50 (per session)
 sbx net logs --follow                # tail -f: keep appending new events until Ctrl-C
 sbx net logs --with-status           # also show the upstream HTTP status (200/404/…)
 sbx net logs --with-query            # keep the URL query (already secret-redacted)
+sbx net logs --with-headers          # the request/response heads, if the session captured them
+sbx net logs --with-body             # those plus the leading bytes of each body
 sbx net logs --all                   # also show refusals a `mute` rule suppressed (tagged)
 sbx net logs --json
 ```
@@ -174,8 +176,8 @@ tag are also in `--json` (`http_version`, `rpc`; `null` when absent).
 
 ### Muting noisy refusals: `[network] mute` (SELinux `dontaudit`)
 
-A busy agent often hammers hosts you have **deliberately left denied**: telemetry,
-feature flags, an optional CDN: and those refusals drown the ones worth acting on.
+A busy agent often hammers hosts you have **deliberately left denied** (telemetry,
+feature flags, an optional CDN), and those refusals drown the ones worth acting on.
 A `[network] mute` rule (the analogue of SELinux's `dontaudit`) keeps a **denied**
 request's line **out of the default log**, without changing anything else:
 
@@ -258,13 +260,155 @@ no," which is the log's whole job: answering *why did it fail just now?*
   a token can ride in a query). It is already redacted: the proxy masks configured
   secret values before an event enters the log.
 
+### Seeing the traffic: `[network] capture`
+
+The log answers *which* requests crossed. With `[network] capture` on, it also
+answers *what* crossed: the request and response heads, and optionally the leading
+bytes of each body.
+
+It is **off by default** and is a **trusted/global-only** setting, like the rest of
+the `[network]` table: an untrusted project's `.sbx.toml` cannot start capturing its
+own traffic. For a one-off debugging run, turn it on for that launch only:
+
+```bash
+sbx run --config '[network] capture = "bodies"'
+sbx net logs --with-body --follow    # from another terminal
+```
+
+Or, in a trusted config file:
+
+```toml
+[network]
+mode = "deny"
+allow = ["api.example.com"]
+capture = "bodies"       # "off" (default) | "headers" | "bodies"
+capture_max_kb = 32      # per body; default 8, ceiling 1024
+```
+
+The traffic prints as an indented block under its event line, `>` for what the cage
+sent and `<` for what came back:
+
+```
+  1234  12:04:31  https/h1  api.example.com:443  POST /v1/messages  allow  200
+      > POST /v1/messages HTTP/1.1
+      > host: api.example.com
+      > content-type: application/json
+      > authorization: <injected by sbx>
+      > {"model":"…","messages":[{"role":"user","content":"hi"}]}
+      < HTTP/1.1 200 OK
+      < content-type: text/event-stream
+      < data: {"type":"message_start", …
+      < … truncated, more followed (8192 byte(s) shown)
+```
+
+`--with-body` implies `--with-headers` (a body without its head names nothing).
+
+#### What a capture never contains
+
+- **Any configured secret.** Every value is masked to an equal-length run of `*`
+  before the bytes are stored, so the capture ring never holds a credential: not in a
+  request, and not in a response that reflects one back.
+- **Any credential sbx injects.** The head recorded is the **client's own** as it stood
+  *before* the [injection](../configuration/secret) happens, so an injected value
+  cannot reach the capture even in principle. The injected headers are listed by
+  **name** only, marked `<injected by sbx>`, so the capture is not mistaken for the
+  whole of what the upstream received.
+
+#### What a capture covers
+
+Every exchange sbx inspects:
+
+- **HTTPS** (`https://`, the MITM'd `CONNECT`) and inspected **cleartext**
+  (`http://`): the request and response heads exactly as they crossed, plus the
+  leading bytes of each body.
+- **HTTP/2 and gRPC** ([`[network] http2`](rules)): the same, per stream. HTTP/2
+  carries a head as compressed pseudo-headers rather than as text, so sbx renders it
+  instead of copying it. The pseudo-headers keep their real names, so what you read is
+  what crossed:
+
+  ```
+  > POST /pkg.Greeter/SayHello HTTP/2
+  > :authority: grpc.example.com
+  > content-type: application/grpc
+  < HTTP/2 200
+  < content-type: application/grpc
+  ```
+
+  There is no reason phrase (`HTTP/2 200`, not `200 OK`) because HTTP/2 sends none.
+- A **WebSocket**, handshake and traffic. The upgrade `GET` and the upstream's
+  `101 Switching Protocols` land as the two heads; the messages that cross afterwards
+  land as two more parts, one per direction:
+
+  ```
+  > GET /realtime HTTP/1.1
+  < HTTP/1.1 101 Switching Protocols
+  > {"type":"session.update"}{"type":"input_audio_buffer.append", …
+  < {"type":"session.created"}{"type":"response.delta", …
+  ```
+
+  A frame the cage sends is XOR-masked on the wire (the protocol requires it), so what
+  is captured is the payload **unmasked**: exactly what the sender sent. A peer that
+  negotiated `permessage-deflate` compresses each message, and those are **decompressed**
+  too, so a compressed tunnel reads the same as a plain one. Message boundaries are not
+  kept, so successive messages read run together, which for the JSON-per-message
+  protocols this is used on stays readable. Control frames (ping, pong, close) carry no
+  application data and are skipped.
+
+  **When it appears.** A WebSocket is the one exchange shown in steps, because a tunnel
+  outlives its handshake: the handshake appears immediately at the `101`, then **each
+  direction** as its own capture fills, and once more when the tunnel closes. Each
+  direction has its own trigger on purpose, since one side of a live stream can fill in
+  seconds while the other trickles for hours. So a busy tunnel shows its traffic within
+  seconds of opening rather than only at teardown. A transcript shown while the tunnel is
+  still open is marked cut, because more may still cross.
+
+#### What a capture does not cover
+
+- A raw **`tcp://` splice**: there is no HTTP head to read, so a method and a body are
+  not merely unimplemented there, they do not exist. Byte counts only:
+  see [`sbx net live`](#sbx-net-live).
+- A **refused** request: nothing was forwarded, so there is no traffic to show. The
+  refusal itself is the log line.
+
+A body is printed as text when it is text, and summarized as
+`<N byte(s) of binary data>` when it is not. A `Content-Encoding: gzip` body is
+captured **compressed** and reads that way: sbx does not decompress it. Under
+`--json` every part is base64-encoded, so a binary body survives the round trip
+intact.
+
+#### Bounds
+
+A capture is bounded three ways, and never trims in silence:
+
+- **Per body**: `capture_max_kb` (default 8 KiB, ceiling 1024). A body that was cut is
+  marked `… truncated, more followed`. The marker names the fact, not a cause: a body
+  is also marked when the exchange was filed while more was still arriving, which an
+  HTTP/2 request body can be (its pump runs concurrently with the response, and a
+  server may answer without draining it). A prefix is never shown as if it were whole.
+- **Per exchange count** and **by a total byte budget**: past it, the *oldest*
+  captures are dropped and the count is reported (`N earlier capture(s) evicted`).
+
+Like the log itself, a capture lives **only in the running session's memory**: never
+written to disk, never bound into the cage, gone when the session exits. The relay is
+untouched by it: the capture is a tee, so the cage receives every byte exactly as it
+would with the capture off, streaming included.
+
 ### `--follow`
 
 `--follow` prints the current listing, then appends new events as they happen (a
 `tail -f`) until Ctrl-C, polling every `--interval` seconds (default 1). If the
 in-memory ring overflowed between polls, the dropped count is announced, never
 silently skipped; a session that ends is noted, and a new one is picked up. The
-append shape is pipe-friendly, and `--json` streams one event object per line.
+append shape is pipe-friendly, and `--json` streams one event object per line. An
+exchange whose traffic is being captured appears first as a bare line, then **once**
+more: complete, with its status and its traffic, when it finishes. A followed
+exchange is never printed piecemeal.
+
+The one exception is a **WebSocket**, which is genuinely several events rather than one:
+it appears when the tunnel opens (with its handshake), then as each direction's transcript
+fills, then once more at close if that changed anything. **Four lines** over the tunnel's
+whole life is the ceiling, and it is never re-emitted showing what it already showed.
+Nothing else is ever re-emitted more than once.
 
 ---
 
@@ -326,6 +470,7 @@ a pipe (one snapshot per tick, since a live view is a *state*, not an event stre
 
 ## See also
 
+- [The four lenses](../concepts/observability#the-four-lenses): this is the egress one; the others watch exec, file writes, and ssh signatures.
 - [Network modes](modes): the postures these surfaces describe.
 - [Rule grammar](rules): how a rule is written, tested, and rendered.
 - [Ask mode](ask): `sbx net rules --source session` and the parked-request flow.

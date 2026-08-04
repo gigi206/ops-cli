@@ -15,6 +15,7 @@
 //! (strip-and-replace) onto the upstream request, and a reflected secret is masked out of the
 //! response DATA/headers/trailers for an injection-target host ([`relay_body_redacting`]).
 
+use super::capture::CapBuf;
 use super::{
     carries_secret, effective_policy, ip_permitted, matching_injections, redact_in_place,
     upstream_server_name, ProxyCtx, SecretNeedle, StatKind,
@@ -26,6 +27,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::{Method, Request, Response, StatusCode};
 use std::io;
 use std::net::IpAddr;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 /// The most concurrent h2 streams the proxy carries on one tunnel — h2 multiplexes, so the
@@ -444,6 +446,15 @@ async fn relay(
     // dropped and sbx's value is the only one forwarded.
     let injected = matching_injections(ctx, host, port, path);
 
+    // Open the traffic capture for this stream, when the launch captures. The head recorded is the
+    // client's own, rendered from the decoded request *before* the rebuild below adds any injected
+    // credential, so a secret cannot reach the capture even in principle. The guard files on drop,
+    // so every early return below files what it saw exactly once.
+    let capture = ctx.begin_capture(seq);
+    if let Some(c) = &capture {
+        c.set_request(&capture_request_head(&req), &injected);
+    }
+
     // Rebuild the request for the upstream: reuse the decoded method/URI (h2 re-derives the
     // pseudo-headers), copying regular headers minus the connection-specific ones h2 forbids and
     // minus any header sbx is injecting (stripped so its value is the only one upstream).
@@ -483,10 +494,22 @@ async fn relay(
             return;
         }
     };
-    // Pump the request body (client → upstream) concurrently; it owns only h2 stream state, so it
-    // is `'static` and spawnable.
+    // Pump the request body (client → upstream) concurrently; it owns only h2 stream state (plus an
+    // `Arc` sink), so it is `'static` and spawnable.
+    //
+    // That concurrency is why the sink is told to expect a source end. The pump can still be running
+    // when this exchange is filed — a server that answers and closes without draining the request, a
+    // bidi-streaming RPC whose client half stays open — and a body captured mid-pump is a prefix.
+    // Marking the source open until the pump reports it exhausted is what keeps that prefix from
+    // being stored as if it were the whole body. (Waiting for the pump instead would let a
+    // never-draining client hold the response status out of `sbx net logs` indefinitely.)
+    let req_sink = capture.as_ref().filter(|c| c.keeps_body()).map(|c| {
+        let sink = c.request_body_sink();
+        sink.expect_source_end();
+        sink
+    });
     tokio::spawn(async move {
-        let _ = relay_body(client_body, up_send_body).await;
+        let _ = relay_body(client_body, up_send_body, req_sink).await;
     });
 
     let resp = match resp_fut.await {
@@ -498,6 +521,14 @@ async fn relay(
     };
     let (mut rparts, up_body) = resp.into_parts();
     ctx.set_status(seq, rparts.status.as_u16());
+
+    // Capture the response head, rendered from the framed status + headers. Teed ahead of the
+    // reflection masking below, like the HTTP/1.1 path: the capture masks its own buffers at filing
+    // time, so what is stored is masked either way, and what the cage receives is decided by
+    // `masks_reflection` alone.
+    if let Some(c) = &capture {
+        c.push_response(&capture_response_head(rparts.status, &rparts.headers));
+    }
 
     // Response-side leak backstop: a configured secret can only re-enter the cage by being
     // *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores and
@@ -532,24 +563,86 @@ async fn relay(
         Ok(s) => s,
         Err(_) => return,
     };
+    // The response body is relayed inline (awaited here), so its sink is finished by the time the
+    // guard files and needs no source-end tracking. Under the headers-only level no sink is handed
+    // over at all: an HTTP/2 head is its own frame, so unlike a byte stream there is nothing to read
+    // past, and not one body byte is ever buffered.
+    let res_sink = capture
+        .as_ref()
+        .filter(|c| c.keeps_body())
+        .map(|c| c.response_sink());
     if masks_reflection {
-        let _ = relay_body_redacting(up_body, client_send_body, &ctx.redactions).await;
+        let _ = relay_body_redacting(up_body, client_send_body, &ctx.redactions, res_sink).await;
     } else {
-        let _ = relay_body(up_body, client_send_body).await;
+        let _ = relay_body(up_body, client_send_body, res_sink).await;
     }
+}
+
+/// Render a client HTTP/2 request head as text for the traffic capture.
+///
+/// HTTP/2 carries a head as HPACK-compressed pseudo-headers, so there is no wire form to copy the
+/// way the HTTP/1.1 path copies the client's own bytes — it is rendered here instead. The
+/// pseudo-headers keep their real names (`:authority`, never a synthesized `Host:`), so a reader is
+/// never shown a fiction of an HTTP/1.1 request that was not sent.
+fn capture_request_head<B>(req: &Request<B>) -> Vec<u8> {
+    let mut out = format!(
+        "{} {} HTTP/2\r\n",
+        req.method(),
+        req.uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+    );
+    if let Some(authority) = req.uri().authority() {
+        out.push_str(":authority: ");
+        out.push_str(authority.as_str());
+        out.push_str("\r\n");
+    }
+    append_headers(&mut out, req.headers());
+    out.into_bytes()
+}
+
+/// Render an HTTP/2 response head as text for the traffic capture, terminated by the blank line the
+/// capture's response split looks for. HTTP/2 has no reason phrase, so the status line carries the
+/// code alone rather than a plausible-looking phrase nothing sent.
+fn capture_response_head(status: StatusCode, headers: &http::HeaderMap) -> Vec<u8> {
+    let mut out = format!("HTTP/2 {}\r\n", status.as_u16());
+    append_headers(&mut out, headers);
+    out.into_bytes()
+}
+
+/// Append `name: value` lines plus the terminating blank line. A header value is bytes, not text, so
+/// a non-UTF-8 one is rendered lossily rather than dropping the header from the capture.
+fn append_headers(out: &mut String, headers: &http::HeaderMap) {
+    for (name, value) in headers.iter() {
+        out.push_str(name.as_str());
+        out.push_str(": ");
+        out.push_str(&String::from_utf8_lossy(value.as_bytes()));
+        out.push_str("\r\n");
+    }
+    out.push_str("\r\n");
 }
 
 /// Relay one h2 body (DATA frames + trailers) from `src` to `dst`, honoring flow control. Used
 /// for both the request (client → upstream) and the response (upstream → client). The trailers
 /// carry the gRPC status, so they are forwarded when present, else the stream is ended with an
 /// empty final DATA frame.
+///
+/// `cap` is the traffic capture's sink for this direction, when the launch captures bodies: each
+/// frame is copied into it as it is relayed (bounded by the sink's own cap, so a large body costs a
+/// fixed amount). The source is reported exhausted only when the DATA loop ends of its own accord —
+/// never on the error or downstream-reset exits, where what was captured really is a prefix.
 async fn relay_body(
     mut src: h2::RecvStream,
     mut dst: h2::SendStream<Bytes>,
+    cap: Option<Arc<CapBuf>>,
 ) -> Result<(), h2::Error> {
     while let Some(chunk) = src.data().await {
         let chunk = chunk?;
         let len = chunk.len();
+        if let Some(cap) = &cap {
+            cap.push(&chunk);
+        }
         if len > 0 {
             dst.reserve_capacity(len);
             loop {
@@ -567,6 +660,10 @@ async fn relay_body(
         }
         // Return the consumed window to the sender so it can keep sending.
         let _ = src.flow_control().release_capacity(len);
+    }
+    // The DATA stream ended on its own: everything this direction will ever carry has been captured.
+    if let Some(cap) = &cap {
+        cap.mark_source_ended();
     }
     match src.trailers().await? {
         Some(trailers) => dst.send_trailers(trailers)?,
@@ -591,10 +688,16 @@ async fn relay_body_redacting(
     mut src: h2::RecvStream,
     mut dst: h2::SendStream<Bytes>,
     needles: &[SecretNeedle],
+    cap: Option<Arc<CapBuf>>,
 ) -> Result<(), h2::Error> {
     while let Some(chunk) = src.data().await {
         let chunk = chunk?;
         let len = chunk.len();
+        // Captured before the masking, like the HTTP/1.1 path: the capture ring masks whatever it
+        // stores at filing time, over whole buffers rather than per frame.
+        if let Some(cap) = &cap {
+            cap.push(&chunk);
+        }
         let mut buf = chunk.to_vec();
         redact_in_place(&mut buf, needles);
         let sent = send_masked(&mut dst, buf).await?;
@@ -603,6 +706,9 @@ async fn relay_body_redacting(
         if !sent {
             return Ok(());
         }
+    }
+    if let Some(cap) = &cap {
+        cap.mark_source_ended();
     }
     match src.trailers().await? {
         Some(mut trailers) => {
@@ -720,5 +826,49 @@ mod tests {
         redact_header_map(&mut headers, &needles);
         assert_eq!(headers["x-echo"], "before-*********-after");
         assert_eq!(headers["x-clean"], "nothing to see");
+    }
+
+    /// An HTTP/2 head has no wire form to copy, so the capture renders it. The rendering must show
+    /// the pseudo-headers under their real names: presenting `:authority` as an HTTP/1.1 `Host:`
+    /// would be a fiction the reader cannot detect, and the point of a capture is that what it shows
+    /// is what crossed.
+    #[test]
+    fn a_captured_h2_request_head_shows_the_pseudo_headers_as_themselves() {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://api.example.com/pkg.Svc/Method?x=1")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .unwrap();
+        let rendered = String::from_utf8(capture_request_head(&req)).unwrap();
+        assert_eq!(
+            rendered,
+            "POST /pkg.Svc/Method?x=1 HTTP/2\r\n\
+             :authority: api.example.com\r\n\
+             content-type: application/grpc\r\n\
+             te: trailers\r\n\r\n"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("host:"),
+            "no synthesized Host: header may appear: {rendered:?}"
+        );
+    }
+
+    /// The response head carries the status code with no reason phrase, because HTTP/2 has none —
+    /// and it ends on the blank line the capture's head/body split looks for.
+    #[test]
+    fn a_captured_h2_response_head_has_no_invented_reason_phrase() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("content-type", "application/grpc".parse().unwrap());
+        let rendered = String::from_utf8(capture_response_head(StatusCode::OK, &headers)).unwrap();
+        assert_eq!(
+            rendered,
+            "HTTP/2 200\r\ncontent-type: application/grpc\r\n\r\n"
+        );
+        assert!(
+            !rendered.contains("OK\r\n"),
+            "HTTP/2 sends no reason phrase, so none is shown: {rendered:?}"
+        );
     }
 }

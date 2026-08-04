@@ -575,10 +575,23 @@ pub(crate) fn start(
         }
     }
 
+    // The traffic capture (`[network] capture`), off unless a trusted layer asked for it. It holds
+    // the same needles the proxy redacts with, so every captured byte is masked on the way in.
+    let capture_level = policy.capture_level();
+    let capture = capture_level.captures().then(|| {
+        Arc::new(super::control::CaptureRing::new(
+            super::control::CaptureCaps::new(capture_level, policy.capture_body_kb()),
+            redactions.clone(),
+        ))
+    });
+
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_injections(injections)
         .with_redactions(redactions)
         .with_app(app.map(str::to_string));
+    if let Some(capture) = &capture {
+        ctx = ctx.with_capture(capture.clone());
+    }
     if let Some(wiring) = notify {
         ctx = ctx.with_notifier(Arc::clone(&wiring.notifier));
     }
@@ -612,8 +625,16 @@ pub(crate) fn start(
         // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.
         let control_listener = UnixListener::bind(&control_uds)?;
         let control_log = log.clone();
+        let control_capture = capture.clone();
         std::thread::spawn(move || {
-            let _ = super::control::serve(control_listener, pending, manual, control_log, flows);
+            let _ = super::control::serve(
+                control_listener,
+                pending,
+                manual,
+                control_log,
+                flows,
+                control_capture,
+            );
         });
         Some(control_uds)
     };

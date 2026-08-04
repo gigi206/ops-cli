@@ -140,6 +140,7 @@ pub(crate) fn read_log(
     after: Option<u64>,
     after_amend: Option<u64>,
     include_muted: bool,
+    with_capture: bool,
 ) -> io::Result<LogSnapshot> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -157,13 +158,20 @@ pub(crate) fn read_log(
     if include_muted {
         cmd.push_str(" all");
     }
+    // `--with-headers`/`--with-body` — ask for the captured traffic. A session that captures nothing
+    // simply sends no `cap` lines, so the request is always safe to make.
+    if with_capture {
+        cmd.push_str(" capture");
+    }
     cmd.push('\n');
     (&stream).write_all(cmd.as_bytes())?;
     (&stream).flush()?;
     let mut events = Vec::new();
+    let mut captures: Vec<Capture> = Vec::new();
     let mut dropped = 0;
     let mut head = 0;
     let mut amend_head = 0;
+    let mut capture_evicted = 0;
     for line in BufReader::new(&stream).lines() {
         let line = line?;
         if line == "ok" {
@@ -175,8 +183,20 @@ pub(crate) fn read_log(
             head = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("amended=") {
             amend_head = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("capture-evicted=") {
+            capture_evicted = v.parse().unwrap_or(0);
         } else if let Some(ev) = parse_event_line(&line) {
             events.push(ev);
+        } else if let Some((seq, part, bytes)) = parse_capture_line(&line) {
+            // Parts of one exchange arrive as consecutive lines; fold them into a single capture.
+            let entry = match captures.iter_mut().find(|c| c.seq == seq) {
+                Some(c) => c,
+                None => {
+                    captures.push(Capture::new(seq));
+                    captures.last_mut().expect("just pushed")
+                }
+            };
+            *entry.part_mut(part) = bytes;
         }
     }
     Ok(LogSnapshot {
@@ -184,17 +204,51 @@ pub(crate) fn read_log(
         dropped,
         head,
         amend_head,
+        captures,
+        capture_evicted,
     })
+}
+
+/// Parse one `cap seq=<n> part=<p> trunc=<0|1> b64=<…>` line into the part it carries. Anything
+/// malformed — a missing field, an unknown part, bytes that do not decode — yields `None`, so a
+/// capture is dropped rather than rendered as garbage.
+fn parse_capture_line(line: &str) -> Option<(u64, CapturePart, CaptureBytes)> {
+    let rest = line.strip_prefix("cap ")?;
+    let (mut seq, mut part, mut truncated, mut bytes) = (None, None, false, None);
+    for token in rest.split(' ') {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "seq" => seq = value.parse::<u64>().ok(),
+            "part" => part = CapturePart::parse(value),
+            "trunc" => truncated = value == "1",
+            "b64" => bytes = base64_decode(value),
+            _ => {}
+        }
+    }
+    Some((
+        seq?,
+        part?,
+        CaptureBytes {
+            bytes: bytes?,
+            truncated,
+        },
+    ))
 }
 
 /// Discover every reachable session's recent egress events: glob the control sockets, parse each
 /// filename's pid, and query it (with an optional per-nothing tail read — a shared cursor makes no
 /// sense across sessions, whose sequence spaces are independent). A dead/stale socket is skipped.
 /// Sessions are returned ordered by pid for stable output.
-pub(crate) fn log_all(data_dir: &Path, include_muted: bool) -> Vec<SessionLog> {
+pub(crate) fn log_all(data_dir: &Path, include_muted: bool, with_capture: bool) -> Vec<SessionLog> {
     let mut sessions = Vec::new();
     for pid in session_pids(data_dir) {
-        if let Ok(snapshot) = read_log(&control_socket(data_dir, pid), None, None, include_muted) {
+        if let Ok(snapshot) = read_log(
+            &control_socket(data_dir, pid),
+            None,
+            None,
+            include_muted,
+            with_capture,
+        ) {
             sessions.push(SessionLog { pid, snapshot });
         }
     }
@@ -335,6 +389,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         status,
         // Amend bookkeeping is server-side; a parsed (client-side) event never carries it.
         amend_seq: None,
+        awaiting_capture: false,
     })
 }
 
@@ -593,6 +648,45 @@ mod tests {
     }
 
     #[test]
+    fn capture_lines_round_trip_through_the_wire_including_binary_and_padding() {
+        let mut cap = Capture::new(9);
+        cap.req_head = CaptureBytes {
+            bytes: b"POST /v1?a=b HTTP/1.1\r\nhost: api.test\r\n".to_vec(),
+            truncated: false,
+        };
+        cap.injected = CaptureBytes {
+            bytes: b"authorization".to_vec(),
+            truncated: false,
+        };
+        // A body of every byte value: the encoding must survive NULs, newlines, and `=` alike.
+        cap.res_body = CaptureBytes {
+            bytes: (0..=255u8).collect(),
+            truncated: true,
+        };
+        let wire = super::super::format_capture_lines(&cap);
+
+        let mut back = Capture::new(9);
+        let mut lines = 0;
+        for line in wire.lines() {
+            let (seq, part, bytes) =
+                parse_capture_line(line).expect("every emitted line must parse back");
+            assert_eq!(seq, 9);
+            *back.part_mut(part) = bytes;
+            lines += 1;
+        }
+        assert_eq!(lines, 3, "one line per non-empty part");
+        assert_eq!(back, cap, "the whole capture round-trips byte for byte");
+    }
+
+    #[test]
+    fn a_malformed_capture_line_is_dropped_rather_than_rendered_as_garbage() {
+        assert!(parse_capture_line("cap seq=1 part=req-head trunc=0 b64=!!!!").is_none());
+        assert!(parse_capture_line("cap part=req-head trunc=0 b64=aGk=").is_none());
+        assert!(parse_capture_line("cap seq=1 part=nope trunc=0 b64=aGk=").is_none());
+        assert!(parse_capture_line("event seq=1 host=a.test").is_none());
+    }
+
+    #[test]
     fn format_and_parse_flow_line_round_trip() {
         let f = FlowSnapshot {
             host: "example.test".into(),
@@ -648,6 +742,7 @@ mod tests {
             // A captured upstream status round-trips on the wire alongside the query path.
             status: Some(200),
             amend_seq: None,
+            awaiting_capture: false,
         };
         let line = format_event_line(&ev);
         let parsed = parse_event_line(line.trim()).expect("a well-formed line parses");
@@ -674,6 +769,7 @@ mod tests {
             muted: false,
             status: None,
             amend_seq: None,
+            awaiting_capture: false,
         };
         let parsed = parse_event_line(format_event_line(&bare).trim()).unwrap();
         assert_eq!(
@@ -708,6 +804,7 @@ mod tests {
                 muted: verdict == LogVerdict::Deny,
                 status: None,
                 amend_seq: None,
+                awaiting_capture: false,
             };
             let parsed = parse_event_line(format_event_line(&ev).trim()).unwrap();
             assert_eq!(

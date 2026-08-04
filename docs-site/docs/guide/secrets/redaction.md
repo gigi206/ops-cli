@@ -66,6 +66,91 @@ the stream, so a coincidental collision *within* a target host's response would
 be masked too, entropy and the 8-byte floor make that vanishingly unlikely, and
 it is confined to the one host.
 
+## The traffic capture is masked unconditionally
+
+[`[network] capture`](../networking/observability#seeing-the-traffic-network-capture)
+retains what an inspected exchange carried, so `sbx net logs --with-body` can show it.
+That is a third place a secret could surface, and it is masked on a **stricter** rule
+than the inbound case above:
+
+- **Every capture, from every host.** Unlike inbound masking (scoped to
+  injection-target responses, because it mutates a stream the cage will read), a capture
+  is not a stream anyone consumes: masking it costs nothing and is applied to all of it.
+- **Masked on the way in, at a single door.** The bytes are masked *before* they are
+  stored, so the ring never holds a credential, and no reader can forget to mask.
+- **Over whole buffers.** The masking sees a finished part rather than each socket read,
+  so a value straddling two reads is one contiguous run by then and is masked exactly.
+
+A credential **sbx injects** never enters a capture at all: the head recorded is the
+client's own as it stood before the injection, and the injected headers appear by **name**
+only (`authorization: <injected by sbx>`).
+
+A WebSocket's messages are **decompressed before they are masked** when the peers
+negotiated `permessage-deflate`, so a secret inside a compressed message is masked out of
+the capture like any other. That is narrower than it sounds: it holds for the capture,
+because the capture holds decoded plaintext. On the wire, a compressed payload is not a
+verbatim needle, so the encoding residual below still applies there.
+
+### A WebSocket: masked in the capture, not on the wire
+
+A capture covers a WebSocket's messages too, and they are masked at the same door as
+everything else. Be precise about what that does and does not mean: the **relay** does not
+mask frames. Once a tunnel is open the framed bytes are relayed verbatim, so a secret a peer
+reflects inside a frame **reaches the cage as it was sent** — inbound masking, above, covers
+HTTP responses, not frames. What is masked is the copy `sbx net logs` shows you. Masking the
+wire would mean rewriting the relayed stream (decode, mask, re-frame, re-mask) on the one
+path that has to stay a byte-exact pipe, so the structural controls below carry that case,
+as they do for anything a byte scan cannot reach.
+
+## Seeing a tripwire fire
+
+Both directions are observable from the host, with the ordinary egress surfaces.
+
+An outbound block is a **security block**, not a policy refusal, so it appears under
+the `blocked` column rather than `deny`:
+
+```sh
+sbx net logs --verdict blocked -f          # as it happens, on a running session
+sbx net stats                              # after the fact, per host
+sbx net stats --json | jq -r '.stats[] | select(.blocked>0) | "\(.blocked)\t\(.host)"'
+```
+
+That distinction is the point of the column: a `deny` is the allowlist working as
+configured, while a `blocked` means a guard stopped something the policy would
+otherwise have let through. In the cage, the same event is a plain `403`:
+
+```console
+$ curl -sS -o /dev/null -w '%{http_code}\n' https://api.example.com/v1/echo \
+    -H "X-Copy: $SOME_TOKEN"
+403
+```
+
+A short secret disables the outbound half at launch, loudly, rather than silently
+scanning nothing:
+
+```
+sbx: warning: the secret for `Authorization` is too short (6 bytes) to redact from outbound
+     requests safely; outbound leak-blocking is disabled for it (the injection still applies)
+```
+
+Inbound masking is visible in the response itself: an upstream that echoes the header
+back returns an equal-length run of `*`, so the framing is intact and only the value
+is gone.
+
+```console
+$ curl -sS https://api.example.com/v1/whoami
+{"seen_authorization":"Bearer ****************************************"}
+```
+
+And in a [capture](../networking/observability#seeing-the-traffic-network-capture), an
+sbx-injected credential is named rather than valued, because the recorded head is the
+client's own, taken before injection:
+
+```sh
+sbx net logs --with-headers --host api.example.com
+#   > authorization: <injected by sbx>
+```
+
 ## Honest scope: these are backstops, not the boundary
 
 Both tripwires are **byte-exact**. They catch a secret sent or reflected
@@ -78,23 +163,23 @@ The actual guarantee is structural, and it is the trio you should rely on:
 1. **Empty netns**: the cage has no route of its own; its only egress is the
    host proxy.
 2. **The egress allowlist**: the cage can only reach the hosts the policy
-   permits. See [../networking/modes.md](../networking/modes).
+   permits. See [Network modes](../networking/modes).
 3. **Host/`to` bounding**: a credential is injected only toward its one concrete
    destination host, never anywhere else.
 
 The tripwires reduce the *naive verbatim* leak in both directions; the three
 structural controls are what make exfiltration to an *arbitrary* host impossible.
 And the source-side lever still dominates: a tightly scoped secret is worth less
-if it does leak. See the resolver guidance in [resolvers.md](resolvers).
+if it does leak. See the resolver guidance in [Resolvers](resolvers).
 
 ## See also
 
-- [injection.md](injection): the broker whose injected header these tripwires
+- [Injection](injection): the broker whose injected header these tripwires
   guard, and the reflecting-upstream residual.
-- [README.md](/): the never-in-cage invariant and least-privilege at the
+- [Secrets architecture](../secrets/): the never-in-cage invariant and least-privilege at the
   source.
-- [../networking/modes.md](../networking/modes): the empty-netns + allowlist
+- [Network modes](../networking/modes): the empty-netns + allowlist
   boundary the tripwires sit behind.
-- [https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture.md](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture): the
+- [`bwrap-secrets-architecture.md`](https://github.com/gigi206/ops-cli/blob/ops-v2/docs/bwrap-secrets-architecture.md): the
   design's honest residuals (reflecting upstream, encoding-evasion, masking's
   limits).

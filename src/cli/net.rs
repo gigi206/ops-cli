@@ -1187,6 +1187,20 @@ struct LogView {
     /// tagged `muted`. They live in a separate ring and are still counted in `sbx net stats`; the
     /// default view omits them.
     all: bool,
+    /// `--with-headers`: show each exchange's request and response heads, when the session captured
+    /// them (`[network] capture`).
+    with_headers: bool,
+    /// `--with-body`: show the captured bodies too — implies `--with-headers`, since a body without
+    /// its head names nothing.
+    with_body: bool,
+}
+
+impl LogView {
+    /// Whether this view needs the captured traffic — the single predicate the reader and the
+    /// renderer branch on, so the two can never disagree about whether to ask for it.
+    fn wants_capture(&self) -> bool {
+        self.with_headers || self.with_body
+    }
 }
 
 /// Parse `sbx net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
@@ -1205,6 +1219,12 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
             Some("--all") => v.all = true,
             Some("--with-query") => v.with_query = true,
             Some("--with-status") => v.with_status = true,
+            Some("--with-headers") => v.with_headers = true,
+            // A body is unreadable without the head that names it, so `--with-body` turns both on.
+            Some("--with-body") => {
+                v.with_body = true;
+                v.with_headers = true;
+            }
             Some("--follow") | Some("-f") => v.follow = true,
             Some("-i") | Some("--interval") => {
                 let val = it.next().ok_or("`--interval` needs a value in seconds")?;
@@ -1267,11 +1287,12 @@ fn collect_logs(
     data_dir: &Path,
     app: Option<&str>,
     include_muted: bool,
+    with_capture: bool,
 ) -> (
     Vec<sandbox::control::SessionLog>,
     Vec<(u32, PathBuf, String)>,
 ) {
-    let mut sessions = sandbox::control::log_all(data_dir, include_muted);
+    let mut sessions = sandbox::control::log_all(data_dir, include_muted, with_capture);
     if let Some(name) = app {
         let pids = session_pids_for_app(data_dir, name);
         sessions.retain(|s| pids.contains(&s.pid));
@@ -1348,7 +1369,12 @@ fn net_logs(args: &[OsString]) -> ExitCode {
         return net_logs_follow(&data_dir, &view, &pal);
     }
 
-    let (sessions, context) = collect_logs(&data_dir, view.app.as_deref(), view.all);
+    let (sessions, context) = collect_logs(
+        &data_dir,
+        view.app.as_deref(),
+        view.all,
+        view.wants_capture(),
+    );
 
     if view.json {
         let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
@@ -1363,7 +1389,8 @@ fn net_logs(args: &[OsString]) -> ExitCode {
                 filtered_log_events(&s.snapshot.events, view)
                     .into_iter()
                     .map(move |e| {
-                        log_event_json(e, s.pid, project.as_deref(), label.as_deref(), view)
+                        let cap = capture_of(&s.snapshot, e.seq, view);
+                        log_event_json(e, s.pid, project.as_deref(), label.as_deref(), view, cap)
                     })
                     .collect::<Vec<_>>()
             })
@@ -1411,7 +1438,12 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     // Seed: the current listing (human render, or NDJSON of the retained events), respecting `-n`.
     // Only actual events are written — the one-shot's "nothing to show" line is skipped, so a follow
     // that pipes to `head` on an idle session emits no spurious line then spins.
-    let (sessions, context) = collect_logs(data_dir, view.app.as_deref(), view.all);
+    let (sessions, context) = collect_logs(
+        data_dir,
+        view.app.as_deref(),
+        view.all,
+        view.wants_capture(),
+    );
     let has_events = sessions
         .iter()
         .any(|s| !filtered_log_events(&s.snapshot.events, view).is_empty());
@@ -1426,6 +1458,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                     c.as_ref().map(|(p, _)| p.as_str()),
                     c.as_ref().map(|(_, l)| l.as_str()),
                     view,
+                    capture_of(&s.snapshot, e.seq, view),
                 );
                 let _ = writeln!(seed, "{obj}");
             }
@@ -1478,9 +1511,11 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
         for pid in pids {
             let entry = cursor.get(&pid).copied();
             let after = entry.map(|(seq, _)| seq);
-            // Request retroactive status re-emission only under `--with-status` — otherwise a status
-            // filling in is invisible and re-showing the line would be pure duplication.
-            let after_amend = if view.with_status {
+            // Request retroactive re-emission only when something amended is actually shown — a
+            // status under `--with-status`, or the traffic under `--with-headers`/`--with-body`.
+            // Otherwise the completion is invisible and re-showing the line would be pure
+            // duplication. Both arrive as ONE amendment per exchange, so an event is re-shown once.
+            let after_amend = if view.with_status || view.wants_capture() {
                 entry.map(|(_, amend)| amend)
             } else {
                 None
@@ -1490,6 +1525,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                 after,
                 after_amend,
                 view.all,
+                view.wants_capture(),
             ) else {
                 continue; // a session that vanished mid-read is handled next tick
             };
@@ -1524,6 +1560,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                             c.as_ref().map(|(p, _)| p.as_str()),
                             c.as_ref().map(|(_, l)| l.as_str()),
                             view,
+                            capture_of(&snap, e.seq, view),
                         );
                         let _ = writeln!(tick, "{obj}");
                     } else {
@@ -1543,6 +1580,9 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                             last_pid = Some(pid);
                         }
                         let _ = writeln!(tick, "{}", render_log_line(e, pid, view, pal));
+                        if let Some(cap) = capture_of(&snap, e.seq, view) {
+                            tick.push_str(&render_capture(cap, view, pal));
+                        }
                     }
                 }
             }
@@ -1649,8 +1689,34 @@ fn render_logs(
                 "    {dim}({evicted} earlier event(s) evicted from the ring){r}"
             );
         }
+        // The capture ring is bounded on its own (a byte budget), so an exchange can be listed with
+        // its traffic already evicted — say so rather than let a missing body read as "none sent".
+        if view.wants_capture() && session.snapshot.capture_evicted > 0 {
+            let _ = writeln!(
+                o,
+                "    {dim}({} earlier capture(s) evicted — the capture budget is bounded){r}",
+                session.snapshot.capture_evicted
+            );
+        }
         for e in events {
             let _ = writeln!(o, "{}", render_log_line(e, session.pid, view, pal));
+            if let Some(cap) = capture_of(&session.snapshot, e.seq, view) {
+                o.push_str(&render_capture(cap, view, pal));
+            }
+        }
+        // Asked for traffic and this session has none at all: say why rather than print the same
+        // listing as without the flag, which reads as "nothing was sent". Both causes are named,
+        // because the reader cannot tell them apart from here: a session that does not capture, and
+        // a capturing session none of whose exchanges had traffic to keep (every one refused, or a
+        // `tcp://` splice, which never has a head to read).
+        if view.wants_capture() && session.snapshot.captures.is_empty() {
+            let _ = writeln!(
+                o,
+                "    {dim}(no captured traffic here — either this session is not capturing (set \
+                 `[network] capture = \"bodies\"`, or launch with \
+                 `--config '[network] capture = \"bodies\"'`), or nothing it did carried any: a \
+                 refused request and a `tcp://` splice never do){r}"
+            );
         }
     }
     if footer {
@@ -1741,6 +1807,119 @@ fn render_log_line(
     )
 }
 
+/// The capture belonging to event `seq` in `snapshot`, or `None` when the view did not ask for one
+/// or the session retained none for that exchange.
+fn capture_of<'a>(
+    snapshot: &'a sandbox::control::LogSnapshot,
+    seq: u64,
+    view: &LogView,
+) -> Option<&'a sandbox::control::Capture> {
+    view.wants_capture()
+        .then(|| snapshot.captures.iter().find(|c| c.seq == seq))
+        .flatten()
+}
+
+/// Render one exchange's captured traffic as an indented block under its event line: `>` lines for
+/// what the cage sent, `<` lines for what came back — the direction convention `curl -v` uses.
+/// Bodies appear only under `--with-body`; a part that was cut is marked, never trimmed in silence.
+/// The marker names the fact rather than a cause: a part is cut when it reached its cap, and also
+/// when the exchange was filed while more was still arriving (an HTTP/2 request body whose pump is
+/// still running). Every configured secret was masked out of these bytes by the session that
+/// captured them.
+fn render_capture(cap: &sandbox::control::Capture, view: &LogView, pal: &style::Palette) -> String {
+    use sandbox::control::CapturePart;
+    use std::fmt::Write as _;
+    let (dim, n, r) = (pal.dim, pal.name, pal.reset);
+    let mut o = String::new();
+    for (part, bytes) in cap.parts() {
+        // A WebSocket's frames are payload like a body, so they answer to the same flag: `--with-headers`
+        // alone shows the handshake, and the transcript needs `--with-body`.
+        let body = matches!(
+            part,
+            CapturePart::ReqBody | CapturePart::ResBody | CapturePart::WsUp | CapturePart::WsDown
+        );
+        if body && !view.with_body {
+            continue;
+        }
+        let arrow = match part {
+            CapturePart::ReqHead
+            | CapturePart::Injected
+            | CapturePart::ReqBody
+            | CapturePart::WsUp => ">",
+            CapturePart::ResHead | CapturePart::ResBody | CapturePart::WsDown => "<",
+        };
+        if part == CapturePart::Injected {
+            // The names of the credentials sbx added for the upstream. Their values are never
+            // captured, so name them rather than let the head read as the whole of what was sent.
+            for name in String::from_utf8_lossy(&bytes.bytes).lines() {
+                let _ = writeln!(
+                    o,
+                    "      {dim}{arrow}{r} {n}{name}{r}{dim}: <injected by sbx>{r}"
+                );
+            }
+            continue;
+        }
+        for line in render_bytes(&bytes.bytes) {
+            let _ = writeln!(o, "      {dim}{arrow}{r} {line}");
+        }
+        if bytes.truncated {
+            let _ = writeln!(
+                o,
+                "      {dim}{arrow} … truncated, more followed ({} byte(s) shown){r}",
+                bytes.bytes.len()
+            );
+        }
+    }
+    o
+}
+
+/// The lines to print for one captured part: its text, split on newlines with control characters
+/// escaped, or a single summary line when the bytes are not text at all (a compressed or binary
+/// body, which would otherwise print as noise). Trailing blank lines are dropped — an HTTP head's
+/// terminator would render as one.
+fn render_bytes(bytes: &[u8]) -> Vec<String> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    if !is_mostly_text(bytes) {
+        return vec![format!("<{} byte(s) of binary data>", bytes.len())];
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|l| {
+            l.chars()
+                .map(|c| match c {
+                    '\r' => String::new(),
+                    '\t' => "    ".to_string(),
+                    c if c.is_control() => format!("\\x{:02x}", c as u32),
+                    c => c.to_string(),
+                })
+                .collect()
+        })
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// Whether `bytes` read as text worth printing: valid UTF-8 (up to a trailing partial character,
+/// which a capped capture will often end on) with no NUL and few control bytes. A gzip or protobuf
+/// body fails this and is summarized instead.
+fn is_mostly_text(bytes: &[u8]) -> bool {
+    if bytes.contains(&0) {
+        return false;
+    }
+    let printable = bytes
+        .iter()
+        .filter(|b| !b.is_ascii_control() || matches!(b, b'\n' | b'\r' | b'\t'))
+        .count();
+    // A body is text if nearly all of it is; the slack covers UTF-8 continuation bytes, which are
+    // non-ASCII rather than control and so already count as printable.
+    printable * 10 >= bytes.len() * 9
+}
+
 /// One event as a JSON object (for `--json` and the `--follow` NDJSON stream). Epoch-ms is a number
 /// (it fits u64); the path honors `--with-query`. The `status` field is included only under
 /// `--with-status` (a number for a completed L7 request, else null) — parity with `--with-query`.
@@ -1751,6 +1930,7 @@ fn log_event_json(
     project: Option<&str>,
     label: Option<&str>,
     view: &LogView,
+    capture: Option<&sandbox::control::Capture>,
 ) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "pid": pid,
@@ -1776,7 +1956,50 @@ fn log_event_json(
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null);
     }
+    if view.wants_capture() {
+        // The captured traffic, present only when the session retained some for this exchange.
+        // Each part carries its bytes **base64-encoded**: a body is arbitrary binary (and may be
+        // compressed), so encoding it is the only lossless choice — a lossy-UTF8 string field would
+        // silently corrupt what the consumer is inspecting.
+        obj["capture"] = match capture {
+            Some(cap) => capture_json(cap, view),
+            None => serde_json::Value::Null,
+        };
+    }
     obj
+}
+
+/// One capture as a JSON object: one field per non-empty part, each `{"b64": …, "truncated": bool}`,
+/// plus `injected` as a plain list of header names (never values). Bodies and a WebSocket's frames
+/// are included only under `--with-body`, matching the human view.
+fn capture_json(cap: &sandbox::control::Capture, view: &LogView) -> serde_json::Value {
+    use sandbox::control::CapturePart;
+    let mut obj = serde_json::Map::new();
+    for (part, bytes) in cap.parts() {
+        let body = matches!(
+            part,
+            CapturePart::ReqBody | CapturePart::ResBody | CapturePart::WsUp | CapturePart::WsDown
+        );
+        if body && !view.with_body {
+            continue;
+        }
+        if part == CapturePart::Injected {
+            let names: Vec<&str> = std::str::from_utf8(&bytes.bytes)
+                .unwrap_or_default()
+                .lines()
+                .collect();
+            obj.insert("injected".into(), serde_json::json!(names));
+            continue;
+        }
+        obj.insert(
+            part.as_str().replace('-', "_"),
+            serde_json::json!({
+                "b64": sandbox::control::base64_encode(&bytes.bytes),
+                "truncated": bytes.truncated,
+            }),
+        );
+    }
+    serde_json::Value::Object(obj)
 }
 
 /// `sbx net rules [--source config|builtin|session] [--filter <substr>] [--json]`: list the effective
@@ -3535,7 +3758,225 @@ mod tests {
             muted: false,
             status: None,
             amend_seq: None,
+            awaiting_capture: false,
         }
+    }
+
+    /// A capture fixture: a POST exchange with both heads, both bodies, and one injected header.
+    fn log_capture(seq: u64) -> sandbox::control::Capture {
+        let part = |b: &[u8], truncated: bool| sandbox::control::CaptureBytes {
+            bytes: b.to_vec(),
+            truncated,
+        };
+        let mut cap = sandbox::control::Capture::new(seq);
+        cap.req_head = part(
+            b"POST /v1/messages HTTP/1.1\r\nhost: api.test\r\ncontent-type: application/json\r\n",
+            false,
+        );
+        cap.injected = part(b"authorization", false);
+        cap.req_body = part(br#"{"prompt":"hi"}"#, false);
+        cap.res_head = part(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n",
+            false,
+        );
+        cap.res_body = part(br#"{"reply":"pong"}"#, true);
+        cap
+    }
+
+    #[test]
+    fn asking_for_traffic_from_a_session_that_does_not_capture_says_so() {
+        let pal = style::Palette::plain();
+        let sessions = vec![sandbox::control::SessionLog {
+            pid: 42,
+            snapshot: sandbox::control::LogSnapshot {
+                events: vec![log_event(
+                    1,
+                    "api.test",
+                    Some("GET"),
+                    Some("/"),
+                    sandbox::control::LogVerdict::Allow,
+                    "allowed",
+                )],
+                dropped: 0,
+                head: 1,
+                amend_head: 0,
+                captures: Vec::new(),
+                capture_evicted: 0,
+            },
+        }];
+        let view = LogView {
+            with_headers: true,
+            with_body: true,
+            ..LogView::default()
+        };
+        let out = render_logs(&sessions, &[], &view, &pal, false);
+        assert!(
+            out.contains("no captured traffic here"),
+            "an empty capture must be explained, not read as an empty exchange: {out}"
+        );
+        // Both causes are named: a session that does not capture, and one whose exchanges simply
+        // carried nothing to keep. Claiming only the first would be wrong for a capturing session
+        // whose every request was refused.
+        assert!(
+            out.contains("not capturing") && out.contains("nothing it did carried any"),
+            "the note must not assert a cause it cannot know: {out}"
+        );
+        // Without the flags the note never appears.
+        let plain = render_logs(&sessions, &[], &LogView::default(), &pal, false);
+        assert!(!plain.contains("captured traffic"), "{plain}");
+    }
+
+    #[test]
+    fn render_capture_shows_each_direction_and_marks_the_truncation() {
+        let pal = style::Palette::plain();
+        let view = LogView {
+            with_headers: true,
+            with_body: true,
+            ..LogView::default()
+        };
+        let out = render_capture(&log_capture(1), &view, &pal);
+        assert!(
+            out.contains("> POST /v1/messages HTTP/1.1"),
+            "the request head is shown with the outbound marker: {out}"
+        );
+        assert!(
+            out.contains("> authorization: <injected by sbx>"),
+            "an injected header is named, never valued: {out}"
+        );
+        assert!(out.contains(r#"> {"prompt":"hi"}"#), "{out}");
+        assert!(out.contains("< HTTP/1.1 200 OK"), "{out}");
+        assert!(out.contains(r#"< {"reply":"pong"}"#), "{out}");
+        assert!(
+            out.contains("truncated, more followed"),
+            "a cut body says so rather than reading as complete: {out}"
+        );
+    }
+
+    /// A WebSocket's transcript renders with the same direction markers as an HTTP exchange, and
+    /// answers to the same flag as a body: the frames ARE the payload, so `--with-headers` alone
+    /// shows the handshake and withholds them.
+    #[test]
+    fn a_websocket_transcript_renders_per_direction_and_only_under_with_body() {
+        let pal = style::Palette::plain();
+        let part = |b: &[u8]| sandbox::control::CaptureBytes {
+            bytes: b.to_vec(),
+            truncated: false,
+        };
+        let mut cap = sandbox::control::Capture::new(1);
+        cap.req_head = part(b"GET /chat HTTP/1.1\r\nhost: api.test\r\n");
+        cap.res_head = part(b"HTTP/1.1 101 Switching Protocols\r\n");
+        cap.ws_up = part(br#"{"from":"cage"}"#);
+        cap.ws_down = part(br#"{"from":"server"}"#);
+
+        let full = render_capture(
+            &cap,
+            &LogView {
+                with_headers: true,
+                with_body: true,
+                ..LogView::default()
+            },
+            &pal,
+        );
+        assert!(
+            full.contains(r#"> {"from":"cage"}"#),
+            "the cage's frames carry the outbound marker: {full}"
+        );
+        assert!(
+            full.contains(r#"< {"from":"server"}"#),
+            "the upstream's carry the inbound one: {full}"
+        );
+
+        let heads_only = render_capture(
+            &cap,
+            &LogView {
+                with_headers: true,
+                ..LogView::default()
+            },
+            &pal,
+        );
+        assert!(
+            heads_only.contains("101 Switching Protocols"),
+            "the handshake still shows: {heads_only}"
+        );
+        assert!(
+            !heads_only.contains("from"),
+            "but the transcript is payload, so it waits for --with-body: {heads_only}"
+        );
+    }
+
+    #[test]
+    fn with_headers_alone_shows_the_heads_and_withholds_both_bodies() {
+        let pal = style::Palette::plain();
+        let view = LogView {
+            with_headers: true,
+            ..LogView::default()
+        };
+        let out = render_capture(&log_capture(1), &view, &pal);
+        assert!(out.contains("> POST /v1/messages HTTP/1.1"));
+        assert!(out.contains("< HTTP/1.1 200 OK"));
+        assert!(
+            !out.contains("prompt") && !out.contains("reply"),
+            "no payload without --with-body: {out}"
+        );
+    }
+
+    #[test]
+    fn with_body_implies_with_headers_and_both_ask_the_session_for_the_capture() {
+        let osv = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
+        let v = parse_log_args(&osv(&["--with-body"])).unwrap();
+        assert!(
+            v.with_body && v.with_headers,
+            "a body needs its head to read"
+        );
+        assert!(v.wants_capture());
+        let h = parse_log_args(&osv(&["--with-headers"])).unwrap();
+        assert!(h.wants_capture() && !h.with_body);
+        assert!(
+            !parse_log_args(&osv(&[])).unwrap().wants_capture(),
+            "an ordinary listing never asks for traffic"
+        );
+    }
+
+    #[test]
+    fn a_binary_body_is_summarized_rather_than_printed_as_noise() {
+        // A gzip magic header plus NUL bytes — not text, and printing it would corrupt a terminal.
+        let binary = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xfe];
+        let lines = render_bytes(&binary);
+        assert_eq!(lines, vec!["<10 byte(s) of binary data>"]);
+        // Real text still renders as text, with the head's trailing blank line dropped.
+        assert_eq!(
+            render_bytes(b"HTTP/1.1 200 OK\r\nx: 1\r\n\r\n"),
+            vec!["HTTP/1.1 200 OK", "x: 1"]
+        );
+    }
+
+    #[test]
+    fn capture_json_encodes_bodies_base64_so_binary_survives_the_round_trip() {
+        let view = LogView {
+            with_headers: true,
+            with_body: true,
+            ..LogView::default()
+        };
+        let j = capture_json(&log_capture(1), &view);
+        assert_eq!(
+            j["injected"],
+            serde_json::json!(["authorization"]),
+            "injected headers are names only"
+        );
+        let b64 = j["res_body"]["b64"].as_str().unwrap();
+        assert_eq!(
+            sandbox::control::base64_decode(b64).unwrap(),
+            br#"{"reply":"pong"}"#.to_vec(),
+            "the body decodes back byte for byte"
+        );
+        assert_eq!(j["res_body"]["truncated"], serde_json::json!(true));
+        // Without --with-body the bodies are absent from JSON too, matching the human view.
+        let heads_only = LogView {
+            with_headers: true,
+            ..LogView::default()
+        };
+        let j = capture_json(&log_capture(1), &heads_only);
+        assert!(j.get("res_body").is_none() && j.get("req_body").is_none());
     }
 
     #[test]
@@ -3687,11 +4128,11 @@ mod tests {
         );
 
         // JSON: the `status` key is present only under `--with-status` (a number, or null).
-        let j_off = log_event_json(&ok, 7, None, None, &off);
+        let j_off = log_event_json(&ok, 7, None, None, &off, None);
         assert!(j_off.get("status").is_none(), "no status key by default");
-        let j_on = log_event_json(&ok, 7, None, None, &on);
+        let j_on = log_event_json(&ok, 7, None, None, &on, None);
         assert_eq!(j_on["status"], serde_json::json!(200));
-        let j_raw = log_event_json(&raw, 7, None, None, &on);
+        let j_raw = log_event_json(&raw, 7, None, None, &on, None);
         assert_eq!(
             j_raw["status"],
             serde_json::Value::Null,
@@ -3736,7 +4177,7 @@ mod tests {
                 "the {tok} transport shows in the line: {line}"
             );
             assert_eq!(
-                log_event_json(ev, 7, None, None, &view)["proto"],
+                log_event_json(ev, 7, None, None, &view, None)["proto"],
                 serde_json::json!(tok),
                 "the JSON proto field names the {tok} transport"
             );
@@ -3746,7 +4187,7 @@ mod tests {
         let mut other = log_event(4, "", None, None, Blocked, "bad-request");
         other.proto = Proto::Other;
         assert_eq!(
-            log_event_json(&other, 7, None, None, &view)["proto"],
+            log_event_json(&other, 7, None, None, &view, None)["proto"],
             serde_json::json!("-")
         );
     }
@@ -3777,7 +4218,7 @@ mod tests {
             "version suffix in the line: {line}"
         );
         assert!(line.contains("grpc"), "rpc tag in the line: {line}");
-        let j = log_event_json(&h2, 7, None, None, &view);
+        let j = log_event_json(&h2, 7, None, None, &view, None);
         assert_eq!(j["http_version"], serde_json::json!("h2"));
         assert_eq!(j["rpc"], serde_json::json!("grpc"));
 
@@ -3800,7 +4241,7 @@ mod tests {
             !line.contains("/h1") && !line.contains("/h2"),
             "no version suffix when unknown: {line}"
         );
-        let j = log_event_json(&plain, 7, None, None, &view);
+        let j = log_event_json(&plain, 7, None, None, &view, None);
         assert_eq!(j["http_version"], serde_json::Value::Null);
         assert_eq!(j["rpc"], serde_json::Value::Null);
     }
@@ -3890,6 +4331,8 @@ mod tests {
                 dropped: 0,
                 head: 3,
                 amend_head: 0,
+                captures: Vec::new(),
+                capture_evicted: 0,
             },
         }];
         let context = vec![(
@@ -3974,6 +4417,8 @@ mod tests {
             dropped: 0,
             head: 4002,
             amend_head: 0,
+            captures: Vec::new(),
+            capture_evicted: 0,
         };
         assert_eq!(snapshot_evicted(&snapshot), 4000);
         // …a fresh ring (seqs from 1) reports none.
@@ -3989,6 +4434,8 @@ mod tests {
             dropped: 0,
             head: 1,
             amend_head: 0,
+            captures: Vec::new(),
+            capture_evicted: 0,
         };
         assert_eq!(snapshot_evicted(&fresh), 0);
 

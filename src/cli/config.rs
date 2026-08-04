@@ -466,6 +466,8 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             deny,
             mute,
             http2,
+            capture,
+            capture_max_kb,
             builtin,
         } => {
             let _ = writeln!(
@@ -488,6 +490,22 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     style::dim_prose(
                         "ask notice: off (parked requests are silent — answer via \
                          `sbx net pending`)",
+                        pal
+                    )
+                );
+            }
+            // A traffic capture retains the plaintext of every inspected exchange, so it is always
+            // stated — never a silent property of a launch.
+            if capture != "off" {
+                let cap = match capture_max_kb {
+                    Some(kb) => format!("capture: {capture} (up to {kb} KiB per body)"),
+                    None => format!("capture: {capture}"),
+                };
+                let _ = writeln!(
+                    o,
+                    "    {}",
+                    style::dim_prose(
+                        &format!("{cap} — read it with `sbx net logs --with-body`"),
                         pal
                     )
                 );
@@ -1146,6 +1164,8 @@ fn render_app_detail(
             deny,
             mute,
             http2,
+            capture,
+            capture_max_kb,
             builtin,
         } => {
             let _ = writeln!(
@@ -1163,6 +1183,22 @@ fn render_app_detail(
                     style::dim_prose(
                         "ask notice: off (parked requests are silent — answer via \
                          `sbx net pending`)",
+                        pal
+                    )
+                );
+            }
+            // A traffic capture retains the plaintext of every inspected exchange, so it is always
+            // stated — never a silent property of a launch.
+            if capture != "off" {
+                let cap = match capture_max_kb {
+                    Some(kb) => format!("capture: {capture} (up to {kb} KiB per body)"),
+                    None => format!("capture: {capture}"),
+                };
+                let _ = writeln!(
+                    o,
+                    "    {}",
+                    style::dim_prose(
+                        &format!("{cap} — read it with `sbx net logs --with-body`"),
                         pal
                     )
                 );
@@ -2179,6 +2215,8 @@ mod tests {
                 deny: vec!["evil.com".into()],
                 mute: vec![],
                 http2: vec![],
+                capture: "off".to_string(),
+                capture_max_kb: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
@@ -2376,6 +2414,8 @@ mod tests {
                 deny: vec![],
                 mute: vec![],
                 http2: vec![],
+                capture: "off".to_string(),
+                capture_max_kb: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Global,

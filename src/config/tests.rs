@@ -108,6 +108,8 @@ fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
     NetworkField::Table(NetworkTable {
         mute: vec![],
         http2: vec![],
+        capture: None,
+        capture_max_kb: None,
         mode: Some(mode.into()),
         allow: allow.iter().map(|s| s.to_string()).collect(),
         deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -181,6 +183,8 @@ fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
         deny: vec![],
         mute: vec!["@telemetry".into(), "telemetry.example.com".into()],
         http2: vec![],
+        capture: None,
+        capture_max_kb: None,
         ask_timeout: None,
         ask_notice: None,
         stats: None,
@@ -495,6 +499,8 @@ fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some("deny".to_string()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -725,6 +731,8 @@ fn an_untrusted_project_app_cannot_widen_its_default_methods() {
     let net = NetworkField::Table(NetworkTable {
         mute: vec![],
         http2: vec![],
+        capture: None,
+        capture_max_kb: None,
         mode: Some("deny".into()),
         allow: vec!["x.com".into()],
         deny: vec![],
@@ -865,6 +873,8 @@ fn network_modes_set_the_egress_default_action() {
         NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some(mode.into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -940,6 +950,8 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
         NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: None,
             allow: vec!["api.foo.com".to_string()],
             deny: vec![],
@@ -996,6 +1008,8 @@ fn a_mode_less_project_network_table_inherits_the_global_mode() {
         network: Some(NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: None,
             allow: vec!["api.proj.com".to_string()],
             deny: vec![],
@@ -1032,6 +1046,8 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
                 http2: vec![],
+                capture: None,
+                capture_max_kb: None,
                 mode: None,
                 allow: vec!["api.app.com".to_string()],
                 deny: vec![],
@@ -1063,6 +1079,8 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
         NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some("deny".into()),
             allow: vec!["cache.nixos.org".into()],
             deny: vec![],
@@ -1090,12 +1108,158 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
 }
 
 #[test]
+fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_typo() {
+    use crate::sandbox::control::CaptureLevel;
+    let capture_table = |level: Option<&str>, kb: Option<u64>| {
+        NetworkField::Table(NetworkTable {
+            mute: vec![],
+            http2: vec![],
+            capture: level.map(str::to_string),
+            capture_max_kb: kb,
+            mode: Some("deny".into()),
+            allow: vec!["api.example.com".into()],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+            dns_cache_ttl: None,
+        })
+    };
+    let mut w = Vec::new();
+
+    // Unset → off, and nothing is captured.
+    let def = validate_network(&mut w, GLOBAL_CONFIG, capture_table(None, None)).unwrap();
+    assert!(matches!(&def, NetworkPolicy::Allowlist(p)
+            if p.capture_level() == CaptureLevel::Off));
+    assert!(w.is_empty());
+
+    // Each level flows through, carrying its per-body cap.
+    let heads =
+        validate_network(&mut w, GLOBAL_CONFIG, capture_table(Some("headers"), None)).unwrap();
+    assert!(matches!(&heads, NetworkPolicy::Allowlist(p)
+            if p.capture_level() == CaptureLevel::Headers));
+    let bodies = validate_network(
+        &mut w,
+        GLOBAL_CONFIG,
+        capture_table(Some("bodies"), Some(64)),
+    )
+    .unwrap();
+    assert!(matches!(&bodies, NetworkPolicy::Allowlist(p)
+            if p.capture_level() == CaptureLevel::Bodies && p.capture_body_kb() == 64));
+    assert!(w.is_empty(), "valid values warn nothing: {w:?}");
+
+    // A typo does NOT silently pick a level: the capture stays off and the miss is named.
+    let typo = validate_network(&mut w, GLOBAL_CONFIG, capture_table(Some("body"), None)).unwrap();
+    assert!(
+        matches!(&typo, NetworkPolicy::Allowlist(p) if p.capture_level() == CaptureLevel::Off),
+        "an unknown level fails closed"
+    );
+    assert_eq!(w.len(), 1);
+    assert!(w[0].contains("unknown capture level"), "{w:?}");
+}
+
+/// The capture rides the `[network]` table, so it inherits that table's trust gate: an untrusted
+/// project cannot start capturing its own traffic. Teeth: the SAME table, from a trusted vs an
+/// untrusted project, must give opposite answers.
+#[test]
+fn an_untrusted_project_cannot_turn_the_capture_on() {
+    use crate::sandbox::control::CaptureLevel;
+    let project = || RawConfig {
+        network: Some(NetworkField::Table(NetworkTable {
+            mute: vec![],
+            http2: vec![],
+            capture: Some("bodies".into()),
+            capture_max_kb: None,
+            mode: Some("deny".into()),
+            allow: vec!["api.example.com".into()],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+            dns_cache_ttl: None,
+        })),
+        ..RawConfig::default()
+    };
+    let level_of = |network: &NetworkPolicy| match network {
+        NetworkPolicy::Allowlist(p) => p.capture_level(),
+        _ => panic!("a filtering posture is expected"),
+    };
+
+    // A global baseline that already filters but captures nothing, so a dropped project table falls
+    // back to a comparable posture rather than to "no network policy at all".
+    let global = || RawConfig {
+        network: Some(NetworkField::Table(NetworkTable {
+            mute: vec![],
+            http2: vec![],
+            capture: None,
+            capture_max_kb: None,
+            mode: Some("deny".into()),
+            allow: vec!["api.example.com".into()],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+            dns_cache_ttl: None,
+        })),
+        ..RawConfig::default()
+    };
+
+    let trusted = resolve_no_plugins(global(), Some((project(), TrustState::Trusted)));
+    assert_eq!(
+        level_of(&trusted.network),
+        CaptureLevel::Bodies,
+        "a trusted project may capture its own traffic"
+    );
+
+    let untrusted = resolve_no_plugins(global(), Some((project(), TrustState::Untrusted)));
+    assert_eq!(
+        level_of(&untrusted.network),
+        CaptureLevel::Off,
+        "an untrusted project's whole `[network]` table drops, capture included"
+    );
+}
+
+/// The `capture` field must stay a `[network]` key. Written after a `[table]` header in a TOML file
+/// it would fold into that table and be silently lost, so this parses the real text and asserts the
+/// field arrives where the launcher reads it.
+#[test]
+fn capture_parses_as_a_network_field_not_a_stray_key() {
+    use crate::sandbox::control::CaptureLevel;
+    let toml = r#"
+[network]
+mode = "deny"
+capture = "bodies"
+capture_max_kb = 32
+allow = ["api.example.com"]
+"#;
+    let raw = crate::config::schema::parse(toml.as_bytes()).expect("the config parses");
+    let mut w = Vec::new();
+    let resolved = validate_network(
+        &mut w,
+        GLOBAL_CONFIG,
+        raw.network.expect("a `[network]` table is present"),
+    )
+    .expect("the table resolves");
+    let NetworkPolicy::Allowlist(p) = &resolved else {
+        panic!("a filtering posture is expected")
+    };
+    assert_eq!(p.capture_level(), CaptureLevel::Bodies);
+    assert_eq!(p.capture_body_kb(), 32);
+    assert!(w.is_empty(), "a well-formed table warns nothing: {w:?}");
+}
+
+#[test]
 fn ask_mode_parses_and_carries_an_optional_timeout() {
     use crate::allowlist::DefaultAction;
     let ask_table = |timeout: Option<&str>| {
         NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some("ask".into()),
             allow: vec![],
             deny: vec![],
@@ -1135,6 +1299,8 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
     let moot = NetworkField::Table(NetworkTable {
         mute: vec![],
         http2: vec![],
+        capture: None,
+        capture_max_kb: None,
         mode: Some("deny".into()),
         allow: vec![],
         deny: vec![],
@@ -1158,6 +1324,8 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
         NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some("ask".into()),
             allow: vec![],
             deny: vec![],
@@ -1189,6 +1357,8 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
     let moot = NetworkField::Table(NetworkTable {
         mute: vec![],
         http2: vec![],
+        capture: None,
+        capture_max_kb: None,
         mode: Some("deny".into()),
         allow: vec![],
         deny: vec![],
@@ -2524,6 +2694,8 @@ fn a_baseline_default_methods_is_ignored_with_a_warning() {
         network: Some(NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some("deny".into()),
             allow: vec!["h.test".into()],
             deny: vec![],
@@ -4540,6 +4712,8 @@ fn an_unknown_network_mode_is_dropped_with_a_warning() {
             network: Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
                 http2: vec![],
+                capture: None,
+                capture_max_kb: None,
                 mode: Some("bogus".into()),
                 allow: vec![],
                 deny: vec![],
@@ -4646,6 +4820,8 @@ fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConf
         network: Some(NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some("deny".into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],
@@ -5173,6 +5349,8 @@ fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
         network: Some(NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some("deny".into()),
             allow: vec!["github.com".into()],
             deny: vec![],
@@ -5231,6 +5409,8 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
         Some(NetworkField::Table(NetworkTable {
             mute: vec![],
             http2: vec![],
+            capture: None,
+            capture_max_kb: None,
             mode: Some("deny".into()),
             allow: vec!["api.example.com".into()],
             deny: vec![],
@@ -5311,6 +5491,8 @@ fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
     Some(NetworkField::Table(NetworkTable {
         mute: vec![],
         http2: vec![],
+        capture: None,
+        capture_max_kb: None,
         mode: Some("deny".into()),
         allow: allow.iter().map(|s| s.to_string()).collect(),
         deny: vec![],

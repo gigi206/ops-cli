@@ -1,0 +1,490 @@
+//! What the egress proxy's forwarding paths cost, measured rather than reasoned about.
+//!
+//! Every measurement here drives the **real** serve loop over a real Unix socket, with real TLS on
+//! both sides — the same code an in-cage request takes. Nothing is stubbed, so a number here moves
+//! when the forwarding path moves.
+//!
+//! Two axes, because they are bounded by different things:
+//!
+//! - **Per request** ([`per_request_cost`]): connection setup dominates, and today every request
+//!   opens its own tunnel and its own upstream connection. This is what a workload issuing many
+//!   small requests (a package fetch, an API-chatty agent) pays.
+//! - **Per byte** ([`bulk_throughput`]): the copies and the scans the relay performs on a large
+//!   body. This is what a workload moving data pays.
+//!
+//! **Read every figure as CPU cost on one machine with a loopback upstream.** There is no network
+//! round trip in any of it, so the connection-setup share reported here is a *floor*: against a real
+//! host, each setup additionally costs its round trips, which are one to two orders of magnitude
+//! larger than the CPU. A change that looks marginal on these numbers can still be decisive on a
+//! real link.
+//!
+//! They are `#[ignore]`d: they take seconds, they report rather than assert, and a throughput figure
+//! is not a pass/fail property. Run them explicitly, in release — a debug rustls measures the
+//! compiler's inlining, not the design:
+//!
+//! ```sh
+//! CARGO_PROFILE_RELEASE_LTO=false cargo test --release --bins -- --ignored --nocapture bench
+//! ```
+
+use super::ca::CertResolver;
+use super::*;
+use crate::allowlist::{classify, EgressPolicy};
+use crate::testutil::TmpDir;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::thread;
+use std::time::Instant;
+
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
+};
+
+/// How many requests a per-request measurement issues. Large enough that a stray scheduling hiccup
+/// does not dominate, small enough that the whole file runs in seconds.
+const REQUESTS: usize = 200;
+
+/// The body one bulk measurement moves through the relay, in bytes. Sized well past any buffer or
+/// capture cap so the steady-state copy cost is what is being timed, not the ramp.
+const BULK_BYTES: usize = 96 * 1024 * 1024;
+
+/// A policy allowing exactly the given entries.
+fn policy(entries: &[&str]) -> EgressPolicy {
+    EgressPolicy::new(
+        entries.iter().map(|e| classify(e).unwrap()).collect(),
+        vec![],
+    )
+}
+
+/// A loopback TLS upstream that serves `conns` connections, one request each, replying with
+/// `head` followed by `body`. It mirrors what the proxy expects of a real upstream: a
+/// `Connection: close` response terminated by EOF.
+fn spawn_tls_upstream(
+    conns: usize,
+    head: String,
+    body: Arc<Vec<u8>>,
+) -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for _ in 0..conns {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let cfg = server_config.clone();
+            let head = head.clone();
+            let body = body.clone();
+            // One thread per connection: the measurement is of the proxy, so the upstream must
+            // never be the queue the client waits behind.
+            thread::spawn(move || {
+                let Ok(conn) = ServerConnection::new(cfg) else {
+                    return;
+                };
+                let mut tls = StreamOwned::new(conn, sock);
+                if read_head(&mut tls).is_err() {
+                    return;
+                }
+                let _ = tls.write_all(head.as_bytes());
+                let _ = tls.write_all(&body);
+                let _ = tls.flush();
+            });
+        }
+    });
+    (addr, ca_der, handle)
+}
+
+/// The cleartext twin of [`spawn_tls_upstream`], for isolating what the path costs with no TLS
+/// anywhere: the difference between the two is the price of the two handshakes.
+fn spawn_plain_upstream(conns: usize, head: String, body: Arc<Vec<u8>>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for _ in 0..conns {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let head = head.clone();
+            let body = body.clone();
+            thread::spawn(move || {
+                if read_head(&mut sock).is_err() {
+                    return;
+                }
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(&body);
+                let _ = sock.flush();
+            });
+        }
+    });
+    addr
+}
+
+/// Read the proxy's cleartext `CONNECT` reply, up to and including the blank line. Nothing may be
+/// read past it: what follows is the client's own TLS.
+fn read_until_blank(sock: &mut UnixStream) -> io::Result<String> {
+    let mut out = String::new();
+    let mut byte = [0u8; 1];
+    while !out.ends_with("\r\n\r\n") && !out.ends_with("\n\n") {
+        match sock.read(&mut byte)? {
+            0 => break,
+            _ => out.push(byte[0] as char),
+        }
+    }
+    Ok(out)
+}
+
+/// Read a request head up to the blank line, discarding it.
+fn read_head<S: Read>(src: &mut S) -> io::Result<()> {
+    let mut br = BufReader::new(src);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match br.read_line(&mut line) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Err(e) => return Err(e),
+            Ok(_) if line == "\r\n" || line == "\n" => return Ok(()),
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Start the real serve loop on its own Unix socket and return the path (with the directory that
+/// owns it, which must outlive the measurement).
+fn serve_on_uds(ctx: Arc<ProxyCtx>) -> (TmpDir, std::path::PathBuf) {
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let _ = serve(listener, ctx);
+    });
+    (dir, path)
+}
+
+/// The client-side TLS config for talking to the proxy's minted leaves.
+///
+/// Session resumption is **off** on purpose: in the cage each request typically comes from its own
+/// short-lived process (a `curl`, a `nix` fetch), which starts with an empty session cache. Leaving
+/// rustls's default cache on would let one long-lived client resume with itself and report a
+/// handshake cost no in-cage caller actually sees.
+fn client_config(proxy_ca: CertificateDer<'static>) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots.add(proxy_ca).unwrap();
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.resumption = rustls::client::Resumption::disabled();
+    Arc::new(cfg)
+}
+
+/// One inspected HTTPS request through the proxy, exactly as a cage client makes it: connect the
+/// socket, `CONNECT`, handshake against the minted leaf, send the request, read to EOF. Returns the
+/// number of response bytes read.
+fn one_https_request(
+    sock_path: &std::path::Path,
+    client_cfg: Arc<ClientConfig>,
+    host: &str,
+    port: u16,
+    request: &[u8],
+) -> io::Result<usize> {
+    let mut sock = UnixStream::connect(sock_path)?;
+    write!(sock, "CONNECT {host}:{port} HTTP/1.1\r\n\r\n")?;
+    sock.flush()?;
+    let established = read_until_blank(&mut sock)?;
+    assert!(
+        established.contains("200 Connection established"),
+        "CONNECT not accepted: {established:?}"
+    );
+    let name = ServerName::try_from(host.to_string()).unwrap();
+    let conn = ClientConnection::new(client_cfg, name).map_err(io::Error::other)?;
+    let mut tls = StreamOwned::new(conn, sock);
+    tls.write_all(request)?;
+    tls.flush().ok();
+    drain(&mut tls)
+}
+
+/// One cleartext (`http://`) request through the proxy: absolute-form, no `CONNECT`, no TLS.
+fn one_http_request(sock_path: &std::path::Path, request: &[u8]) -> io::Result<usize> {
+    let mut sock = UnixStream::connect(sock_path)?;
+    sock.write_all(request)?;
+    sock.flush()?;
+    drain(&mut sock)
+}
+
+/// One direct TLS request to the upstream, bypassing the proxy entirely — the floor a client pays
+/// for the same exchange with nothing inspecting it.
+fn one_direct_request(
+    addr: SocketAddr,
+    cfg: Arc<ClientConfig>,
+    host: &str,
+    request: &[u8],
+) -> io::Result<usize> {
+    let sock = TcpStream::connect(addr)?;
+    let name = ServerName::try_from(host.to_string()).unwrap();
+    let conn = ClientConnection::new(cfg, name).map_err(io::Error::other)?;
+    let mut tls = StreamOwned::new(conn, sock);
+    tls.write_all(request)?;
+    tls.flush().ok();
+    drain(&mut tls)
+}
+
+/// Read a stream to EOF, counting bytes and holding none of them — a bulk measurement moves more
+/// than fits comfortably in memory twice, and the client's own allocation is not what is timed.
+fn drain<S: Read>(src: &mut S) -> io::Result<usize> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0;
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(total),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Report one per-request figure.
+fn report_rate(label: &str, elapsed: Duration, requests: usize) {
+    let per = elapsed.as_secs_f64() / requests as f64;
+    println!(
+        "  {label:<44} {:>8.0} µs/req   {:>7.0} req/s",
+        per * 1e6,
+        1.0 / per
+    );
+}
+
+/// Report one throughput figure.
+fn report_rate_bytes(label: &str, elapsed: Duration, bytes: usize) {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "  {label:<44} {:>8.0} MiB/s   ({:.2} s for {:.0} MiB)",
+        mib / elapsed.as_secs_f64(),
+        elapsed.as_secs_f64(),
+        mib
+    );
+}
+
+const SMALL_BODY: &str = "{\"ok\":true}";
+
+/// The head of a small canned response.
+fn small_head() -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        SMALL_BODY.len()
+    )
+}
+
+/// What one small request costs, and where the cost sits.
+///
+/// Four figures, each isolating one layer:
+///
+/// 1. **direct TLS, no proxy** — one handshake and the exchange, the floor for an inspected design.
+/// 2. **cleartext through the proxy** — the whole forwarding path with no TLS at all: parsing, the
+///    verdict, the upstream dial, the relay.
+/// 3. **HTTPS through the proxy** — what a cage request actually pays today: two handshakes on top
+///    of (2), because both the tunnel and the upstream connection are opened per request.
+/// 4. **HTTPS with an upstream that resumes** — the proxy's upstream config is shared across
+///    requests, so rustls's session cache is warm after the first; this is the shipped behaviour,
+///    and (3) minus (4) is what resumption already saves.
+///
+/// The gap between (2) and (3) prices connection setup on this path. On loopback that gap is CPU
+/// alone; against a real host, add its round trips to every one of them.
+#[test]
+#[ignore = "a measurement, not an assertion: run explicitly, in release"]
+fn per_request_cost() {
+    println!("\nper-request cost ({REQUESTS} requests, loopback upstream, CPU only — no RTT)");
+    let body = Arc::new(SMALL_BODY.as_bytes().to_vec());
+    let request = b"GET /v1/thing HTTP/1.1\r\nHost: upstream.test\r\nAccept: */*\r\n\r\n";
+
+    // 1. Direct TLS to the upstream, nothing in the middle.
+    {
+        let (addr, up_ca, _h) = spawn_tls_upstream(REQUESTS, small_head(), body.clone());
+        let cfg = client_config(up_ca);
+        let started = Instant::now();
+        for _ in 0..REQUESTS {
+            one_direct_request(addr, cfg.clone(), "upstream.test", request).unwrap();
+        }
+        report_rate("direct TLS, no proxy", started.elapsed(), REQUESTS);
+    }
+
+    // 2. Cleartext through the proxy: every step of the path except TLS.
+    {
+        let addr = spawn_plain_upstream(REQUESTS, small_head(), body.clone());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["http://upstream.test:*"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let (_dir, path) = serve_on_uds(ctx);
+        let req = format!(
+            "GET http://upstream.test:{}/v1/thing HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+            addr.port()
+        );
+        let started = Instant::now();
+        for _ in 0..REQUESTS {
+            one_http_request(&path, req.as_bytes()).unwrap();
+        }
+        report_rate("cleartext through the proxy", started.elapsed(), REQUESTS);
+    }
+
+    // 3 & 4. HTTPS through the proxy, with the upstream session cache cold and warm.
+    for (label, resume) in [
+        ("HTTPS through the proxy, no upstream resume", false),
+        ("HTTPS through the proxy, upstream resumes", true),
+    ] {
+        let (addr, up_ca, _h) = spawn_tls_upstream(REQUESTS, small_head(), body.clone());
+        let mut roots = RootCertStore::empty();
+        roots.add(up_ca).unwrap();
+        let mut upstream_cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        if !resume {
+            upstream_cfg.resumption = rustls::client::Resumption::disabled();
+        }
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(Arc::new(upstream_cfg))
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let (_dir, path) = serve_on_uds(ctx);
+        let cfg = client_config(proxy_ca_der);
+        let started = Instant::now();
+        for _ in 0..REQUESTS {
+            one_https_request(&path, cfg.clone(), "upstream.test", addr.port(), request).unwrap();
+        }
+        report_rate(label, started.elapsed(), REQUESTS);
+    }
+}
+
+/// What one large response costs per byte, and what each inspection layer adds.
+///
+/// Four figures over the same body:
+///
+/// 1. **plain relay** — decrypt, copy, re-encrypt, with nothing inspecting the bytes.
+/// 2. **with the outbound-leak scan** — the response is scanned for configured secrets, which
+///    happens on every response from an injection-target host.
+/// 3. **with `capture = bodies`** — the tee that feeds `sbx net logs --with-body`, bounded by the
+///    capture cap, so this should converge on (1) once the cap fills.
+/// 4. **raw L4 splice** (`tcp://`) — no TLS termination and no inspection at all: the ceiling any
+///    inspected path is measured against.
+#[test]
+#[ignore = "a measurement, not an assertion: run explicitly, in release"]
+fn bulk_throughput() {
+    use crate::sandbox::control::{CaptureCaps, CaptureLevel, CaptureRing};
+
+    println!(
+        "\nbulk throughput ({} MiB per run, loopback upstream, CPU only — no RTT)",
+        BULK_BYTES / (1024 * 1024)
+    );
+    let body = Arc::new(vec![b'x'; BULK_BYTES]);
+    let head =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {BULK_BYTES}\r\nConnection: close\r\n\r\n");
+    let request = b"GET /bulk HTTP/1.1\r\nHost: upstream.test\r\nAccept: */*\r\n\r\n";
+
+    // A secret long enough to be scanned, chosen so it never occurs in the body.
+    let needles = vec![SecretNeedle::named(
+        "bench-token",
+        b"BENCH-SECRET-VALUE-0123456789".to_vec(),
+    )];
+    let injection = || HeaderInjection {
+        rule: classify("upstream.test").unwrap(),
+        header: "authorization".to_string(),
+        value: "Bearer BENCH-SECRET-VALUE-0123456789".to_string(),
+    };
+
+    for label in [
+        "plain relay",
+        "with the outbound-leak scan",
+        "with capture = bodies",
+    ] {
+        let (addr, up_ca, _h) = spawn_tls_upstream(1, head.clone(), body.clone());
+        let mut roots = RootCertStore::empty();
+        roots.add(up_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut ctx = ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        if label == "with the outbound-leak scan" {
+            ctx = ctx
+                .with_injections(vec![injection()])
+                .with_redactions(needles.clone());
+        }
+        if label == "with capture = bodies" {
+            ctx = ctx.with_capture(Arc::new(CaptureRing::new(
+                CaptureCaps::new(CaptureLevel::Bodies, 64),
+                vec![],
+            )));
+        }
+        let (_dir, path) = serve_on_uds(Arc::new(ctx));
+        let cfg = client_config(proxy_ca_der);
+        let started = Instant::now();
+        let read = one_https_request(&path, cfg, "upstream.test", addr.port(), request).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            read >= BULK_BYTES,
+            "{label}: the whole body must arrive, got {read} of {BULK_BYTES}"
+        );
+        report_rate_bytes(label, elapsed, BULK_BYTES);
+    }
+
+    // 4. The raw L4 splice: a `tcp://` rule, so the proxy never terminates TLS. The client speaks
+    //    straight to the upstream through the tunnel, which is what the splice is for.
+    {
+        let (addr, up_ca, _h) = spawn_tls_upstream(1, head.clone(), body.clone());
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&[&format!("tcp://upstream.test:{}", addr.port())]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let (_dir, path) = serve_on_uds(ctx);
+        let started = Instant::now();
+        let mut sock = UnixStream::connect(&path).unwrap();
+        write!(
+            sock,
+            "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
+            addr.port()
+        )
+        .unwrap();
+        sock.flush().unwrap();
+        let established = read_until_blank(&mut sock).unwrap();
+        assert!(
+            established.contains("200 Connection established"),
+            "CONNECT not accepted for the splice: {established:?}"
+        );
+        let cfg = client_config(up_ca);
+        let name = ServerName::try_from("upstream.test".to_string()).unwrap();
+        let conn = ClientConnection::new(cfg, name).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+        tls.write_all(request).unwrap();
+        tls.flush().ok();
+        let read = drain(&mut tls).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            read >= BULK_BYTES,
+            "splice: the whole body must arrive, got {read} of {BULK_BYTES}"
+        );
+        report_rate_bytes("raw L4 splice (tcp://), no inspection", elapsed, BULK_BYTES);
+    }
+}

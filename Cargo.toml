@@ -57,6 +57,12 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "io-
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
 zbus = { version = "5", default-features = false, features = ["async-io"] }
+# Raw DEFLATE, for reading a `permessage-deflate` WebSocket in the traffic capture: those
+# payloads are compressed on the wire, so without this the transcript of the very protocols
+# the capture exists for reads as binary. Pure Rust with no C, so the static musl build is
+# unaffected, and it decodes only the proxy's own copy — never anything it relays.
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+memchr = "2.8.3"
 
 [build-dependencies]
 # Hash the embedded engines (nix, bwrap) at build time (same crate as the runtime dep,

@@ -315,6 +315,7 @@ mod tests {
             muted: false,
             status: None,
             amend_seq: None,
+            awaiting_capture: false,
         }
     }
 

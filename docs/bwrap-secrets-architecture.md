@@ -245,6 +245,32 @@ transparently proxy).
   have exec escapes (`git -c …`, `tar --to-command`, `find -exec`, `awk`, …), so the
   egress allowlist, not the command list, is the load-bearing barrier for that tier.
 - **Capability is fully usable in-session**: scope the secret tightly at the source.
+- **The traffic capture is a fourth place a secret could surface.** `[network] capture`
+  retains the plaintext of an inspected exchange (heads, optionally the leading bytes
+  of each body, and a WebSocket's message payloads unmasked) in the launch process's
+  memory, so `sbx net logs --with-body` can show
+  what crossed. Three things keep the invariant: the capture ring has a **single** entry
+  point, which masks every configured needle before storing (over whole buffers, so a
+  needle split across two socket reads is still masked exactly); the request head recorded
+  is the **client's own** as it stood **before injection** (copied verbatim on HTTP/1.1,
+  rendered from the decoded pseudo-headers on HTTP/2, which carries no head bytes to
+  copy), so an injected credential never enters a capture and is noted by header *name*
+  only; and the whole feature is trusted-only,
+  off by default, host-memory-only (never on disk, never bound into the cage). The residual
+  is the same one the redaction layer already carries: an **encoded** or transformed secret
+  is not a verbatim needle and is therefore not masked, in a capture exactly as on the wire.
+
+  A WebSocket's messages are decoded before they are masked — unmasked, and inflated when
+  `permessage-deflate` was negotiated — so the encoding residual above does **not** apply to
+  a capture of one: the ring holds plaintext, and plaintext is what the needles are matched
+  against. The residual stays on the wire, where the bytes are still compressed.
+
+  One asymmetry is worth stating plainly rather than leaving to be inferred. A WebSocket's
+  frames are masked **in the capture** but not **on the wire**: once a tunnel is open the
+  relay is a byte-exact pipe, so a secret a peer reflects inside a frame reaches the cage as
+  it was sent. Masking it would mean rewriting the relayed stream (decode, mask, re-frame,
+  re-mask) on the one path whose whole contract is not to touch what crosses. The capture
+  decodes frames only to copy them aside; that copy is masked, the pipe is not.
 - **A `network = true` resolver gets unrestricted host egress.** A resolver plugin runs
   **host-side** (outside the agent's cage), so a manifest that declares `network = true`
   (to reach a remote secret-manager / KMS / third-party-vault engine) shares the host

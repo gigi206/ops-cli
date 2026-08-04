@@ -127,6 +127,11 @@ pub(crate) struct ProxyCtx {
     /// and consulted from the one [`Self::outcome_l7`] chokepoint, so a refusal site added later
     /// cannot forget to announce itself.
     pub(super) notifier: Option<Arc<crate::sandbox::notify_sink::Notifier>>,
+    /// The session's traffic capture (`[network] capture`), or `None` — the default — when nothing
+    /// is captured. Attached by [`crate::sandbox::egress::start`] via [`Self::with_capture`]; every
+    /// inspected forwarding path opens a capture through the one [`Self::begin_capture`] entry
+    /// point, so a path that does not ask for one simply captures nothing.
+    pub(super) capture: Option<Arc<crate::sandbox::control::CaptureRing>>,
 }
 
 impl ProxyCtx {
@@ -175,6 +180,7 @@ impl ProxyCtx {
             conns: AtomicUsize::new(0),
             app: None,
             notifier: None,
+            capture: None,
         })
     }
 
@@ -217,6 +223,36 @@ impl ProxyCtx {
     pub(crate) fn with_flows(mut self, flows: Arc<crate::sandbox::control::FlowRegistry>) -> Self {
         self.flows = Some(flows);
         self
+    }
+
+    /// Attach the session's traffic capture, so each inspected exchange files what it carried for
+    /// `sbx net logs --with-headers/--with-body`. Set by the launch
+    /// ([`crate::sandbox::egress::start`]) only when a **trusted** layer turned the capture on;
+    /// left unset nothing is ever buffered on the forwarding path.
+    pub(crate) fn with_capture(
+        mut self,
+        capture: Arc<crate::sandbox::control::CaptureRing>,
+    ) -> Self {
+        self.capture = Some(capture);
+        self
+    }
+
+    /// Open a capture for the permitted exchange logged as `seq`, or `None` when this launch does
+    /// not capture (or nothing was logged). The returned guard files the exchange when it is
+    /// dropped, however the relay ends — hold it for the exchange's lifetime.
+    ///
+    /// Call only for a *permitted* request: a refusal forwards nothing, so there is no traffic to
+    /// show, and the decision itself is already the log event.
+    pub(super) fn begin_capture(&self, seq: Option<u64>) -> Option<super::capture::CaptureGuard> {
+        let (capture, log, seq) = (self.capture.as_ref()?, self.log.as_ref()?, seq?);
+        // Tell the event ring a capture is coming, so an arriving status waits for it and the event
+        // is re-emitted exactly once with everything.
+        log.expect_capture(seq);
+        Some(super::capture::CaptureGuard::new(
+            capture.clone(),
+            log.clone(),
+            seq,
+        ))
     }
 
     /// Register a permitted tunnel in the live flow registry, returning its RAII guard — hold it for

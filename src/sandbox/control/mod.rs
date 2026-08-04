@@ -32,8 +32,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::allowlist::Rule;
 
+mod capture;
 mod client;
-// The host-side reader/querier is re-exported so callers keep reaching it as `control::…`.
+// The traffic capture and the host-side reader/querier are re-exported so callers keep reaching
+// them as `control::…`.
+pub(crate) use capture::*;
 pub(crate) use client::*;
 // Exercised by a server-side round-trip unit test (the server formats, the client parses).
 #[cfg(test)]
@@ -538,12 +541,17 @@ pub(crate) struct LogEvent {
     /// decision point. `None` for an L4 (`tcp://`) splice (no HTTP response to parse), a refusal, an
     /// `error` (no response), or a request whose response has not yet arrived.
     pub(crate) status: Option<u16>,
-    /// The amendment sequence at which [`LogRing::set_status`] filled in `status`, or `None` while
-    /// the status is unset. It is a SECOND monotonic cursor (distinct from `seq`): a `--follow`
-    /// reader that already passed this event's `seq` uses it to pick the event up again once its
-    /// status arrives, so `--with-status` is not blank in follow mode. Server-side only — never sent
-    /// over the wire (the reader tracks the ring's amend cursor from the `amended=` reply line).
+    /// The amendment sequence at which this event was last completed, or `None` while nothing has
+    /// amended it. It is a SECOND monotonic cursor (distinct from `seq`): a `--follow` reader that
+    /// already passed this event's `seq` uses it to pick the event up again once its status (and,
+    /// when captured, its traffic) arrives, so `--with-status` is not blank in follow mode.
+    /// Server-side only — never sent over the wire (the reader tracks the ring's amend cursor from
+    /// the `amended=` reply line).
     pub(crate) amend_seq: Option<u64>,
+    /// Whether a traffic capture is still being filled in for this exchange. While it is, an
+    /// arriving status fills the field but does **not** amend: the capture is what completes the
+    /// record, so the event is re-emitted exactly once, carrying everything. Server-side only.
+    pub(crate) awaiting_capture: bool,
 }
 
 /// The result of a `LOG` query: the events past the caller's cursor, how many fell off the ring
@@ -556,6 +564,12 @@ pub(crate) struct LogSnapshot {
     pub(crate) dropped: u64,
     pub(crate) head: u64,
     pub(crate) amend_head: u64,
+    /// The captured traffic for those of `events` that have a capture retained — empty unless the
+    /// reader asked for it (`--with-headers`/`--with-body`) and the launch captures at all.
+    pub(crate) captures: Vec<Capture>,
+    /// How many captures this session has evicted to stay inside its byte budget, so a reader can be
+    /// told its view is partial rather than inferring completeness from a missing body.
+    pub(crate) capture_evicted: u64,
 }
 
 /// A bounded ring of recent egress decisions, newest appended, oldest evicted past `cap`. Shared
@@ -634,6 +648,7 @@ impl LogRing {
             muted,
             status: None,
             amend_seq: None,
+            awaiting_capture: false,
         };
         // A muted refusal goes to its own ring so it can never evict a real event from `events`;
         // both rings share `self.cap` and the monotonic `seq`.
@@ -655,8 +670,55 @@ impl LogRing {
         let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
             ev.status = Some(status);
+            if ev.awaiting_capture {
+                // A capture is still being filled in for this exchange. Amending now would re-emit
+                // the event with a status but no traffic, and again once the capture lands — so hold
+                // the amendment for `capture_settled`, which fires exactly once.
+                return;
+            }
             // Stamp the amendment cursor so a follow reader that already passed this event's `seq`
             // re-reads it once (with its status now filled) on its next poll.
+            ev.amend_seq = Some(g.next_amend);
+            g.next_amend += 1;
+        }
+    }
+
+    /// Mark the event `seq` as having a traffic capture on the way, so an arriving status waits for
+    /// [`capture_settled`](LogRing::capture_settled) instead of amending on its own. Called right
+    /// after the event is pushed, only when the launch captures.
+    pub(crate) fn expect_capture(&self, seq: u64) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
+            ev.awaiting_capture = true;
+        }
+    }
+
+    /// Release the amendment held back for a pending capture. `filed` says whether a capture was
+    /// actually stored; with none, the event is amended only if a status is waiting to be shown (so
+    /// an exchange with nothing new is not re-emitted at all).
+    pub(crate) fn capture_settled(&self, seq: u64, filed: bool) {
+        let mut guard = self.inner.lock().unwrap();
+        let g = &mut *guard;
+        if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
+            ev.awaiting_capture = false;
+            if !filed && ev.status.is_none() {
+                return;
+            }
+            ev.amend_seq = Some(g.next_amend);
+            g.next_amend += 1;
+        }
+    }
+
+    /// Amend the event `seq` again because its capture grew after it was first settled — the one case
+    /// where an exchange is worth re-emitting twice.
+    ///
+    /// A WebSocket is that case and the only one: its handshake settles at the `101` (so the tunnel's
+    /// opening is visible while it is open), and the frames that cross afterwards are a second thing
+    /// to show. Every other exchange settles once and is never re-emitted again.
+    pub(crate) fn capture_grew(&self, seq: u64) {
+        let mut guard = self.inner.lock().unwrap();
+        let g = &mut *guard;
+        if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
             ev.amend_seq = Some(g.next_amend);
             g.next_amend += 1;
         }
@@ -711,6 +773,10 @@ impl LogRing {
             dropped,
             head,
             amend_head,
+            // The captures are attached by whoever serves this snapshot (the control dispatch reads
+            // them from the separate capture ring, and only when the reader asked for them).
+            captures: Vec::new(),
+            capture_evicted: 0,
         }
     }
 }
@@ -872,6 +938,7 @@ pub(crate) fn serve(
     manual: Arc<ManualRules>,
     log: Arc<LogRing>,
     flows: Arc<FlowRegistry>,
+    capture: Option<Arc<CaptureRing>>,
 ) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
@@ -879,8 +946,9 @@ pub(crate) fn serve(
         let manual = manual.clone();
         let log = log.clone();
         let flows = flows.clone();
+        let capture = capture.clone();
         std::thread::spawn(move || {
-            let _ = handle(stream, &state, &manual, &log, &flows);
+            let _ = handle(stream, &state, &manual, &log, &flows, capture.as_deref());
         });
     }
     Ok(())
@@ -907,13 +975,14 @@ fn handle(
     manual: &ManualRules,
     log: &LogRing,
     flows: &FlowRegistry,
+    capture: Option<&CaptureRing>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(CMD_MAX));
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let response = dispatch(line.trim(), state, manual, log, flows);
+    let response = dispatch(line.trim(), state, manual, log, flows, capture);
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
 }
@@ -938,6 +1007,7 @@ fn dispatch(
     manual: &ManualRules,
     log: &LogRing,
     flows: &FlowRegistry,
+    capture: Option<&CaptureRing>,
 ) -> String {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
@@ -1048,6 +1118,7 @@ fn dispatch(
             let mut after = None;
             let mut after_amend = None;
             let mut include_muted = false;
+            let mut want_capture = false;
             for token in parts {
                 if let Some(v) = token.strip_prefix("after=") {
                     after = v.parse().ok();
@@ -1056,6 +1127,10 @@ fn dispatch(
                 } else if token == "all" {
                     // `sbx net log --all` — fold the muted (`dontaudit`) ring into the view.
                     include_muted = true;
+                } else if token == "capture" {
+                    // `sbx net log --with-headers/--with-body` — attach the captured traffic. Sent
+                    // only when asked, so an ordinary listing never carries request/response bytes.
+                    want_capture = true;
                 }
             }
             let snapshot = log.snapshot(after, after_amend, include_muted);
@@ -1065,8 +1140,24 @@ fn dispatch(
             }
             out.push_str(&format!("head={}\n", snapshot.head));
             out.push_str(&format!("amended={}\n", snapshot.amend_head));
+            // Each event's capture (when one is retained) follows its own `event` line, so a reader
+            // attaches it without a second lookup and an older reader ignores the unknown lines.
+            let captures = match (want_capture, capture) {
+                (true, Some(ring)) => {
+                    let seqs: Vec<u64> = snapshot.events.iter().map(|e| e.seq).collect();
+                    let (found, evicted) = ring.get(&seqs);
+                    if evicted > 0 {
+                        out.push_str(&format!("capture-evicted={evicted}\n"));
+                    }
+                    found
+                }
+                _ => Vec::new(),
+            };
             for ev in &snapshot.events {
                 out.push_str(&format_event_line(ev));
+                if let Some(cap) = captures.iter().find(|c| c.seq == ev.seq) {
+                    out.push_str(&format_capture_lines(cap));
+                }
             }
             out.push_str("ok\n");
             out
@@ -1098,6 +1189,24 @@ fn format_flow_line(f: &FlowSnapshot) -> String {
         f.down,
         f.host,
     )
+}
+
+/// Format one capture as its control-wire lines — one per non-empty part, each following the
+/// `event` line it belongs to. The bytes travel base64-encoded (`b64=` last, since its padding is
+/// the one `=` a value can end with) because a captured body is arbitrary binary and the wire is
+/// line-based. `trunc=1` marks a part cut at its cap.
+fn format_capture_lines(cap: &Capture) -> String {
+    let mut out = String::new();
+    for (part, bytes) in cap.parts() {
+        out.push_str(&format!(
+            "cap seq={} part={} trunc={} b64={}\n",
+            cap.seq,
+            part.as_str(),
+            u8::from(bytes.truncated),
+            base64_encode(&bytes.bytes),
+        ));
+    }
+    out
 }
 
 /// Format one event as a control-wire line. Fields are `key=value` tokens split on their first `=`;
@@ -1302,7 +1411,7 @@ mod tests {
         let parked = thread::spawn(move || s.park("api.test", 8080, "/", None, 256, |_| {}));
         let seq = wait_for_one(&state);
         assert_eq!(
-            dispatch(&format!("ALLOW {seq}"), &state, &manual, &log, &flows),
+            dispatch(&format!("ALLOW {seq}"), &state, &manual, &log, &flows, None),
             "ok host=api.test count=1\n"
         );
         assert_eq!(parked.join().unwrap(), Verdict::Allow);
@@ -1321,12 +1430,13 @@ mod tests {
             &manual,
             &log,
             &flows,
+            None,
         );
         parked.join().unwrap();
         assert_eq!(manual.snapshot().0.len(), 1, "`… session` must remember");
         // And `RULES` reports the remembered rule with its exact port.
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows)
+            dispatch("RULES", &state, &manual, &log, &flows, None)
                 .contains("manual allow https://api.test:8080"),
             "RULES must list the remembered host:port"
         );
@@ -1343,22 +1453,29 @@ mod tests {
         // `RULES` reports it — the proactive `--session` path. It is accepted in any posture (the
         // proxy folds the overlay into its effective policy for every filtering posture).
         assert_eq!(
-            dispatch("REMEMBER ALLOW *.foo.test", &state, &manual, &log, &flows),
+            dispatch(
+                "REMEMBER ALLOW *.foo.test",
+                &state,
+                &manual,
+                &log,
+                &flows,
+                None
+            ),
             "ok\n"
         );
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows)
+            dispatch("RULES", &state, &manual, &log, &flows, None)
                 .contains("manual allow https://*.foo.test"),
             "REMEMBER must load the rule"
         );
 
         // A malformed rule (a `*` catch-all) and a missing kind/rule are `err bad-request`.
         assert_eq!(
-            dispatch("REMEMBER ALLOW *", &state, &manual, &log, &flows),
+            dispatch("REMEMBER ALLOW *", &state, &manual, &log, &flows, None),
             "err bad-request\n"
         );
         assert_eq!(
-            dispatch("REMEMBER ALLOW", &state, &manual, &log, &flows),
+            dispatch("REMEMBER ALLOW", &state, &manual, &log, &flows, None),
             "err bad-request\n"
         );
 
@@ -1370,7 +1487,8 @@ mod tests {
                 &state,
                 &manual,
                 &log,
-                &flows
+                &flows,
+                None
             ),
             "ok\n"
         );
@@ -1394,7 +1512,7 @@ mod tests {
         // …and `RULES` reports it as a `manual mute` line, so `sbx net rules --source session` lists
         // a live mute (distinct from the allow/deny lines).
         assert!(
-            dispatch("RULES", &state, &manual, &log, &flows)
+            dispatch("RULES", &state, &manual, &log, &flows, None)
                 .contains("manual mute https://play.googleapis.com"),
             "RULES must list a live mute"
         );
@@ -1457,7 +1575,7 @@ mod tests {
         g.up.fetch_add(100, Ordering::Relaxed);
         g.down.fetch_add(200, Ordering::Relaxed);
 
-        let resp = dispatch("FLOWS", &state, &manual, &log, &flows);
+        let resp = dispatch("FLOWS", &state, &manual, &log, &flows, None);
         assert!(resp.ends_with("ok\n"), "the reply ends with ok: {resp:?}");
         let parsed: Vec<FlowSnapshot> = resp.lines().filter_map(parse_flow_line).collect();
         assert_eq!(parsed.len(), 1, "one open flow is listed");
@@ -1469,7 +1587,10 @@ mod tests {
 
         // An empty registry lists no flow, just `ok`.
         drop(g);
-        assert_eq!(dispatch("FLOWS", &state, &manual, &log, &flows), "ok\n");
+        assert_eq!(
+            dispatch("FLOWS", &state, &manual, &log, &flows, None),
+            "ok\n"
+        );
     }
 
     #[test]
@@ -1488,7 +1609,7 @@ mod tests {
         let served_manual = manual.clone();
         let flows = Arc::new(FlowRegistry::new());
         thread::spawn(move || {
-            let _ = serve(listener, pending, served_manual, log, flows);
+            let _ = serve(listener, pending, served_manual, log, flows, None);
         });
 
         // A loaded rule reports `Loaded` and lands in the overlay the proxy folds into its policy.
@@ -1525,7 +1646,7 @@ mod tests {
             let log = log.clone();
             let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log, flows);
+                let _ = serve(listener, pending, manual, log, flows, None);
             });
         }
 
@@ -1666,7 +1787,7 @@ mod tests {
         // response lines come back in a deterministic oldest-first order.
         let _ = park_next(&state, "x.test", 8080, 0);
         let _ = park_next(&state, "y.test", 8080, 1);
-        let response = dispatch("DENY *", &state, &manual, &log, &flows);
+        let response = dispatch("DENY *", &state, &manual, &log, &flows, None);
         assert_eq!(response, "answered host=x.test\nanswered host=y.test\nok\n");
         assert!(
             manual.snapshot().1.is_empty(),
@@ -1676,12 +1797,15 @@ mod tests {
         // `ALLOW * session` drains and remembers each host:port as a manual rule.
         let _ = park_next(&state, "p.test", 8080, 0);
         let _ = park_next(&state, "q.test", 8080, 1);
-        let _ = dispatch("ALLOW * session", &state, &manual, &log, &flows);
+        let _ = dispatch("ALLOW * session", &state, &manual, &log, &flows, None);
         let (allow, _) = manual.snapshot();
         assert_eq!(allow.len(), 2, "`* session` remembers each answered host");
 
         // An empty queue replies a clean `ok` with no `answered` lines.
-        assert_eq!(dispatch("ALLOW *", &state, &manual, &log, &flows), "ok\n");
+        assert_eq!(
+            dispatch("ALLOW *", &state, &manual, &log, &flows, None),
+            "ok\n"
+        );
     }
 
     #[test]
@@ -1704,7 +1828,7 @@ mod tests {
             let log = log.clone();
             let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log, flows);
+                let _ = serve(listener, pending, manual, log, flows, None);
             });
         }
 
@@ -2028,12 +2152,12 @@ mod tests {
             let log = log.clone();
             let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log, flows);
+                let _ = serve(listener, pending, manual, log, flows, None);
             });
         }
 
         // A tail read over the socket returns both events, newest last, with the fields intact.
-        let snap = read_log(&socket, None, None, false).unwrap();
+        let snap = read_log(&socket, None, None, false, false).unwrap();
         assert_eq!(snap.events.len(), 2);
         assert_eq!(snap.head, 2);
         assert_eq!(snap.events[0].host, "a.test");
@@ -2043,13 +2167,13 @@ mod tests {
         assert_eq!(snap.events[1].path.as_deref(), Some("/two?t=1"));
 
         // A follow read past the first event returns only the second, no gap.
-        let after = read_log(&socket, Some(1), None, false).unwrap();
+        let after = read_log(&socket, Some(1), None, false, false).unwrap();
         assert_eq!(after.events.len(), 1);
         assert_eq!(after.events[0].seq, 2);
         assert_eq!(after.dropped, 0);
 
         // Discovery: `log_all` globs the egress dir and finds this session by its socket pid.
-        let sessions = log_all(data.path(), false);
+        let sessions = log_all(data.path(), false, false);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].pid, pid);
         assert_eq!(sessions[0].snapshot.events.len(), 2);

@@ -161,7 +161,10 @@ use crate::allowlist::{self, Decision, L4Decision, Rule};
 
 use super::egress_stats::StatKind;
 
+#[cfg(test)]
+mod bench;
 mod ca;
+mod capture;
 mod ctx;
 mod dns;
 mod h2mitm;
@@ -171,6 +174,7 @@ mod websocket;
 mod wire;
 use ca::upstream_server_name;
 pub(crate) use ca::Ca;
+use capture::CaptureReader;
 use ctx::effective_policy;
 pub(crate) use ctx::{builtin_allow_rules, union_with_builtin, ProxyCtx};
 pub(crate) use inject::{HeaderInjection, SecretNeedle};
@@ -857,6 +861,16 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    re-runs this match, so the secret cannot ride along to an unintended host.
     let injected = matching_injections(ctx, &connect_host, port, &itarget);
 
+    // 8a. Open the traffic capture for this exchange, when the launch captures. The request head
+    //     recorded is the client's own (`inner_bytes`), taken before the reserialization below adds
+    //     any injected credential — so a secret cannot reach the capture even in principle; only the
+    //     injected header *names* are noted. The guard files on drop, so however this relay ends,
+    //     what it saw is filed exactly once.
+    let capture = ctx.begin_capture(allow_seq);
+    if let Some(c) = &capture {
+        c.set_request(&inner_bytes, &injected);
+    }
+
     // 8b. A WebSocket upgrade cannot ride the one-shot request/response path below (which forces
     //     `Connection: close` and relays a single direction). The handshake was inspected by the same
     //     verdict as any request — host, path, method, anti-fronting, SSRF, upstream-cert — and the
@@ -871,11 +885,16 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //         (the handshake is a legitimate GET and the host/path is still gated); a dedicated
     //         `ws://` opt-in scheme, if a read-only-should-forbid-WS case ever arises, is a future
     //         refinement, not a gap here.
-    //       - Once opened, the framed bytes are opaque and relayed verbatim: they are NOT scanned by
-    //         the response-side redaction ([`pump_redacting`]). The boundary stays the empty netns +
-    //         the allowlist + the inspected handshake; frame-level redaction is out of scope (masked,
-    //         framed binary that a byte scan cannot meaningfully cover).
+    //       - Once opened, the framed bytes are relayed VERBATIM: they are NOT scanned by the
+    //         response-side redaction ([`pump_redacting`]), so a secret a peer reflects inside a
+    //         frame reaches the cage as it was sent. The boundary stays the empty netns + the
+    //         allowlist + the inspected handshake. Masking a frame would mean rewriting the relayed
+    //         stream (decode, mask, re-frame, re-mask), which is a far larger change to the one path
+    //         that must stay a byte-exact pipe; the traffic capture decodes frames only to copy them
+    //         aside, and masks its own buffers, without touching what is relayed.
     if ws_upgrade {
+        // The capture follows the handshake into the upgrade relay, which files it at the `101` (it
+        // cannot wait for a tunnel that may stay open for hours — see [`relay_upgrade`]).
         return relay_upgrade(
             br,
             upstream,
@@ -883,6 +902,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             &injected,
             ctx,
             allow_seq,
+            capture.as_ref(),
             flow.up.clone(),
             flow.down.clone(),
         );
@@ -927,6 +947,9 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 );
             }
         };
+        if let Some(c) = &capture {
+            c.set_request_body(&body);
+        }
         let reserialized = reserialize_request(&inner, &injected, Some(body.len() as u64));
         upstream.write_all(&reserialized)?;
         upstream.write_all(&body)?;
@@ -948,7 +971,15 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
             let _ = client.flush();
         }
-        copy_exact(&mut br, &mut upstream, body_len)?;
+        // The body is teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
+        match &capture {
+            Some(c) => copy_exact(
+                &mut CaptureReader::new(&mut br, c.request_body_sink()),
+                &mut upstream,
+                body_len,
+            )?,
+            None => copy_exact(&mut br, &mut upstream, body_len)?,
+        }
         // Count the forwarded body (`copy_exact` moved exactly `body_len` bytes upstream).
         flow.up.fetch_add(body_len, Ordering::Relaxed);
     }
@@ -973,7 +1004,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     }
     // Count upstream→client (`down`) through the whole relayed response (the peeked prefix is chained
     // back in, so it is counted too).
-    let mut response = CountingReader::new(
+    let response = CountingReader::new(
         io::Cursor::new(prefix).chain(&mut upstream),
         flow.down.clone(),
     );
@@ -989,6 +1020,13 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             .injections
             .iter()
             .any(|inj| names_exact_host(&connect_host, Some(&inj.rule)));
+    // The response is teed on the way through, ahead of the reflection masking: the capture does its
+    // own masking at filing time (over whole buffers), so what is stored is masked either way, and
+    // what the cage receives is decided by `masks_reflection` alone.
+    let mut response: Box<dyn Read + '_> = match &capture {
+        Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
+        None => Box::new(response),
+    };
     if masks_reflection {
         pump_redacting(&mut response, br.get_mut(), &ctx.redactions)?;
     } else {
@@ -1545,6 +1583,13 @@ fn handle_cleartext(
     // closes). This is inspected cleartext, so the byte counters reflect application data.
     let flow = ctx.register_flow(&host, port, super::control::Proto::Http);
 
+    // Open the traffic capture. No credential is ever injected on a cleartext request, so the head
+    // recorded here is both what arrived and what is forwarded, and no injected names accompany it.
+    let capture = ctx.begin_capture(allow_seq);
+    if let Some(c) = &capture {
+        c.set_request(head_bytes, &[]);
+    }
+
     // 8. Forward the request in **origin-form** (`GET /path HTTP/1.1`) with the client's `Host` — an
     //    origin server, unlike a proxy, expects the path, not the absolute-form URL. No credential is
     //    injected (a header secret never rides a cleartext request). `Connection: close` is forced so
@@ -1566,7 +1611,15 @@ fn handle_cleartext(
         let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
         let _ = client.flush();
     }
-    copy_exact(&mut client, &mut upstream, body_len)?;
+    // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
+    match &capture {
+        Some(c) => copy_exact(
+            &mut CaptureReader::new(&mut client, c.request_body_sink()),
+            &mut upstream,
+            body_len,
+        )?,
+        None => copy_exact(&mut client, &mut upstream, body_len)?,
+    }
     flow.up.fetch_add(body_len, Ordering::Relaxed);
     upstream.flush().ok();
 
@@ -1585,10 +1638,14 @@ fn handle_cleartext(
         }
     }
     // Count upstream→client (`down`) through the whole relayed response (peeked prefix chained in).
-    let mut response = CountingReader::new(
+    let response = CountingReader::new(
         io::Cursor::new(prefix).chain(&mut upstream),
         flow.down.clone(),
     );
+    let mut response: Box<dyn Read + '_> = match &capture {
+        Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
+        None => Box::new(response),
+    };
     pump_to_eof(&mut response, &mut client)
 }
 
@@ -2003,6 +2060,13 @@ fn handle_https_forward(
     //    encrypted, never in the clear.
     let injected = matching_injections(ctx, &host, port, &path);
 
+    // 8a. Open the traffic capture, recording the client's own head (before the reserialization
+    //     below adds any injected credential) plus the injected header names, never their values.
+    let capture = ctx.begin_capture(allow_seq);
+    if let Some(c) = &capture {
+        c.set_request(head_bytes, &injected);
+    }
+
     // 9. Forward the one request in **origin-form** (`POST /path`) with the injected credential and
     //    `Connection: close` forced (the reserializer strips hop-by-hop headers and the client's copy
     //    of any injected header). A pipelined second request is never forwarded, so it cannot skip the
@@ -2053,6 +2117,9 @@ fn handle_https_forward(
                 );
             }
         };
+        if let Some(c) = &capture {
+            c.set_request_body(&body);
+        }
         let reserialized = reserialize_request(&origin, &injected, Some(body.len() as u64));
         upstream.write_all(&reserialized)?;
         upstream.write_all(&body)?;
@@ -2070,7 +2137,15 @@ fn handle_https_forward(
             let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
             let _ = client.flush();
         }
-        copy_exact(&mut client, &mut upstream, body_len)?;
+        // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
+        match &capture {
+            Some(c) => copy_exact(
+                &mut CaptureReader::new(&mut client, c.request_body_sink()),
+                &mut upstream,
+                body_len,
+            )?,
+            None => copy_exact(&mut client, &mut upstream, body_len)?,
+        }
         flow.up.fetch_add(body_len, Ordering::Relaxed);
     }
     upstream.flush().ok();
@@ -2087,7 +2162,7 @@ fn handle_https_forward(
             ctx.set_status(allow_seq, code);
         }
     }
-    let mut response = CountingReader::new(
+    let response = CountingReader::new(
         io::Cursor::new(prefix).chain(&mut upstream),
         flow.down.clone(),
     );
@@ -2096,6 +2171,11 @@ fn handle_https_forward(
             .injections
             .iter()
             .any(|inj| names_exact_host(&host, Some(&inj.rule)));
+    // Teed ahead of the reflection masking — the capture masks its own buffers at filing time.
+    let mut response: Box<dyn Read + '_> = match &capture {
+        Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
+        None => Box::new(response),
+    };
     if masks_reflection {
         pump_redacting(&mut response, &mut client, &ctx.redactions)?;
     } else {
@@ -2234,16 +2314,7 @@ fn matching_injections<'a>(
 fn carries_secret(head_bytes: &[u8], redactions: &[SecretNeedle]) -> bool {
     redactions
         .iter()
-        .any(|n| contains_subslice(head_bytes, n.as_bytes()))
-}
-
-/// Whether `needle` occurs as a contiguous byte run in `haystack`. An empty or over-long needle
-/// never matches (the empty needle is screened out at resolution, but guard here too).
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
+        .any(|n| n.find_in(head_bytes, 0).is_some())
 }
 
 /// Reserialize a request head for forwarding upstream: keep the request line and headers, but
@@ -2417,20 +2488,18 @@ fn pump_redacting<R: Read, W: Write>(
 /// Replace every occurrence of every needle in `buf` with an equal-length run of `*`, in place.
 /// Equal length is the invariant the streaming framing relies on; an empty or over-long needle is
 /// skipped (the empty needle is screened out at resolution, but guard here too).
-fn redact_in_place(buf: &mut [u8], needles: &[SecretNeedle]) {
+pub(crate) fn redact_in_place(buf: &mut [u8], needles: &[SecretNeedle]) {
     for needle in needles {
-        let n = needle.as_bytes();
-        if n.is_empty() || n.len() > buf.len() {
+        let len = needle.as_bytes().len();
+        if len == 0 || len > buf.len() {
             continue;
         }
-        let mut i = 0;
-        while i + n.len() <= buf.len() {
-            if &buf[i..i + n.len()] == n {
-                buf[i..i + n.len()].fill(b'*');
-                i += n.len();
-            } else {
-                i += 1;
-            }
+        // Left to right, non-overlapping: a match is masked and the search resumes past it, so a
+        // needle cannot match inside the `*` run its own occurrence just produced.
+        let mut at = 0;
+        while let Some(found) = needle.find_in(buf, at) {
+            buf[found..found + len].fill(b'*');
+            at = found + len;
         }
     }
 }
@@ -5399,7 +5468,7 @@ mod tests {
             let (pending, served_manual, log, flows) =
                 (pending.clone(), manual.clone(), log.clone(), flows.clone());
             std::thread::spawn(move || {
-                let _ = control::serve(listener, pending, served_manual, log, flows);
+                let _ = control::serve(listener, pending, served_manual, log, flows, None);
             });
         }
 
@@ -6155,6 +6224,17 @@ mod tests {
         );
     }
 
+    /// A deliberately naive substring scan, kept for the tests alone.
+    ///
+    /// The production path searches with a real substring searcher; asserting against a separate,
+    /// obviously-correct implementation means a test cannot inherit a bug from the code it checks.
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return false;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
     #[test]
     fn contains_subslice_matches_a_byte_run() {
         assert!(contains_subslice(b"hello world", b"o wo"));
@@ -6802,6 +6882,28 @@ mod tests {
         assert_eq!(buf.len(), before, "masking preserves length");
     }
 
+    /// Masking is left to right and NON-OVERLAPPING: the search resumes past a match, so a needle
+    /// never matches inside the `*` run its own occurrence produced. Pinned because the search is a
+    /// substring searcher rather than a hand-rolled walk, and a searcher that resumed one byte
+    /// later instead of one match later would keep finding the same region.
+    #[test]
+    fn redact_in_place_masks_left_to_right_without_overlapping_itself() {
+        let needles = vec![SecretNeedle::named("test-secret", b"aaa".to_vec())];
+        let mut buf = b"aaaaa".to_vec();
+        redact_in_place(&mut buf, &needles);
+        assert_eq!(
+            buf, b"***aa",
+            "the first match is consumed whole and the search resumes after it"
+        );
+
+        // A needle made only of the mask byte would, on a re-scanning implementation, keep matching
+        // what it just wrote and never terminate.
+        let stars = vec![SecretNeedle::named("test-secret", b"**".to_vec())];
+        let mut buf = b"a**b**c".to_vec();
+        redact_in_place(&mut buf, &stars);
+        assert_eq!(buf, b"a**b**c", "masking is idempotent, and it terminates");
+    }
+
     #[test]
     fn redact_in_place_ignores_an_overlong_or_empty_needle() {
         let needles = vec![
@@ -7050,6 +7152,971 @@ mod tests {
             counter.load(Ordering::SeqCst),
             0,
             "both guards released their slot on drop"
+        );
+    }
+
+    // ── Traffic capture (`[network] capture`) ─────────────────────────────────────────────────────
+
+    /// A capturing proxy, allowing `upstream.test` and capturing at `level`.
+    #[cfg(test)]
+    fn capturing_ctx(
+        proxy_ca: Arc<Ca>,
+        upstream_cfg: Arc<ClientConfig>,
+        log: Arc<crate::sandbox::control::LogRing>,
+        level: crate::sandbox::control::CaptureLevel,
+        body_kb: u64,
+        injections: Vec<HeaderInjection>,
+        redactions: Vec<SecretNeedle>,
+    ) -> Arc<ProxyCtx> {
+        use crate::sandbox::control::{CaptureCaps, CaptureRing};
+        let ring = Arc::new(CaptureRing::new(
+            CaptureCaps::new(level, body_kb),
+            redactions.clone(),
+        ));
+        Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_log(log)
+                .with_capture(ring)
+                .with_injections(injections)
+                .with_redactions(redactions)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        )
+    }
+
+    /// The captured exchange for the single event in `log`, read back the way the control socket
+    /// serves it (through the ring the ctx holds).
+    ///
+    /// Waits for it: the capture is filed when the proxy's connection handler returns, which happens
+    /// on the proxy thread *after* the client has read the last byte — so a test that reads the
+    /// response and looks immediately would race the filing. This is the same ordering a live
+    /// `sbx net logs` sees (an exchange in flight simply has no traffic yet), so waiting is the
+    /// honest synchronization, not a workaround for a product race.
+    #[cfg(test)]
+    fn one_capture(
+        ctx: &ProxyCtx,
+        log: &crate::sandbox::control::LogRing,
+    ) -> crate::sandbox::control::Capture {
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events.len(), 1, "one event expected: {events:?}");
+        let ring = ctx.capture.as_ref().expect("a capturing ctx");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(cap) = ring.get(&[events[0].seq]).0.into_iter().next() {
+                return cap;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exchange's capture was never filed"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// End to end over a real TLS MITM: a POST with a body is captured in both directions, and the
+    /// response the cage receives is byte-identical to what the upstream sent. Teeth: the tee sits in
+    /// the middle of the relay, so a bug there would either corrupt the relayed body or capture the
+    /// wrong bytes — this asserts both at once.
+    #[test]
+    fn a_capturing_launch_records_both_directions_without_disturbing_the_relay() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"reply\":\"pong\"}\n",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ctx(
+            proxy_ca,
+            upstream_cfg,
+            log.clone(),
+            CaptureLevel::Bodies,
+            8,
+            vec![],
+            vec![],
+        );
+        let got = through_proxy(
+            ctx.clone(),
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"POST /v1/messages HTTP/1.1\r\nHost: upstream.test\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"prompt\":\"hi\"}\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+
+        assert!(
+            got.ends_with("{\"reply\":\"pong\"}\n"),
+            "the relayed response is untouched by the tee: {got:?}"
+        );
+
+        let cap = one_capture(&ctx, &log);
+        let req_head = String::from_utf8(cap.req_head.bytes.clone()).unwrap();
+        assert!(
+            req_head.starts_with("POST /v1/messages HTTP/1.1"),
+            "the request line is captured: {req_head:?}"
+        );
+        assert!(req_head.contains("Content-Type: application/json"));
+        assert_eq!(
+            String::from_utf8(cap.req_body.bytes.clone()).unwrap(),
+            "{\"prompt\":\"hi\"}\n",
+            "the request body is captured"
+        );
+        let res_head = String::from_utf8(cap.res_head.bytes.clone()).unwrap();
+        assert!(res_head.starts_with("HTTP/1.1 200 OK"), "{res_head:?}");
+        assert_eq!(
+            String::from_utf8(cap.res_body.bytes.clone()).unwrap(),
+            "{\"reply\":\"pong\"}\n",
+            "the response body is captured"
+        );
+        assert!(!cap.req_body.truncated && !cap.res_body.truncated);
+    }
+
+    /// The headers level captures the two heads and neither body — the level a user picks precisely
+    /// so no payload is retained.
+    #[test]
+    fn the_headers_level_captures_no_payload_at_all() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nsecret-reply",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ctx(
+            proxy_ca,
+            upstream_cfg,
+            log.clone(),
+            CaptureLevel::Headers,
+            8,
+            vec![],
+            vec![],
+        );
+        let got = through_proxy(
+            ctx.clone(),
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"POST /p HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 11\r\nConnection: close\r\n\r\nsecret-body",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(
+            got.ends_with("secret-reply"),
+            "the relay still works: {got:?}"
+        );
+
+        let cap = one_capture(&ctx, &log);
+        assert!(!cap.req_head.bytes.is_empty() && !cap.res_head.bytes.is_empty());
+        assert!(
+            cap.req_body.is_empty(),
+            "no request payload at the headers level"
+        );
+        assert!(
+            cap.res_body.is_empty(),
+            "no response payload at the headers level"
+        );
+    }
+
+    /// A body over the per-body cap is cut and SAYS it was cut, while the cage still receives every
+    /// byte. Teeth: the cap is what bounds host memory, so a silent truncation (or a truncated
+    /// *relay*) would be the dangerous failure.
+    #[test]
+    fn a_body_over_the_cap_is_marked_truncated_and_still_relayed_whole() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        // 3 KiB of body against a 1 KiB cap.
+        let body = vec![b'y'; 3 * 1024];
+        let mut resp =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        resp.extend_from_slice(&body);
+        let resp: &'static [u8] = Box::leak(resp.into_boxed_slice());
+
+        let (addr, upstream_ca, up) = spawn_upstream("upstream.test", resp);
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ctx(
+            proxy_ca,
+            upstream_cfg,
+            log.clone(),
+            CaptureLevel::Bodies,
+            1,
+            vec![],
+            vec![],
+        );
+        let got = through_proxy(
+            ctx.clone(),
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert_eq!(
+            got.matches('y').count(),
+            3 * 1024,
+            "the cage receives the whole body regardless of the capture cap"
+        );
+
+        let cap = one_capture(&ctx, &log);
+        assert_eq!(cap.res_body.bytes.len(), 1024, "cut exactly at the cap");
+        assert!(cap.res_body.truncated, "and the cut is reported");
+    }
+
+    /// An injected credential never enters the capture: the head recorded is the CLIENT's (taken
+    /// before the injection), so only the header's NAME is noted. Teeth: the same request is
+    /// forwarded upstream WITH the secret, so a capture taken one step later would hold it.
+    #[test]
+    fn an_injected_credential_is_named_in_the_capture_but_never_valued() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ctx(
+            proxy_ca,
+            upstream_cfg,
+            log.clone(),
+            CaptureLevel::Bodies,
+            8,
+            vec![injection(
+                "upstream.test:*",
+                "authorization",
+                "Bearer s3cr3t-token",
+            )],
+            vec![SecretNeedle::named("TOKEN", b"s3cr3t-token".to_vec())],
+        );
+        let _ = through_proxy(
+            ctx.clone(),
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+
+        let cap = one_capture(&ctx, &log);
+        let whole: Vec<u8> = cap
+            .parts()
+            .into_iter()
+            .flat_map(|(_, b)| b.bytes.clone())
+            .collect();
+        assert!(
+            !contains_subslice(&whole, b"s3cr3t-token"),
+            "no part of the capture may carry the injected value"
+        );
+        assert_eq!(
+            String::from_utf8(cap.injected.bytes.clone()).unwrap(),
+            "authorization",
+            "the injected header is named so the capture does not read as the whole request"
+        );
+    }
+
+    /// A response that reflects a configured secret is masked in the capture — the ring never holds
+    /// a credential even when the upstream hands one back.
+    #[test]
+    fn a_reflected_secret_is_masked_out_of_the_capture() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\nyou sent s3cr3t-token back",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ctx(
+            proxy_ca,
+            upstream_cfg,
+            log.clone(),
+            CaptureLevel::Bodies,
+            8,
+            vec![],
+            vec![SecretNeedle::named("TOKEN", b"s3cr3t-token".to_vec())],
+        );
+        let _ = through_proxy(
+            ctx.clone(),
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+
+        let cap = one_capture(&ctx, &log);
+        let body = String::from_utf8(cap.res_body.bytes.clone()).unwrap();
+        assert_eq!(
+            body, "you sent ************ back",
+            "the reflected secret is masked, at equal length"
+        );
+    }
+
+    /// The inspected-cleartext (`http://`) path captures too. Teeth: this is a separate handler from
+    /// the CONNECT/TLS one, wired separately, so nothing in the tunneled tests covers it.
+    #[test]
+    fn a_cleartext_exchange_is_captured_in_both_directions() {
+        use crate::sandbox::control::{
+            CaptureCaps, CaptureLevel, CaptureRing, LogRing, LOG_RING_CAP,
+        };
+        let (addr, _up_head) = spawn_plain_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let port = addr.port();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ring = Arc::new(CaptureRing::new(
+            CaptureCaps::new(CaptureLevel::Bodies, 8),
+            vec![],
+        ));
+        let rule = format!("http://upstream.test:{port}");
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
+                .unwrap()
+                .with_log(log.clone())
+                .with_capture(ring)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let request = format!(
+            "POST http://upstream.test:{port}/path HTTP/1.1\r\nHost: upstream.test:{port}\r\n\
+             Content-Length: 7\r\nConnection: close\r\n\r\npayload"
+        );
+        let resp = through_cleartext(ctx.clone(), request.as_bytes()).unwrap();
+        assert!(resp.contains("hello"), "the relay still works: {resp:?}");
+
+        let cap = one_capture(&ctx, &log);
+        assert!(String::from_utf8(cap.req_head.bytes.clone())
+            .unwrap()
+            .starts_with("POST http://upstream.test"));
+        assert_eq!(
+            String::from_utf8(cap.req_body.bytes.clone()).unwrap(),
+            "payload",
+            "the cleartext request body is captured"
+        );
+        assert!(String::from_utf8(cap.res_head.bytes.clone())
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            String::from_utf8(cap.res_body.bytes.clone()).unwrap(),
+            "hello"
+        );
+    }
+
+    /// A REQUEST body larger than the cap is marked truncated end to end. Teeth: the request sink is
+    /// filled by the relay's own read loop, so a body that fills it exactly on a read boundary is the
+    /// case where a truncation could go unrecorded — and the cage must still receive every byte.
+    #[test]
+    fn a_request_body_over_the_cap_is_marked_truncated_and_still_forwarded_whole() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        // Exactly twice the 1 KiB cap, so the relay's copy lands the cut on a boundary.
+        let body = "z".repeat(2048);
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ctx(
+            proxy_ca,
+            upstream_cfg,
+            log.clone(),
+            CaptureLevel::Bodies,
+            1,
+            vec![],
+            vec![],
+        );
+        let request = format!(
+            "POST /p HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = through_proxy(
+            ctx.clone(),
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            request.as_bytes(),
+        )
+        .unwrap();
+        up.join().unwrap();
+
+        let cap = one_capture(&ctx, &log);
+        assert_eq!(cap.req_body.bytes.len(), 1024, "cut at the cap");
+        assert!(
+            cap.req_body.truncated,
+            "a request body cut on a read boundary must still say it was cut"
+        );
+    }
+
+    /// A launch that does not capture stores nothing at all — the default costs no memory and leaks
+    /// no plaintext into the control plane.
+    #[test]
+    fn a_non_capturing_launch_files_nothing() {
+        use crate::sandbox::control::{LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_log(log.clone())
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let _ = through_proxy(
+            ctx.clone(),
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"POST /p HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecret",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(ctx.capture.is_none(), "no capture ring is even built");
+        // The event is still logged — only the traffic is absent.
+        assert_eq!(log.snapshot(None, None, false).events.len(), 1);
+    }
+
+    /// A capturing ctx allowing a WebSocket upgrade to `upstream.test`.
+    #[cfg(test)]
+    fn capturing_ws_ctx(
+        proxy_ca: Arc<Ca>,
+        upstream_cfg: Arc<ClientConfig>,
+        log: Arc<crate::sandbox::control::LogRing>,
+        level: crate::sandbox::control::CaptureLevel,
+    ) -> Arc<ProxyCtx> {
+        use crate::sandbox::control::{CaptureCaps, CaptureRing};
+        let ring = Arc::new(CaptureRing::new(CaptureCaps::new(level, 8), vec![]));
+        Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_log(log)
+                .with_capture(ring)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        )
+    }
+
+    /// Encode one WebSocket frame the way a peer would. A client must mask; a server must not.
+    #[cfg(test)]
+    fn ws_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
+        let mut out = vec![0x80 | opcode];
+        let flag = if mask.is_some() { 0x80u8 } else { 0 };
+        out.push(flag | payload.len() as u8);
+        match mask {
+            Some(key) => {
+                out.extend_from_slice(&key);
+                out.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+            }
+            None => out.extend_from_slice(payload),
+        }
+        out
+    }
+
+    /// A WebSocket upstream that speaks real framing: it pushes a text frame **in the same write as
+    /// the `101`** (so the frame lands in the bytes the proxy read past the handshake head — the path
+    /// that would silently lose the first message), then echoes a frame back and closes.
+    #[cfg(test)]
+    fn spawn_frame_ws_upstream() -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(conn) = ServerConnection::new(server_config) else {
+                return;
+            };
+            let mut tls = StreamOwned::new(conn, sock);
+            {
+                let mut br = BufReader::new(&mut tls);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match br.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+            let mut opening = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n"
+                .to_vec();
+            opening.extend(ws_frame(0x1, br#"{"from":"server"}"#, None));
+            let _ = tls.write_all(&opening);
+            let _ = tls.flush();
+            let mut buf = [0u8; 256];
+            if matches!(tls.read(&mut buf), Ok(n) if n > 0) {
+                let _ = tls.write_all(&ws_frame(0x1, br#"{"echo":true}"#, None));
+                let _ = tls.flush();
+            }
+        });
+        (addr, ca_der, handle)
+    }
+
+    /// Open a WebSocket through the proxy, send one properly masked text frame, and return every raw
+    /// byte the cage received after the handshake — so a test can check the relay was untouched.
+    #[cfg(test)]
+    fn through_proxy_ws_frames(
+        ctx: Arc<ProxyCtx>,
+        proxy_ca: CertificateDer<'static>,
+        connect_host: &str,
+        connect_port: u16,
+    ) -> io::Result<Vec<u8>> {
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        write!(
+            sock,
+            "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
+        )?;
+        sock.flush()?;
+        let _ = read_until_blank(&mut sock)?;
+        let mut roots = RootCertStore::empty();
+        roots.add(proxy_ca).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from(connect_host.to_string()).unwrap();
+        let conn =
+            ClientConnection::new(Arc::new(client_config), name).map_err(io::Error::other)?;
+        let mut tls = StreamOwned::new(conn, sock);
+        let upgrade = format!(
+            "GET /chat HTTP/1.1\r\nHost: {connect_host}\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        tls.write_all(upgrade.as_bytes())?;
+        tls.flush()?;
+        let head = read_head_until_blank(&mut tls)?;
+        assert!(head.contains("101 Switching Protocols"), "{head:?}");
+        tls.write_all(&ws_frame(
+            0x1,
+            br#"{"from":"cage"}"#,
+            Some([0x11, 0x22, 0x33, 0x44]),
+        ))?;
+        tls.flush()?;
+        let mut frames = Vec::new();
+        let _ = tls.read_to_end(&mut frames);
+        Ok(frames)
+    }
+
+    /// The transcript of an established WebSocket is captured in both directions: the cage's own
+    /// frames under `ws-up`, the upstream's under `ws-down`, each holding the payloads and nothing
+    /// else. And the relay is untouched — the cage receives the upstream's frames byte for byte.
+    ///
+    /// Three teeth in one: a client frame is XOR-masked on the wire, so capturing it verbatim would
+    /// store noise (the test asserts the plaintext is absent from the relayed bytes but present in
+    /// the capture); the upstream's first frame rides in the same write as the `101`, so it is only
+    /// captured if the bytes read past the handshake head are fed through the decoder; and the
+    /// frames must arrive as a SECOND filing folded into the handshake's entry, not as a duplicate.
+    #[test]
+    fn a_websocket_transcript_is_captured_in_both_directions_without_disturbing_the_relay() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, up) = spawn_frame_ws_upstream();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
+
+        let relayed =
+            through_proxy_ws_frames(ctx.clone(), proxy_ca_der, "upstream.test", addr.port())
+                .unwrap();
+        up.join().unwrap();
+
+        let mut expected = ws_frame(0x1, br#"{"from":"server"}"#, None);
+        expected.extend(ws_frame(0x1, br#"{"echo":true}"#, None));
+        assert_eq!(
+            relayed, expected,
+            "the cage must receive the upstream's frames byte for byte"
+        );
+
+        // The frames are filed when the tunnel ends, folded into the handshake's entry.
+        let ring = ctx.capture.as_ref().expect("a capturing ctx");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let cap = loop {
+            let seqs: Vec<u64> = log
+                .snapshot(None, None, false)
+                .events
+                .iter()
+                .map(|e| e.seq)
+                .collect();
+            match ring.get(&seqs).0.into_iter().next() {
+                Some(c) if !c.ws_up.is_empty() && !c.ws_down.is_empty() => break c,
+                _ => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the WebSocket transcript was never filed"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        assert_eq!(
+            String::from_utf8(cap.ws_up.bytes.clone()).unwrap(),
+            r#"{"from":"cage"}"#,
+            "the cage's own frame is captured unmasked"
+        );
+        assert_eq!(
+            String::from_utf8(cap.ws_down.bytes.clone()).unwrap(),
+            r#"{"from":"server"}{"echo":true}"#,
+            "both upstream frames are captured, including the one sent with the `101`"
+        );
+        // The handshake filed earlier is still there: one entry per exchange, not two.
+        assert!(
+            String::from_utf8_lossy(&cap.req_head.bytes).contains("GET /chat HTTP/1.1")
+                && String::from_utf8_lossy(&cap.res_head.bytes).contains("101 Switching Protocols"),
+            "the frames folded into the handshake's capture rather than replacing it: {cap:?}"
+        );
+        assert_eq!(ring.get(&[cap.seq]).0.len(), 1, "no duplicate entry");
+    }
+
+    /// The WebSocket handshake is captured on both sides, INCLUDING the upstream's `101` — and it is
+    /// filed at the `101` rather than at teardown, so it reaches a reader while the tunnel is still
+    /// open. Teeth: the capture used to be filed before the upstream response was even read, so the
+    /// `101` could not appear; and a capture held until the guard dropped would arrive only when the
+    /// tunnel closed, which for a real WebSocket can be hours.
+    ///
+    /// This upstream does not speak real framing, which pins the other half of the contract: a byte
+    /// stream that is not WebSocket framing yields no transcript rather than an invented one.
+    #[test]
+    fn a_websocket_handshake_is_captured_including_the_101_but_not_the_frames() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, up) = spawn_ws_upstream();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
+
+        let transcript =
+            through_proxy_websocket(ctx.clone(), proxy_ca_der, "upstream.test", addr.port())
+                .unwrap();
+        up.join().unwrap();
+        // The relay is untouched by the capture: the `101`, the server's push, and the echo of the
+        // client's own frame all still round-trip.
+        assert!(
+            transcript.contains("101 Switching Protocols")
+                && transcript.contains("S-FIRST;")
+                && transcript.contains("ECHO:client-frame"),
+            "the capture disturbed the relay: {transcript:?}"
+        );
+
+        let cap = one_capture(&ctx, &log);
+        let req_head = String::from_utf8_lossy(&cap.req_head.bytes).into_owned();
+        assert!(
+            req_head.contains("GET /chat HTTP/1.1") && req_head.contains("Upgrade: websocket"),
+            "the handshake request is captured: {req_head:?}"
+        );
+        let res_head = String::from_utf8_lossy(&cap.res_head.bytes).into_owned();
+        assert!(
+            res_head.contains("101 Switching Protocols")
+                && res_head.contains("Sec-WebSocket-Accept"),
+            "the upstream's `101` is captured: {res_head:?}"
+        );
+        for (part, bytes) in cap.parts() {
+            let text = String::from_utf8_lossy(&bytes.bytes);
+            assert!(
+                !text.contains("S-FIRST;") && !text.contains("client-frame"),
+                "a WebSocket frame must not reach the capture ({part:?}): {text:?}"
+            );
+        }
+        // The status amendment was released with the capture, so `--with-status` shows the `101`
+        // while the tunnel is open rather than after it closes.
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events[0].status, Some(101), "{events:?}");
+    }
+
+    /// A WebSocket upstream that completes the handshake and then HOLDS the tunnel open until it is
+    /// released, so a test can observe what the proxy filed while the tunnel is **live** rather than
+    /// only after it closed. Returns the release channel alongside the usual pieces.
+    #[cfg(test)]
+    fn spawn_held_ws_upstream() -> (
+        SocketAddr,
+        CertificateDer<'static>,
+        std::sync::mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(conn) = ServerConnection::new(server_config) else {
+                return;
+            };
+            let mut tls = StreamOwned::new(conn, sock);
+            {
+                let mut br = BufReader::new(&mut tls);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match br.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+            let _ = tls.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+            );
+            let _ = tls.flush();
+            // Send nothing more and do not close: the proxy stays inside its relay, which is the
+            // state this upstream exists to hold.
+            let _ = released.recv();
+        });
+        (addr, ca_der, release, handle)
+    }
+
+    /// The handshake capture is filed at the `101`, **while the tunnel is still open** — not when the
+    /// guard drops at teardown. That is a timing property, so it needs a live tunnel to assert
+    /// against: a real WebSocket can stay open for hours, and a capture held until then would keep
+    /// the `101` out of `sbx net logs` for exactly as long.
+    ///
+    /// Teeth: move the filing back to the guard's `Drop` and the poll below never finds a capture,
+    /// because the only thing that ends this tunnel is the release at the bottom of the test.
+    #[test]
+    fn a_websocket_capture_is_filed_while_the_tunnel_is_still_open() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, release, up) = spawn_held_ws_upstream();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Headers);
+
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let serving = ctx.clone();
+        thread::spawn(move || {
+            let _ = serve(listener, serving);
+        });
+
+        // A client that opens the tunnel and then STAYS on it: its final read returns only once the
+        // upstream is released, so while this thread is alive the tunnel is provably open.
+        let port = addr.port();
+        let client = thread::spawn(move || -> String {
+            let mut sock = UnixStream::connect(&path).unwrap();
+            write!(sock, "CONNECT upstream.test:{port} HTTP/1.1\r\n\r\n").unwrap();
+            sock.flush().unwrap();
+            let _ = read_until_blank(&mut sock);
+            let mut roots = RootCertStore::empty();
+            roots.add(proxy_ca_der).unwrap();
+            let client_config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let name = ServerName::try_from("upstream.test".to_string()).unwrap();
+            let conn = ClientConnection::new(Arc::new(client_config), name).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let upgrade = "GET /chat HTTP/1.1\r\nHost: upstream.test\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n";
+            let _ = tls.write_all(upgrade.as_bytes());
+            let _ = tls.flush();
+            let head = read_head_until_blank(&mut tls).unwrap_or_default();
+            let mut rest = String::new();
+            let _ = tls.read_to_string(&mut rest);
+            head
+        });
+
+        let ring = ctx.capture.as_ref().expect("a capturing ctx");
+        // Generous on purpose: what is being asserted is an ORDERING (filed before the tunnel ends),
+        // and the tunnel cannot end until the release at the bottom of this test. The deadline only
+        // exists so a regression fails instead of hanging, so it costs nothing when passing and must
+        // not be tight enough to trip on a loaded machine running the rest of the suite alongside.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let cap = loop {
+            let seqs: Vec<u64> = log
+                .snapshot(None, None, false)
+                .events
+                .iter()
+                .map(|e| e.seq)
+                .collect();
+            if let Some(c) = ring.get(&seqs).0.into_iter().next() {
+                break c;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handshake capture never arrived while the tunnel was open"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        // The observation only means something if the tunnel really is still open, and it is: the
+        // client cannot finish until the upstream is released, which happens below.
+        assert!(
+            !client.is_finished(),
+            "the tunnel closed before the capture was observed, so this proves nothing"
+        );
+        assert!(
+            String::from_utf8_lossy(&cap.res_head.bytes).contains("101 Switching Protocols"),
+            "{:?}",
+            cap.res_head
+        );
+        assert_eq!(
+            log.snapshot(None, None, false).events[0].status,
+            Some(101),
+            "the status amendment is released with the capture, not at teardown"
+        );
+
+        let _ = release.send(());
+        let head = client.join().unwrap();
+        let _ = up.join();
+        assert!(
+            head.contains("101 Switching Protocols"),
+            "the client completed the handshake: {head:?}"
+        );
+    }
+
+    /// An upgrade the upstream declines is not a WebSocket at all — it is an ordinary response, and
+    /// it is captured like one, body included. Teeth: this branch relays through a different reader
+    /// than every other response path, so it would be the one to silently miss the tee.
+    #[test]
+    fn a_declined_websocket_upgrade_is_captured_like_an_ordinary_response() {
+        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 14\r\n\r\nnot-upgradable",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ws_ctx(proxy_ca, upstream_cfg, log.clone(), CaptureLevel::Bodies);
+
+        let transcript =
+            through_proxy_websocket(ctx.clone(), proxy_ca_der, "upstream.test", addr.port())
+                .unwrap();
+        up.join().unwrap();
+        assert!(
+            transcript.contains("401") && transcript.contains("not-upgradable"),
+            "the declined response was not relayed: {transcript:?}"
+        );
+
+        let cap = one_capture(&ctx, &log);
+        assert!(
+            String::from_utf8_lossy(&cap.res_head.bytes).contains("401 Unauthorized"),
+            "{:?}",
+            cap.res_head
+        );
+        assert_eq!(
+            cap.res_body.bytes, b"not-upgradable",
+            "the declined response's body is captured like any other"
         );
     }
 }

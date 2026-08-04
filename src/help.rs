@@ -2034,7 +2034,8 @@ const PAGES: &[Page] = &[
     Page {
         path: &["net", "logs"],
         synopsis: "sbx net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] \
-                   [-n <N>] [--all] [--with-query] [--with-status] [-f|--follow] [-i|--interval <secs>] [--json]",
+                   [-n <N>] [--all] [--with-query] [--with-status] [--with-headers] [--with-body] \
+                   [-f|--follow] [-i|--interval <secs>] [--json]",
         summary: "the live, per-request egress log of a running session",
         options: &[
             ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
@@ -2047,6 +2048,10 @@ const PAGES: &[Page] = &[
                               secret-redacted)"),
             ("--with-status", "show the upstream HTTP status (200/404/…) — completed L7 requests \
                                only; `-` for an L4 splice, a refusal, or an error"),
+            ("--with-headers", "show each exchange's request and response heads, when the session \
+                                captured them (`[network] capture`)"),
+            ("--with-body", "show the captured bodies too (implies `--with-headers`); needs \
+                             `[network] capture = \"bodies\"`"),
             ("-f, --follow", "after the initial listing, keep appending new events (a `tail -f`) \
                               until Ctrl-C"),
             ("-i, --interval <secs>", "the `--follow` poll interval in seconds (default 1)"),
@@ -2092,11 +2097,49 @@ const PAGES: &[Page] = &[
             `--with-query` keeps it — already redacted, since the proxy masks configured secret\n\
             values before an event enters the log.\n\
             \n\
+            TRAFFIC (`--with-headers` / `--with-body`): with `[network] capture` on, each inspected\n\
+            exchange also carries what actually crossed — the request and response heads, and under\n\
+            `--with-body` the leading bytes of each body. It prints as an indented block under the\n\
+            event line, `>` for what the cage sent and `<` for what came back. Nothing is shown for\n\
+            a session that does not capture; turn it on for one launch with\n\
+            `sbx run --config \'[network] capture = \"bodies\"\'`, or in a trusted config file.\n\
+            \n\
+            What a capture never contains: any configured secret (every value is masked before the\n\
+            bytes are stored) and any credential sbx injects (the head recorded is the client\'s own,\n\
+            taken before the injection — the injected headers are listed by NAME only).\n\
+            \n\
+            Every inspected path is covered: HTTPS, inspected cleartext, HTTP/2 and gRPC\n\
+            (`[network] http2` — its head is rendered rather than copied, keeping the real\n\
+            pseudo-header names and no invented reason phrase), and a WebSocket (its handshake\n\
+            including the upstream `101`, then the messages each direction carried, UNMASKED; control\n\
+            frames carry no application data and are skipped). A WebSocket is shown in steps because\n\
+            a tunnel outlives its handshake: the handshake at the `101`, then EACH DIRECTION as its\n\
+            capture fills, then once more at close if that changed anything — four lines over a\n\
+            tunnel's whole life at the very most, never showing what it already showed, and a\n\
+            transcript shown while the tunnel is open is marked cut. What a capture does not\n\
+            cover: a `tcp://` splice (no HTTP head exists to read) and a refused request (nothing\n\
+            was forwarded). A `permessage-deflate` WebSocket is decompressed, so a compressed tunnel\n\
+            reads like a plain one. A body is shown as text when it is text, and summarized as\n\
+            `<N byte(s) of binary data>` when it is not — a compressed body is captured compressed\n\
+            and reads that way. Under `--json` every part is base64-encoded, so a binary body\n\
+            survives intact.\n\
+            \n\
+            A capture is bounded three ways: per body (`[network] capture_max_kb`, default 8 KiB),\n\
+            per exchange count, and by a total byte budget past which the OLDEST captures are\n\
+            dropped — the drop is reported, and a body that was cut is marked, never trimmed in\n\
+            silence (at its cap, or because the exchange was filed while more was still arriving —\n\
+            a prefix is never shown as if it were whole). Like the log itself it lives only in the\n\
+            running session\'s memory: never written to disk, never bound into the cage, gone when\n\
+            the session exits.\n\
+            \n\
             `--follow` prints the current listing, then appends new events as they happen (a\n\
             `tail -f`) until Ctrl-C, polling every `--interval` seconds (default 1). If the ring\n\
             overflowed between polls the dropped count is announced, never silently skipped; a\n\
             session that ends is noted. The append shape is pipe-friendly, and `--json` streams one\n\
-            event object per line. Host-side and read-only — no launch, no nix, no network.",
+            event object per line. An exchange whose traffic is still being captured appears first\n\
+            as a bare line, then once more — complete, with its status and its traffic — when it\n\
+            finishes, so a followed exchange is never printed piecemeal.\n\
+            Host-side and read-only — no launch, no nix, no network.",
     },
     Page {
         path: &["net", "live"],

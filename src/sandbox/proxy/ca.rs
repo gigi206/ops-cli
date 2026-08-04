@@ -124,6 +124,13 @@ impl Ca {
         let mut params =
             CertificateParams::new(vec![host.to_string()]).map_err(io::Error::other)?;
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        // An Authority Key Identifier naming the signing CA. RFC 5280 §4.2.1.1 requires it on every
+        // certificate a conforming CA issues (only a self-signed root may omit it), and OpenSSL 3.6
+        // began enforcing that: without it, a client on such a build refuses the leaf outright with
+        // `Missing Authority Key Identifier` and cannot reach any inspected host. Not every TLS
+        // stack checks, which is exactly why its absence went unnoticed — one stack fails, another
+        // does not.
+        params.use_authority_key_identifier_extension = true;
         let leaf = params
             .signed_by(&leaf_key, &self.cert, &self.key)
             .map_err(io::Error::other)?;
@@ -208,5 +215,26 @@ mod tests {
         // Constructing it exercises the provider install and the root store load.
         let _ = upstream_config();
         assert!(upstream_server_name("cache.nixos.org").is_ok());
+    }
+
+    /// A minted leaf carries an Authority Key Identifier. RFC 5280 §4.2.1.1 requires it on every
+    /// certificate a conforming CA issues, and a TLS stack that enforces it (OpenSSL 3.6 onward)
+    /// rejects a leaf without one — which makes every inspected host unreachable for that client.
+    ///
+    /// Checked on the DER because that is what the client parses: the extension's OID is 2.5.29.35,
+    /// encoded as the bytes `06 03 55 1d 23`. A self-signed root may omit it, and the CA here does,
+    /// so this looks at the leaf specifically.
+    #[test]
+    fn a_minted_leaf_names_the_authority_that_signed_it() {
+        const AKI_OID_DER: &[u8] = &[0x06, 0x03, 0x55, 0x1d, 0x23];
+        let ca = Ca::ephemeral().unwrap();
+        let leaf = ca.leaf_for("api.example.com").unwrap();
+        let der = leaf.cert.first().expect("a leaf is sent first");
+        assert!(
+            der.as_ref()
+                .windows(AKI_OID_DER.len())
+                .any(|w| w == AKI_OID_DER),
+            "the leaf must carry an Authority Key Identifier, or a strict TLS stack refuses it"
+        );
     }
 }

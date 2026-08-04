@@ -280,6 +280,11 @@ pub(crate) enum NetworkView {
         /// gRPC) instead of HTTP/1.1. A transport choice, orthogonal to the verdict — the host must
         /// still be permitted by an `allow` rule. Empty for a policy that designates no h2 host.
         http2: Vec<String>,
+        /// The traffic-capture level (`off`/`headers`/`bodies`) and, when bodies are captured, the
+        /// per-body cap in KiB. Surfaced so a launch that retains the plaintext of its exchanges
+        /// says so in `sbx config` — a capture is never silent.
+        capture: String,
+        capture_max_kb: Option<u64>,
         builtin: Vec<String>,
     },
 }
@@ -984,6 +989,11 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
             mute: a.mute_rules().iter().map(|r| r.to_string()).collect(),
             http2: a.http2_hosts().iter().map(|h| h.display()).collect(),
+            capture: a.capture_level().as_str().to_string(),
+            capture_max_kb: a
+                .capture_level()
+                .captures_bodies()
+                .then(|| a.capture_body_kb()),
             builtin: sandbox::builtin_allow_rules()
                 .iter()
                 .map(|r| r.to_string())
@@ -1542,6 +1552,8 @@ mod tests {
                 deny: vec![],
                 mute: vec![],
                 http2: vec![],
+                capture: "off".to_string(),
+                capture_max_kb: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,

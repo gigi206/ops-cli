@@ -3897,6 +3897,23 @@ fn validate_network_table(
     if let Some(secs) = table.dns_cache_ttl {
         policy = policy.with_dns_cache_ttl(Some(std::time::Duration::from_secs(secs)));
     }
+    // The traffic capture: how much of each permitted exchange the proxy keeps for
+    // `sbx net logs --with-headers/--with-body`. Never a verdict. An unknown level is dropped with a
+    // warning and the capture stays off — fail-closed, since the value names how much plaintext the
+    // launch retains.
+    if let Some(raw) = &table.capture {
+        match crate::sandbox::control::CaptureLevel::parse(raw) {
+            Some(level) => policy = policy.with_capture(level, table.capture_max_kb),
+            None => warnings.push(format!(
+                "{source_label}: ignoring unknown capture level `{raw}` (expected \"off\", \
+                 \"headers\", or \"bodies\") — the traffic capture stays off"
+            )),
+        }
+    } else if table.capture_max_kb.is_some() {
+        warnings.push(format!(
+            "{source_label}: `capture_max_kb` is only meaningful with `capture = \"bodies\"` — ignored"
+        ));
+    }
     Some(NetworkPolicy::Allowlist(policy))
 }
 

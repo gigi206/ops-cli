@@ -780,6 +780,13 @@ pub(crate) struct EgressPolicy {
     /// [`Self::speaks_http2`] to pick the TLS ALPN — never a verdict (a host must still be allowed by
     /// an `allow` rule). Read via [`Self::http2_hosts`].
     http2: Vec<Http2Host>,
+    /// The `[network] capture` level: how much of each inspected exchange the proxy files for
+    /// `sbx net logs --with-headers/--with-body`. `Off` by default and never a verdict. Read via
+    /// [`Self::capture_level`].
+    capture: crate::sandbox::control::CaptureLevel,
+    /// The `[network] capture_max_kb` per-body cap, in KiB. `None` means the default; the ring
+    /// clamps it to its own ceiling. Read via [`Self::capture_body_kb`].
+    capture_body_kb: Option<u64>,
 }
 
 impl EgressPolicy {
@@ -795,6 +802,8 @@ impl EgressPolicy {
             suppress_ask_notice: false,
             dns_cache_ttl: None,
             http2: Vec::new(),
+            capture: crate::sandbox::control::CaptureLevel::Off,
+            capture_body_kb: None,
         }
     }
 
@@ -855,6 +864,30 @@ impl EgressPolicy {
     /// The configured DNS cache TTL (raw `Option` — the resolver applies the 60s default for `None`).
     pub(crate) fn dns_cache_ttl(&self) -> Option<std::time::Duration> {
         self.dns_cache_ttl
+    }
+
+    /// Set the traffic-capture level and its per-body cap (builder style), from `[network] capture`
+    /// and `[network] capture_max_kb`. Never a verdict — a captured request is one the policy
+    /// already permitted.
+    pub(crate) fn with_capture(
+        mut self,
+        level: crate::sandbox::control::CaptureLevel,
+        body_kb: Option<u64>,
+    ) -> Self {
+        self.capture = level;
+        self.capture_body_kb = body_kb;
+        self
+    }
+
+    /// How much of each inspected exchange this launch captures — [`CaptureLevel::Off`] by default.
+    pub(crate) fn capture_level(&self) -> crate::sandbox::control::CaptureLevel {
+        self.capture
+    }
+
+    /// The per-body capture cap in KiB, defaulted here so every caller sizes its buffers alike.
+    pub(crate) fn capture_body_kb(&self) -> u64 {
+        self.capture_body_kb
+            .unwrap_or(crate::sandbox::control::CAPTURE_BODY_KB_DEFAULT)
     }
 
     /// Attach the `[network] http2` host set, returning the policy (builder style). Each entry names

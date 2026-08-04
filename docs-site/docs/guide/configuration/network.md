@@ -8,7 +8,7 @@ mode does, the rule grammar, ask mode, and observability, see the
 project, ignored from an untrusted one: since narrowing or widening the network is a
 confidentiality choice an untrusted project may not make.
 
-See also: [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [`[net.groups]`](net-groups) · [`[secret]`](secret).
+See also: [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [`[net.groups]`](../networking/groups) · [`[secret]`](secret).
 
 ## The two forms
 
@@ -57,12 +57,46 @@ for the full semantics.
 | `stats` | `false` turns off the per-host decision counters ([`sbx net stats`](../networking/observability)) |
 | `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
+| `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
+| `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"` |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules): a host,
 `*.domain`, `host/path`, an IP, `re:<regex>`, `http://host` (inspected cleartext),
 `tcp://host:port` (raw), an optional `{GET,POST}` verb prefix, or `@<group>`
-referencing a [`[net.groups]`](net-groups).
+referencing a [`[net.groups]`](../networking/groups).
+
+## Seeing the traffic (`capture`)
+
+`capture` turns the egress log from *which requests crossed* into *what crossed*: the
+request and response heads, and optionally the leading bytes of each body, readable with
+[`sbx net logs --with-headers` / `--with-body`](../networking/observability#seeing-the-traffic-network-capture).
+
+```toml
+[network]
+mode = "deny"
+allow = ["api.example.com"]
+capture = "bodies"       # "off" (default) | "headers" | "bodies"
+capture_max_kb = 32      # per body; default 8, ceiling 1024
+```
+
+For a one-off debugging run, prefer the one-shot override, which needs no file edit and
+is trusted by invocation:
+
+```bash
+sbx run --config '[network] capture = "bodies"'
+```
+
+Every inspected path is captured: HTTPS, inspected cleartext,
+[HTTP/2 and gRPC](#http2-and-grpc) per stream, and a WebSocket — its handshake, then
+the messages each direction carried, unmasked. A raw [`tcp://`](../networking/rules)
+splice has no head to read and is the one exception.
+
+Three properties, covered in full on the [observability page](../networking/observability#seeing-the-traffic-network-capture):
+every configured secret is masked out of a capture before it is stored (and an
+sbx-injected credential never enters one at all); a capture lives only in the running
+session's memory, never on disk and never inside the cage; and it is bounded per body,
+per exchange count, and by a total byte budget, reporting whatever it drops.
 
 ## DNS resolution (`dns_cache_ttl`)
 
@@ -104,7 +138,7 @@ Notes:
 
 - **`{POST}` is required.** gRPC uses `POST`, but a bare `allow = ["grpc.example.com"]` is
   read-by-default (`{GET,HEAD}`) for an **app**, so every RPC would be refused. Prefix the rule with
-  `{POST}` (or `{*}`). (`sbx run` are all-verbs, so the baseline is less strict: but be
+  `{POST}` (or `{*}`). (`sbx run` are all-verbs, so the baseline is less strict, but be
   explicit.)
 - **`http2` selects the transport, not the verdict.** A host must still be permitted by an `allow`
   rule; `http2` only decides HTTP/2-vs-HTTP/1.1. It is `host` or `host:port` (a bare host matches any
@@ -117,6 +151,13 @@ Notes:
   One honest limit: response masking is a byte scan, so a secret inside a **gzip-compressed** gRPC
   message (gRPC compresses more often than plain HTTP) is not masked: the same limit gzip already
   imposes on the HTTP/1.1 path.
+- **The traffic capture works on HTTP/2 too.** With [`capture`](#seeing-the-traffic-capture)
+  on, each stream carries its heads and the leading bytes of each body into
+  [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture).
+  An HTTP/2 head is compressed pseudo-headers rather than text, so sbx renders it under
+  the real names (`:authority`, and `HTTP/2 200` with no reason phrase, because HTTP/2
+  sends none). A gRPC message is length-prefixed protobuf, so a body usually shows as
+  `<N byte(s) of binary data>` unless the service speaks gRPC-Web or JSON.
 - **mTLS / certificate-pinned** gRPC cannot be man-in-the-middled; those need a raw
   [`tcp://`](../networking/rules) passthrough (a separate capability).
 - Trusted/global-only like the rest of the table; a malformed entry is dropped with a warning

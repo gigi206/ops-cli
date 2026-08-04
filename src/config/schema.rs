@@ -1016,6 +1016,11 @@ pub(crate) enum SecretFrom {
 /// The two shapes the `network` field accepts: a bare posture string, or a table for the
 /// filtered-egress carve-out lists. An untagged enum so both TOML forms parse — `network = "none"`
 /// and `[network] mode = "deny"` (or `"allow"`/`"ask"`) — keeping the simple case a one-liner.
+// The table variant is far larger than the bare-string one, and deliberately so: this is a
+// deserialization shape, built once per config layer and consumed immediately into the resolved
+// view. Boxing it would add an indirection to every field read to save a stack copy that happens a
+// handful of times per launch.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum NetworkField {
@@ -1072,6 +1077,23 @@ pub(crate) struct NetworkTable {
     /// cache (resolve every request). Trusted/global-only like the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dns_cache_ttl: Option<u64>,
+    /// How much of each permitted exchange the egress proxy retains for `sbx net logs
+    /// --with-headers`/`--with-body`: `"off"` (the default), `"headers"` (the request and response
+    /// heads), or `"bodies"` (those plus a bounded prefix of each body). Never a verdict — a
+    /// captured request was already allowed, and capturing changes nothing about what is. What it
+    /// changes is how much plaintext the launch holds in memory, which is why it is
+    /// trusted/global-only like the rest of the table: an untrusted project cannot start capturing
+    /// its own traffic. An unknown level is dropped with a warning and the capture stays off
+    /// (fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capture: Option<String>,
+    /// The per-body capture cap in KiB, meaningful only with `capture = "bodies"` (it is ignored,
+    /// with a warning, otherwise). Absent means the default (8); the value is clamped to the
+    /// ceiling (1024) rather than refused, since asking for more retains fewer exchanges rather
+    /// than more bytes. The head side has its own independent bound, so a header flood cannot eat
+    /// the body budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capture_max_kb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ask_timeout: Option<String>,
     /// Whether to print the `ask`-mode park notice to stderr when a request parks. On by default; a
@@ -1858,6 +1880,8 @@ mod tests {
             Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
                 http2: vec![],
+                capture: None,
+                capture_max_kb: None,
                 mode: Some("deny".into()),
                 allow: vec![
                     "github.com".into(),
@@ -1883,6 +1907,8 @@ mod tests {
             Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
                 http2: vec![],
+                capture: None,
+                capture_max_kb: None,
                 mode: Some("deny".into()),
                 allow: vec![],
                 deny: vec![],
@@ -1905,6 +1931,8 @@ mod tests {
             Some(NetworkField::Table(NetworkTable {
                 mute: vec![],
                 http2: vec![],
+                capture: None,
+                capture_max_kb: None,
                 mode: None,
                 allow: vec!["api.foo.com".into()],
                 deny: vec![],
