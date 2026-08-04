@@ -158,9 +158,9 @@ the response did not announce a close or a connection-bound authentication schem
 `Negotiate`). Anything else closes.
 
 A connection that has waited more than **10 seconds** is dropped rather than reused, and no
-more than 64 are held at once (4 per host), so reuse never turns into an unbounded set of
-open sockets. The count is the guarantee; the delay only decides what is still fresh enough
-to hand over.
+more than 64 are held at once (4 per host and credential set), so reuse never turns into an
+unbounded set of open sockets. The count is the guarantee; the delay only decides what is
+still fresh enough to hand over.
 
 ### The residual
 
