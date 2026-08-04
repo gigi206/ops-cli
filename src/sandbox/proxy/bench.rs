@@ -34,6 +34,7 @@ use crate::testutil::TmpDir;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Instant;
 
@@ -184,7 +185,7 @@ fn spawn_plain_upstream(conns: usize, head: String, body: Arc<Vec<u8>>) -> Socke
 
 /// Read the proxy's cleartext `CONNECT` reply, up to and including the blank line. Nothing may be
 /// read past it: what follows is the client's own TLS.
-fn read_until_blank(sock: &mut UnixStream) -> io::Result<String> {
+fn read_until_blank<S: Read>(sock: &mut S) -> io::Result<String> {
     let mut out = String::new();
     let mut byte = [0u8; 1];
     while !out.ends_with("\r\n\r\n") && !out.ends_with("\n\n") {
@@ -239,9 +240,8 @@ fn client_config(proxy_ca: CertificateDer<'static>) -> Arc<ClientConfig> {
     Arc::new(cfg)
 }
 
-/// One inspected HTTPS request through the proxy, exactly as a cage client makes it: connect the
-/// socket, `CONNECT`, handshake against the minted leaf, send the request, read to EOF. Returns the
-/// number of response bytes read.
+/// One inspected HTTPS request straight onto the proxy's socket — the forwarding cost with nothing
+/// in front of it.
 fn one_https_request(
     sock_path: &std::path::Path,
     client_cfg: Arc<ClientConfig>,
@@ -249,7 +249,26 @@ fn one_https_request(
     port: u16,
     request: &[u8],
 ) -> io::Result<usize> {
-    let mut sock = UnixStream::connect(sock_path)?;
+    one_https_exchange(
+        UnixStream::connect(sock_path)?,
+        client_cfg,
+        host,
+        port,
+        request,
+    )
+}
+
+/// The client half of one inspected HTTPS request, over whatever transport already reaches the
+/// proxy: `CONNECT`, handshake against the minted leaf, send the request, read to EOF. Returns the
+/// number of response bytes read. Split from the socket it rides so the same exchange can be timed
+/// with and without the cage's forwarder in the way.
+fn one_https_exchange<S: Read + Write>(
+    mut sock: S,
+    client_cfg: Arc<ClientConfig>,
+    host: &str,
+    port: u16,
+    request: &[u8],
+) -> io::Result<usize> {
     write!(sock, "CONNECT {host}:{port} HTTP/1.1\r\n\r\n")?;
     sock.flush()?;
     let established = read_until_blank(&mut sock)?;
@@ -263,6 +282,57 @@ fn one_https_request(
     tls.write_all(request)?;
     tls.flush().ok();
     drain(&mut tls)
+}
+
+/// Kills a spawned helper when the measurement that needed it ends.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The forwarder the cage runs in front of the proxy: `socat TCP-LISTEN:…,fork UNIX-CONNECT:<uds>`.
+/// A request crossing it takes the same two hops an in-cage request takes — the namespace is what is
+/// missing here, and the namespace is not what costs.
+///
+/// It forks once per accepted connection, and the client leg is one connection per request by
+/// construction, so this is the one per-request cost that does not shrink when upstream connections
+/// are reused. Measuring it rather than adding a separately-timed figure to the proxy's own is the
+/// point: the two are not obviously additive.
+///
+/// Returns `None` when `socat` is not installed or does not come up, which drops the figure rather
+/// than failing the run — this file reports, and a missing tool is not a result.
+fn spawn_cage_forwarder(uds: &std::path::Path) -> Option<(SocketAddr, KillOnDrop)> {
+    // Take a port from the kernel, then hand it to socat: `reuseaddr` covers the gap between letting
+    // the probe listener go and socat binding the same port.
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .ok()?
+        .local_addr()
+        .ok()?
+        .port();
+    let child = Command::new("socat")
+        .arg(format!("TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr"))
+        .arg(format!("UNIX-CONNECT:{}", uds.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let guard = KillOnDrop(child);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    // Wait for the listener to answer rather than sleeping a guessed interval: a fixed sleep either
+    // wastes the run's time or times the process still starting up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if TcpStream::connect(addr).is_ok() {
+            return Some((addr, guard));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
 }
 
 /// One cleartext (`http://`) request through the proxy: absolute-form, no `CONNECT`, no TLS.
@@ -347,7 +417,7 @@ fn small_head_keepalive() -> String {
 
 /// What one small request costs, and where the cost sits.
 ///
-/// Five figures, each isolating one layer:
+/// Six figures, each isolating one layer:
 ///
 /// 1. **direct TLS, no proxy** — one handshake and the exchange, the floor for an inspected design.
 /// 2. **cleartext through the proxy** — the whole forwarding path with no TLS at all: parsing, the
@@ -359,10 +429,16 @@ fn small_head_keepalive() -> String {
 ///    already saves without any connection being kept.
 /// 5. **HTTPS with the upstream connection reused** (`[network] pool`) — the client leg is unchanged,
 ///    one connection and one handshake per request, so this isolates the upstream handshake alone.
+/// 6. **the same, across the cage's forwarder** — (5) with a real `socat …,fork` hop in front of the
+///    proxy, which is what an in-cage client crosses. It forks per connection and the client leg is
+///    one connection per request, so this cost is fixed per request no matter what the upstream leg
+///    does.
 ///
 /// The gap between (2) and (3) prices connection setup on this path, and (4) minus (5) prices the
 /// upstream half of it. On loopback those gaps are CPU alone; against a real host each avoided
 /// handshake also saves its round trips, so the same change is worth more there than it reads here.
+/// (6) minus (5) is the exception and reads the same everywhere: a fork costs what it costs, so its
+/// *share* grows as the rest of the path gets cheaper.
 #[test]
 #[ignore = "a measurement, not an assertion: run explicitly, in release"]
 fn per_request_cost() {
@@ -435,9 +511,11 @@ fn per_request_cost() {
         report_rate(label, started.elapsed(), REQUESTS);
     }
 
-    // 5. HTTPS through the proxy reusing the upstream connection. The client leg is unchanged — one
-    //    connection and one handshake per request, as the cage's forwarder produces — so what this
-    //    isolates is exactly the upstream handshake the pool removes.
+    // 5 & 6. HTTPS through the proxy reusing the upstream connection, taken twice on the same proxy
+    //    and the same upstream in the same run: first straight onto the proxy's socket, then across
+    //    the forwarder the cage actually runs. The client leg is unchanged in both — one connection
+    //    and one handshake per request — so (5) isolates the upstream handshake the pool removes and
+    //    (6) minus (5) is what the forwarder costs on top of it.
     {
         let (addr, up_ca) = spawn_keepalive_tls_upstream(small_head_keepalive(), body.clone());
         let mut roots = RootCertStore::empty();
@@ -468,6 +546,25 @@ fn per_request_cost() {
             started.elapsed(),
             REQUESTS,
         );
+
+        let label = "the same, through the cage's forwarder";
+        match spawn_cage_forwarder(&path) {
+            Some((forwarder, _socat)) => {
+                let started = Instant::now();
+                for _ in 0..REQUESTS {
+                    one_https_exchange(
+                        TcpStream::connect(forwarder).unwrap(),
+                        cfg.clone(),
+                        "upstream.test",
+                        addr.port(),
+                        request,
+                    )
+                    .unwrap();
+                }
+                report_rate(label, started.elapsed(), REQUESTS);
+            }
+            None => println!("  {label:<44} {:>8}", "skipped: no socat"),
+        }
     }
 }
 
