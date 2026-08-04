@@ -70,6 +70,12 @@
   --ifm-toc-padding-vertical: 0.4rem;
 
   --docusaurus-highlighted-code-line-bg: rgba(232, 137, 95, 0.14);
+
+  /* The page background as raw channels, so the landing hero's veil and the
+     navbar that floats over it can fade to it at an arbitrary alpha. It lives
+     here rather than on `.home` because the navbar is a sibling of the page
+     wrapper, out of reach of any class the landing page sets on itself. */
+  --home-veil: 251, 247, 241;
 }
 
 /* Infima's own variables, mapped onto the tokens above. This block carries the
@@ -147,6 +153,8 @@ html[data-theme='dark']:root {
 
   --ifm-menu-color-background-hover: rgba(232, 137, 95, 0.08);
   --ifm-table-stripe-background: rgba(232, 137, 95, 0.03);
+
+  --home-veil: 23, 20, 15;
 }
 
 /* ==========================================================================
@@ -289,6 +297,48 @@ h4 {
 
 .navbar {
   border-bottom: 1px solid var(--keep-border);
+}
+
+/* On the landing page the hero runs the full height of the viewport and the bar
+   floats over it, so it gives up its rule and most of its opacity. `:has()` is
+   the hook because the navbar is a sibling *before* the page wrapper, which puts
+   it out of reach of any class the page sets on its own subtree — and it
+   re-evaluates on its own across client-side route changes. */
+body:has(.home__hero) .navbar {
+  /* Enough of the page colour to read as a bar in its own right, still short of
+     hiding what passes behind it; the blur does the rest. */
+  background: rgba(var(--home-veil), 0.55);
+  backdrop-filter: blur(10px);
+  border-bottom-color: transparent;
+  transition: background var(--ifm-transition-fast) ease,
+    border-color var(--ifm-transition-fast) ease;
+}
+
+/* Past the hero it has ordinary content under it, not footage: it drops the
+   frosting and becomes the same solid bar the documentation carries. */
+body:has(.home__hero).is-past-hero .navbar {
+  background: var(--ifm-navbar-background-color);
+  backdrop-filter: none;
+  border-bottom-color: var(--keep-border);
+}
+
+/* The brand and the nav links are the only bare text in the bar: every control
+   beside them carries its own surface to stand on. Over the hero's brightest
+   frames the muted link colour measures under 2:1 against the footage, so on
+   this page they take the ink colour and a soft scrim. Light mode is left alone,
+   where dark ink on bright fog already clears the threshold. */
+html[data-theme='dark'] body:has(.home__hero):not(.is-past-hero) .navbar__title,
+html[data-theme='dark'] body:has(.home__hero):not(.is-past-hero) .navbar__items .navbar__link {
+  color: var(--keep-ink);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+}
+
+/* The sliding mobile menu is opaque again: it covers the hero rather than
+   floating on it. */
+body:has(.home__hero) .navbar-sidebar,
+body:has(.home__hero) .navbar--sidebar-show {
+  background: var(--ifm-background-color);
+  backdrop-filter: none;
 }
 
 .navbar__title {
@@ -729,12 +779,17 @@ pre {
   --home-olive: #6f8b3a;
   --home-deep: #f4efe7;
   --home-rule: rgba(180, 85, 47, 0.07);
-  --home-veil: 251, 247, 241;
-  --home-video-opacity: 0.62;
+  /* A warm edge a short step off the neutral border, not the accent itself: the
+     design marks a card as lit without ruling it in orange. */
+  --home-edge: #dbbfad;
+  --home-video-opacity: 0.8;
   --home-video-filter: saturate(0.3) contrast(1.08) brightness(0.92);
-  --home-veil-alpha: 0.55;
-  --home-hatch-a: #efe8dd;
-  --home-hatch-b: #f7f2ea;
+  /* The three stops of the hero veil. The top stop is light on purpose: the bar
+     floats over the footage there, and the point is to see through both. It
+     thickens towards the copy, which is where the veil earns its contrast. */
+  --home-veil-top: 0.3;
+  --home-veil-mid: 0.42;
+  --home-veil-low: 0.78;
 }
 
 html[data-theme='dark']:root .home {
@@ -744,12 +799,12 @@ html[data-theme='dark']:root .home {
   --home-olive: #b7c98a;
   --home-deep: #120f0c;
   --home-rule: rgba(232, 137, 95, 0.07);
-  --home-veil: 23, 20, 15;
-  --home-video-opacity: 0.38;
+  --home-edge: #4a3226;
+  --home-video-opacity: 0.8;
   --home-video-filter: saturate(0.35) contrast(1.05);
-  --home-veil-alpha: 0.74;
-  --home-hatch-a: #211c16;
-  --home-hatch-b: #1a1611;
+  --home-veil-top: 0.26;
+  --home-veil-mid: 0.4;
+  --home-veil-low: 0.76;
 }
 
 .home__inner {
@@ -762,7 +817,7 @@ html[data-theme='dark']:root .home {
    keeps the seam between them soft rather than ruled. */
 .home__section {
   position: relative;
-  padding: 4rem 0;
+  padding: 5.5rem 0;
 }
 
 .home__section--tint {
@@ -794,18 +849,45 @@ html[data-theme='dark']:root .home {
 /* Hero
    ------------------------------------------------------------------------ */
 
+/* Full-bleed and viewport-tall, with the copy sitting on its floor. The bar is
+   pulled over it rather than the hero being pushed below it, which is what makes
+   the footage start at the very top of the window.
+
+   `min-height` rather than `height`: on a narrow screen the copy is taller than
+   the viewport, and a fixed height would push the last line out of the box. And
+   `svh` rather than `vh`, so the hero does not jump by the height of a mobile
+   URL bar the moment the page scrolls. */
 .home__hero {
   position: relative;
+  display: flex;
+  align-items: flex-end;
+  min-height: 100vh;
+  min-height: 100svh;
+  margin-top: calc(-1 * var(--ifm-navbar-height));
   overflow: hidden;
-  padding: 4rem 0 4.25rem;
-  background-image: repeating-linear-gradient(90deg, var(--home-rule) 0 1px, transparent 1px 96px),
-    repeating-linear-gradient(0deg, var(--home-rule) 0 1px, transparent 1px 96px);
-  background-position: center top;
 }
 
-/* Behind everything, dimmed hard and masked out towards the copy so the headline
-   keeps its contrast. The gradient over it is what makes the text readable, not
-   the video's own brightness. */
+/* The layer that drifts, a little slower than the page, growing imperceptibly.
+   Oversized top and bottom so the travel never exposes an edge.
+
+   Its fill is what the hero shows before the footage decodes, and what the
+   footage sits on. A flat fill rather than the design's diagonal hatch: the
+   video is not fully opaque, so a hatch underneath does not read as texture
+   behind the picture, it reads as a grid printed across it. */
+.home__hero-media {
+  position: absolute;
+  top: -8%;
+  left: 0;
+  width: 100%;
+  height: 116%;
+  z-index: 0;
+  background: var(--keep-bg);
+  will-change: transform;
+  pointer-events: none;
+}
+
+/* The veil over it is what makes the text readable, not the video's own
+   brightness. */
 .home__hero-video {
   position: absolute;
   inset: 0;
@@ -816,48 +898,66 @@ html[data-theme='dark']:root .home {
      rather than a blue-and-ochre photograph behind the words. */
   opacity: var(--home-video-opacity);
   filter: var(--home-video-filter);
-  z-index: 0;
-  pointer-events: none;
 }
 
-.home__hero::after {
-  content: '';
+/* Darkest at the top, where the navbar floats, and again at the bottom, where
+   the copy sits; it closes on the page background so the hero has no seam with
+   the band under it. */
+.home__hero-veil {
   position: absolute;
   inset: 0;
   z-index: 1;
-  background:
-    linear-gradient(
-      to bottom,
-      rgba(var(--home-veil), 0) calc(100% - 220px),
-      rgb(var(--home-veil)) 100%
-    ),
-    rgba(var(--home-veil), var(--home-veil-alpha));
   pointer-events: none;
-}
-
-/* The hatch the design lays under the footage, so the hero has a texture even
-   before the video decodes. */
-.home__hero::before {
-  content: '';
-  z-index: 0;
-  position: absolute;
-  inset: 0;
-  background-image: repeating-linear-gradient(
-    135deg,
-    var(--home-hatch-a) 0 2px,
-    var(--home-hatch-b) 2px 9px
+  background: linear-gradient(
+    to bottom,
+    rgba(var(--home-veil), var(--home-veil-top)) 0%,
+    rgba(var(--home-veil), var(--home-veil-mid)) 34%,
+    rgba(var(--home-veil), var(--home-veil-low)) 72%,
+    rgb(var(--home-veil)) 100%
   );
-  pointer-events: none;
 }
 
-.home__hero-grid {
+.home__hero-copy {
   position: relative;
-  /* Above the video and its veil, which are the hero's own pseudo-layers. */
+  /* Above the footage and its veil. */
   z-index: 2;
-  display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
-  gap: 3rem;
+  width: 100%;
+  /* Clears the bar the hero now runs under. */
+  padding-top: calc(var(--ifm-navbar-height) + 3.5rem);
+  padding-bottom: 5.75rem;
+  will-change: transform, opacity;
+}
+
+.home__scrollcue {
+  position: absolute;
+  z-index: 2;
+  right: 2.5rem;
+  bottom: 2.5rem;
+  display: flex;
+  flex-direction: column;
   align-items: center;
+  gap: 0.625rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+.home__scrollcue-line {
+  width: 1px;
+  height: 2.75rem;
+  background: linear-gradient(to bottom, var(--keep-accent), transparent);
+  animation: home-drift 1.6s ease-in-out infinite alternate;
+}
+
+@keyframes home-drift {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(8px);
+  }
 }
 
 .home__hero-head {
@@ -880,9 +980,12 @@ html[data-theme='dark']:root .home {
   gap: 0.625rem;
   margin: 0 0 1.25rem;
   padding: 0.375rem 0.875rem 0.375rem 0.625rem;
-  border: 1px solid var(--keep-border);
+  border: 1px solid var(--keep-border-strong);
   border-radius: 999px;
-  background: var(--ifm-background-surface-color);
+  /* Frosted rather than opaque: it sits on moving footage, and a solid chip
+     would punch a hole in it. */
+  background: rgba(var(--home-veil), 0.72);
+  backdrop-filter: blur(6px);
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.75rem;
   letter-spacing: normal;
@@ -965,15 +1068,55 @@ html[data-theme='dark']:root .home {
 }
 
 .home__command {
-  white-space: pre;
-  line-height: 1.6;
-  padding: 0.6875rem 1.125rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  /* A flex item defaults to min-width:auto, which the `pre` text inside would
+     hold open past the viewport on a narrow screen; the hero clips its overflow,
+     so the box would lose its right edge rather than scroll. */
+  min-width: 0;
+  padding: 0.6875rem 0.875rem 0.6875rem 1.125rem;
   border: 1px solid var(--keep-border-strong);
   border-radius: 10px;
+  background: rgba(var(--home-veil), 0.78);
+  backdrop-filter: blur(6px);
+}
+
+.home__command-text {
+  display: block;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 0;
+  border: none;
   background: transparent;
+  white-space: pre;
+  line-height: 1.6;
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.875rem;
   color: var(--keep-body);
+}
+
+.home__command-sigil {
+  color: var(--keep-accent);
+}
+
+.home__command-copy {
+  flex: none;
+  align-self: stretch;
+  padding: 0 0 0 0.75rem;
+  border: none;
+  border-left: 1px solid var(--keep-border-strong);
+  border-radius: 0;
+  background: transparent;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  color: var(--keep-faint);
+  cursor: pointer;
+  transition: color var(--ifm-transition-fast);
+}
+
+.home__command-copy:hover {
+  color: var(--keep-accent);
 }
 
 .home__badges {
@@ -991,6 +1134,22 @@ html[data-theme='dark']:root .home {
 .home__badges li::before {
   content: '✓ ';
   color: var(--home-olive);
+}
+
+/* 00 — preflight
+   ------------------------------------------------------------------------ */
+
+/* The transcript used to share the hero with the copy. The hero is the footage
+   now, so the terminal gets its own band, and a wider column with it. */
+.home__preflight {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: 3.5rem;
+  align-items: center;
+}
+
+.home__preflight .home__aside--lead {
+  margin-bottom: 0;
 }
 
 /* Terminal
@@ -1036,9 +1195,8 @@ html[data-theme='dark']:root .home {
   overflow-x: auto;
   background: transparent;
   font-family: var(--ifm-font-family-monospace);
-  /* Sized to the narrower column the design gives this side, so the quoted
-     output never clips. */
-  font-size: 0.625rem;
+  /* Sized so the longest quoted line still fits the column without clipping. */
+  font-size: 0.75rem;
   line-height: 1.8;
   color: var(--keep-code-fg);
   white-space: pre;
@@ -1099,6 +1257,40 @@ html[data-theme='dark']:root .home {
   font-size: 1.25rem;
   font-weight: 600;
   letter-spacing: -0.02em;
+}
+
+/* In a section head the title is one of two columns, so the rhythm below it is
+   the head's own margin. */
+.home__section-title--flush {
+  margin-bottom: 0;
+}
+
+.home__section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 2.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+}
+
+/* Bounded so the note can stand beside the title rather than being pushed onto
+   its own line by a heading that would otherwise take the whole measure. */
+.home__section-head > :first-child {
+  max-width: 40rem;
+}
+
+/* The standing condition, stated next to the claim it qualifies. */
+.home__note {
+  max-width: 20rem;
+  margin: 0;
+  padding: 0.625rem 0.875rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 8px;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--keep-faint);
 }
 
 .home__aside {
@@ -1224,7 +1416,7 @@ html[data-theme='dark']:root .home {
 }
 
 .home__card--layer:hover {
-  border-color: var(--keep-accent);
+  border-color: var(--home-edge);
   background: linear-gradient(0deg, var(--keep-chip-bg), transparent 60%),
     var(--ifm-background-surface-color);
   text-decoration: none;
@@ -1363,9 +1555,10 @@ html[data-theme='dark']:root .home {
   background: var(--home-deep);
 }
 
-/* The affirmative side is the one lit up. */
+/* The affirmative side is the one lit up: a warm face, and an edge a step off
+   the neutral one rather than a rule in full accent. */
 .home__is-card--yes {
-  border-color: var(--keep-accent);
+  border-color: var(--home-edge);
   background: var(--keep-accent-soft);
 }
 
@@ -1464,17 +1657,66 @@ html[data-theme='dark']:root .home {
   margin-top: 0 !important;
 }
 
+/* Reveal on scroll
+   ------------------------------------------------------------------------ */
+
+/* The script adds `rv` to everything it can animate, then `rv--out` to what is
+   still below the fold at mount. Nothing here hides content on its own: the page
+   as served is the page as read, so a blocked script or an observer that never
+   fires leaves no block stranded in the hidden state.
+
+   The list carries the hover properties as well as the reveal ones, because this
+   rule lands on cards and rows that animate on hover and would otherwise lose
+   their own `transition` to it. Which is also why the stagger's wait is a delay
+   on the two reveal properties alone, taken from a custom property: as a plain
+   `transition-delay` it would sit on the hover properties too, and the fourth
+   card in a row would take its whole turn to acknowledge the pointer. */
+.rv {
+  transition: opacity 0.8s cubic-bezier(0.22, 1, 0.36, 1) var(--rv-delay, 0ms),
+    transform 0.8s cubic-bezier(0.22, 1, 0.36, 1) var(--rv-delay, 0ms),
+    border-color 200ms ease, background 200ms ease;
+}
+
+.rv--out {
+  opacity: 0;
+  transform: translateY(2.125rem);
+}
+
+/* A staggered run travels less, and faster: five items each sliding the full
+   distance reads as a list arriving one piece at a time rather than one block
+   settling. */
+[data-stagger] > .rv {
+  transition: opacity 0.45s ease var(--rv-delay, 0ms),
+    transform 0.45s cubic-bezier(0.22, 1, 0.36, 1) var(--rv-delay, 0ms),
+    border-color 200ms ease, background 200ms ease;
+}
+
+[data-stagger] > .rv--out {
+  transform: translateY(0.625rem);
+}
+
 /* Responsive
    ------------------------------------------------------------------------ */
 
 @media (max-width: 996px) {
-  .home__hero-grid,
+  .home__preflight,
   .home__profile {
     grid-template-columns: minmax(0, 1fr);
   }
 
   .home__lede {
     max-width: none;
+  }
+
+  /* Nothing to point at once the hero is taller than the window anyway, and at
+     this width it would sit on the copy. */
+  .home__scrollcue {
+    display: none;
+  }
+
+  .home__hero-copy {
+    padding-top: calc(var(--ifm-navbar-height) + 2.5rem);
+    padding-bottom: 4rem;
   }
 }
 
@@ -1498,6 +1740,15 @@ html[data-theme='dark']:root .home {
   .terminal__body {
     font-size: 0.6875rem;
   }
+
+  .home__command-text {
+    font-size: 0.8125rem;
+  }
+
+  /* The note has the measure to itself once it drops under the title. */
+  .home__note {
+    max-width: none;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1508,12 +1759,19 @@ html[data-theme='dark']:root .home {
   .home__card,
   .home__cta,
   .home__verb,
-  .home__ghost {
+  .home__ghost,
+  .rv {
     transition: none;
   }
 
   .home__cta:hover {
     transform: none;
+  }
+
+  /* The script skips the reveal and the parallax under this preference; the cue
+     is the one piece of motion declared in CSS, so it is stopped here. */
+  .home__scrollcue-line {
+    animation: none;
   }
 }
 

@@ -1,4 +1,4 @@
-import React, { type ReactNode } from 'react';
+import React, { useEffect, useState, type ReactNode } from 'react';
 import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import CodeBlock from '@theme/CodeBlock';
@@ -38,6 +38,9 @@ const TRANSCRIPT: { kind: 'cmd' | 'ok' | 'detail' | 'plain' | 'blank'; text?: st
   { kind: 'cmd', text: 'sbx app run opencode' },
 ];
 
+// What the hero's copy button hands over, and what it prints above it.
+const COMMAND = ['sbx app import opencode.toml', 'sbx app run opencode'];
+
 const INSIDE = [
   'the project directory',
   'a per-project Nix store',
@@ -56,24 +59,27 @@ const ABSENT = [
 
 // Three always-on layers (Landlock is a deferred option in this codebase, not a
 // layer that runs today), plus the egress firewall, which is opt-in by posture.
-const LAYERS: { n: string; tag?: string; name: string; detail: string; to?: string }[] = [
+const LAYERS: { n: string; tag?: string; name: string; detail: string; to: string; delay: number }[] = [
   {
     n: '01',
     name: 'bubblewrap',
     detail: 'All namespaces, no_new_privs, capabilities dropped.',
     to: '/docs/concepts/enforcement',
+    delay: 60,
   },
   {
     n: '02',
     name: 'seccomp',
     detail: 'A two-filter syscall denylist, applied unconditionally.',
     to: '/docs/configuration/seccomp',
+    delay: 130,
   },
   {
     n: '03',
     name: 'cgroup v2',
     detail: 'Memory, pids and CPU limits, best-effort.',
     to: '/docs/configuration/limits',
+    delay: 200,
   },
   {
     n: '04',
@@ -82,6 +88,7 @@ const LAYERS: { n: string; tag?: string; name: string; detail: string; to?: stri
     detail:
       'Deny by default, then allow by host, port, path, method or regex. A host-side MITM proxy is the only way out of an empty netns.',
     to: '/docs/networking/',
+    delay: 270,
   },
 ];
 
@@ -120,6 +127,154 @@ from   = "env://ANTHROPIC_API_KEY"
 kind   = "http-header"
 header = "x-api-key"
 type   = "raw"`;
+
+/**
+ * The cinematic layer: a parallax pass over the hero, and blocks that rise into
+ * view. The scroll-progress rule is not part of it; that one runs on every page
+ * and lives in the theme's Root.
+ *
+ * All of it is additive. The server-rendered page is already complete and fully
+ * visible; this only ever hides something after it has confirmed the browser
+ * can put it back, and it never hides what is on screen at mount. A reader with
+ * the script blocked, or one who asked for reduced motion, gets the same page
+ * without the movement rather than a blank one.
+ */
+function useCinematic(): void {
+  useEffect(() => {
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let observer: IntersectionObserver | undefined;
+
+    if (!reduced && 'IntersectionObserver' in window) {
+      // A block's own parts: its children when it staggers them, itself
+      // otherwise. Keeping the mapping lets the observer watch one node per
+      // block and still release a whole run of children at once.
+      const parts = new Map<Element, HTMLElement[]>();
+
+      observer = new IntersectionObserver(
+        (entries, self) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            parts.get(entry.target)?.forEach((part) => part.classList.remove('rv--out'));
+            self.unobserve(entry.target);
+          }
+        },
+        { rootMargin: '0px 0px -8% 0px' },
+      );
+
+      const fold = window.innerHeight * 0.9;
+      document.querySelectorAll<HTMLElement>('[data-reveal]').forEach((block) => {
+        const step = Number(block.dataset.stagger ?? '0');
+        const delay = Number(block.dataset.delay ?? '0');
+        const nodes = step > 0 ? (Array.from(block.children) as HTMLElement[]) : [block];
+
+        nodes.forEach((node, i) => {
+          node.classList.add('rv');
+          // A custom property rather than `transition-delay`, which would apply
+          // to every transitioned property: a card that waits its turn to appear
+          // must not also wait that long to answer the pointer.
+          const wait = delay + i * step;
+          if (wait > 0) node.style.setProperty('--rv-delay', `${wait}ms`);
+        });
+
+        if (block.getBoundingClientRect().top < fold) return;
+        nodes.forEach((node) => node.classList.add('rv--out'));
+        parts.set(block, nodes);
+        observer!.observe(block);
+      });
+    }
+
+    const hero = document.querySelector<HTMLElement>('.home__hero');
+    const bar = document.querySelector<HTMLElement>('.navbar');
+    const media = document.getElementById('home-hero-media');
+    const copy = document.getElementById('home-hero-copy');
+    const cue = document.getElementById('home-hero-cue');
+
+    // The bar is frosted only for as long as the hero is behind it: once the
+    // page has scrolled past, it has ordinary content under it and goes solid.
+    // A state, not an effect, so it holds whatever the motion preference is —
+    // and the class marks the page as scrolled past rather than as over the
+    // hero, so the very first paint, before any script, is already right.
+    const barState = (): void => {
+      if (!hero) return;
+      const past = hero.getBoundingClientRect().bottom <= (bar?.offsetHeight ?? 0);
+      document.body.classList.toggle('is-past-hero', past);
+    };
+
+    let frame = 0;
+    const paint = (): void => {
+      frame = 0;
+      barState();
+
+      // Everything below is the parallax, which is motion and nothing else.
+      if (reduced) return;
+      const y = window.scrollY;
+
+      if (media) {
+        const scale = 1 + Math.min(y, 900) * 0.00018;
+        media.style.transform = `translate3d(0, ${(y * 0.28).toFixed(1)}px, 0) scale(${scale.toFixed(4)})`;
+      }
+      if (copy) {
+        copy.style.transform = `translate3d(0, ${(y * 0.14).toFixed(1)}px, 0)`;
+        copy.style.opacity = String(1 - Math.min(y / 520, 1) * 0.92);
+      }
+      if (cue) cue.style.opacity = String(Math.max(0, 1 - y / 260));
+    };
+
+    const onScroll = (): void => {
+      if (!frame) frame = requestAnimationFrame(paint);
+    };
+
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    paint();
+
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onScroll);
+      if (frame) cancelAnimationFrame(frame);
+      observer?.disconnect();
+      // The class outlives this page otherwise, and the next landing mount would
+      // start out claiming the hero is already behind it.
+      document.body.classList.remove('is-past-hero');
+    };
+  }, []);
+}
+
+function Command(): ReactNode {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const id = window.setTimeout(() => setCopied(false), 1600);
+    return () => window.clearTimeout(id);
+  }, [copied]);
+
+  return (
+    <div className="home__command">
+      <code className="home__command-text">
+        {COMMAND.map((line, i) => (
+          <span key={line}>
+            <span className="home__command-sigil">$</span> {line}
+            {i < COMMAND.length - 1 ? '\n' : ''}
+          </span>
+        ))}
+      </code>
+      <button
+        type="button"
+        className="home__command-copy"
+        aria-label="Copy both commands"
+        onClick={() => {
+          navigator.clipboard?.writeText(COMMAND.join('\n')).then(
+            () => setCopied(true),
+            () => undefined,
+          );
+        }}
+      >
+        {copied ? 'copied' : 'copy'}
+      </button>
+    </div>
+  );
+}
 
 function Transcript(): ReactNode {
   return (
@@ -177,84 +332,115 @@ function Transcript(): ReactNode {
 
 export default function Home(): ReactNode {
   const { siteConfig } = useDocusaurusContext();
+  useCinematic();
 
   return (
     <Layout description={siteConfig.tagline}>
       <main className="home">
         <section className="home__hero">
-          {/* The keep in the morning fog, from the design's hero video slot. Muted,
-              looping, decorative: it carries no information the page needs, so it
-              is aria-hidden and CSS drops it under prefers-reduced-motion. */}
-          <video
-            className="home__hero-video"
-            src={useBaseUrl('/assets/hero-keep.mp4')}
-            autoPlay
-            muted
-            loop
-            playsInline
-            aria-hidden="true"
-            tabIndex={-1}
-          />
-          <div className="home__inner home__hero-grid">
-            <div className="home__hero-copy">
-              <p className="home__eyebrow">single static Rust binary · Linux</p>
-              <div className="home__hero-head">
-                <ThemedImage
-                  className="home__mark"
-                  alt=""
-                  sources={{
-                    light: useBaseUrl('/assets/logo.svg'),
-                    dark: useBaseUrl('/assets/logo-dark.svg'),
-                  }}
-                />
-                <h1 className="home__title">
-                  The bind layout <em>is</em> the security control.
-                </h1>
-              </div>
-              <p className="home__lede">
-                sbx is a sandbox launcher. It runs tools and encapsulated AI agents inside a
-                bubblewrap cage, where they install a project's full dependency set through
-                single-user, daemonless Nix, without mutating the host OS.
-              </p>
-              <div className="home__actions">
-                <Link className="home__cta" to="/docs/getting-started/quickstart">
-                  Get started
-                </Link>
-                <code className="home__command">
-                  $ sbx app import opencode.toml{'\n'}$ sbx app run opencode
-                </code>
-              </div>
-              <ul className="home__badges">
-                <li>no OCI runtime</li>
-                <li>no daemon</li>
-                <li>no root</li>
-              </ul>
+          {/* The keep in the morning fog. Muted, looping, decorative: it carries
+              no information the page needs, so it is aria-hidden, it drifts
+              under the copy as the page scrolls, and CSS drops it entirely under
+              prefers-reduced-motion. The hatch beneath it is what the hero shows
+              before the footage decodes. */}
+          <div className="home__hero-media" id="home-hero-media">
+            <video
+              className="home__hero-video"
+              src={useBaseUrl('/assets/hero-keep.mp4')}
+              autoPlay
+              muted
+              loop
+              playsInline
+              aria-hidden="true"
+              tabIndex={-1}
+            />
+          </div>
+          <div className="home__hero-veil" />
+
+          <div className="home__inner home__hero-copy" id="home-hero-copy">
+            <p className="home__eyebrow">single static Rust binary · Linux</p>
+            <div className="home__hero-head">
+              <ThemedImage
+                className="home__mark"
+                alt=""
+                sources={{
+                  light: useBaseUrl('/assets/logo.svg'),
+                  dark: useBaseUrl('/assets/logo-dark.svg'),
+                }}
+              />
+              <h1 className="home__title">
+                The bind layout <em>is</em> the security control.
+              </h1>
             </div>
-            <Transcript />
+            <p className="home__lede">
+              sbx is a sandbox launcher. It runs tools and encapsulated AI agents inside a
+              bubblewrap cage, where they install a project's full dependency set through
+              single-user, daemonless Nix, without mutating the host OS.
+            </p>
+            <div className="home__actions">
+              <Link className="home__cta" to="/docs/getting-started/quickstart">
+                Get started
+              </Link>
+              <Command />
+            </div>
+            <ul className="home__badges">
+              <li>no OCI runtime</li>
+              <li>no daemon</li>
+              <li>no root</li>
+            </ul>
+          </div>
+
+          <div className="home__scrollcue" id="home-hero-cue" aria-hidden="true">
+            <span>scroll</span>
+            <span className="home__scrollcue-line" />
+          </div>
+        </section>
+
+        <section className="home__section">
+          <div className="home__inner">
+            <div className="home__preflight" data-reveal>
+              <div>
+                <p className="home__kicker home__kicker--accent">00 · preflight</p>
+                <h2 className="home__section-title">
+                  Check the ground before you build the wall.
+                </h2>
+                <p className="home__aside home__aside--lead">
+                  sbx requires capability-bearing unprivileged user namespaces. Without them{' '}
+                  <Link to="/docs/cli/doctor">
+                    <code>sbx doctor</code>
+                  </Link>{' '}
+                  hard-fails, because there is no emulation fallback: emulation is not a
+                  boundary.
+                </p>
+              </div>
+              <Transcript />
+            </div>
           </div>
         </section>
 
         <section className="home__section home__section--tint">
           <div className="home__inner">
-            <p className="home__kicker home__kicker--accent">01 · the cage</p>
-            <h2 className="home__section-title">A secret is protected by being absent.</h2>
-            <p className="home__aside home__aside--lead">
-              sbx runs as your uid, and same-uid means read-only is not a boundary. The host
-              filesystem and your credentials simply are not in the cage unless a{' '}
-              <Link to="/docs/concepts/trust">trusted config</Link> grants them.
-            </p>
+            <div data-reveal>
+              <p className="home__kicker home__kicker--accent">01 · the cage</p>
+              <h2 className="home__section-title">A secret is protected by being absent.</h2>
+              <p className="home__aside home__aside--lead">
+                sbx runs as your uid, and same-uid means read-only is not a boundary. The host
+                filesystem and your credentials simply are not in the cage unless a{' '}
+                <Link to="/docs/concepts/trust">trusted config</Link> grants them.
+              </p>
+            </div>
             <div className="home__cage">
-              <div className="home__cage-col">
+              <div className="home__cage-col" data-reveal data-delay="80">
                 <p className="home__cage-head">Inside the cage</p>
-                <ul className="home__list home__list--in">
+                <ul className="home__list home__list--in" data-reveal data-stagger="55">
                   {INSIDE.map((item) => (
                     <li key={item}>{item}</li>
                   ))}
                 </ul>
               </div>
-              <div className="home__cage-col">
+              <div className="home__cage-col" data-reveal data-delay="160">
                 <p className="home__cage-head">Absent by default</p>
-                <ul className="home__list home__list--out">
+                <ul className="home__list home__list--out" data-reveal data-stagger="55">
                   {ABSENT.map((item) => (
                     <li key={item}>{item}</li>
                   ))}
@@ -266,55 +452,56 @@ export default function Home(): ReactNode {
 
         <section className="home__section">
           <div className="home__inner">
-            <p className="home__kicker home__kicker--accent">02 · enforcement</p>
-            <h2 className="home__section-title">Four layers, three of them always on.</h2>
+            <div className="home__section-head" data-reveal>
+              <div>
+                <p className="home__kicker home__kicker--accent">02 · enforcement</p>
+                <h2 className="home__section-title home__section-title--flush">
+                  Four layers, three of them always on.
+                </h2>
+              </div>
+              <p className="home__note">
+                requires capability-bearing unprivileged userns · no emulation fallback
+              </p>
+            </div>
             <p className="home__aside home__aside--lead">
-              Every launch goes through them, and none is a toggle. They require
-              capability-bearing unprivileged user namespaces: without them{' '}
-              <Link to="/docs/cli/doctor">
-                <code>sbx doctor</code>
-              </Link>{' '}
-              hard-fails, because there is no emulation fallback. The network posture is the
-              one you choose: the host network by default, or a filtered egress the cage
-              cannot step around.
+              Every launch goes through them, and none is a toggle. The network posture is the
+              one you choose: the host network by default, or a filtered egress the cage cannot
+              step around.
             </p>
             <div className="home__grid home__grid--three">
-              {LAYERS.map(({ n, tag, name, detail, to }) => {
-                const body = (
-                  <>
-                    <p className="home__layer-n">
-                      layer {n}
-                      {tag && <span className="home__layer-tag">{tag}</span>}
-                    </p>
-                    <p className="home__card-name">{name}</p>
-                    <p className="home__card-detail">{detail}</p>
-                  </>
-                );
-                return (
-                  <Link className="home__card home__card--layer" to={to!} key={n}>
-                    {body}
-                  </Link>
-                );
-              })}
+              {LAYERS.map(({ n, tag, name, detail, to, delay }) => (
+                <Link
+                  className="home__card home__card--layer"
+                  to={to}
+                  key={n}
+                  data-reveal
+                  data-delay={delay}
+                >
+                  <p className="home__layer-n">
+                    layer {n}
+                    {tag && <span className="home__layer-tag">{tag}</span>}
+                  </p>
+                  <p className="home__card-name">{name}</p>
+                  <p className="home__card-detail">{detail}</p>
+                </Link>
+              ))}
             </div>
           </div>
         </section>
 
         <section className="home__section home__section--tint">
           <div className="home__inner">
-            <p className="home__kicker home__kicker--accent">03 · app profiles</p>
-            <h2 className="home__section-title">One profile per agent.</h2>
             <div className="home__profile">
-              <div>
+              <div data-reveal>
+                <p className="home__kicker home__kicker--accent">03 · app profiles</p>
+                <h2 className="home__section-title">One profile per agent.</h2>
                 <p className="home__aside home__aside--lead">
                   An <code>[app.&lt;name&gt;]</code> table, or a standalone profile file,
                   defines a reusable launcher with its own isolated <code>$HOME</code>,
                   package set, network allowlist and host-side credential injection.
                 </p>
-                <ul className="home__arrows">
-                  <li>
-                    Trust is bound to the file's content hash, the direnv model.
-                  </li>
+                <ul className="home__arrows" data-reveal data-stagger="70">
+                  <li>Trust is bound to the file's content hash, the direnv model.</li>
                   <li>
                     An untrusted <code>.sbx.toml</code> cannot touch security fields.
                   </li>
@@ -323,7 +510,7 @@ export default function Home(): ReactNode {
                   </li>
                 </ul>
               </div>
-              <div className="home__profile-code">
+              <div className="home__profile-code" data-reveal data-delay="120">
                 <Tabs groupId="profile-form">
                   <TabItem value="project" label=".sbx.toml" default>
                     <CodeBlock language="toml">{PROFILE_SAMPLE}</CodeBlock>
@@ -339,14 +526,16 @@ export default function Home(): ReactNode {
 
         <section className="home__section home__section--deep">
           <div className="home__inner">
-            <p className="home__kicker home__kicker--accent">04 · surface</p>
-            <h2 className="home__section-title">The verbs you reach for.</h2>
-            <p className="home__aside home__aside--lead">
-              Eight of them carry most of the work. The{' '}
-              <Link to="/docs/cli/">full reference</Link> covers the rest: networking,
-              secrets, tasks, plugins, storage and housekeeping.
-            </p>
-            <div className="home__verbs">
+            <div data-reveal>
+              <p className="home__kicker home__kicker--accent">04 · surface</p>
+              <h2 className="home__section-title">The verbs you reach for.</h2>
+              <p className="home__aside home__aside--lead">
+                Eight of them carry most of the work. The{' '}
+                <Link to="/docs/cli/">full reference</Link> covers the rest: networking,
+                secrets, tasks, plugins, storage and housekeeping.
+              </p>
+            </div>
+            <div className="home__verbs" data-reveal data-stagger="45">
               {VERBS.map(({ cmd, detail, to }) => (
                 <Link className="home__verb" to={to} key={cmd}>
                   <code className="home__verb-cmd">{cmd}</code>
@@ -359,7 +548,7 @@ export default function Home(): ReactNode {
 
         <section className="home__section home__section--tint">
           <div className="home__inner home__is">
-            <div className="home__is-card home__is-card--yes">
+            <div className="home__is-card home__is-card--yes" data-reveal>
               <p className="home__kicker home__kicker--accent">sbx is</p>
               <h2 className="home__section-title home__section-title--sm">
                 A sandbox launcher, built for untrusted autonomous agents.
@@ -369,7 +558,7 @@ export default function Home(): ReactNode {
                 is a locked-down agent, not an interactive shell.
               </p>
             </div>
-            <div className="home__is-card">
+            <div className="home__is-card" data-reveal data-delay="110">
               <p className="home__kicker">sbx is not</p>
               <h2 className="home__section-title home__section-title--sm">
                 A container manager. An environment manager.
@@ -383,7 +572,7 @@ export default function Home(): ReactNode {
         </section>
 
         <section className="home__section home__closer">
-          <div className="home__inner">
+          <div className="home__inner" data-reveal>
             <ThemedImage
               className="home__closer-mark"
               alt=""
