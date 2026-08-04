@@ -4322,8 +4322,9 @@ fn build(
             &prep.bwrap,
             app,
             prep.cfg.egress_stats,
-            // Pair the per-session MITM CA with the base root bundle so the injected CA file is a full,
-            // ordinary bundle (a lone cert trips tools that heuristically reject a "too small" CA).
+            // The base roots to pair the per-session MITM CA with, for a policy that lets a client
+            // reach a server this proxy does not stand in for. Which policies those are, and what the
+            // pairing costs when it buys nothing, is decided where the file is written.
             Some(prep.userland.ca_bundle_src.as_path()),
             // The session's own proxy: a launch stands up exactly one, so the pid already names it.
             "",
