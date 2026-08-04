@@ -748,9 +748,22 @@ pre {
   padding: 3.5rem var(--ifm-navbar-padding-horizontal) 4rem;
 }
 
+/* The theme folds the row to one column per line below 996px, which leaves the
+   lists stacked down the left edge with the rest of each line empty. They are
+   laid out here instead, and fold only once a column can no longer hold its
+   longest entry. */
 .footer__links {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  row-gap: 3rem;
   max-width: 68rem;
   margin: 0 auto 2rem;
+}
+
+/* The row gap is the only spacing between folded lines; the theme's own bottom
+   margin would stack on top of it. */
+.footer__links .footer__col {
+  margin-bottom: 0;
 }
 
 .footer__title {
