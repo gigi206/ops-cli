@@ -166,6 +166,28 @@ A [`tcp://` L4 rule](rules#raw-l4-splice-tcp) opts out of this: the proxy splice
 raw byte stream without terminating TLS, for non-HTTP protocols. That is why a raw
 splice has no path/method controls and bypasses the credential machinery.
 
+### What the cage's trust anchor holds
+
+The CA the cage trusts is at `/opt/sbx/egress-ca.pem`, written owner-only outside every
+writable mount and bound read-only, so the agent cannot rewrite its own anchor. What the
+file contains follows from the question the previous paragraph raises: can anything in
+this cage reach a server the proxy does not stand in for?
+
+With every rule inspected, no. The proxy terminates each connection and presents its own
+leaf, so the session CA is the only anchor a client ever exercises, and the file holds
+that one certificate. Add a `tcp://` rule and the answer changes: a spliced stream
+reaches the real server, the client authenticates it, and the ordinary public roots are
+what lets it. The file then carries the session CA followed by the host's root bundle.
+
+The difference is worth what it costs. The full bundle is about 460 KB and 120
+certificates, and a client that loads its trust store on each connection reads all of
+it: in a cage, `curl` spent about 13 ms in its TLS phase against about 1.3 ms on the
+session CA alone. That was the largest single cost on the inspected path.
+
+One consequence to know if a client starts failing: a tool that rejects a trust store for
+looking too small will do so under an all-inspected policy. None of `curl`, `git`, Python
+or Node does.
+
 ### Requests that arrive without a CONNECT
 
 Not every client tunnels. With a proxy configured, some send the whole request to the

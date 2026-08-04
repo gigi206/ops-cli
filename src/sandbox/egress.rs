@@ -585,6 +585,17 @@ pub(crate) fn start(
         ))
     });
 
+    // Whether a client in the cage can ever complete a TLS handshake with a server that is not this
+    // proxy, which decides what the cage's trust anchor has to hold (see where it is written below).
+    // On an inspected rule it cannot: the proxy terminates the TLS and presents its own leaf, so the
+    // session CA is the only anchor exercised. A `tcp://` rule splices the byte stream through
+    // untouched, and there the client authenticates the real server itself. Only `allow` rules are
+    // asked — a denied destination is never reached, whichever layer it names.
+    let splices_any = policy
+        .allow_rules()
+        .iter()
+        .any(|r| r.layer == crate::allowlist::Layer::L4);
+
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_injections(injections)
         .with_redactions(redactions)
@@ -644,19 +655,24 @@ pub(crate) fn start(
     let ctx = Arc::new(ctx);
 
     // Write the CA bundle owner-only, outside every writable mount, then bind it read-only — the
-    // agent gets a trust anchor it cannot rewrite. The bundle is the per-session MITM CA FOLLOWED BY
-    // the base root bundle (`ca_bundle`, the same Mozilla roots sbx binds at /etc/ssl): every allowed
-    // egress is MITM'd and so presents the MITM CA, but a bundle of a single cert is unusual and trips
-    // tools that heuristically reject a "too small" CA file (e.g. a client that sanity-checks
-    // `certifi`), so pairing it with the normal roots keeps the file a full, ordinary bundle.
+    // agent gets a trust anchor it cannot rewrite. It always opens with the per-session MITM CA,
+    // which is what verifies every inspected byte the cage receives.
     //
-    // The extra roots authenticate nothing here: the MITM CA is what verifies the wire, and the
-    // empty netns permits no un-proxied TLS. They are not free, though, and reading otherwise sends
-    // the next reader looking for this cost somewhere else. The file runs to ~460 KB and 120
-    // certificates, and a client that loads its store per connection pays for all of it — measured
-    // in a cage, `curl` spends ~13 ms in its TLS phase against ~1.4 ms when pointed at the MITM CA
-    // alone. Trimming it would be a trade rather than a fix: a `tcp://` rule and a shared-network
-    // launch both end TLS at the real server, where these roots are what verifies it.
+    // Whether the public roots follow depends on whether anything in the cage can reach a server
+    // this proxy does not stand in for. A splice (`tcp://`) hands the stream through untouched, so
+    // the client authenticates the real server and needs the ordinary roots to do it; those roots
+    // then belong in the anchor. With every rule inspected, they verify nothing, and they are not
+    // free: appended, the file runs to ~460 KB and 120 certificates, and a client that loads its
+    // store per connection pays for all of it. Measured in a cage, `curl` spends ~13 ms in its TLS
+    // phase against ~1.4 ms on the MITM CA alone, and Python's default context takes ~25 ms on the
+    // full file. That is the largest single cost on the inspected path, larger than the forwarder
+    // and larger than an upstream handshake.
+    //
+    // The reason they were appended unconditionally is real and survives here: a lone certificate is
+    // an unusual CA file, and a client that sanity-checks the store's shape (a `certifi` heuristic)
+    // can reject it. That risk is now taken only where it buys something, and it was never
+    // hypothetical-free either way — a host with no root bundle to point at already produced a
+    // one-certificate file, on every launch, for as long as this has existed.
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -666,7 +682,7 @@ pub(crate) fn start(
             .mode(0o600)
             .open(&ca_file)?;
         f.write_all(ctx.ca_cert_pem().as_bytes())?;
-        if let Some(bundle) = ca_bundle {
+        if let Some(bundle) = ca_bundle.filter(|_| splices_any) {
             if let Ok(roots) = std::fs::read(bundle) {
                 f.write_all(b"\n")?;
                 f.write_all(&roots)?;
@@ -1118,11 +1134,11 @@ mod tests {
         assert_eq!(mode, 0o600, "the CA key/cert file must be owner-only");
         let ca_pem = std::fs::read_to_string(&ca.src).unwrap();
         assert!(ca_pem.contains("BEGIN CERTIFICATE"));
-        // it is a full bundle: the per-session MITM CA PLUS the base roots (a lone cert trips tools
-        // that reject a "too small" CA bundle).
+        // This policy splices nothing, so the MITM CA is the only anchor a client can exercise and
+        // the base roots stay out — see the dedicated test below for the pair of cases.
         assert!(
-            ca_pem.contains("# sbx-test-base-roots"),
-            "the CA file must append the base root bundle to the MITM CA"
+            !ca_pem.contains("# sbx-test-base-roots"),
+            "with every rule inspected the base roots must not be appended"
         );
 
         let (host_uds, ca_file) = (guard.host_uds.clone(), guard.ca_file.clone());
@@ -1158,6 +1174,62 @@ mod tests {
     /// request is answered — is created host-side but **never** bound into the cage. In Mode B the
     /// in-cage agent is the adversary; if it could reach this socket it could answer its own asks.
     /// Only the proxy socket and the CA cross in.
+    /// What the cage's trust anchor has to hold follows from one question: can anything in there
+    /// reach a server this proxy does not stand in for?
+    ///
+    /// With every rule inspected it cannot, the session CA is the only anchor ever exercised, and
+    /// appending the public roots would add ~460 KB and 120 certificates that verify nothing and
+    /// that a client re-reads on every connection. A `tcp://` rule splices the stream through
+    /// untouched, the client authenticates the real server itself, and the roots are then the only
+    /// thing that lets it.
+    #[test]
+    fn the_cage_ca_carries_the_public_roots_only_where_a_splice_needs_them() {
+        for (instance, entry, roots_expected) in [
+            ("-8", "api.example.com", false),
+            ("-9", "tcp://db.example.com:5432", true),
+        ] {
+            let data = TmpDir::new();
+            let layout = Layout::under(data.path());
+            std::fs::create_dir_all(layout.data_dir()).unwrap();
+            let roots = data.path().join("roots.pem");
+            std::fs::write(
+                &roots,
+                "# sbx-test-base-roots\n-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+            )
+            .unwrap();
+
+            let (_guard, wiring) = start(
+                &layout,
+                tcp_policy(&[entry]),
+                &[],
+                Path::new("/"),
+                Path::new(UNUSED_BWRAP),
+                None,
+                false,
+                Some(roots.as_path()),
+                instance,
+                None,
+            )
+            .expect("start the egress proxy");
+
+            let ca = wiring
+                .binds
+                .iter()
+                .find(|b| b.dest == Path::new(CAGE_CA))
+                .expect("the CA is bound into the cage");
+            let pem = std::fs::read_to_string(&ca.src).unwrap();
+            assert!(
+                pem.contains("BEGIN CERTIFICATE"),
+                "`{entry}`: the MITM CA anchors the cage either way"
+            );
+            assert_eq!(
+                pem.contains("# sbx-test-base-roots"),
+                roots_expected,
+                "`{entry}`: base roots appended should be {roots_expected}"
+            );
+        }
+    }
+
     fn tcp_policy(entries: &[&str]) -> crate::allowlist::EgressPolicy {
         let rules = entries
             .iter()
