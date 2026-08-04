@@ -1128,6 +1128,24 @@ impl EgressPolicy {
         }
     }
 
+    /// Whether **any** allowed destination is reached by a raw splice — the coarse, host-agnostic
+    /// form of [`Self::l4_decision`], asked once at launch rather than per connection.
+    ///
+    /// It decides what the cage's trust anchor has to hold. Under an inspected rule a client in the
+    /// cage never completes a handshake with the real server: the proxy terminates the TLS and
+    /// presents its own leaf, so the session CA is the only anchor exercised and the public roots are
+    /// inert weight. A `tcp://` rule splices the byte stream through untouched, and there the client
+    /// authenticates the real server itself — which it cannot do without those roots.
+    ///
+    /// Only **allow** rules are asked, for two reasons. A denied destination is never reached,
+    /// whichever layer names it. And a deny that merely *suppresses* a splice
+    /// ([`L4Decision::Suppressed`]) sends that one connection to the inspected path without
+    /// retracting the rule, so ignoring the deny list over-reports at worst — the anchor carries
+    /// roots nothing ends up needing, which costs bytes. Under-reporting would fail a handshake.
+    pub(crate) fn splices_any(&self) -> bool {
+        self.allow.iter().any(|r| r.layer == Layer::L4)
+    }
+
     /// Apply an app's read-by-default posture: rewrite every **allow** rule whose methods are
     /// [`Methods::Unspecified`] (no explicit prefix) to `default`. Only a concrete [`Methods::Only`]
     /// set narrows — an app whose default is [`Methods::Any`] (declared `default_methods = ["*"]`) or
@@ -2776,6 +2794,37 @@ mod tests {
             p.explain("ssh.example.com", 22, "/", "GET"),
             Decision::DeniedDefault
         );
+    }
+
+    #[test]
+    fn only_an_allowed_tcp_rule_reports_that_a_splice_can_happen() {
+        // What the cage's trust anchor has to carry hangs on this one answer, so each way of *not*
+        // being a splice is asserted rather than assumed.
+        assert!(!allow(&[]).splices_any(), "an empty policy splices nothing");
+        assert!(
+            !allow(&["api.example.com", "http://plain.example.com/x"]).splices_any(),
+            "both inspected layers terminate at the proxy's own leaf"
+        );
+        assert!(
+            allow(&["api.example.com", "tcp://db.example.com:5432"]).splices_any(),
+            "one tcp:// rule among inspected ones is enough"
+        );
+        // A deny never opens a splice, so a tcp:// deny alone does not report one.
+        assert!(
+            !EgressPolicy::new(vec![], vec![rule("tcp://db.example.com:5432")]).splices_any(),
+            "a deny names a destination that is never reached"
+        );
+        // And a deny that suppresses the only splice still reports one: the answer over-reports on
+        // purpose (roots nothing needs cost bytes; missing roots would fail a handshake).
+        let suppressed = EgressPolicy::new(
+            vec![rule("tcp://db.example.com:5432")],
+            vec![rule("db.example.com:*")],
+        );
+        assert!(matches!(
+            suppressed.l4_decision("db.example.com", 5432),
+            L4Decision::Suppressed(_)
+        ));
+        assert!(suppressed.splices_any());
     }
 
     #[test]

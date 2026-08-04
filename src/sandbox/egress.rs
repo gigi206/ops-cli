@@ -587,14 +587,8 @@ pub(crate) fn start(
 
     // Whether a client in the cage can ever complete a TLS handshake with a server that is not this
     // proxy, which decides what the cage's trust anchor has to hold (see where it is written below).
-    // On an inspected rule it cannot: the proxy terminates the TLS and presents its own leaf, so the
-    // session CA is the only anchor exercised. A `tcp://` rule splices the byte stream through
-    // untouched, and there the client authenticates the real server itself. Only `allow` rules are
-    // asked — a denied destination is never reached, whichever layer it names.
-    let splices_any = policy
-        .allow_rules()
-        .iter()
-        .any(|r| r.layer == crate::allowlist::Layer::L4);
+    // Read here because `policy` is moved into the proxy context on the next line.
+    let splices_any = policy.splices_any();
 
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
         .with_injections(injections)
