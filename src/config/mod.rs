@@ -3897,6 +3897,11 @@ fn validate_network_table(
     if let Some(secs) = table.dns_cache_ttl {
         policy = policy.with_dns_cache_ttl(Some(std::time::Duration::from_secs(secs)));
     }
+    // Upstream connection reuse. Off unless asked for, and never a verdict — it decides how a
+    // permitted request is carried, not whether it is.
+    if let Some(pool) = table.pool {
+        policy = policy.with_pool(pool);
+    }
     // The traffic capture: how much of each permitted exchange the proxy keeps for
     // `sbx net logs --with-headers/--with-body`. Never a verdict. An unknown level is dropped with a
     // warning and the capture stays off — fail-closed, since the value names how much plaintext the

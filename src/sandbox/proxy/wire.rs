@@ -364,10 +364,122 @@ pub(super) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming
     }
 }
 
+/// Whether a relayed response leaves its connection able to carry a further request. Read entirely
+/// off the head the upstream sent, and false unless every one of three conditions holds:
+///
+///   - the protocol version persists: HTTP/1.1 does by default, HTTP/1.0 only when it asks to;
+///   - no `close` token in `Connection` — that token is the upstream announcing this is the last
+///     response it will serve on the connection;
+///   - no `WWW-Authenticate` naming a **connection-bound** scheme (`NTLM`, `Negotiate`). Those bind
+///     an authenticated identity to the TCP connection rather than to the request, so handing the
+///     connection to a later request would hand it an authentication state it never asked for and
+///     cannot see. A proxy that injects credentials of its own has no business blurring that line.
+///
+/// A head that will not parse is not reusable either: an unreadable head is exactly the case where
+/// nothing about the connection's state is known.
+pub(super) fn response_keeps_alive(head: &[u8]) -> bool {
+    let Ok(parsed) = parse_head(head) else {
+        return false;
+    };
+    // A repeated `Connection` is legal (each carries its own token list), so every one is read.
+    let connection_token = |tok: &str| {
+        parsed
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+            .flat_map(|(_, v)| v.split(','))
+            .any(|t| t.trim().eq_ignore_ascii_case(tok))
+    };
+    if connection_token("close") {
+        return false;
+    }
+    let connection_bound_auth = parsed
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+        .flat_map(|(_, v)| v.split(','))
+        .any(|challenge| {
+            let scheme = challenge.split_whitespace().next().unwrap_or("");
+            scheme.eq_ignore_ascii_case("ntlm") || scheme.eq_ignore_ascii_case("negotiate")
+        });
+    if connection_bound_auth {
+        return false;
+    }
+    match parsed.request_line.split(' ').next().unwrap_or("") {
+        "HTTP/1.1" => true,
+        "HTTP/1.0" => connection_token("keep-alive"),
+        _ => false,
+    }
+}
+
+/// A response head rewritten as the **client** should see it: every `Connection` and `Keep-Alive`
+/// header dropped, and a single `Connection: close` put back before the terminator.
+///
+/// The two legs of a forwarded request have independent connection lifetimes, and this is what keeps
+/// them from being mistaken for one. The proxy may hold the upstream leg open to serve a later
+/// request, while the client leg is one request per connection by construction — the tunnel is torn
+/// down as soon as this response is relayed. Passing the upstream's keep-alive through would invite
+/// the client to send a second request into a socket already closing: an idempotent one is silently
+/// retried, doubling the very traffic the reuse was meant to save, and a `POST` simply fails.
+/// `Connection` is hop-by-hop, so setting it is the proxy's to do — exactly as it already is on the
+/// request side.
+///
+/// A head with no blank-line terminator comes back untouched: there is nothing well-formed to
+/// rewrite, and synthesizing a terminator would fabricate a head the upstream never sent.
+pub(super) fn force_close_in_head(head: &[u8]) -> Vec<u8> {
+    const CLOSE: &[u8] = b"Connection: close\r\n";
+    let mut out = Vec::with_capacity(head.len() + CLOSE.len());
+    let mut lines = head.split_inclusive(|&b| b == b'\n');
+    match lines.next() {
+        // The status line is not a header; it is copied through verbatim.
+        Some(status) => out.extend_from_slice(status),
+        None => return head.to_vec(),
+    }
+    // Dropping a header written over several lines (the obsolete line folding) means dropping its
+    // continuations too, or the fold would silently re-attach to whichever header now precedes it.
+    let mut dropping = false;
+    let mut terminated = false;
+    for line in lines {
+        let bare = strip_eol(line);
+        if bare.is_empty() {
+            out.extend_from_slice(CLOSE);
+            out.extend_from_slice(line);
+            terminated = true;
+            break;
+        }
+        if matches!(bare.first(), Some(b' ' | b'\t')) {
+            if dropping {
+                continue;
+            }
+        } else {
+            let name = bare
+                .split(|&b| b == b':')
+                .next()
+                .unwrap_or(&[])
+                .trim_ascii();
+            dropping = name.eq_ignore_ascii_case(b"connection")
+                || name.eq_ignore_ascii_case(b"keep-alive");
+            if dropping {
+                continue;
+            }
+        }
+        out.extend_from_slice(line);
+    }
+    if terminated {
+        out
+    } else {
+        head.to_vec()
+    }
+}
+
 /// The framing state machine's position inside a response body.
 enum BodyState {
-    /// Nothing to read: a bodiless response, or a framed one fully consumed.
-    Done,
+    /// Nothing left to read. `as_framed` separates the two ways a body arrives here: `true` when it
+    /// ended exactly where the head said it would (a bodiless status, the declared length consumed,
+    /// the blank line closing a chunked body's trailers), `false` when the upstream stopped
+    /// mid-message. Both end the relay identically — the cage gets the bytes that did arrive — but
+    /// only the first leaves the connection positioned at the start of whatever comes next.
+    Done { as_framed: bool },
     /// This many declared bytes are still outstanding.
     Length(u64),
     /// At the start of a chunk-size line.
@@ -406,7 +518,7 @@ pub(super) struct FramedBody<R> {
 impl<R: BufRead> FramedBody<R> {
     pub(super) fn new(inner: R, framing: BodyFraming) -> Self {
         let state = match framing {
-            BodyFraming::Empty => BodyState::Done,
+            BodyFraming::Empty => BodyState::Done { as_framed: true },
             BodyFraming::Length(n) => BodyState::Length(n),
             BodyFraming::Chunked => BodyState::ChunkSize,
             BodyFraming::ToEof => BodyState::ToEof,
@@ -417,6 +529,20 @@ impl<R: BufRead> FramedBody<R> {
             pending: Vec::new(),
             at: 0,
         }
+    }
+
+    /// Whether the body ended **exactly where its framing said it would**, leaving the reader
+    /// positioned at the start of whatever the connection carries next.
+    ///
+    /// This is a check of the terminal state, not a flag raised along the way, and that is what
+    /// makes it safe to build on: a relay abandoned part-way — a client that went away mid-body, a
+    /// read that errored — leaves the machine inside `Length`/`ChunkData`, so it answers `false`
+    /// without any caller having to remember to say so. Reaching [`BodyState::Done`] is not the
+    /// answer either: the machine also lands there when the upstream stops mid-message, which ends
+    /// the relay the same way but leaves the connection at an unknown position. A body delimited by
+    /// the close is never framed, so it never qualifies.
+    pub(super) fn ended_as_framed(&self) -> bool {
+        matches!(self.state, BodyState::Done { as_framed: true })
     }
 
     /// Read one framing line, returning its bytes whether or not it was terminated. An untermined
@@ -453,10 +579,10 @@ impl<R: BufRead> Read for FramedBody<R> {
                 return Ok(0);
             }
             match self.state {
-                BodyState::Done => return Ok(0),
+                BodyState::Done { .. } => return Ok(0),
                 BodyState::ToEof => return self.inner.read(out),
                 BodyState::Length(0) => {
-                    self.state = BodyState::Done;
+                    self.state = BodyState::Done { as_framed: true };
                     return Ok(0);
                 }
                 BodyState::Length(n) => {
@@ -466,7 +592,7 @@ impl<R: BufRead> Read for FramedBody<R> {
                         // The upstream closed before its declared length. Ending here hands the cage
                         // the bytes that did arrive followed by a clean close, which is what a
                         // close-delimited relay did with the same truncation.
-                        self.state = BodyState::Done;
+                        self.state = BodyState::Done { as_framed: false };
                         return Ok(0);
                     }
                     self.state = BodyState::Length(n - got as u64);
@@ -478,7 +604,7 @@ impl<R: BufRead> Read for FramedBody<R> {
                     self.state = match size {
                         Some(0) => BodyState::ChunkTrailers,
                         Some(n) => BodyState::ChunkData(n),
-                        None if line.is_empty() => BodyState::Done,
+                        None if line.is_empty() => BodyState::Done { as_framed: false },
                         None => BodyState::ToEof,
                     };
                     self.pending = line;
@@ -488,7 +614,7 @@ impl<R: BufRead> Read for FramedBody<R> {
                     let want = n.min(out.len() as u64) as usize;
                     let got = self.inner.read(&mut out[..want])?;
                     if got == 0 {
-                        self.state = BodyState::Done;
+                        self.state = BodyState::Done { as_framed: false };
                         return Ok(0);
                     }
                     self.state = BodyState::ChunkData(n - got as u64);
@@ -500,7 +626,7 @@ impl<R: BufRead> Read for FramedBody<R> {
                     self.state = if n == 2 && crlf == *b"\r\n" {
                         BodyState::ChunkSize
                     } else if n == 0 {
-                        BodyState::Done
+                        BodyState::Done { as_framed: false }
                     } else {
                         BodyState::ToEof
                     };
@@ -510,12 +636,12 @@ impl<R: BufRead> Read for FramedBody<R> {
                     let (line, complete) = self.framing_line();
                     if !complete {
                         self.state = if line.is_empty() {
-                            BodyState::Done
+                            BodyState::Done { as_framed: false }
                         } else {
                             BodyState::ToEof
                         };
                     } else if strip_eol(&line).is_empty() {
-                        self.state = BodyState::Done;
+                        self.state = BodyState::Done { as_framed: true };
                     }
                     self.pending = line;
                 }
@@ -560,6 +686,190 @@ mod tests {
         let mut out = Vec::new();
         body.read_to_end(&mut out).unwrap();
         out
+    }
+
+    /// Read a whole framed body and report whether it ended where its framing said it would.
+    fn framed_verdict(head: &[u8], method: &str, wire: &[u8]) -> bool {
+        let framing = response_framing(head, method);
+        let mut body = FramedBody::new(io::BufReader::new(io::Cursor::new(wire.to_vec())), framing);
+        body.read_to_end(&mut Vec::new()).unwrap();
+        body.ended_as_framed()
+    }
+
+    #[test]
+    fn a_body_that_ends_where_its_framing_said_reports_so() {
+        // The three ways a message can legitimately end. Each is followed on the wire by bytes that
+        // do not belong to it, which is the situation the verdict exists for: they are exactly what a
+        // reused connection would go on to read.
+        for (head, method, wire) in [
+            (
+                &b"HTTP/1.1 204 No Content\r\n\r\n"[..],
+                "GET",
+                &b"HTTP/1.1 200 OK\r\n\r\n"[..],
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"[..],
+                "GET",
+                &b"helloHTTP/1.1 200 OK\r\n\r\n"[..],
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+                "GET",
+                &b"5\r\nhello\r\n0\r\n\r\nHTTP/1.1 200 OK\r\n\r\n"[..],
+            ),
+        ] {
+            assert!(
+                framed_verdict(head, method, wire),
+                "a complete message must report itself framed: {:?}",
+                String::from_utf8_lossy(head)
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_the_upstream_cut_short_is_not_reported_as_framed() {
+        // Every one of these ends the relay at the same place a complete message would — the cage
+        // gets the bytes that arrived and a clean close. What separates them is where the connection
+        // is left, and that is the whole point of asking: a truncated message leaves it nowhere
+        // knowable, so it must never be handed to another request.
+        for (head, wire, what) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"[..],
+                &b"hello"[..],
+                "a body shorter than its declared length",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+                &b"5\r\nhel"[..],
+                "a chunk cut inside its data",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+                &b"5\r\nhello\r\n"[..],
+                "a chunked body with no terminal chunk",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+                &b"5\r\nhello\r\n0\r\n"[..],
+                "a terminal chunk whose trailers never end",
+            ),
+        ] {
+            assert!(
+                !framed_verdict(head, "GET", wire),
+                "{what} must not report itself framed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_delimited_body_is_never_reported_as_framed() {
+        // Nothing in the head says where this ends, so the relay reads to the close. There is no
+        // "after" on such a connection to be positioned at.
+        assert!(!framed_verdict(b"HTTP/1.1 200 OK\r\n\r\n", "GET", b"hello"));
+    }
+
+    #[test]
+    fn a_body_abandoned_part_way_is_not_reported_as_framed() {
+        // The verdict is read off the terminal state rather than raised along the way, so a relay
+        // that stops early — a client that went away mid-body — answers `false` on its own, with no
+        // caller having to notice and say so.
+        let mut body = FramedBody::new(
+            io::BufReader::new(io::Cursor::new(b"hello world".to_vec())),
+            BodyFraming::Length(11),
+        );
+        let mut some = [0u8; 5];
+        body.read_exact(&mut some).unwrap();
+        assert!(
+            !body.ended_as_framed(),
+            "a body still mid-message is not framed-complete"
+        );
+    }
+
+    #[test]
+    fn a_head_rewritten_for_the_client_carries_exactly_one_connection_close() {
+        let out = force_close_in_head(
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\
+              Content-Length: 5\r\n\r\n",
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+            "the upstream's persistence headers give way to a single close"
+        );
+    }
+
+    #[test]
+    fn rewriting_a_head_drops_a_folded_headers_continuation_lines_too() {
+        // Obsolete line folding: dropping only a folded header's first line would leave its
+        // continuation attached to whatever header now precedes it, silently corrupting that one.
+        let out = force_close_in_head(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive,\r\n te\r\nEtag: x\r\n\r\n",
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nEtag: x\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_head_is_returned_untouched_rather_than_completed() {
+        // Synthesizing the terminator would fabricate a head the upstream never sent.
+        let cut = &b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"[..];
+        assert_eq!(force_close_in_head(cut), cut);
+    }
+
+    #[test]
+    fn a_response_states_whether_its_connection_survives_it() {
+        for (head, reusable, what) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+                true,
+                "HTTP/1.1 persists by default",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"[..],
+                false,
+                "an explicit close ends the connection",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\n\r\n"[..],
+                false,
+                "a close among several tokens still ends it",
+            ),
+            (
+                &b"HTTP/1.0 200 OK\r\n\r\n"[..],
+                false,
+                "HTTP/1.0 does not persist unless it asks to",
+            ),
+            (
+                &b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n"[..],
+                true,
+                "HTTP/1.0 asking to persist",
+            ),
+            (
+                &b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM\r\n\r\n"[..],
+                false,
+                "NTLM binds the identity to the connection",
+            ),
+            (
+                &b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Negotiate, Basic realm=\"x\"\r\n\r\n"[..],
+                false,
+                "so does Negotiate, wherever it sits in the challenge list",
+            ),
+            (
+                &b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"x\"\r\n\r\n"[..],
+                true,
+                "a request-scoped scheme leaves the connection alone",
+            ),
+            (&b"not a response at all\r\n\r\n"[..], false, "an unparsable head knows nothing"),
+        ] {
+            assert_eq!(
+                response_keeps_alive(head),
+                reusable,
+                "{what}: {:?}",
+                String::from_utf8_lossy(head)
+            );
+        }
     }
 
     #[test]

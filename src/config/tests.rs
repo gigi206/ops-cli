@@ -118,6 +118,7 @@ fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
         stats: None,
         default_methods: None,
         dns_cache_ttl: None,
+        pool: None,
     })
 }
 
@@ -190,6 +191,7 @@ fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
         stats: None,
         default_methods: None,
         dns_cache_ttl: None,
+        pool: None,
     });
     let policy =
         super::validate_network(&mut w, GLOBAL_CONFIG, field, &g, &NetworkPolicy::default())
@@ -509,6 +511,7 @@ fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })),
         ..RawConfig::default()
     }
@@ -741,6 +744,7 @@ fn an_untrusted_project_app_cannot_widen_its_default_methods() {
         stats: None,
         default_methods: Some(vec!["*".into()]),
         dns_cache_ttl: None,
+        pool: None,
     });
     let project = raw_with_app("probe", raw_app(&["id"], &[], &[], &[], Some(net)));
     let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
@@ -883,6 +887,7 @@ fn network_modes_set_the_egress_default_action() {
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })
     };
 
@@ -960,6 +965,7 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })
     };
     let filtering = |action| NetworkPolicy::Allowlist(EgressPolicy::default().with_default(action));
@@ -1018,6 +1024,7 @@ fn a_mode_less_project_network_table_inherits_the_global_mode() {
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })),
         ..RawConfig::default()
     };
@@ -1056,6 +1063,7 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
                 stats: None,
                 default_methods: None,
                 dns_cache_ttl: None,
+                pool: None,
             })),
             ..RawApp::default()
         },
@@ -1071,6 +1079,69 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
         "the app inherits the baseline's `ask` mode"
     );
     assert_eq!(p.allow_rules().len(), 1, "the app keeps its own rule");
+}
+
+/// `pool` reaches the policy from a layer entitled to set it, and only from one. The reuse of an
+/// upstream connection is a transport decision the proxy makes on a request that a credential may
+/// ride, so it belongs to the same trusted `[network]` table as the rest: an untrusted project's
+/// table is dropped whole, and its `pool` with it.
+#[test]
+fn the_pool_toggle_defaults_off_and_is_gated_trusted_only() {
+    let pool_table = |pool: Option<bool>| {
+        NetworkField::Table(NetworkTable {
+            mute: vec![],
+            http2: vec![],
+            capture: None,
+            capture_max_kb: None,
+            mode: Some("deny".into()),
+            allow: vec!["api.example.com".into()],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+            dns_cache_ttl: None,
+            pool,
+        })
+    };
+    let mut w = Vec::new();
+    let pool_of = |network: &NetworkPolicy| match network {
+        NetworkPolicy::Allowlist(p) => p.pool(),
+        _ => panic!("a filtering posture is expected"),
+    };
+
+    // Unset, and explicitly off, are the same posture: no connection is ever reused.
+    for value in [None, Some(false)] {
+        let got = validate_network(&mut w, GLOBAL_CONFIG, pool_table(value)).unwrap();
+        assert!(
+            !pool_of(&got),
+            "reuse is off unless it is asked for: {value:?}"
+        );
+    }
+    let on = validate_network(&mut w, GLOBAL_CONFIG, pool_table(Some(true))).unwrap();
+    assert!(pool_of(&on), "a trusted layer turns reuse on");
+    assert!(w.is_empty(), "valid values warn nothing: {w:?}");
+
+    // An untrusted project cannot: its whole `[network]` table is dropped before this field is ever
+    // read, so the launch keeps the posture the trusted layer gave it.
+    let project = || RawConfig {
+        network: Some(pool_table(Some(true))),
+        ..RawConfig::default()
+    };
+    let global = || RawConfig {
+        network: Some(pool_table(None)),
+        ..RawConfig::default()
+    };
+    let trusted = resolve_no_plugins(global(), Some((project(), TrustState::Trusted)));
+    assert!(
+        pool_of(&trusted.network),
+        "a trusted project may turn reuse on"
+    );
+    let untrusted = resolve_no_plugins(global(), Some((project(), TrustState::Untrusted)));
+    assert!(
+        !pool_of(&untrusted.network),
+        "an untrusted project's whole `[network]` table drops, its `pool` included"
+    );
 }
 
 #[test]
@@ -1089,6 +1160,7 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
             stats: None,
             default_methods: None,
             dns_cache_ttl: ttl,
+            pool: None,
         })
     };
     let mut w = Vec::new();
@@ -1124,6 +1196,7 @@ fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_ty
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })
     };
     let mut w = Vec::new();
@@ -1179,6 +1252,7 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })),
         ..RawConfig::default()
     };
@@ -1203,6 +1277,7 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })),
         ..RawConfig::default()
     };
@@ -1268,6 +1343,7 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })
     };
     let mut w = Vec::new();
@@ -1309,6 +1385,7 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
         stats: None,
         default_methods: None,
         dns_cache_ttl: None,
+        pool: None,
     });
     let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
     assert!(
@@ -1334,6 +1411,7 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })
     };
     let mut w = Vec::new();
@@ -1367,6 +1445,7 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
         stats: None,
         default_methods: None,
         dns_cache_ttl: None,
+        pool: None,
     });
     let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
     assert!(
@@ -2704,6 +2783,7 @@ fn a_baseline_default_methods_is_ignored_with_a_warning() {
             stats: None,
             default_methods: Some(vec!["GET".into()]),
             dns_cache_ttl: None,
+            pool: None,
         })),
         ..RawConfig::default()
     };
@@ -4722,6 +4802,7 @@ fn an_unknown_network_mode_is_dropped_with_a_warning() {
                 stats: None,
                 default_methods: None,
                 dns_cache_ttl: None,
+                pool: None,
             })),
             ..RawConfig::default()
         },
@@ -4830,6 +4911,7 @@ fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConf
             stats: None,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })),
         secret: Some(raw_secret_section(secrets)),
         ..RawConfig::default()
@@ -5359,6 +5441,7 @@ fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
             stats,
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })),
         ..RawConfig::default()
     };
@@ -5419,6 +5502,7 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
             stats: Some(false),
             default_methods: None,
             dns_cache_ttl: None,
+            pool: None,
         })),
     );
     let r = resolve_no_plugins(raw_with_app("demo", app), None);
@@ -5501,6 +5585,7 @@ fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
         stats: None,
         default_methods: None,
         dns_cache_ttl: None,
+        pool: None,
     }))
 }
 

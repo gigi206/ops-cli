@@ -224,12 +224,50 @@ so does a response to `HEAD`. The status decides, not the length.
 
 The last row is the deliberate asymmetry. Where an ambiguous *request* is refused, an
 ambiguous *response* is relayed to the close. Cutting it would turn an upstream's
-framing bug into a truncation the tool in the cage would blame on sbx, and the proxy
-forces `Connection: close` upstream, so relaying to the close is correct. Framing can
+framing bug into a truncation the tool in the cage would blame on sbx. Framing can
 shorten the wait; it never shortens a response.
 
 A chunked response reaches the cage **verbatim**, size lines and trailers included. The
 proxy learns where the body ends without rewriting a byte of it.
+
+### Reusing an upstream connection (`pool`)
+
+Framing is what makes reuse possible: a proxy that cannot tell the end of a message
+from the end of a socket has to close the socket to know it is done. Once it can, a
+finished connection to the real server is a validated TLS session the next request
+could use instead of paying for another handshake. With
+[`[network] pool = true`](../configuration/network#reusing-upstream-connections-pool)
+it does. The setting is off by default.
+
+Reuse never touches the verdict. Every request is checked in full, exactly as it is
+without it: the allowlist, the `Host`/SNI agreement, the address guard, the secret
+tripwires. What is reused is the handshake.
+
+**The two legs are independent, and that is the load-bearing part.** The client leg is
+one request per connection by construction, which is what stops a pipelined second
+request from skipping the check. So when the proxy forwards with keep-alive on the
+upstream leg, it still tells the *client* `Connection: close`. A client told otherwise
+would send its next request into a tunnel already closing.
+
+A connection is offered to another request only when all of these hold:
+
+| Condition | Why |
+|---|---|
+| same host and port | the certificate was validated for that name |
+| same injected credentials | a connection that carried a secret is never given to a request that does not receive the same one |
+| the body ended where its framing said | a truncated message leaves the connection at an unknown position |
+| nothing arrived after it | anything else means the connection has moved past that message |
+| the response announced no close, and no `NTLM`/`Negotiate` | those bind an identity to the connection itself |
+
+Anything else closes. What is held is bounded by **count**, not by a clock: 64 waiting
+connections in total, 4 per host, the same stance the rest of the proxy takes toward
+held resources. The clock answers a different question, which is how stale a connection
+may be and still be handed over: one that has waited more than 10 seconds is dropped
+rather than reused.
+
+The residual is a server closing a waiting connection in the microseconds between the
+proxy's check and its write. That request gets a `502 upstream-closed`, never a silent
+empty response.
 
 ### CONNECT authority == SNI == decrypted Host (anti-domain-fronting)
 
@@ -281,9 +319,14 @@ The categories surface in [`sbx net logs`](observability#sbx-net-logs) as the
 per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text is
 never disclosed, so a global-config rule the cage cannot read does not leak),
 `denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,
-`outbound-secret`, and the transport-side `dns-failure`, `upstream-unreachable`, and
-`upstream-cert-rejected`. A genuine upstream status (a real `404`) is relayed
-verbatim with no such header.
+`outbound-secret`, and the transport-side `dns-failure`, `upstream-unreachable`,
+`upstream-cert-rejected`, and `upstream-closed`. A genuine upstream status (a real
+`404`) is relayed verbatim with no such header.
+
+`upstream-closed` is the one that names a server that accepted the request and then
+went away without answering. Saying so is deliberate: an empty relay would be
+indistinguishable from a genuine zero-byte response, and it is also where the one
+residual of [connection reuse](#reusing-an-upstream-connection-pool) would surface.
 
 Every one of these is a **request-side** category: they describe requests the proxy
 declined to make. No response is ever refused for how it is framed, per the inbound

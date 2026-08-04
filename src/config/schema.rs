@@ -1077,6 +1077,18 @@ pub(crate) struct NetworkTable {
     /// cache (resolve every request). Trusted/global-only like the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dns_cache_ttl: Option<u64>,
+    /// Whether the egress proxy may carry a request over an upstream connection an earlier request
+    /// left behind, instead of opening and validating a new one every time. Off by default. It
+    /// changes nothing about which requests are permitted: a reused connection is offered only to a
+    /// request going to the same host and port **and** carrying the same injected credentials, and
+    /// only after a response that ended exactly where its framing said it would. What it buys is the
+    /// TLS handshake, which dominates the cost of a small request — a build that fetches from one
+    /// host thousands of times pays for one handshake instead of thousands. The residual it accepts:
+    /// an upstream may close a reusable connection at any moment, and a request that loses that race
+    /// gets a `502` (`upstream-closed`) instead of a response. Trusted/global-only like the rest of
+    /// the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pool: Option<bool>,
     /// How much of each permitted exchange the egress proxy retains for `sbx net logs
     /// --with-headers`/`--with-body`: `"off"` (the default), `"headers"` (the request and response
     /// heads), or `"bodies"` (those plus a bounded prefix of each body). Never a verdict — a
@@ -1895,6 +1907,7 @@ mod tests {
                 stats: None,
                 default_methods: None,
                 dns_cache_ttl: None,
+                pool: None,
             }))
         );
     }
@@ -1917,6 +1930,7 @@ mod tests {
                 stats: None,
                 default_methods: None,
                 dns_cache_ttl: None,
+                pool: None,
             }))
         );
     }
@@ -1941,6 +1955,7 @@ mod tests {
                 stats: None,
                 default_methods: None,
                 dns_cache_ttl: None,
+                pool: None,
             }))
         );
     }

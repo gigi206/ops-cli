@@ -169,6 +169,7 @@ mod ctx;
 mod dns;
 mod h2mitm;
 mod inject;
+mod pool;
 mod ssrf;
 mod websocket;
 mod wire;
@@ -178,6 +179,7 @@ use capture::{CaptureGuard, CaptureReader};
 use ctx::effective_policy;
 pub(crate) use ctx::{builtin_allow_rules, union_with_builtin, ProxyCtx};
 pub(crate) use inject::{HeaderInjection, SecretNeedle};
+use pool::{PoolKey, UpstreamTls};
 use ssrf::{ip_permitted, names_exact_host};
 use websocket::*;
 use wire::*;
@@ -784,48 +786,52 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         );
     };
 
-    // 7. Connect to the address we just checked (not a re-resolve, which would reopen the
-    //    rebinding window) and validate the upstream certificate up front; a forged or self-signed
-    //    upstream is refused, never passed through. The two failure shapes get distinct reasons so
-    //    "the host is down" reads differently from "its certificate was rejected".
-    let mut upstream = match connect_upstream(ip, port, &connect_host, ctx) {
-        Ok(u) => u,
-        Err(UpstreamError::Unreachable) => {
-            ctx.push_log(
-                super::control::Proto::Https,
+    // 7. Match this request's host-scoped credential injections. This runs *after* the verdict, so a
+    //    denied request never receives a secret, and is keyed on the already-verified `connect_host`
+    //    plus the decrypted path — so the credential reaches exactly the destination it was scoped
+    //    to. A redirect to another host opens a new tunnel and re-runs this match, so the secret
+    //    cannot ride along to an unintended host. It is settled before any connection is taken,
+    //    because which credentials a request carries is half of what partitions the pool below.
+    let injected_ids = matching_injection_ids(ctx, &connect_host, port, &itarget);
+    let injected = injection_pairs(ctx, &injected_ids);
+
+    // 7a. Whether this request may share its upstream leg with others. It takes a launch that asked
+    //     for reuse, an HTTP/1.1 request (the version whose connections persist by default), and no
+    //     protocol upgrade — an upgrade takes the connection over entirely. The key pairs the
+    //     verified host and port with the exact credential set above, so a connection that carried a
+    //     secret is only ever offered to a request that receives the same secret.
+    let keep_alive = ctx.pool.is_some()
+        && !ws_upgrade
+        && inner.request_line.split_whitespace().nth(2) == Some("HTTP/1.1");
+    let pool_key = keep_alive.then(|| PoolKey::new(&connect_host, port, &injected_ids));
+    // Taking a parked connection is limited to a request the proxy can send a second time, because a
+    // connection the upstream closed while it was parked only shows up after the write. That means a
+    // request with no body, or a chunked one whose body the de-chunker buffers before forwarding; a
+    // body streaming straight from the client is gone once written. Such a request opens its own
+    // connection and still leaves it behind for the next one.
+    let replayable = chunked || body_len == 0;
+
+    // 7b. Take the upstream connection: a parked one, or a new one to the address just checked (not
+    //     a re-resolve, which would reopen the rebinding window) with its certificate validated up
+    //     front — a forged or self-signed upstream is refused, never passed through.
+    let (mut upstream, mut from_pool) = match acquire_upstream(
+        ctx,
+        pool_key.as_ref().filter(|_| replayable),
+        ip,
+        port,
+        &connect_host,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return refuse_upstream(
+                br.get_mut(),
+                ctx,
                 &connect_host,
                 port,
-                Some(&imethod),
-                Some(&itarget),
-                super::control::LogVerdict::Error,
-                "upstream-unreachable",
-            );
-            return respond_refusal_tls(
-                &mut br,
-                "502 Bad Gateway",
-                "upstream-unreachable",
-                &format!("`{connect_host}` is allowed but could not be reached"),
-            );
-        }
-        Err(UpstreamError::CertRejected) => {
-            ctx.push_log(
-                super::control::Proto::Https,
-                &connect_host,
-                port,
-                Some(&imethod),
-                Some(&itarget),
-                super::control::LogVerdict::Error,
-                "upstream-cert-rejected",
-            );
-            return respond_refusal_tls(
-                &mut br,
-                "502 Bad Gateway",
-                "upstream-cert-rejected",
-                &format!(
-                    "the TLS certificate presented by `{connect_host}` was rejected \
-                     (upstream validation failed)"
-                ),
-            );
+                &imethod,
+                &itarget,
+                e,
+            )
         }
     };
 
@@ -853,13 +859,6 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // upgrade: a WS over TLS is still inspected TLS, so its proto stays `https`. The relay increments
     // the guard's byte counters as data flows (application-plaintext bytes on this inspected path).
     let flow = ctx.register_flow(&connect_host, port, super::control::Proto::Https);
-
-    // 8. Inject any matching host-scoped credentials. This runs *after* the verdict, so a
-    //    denied request never receives a secret, and is keyed on the already-verified
-    //    `connect_host` plus the decrypted path — so the credential reaches exactly the
-    //    destination it was scoped to. A redirect to another host opens a new tunnel and
-    //    re-runs this match, so the secret cannot ride along to an unintended host.
-    let injected = matching_injections(ctx, &connect_host, port, &itarget);
 
     // 8a. Open the traffic capture for this exchange, when the launch captures. The request head
     //     recorded is the client's own (`inner_bytes`), taken before the reserialization below adds
@@ -908,11 +907,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         );
     }
 
-    // 9. Forward this one request and stream the response back, then close — a pipelined second
-    //    request is never forwarded, so it cannot skip the per-request check. The head is
-    //    reserialized with `Connection: close` forced so a keep-alive upstream closes after the
-    //    one response (otherwise there is no EOF and the read would block until the timeout).
-    if chunked {
+    // 9. Forward this one request and stream the response back — a pipelined second request from the
+    //    client is never forwarded, so it cannot skip the per-request check.
+    //
+    //    The forwarded bytes are materialized whenever the proxy still holds all of them (see
+    //    `replayable` above): that is what lets a connection the upstream closed while it was parked
+    //    cost a second attempt instead of an empty response. A body streaming straight from the
+    //    client is gone once written, which is exactly why such a request never took a parked one.
+    let forwarded: Option<Vec<u8>> = if chunked {
         // A `Transfer-Encoding: chunked` request: de-chunk the body into a bounded buffer and
         // forward a clean `Content-Length`-framed request (the `Transfer-Encoding` header is
         // stripped by `reserialize_request` when a length is forced), so no chunked framing — and
@@ -950,14 +952,51 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         if let Some(c) = &capture {
             c.set_request_body(&body);
         }
-        let reserialized = reserialize_request(&inner, &injected, Some(body.len() as u64));
-        upstream.write_all(&reserialized)?;
-        upstream.write_all(&body)?;
-        // Count client→upstream (`up`) — the forwarded head plus the de-chunked body.
-        flow.up
-            .fetch_add((reserialized.len() + body.len()) as u64, Ordering::Relaxed);
+        let mut req = reserialize_request(&inner, &injected, Some(body.len() as u64), keep_alive);
+        req.extend_from_slice(&body);
+        Some(req)
+    } else if body_len == 0 {
+        Some(reserialize_request(&inner, &injected, None, keep_alive))
     } else {
-        let reserialized = reserialize_request(&inner, &injected, None);
+        None
+    };
+
+    if let Some(req) = &forwarded {
+        // Exactly one retry, and only for a connection that came from the pool: after it, the
+        // connection is fresh and the loop condition ends it. The check is a peek, so an upstream
+        // that is simply slow to answer — a completion that thinks before its first token — is
+        // waited for rather than retried (the read bound is lifted first, or that wait would look
+        // like a dead connection), and a healthy connection reaches the relay untouched. Only the
+        // attempt that survives is counted on the flow.
+        loop {
+            upstream.write_all(req)?;
+            upstream.flush().ok();
+            begin_response_stream(&upstream.sock);
+            if !from_pool || upstream_spoke(&upstream.sock) {
+                break;
+            }
+            let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &connect_host) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return refuse_upstream(
+                        br.get_mut(),
+                        ctx,
+                        &connect_host,
+                        port,
+                        &imethod,
+                        &itarget,
+                        e,
+                    )
+                }
+            };
+            upstream = fresh;
+            from_pool = false;
+        }
+        // Count client→upstream (`up`) — the forwarded head plus any body that rode with it.
+        flow.up.fetch_add(req.len() as u64, Ordering::Relaxed);
+    } else {
+        // A body the proxy does not hold: forwarded straight from the client, on its own connection.
+        let reserialized = reserialize_request(&inner, &injected, None, keep_alive);
         upstream.write_all(&reserialized)?;
         flow.up
             .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
@@ -966,7 +1005,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // `copy_exact` below would block reading a body the client will not send, until the timeout.
         // `Expect` is stripped from the forwarded head (see `reserialize_request`), so the upstream
         // does not run the handshake a second time.
-        if body_len > 0 && head_expects_continue(&inner) {
+        if head_expects_continue(&inner) {
             let client = br.get_mut();
             let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
             let _ = client.flush();
@@ -982,12 +1021,11 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         }
         // Count the forwarded body (`copy_exact` moved exactly `body_len` bytes upstream).
         flow.up.fetch_add(body_len, Ordering::Relaxed);
+        upstream.flush().ok();
+        // The request is permitted and fully forwarded; the response may now idle between bursts (a
+        // streamed completion), so lift the upstream read timeout for the relay below.
+        begin_response_stream(&upstream.sock);
     }
-    upstream.flush().ok();
-
-    // The request is permitted and fully forwarded; the response may now idle between bursts (a
-    // streamed completion), so lift the upstream read timeout for the relay below.
-    begin_response_stream(&upstream.sock);
 
     // 9b. Response-side leak backstop: a configured secret can only re-enter the cage by being
     //     *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores
@@ -1013,14 +1051,36 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     pulled off the socket, so the body must be read from IT and never from the socket again.
     //     `set_status` amends the `allow` event pushed above; on an L4 splice, a refusal, or an
     //     error there is no such amend (no response).
-    let mut up_br = BufReader::new(upstream);
+    let mut up_br = BufReader::new(&mut upstream);
     let (resp_head, complete) = relay_response_head(
         &mut up_br,
         br.get_mut(),
         &flow.down,
         capture.as_ref(),
         head_masking,
+        keep_alive,
     )?;
+    // An upstream that closed without answering leaves nothing to relay, and saying so is the honest
+    // reply: an empty success is indistinguishable from a genuine zero-byte response, and it would
+    // hide the one failure reuse can produce — a connection the far side closed in the window
+    // between the pool's probe and the write.
+    if resp_head.is_empty() {
+        ctx.push_log(
+            super::control::Proto::Https,
+            &connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            super::control::LogVerdict::Error,
+            "upstream-closed",
+        );
+        return respond_refusal_tls(
+            &mut br,
+            "502 Bad Gateway",
+            "upstream-closed",
+            &format!("`{connect_host}` closed the connection without sending a response"),
+        );
+    }
     // Record only a FINAL status (>= 200). Any interim 1xx was relayed and read past above, so what
     // is left is the request's real outcome; a head cut short parses to nothing and simply leaves
     // the event without a status.
@@ -1035,21 +1095,41 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     } else {
         BodyFraming::ToEof
     };
-    // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
-    let response = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
 
     // 10. The body is teed on the way through, ahead of the reflection masking: the capture does its
     //     own masking at filing time (over whole buffers), so what is stored is masked either way,
     //     and what the cage receives is decided by `masks_reflection` alone (the head above was
-    //     masked under the same decision).
-    let mut response: Box<dyn Read + '_> = match &capture {
-        Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
-        None => Box::new(response),
-    };
-    if masks_reflection {
-        pump_redacting(&mut response, br.get_mut(), &ctx.redactions)?;
-    } else {
-        pump_to_eof(&mut response, br.get_mut())?;
+    //     masked under the same decision). Counted upstream→client (`down`) through the body; the
+    //     head was counted as it was relayed.
+    let mut framed = FramedBody::new(&mut up_br, framing);
+    {
+        let response = CountingReader::new(&mut framed, flow.down.clone());
+        let mut response: Box<dyn Read + '_> = match &capture {
+            Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
+            None => Box::new(response),
+        };
+        if masks_reflection {
+            pump_redacting(&mut response, br.get_mut(), &ctx.redactions)?;
+        } else {
+            pump_to_eof(&mut response, br.get_mut())?;
+        }
+    }
+
+    // 11. The response is over. Whether its connection may carry another request takes three answers,
+    //     every one of them necessary: the body ended exactly where its framing said (a truncated one
+    //     leaves the connection at an unknown position), nothing the head read pulled ahead is still
+    //     buffered, and the response itself left the connection reusable. The pool settles the one
+    //     remaining question — whether anything is pending on the socket — and closes the connection
+    //     when the answer is no. This sits after the relay's `?`, so a relay that ended early parks
+    //     nothing.
+    let ended_as_framed = framed.ended_as_framed();
+    drop(framed);
+    let no_residual = up_br.buffer().is_empty();
+    drop(up_br);
+    if ended_as_framed && no_residual && response_keeps_alive(&resp_head) {
+        if let (Some(pool), Some(key)) = (ctx.pool.as_ref(), pool_key) {
+            pool.park(key, upstream, ctx.timeout);
+        }
     }
     // The response is fully relayed — close the intercepted TLS cleanly so the client sees a proper
     // end-of-stream, not a bare socket drop (the reported `without sending TLS close_notify`).
@@ -1594,7 +1674,8 @@ fn handle_cleartext(
         request_line: format!("{method} {path} {version}"),
         headers: head.headers.clone(),
     };
-    let reserialized = reserialize_request(&origin, &[], None);
+    // Never reused: reuse exists to amortize a TLS handshake, and a cleartext leg has none to save.
+    let reserialized = reserialize_request(&origin, &[], None, false);
     upstream.write_all(&reserialized)?;
     flow.up
         .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
@@ -1623,8 +1704,14 @@ fn handle_cleartext(
     //    the response is relayed unredacted (there is nothing this path could reflect that the
     //    tripwire above did not already refuse outbound).
     let mut up_br = BufReader::new(upstream);
-    let (resp_head, complete) =
-        relay_response_head(&mut up_br, &mut client, &flow.down, capture.as_ref(), &[])?;
+    let (resp_head, complete) = relay_response_head(
+        &mut up_br,
+        &mut client,
+        &flow.down,
+        capture.as_ref(),
+        &[],
+        false,
+    )?;
     if let Some(code) = parse_status_code(&resp_head) {
         if code >= 200 {
             ctx.set_status(allow_seq, code);
@@ -1991,48 +2078,34 @@ fn handle_https_forward(
         );
     };
 
-    // 7. Open a validated TLS connection to the checked address (not a re-resolve, which would reopen
-    //    the rebinding window). A forged/self-signed upstream is refused, never downgraded; the two
-    //    failure shapes get distinct reasons.
-    let mut upstream = match connect_upstream(ip, port, &host, ctx) {
-        Ok(u) => u,
-        Err(UpstreamError::Unreachable) => {
-            ctx.push_log(
-                super::control::Proto::Https,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
-                super::control::LogVerdict::Error,
-                "upstream-unreachable",
-            );
-            return write_refusal(
-                &mut client,
-                "502 Bad Gateway",
-                "upstream-unreachable",
-                &format!("`{host}:{port}` is allowed but could not be reached"),
-            );
-        }
-        Err(UpstreamError::CertRejected) => {
-            ctx.push_log(
-                super::control::Proto::Https,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
-                super::control::LogVerdict::Error,
-                "upstream-cert-rejected",
-            );
-            return write_refusal(
-                &mut client,
-                "502 Bad Gateway",
-                "upstream-cert-rejected",
-                &format!(
-                    "the TLS certificate presented by `{host}` was rejected \
-                     (upstream validation failed)"
-                ),
-            );
-        }
+    // 7. Match this request's host-scoped credential injection — after the verdict (a denied request
+    //    never gets a secret) and keyed on the verified host + decrypted path, so it reaches only its
+    //    scoped destination. Unlike the `http://` path, the upstream is TLS, so a header secret rides
+    //    it encrypted, never in the clear. Settled before a connection is taken, because which
+    //    credentials a request carries is half of what partitions the pool.
+    let injected_ids = matching_injection_ids(ctx, &host, port, &path);
+    let injected = injection_pairs(ctx, &injected_ids);
+
+    // 7a. Whether this request may share its upstream leg with others, on the same terms as the
+    //     tunneled path: the launch has to have asked for reuse, and the request has to be HTTP/1.1.
+    //     Only a request the proxy can send again takes a parked connection.
+    let keep_alive =
+        ctx.pool.is_some() && head.request_line.split_whitespace().nth(2) == Some("HTTP/1.1");
+    let pool_key = keep_alive.then(|| PoolKey::new(&host, port, &injected_ids));
+    let replayable = chunked || body_len == 0;
+
+    // 7b. Take the upstream connection: a parked one, or a new validated TLS connection to the
+    //     checked address (not a re-resolve, which would reopen the rebinding window). A
+    //     forged/self-signed upstream is refused, never downgraded.
+    let (mut upstream, mut from_pool) = match acquire_upstream(
+        ctx,
+        pool_key.as_ref().filter(|_| replayable),
+        ip,
+        port,
+        &host,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => return refuse_upstream(&mut client, ctx, &host, port, method, &path, e),
     };
 
     // The request is permitted and the upstream TLS handshake is validated — record the one `allow`.
@@ -2049,12 +2122,6 @@ fn handle_https_forward(
     );
     let flow = ctx.register_flow(&host, port, super::control::Proto::Https);
 
-    // 8. Inject any matching host-scoped credential — after the verdict (a denied request never gets a
-    //    secret) and keyed on the verified host + decrypted path, so it reaches only its scoped
-    //    destination. Unlike the `http://` path, the upstream is TLS, so a header secret rides it
-    //    encrypted, never in the clear.
-    let injected = matching_injections(ctx, &host, port, &path);
-
     // 8a. Open the traffic capture, recording the client's own head (before the reserialization
     //     below adds any injected credential) plus the injected header names, never their values.
     let capture = ctx.begin_capture(allow_seq);
@@ -2062,10 +2129,11 @@ fn handle_https_forward(
         c.set_request(head_bytes, &injected);
     }
 
-    // 9. Forward the one request in **origin-form** (`POST /path`) with the injected credential and
-    //    `Connection: close` forced (the reserializer strips hop-by-hop headers and the client's copy
-    //    of any injected header). A pipelined second request is never forwarded, so it cannot skip the
-    //    per-request check.
+    // 9. Forward the one request in **origin-form** (`POST /path`) with the injected credential (the
+    //    reserializer strips hop-by-hop headers and the client's copy of any injected header). A
+    //    pipelined second request is never forwarded, so it cannot skip the per-request check. The
+    //    forwarded bytes are materialized when the proxy still holds all of them, so a connection the
+    //    upstream closed while it was parked costs a second attempt rather than an empty response.
     let version = head
         .request_line
         .split_whitespace()
@@ -2075,7 +2143,7 @@ fn handle_https_forward(
         request_line: format!("{method} {path} {version}"),
         headers: head.headers.clone(),
     };
-    if chunked {
+    let forwarded: Option<Vec<u8>> = if chunked {
         // A `Transfer-Encoding: chunked` request: de-chunk the body into a bounded buffer and forward
         // a clean `Content-Length`-framed request (the reserializer strips the client's
         // Transfer-Encoding when a length is forced), so no chunked framing — and no CL/TE
@@ -2115,20 +2183,43 @@ fn handle_https_forward(
         if let Some(c) = &capture {
             c.set_request_body(&body);
         }
-        let reserialized = reserialize_request(&origin, &injected, Some(body.len() as u64));
-        upstream.write_all(&reserialized)?;
-        upstream.write_all(&body)?;
-        flow.up
-            .fetch_add((reserialized.len() + body.len()) as u64, Ordering::Relaxed);
+        let mut req = reserialize_request(&origin, &injected, Some(body.len() as u64), keep_alive);
+        req.extend_from_slice(&body);
+        Some(req)
+    } else if body_len == 0 {
+        Some(reserialize_request(&origin, &injected, None, keep_alive))
     } else {
-        let reserialized = reserialize_request(&origin, &injected, None);
+        None
+    };
+
+    if let Some(req) = &forwarded {
+        // Exactly one retry, and only for a connection that came from the pool — see the tunneled
+        // path for why the peek, and why the read bound is lifted before it.
+        loop {
+            upstream.write_all(req)?;
+            upstream.flush().ok();
+            begin_response_stream(&upstream.sock);
+            if !from_pool || upstream_spoke(&upstream.sock) {
+                break;
+            }
+            let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &host) {
+                Ok(pair) => pair,
+                Err(e) => return refuse_upstream(&mut client, ctx, &host, port, method, &path, e),
+            };
+            upstream = fresh;
+            from_pool = false;
+        }
+        flow.up.fetch_add(req.len() as u64, Ordering::Relaxed);
+    } else {
+        // A body the proxy does not hold: forwarded straight from the client, on its own connection.
+        let reserialized = reserialize_request(&origin, &injected, None, keep_alive);
         upstream.write_all(&reserialized)?;
         flow.up
             .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
         // Answer a client `Expect: 100-continue` now (the request is permitted and the upstream is
         // up), else `copy_exact` would block reading a body the client withholds. `Expect` is
         // stripped from the forwarded head, so the upstream does not re-run the handshake.
-        if body_len > 0 && head_expects_continue(head) {
+        if head_expects_continue(head) {
             let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
             let _ = client.flush();
         }
@@ -2142,11 +2233,10 @@ fn handle_https_forward(
             None => copy_exact(&mut client, &mut upstream, body_len)?,
         }
         flow.up.fetch_add(body_len, Ordering::Relaxed);
+        upstream.flush().ok();
+        // The request is fully forwarded; the response may idle between bursts, so lift the timeout.
+        begin_response_stream(&upstream.sock);
     }
-    upstream.flush().ok();
-
-    // The request is fully forwarded; the response may idle between bursts, so lift the read timeout.
-    begin_response_stream(&upstream.sock);
 
     // 10. Relay the response head, then stream its framed body to the plaintext client and close.
     //     Mask a reflected secret only for a response from an injection-target host (every other
@@ -2162,14 +2252,34 @@ fn handle_https_forward(
     } else {
         &[]
     };
-    let mut up_br = BufReader::new(upstream);
+    let mut up_br = BufReader::new(&mut upstream);
     let (resp_head, complete) = relay_response_head(
         &mut up_br,
         &mut client,
         &flow.down,
         capture.as_ref(),
         head_masking,
+        keep_alive,
     )?;
+    // An upstream that closed without answering leaves nothing to relay, and an empty success would
+    // be indistinguishable from a genuine zero-byte response — see the tunneled path.
+    if resp_head.is_empty() {
+        ctx.push_log(
+            super::control::Proto::Https,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            super::control::LogVerdict::Error,
+            "upstream-closed",
+        );
+        return write_refusal(
+            &mut client,
+            "502 Bad Gateway",
+            "upstream-closed",
+            &format!("`{host}` closed the connection without sending a response"),
+        );
+    }
     if let Some(code) = parse_status_code(&resp_head) {
         if code >= 200 {
             ctx.set_status(allow_seq, code);
@@ -2181,16 +2291,30 @@ fn handle_https_forward(
         BodyFraming::ToEof
     };
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
-    let response = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
     // Teed ahead of the reflection masking — the capture masks its own buffers at filing time.
-    let mut response: Box<dyn Read + '_> = match &capture {
-        Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
-        None => Box::new(response),
-    };
-    if masks_reflection {
-        pump_redacting(&mut response, &mut client, &ctx.redactions)?;
-    } else {
-        pump_to_eof(&mut response, &mut client)?;
+    let mut framed = FramedBody::new(&mut up_br, framing);
+    {
+        let response = CountingReader::new(&mut framed, flow.down.clone());
+        let mut response: Box<dyn Read + '_> = match &capture {
+            Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
+            None => Box::new(response),
+        };
+        if masks_reflection {
+            pump_redacting(&mut response, &mut client, &ctx.redactions)?;
+        } else {
+            pump_to_eof(&mut response, &mut client)?;
+        }
+    }
+    // 11. Whether this connection may carry another request — the same three answers as the tunneled
+    //     path, and after the relay's `?` for the same reason.
+    let ended_as_framed = framed.ended_as_framed();
+    drop(framed);
+    let no_residual = up_br.buffer().is_empty();
+    drop(up_br);
+    if ended_as_framed && no_residual && response_keeps_alive(&resp_head) {
+        if let (Some(pool), Some(key)) = (ctx.pool.as_ref(), pool_key) {
+            pool.park(key, upstream, ctx.timeout);
+        }
     }
     Ok(())
 }
@@ -2229,6 +2353,80 @@ fn connect_upstream(
     conn.complete_io(&mut sock)
         .map_err(|_| UpstreamError::CertRejected)?;
     Ok(StreamOwned::new(conn, sock))
+}
+
+/// The upstream connection this request will ride: one an earlier request to the same host left
+/// behind when the launch reuses connections and the pool holds a live one, else a freshly connected
+/// and validated one. The flag says which, so a connection that dies between the pool's probe and
+/// the request write can be named for what it is rather than surfacing as an empty response.
+///
+/// Reuse deliberately sits **after** the verdict, the name resolution and the address guard, not
+/// instead of them: a parked connection shortens the handshake, never the checks. It also cannot
+/// outlive what authorized it — the certificate was validated against `host`, which is part of the
+/// key, so a reused connection goes to a server that was authenticated for exactly this name.
+fn acquire_upstream(
+    ctx: &ProxyCtx,
+    key: Option<&PoolKey>,
+    ip: IpAddr,
+    port: u16,
+    host: &str,
+) -> Result<(UpstreamTls, bool), UpstreamError> {
+    if let (Some(pool), Some(key)) = (ctx.pool.as_ref(), key) {
+        if let Some(stream) = pool.checkout(key) {
+            return Ok((stream, true));
+        }
+    }
+    connect_upstream(ip, port, host, ctx).map(|stream| (stream, false))
+}
+
+/// Refuse a request because its validated upstream could not be opened. Both shapes are a `502`,
+/// with distinct reasons so "the host is down" reads differently from "its certificate was
+/// rejected". Written straight to whichever client leg asked — the decrypted tunnel on the
+/// inspected-TLS path, the plaintext socket on the absolute-form one.
+fn refuse_upstream<W: Write>(
+    w: &mut W,
+    ctx: &ProxyCtx,
+    host: &str,
+    port: u16,
+    method: &str,
+    target: &str,
+    err: UpstreamError,
+) -> io::Result<()> {
+    let (reason, detail) = match err {
+        UpstreamError::Unreachable => (
+            "upstream-unreachable",
+            format!("`{host}:{port}` is allowed but could not be reached"),
+        ),
+        UpstreamError::CertRejected => (
+            "upstream-cert-rejected",
+            format!(
+                "the TLS certificate presented by `{host}` was rejected (upstream validation failed)"
+            ),
+        ),
+    };
+    ctx.push_log(
+        super::control::Proto::Https,
+        host,
+        port,
+        Some(method),
+        Some(target),
+        super::control::LogVerdict::Error,
+        reason,
+    );
+    write_refusal(w, "502 Bad Gateway", reason, &detail)
+}
+
+/// Whether the upstream has anything at all to say on this connection, by a peek that leaves it
+/// untouched for the relay that follows.
+///
+/// Asked of a **reused** connection only, and it answers one question: was the connection still
+/// there when the request went out? An upstream may close a parked connection at any moment, and the
+/// proxy learns of it only after writing — so this is where that shows up, before a byte of response
+/// has reached the client and while the request is still in hand to send again. `false` means the
+/// far side is gone.
+fn upstream_spoke(sock: &TcpStream) -> bool {
+    let mut one = [0u8; 1];
+    matches!(sock.peek(&mut one), Ok(n) if n > 0)
 }
 
 /// Read a request head byte-by-byte until the blank-line terminator, leaving the stream positioned
@@ -2310,10 +2508,34 @@ fn matching_injections<'a>(
     port: u16,
     target: &str,
 ) -> Vec<(&'a str, &'a str)> {
+    injection_pairs(ctx, &matching_injection_ids(ctx, host, port, target))
+}
+
+/// The same match as [`matching_injections`], as **positions** in `ctx.injections`.
+///
+/// This is what identifies a credential set without carrying one: the upstream-connection pool is
+/// partitioned by which credentials a request received, and its key has to name them without holding
+/// them. Ascending by construction, so two requests matching the same rules produce the same list.
+/// The two functions share this one matcher so the partition can never drift from the injection.
+fn matching_injection_ids(ctx: &ProxyCtx, host: &str, port: u16, target: &str) -> Vec<usize> {
     ctx.injections
         .iter()
-        .filter(|inj| allowlist::rule_matches(&inj.rule, host, port, target))
-        .map(|inj| (inj.header.as_str(), inj.value.as_str()))
+        .enumerate()
+        .filter(|(_, inj)| allowlist::rule_matches(&inj.rule, host, port, target))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The `(header, value)` pairs named by positions in `ctx.injections`. Borrowed from the context, so
+/// no secret is copied beyond the forwarded head.
+fn injection_pairs<'a>(ctx: &'a ProxyCtx, ids: &[usize]) -> Vec<(&'a str, &'a str)> {
+    ids.iter()
+        .map(|&i| {
+            (
+                ctx.injections[i].header.as_str(),
+                ctx.injections[i].value.as_str(),
+            )
+        })
         .collect()
 }
 
@@ -2328,12 +2550,18 @@ fn carries_secret(head_bytes: &[u8], redactions: &[SecretNeedle]) -> bool {
         .any(|n| n.find_in(head_bytes, 0).is_some())
 }
 
-/// Reserialize a request head for forwarding upstream: keep the request line and headers, but
-/// drop any client `Connection`/`Proxy-Connection` (the proxy owns hop-by-hop semantics) and
-/// force `Connection: close`, so a keep-alive upstream closes after this one response — giving the
-/// proxy a prompt EOF instead of a blocked read. One request per tunnel makes this safe.
-/// `Proxy-Authorization` is dropped too: it is a credential for the *proxy hop*, and forwarding it
-/// would hand the origin server a secret addressed to sbx.
+/// Reserialize a request head for forwarding upstream: keep the request line and headers, but drop
+/// any client `Connection`/`Proxy-Connection` — the proxy owns hop-by-hop semantics on both legs and
+/// sets this one itself. `Proxy-Authorization` is dropped too: it is a credential for the *proxy
+/// hop*, and forwarding it would hand the origin server a secret addressed to sbx.
+///
+/// `keep_alive` decides what goes in its place, and it is a statement about the **upstream** leg
+/// alone. `false` forces `Connection: close`, so the server closes after this one response; that was
+/// long the only option, because the relay could not tell the end of a message from the end of a
+/// socket and needed the close to know where to stop. `true` says nothing at all, which under
+/// HTTP/1.1 is the request to keep the connection open — the proxy then knows where the response
+/// ends on its own, and the connection can carry a later request. Neither value reaches the client:
+/// its own leg is closed after one response either way (see [`force_close_in_head`]).
 ///
 /// Each `(header, value)` in `injections` is **strip-and-replace**d: every client-supplied copy of
 /// that header — over all spellings (case- and `_`/`-`-insensitive, see [`header_name_eq`]) — is
@@ -2344,6 +2572,7 @@ fn reserialize_request(
     head: &Head,
     injections: &[(&str, &str)],
     force_content_length: Option<u64>,
+    keep_alive: bool,
 ) -> Vec<u8> {
     let mut out = String::with_capacity(head.request_line.len() + 64);
     out.push_str(&head.request_line);
@@ -2389,7 +2618,10 @@ fn reserialize_request(
         out.push_str(&n.to_string());
         out.push_str("\r\n");
     }
-    out.push_str("Connection: close\r\n\r\n");
+    if !keep_alive {
+        out.push_str("Connection: close\r\n");
+    }
+    out.push_str("\r\n");
     out.into_bytes()
 }
 
@@ -2403,11 +2635,14 @@ fn reserialize_request(
 /// close_notify`) — the failure mode that cut streaming agents mid-completion.
 ///
 /// The client *write* timeout is deliberately left untouched, so a stalled in-cage reader still
-/// cannot pin a proxy thread indefinitely, and the forced `Connection: close` means a finished
-/// upstream closes and ends the relay with a clean EOF. Residual (bounded by `MAX_CONCURRENT_CONNS`,
+/// cannot pin a proxy thread indefinitely, and a response whose framing is known ends at its own
+/// last byte without waiting for anything. Residual (bounded by `MAX_CONCURRENT_CONNS`,
 /// same-tenant): an upstream that neither sends nor closes while its client has gone away can hold a
 /// thread until it does — the accepted cost of not killing a genuinely idle stream, as for the L4
 /// splice.
+///
+/// The bound is put back before a finished connection is parked for reuse, since a connection that
+/// is not relaying anything has no claim to be left unbounded (see [`pool::UpstreamPool::park`]).
 fn begin_response_stream(upstream: &TcpStream) {
     let _ = upstream.set_read_timeout(None);
 }
@@ -2431,27 +2666,41 @@ fn begin_response_stream(upstream: &TcpStream) {
 /// A head the upstream cuts short is relayed as far as it arrived and reported incomplete, never an
 /// error: the caller then delimits the rest by the close, which is what this path did throughout
 /// before it framed anything.
+///
+/// `close_client_leg` rewrites the final head's `Connection` for the client only ([`force_close_in_head`]),
+/// which is what keeps the two legs' connection lifetimes independent once the upstream leg is
+/// forwarded with keep-alive. Three things stay pinned to the **upstream's own** bytes across that
+/// rewrite: the head returned to the caller, so the body framing is decided from what the server
+/// actually said; the capture, which records the response as it was served; and the equal-length
+/// masking contract, which is applied after the rewrite rather than through it. The byte counter
+/// follows the other side — it measures what crossed to the cage, so it counts what was written.
 fn relay_response_head<R: BufRead, W: Write>(
     up: &mut R,
     client: &mut W,
     down: &AtomicU64,
     capture: Option<&CaptureGuard>,
     redactions: &[SecretNeedle],
+    close_client_leg: bool,
 ) -> io::Result<(Vec<u8>, bool)> {
     loop {
         let (head, complete) = read_response_head(up, HEAD_MAX);
         if head.is_empty() {
             return Ok((head, false));
         }
-        if redactions.is_empty() {
-            client.write_all(&head)?;
+        let interim =
+            complete && matches!(parse_status_code(&head), Some(c) if (100..200).contains(&c));
+        // An interim `1xx` is not the response, so its framing is not the connection's to state.
+        let mut wire = if close_client_leg && complete && !interim {
+            force_close_in_head(&head)
         } else {
-            let mut masked = head.clone();
-            redact_in_place(&mut masked, redactions);
-            client.write_all(&masked)?;
+            head.clone()
+        };
+        if !redactions.is_empty() {
+            redact_in_place(&mut wire, redactions);
         }
-        down.fetch_add(head.len() as u64, Ordering::Relaxed);
-        if complete && matches!(parse_status_code(&head), Some(c) if (100..200).contains(&c)) {
+        client.write_all(&wire)?;
+        down.fetch_add(wire.len() as u64, Ordering::Relaxed);
+        if interim {
             client.flush().ok();
             continue;
         }
@@ -4665,7 +4914,7 @@ mod tests {
             let mut client = Vec::new();
             let down = Arc::new(AtomicU64::new(0));
             let (head, complete) =
-                relay_response_head(&mut up, &mut client, &down, None, &needles).unwrap();
+                relay_response_head(&mut up, &mut client, &down, None, &needles, false).unwrap();
             assert!(complete);
             assert_eq!(
                 parse_status_code(&head),
@@ -5020,6 +5269,449 @@ mod tests {
         .unwrap();
         up.join().unwrap();
         assert!(got.ends_with("hello"), "the body relays whole: {got:?}");
+    }
+
+    /// A loopback TLS "upstream" that keeps its connections open: it serves request after request on
+    /// the same connection, replying `response` to each, and accepts as many connections as it is
+    /// given. The returned counter is the figure the reuse tests turn on — how many TCP connections
+    /// it had to accept to serve them all.
+    /// What a keep-alive upstream reports back: how many TCP connections it had to accept, and the
+    /// request heads it served, in order.
+    struct UpstreamWitness {
+        accepted: Arc<AtomicUsize>,
+        heads: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl UpstreamWitness {
+        fn connections(&self) -> usize {
+            self.accepted.load(Ordering::Relaxed)
+        }
+
+        fn heads(&self) -> Vec<String> {
+            self.heads.lock().unwrap().clone()
+        }
+    }
+
+    fn spawn_keepalive_upstream(
+        response: &'static [u8],
+    ) -> (SocketAddr, CertificateDer<'static>, UpstreamWitness) {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = accepted.clone();
+        let seen = heads.clone();
+        thread::spawn(move || {
+            while let Ok((sock, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let config = server_config.clone();
+                let seen = seen.clone();
+                thread::spawn(move || {
+                    let Ok(conn) = ServerConnection::new(config) else {
+                        return;
+                    };
+                    let mut tls = StreamOwned::new(conn, sock);
+                    loop {
+                        // One head per iteration, read a byte at a time so nothing of a following
+                        // request is swallowed; EOF or an error ends the connection.
+                        let mut head = Vec::new();
+                        let mut one = [0u8; 1];
+                        loop {
+                            match tls.read(&mut one) {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => head.push(one[0]),
+                            }
+                            if head.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        seen.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&head).into_owned());
+                        if tls.write_all(response).is_err() || tls.flush().is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, ca_der, UpstreamWitness { accepted, heads })
+    }
+
+    /// Drive several HTTPS requests through **one** proxy instance, one client connection each — the
+    /// shape the cage's forwarder produces. A single `ProxyCtx` serves them all, which is what lets a
+    /// connection one request leaves behind be found by the next. Each response is read to the
+    /// client-side end of stream before the following request starts, so what the proxy did with its
+    /// upstream connection has already happened by then.
+    fn through_proxy_repeatedly(
+        ctx: Arc<ProxyCtx>,
+        proxy_ca: CertificateDer<'static>,
+        connect_host: &str,
+        connect_port: u16,
+        requests: &[&[u8]],
+    ) -> io::Result<Vec<String>> {
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut roots = RootCertStore::empty();
+        roots.add(proxy_ca).unwrap();
+        let client_config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let mut out = Vec::new();
+        for request in requests {
+            let mut sock = UnixStream::connect(&path).unwrap();
+            write!(
+                sock,
+                "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
+            )
+            .unwrap();
+            sock.flush().unwrap();
+            let established = read_until_blank(&mut sock)?;
+            assert!(
+                established.contains("200 Connection established"),
+                "CONNECT not accepted: {established:?}"
+            );
+            let name = ServerName::try_from(connect_host.to_string()).unwrap();
+            let conn =
+                ClientConnection::new(client_config.clone(), name).map_err(io::Error::other)?;
+            let mut tls = StreamOwned::new(conn, sock);
+            tls.write_all(request)?;
+            tls.flush().ok();
+            let mut resp = String::new();
+            match tls.read_to_string(&mut resp) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+                Err(e) => return Err(e),
+            }
+            out.push(resp);
+        }
+        Ok(out)
+    }
+
+    /// A context for the reuse tests: allows `upstream.test` on any port, resolves it to loopback,
+    /// validates against the upstream's own CA, and reuses connections when `pool` is set.
+    fn reuse_ctx(
+        upstream_ca: CertificateDer<'static>,
+        pool: bool,
+        injections: Vec<HeaderInjection>,
+    ) -> (Arc<ProxyCtx>, CertificateDer<'static>) {
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]).with_pool(pool))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        let ctx = if injections.is_empty() {
+            ctx
+        } else {
+            ctx.with_injections(injections)
+        };
+        (Arc::new(ctx), proxy_ca_der)
+    }
+
+    /// The whole point of the increment: two requests to the same host, one TLS handshake. Nothing
+    /// else in this file could show it — every other upstream helper serves one request and closes,
+    /// so reuse would look identical to no reuse.
+    #[test]
+    fn two_requests_to_one_host_share_a_single_upstream_connection() {
+        let (addr, upstream_ca, upstream) =
+            spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+        let pool_ctx = ctx.clone();
+        let got = through_proxy_repeatedly(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            &[
+                b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            ],
+        )
+        .unwrap();
+        for resp in &got {
+            assert!(resp.ends_with("hello"), "both responses arrive: {resp:?}");
+        }
+        assert_eq!(
+            upstream.connections(),
+            1,
+            "the second request must ride the connection the first left behind"
+        );
+        assert_eq!(
+            pool_ctx.pool.as_ref().unwrap().len(),
+            1,
+            "and it must go back for a third"
+        );
+    }
+
+    /// The control for the test above, and the guarantee for every launch that does not ask for
+    /// reuse: without the setting the proxy opens — and validates — its own connection per request.
+    #[test]
+    fn without_the_setting_each_request_opens_its_own_upstream_connection() {
+        let (addr, upstream_ca, upstream) =
+            spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, false, vec![]);
+        let pool_ctx = ctx.clone();
+        through_proxy_repeatedly(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            &[
+                b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            upstream.connections(),
+            2,
+            "no reuse means one upstream connection per request"
+        );
+        assert!(pool_ctx.pool.is_none(), "and no pool exists to hold one");
+    }
+
+    /// The trap that makes reuse a regression if it is missed: the upstream's `Connection` describes
+    /// the *upstream* leg. The client leg is one request per connection whatever the upstream says,
+    /// so a client told `keep-alive` would send its next request into a socket already closing — an
+    /// idempotent one silently retried (doubling the traffic reuse was meant to save), a `POST`
+    /// simply failed.
+    #[test]
+    fn a_reused_upstream_still_tells_the_client_to_close() {
+        let (addr, upstream_ca, _upstream) = spawn_keepalive_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\nKeep-Alive: timeout=60\r\n\r\nhello",
+        );
+        let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+        let got = through_proxy_repeatedly(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            &[b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n"],
+        )
+        .unwrap();
+        let head = got[0].split("\r\n\r\n").next().unwrap().to_lowercase();
+        assert!(
+            head.contains("connection: close"),
+            "the client leg must be told to close: {:?}",
+            got[0]
+        );
+        assert!(
+            !head.contains("keep-alive"),
+            "and must not see the upstream leg's persistence: {:?}",
+            got[0]
+        );
+        assert!(
+            got[0].ends_with("hello"),
+            "the body is untouched: {:?}",
+            got[0]
+        );
+    }
+
+    /// An upstream that says it is closing is taken at its word, however willing the proxy is to
+    /// reuse: the next request opens its own connection rather than writing into a closing one.
+    #[test]
+    fn an_upstream_that_announces_a_close_is_not_reused() {
+        let (addr, upstream_ca, upstream) = spawn_keepalive_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+        through_proxy_repeatedly(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            &[
+                b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            upstream.connections(),
+            2,
+            "a connection the upstream is closing must not be reused"
+        );
+    }
+
+    /// The partition that matters most: a credential scoped to one path must not widen its reach
+    /// through a shared connection. Two requests to the same host and port, one receiving the
+    /// injection and one not, are two different keys — so they get two different connections, even
+    /// though everything about the address matches.
+    #[test]
+    fn a_path_scoped_credential_partitions_the_pool() {
+        let (addr, upstream_ca, upstream) =
+            spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let (ctx, proxy_ca_der) = reuse_ctx(
+            upstream_ca,
+            true,
+            vec![injection(
+                "upstream.test:*/secret",
+                "Authorization",
+                "Bearer sbx",
+            )],
+        );
+        through_proxy_repeatedly(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            &[
+                b"GET /secret HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                b"GET /public HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            ],
+        )
+        .unwrap();
+        // Pinned first: the two requests really do differ in what they carry. Without this the
+        // assertion below would pass just as well if the injection matched neither of them.
+        let heads = upstream.heads();
+        assert_eq!(
+            heads.len(),
+            2,
+            "both requests reached the upstream: {heads:?}"
+        );
+        assert!(
+            heads[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer sbx"),
+            "the scoped path carries the credential: {heads:?}"
+        );
+        assert!(
+            !heads[1].to_ascii_lowercase().contains("authorization"),
+            "the other path carries none: {heads:?}"
+        );
+        assert_eq!(
+            upstream.connections(),
+            2,
+            "a connection that carried a credential is not offered to a request without it"
+        );
+    }
+
+    /// Two requests that DO share a credential share a connection — the other half of the partition,
+    /// without which the rule above would be indistinguishable from reuse simply not working.
+    #[test]
+    fn two_requests_carrying_the_same_credential_share_a_connection() {
+        let (addr, upstream_ca, upstream) =
+            spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let (ctx, proxy_ca_der) = reuse_ctx(
+            upstream_ca,
+            true,
+            vec![injection("upstream.test:*", "Authorization", "Bearer sbx")],
+        );
+        through_proxy_repeatedly(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            &[
+                b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            ],
+        )
+        .unwrap();
+        let heads = upstream.heads();
+        assert!(
+            heads
+                .iter()
+                .all(|h| h.to_ascii_lowercase().contains("authorization: bearer sbx")),
+            "both requests carry the same credential: {heads:?}"
+        );
+        assert_eq!(upstream.connections(), 1);
+    }
+
+    /// A connection is only reusable if the message that just crossed it accounted for every byte the
+    /// upstream sent. Anything past the end means the connection has moved on from that message, and
+    /// nobody knows to what.
+    ///
+    /// Both body sizes are here because the residue lands somewhere different in each, and a
+    /// different guard catches it. A small response is read through the proxy's own buffered reader,
+    /// so the residue stays there; a body past that reader's capacity is read straight through to the
+    /// TLS session, so the residue ends up inside **rustls** instead. Checking one place would hand a
+    /// poisoned connection to the next request in the other case.
+    #[test]
+    fn a_connection_holding_bytes_past_the_message_is_not_reused() {
+        for (len, where_it_lands) in [(5usize, "the proxy's reader"), (RELAY_CHUNK * 2, "rustls")] {
+            let mut response =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n").into_bytes();
+            response.extend(std::iter::repeat_n(b'x', len));
+            response.extend_from_slice(b"BYTES-THE-MESSAGE-DID-NOT-CLAIM");
+            let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+
+            let (addr, upstream_ca, upstream) = spawn_keepalive_upstream(response);
+            let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+            let pool_ctx = ctx.clone();
+            let got = through_proxy_repeatedly(
+                ctx,
+                proxy_ca_der,
+                "upstream.test",
+                addr.port(),
+                &[
+                    b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                    b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                ],
+            )
+            .unwrap();
+            // The framing still holds: the cage gets its declared body, and not one byte of the residue.
+            assert!(
+                !got[0].contains("BYTES-THE-MESSAGE-DID-NOT-CLAIM"),
+                "the relay must stop at the end of the message ({where_it_lands})"
+            );
+            assert_eq!(
+                upstream.connections(),
+                2,
+                "a connection with bytes left in {where_it_lands} must not serve another request"
+            );
+            assert_eq!(
+                pool_ctx.pool.as_ref().unwrap().len(),
+                0,
+                "nor be parked at all ({where_it_lands})"
+            );
+        }
+    }
+
+    /// An upstream that closes without answering used to relay nothing and end the tunnel, which the
+    /// cage reads as a successful empty response. It is now named: a `502 upstream-closed`. That is
+    /// also where the one failure reuse can produce surfaces — a connection the far side closed
+    /// between the pool's probe and the write — so it must not be a silent success.
+    #[test]
+    fn an_upstream_that_closes_without_answering_is_refused_rather_than_relayed_empty() {
+        let (addr, upstream_ca, up) = spawn_upstream("upstream.test", b"");
+        let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, false, vec![]);
+        let got = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            b"GET /p HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        )
+        .unwrap();
+        up.join().unwrap();
+        assert!(got.contains("502 Bad Gateway"), "expected a 502: {got:?}");
+        assert!(
+            got.contains("upstream-closed"),
+            "and the reason must name what happened: {got:?}"
+        );
     }
 
     /// The event log redacts a configured secret out of a request's path **before** it enters the
@@ -6532,6 +7224,7 @@ mod tests {
             &head,
             &[("Authorization", "Bearer sbx"), ("X-Api-Key", "K")],
             None,
+            false,
         );
         let s = String::from_utf8(out).unwrap();
         assert_eq!(

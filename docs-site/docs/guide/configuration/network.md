@@ -56,6 +56,7 @@ for the full semantics.
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
 | `stats` | `false` turns off the per-host decision counters ([`sbx net stats`](../networking/observability)) |
 | `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
+| `pool` | `true` lets the proxy carry a request over an upstream connection an earlier request left behind (default `false`): see below |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"` |
@@ -115,6 +116,62 @@ mode = "deny"
 allow = ["cache.nixos.org"]
 dns_cache_ttl = 60   # seconds (0 = resolve every request)
 ```
+
+## Reusing upstream connections (`pool`)
+
+By default every permitted request opens its own connection to the real server and validates
+its certificate before a byte is forwarded. That is one TLS handshake per request, and on a
+workload of many small fetches (a `nix` build pulling thousands of paths from
+`cache.nixos.org`) it is where most of the time goes. Setting `pool = true` lets a request
+that has finished hand its connection to the next one instead of closing it.
+
+```toml
+[network]
+mode  = "deny"
+allow = ["cache.nixos.org", "api.example.com"]
+pool  = true
+```
+
+Measured on loopback, with the client side unchanged, a small request costs about **470 µs**
+with reuse against **730 µs** without it: roughly a third of the per-request cost. Against a
+real host the saving is larger, because each avoided handshake also avoids its round trips.
+
+### What it does not change
+
+Reuse decides how a permitted request is carried, never whether it is permitted. Every check
+runs on every request exactly as before: the allowlist verdict, the `Host`/SNI agreement, the
+address guard, the secret tripwires. A reused connection shortens the handshake and nothing
+else.
+
+Which connection a request may be given is deliberately narrow. A connection is offered only
+to a request that matches on **all** of:
+
+- the same **host and port**, with the certificate that was validated for that name;
+- the same **injected credentials**. A connection that carried a
+  [credential](../secrets/injection) is never offered to a request that does not receive the
+  same one, so reuse cannot widen where a secret has been. Two paths on one host, one of them
+  the scope of a `[secret]`, are two separate connections.
+
+And a connection is only kept at all when the response it just carried left it in a known
+state: the body ended exactly where its framing said it would, nothing arrived after it, and
+the response did not announce a close or a connection-bound authentication scheme (`NTLM`,
+`Negotiate`). Anything else closes.
+
+A connection that has waited more than **10 seconds** is dropped rather than reused, and no
+more than 64 are held at once (4 per host), so reuse never turns into an unbounded set of
+open sockets. The count is the guarantee; the delay only decides what is still fresh enough
+to hand over.
+
+### The residual
+
+A server may close a waiting connection at any moment. The proxy checks before it hands one
+over, which catches this whenever the close has already arrived, and it retries once on a
+fresh connection when it can. The window it cannot close is the one between that check and
+the write, measured in microseconds against a wait measured in seconds. A request that loses
+that race gets a `502` named `upstream-closed` rather than a silent empty response.
+
+That residual is why `pool` is off by default. Turn it on when a workload's cost is
+per-request rather than per-byte.
 
 ## HTTP/2 and gRPC
 

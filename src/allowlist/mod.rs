@@ -787,6 +787,10 @@ pub(crate) struct EgressPolicy {
     /// The `[network] capture_max_kb` per-body cap, in KiB. `None` means the default; the ring
     /// clamps it to its own ceiling. Read via [`Self::capture_body_kb`].
     capture_body_kb: Option<u64>,
+    /// Whether the proxy may carry a permitted request over an upstream connection a previous
+    /// request left behind (`[network] pool`). Off by default, and never a verdict — it changes how
+    /// a request that is already allowed is carried, not whether it is. Read via [`Self::pool`].
+    pool: bool,
 }
 
 impl EgressPolicy {
@@ -804,6 +808,7 @@ impl EgressPolicy {
             http2: Vec::new(),
             capture: crate::sandbox::control::CaptureLevel::Off,
             capture_body_kb: None,
+            pool: false,
         }
     }
 
@@ -864,6 +869,18 @@ impl EgressPolicy {
     /// The configured DNS cache TTL (raw `Option` — the resolver applies the 60s default for `None`).
     pub(crate) fn dns_cache_ttl(&self) -> Option<std::time::Duration> {
         self.dns_cache_ttl
+    }
+
+    /// Allow (or forbid) reuse of validated upstream connections across requests, from
+    /// `[network] pool`. Never a verdict — see the field.
+    pub(crate) fn with_pool(mut self, pool: bool) -> Self {
+        self.pool = pool;
+        self
+    }
+
+    /// Whether the proxy may reuse a validated upstream connection across requests.
+    pub(crate) fn pool(&self) -> bool {
+        self.pool
     }
 
     /// Set the traffic-capture level and its per-body cap (builder style), from `[network] capture`

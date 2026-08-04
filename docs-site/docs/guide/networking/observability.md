@@ -320,7 +320,12 @@ Every exchange sbx inspects:
 
 - **HTTPS** (`https://`, the MITM'd `CONNECT`) and inspected **cleartext**
   (`http://`): the request and response heads exactly as they crossed, plus the
-  leading bytes of each body.
+  leading bytes of each body. One header is an exception, and only under
+  [`[network] pool`](../configuration/network#reusing-upstream-connections-pool): the
+  capture records the response's `Connection` as the **upstream** sent it, while the
+  cage is always told `close`, because the two connections have separate lifetimes. So
+  a capture may read `keep-alive` on an exchange whose client was told to close. That
+  is the honest record of what each side said, not a discrepancy.
 - **HTTP/2 and gRPC** ([`[network] http2`](rules)): the same, per stream. HTTP/2
   carries a head as compressed pseudo-headers rather than as text, so sbx renders it
   instead of copying it. The pseudo-headers keep their real names, so what you read is

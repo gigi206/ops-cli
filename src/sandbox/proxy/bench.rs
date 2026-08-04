@@ -6,9 +6,10 @@
 //!
 //! Two axes, because they are bounded by different things:
 //!
-//! - **Per request** ([`per_request_cost`]): connection setup dominates, and today every request
-//!   opens its own tunnel and its own upstream connection. This is what a workload issuing many
-//!   small requests (a package fetch, an API-chatty agent) pays.
+//! - **Per request** ([`per_request_cost`]): connection setup dominates. Every request opens its own
+//!   tunnel, and unless the launch reuses upstream connections it opens its own upstream connection
+//!   too. This is what a workload issuing many small requests (a package fetch, an API-chatty agent)
+//!   pays.
 //! - **Per byte** ([`bulk_throughput`]): the copies and the scans the relay performs on a large
 //!   body. This is what a workload moving data pays.
 //!
@@ -55,6 +56,61 @@ fn policy(entries: &[&str]) -> EgressPolicy {
         entries.iter().map(|e| classify(e).unwrap()).collect(),
         vec![],
     )
+}
+
+/// A loopback TLS upstream that serves request after request on each connection it accepts, as a
+/// real keep-alive server does. Reuse cannot be measured against anything else: an upstream that
+/// closes after one response makes a proxy that reuses connections indistinguishable from one that
+/// does not. Accepts for as long as the process runs.
+fn spawn_keepalive_tls_upstream(
+    head: String,
+    body: Arc<Vec<u8>>,
+) -> (SocketAddr, CertificateDer<'static>) {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        while let Ok((sock, _)) = listener.accept() {
+            let cfg = server_config.clone();
+            let head = head.clone();
+            let body = body.clone();
+            thread::spawn(move || {
+                let Ok(conn) = ServerConnection::new(cfg) else {
+                    return;
+                };
+                let mut tls = StreamOwned::new(conn, sock);
+                loop {
+                    // A byte-at-a-time head read, so nothing of a following request is swallowed.
+                    let mut seen = Vec::new();
+                    let mut one = [0u8; 1];
+                    loop {
+                        match tls.read(&mut one) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => seen.push(one[0]),
+                        }
+                        if seen.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    // Head and body in ONE write: two would leave the second held by Nagle on a
+                    // connection that never closes, and the delayed ACK that releases it would show
+                    // up as ~40 ms of "proxy cost" that belongs to this test upstream.
+                    let mut reply = head.as_bytes().to_vec();
+                    reply.extend_from_slice(&body);
+                    if tls.write_all(&reply).is_err() || tls.flush().is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, ca_der)
 }
 
 /// A loopback TLS upstream that serves `conns` connections, one request each, replying with
@@ -280,21 +336,33 @@ fn small_head() -> String {
     )
 }
 
+/// The same head from a server that keeps its connections open — what an upstream has to say before
+/// the proxy will reuse its connection at all.
+fn small_head_keepalive() -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        SMALL_BODY.len()
+    )
+}
+
 /// What one small request costs, and where the cost sits.
 ///
-/// Four figures, each isolating one layer:
+/// Five figures, each isolating one layer:
 ///
 /// 1. **direct TLS, no proxy** — one handshake and the exchange, the floor for an inspected design.
 /// 2. **cleartext through the proxy** — the whole forwarding path with no TLS at all: parsing, the
 ///    verdict, the upstream dial, the relay.
-/// 3. **HTTPS through the proxy** — what a cage request actually pays today: two handshakes on top
+/// 3. **HTTPS through the proxy** — what a cage request pays with reuse off: two handshakes on top
 ///    of (2), because both the tunnel and the upstream connection are opened per request.
 /// 4. **HTTPS with an upstream that resumes** — the proxy's upstream config is shared across
-///    requests, so rustls's session cache is warm after the first; this is the shipped behaviour,
-///    and (3) minus (4) is what resumption already saves.
+///    requests, so rustls's session cache is warm after the first; (3) minus (4) is what resumption
+///    already saves without any connection being kept.
+/// 5. **HTTPS with the upstream connection reused** (`[network] pool`) — the client leg is unchanged,
+///    one connection and one handshake per request, so this isolates the upstream handshake alone.
 ///
-/// The gap between (2) and (3) prices connection setup on this path. On loopback that gap is CPU
-/// alone; against a real host, add its round trips to every one of them.
+/// The gap between (2) and (3) prices connection setup on this path, and (4) minus (5) prices the
+/// upstream half of it. On loopback those gaps are CPU alone; against a real host each avoided
+/// handshake also saves its round trips, so the same change is worth more there than it reads here.
 #[test]
 #[ignore = "a measurement, not an assertion: run explicitly, in release"]
 fn per_request_cost() {
@@ -365,6 +433,41 @@ fn per_request_cost() {
             one_https_request(&path, cfg.clone(), "upstream.test", addr.port(), request).unwrap();
         }
         report_rate(label, started.elapsed(), REQUESTS);
+    }
+
+    // 5. HTTPS through the proxy reusing the upstream connection. The client leg is unchanged — one
+    //    connection and one handshake per request, as the cage's forwarder produces — so what this
+    //    isolates is exactly the upstream handshake the pool removes.
+    {
+        let (addr, up_ca) = spawn_keepalive_tls_upstream(small_head_keepalive(), body.clone());
+        let mut roots = RootCertStore::empty();
+        roots.add(up_ca).unwrap();
+        let mut upstream_cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        upstream_cfg.resumption = rustls::client::Resumption::disabled();
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]).with_pool(true))
+                .unwrap()
+                .with_upstream(Arc::new(upstream_cfg))
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let (_dir, path) = serve_on_uds(ctx);
+        let cfg = client_config(proxy_ca_der);
+        // One warm-up request, so the figure is the steady state rather than the first handshake
+        // amortized over the run.
+        one_https_request(&path, cfg.clone(), "upstream.test", addr.port(), request).unwrap();
+        let started = Instant::now();
+        for _ in 0..REQUESTS {
+            one_https_request(&path, cfg.clone(), "upstream.test", addr.port(), request).unwrap();
+        }
+        report_rate(
+            "HTTPS through the proxy, upstream reused",
+            started.elapsed(),
+            REQUESTS,
+        );
     }
 }
 

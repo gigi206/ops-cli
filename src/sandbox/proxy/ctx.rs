@@ -133,6 +133,11 @@ pub(crate) struct ProxyCtx {
     /// inspected forwarding path opens a capture through the one [`Self::begin_capture`] entry
     /// point, so a path that does not ask for one simply captures nothing.
     pub(super) capture: Option<Arc<crate::sandbox::control::CaptureRing>>,
+    /// The validated upstream connections a finished request left behind, for a later request to
+    /// the same host with the same credentials to reuse (`[network] pool`), or `None` — the default
+    /// — when the launch opens a fresh connection per request. Shared across connection threads
+    /// through the `Arc<ProxyCtx>`; see [`super::pool`] for what may enter it and why.
+    pub(super) pool: Option<super::pool::UpstreamPool>,
 }
 
 impl ProxyCtx {
@@ -160,6 +165,9 @@ impl ProxyCtx {
         // each host once and reuses it — tunable via `[network] dns_cache_ttl` (default 60s, `0`
         // disables the cache).
         let resolve = caching_resolver(policy.dns_cache_ttl().unwrap_or(Duration::from_secs(60)));
+        // Built only when the launch asks for reuse, so a launch that does not is byte-for-byte the
+        // connection-per-request path and cannot inherit any of reuse's failure modes.
+        let pool = policy.pool().then(super::pool::UpstreamPool::new);
         Ok(ProxyCtx {
             ca,
             server_config,
@@ -182,6 +190,7 @@ impl ProxyCtx {
             app: None,
             notifier: None,
             capture: None,
+            pool,
         })
     }
 
@@ -652,6 +661,9 @@ pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
         // Carry the HTTP/2 host set through — a rebuild that dropped it would silently demote a
         // designated gRPC host back to HTTP/1.1, failing every h2-only client.
         .with_http2(user.http2_hosts().to_vec())
+        // Carry the upstream-reuse setting through — this rebuild is what the proxy context reads
+        // the setting from, so dropping it here would turn the whole feature off.
+        .with_pool(user.pool())
 }
 
 /// The policy the proxy evaluates for a request: the immutable config policy, or — when a live
@@ -685,7 +697,8 @@ pub(super) fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPol
             .with_ask_notice(ctx.policy.ask_notice())
             .with_mute(mute)
             .with_dns_cache_ttl(ctx.policy.dns_cache_ttl())
-            .with_http2(ctx.policy.http2_hosts().to_vec()),
+            .with_http2(ctx.policy.http2_hosts().to_vec())
+            .with_pool(ctx.policy.pool()),
     )
 }
 
