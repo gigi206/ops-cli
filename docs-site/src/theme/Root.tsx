@@ -1,13 +1,9 @@
 import React, { useCallback, useEffect, useRef, type ReactNode } from 'react';
 import { useLocation } from '@docusaurus/router';
 
-// The reading position, as a rule across the top of every page.
-//
-// It lives in Root rather than in a page because Root is the one component that
-// survives a client-side route change: the listener is attached once for the
-// life of the tab instead of being torn down and rebuilt on every navigation.
-// Only the repaint follows the route, since a new page arrives scrolled to the
-// top with a height of its own.
+// The reading position, as a rule across the top of every page. It belongs in
+// Root because Root survives client-side route changes: the listener is attached
+// once, and only the repaint follows the route.
 function ScrollProgress(): ReactNode {
   const fill = useRef<HTMLSpanElement>(null);
   const frame = useRef(0);

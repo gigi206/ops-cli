@@ -299,11 +299,9 @@ h4 {
   border-bottom: 1px solid var(--keep-border);
 }
 
-/* On the landing page the hero runs the full height of the viewport and the bar
-   floats over it, so it gives up its rule and most of its opacity. `:has()` is
-   the hook because the navbar is a sibling *before* the page wrapper, which puts
-   it out of reach of any class the page sets on its own subtree — and it
-   re-evaluates on its own across client-side route changes. */
+/* On the landing page the bar floats over a viewport-tall hero. `:has()` is the
+   hook because the navbar is a sibling before the page wrapper, out of reach of
+   any class the page sets on its own subtree. */
 body:has(.home__hero) .navbar {
   /* Enough of the page colour to read as a bar in its own right, still short of
      hiding what passes behind it; the blur does the rest. */
@@ -322,11 +320,10 @@ body:has(.home__hero).is-past-hero .navbar {
   border-bottom-color: var(--keep-border);
 }
 
-/* The brand and the nav links are the only bare text in the bar: every control
-   beside them carries its own surface to stand on. Over the hero's brightest
-   frames the muted link colour measures under 2:1 against the footage, so on
-   this page they take the ink colour and a soft scrim. Light mode is left alone,
-   where dark ink on bright fog already clears the threshold. */
+/* The brand and the nav links are the only bare text in the bar; every control
+   beside them has its own surface. Over the footage the muted link colour falls
+   under 2:1, so here they take the ink colour and a scrim. Light mode already
+   clears the threshold. */
 html[data-theme='dark'] body:has(.home__hero):not(.is-past-hero) .navbar__title,
 html[data-theme='dark'] body:has(.home__hero):not(.is-past-hero) .navbar__items .navbar__link {
   color: var(--keep-ink);
@@ -872,14 +869,10 @@ html[data-theme='dark']:root .home {
 /* Hero
    ------------------------------------------------------------------------ */
 
-/* Full-bleed and viewport-tall, with the copy sitting on its floor. The bar is
-   pulled over it rather than the hero being pushed below it, which is what makes
-   the footage start at the very top of the window.
-
-   `min-height` rather than `height`: on a narrow screen the copy is taller than
-   the viewport, and a fixed height would push the last line out of the box. And
-   `svh` rather than `vh`, so the hero does not jump by the height of a mobile
-   URL bar the moment the page scrolls. */
+/* Full-bleed and viewport-tall, the copy on its floor, the bar pulled over it.
+   `min-height`, not `height`: on a narrow screen the copy is taller than the
+   viewport and would be clipped. `svh`, not `vh`: no jump when a mobile URL bar
+   retracts. */
 .home__hero {
   position: relative;
   display: flex;
@@ -890,13 +883,9 @@ html[data-theme='dark']:root .home {
   overflow: hidden;
 }
 
-/* The layer that drifts, a little slower than the page, growing imperceptibly.
-   Oversized top and bottom so the travel never exposes an edge.
-
-   Its fill is what the hero shows before the footage decodes, and what the
-   footage sits on. A flat fill rather than the design's diagonal hatch: the
-   video is not fully opaque, so a hatch underneath does not read as texture
-   behind the picture, it reads as a grid printed across it. */
+/* Drifts slower than the page. Oversized top and bottom so the travel never
+   exposes an edge. Its flat fill backs the footage, which is not opaque: a
+   patterned fill would read as printed across the picture. */
 .home__hero-media {
   position: absolute;
   top: -8%;
@@ -1683,17 +1672,11 @@ html[data-theme='dark']:root .home {
 /* Reveal on scroll
    ------------------------------------------------------------------------ */
 
-/* The script adds `rv` to everything it can animate, then `rv--out` to what is
-   still below the fold at mount. Nothing here hides content on its own: the page
-   as served is the page as read, so a blocked script or an observer that never
-   fires leaves no block stranded in the hidden state.
-
-   The list carries the hover properties as well as the reveal ones, because this
-   rule lands on cards and rows that animate on hover and would otherwise lose
-   their own `transition` to it. Which is also why the stagger's wait is a delay
-   on the two reveal properties alone, taken from a custom property: as a plain
-   `transition-delay` it would sit on the hover properties too, and the fourth
-   card in a row would take its whole turn to acknowledge the pointer. */
+/* The script adds `rv` to what it can animate, `rv--out` to what is below the
+   fold at mount. Nothing is hidden by CSS alone, so a blocked script strands
+   nothing. The list includes the hover properties because this rule lands on
+   cards that animate on hover and would otherwise override their transition;
+   the stagger's wait is a per-property delay for the same reason. */
 .rv {
   transition: opacity 0.8s cubic-bezier(0.22, 1, 0.36, 1) var(--rv-delay, 0ms),
     transform 0.8s cubic-bezier(0.22, 1, 0.36, 1) var(--rv-delay, 0ms),
@@ -1775,10 +1758,8 @@ html[data-theme='dark']:root .home {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  /* The hero video is not hidden here: under this preference the script never
-     attaches a source, so nothing moves and nothing is fetched, and the element
-     stays to show its poster. Hiding it would take the picture away too, which
-     is more than the preference asks for. */
+  /* The hero video is deliberately not hidden: the script attaches no source
+     under this preference, so the element stays to show its poster. */
 
   .home__card,
   .home__cta,

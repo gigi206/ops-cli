@@ -8,10 +8,8 @@ import ThemedImage from '@theme/ThemedImage';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 
-// The transcript is real output, trimmed and with host-specific paths made
-// generic the way the guide does it. The repository's own rule is that quoted
-// output matches the binary; inventing a plausible line would break it on the
-// most-read page of the site.
+// Real `sbx` output, trimmed, with host-specific paths made generic. Quoted
+// output must match the binary.
 const TRANSCRIPT: { kind: 'cmd' | 'ok' | 'detail' | 'plain' | 'blank'; text?: string; tail?: string }[] = [
   { kind: 'cmd', text: 'sbx doctor' },
   { kind: 'plain', text: 'sbx doctor — runtime preflight' },
@@ -129,15 +127,11 @@ header = "x-api-key"
 type   = "raw"`;
 
 /**
- * The cinematic layer: a parallax pass over the hero, and blocks that rise into
- * view. The scroll-progress rule is not part of it; that one runs on every page
- * and lives in the theme's Root.
+ * Parallax over the hero, and blocks that rise as they come into view.
  *
- * All of it is additive. The server-rendered page is already complete and fully
- * visible; this only ever hides something after it has confirmed the browser
- * can put it back, and it never hides what is on screen at mount. A reader with
- * the script blocked, or one who asked for reduced motion, gets the same page
- * without the movement rather than a blank one.
+ * Purely additive: the server-rendered page is complete and visible, and this
+ * only hides what is still below the fold, after confirming it can reveal it
+ * again. A blocked script or reduced motion leaves the page whole, not blank.
  */
 function useCinematic(): void {
   useEffect(() => {
@@ -145,9 +139,8 @@ function useCinematic(): void {
     let observer: IntersectionObserver | undefined;
 
     if (!reduced && 'IntersectionObserver' in window) {
-      // A block's own parts: its children when it staggers them, itself
-      // otherwise. Keeping the mapping lets the observer watch one node per
-      // block and still release a whole run of children at once.
+      // A block's parts: its children when it staggers them, itself otherwise.
+      // The observer watches one node per block and releases them together.
       const parts = new Map<Element, HTMLElement[]>();
 
       observer = new IntersectionObserver(
@@ -169,9 +162,8 @@ function useCinematic(): void {
 
         nodes.forEach((node, i) => {
           node.classList.add('rv');
-          // A custom property rather than `transition-delay`, which would apply
-          // to every transitioned property: a card that waits its turn to appear
-          // must not also wait that long to answer the pointer.
+          // A custom property, not `transition-delay`: that would delay every
+          // transitioned property, including the hover ones.
           const wait = delay + i * step;
           if (wait > 0) node.style.setProperty('--rv-delay', `${wait}ms`);
         });
@@ -189,11 +181,9 @@ function useCinematic(): void {
     const copy = document.getElementById('home-hero-copy');
     const cue = document.getElementById('home-hero-cue');
 
-    // The bar is frosted only for as long as the hero is behind it: once the
-    // page has scrolled past, it has ordinary content under it and goes solid.
-    // A state, not an effect, so it holds whatever the motion preference is —
-    // and the class marks the page as scrolled past rather than as over the
-    // hero, so the very first paint, before any script, is already right.
+    // The bar is frosted while the hero is behind it, solid once past. The class
+    // marks "scrolled past" rather than "over the hero" so the first paint, before
+    // any script, is already correct. A state, not motion: it always runs.
     const barState = (): void => {
       if (!hero) return;
       const past = hero.getBoundingClientRect().bottom <= (bar?.offsetHeight ?? 0);
@@ -205,7 +195,7 @@ function useCinematic(): void {
       frame = 0;
       barState();
 
-      // Everything below is the parallax, which is motion and nothing else.
+      // Below is parallax, which is motion and nothing else.
       if (reduced) return;
       const y = window.scrollY;
 
@@ -233,60 +223,34 @@ function useCinematic(): void {
       window.removeEventListener('resize', onScroll);
       if (frame) cancelAnimationFrame(frame);
       observer?.disconnect();
-      // The class outlives this page otherwise, and the next landing mount would
-      // start out claiming the hero is already behind it.
+      // Otherwise the next landing mount starts out believing the hero is past.
       document.body.classList.remove('is-past-hero');
     };
   }, []);
 }
 
-// The hero's footage: "Castle, Mist, Forest" by HelpUkraine, published on
-// Pixabay on 30 June 2022 and served from static/assets/hero-keep.mp4.
-//
+// Hero footage: "Castle, Mist, Forest" by HelpUkraine, 960x540 rendition.
 //   source:  https://pixabay.com/videos/castle-mist-forest-nature-mountain-122406/
-//   licence: https://pixabay.com/service/license-summary/
-//
-// The Pixabay Content License allows commercial use, modification, and requires
-// no attribution; this note is here so the provenance of a binary in the tree is
-// answerable without a trip through the git log. Both files are hosted here
-// rather than hotlinked: the page contacts no third party at load, and their
-// terms do not offer their CDN as an origin for other people's sites.
-//
-// The four renditions the source offers, measured rather than guessed:
-//
-//   tiny    640x360    2.2 MB   .../122406-725513242_tiny.mp4
-//   small   960x540    4.7 MB   .../122406-725513242_small.mp4   <- in the tree
-//   medium  1280x720   7.4 MB   .../122406-725513242_medium.mp4
-//   large   1920x1080  15.5 MB  .../122406-725513242_large.mp4
-//
-// all under https://cdn.pixabay.com/video/2022/06/28/
-//
-// `small` is the one that ships. The hero draws the footage across 1440px and
-// wider, so `tiny` is magnified past two-to-one and its battlements go soft
-// where this one holds its edges. Above `small` the gain lands on detail the
-// veil over the footage swallows, at 1.6x then 3.3x the weight.
-//
-// The poster is the first frame of `large`, re-encoded to 1280px of WebP: 12 KB,
-// and the only thing a reader gets when the video is declined.
+//   licence: https://pixabay.com/service/license-summary/ (Pixabay Content License)
+// Self-hosted rather than loaded from the origin CDN, which keeps the page free
+// of third-party requests. The poster is the first frame, as WebP.
 const HERO_VIDEO = '/assets/hero-keep.mp4';
 const HERO_POSTER = '/assets/hero-keep.webp';
 
 /**
- * The hero's footage is decorative, and it weighs more than everything else the
- * page loads put together. So it is fetched only once the browser has said it is
- * welcome: never under reduced motion, never under Save-Data, and not over a
- * connection the browser itself calls slow. Declining it costs the reader
- * nothing but the movement: the poster is in the markup, so the hero carries its
- * picture either way.
+ * Attaches the hero video source, unless the browser reports that a 4.7 MB
+ * decorative background is unwelcome: reduced motion, Save-Data, or one of the
+ * two slowest connection tiers. The poster carries the hero in those cases.
  *
- * Where a browser reports nothing the footage loads. Safari and Firefox expose
- * no Network Information API at all, so silence has to mean the full page
- * rather than a degraded one; every read here is optional for that reason.
+ * Setting the source here rather than in the markup is what makes the decision
+ * possible at all: an `src` in the served HTML starts the download before any
+ * preference can be read.
  *
- * The source is attached from here rather than written into the markup on
- * purpose: an `src` in the served HTML starts the download before any of this
- * can be consulted, which is what made a reduced-motion reader pay for footage
- * that CSS then refused to show.
+ * Every read of `navigator.connection` is optional because Safari and Firefox do
+ * not implement it, and absence must mean the full page. `effectiveType` is only
+ * consulted for its bottom two tiers: it is an estimate from observed round
+ * trips, and at first paint it commonly reports "3g" on a fast link, so a
+ * stricter bound withholds the footage from ordinary visits.
  */
 function useHeroVideo(src: string): React.RefObject<HTMLVideoElement | null> {
   const video = useRef<HTMLVideoElement>(null);
@@ -302,7 +266,7 @@ function useHeroVideo(src: string): React.RefObject<HTMLVideoElement | null> {
       }
     ).connection;
     if (link?.saveData) return;
-    if (link?.effectiveType && link.effectiveType !== '4g') return;
+    if (link?.effectiveType === '2g' || link?.effectiveType === 'slow-2g') return;
 
     el.src = src;
   }, [src]);
