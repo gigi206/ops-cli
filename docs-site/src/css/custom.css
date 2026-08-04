@@ -1930,7 +1930,19 @@ html[data-theme='dark']:root .home {
   border-radius: 3px;
 }
 
+/* Past the theme's mobile threshold the search container is pinned to the right
+   of the bar and the mode toggle is dropped, which only holds once the bar is
+   down to the field alone. There is still room for the three controls here, so
+   the container is put back into the flow and the toggle kept alongside it. */
 @media (max-width: 996px) {
+  .navbar__items--right > *:has(> #pagefind-search-mount) {
+    position: static;
+  }
+
+  .navbar__items--right .theme-toggle {
+    display: flex;
+  }
+
   #pagefind-search-mount .pagefind-ui__search-input {
     width: min(9rem, 38vw);
   }
@@ -1944,9 +1956,25 @@ html[data-theme='dark']:root .home {
   }
 }
 
-/* Below this the navbar cannot hold the search field and the repository button
-   side by side; the button stays reachable from the sliding menu. */
+/* The sliding menu is modal, and covers the bar only as far as its own width.
+   Whatever reaches past it is either a duplicate of a control the menu already
+   carries or a field the menu has no room for, so the group is hidden for as
+   long as the menu is open. */
+.navbar-sidebar--show .navbar__items--right {
+  visibility: hidden;
+}
+
+/* Below this the field alone fills the bar and the theme's own arrangement is
+   restored, the sliding menu carrying the rest. Overriding it here rather than
+   bounding the block above keeps the two ranges from leaving a gap between them
+   at a fractional viewport width. */
 @media (max-width: 768px) {
+  .navbar__items--right > *:has(> #pagefind-search-mount) {
+    position: absolute;
+    right: var(--ifm-navbar-padding-horizontal);
+  }
+
+  .navbar__items--right .theme-toggle,
   .navbar__items--right .navbar__link[href*='github.com'] {
     display: none;
   }
