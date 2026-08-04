@@ -448,6 +448,29 @@ body:has(.home__hero) .navbar--sidebar-show {
 }
 
 /* ==========================================================================
+   Scroll progress
+   ========================================================================== */
+
+/* The reading position, on every page. Infima fixes the navbar at
+   --ifm-z-index-fixed (200); this reads over it, so it sits one step higher. */
+.scroll-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  z-index: 210;
+  pointer-events: none;
+}
+
+.scroll-progress > span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--keep-accent);
+}
+
+/* ==========================================================================
    Doc sidebar
    ========================================================================== */
 
