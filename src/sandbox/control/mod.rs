@@ -552,6 +552,51 @@ pub(crate) struct LogEvent {
     /// arriving status fills the field but does **not** amend: the capture is what completes the
     /// record, so the event is re-emitted exactly once, carrying everything. Server-side only.
     pub(crate) awaiting_capture: bool,
+    /// Configured secrets seen crossing this exchange's WebSocket tunnel, if any. Empty for
+    /// everything else: the two HTTP tripwires act on the exchange itself (a `403` outbound, a
+    /// masked response inbound), while an open tunnel is relayed byte-exact, so the sighting IS the
+    /// outcome there. Each credential appears at most once per direction — a value that keeps
+    /// crossing says nothing new after the first time.
+    pub(crate) secrets_seen: Vec<SecretSighting>,
+}
+
+/// Which way a configured secret was seen crossing an open WebSocket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretWay {
+    /// Cage → upstream: the agent sent it out.
+    Out,
+    /// Upstream → cage: the far side sent it back.
+    Back,
+}
+
+impl SecretWay {
+    /// The stable wire/display token for this direction.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SecretWay::Out => "out",
+            SecretWay::Back => "back",
+        }
+    }
+
+    /// Parse the wire token back, for the reading client.
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        match token {
+            "out" => Some(SecretWay::Out),
+            "back" => Some(SecretWay::Back),
+            _ => None,
+        }
+    }
+}
+
+/// One configured credential seen crossing a tunnel, and which way it went.
+///
+/// The `name` is the credential's **logical name** — the label the configuration gave it, never its
+/// value. That is the whole point of naming needles: an alarm has to say *which* secret without
+/// becoming a second place the secret can be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SecretSighting {
+    pub(crate) name: String,
+    pub(crate) way: SecretWay,
 }
 
 /// The result of a `LOG` query: the events past the caller's cursor, how many fell off the ring
@@ -649,6 +694,7 @@ impl LogRing {
             status: None,
             amend_seq: None,
             awaiting_capture: false,
+            secrets_seen: Vec::new(),
         };
         // A muted refusal goes to its own ring so it can never evict a real event from `events`;
         // both rings share `self.cap` and the monotonic `seq`.
@@ -719,6 +765,37 @@ impl LogRing {
         let mut guard = self.inner.lock().unwrap();
         let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
+            ev.amend_seq = Some(g.next_amend);
+            g.next_amend += 1;
+        }
+    }
+
+    /// Note that a configured secret was seen crossing the tunnel of event `seq`, and amend the
+    /// event so a `--follow` reader is told **while the tunnel is still open**.
+    ///
+    /// The amendment is unconditional, including while a capture is still filling: an alarm the user
+    /// only learns about once the tunnel closes — which for a WebSocket may be hours — is not an
+    /// alarm. That is why it does not take the `awaiting_capture` path a status takes. What bounds
+    /// the re-emissions instead is the caller: a credential is reported once per direction, so a
+    /// tunnel adds at most two amendments per configured secret over its whole life.
+    ///
+    /// A repeat of an already-recorded (name, direction) is dropped rather than amending again, so a
+    /// second caller cannot turn the alarm into a stream.
+    pub(crate) fn secret_seen(&self, seq: u64, name: &str, way: SecretWay) {
+        let mut guard = self.inner.lock().unwrap();
+        let g = &mut *guard;
+        if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
+            if ev
+                .secrets_seen
+                .iter()
+                .any(|s| s.name == name && s.way == way)
+            {
+                return;
+            }
+            ev.secrets_seen.push(SecretSighting {
+                name: name.to_string(),
+                way,
+            });
             ev.amend_seq = Some(g.next_amend);
             g.next_amend += 1;
         }
@@ -1155,6 +1232,10 @@ fn dispatch(
             };
             for ev in &snapshot.events {
                 out.push_str(&format_event_line(ev));
+                // A sighting is not gated on `--with-headers`/`--with-body` the way a capture is: a
+                // capture is a debugging convenience the reader opts into, while a secret crossing a
+                // tunnel is a fact about the session that has to reach a plain `sbx net logs`.
+                out.push_str(&format_sighting_lines(ev));
                 if let Some(cap) = captures.iter().find(|c| c.seq == ev.seq) {
                     out.push_str(&format_capture_lines(cap));
                 }
@@ -1204,6 +1285,24 @@ fn format_capture_lines(cap: &Capture) -> String {
             part.as_str(),
             u8::from(bytes.truncated),
             base64_encode(&bytes.bytes),
+        ));
+    }
+    out
+}
+
+/// Format an event's secret sightings, one `seen` line each, or nothing when it has none.
+///
+/// `name` is emitted **last** and read as the rest of the line rather than as a whitespace token: a
+/// credential's logical name comes from a configuration key, which — unlike a host or a request
+/// target — may legitimately contain a space.
+fn format_sighting_lines(ev: &LogEvent) -> String {
+    let mut out = String::new();
+    for seen in &ev.secrets_seen {
+        out.push_str(&format!(
+            "seen seq={} way={} name={}\n",
+            ev.seq,
+            seen.way.as_str(),
+            seen.name,
         ));
     }
     out

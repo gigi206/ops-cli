@@ -1580,6 +1580,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                             last_pid = Some(pid);
                         }
                         let _ = writeln!(tick, "{}", render_log_line(e, pid, view, pal));
+                        tick.push_str(&render_sightings(e, pal));
                         if let Some(cap) = capture_of(&snap, e.seq, view) {
                             tick.push_str(&render_capture(cap, view, pal));
                         }
@@ -1700,6 +1701,7 @@ fn render_logs(
         }
         for e in events {
             let _ = writeln!(o, "{}", render_log_line(e, session.pid, view, pal));
+            o.push_str(&render_sightings(e, pal));
             if let Some(cap) = capture_of(&session.snapshot, e.seq, view) {
                 o.push_str(&render_capture(cap, view, pal));
             }
@@ -1805,6 +1807,31 @@ fn render_log_line(
         "    {dim}{pid}{r}  {dim}{time}{r}  {dim}{proto}{r}  {n}{hostport}{r}  {method}{path}{rpc}  {vc}{}{r}{reason}{ws}{muted}{status}",
         e.verdict.as_str()
     )
+}
+
+/// Render the configured secrets seen crossing an exchange's WebSocket tunnel, one line each, or
+/// nothing when none were.
+///
+/// Shown on every view, not behind `--with-headers`/`--with-body`: a capture is a debugging
+/// convenience the reader opts into, while a credential crossing a tunnel is a fact about the
+/// session that has to reach a plain `sbx net logs`. It reads as a warning rather than as traffic,
+/// because unlike the two HTTP tripwires nothing was refused or masked — the bytes crossed, and this
+/// says so. Only the credential's NAME is printed; its value never leaves the host.
+fn render_sightings(e: &sandbox::control::LogEvent, pal: &style::Palette) -> String {
+    let (warn, r) = (pal.warn, pal.reset);
+    let mut out = String::new();
+    for seen in &e.secrets_seen {
+        let way = match seen.way {
+            sandbox::control::SecretWay::Out => "cage → upstream",
+            sandbox::control::SecretWay::Back => "upstream → cage",
+        };
+        out.push_str(&format!(
+            "      {warn}! secret `{}` crossed this websocket ({way}); it was NOT blocked or \
+             masked{r}\n",
+            seen.name
+        ));
+    }
+    out
 }
 
 /// The capture belonging to event `seq` in `snapshot`, or `None` when the view did not ask for one
@@ -1949,6 +1976,13 @@ fn log_event_json(
         "rpc": (e.rpc != sandbox::control::RpcKind::None).then(|| e.rpc.as_str()),
         "reason": e.reason,
         "muted": e.muted,
+        // Configured secrets seen crossing this exchange's websocket tunnel, by NAME and direction
+        // (`out` = cage to upstream, `back` = upstream to cage). Empty for everything else. Present
+        // unconditionally, like `muted`: it is a fact about the session, not a view option.
+        "secrets_seen": e.secrets_seen.iter().map(|s| serde_json::json!({
+            "name": s.name,
+            "way": s.way.as_str(),
+        })).collect::<Vec<_>>(),
     });
     if view.with_status {
         obj["status"] = e
@@ -3759,7 +3793,85 @@ mod tests {
             status: None,
             amend_seq: None,
             awaiting_capture: false,
+            secrets_seen: Vec::new(),
         }
+    }
+
+    /// A secret seen crossing a tunnel is shown on a PLAIN `sbx net logs`, with no flag asked for,
+    /// and it says plainly that nothing was stopped.
+    ///
+    /// Teeth on both halves. It is not behind `--with-headers`/`--with-body`, because a capture is a
+    /// debugging convenience a reader opts into while a credential leaving the cage is a fact about
+    /// the session. And the wording states the outcome: unlike the two HTTP tripwires, this one
+    /// neither refused nor masked anything, so a line that only said "secret detected" would leave a
+    /// reader believing they were protected when they were not.
+    #[test]
+    fn a_secret_seen_crossing_a_tunnel_shows_without_asking_and_says_it_was_not_stopped() {
+        let pal = style::Palette::plain();
+        let mut ev = log_event(
+            1,
+            "chat.test",
+            Some("GET"),
+            Some("/socket"),
+            sandbox::control::LogVerdict::Allow,
+            "allowed",
+        );
+        ev.secrets_seen.push(sandbox::control::SecretSighting {
+            name: "demo-token".into(),
+            way: sandbox::control::SecretWay::Out,
+        });
+        let sessions = vec![sandbox::control::SessionLog {
+            pid: 42,
+            snapshot: sandbox::control::LogSnapshot {
+                events: vec![ev.clone()],
+                dropped: 0,
+                head: 1,
+                amend_head: 0,
+                captures: Vec::new(),
+                capture_evicted: 0,
+            },
+        }];
+        let out = render_logs(&sessions, &[], &LogView::default(), &pal, false);
+        assert!(
+            out.contains("demo-token"),
+            "the credential is named on the default view: {out}"
+        );
+        assert!(
+            out.contains("NOT blocked or masked"),
+            "the line must not let a reader think the leak was stopped: {out}"
+        );
+        assert!(
+            out.contains("cage → upstream"),
+            "the direction is part of the fact: {out}"
+        );
+
+        // An event with no sighting adds nothing, so ordinary output is unchanged.
+        let quiet = log_event(
+            2,
+            "api.test",
+            Some("GET"),
+            Some("/x"),
+            sandbox::control::LogVerdict::Allow,
+            "allowed",
+        );
+        let plain = render_logs(
+            &[sandbox::control::SessionLog {
+                pid: 42,
+                snapshot: sandbox::control::LogSnapshot {
+                    events: vec![quiet],
+                    dropped: 0,
+                    head: 1,
+                    amend_head: 0,
+                    captures: Vec::new(),
+                    capture_evicted: 0,
+                },
+            }],
+            &[],
+            &LogView::default(),
+            &pal,
+            false,
+        );
+        assert!(!plain.contains("secret `"), "{plain}");
     }
 
     /// A capture fixture: a POST exchange with both heads, both bodies, and one injected header.

@@ -151,6 +151,11 @@ heads, then the leading bytes of each body), for a session launched with
 on. Secrets are masked and an sbx-injected credential is named, never valued. See
 [Observability](../networking/observability).
 
+A `!` line under an event reports a configured secret **seen crossing that exchange's
+WebSocket**, by name and direction. It needs no flag, and it is a report rather than a
+verdict: an open tunnel is relayed byte-exact, so nothing was blocked or masked. See
+[Redaction](../secrets/redaction#the-third-tripwire-a-websocket-is-watched-not-filtered).
+
 ## `sbx net live`
 
 ```

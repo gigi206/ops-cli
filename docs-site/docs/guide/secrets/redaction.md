@@ -99,8 +99,37 @@ mask frames. Once a tunnel is open the framed bytes are relayed verbatim, so a s
 reflects inside a frame **reaches the cage as it was sent** — inbound masking, above, covers
 HTTP responses, not frames. What is masked is the copy `sbx net logs` shows you. Masking the
 wire would mean rewriting the relayed stream (decode, mask, re-frame, re-mask) on the one
-path that has to stay a byte-exact pipe, so the structural controls below carry that case,
-as they do for anything a byte scan cannot reach.
+path that has to stay a byte-exact pipe.
+
+## The third tripwire: a WebSocket is watched, not filtered
+
+The two tripwires above act on what they find: one refuses, the other masks. On an open
+WebSocket neither is possible, so sbx does the one honest thing left and **reports**. Whenever
+a secret is configured, the frames crossing a tunnel are decoded and scanned, and a
+configured value seen crossing is named on that tunnel's log line:
+
+```
+      ! secret `openai-key` crossed this websocket (upstream → cage); it was NOT blocked or masked
+```
+
+The wording is the point. **The frame reached its destination.** This is an alarm, not a
+control: it tells you a credential is somewhere it should not be, while the tunnel is still
+open, so you can act. Treating it as protection would be exactly the mistake the line is
+worded to prevent.
+
+- Both directions: `cage → upstream` (the agent sent it out) and `upstream → cage` (the far
+  side sent it back).
+- The credential's **name**, never its value.
+- **Once per credential per direction** — a repeat carries no new information.
+- It runs **whether or not the launch captures**: an enforcement path must not depend on a
+  debugging setting. It sees the payloads decoded, so a masked frame and a
+  `permessage-deflate` message are scanned as the text they carry.
+- Byte-exact and per message, with the same honest scope as the rest of this page: a
+  re-encoded value, or one split across two separate messages, is not caught.
+
+See [Observability](../networking/observability#a-secret-crossing-a-websocket) for the
+`--json` shape. And as everywhere on this page, the structural controls below are what
+actually bound the damage.
 
 ## Seeing a tripwire fire
 

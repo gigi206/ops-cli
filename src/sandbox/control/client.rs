@@ -187,6 +187,13 @@ pub(crate) fn read_log(
             capture_evicted = v.parse().unwrap_or(0);
         } else if let Some(ev) = parse_event_line(&line) {
             events.push(ev);
+        } else if let Some((seq, sighting)) = parse_sighting_line(&line) {
+            // A sighting follows its own event on the wire, so the event it belongs to is already in
+            // hand. One that arrives without it (an evicted event, a truncated reply) is dropped
+            // rather than invented into a bare record with no host or time to show it against.
+            if let Some(ev) = events.iter_mut().find(|e| e.seq == seq) {
+                ev.secrets_seen.push(sighting);
+            }
         } else if let Some((seq, part, bytes)) = parse_capture_line(&line) {
             // Parts of one exchange arrive as consecutive lines; fold them into a single capture.
             let entry = match captures.iter_mut().find(|c| c.seq == seq) {
@@ -336,6 +343,33 @@ pub(super) fn parse_flow_line(line: &str) -> Option<FlowSnapshot> {
 /// Parse one `event seq=… at=… port=… verdict=… reason=… [method=…] host=… [path=…]` line into an
 /// event, or `None` if it is malformed. Each token is split on its first `=`, so a `path` carrying a
 /// query string's `=` round-trips (it is the last field).
+/// Parse one `seen seq=… way=… name=…` line into the event sequence it belongs to and the sighting,
+/// or `None` if it is malformed.
+///
+/// `name` is read as the **rest of the line**, not as a whitespace token: it is a configuration key,
+/// which may carry a space where a host or a request target cannot.
+fn parse_sighting_line(line: &str) -> Option<(u64, SecretSighting)> {
+    let rest = line.strip_prefix("seen ")?;
+    let (fields, name) = rest.split_once(" name=")?;
+    let mut seq = None;
+    let mut way = None;
+    for token in fields.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "seq" => seq = value.parse().ok(),
+            "way" => way = SecretWay::parse(value),
+            _ => {}
+        }
+    }
+    Some((
+        seq?,
+        SecretSighting {
+            name: name.to_string(),
+            way: way?,
+        },
+    ))
+}
+
 fn parse_event_line(line: &str) -> Option<LogEvent> {
     let mut seq = None;
     let mut at = None;
@@ -390,6 +424,7 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         // Amend bookkeeping is server-side; a parsed (client-side) event never carries it.
         amend_seq: None,
         awaiting_capture: false,
+        secrets_seen: Vec::new(),
     })
 }
 
@@ -743,6 +778,7 @@ mod tests {
             status: Some(200),
             amend_seq: None,
             awaiting_capture: false,
+            secrets_seen: Vec::new(),
         };
         let line = format_event_line(&ev);
         let parsed = parse_event_line(line.trim()).expect("a well-formed line parses");
@@ -770,6 +806,7 @@ mod tests {
             status: None,
             amend_seq: None,
             awaiting_capture: false,
+            secrets_seen: Vec::new(),
         };
         let parsed = parse_event_line(format_event_line(&bare).trim()).unwrap();
         assert_eq!(
@@ -805,6 +842,7 @@ mod tests {
                 status: None,
                 amend_seq: None,
                 awaiting_capture: false,
+                secrets_seen: Vec::new(),
             };
             let parsed = parse_event_line(format_event_line(&ev).trim()).unwrap();
             assert_eq!(
@@ -825,5 +863,73 @@ mod tests {
         assert_eq!(parsed.http_ver, HttpVer::Unknown);
         assert_eq!(parsed.rpc, RpcKind::None);
         assert_eq!(parsed.proto, Proto::Https);
+    }
+
+    /// A sighting round-trips over the control wire, INCLUDING a credential name carrying a space.
+    /// The name comes from a configuration key, so unlike a host or a request target it is not
+    /// whitespace-free — which is why it is written last and read as the rest of the line. A
+    /// whitespace-token parser would truncate it and name the wrong credential.
+    #[test]
+    fn a_sighting_round_trips_with_a_spaced_credential_name() {
+        let mut ev = LogEvent {
+            seq: 9,
+            at_epoch_ms: 1_000_000,
+            host: "chat.example.com".into(),
+            port: 443,
+            method: Some("GET".into()),
+            path: Some("/socket".into()),
+            verdict: LogVerdict::Allow,
+            reason: "allowed".into(),
+            proto: Proto::Https,
+            http_ver: HttpVer::Unknown,
+            rpc: RpcKind::None,
+            muted: false,
+            status: Some(101),
+            amend_seq: None,
+            awaiting_capture: false,
+            secrets_seen: Vec::new(),
+        };
+        ev.secrets_seen.push(SecretSighting {
+            name: "my api token".into(),
+            way: SecretWay::Back,
+        });
+        ev.secrets_seen.push(SecretSighting {
+            name: "other".into(),
+            way: SecretWay::Out,
+        });
+        let wire = format_sighting_lines(&ev);
+        let parsed: Vec<(u64, SecretSighting)> =
+            wire.lines().filter_map(parse_sighting_line).collect();
+        assert_eq!(parsed.len(), 2, "both sightings cross the wire: {wire:?}");
+        assert_eq!(parsed[0].0, 9, "each line names the event it belongs to");
+        assert_eq!(parsed[0].1.name, "my api token", "the space survives");
+        assert_eq!(parsed[0].1.way, SecretWay::Back);
+        assert_eq!(parsed[1].1.name, "other");
+        assert_eq!(parsed[1].1.way, SecretWay::Out);
+    }
+
+    /// An event with no sighting writes no line at all, so the ordinary case costs the wire nothing
+    /// and an older reader sees exactly what it saw before.
+    #[test]
+    fn an_event_with_no_sighting_writes_no_line() {
+        let ev = LogEvent {
+            seq: 1,
+            at_epoch_ms: 0,
+            host: "api.example.com".into(),
+            port: 443,
+            method: None,
+            path: None,
+            verdict: LogVerdict::Allow,
+            reason: "allowed".into(),
+            proto: Proto::Https,
+            http_ver: HttpVer::Unknown,
+            rpc: RpcKind::None,
+            muted: false,
+            status: None,
+            amend_seq: None,
+            awaiting_capture: false,
+            secrets_seen: Vec::new(),
+        };
+        assert!(format_sighting_lines(&ev).is_empty());
     }
 }

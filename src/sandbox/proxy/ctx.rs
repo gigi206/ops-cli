@@ -14,6 +14,7 @@ use std::time::Duration;
 use rustls::{ClientConfig, ServerConfig};
 
 use crate::allowlist::{self, EgressPolicy, Rule};
+use crate::sandbox::control::SecretWay;
 use crate::sandbox::egress_stats::{EgressStats, StatKind};
 
 use super::ca::{ensure_provider, upstream_config, upstream_config_h2, Ca, CertResolver};
@@ -253,6 +254,21 @@ impl ProxyCtx {
             log.clone(),
             seq,
         ))
+    }
+
+    /// Record that the configured secret `name` was seen crossing the WebSocket tunnel logged as
+    /// `seq`, in the direction `way`. A no-op when nothing was logged (tests) or the launch has no
+    /// event ring.
+    ///
+    /// This is a report, never a verdict: the tunnel stays open and its bytes are relayed exactly as
+    /// they crossed. Blocking would mean tearing down a live tunnel on a byte-exact match, and
+    /// masking would mean rewriting a stream two peers agreed the framing of — so what the proxy
+    /// does here is tell the user, on the tunnel's own event, while it is still open.
+    pub(super) fn websocket_secret_seen(&self, seq: Option<u64>, name: &str, way: SecretWay) {
+        let (Some(log), Some(seq)) = (self.log.as_ref(), seq) else {
+            return;
+        };
+        log.secret_seen(seq, name, way);
     }
 
     /// Register a permitted tunnel in the live flow registry, returning its RAII guard — hold it for

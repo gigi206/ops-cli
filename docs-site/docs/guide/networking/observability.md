@@ -362,6 +362,40 @@ Every exchange sbx inspects:
   seconds of opening rather than only at teardown. A transcript shown while the tunnel is
   still open is marked cut, because more may still cross.
 
+### A secret crossing a WebSocket
+
+Separately from the capture, and shown **with no flag asked for**, `sbx net logs` reports a
+configured secret seen crossing an exchange's WebSocket tunnel:
+
+```
+14:22:07  allow   chat.example.com:443  GET /realtime
+      ! secret `openai-key` crossed this websocket (upstream → cage); it was NOT blocked or masked
+```
+
+Read the second half of that line literally. Unlike the two HTTP tripwires in
+[Redaction](../secrets/redaction) — which refuse an outbound request with a `403` and mask a
+reflected value out of a response — **nothing was stopped here**. An open tunnel is a
+byte-exact pipe between two peers that agreed their own framing, masking and compression, so
+the frame reached its destination exactly as it was sent. What sbx does is tell you that it
+did, while the tunnel is still open.
+
+- **Both directions.** `cage → upstream` is the agent sending a credential out;
+  `upstream → cage` is the far side sending one back.
+- **By name, never by value.** The credential's configured name is printed; its value stays
+  on the host, as everywhere else.
+- **Once per credential per direction.** A value that keeps crossing says nothing new, and
+  repeating it would turn an alarm into noise.
+- **Independent of `capture`.** It runs whenever a secret is configured, whether or not the
+  launch captures. A check that followed a debugging setting would be missing exactly when it
+  mattered. It sees the same decoded payloads a capture would, so a masked frame and a
+  `permessage-deflate` message are both scanned as the text they carry.
+- **Byte-exact, per message.** Like the other tripwires it matches a verbatim value; a
+  re-encoded one, or one split across two separate messages, is out of scope by design.
+  Within one message a value spanning several frames is still seen.
+
+Under `--json` the same fact rides on every event as `secrets_seen`, a possibly-empty list of
+`{"name": …, "way": "out"|"back"}`.
+
 #### What a capture does not cover
 
 - A raw **`tcp://` splice**: there is no HTTP head to read, so a method and a body are
@@ -406,9 +440,11 @@ exchange is never printed piecemeal.
 
 The one exception is a **WebSocket**, which is genuinely several events rather than one:
 it appears when the tunnel opens (with its handshake), then as each direction's transcript
-fills, then once more at close if that changed anything. **Four lines** over the tunnel's
-whole life is the ceiling, and it is never re-emitted showing what it already showed.
-Nothing else is ever re-emitted more than once.
+fills, then once more at close if that changed anything. **Four lines of traffic** over the
+tunnel's whole life is the ceiling, and it is never re-emitted showing what it already
+showed. A [secret sighting](#a-secret-crossing-a-websocket) adds at most one line per
+credential per direction on top of that, since it re-emits the event too. Nothing else is
+ever re-emitted more than once.
 
 ---
 

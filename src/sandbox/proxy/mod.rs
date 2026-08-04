@@ -7222,6 +7222,77 @@ mod tests {
         }
     }
 
+    /// End to end: an upstream that reflects a configured secret inside a WebSocket frame is
+    /// reported on the tunnel's own log event — and the cage still receives the frame byte for byte.
+    ///
+    /// Both halves matter. The report is the whole feature: an open tunnel is relayed exactly, so
+    /// unlike the two HTTP tripwires nothing is refused or masked, and telling the user is the only
+    /// outcome there is. The byte-identical relay is what proves the tripwire is an observer: a
+    /// tripwire that perturbed the stream would break the very protocol it is watching.
+    ///
+    /// Teeth: this ctx captures NOTHING. The scan must not ride on `[network] capture`, which is a
+    /// debugging convenience a user turns on and off — a security check that followed it would be
+    /// absent exactly when it was needed.
+    #[test]
+    fn a_secret_reflected_into_a_websocket_frame_is_reported_on_its_event() {
+        use crate::sandbox::control::{LogRing, SecretWay, LOG_RING_CAP};
+        const LEAK: &[u8] = br#"{"echo":"SECRET-VALUE-0123456789"}"#;
+        let (addr, upstream_ca, up) = spawn_leaking_ws_upstream(LEAK);
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_log(log.clone())
+                .with_redactions(vec![SecretNeedle::named(
+                    "demo-token",
+                    b"SECRET-VALUE-0123456789".to_vec(),
+                )])
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+
+        let relayed =
+            through_proxy_ws_frames(ctx.clone(), proxy_ca_der, "upstream.test", addr.port())
+                .unwrap();
+        up.join().unwrap();
+        assert_eq!(
+            relayed,
+            ws_frame(0x1, LEAK, None),
+            "the frame reaches the cage exactly as it was sent: this reports, it never rewrites"
+        );
+
+        // The sighting amends the tunnel's event, so a follow reader sees it without waiting for the
+        // tunnel to close. Polled because the relay files it from the proxy thread.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let seen = loop {
+            let events = log.snapshot(None, None, false).events;
+            match events.iter().find(|e| !e.secrets_seen.is_empty()) {
+                Some(e) => break e.secrets_seen.clone(),
+                None => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the secret crossing the tunnel was never reported: {events:?}"
+                ),
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(seen.len(), 1, "one credential, reported once: {seen:?}");
+        assert_eq!(seen[0].name, "demo-token", "reported by NAME");
+        assert_eq!(
+            seen[0].way,
+            SecretWay::Back,
+            "the upstream sent it back, which is not the direction the cage sent"
+        );
+    }
+
     /// End to end over a real TLS MITM: a POST with a body is captured in both directions, and the
     /// response the cage receives is byte-identical to what the upstream sent. Teeth: the tee sits in
     /// the middle of the relay, so a bug there would either corrupt the relayed body or capture the
@@ -7670,6 +7741,54 @@ mod tests {
                 .with_capture(ring)
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         )
+    }
+
+    /// A WebSocket upstream that REFLECTS a secret back inside a frame: it accepts the upgrade and
+    /// pushes one text frame carrying `payload`. The shape the leak tripwire exists for — a
+    /// cooperating or compromised far side echoing a credential into the tunnel.
+    #[cfg(test)]
+    fn spawn_leaking_ws_upstream(
+        payload: &'static [u8],
+    ) -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(conn) = ServerConnection::new(server_config) else {
+                return;
+            };
+            let mut tls = StreamOwned::new(conn, sock);
+            {
+                let mut br = BufReader::new(&mut tls);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match br.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+            let mut opening = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n"
+                .to_vec();
+            opening.extend(ws_frame(0x1, payload, None));
+            let _ = tls.write_all(&opening);
+            let _ = tls.flush();
+            let mut buf = [0u8; 256];
+            let _ = tls.read(&mut buf);
+        });
+        (addr, ca_der, handle)
     }
 
     /// Encode one WebSocket frame the way a peer would. A client must mask; a server must not.

@@ -7,6 +7,7 @@
 
 use super::capture::{CapBuf, CaptureGuard};
 use super::*;
+use crate::sandbox::control::SecretWay;
 use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 
@@ -24,7 +25,15 @@ use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 /// [`Inflater`]. Control frames (close, ping, pong) carry no application data and are skipped, and
 /// they may interleave a fragmented message without disturbing its reassembly.
 pub(super) struct FrameTee {
-    sink: Arc<CapBuf>,
+    /// The capture's sink, when the launch captures bodies.
+    sink: Option<Arc<CapBuf>>,
+    /// Whether the sink has already reported itself full. It is asked once: a filled sink keeps
+    /// answering "full", and re-reporting it would re-emit the tunnel's transcript on every later
+    /// read instead of the one time that fact is news.
+    sink_full: bool,
+    /// The leak tripwire, when the launch has any secret configured. It never fills, so a tunnel
+    /// that scans keeps following the framing after the capture stops.
+    scan: Option<LeakScan>,
     /// The header of the frame being decoded. It can arrive split across reads, and is bounded: a
     /// WebSocket frame header is at most 14 bytes.
     header: Vec<u8>,
@@ -48,6 +57,94 @@ pub(super) struct FrameTee {
     compressed: bool,
     /// Whether the data frame being decoded ends its message.
     fin: bool,
+}
+
+/// The most plaintext the leak scan asks the decoder to produce out of one compressed message.
+///
+/// A bound is needed because a compressed message can inflate to far more than it cost to send. It
+/// is generous next to anything that would plausibly carry a leaked credential, and a message that
+/// inflates past it is scanned up to it — never silently claimed to have been scanned whole.
+const SCAN_MESSAGE_CAP: usize = 256 * 1024;
+
+/// The leak tripwire for one direction of an established WebSocket.
+///
+/// Unlike the two HTTP tripwires this one **never mutates**. An open tunnel is a byte-exact pipe
+/// between two peers that agreed their own framing, masking and compression; rewriting a payload in
+/// flight would mean re-framing and re-masking the stream around it, on the one path that has to
+/// stay exact. So a sighting produces a note on the tunnel's own log event: the bytes still cross
+/// as they were sent, and the user is told that they did.
+///
+/// Scanning is per **message**, not per stream. A message is one application payload, so a value
+/// split across two of them is two payloads — which a byte-exact scan does not claim to catch, no
+/// more than it catches a re-encoded one. Within a message the pieces are contiguous, so a carry of
+/// `max_len - 1` bytes spans the frame and read boundaries inside it.
+///
+/// Each needle is reported once per direction: a credential that keeps crossing says nothing new
+/// after the first time, and repeating it would turn an alarm into noise.
+struct LeakScan {
+    needles: Vec<SecretNeedle>,
+    /// The tail of the message being scanned, so a value straddling two pieces is still matched.
+    carry: Vec<u8>,
+    /// How much tail to keep: one byte short of the longest needle, the most that can be the start
+    /// of a match completed by the next piece.
+    keep: usize,
+    /// Which needles have already been reported for this direction.
+    reported: Vec<bool>,
+    /// Names seen since the caller last drained them. A name is a label, never the value.
+    fresh: Vec<String>,
+}
+
+impl LeakScan {
+    /// A scanner for `needles`, or `None` when there is nothing to look for. The needles are the
+    /// already-screened set (a value below the redaction floor never becomes one), so the false
+    /// positives that floor exists to prevent cannot reach here either.
+    fn new(needles: &[SecretNeedle]) -> Option<Self> {
+        if needles.is_empty() {
+            return None;
+        }
+        let keep = needles
+            .iter()
+            .map(|n| n.as_bytes().len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        Some(LeakScan {
+            needles: needles.to_vec(),
+            carry: Vec::with_capacity(keep),
+            keep,
+            reported: vec![false; needles.len()],
+            fresh: Vec::new(),
+        })
+    }
+
+    /// A new application message begins: nothing carries across it.
+    fn start_message(&mut self) {
+        self.carry.clear();
+    }
+
+    /// Scan one decoded piece of the current message.
+    fn take(&mut self, piece: &[u8]) {
+        if self.reported.iter().all(|seen| *seen) {
+            // Every configured value has already been reported for this direction; there is nothing
+            // left this scan could learn, so it stops costing anything.
+            return;
+        }
+        self.carry.extend_from_slice(piece);
+        let hits: Vec<usize> = (0..self.needles.len())
+            .filter(|&i| !self.reported[i] && self.needles[i].find_in(&self.carry, 0).is_some())
+            .collect();
+        for i in hits {
+            self.reported[i] = true;
+            self.fresh.push(self.needles[i].name().to_string());
+        }
+        let drop = self.carry.len().saturating_sub(self.keep);
+        self.carry.drain(..drop);
+    }
+
+    /// Take the names seen since the last call, for the caller to report.
+    fn drain(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.fresh)
+    }
 }
 
 /// One direction's `permessage-deflate` decompressor.
@@ -196,11 +293,25 @@ enum HeaderScan {
 }
 
 impl FrameTee {
-    /// A decoder feeding `sink`. `deflate` carries the negotiated compression for this direction:
+    /// A decoder feeding whichever consumers this launch has: the capture's `sink`, the leak scan
+    /// over `needles`, or both. `deflate` carries the negotiated compression for this direction:
     /// `None` when the extension was not agreed, so nothing is reassembled or inflated.
-    pub(super) fn new(sink: Arc<CapBuf>, deflate: Option<bool>) -> Self {
-        FrameTee {
+    ///
+    /// Returns `None` when neither consumer is present, so a tunnel that neither captures nor scans
+    /// is relayed without the framing being followed at all.
+    pub(super) fn new(
+        sink: Option<Arc<CapBuf>>,
+        needles: &[SecretNeedle],
+        deflate: Option<bool>,
+    ) -> Option<Self> {
+        let scan = LeakScan::new(needles);
+        if sink.is_none() && scan.is_none() {
+            return None;
+        }
+        Some(FrameTee {
             sink,
+            sink_full: false,
+            scan,
             header: Vec::with_capacity(14),
             payload_left: 0,
             keeps: false,
@@ -211,7 +322,39 @@ impl FrameTee {
             pending: Vec::new(),
             compressed: false,
             fin: false,
+        })
+    }
+
+    /// Hand one decoded piece to whichever consumers are present, and report whether the capture
+    /// sink filled **on this piece** — asked once, so a full sink cannot re-trigger on every later
+    /// read. The scan sees the same piece whether or not the capture is still taking bytes: what is
+    /// retained for a human to read and what is watched for a leak are different questions.
+    fn consume(&mut self, piece: &[u8]) -> bool {
+        if let Some(scan) = self.scan.as_mut() {
+            scan.take(piece);
         }
+        if self.sink_full {
+            return false;
+        }
+        match self.sink.as_ref() {
+            Some(sink) if sink.push(piece) => {
+                self.sink_full = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Names this direction has newly seen crossing it, for the caller to report. Empty on all but
+    /// the few passes where a configured value is first spotted.
+    pub(super) fn sightings(&mut self) -> Vec<String> {
+        self.scan.as_mut().map(LeakScan::drain).unwrap_or_default()
+    }
+
+    /// Whether nothing further can be learned from this direction, so the decoder may stop: the
+    /// capture is full and there is no scan to keep going for.
+    fn spent(&self) -> bool {
+        self.sink_full && self.scan.is_none()
     }
 
     /// Follow `chunk` through the framing, capturing what it carries. Returns whether the sink filled
@@ -221,6 +364,9 @@ impl FrameTee {
         if self.done {
             return false;
         }
+        // Accumulated rather than returned on the spot: a filled capture sink no longer ends the
+        // decode, because a scan may still want the rest of this chunk.
+        let mut filled = false;
         let mut at = 0;
         while at < chunk.len() {
             if self.payload_left == 0 {
@@ -230,7 +376,7 @@ impl FrameTee {
                     HeaderScan::Need => continue,
                     HeaderScan::Bad => {
                         self.done = true;
-                        return false;
+                        break;
                     }
                     HeaderScan::Done {
                         payload_len,
@@ -249,16 +395,23 @@ impl FrameTee {
                             self.fin = fin;
                             if starts_message {
                                 // A new message: whether it is compressed is decided here and
-                                // inherited by its continuation frames.
+                                // inherited by its continuation frames, and nothing carries across
+                                // the boundary for the scan.
                                 self.compressed = rsv1 && self.inflater.is_some();
                                 self.pending.clear();
+                                if let Some(scan) = self.scan.as_mut() {
+                                    scan.start_message();
+                                }
                             }
                         }
                     }
                 }
                 // A zero-length frame carries no payload to consume, so its end is here.
-                if self.payload_left == 0 && self.end_of_frame() {
-                    return true;
+                if self.payload_left == 0 {
+                    filled |= self.end_of_frame();
+                }
+                if self.done {
+                    break;
                 }
                 continue;
             }
@@ -272,36 +425,54 @@ impl FrameTee {
                 }
                 if self.compressed {
                     // A compressed message is only decodable whole, so it is held until its last
-                    // frame. Bounded by what the sink could ever keep: past that, inflating more
-                    // would yield bytes that are discarded anyway, and stopping mid-message leaves
-                    // the shared window out of step, so this direction stops here rather than
-                    // decoding the rest wrongly.
+                    // frame. Bounded by what its consumers could ever use: past that, inflating more
+                    // would yield bytes nobody reads, and stopping mid-message leaves the shared
+                    // window out of step, so this direction stops here rather than decoding the rest
+                    // wrongly.
                     if self.pending.len() + piece.len() > self.compressed_budget() {
-                        self.sink.push(&piece);
+                        filled |= self.consume(&piece);
                         self.done = true;
-                        return true;
+                        break;
                     }
                     self.pending.extend_from_slice(&piece);
-                } else if self.sink.push(&piece) {
-                    self.done = true;
-                    return true;
+                } else {
+                    filled |= self.consume(&piece);
+                    if self.spent() {
+                        self.done = true;
+                    }
                 }
             }
             self.mask_at = ((self.mask_at as usize + take) % 4) as u8;
             self.payload_left -= take as u64;
             at += take;
-            if self.payload_left == 0 && self.end_of_frame() {
-                return true;
+            if self.payload_left == 0 {
+                filled |= self.end_of_frame();
+            }
+            if self.done {
+                break;
             }
         }
-        false
+        filled
     }
 
-    /// The most compressed bytes held for one message. Generous against the sink's own capacity,
-    /// since compression is the point: a message that inflates to far more than this is cut by the
-    /// sink, not here.
+    /// The most plaintext one compressed message is decoded into, which is whatever its consumers
+    /// could actually use: the capture keeps up to its own cap, while the leak scan wants the whole
+    /// message, since a value past the capture's cap is exactly the one worth reporting.
+    fn plaintext_cap(&self) -> usize {
+        let capture = self.sink.as_ref().map_or(0, |s| s.cap());
+        let scan = if self.scan.is_some() {
+            SCAN_MESSAGE_CAP
+        } else {
+            0
+        };
+        capture.max(scan)
+    }
+
+    /// The most compressed bytes held for one message. Generous against what that message could
+    /// yield, since compression is the point: a message that inflates to far more than this is cut
+    /// by its consumers, not here.
     fn compressed_budget(&self) -> usize {
-        self.sink.cap().saturating_mul(4).max(64 * 1024)
+        self.plaintext_cap().saturating_mul(4).max(64 * 1024)
     }
 
     /// Settle a frame that has just ended. A compressed message becomes capturable only now, on its
@@ -311,14 +482,22 @@ impl FrameTee {
             return false;
         }
         let compressed = std::mem::take(&mut self.pending);
-        let cap = self.sink.cap();
+        let cap = self.plaintext_cap();
         let Some(inflater) = self.inflater.as_mut() else {
             return false;
         };
         match inflater.message(&compressed, cap) {
             Some(plain) => {
-                if self.sink.push(&plain) {
+                // The message arrives whole here, so the scan needs no carry on this path — it is
+                // handed the one payload it was going to reassemble anyway.
+                if let Some(scan) = self.scan.as_mut() {
+                    scan.start_message();
+                }
+                let filled = self.consume(&plain);
+                if self.spent() {
                     self.done = true;
+                }
+                if filled {
                     return true;
                 }
             }
@@ -514,10 +693,14 @@ pub(super) fn relay_upgrade(
         &client_pending,
         upstream,
         &upstream_pending,
-        capture,
         deflate,
-        up,
-        down,
+        TunnelObservers {
+            up,
+            down,
+            capture,
+            ctx,
+            seq: allow_seq,
+        },
     )
 }
 
@@ -583,16 +766,62 @@ pub(super) fn read_plaintext<D: rustls::SideData>(
 /// that direction (a `close_notify` to the peer), so the reverse direction drains fully before teardown.
 /// The bytes each side already read past its head (`*_pending`) are seeded into the send buffers first.
 #[allow(clippy::too_many_arguments)]
+/// Everything an established tunnel reports its activity to, gathered so the relay and its decoders
+/// pass one value rather than five. They travel together because they answer one question between
+/// them — what crossed this tunnel — for three different readers: `sbx net live` (the byte
+/// counters), `sbx net logs --with-body` (the transcript), and a secret sighting on the event.
+pub(super) struct TunnelObservers<'a> {
+    /// Bytes cage → upstream, for the live flow view.
+    pub(super) up: Arc<AtomicU64>,
+    /// Bytes upstream → cage.
+    pub(super) down: Arc<AtomicU64>,
+    /// The capture the transcript is filed into, when this launch captures bodies.
+    pub(super) capture: Option<&'a CaptureGuard>,
+    /// The context a secret sighting is recorded through.
+    pub(super) ctx: &'a ProxyCtx,
+    /// The log event a sighting amends, or `None` when nothing was logged (tests).
+    pub(super) seq: Option<u64>,
+}
+
+/// Push one direction's bytes through its decoder and act on both things that can come of it: file
+/// the transcript when the capture has just filled, and report a configured secret newly seen
+/// crossing. One place, so a call site cannot follow the framing and then forget half of it.
+///
+/// The transcript is filed whenever a direction reaches its cap, and once more when the tunnel ends
+/// (in the capture guard's teardown). Each direction has its own trigger, and each fires at most
+/// once: one side of a live stream can fill in seconds while the other trickles for hours, so a
+/// single shared trigger would strand whichever filled second. The guard drops a filing that would
+/// show what it already showed, which is what keeps the count bounded.
+fn follow(tee: &mut Option<FrameTee>, chunk: &[u8], way: SecretWay, obs: &TunnelObservers) {
+    let Some(tee) = tee.as_mut() else {
+        return;
+    };
+    if tee.push(chunk) {
+        if let Some(c) = obs.capture {
+            c.file_frames_snapshot();
+        }
+    }
+    for name in tee.sightings() {
+        obs.ctx.websocket_secret_seen(obs.seq, &name, way);
+    }
+}
+
 pub(super) fn relay_websocket(
     mut client: StreamOwned<ServerConnection, UnixStream>,
     client_pending: &[u8],
     mut upstream: StreamOwned<ClientConnection, TcpStream>,
     upstream_pending: &[u8],
-    capture: Option<&CaptureGuard>,
     deflate: Deflate,
-    up: Arc<AtomicU64>,
-    down: Arc<AtomicU64>,
+    obs: TunnelObservers,
 ) -> io::Result<()> {
+    // Only a body-keeping capture has anything to file for a tunnel, so it is narrowed once, here,
+    // rather than re-tested at each use — which would leave two spellings of "the capture" in scope
+    // and invite a later reader to reach for the wrong one.
+    let obs = TunnelObservers {
+        capture: obs.capture.filter(|c| c.keeps_body()),
+        ..obs
+    };
+    let TunnelObservers { up, down, ctx, .. } = &obs;
     // Seed the already-read bytes into the destination send buffers (the loop flushes them out), and
     // count them (`up` = client→upstream, `down` = upstream→client) toward the live flow view.
     upstream.conn.writer().write_all(client_pending)?;
@@ -600,46 +829,37 @@ pub(super) fn relay_websocket(
     up.fetch_add(client_pending.len() as u64, Ordering::Relaxed);
     down.fetch_add(upstream_pending.len() as u64, Ordering::Relaxed);
 
-    // The traffic capture's frame decoders, one per direction, when the launch captures bodies. They
-    // see exactly the bytes the relay moves — starting with the ones each side already read past its
-    // handshake head, which are frames like any other and would otherwise be missed.
-    let capture = capture.filter(|c| c.keeps_body());
-    let (mut tee_up, mut tee_down) = match capture {
+    // One frame decoder per direction, present when this launch has something to do with the frames:
+    // a traffic capture to fill, a configured secret to watch for, or both. They see exactly the
+    // bytes the relay moves — starting with the ones each side already read past its handshake head,
+    // which are frames like any other and would otherwise be missed. With neither consumer the
+    // framing is not followed at all and the tunnel is a plain pipe.
+    let capture = obs.capture;
+    let (to_upstream, to_client) = match capture {
         Some(c) => {
-            let (to_upstream, to_client) = c.ws_sinks();
-            // Each direction is decompressed under the peer that COMPRESSES it: the cage's frames
-            // by the client parameters, the upstream's by the server ones.
-            let (up_deflate, down_deflate) = match deflate.negotiated {
-                true => (
-                    Some(deflate.client_no_context_takeover),
-                    Some(deflate.server_no_context_takeover),
-                ),
-                false => (None, None),
-            };
-            (
-                Some(FrameTee::new(to_upstream, up_deflate)),
-                Some(FrameTee::new(to_client, down_deflate)),
-            )
+            let (u, d) = c.ws_sinks();
+            (Some(u), Some(d))
         }
         None => (None, None),
     };
+    // Each direction is decompressed under the peer that COMPRESSES it: the cage's frames by the
+    // client parameters, the upstream's by the server ones.
+    let (up_deflate, down_deflate) = match deflate.negotiated {
+        true => (
+            Some(deflate.client_no_context_takeover),
+            Some(deflate.server_no_context_takeover),
+        ),
+        false => (None, None),
+    };
+    let mut tee_up = FrameTee::new(to_upstream, &ctx.redactions, up_deflate);
+    let mut tee_down = FrameTee::new(to_client, &ctx.redactions, down_deflate);
     // The transcript is filed whenever a direction reaches its cap, and once more when the tunnel
     // ends (in the capture guard's teardown). Each direction has its own trigger, and each fires at
     // most once: one side of a live stream can fill in seconds while the other trickles for hours,
     // so a single shared trigger would strand whichever filled second. The guard drops a filing that
     // would show what it already showed, which is what keeps the count bounded.
-    let mut filled = false;
-    if let Some(tee) = &mut tee_up {
-        filled |= tee.push(client_pending);
-    }
-    if let Some(tee) = &mut tee_down {
-        filled |= tee.push(upstream_pending);
-    }
-    if filled {
-        if let Some(c) = capture {
-            c.file_frames_snapshot();
-        }
-    }
+    follow(&mut tee_up, client_pending, SecretWay::Out, &obs);
+    follow(&mut tee_down, upstream_pending, SecretWay::Back, &obs);
     client.sock.set_nonblocking(true)?;
     upstream.sock.set_nonblocking(true)?;
 
@@ -672,13 +892,7 @@ pub(super) fn relay_websocket(
                 Some(n) => {
                     upstream.conn.writer().write_all(&buf[..n])?;
                     up.fetch_add(n as u64, Ordering::Relaxed);
-                    if let Some(tee) = &mut tee_up {
-                        if tee.push(&buf[..n]) {
-                            if let Some(c) = capture {
-                                c.file_frames_snapshot();
-                            }
-                        }
-                    }
+                    follow(&mut tee_up, &buf[..n], SecretWay::Out, &obs);
                     progressed = true;
                 }
                 None => {}
@@ -694,13 +908,7 @@ pub(super) fn relay_websocket(
                 Some(n) => {
                     client.conn.writer().write_all(&buf[..n])?;
                     down.fetch_add(n as u64, Ordering::Relaxed);
-                    if let Some(tee) = &mut tee_down {
-                        if tee.push(&buf[..n]) {
-                            if let Some(c) = capture {
-                                c.file_frames_snapshot();
-                            }
-                        }
-                    }
+                    follow(&mut tee_down, &buf[..n], SecretWay::Back, &obs);
                     progressed = true;
                 }
                 None => {}
@@ -774,7 +982,13 @@ mod tests {
     /// must. Extended lengths are chosen the way a real peer would, so a test exercises the same
     /// header shapes the decoder meets on the wire.
     fn frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
-        let mut out = vec![0x80 | opcode];
+        frame_with_fin(opcode, payload, mask, true)
+    }
+
+    /// The same, with `fin` chosen: a fragmented message is a first frame with `fin` clear followed
+    /// by continuations (opcode `0x0`), the last of which sets it.
+    fn frame_with_fin(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>, fin: bool) -> Vec<u8> {
+        let mut out = vec![if fin { 0x80 | opcode } else { opcode }];
         let flag = if mask.is_some() { 0x80u8 } else { 0 };
         match payload.len() {
             n if n < 126 => out.push(flag | n as u8),
@@ -800,13 +1014,27 @@ mod tests {
     /// A tee over a sink of `cap` bytes, plus the sink so a test can read what it captured.
     fn tee(cap: usize) -> (FrameTee, Arc<CapBuf>) {
         let sink = Arc::new(CapBuf::new(cap));
-        (FrameTee::new(sink.clone(), None), sink)
+        (
+            FrameTee::new(Some(sink.clone()), &[], None).expect("a sink is a consumer"),
+            sink,
+        )
     }
 
     /// The same over a `permessage-deflate` direction; `no_takeover` mirrors what the peer announced.
     fn deflating_tee(cap: usize, no_takeover: bool) -> (FrameTee, Arc<CapBuf>) {
         let sink = Arc::new(CapBuf::new(cap));
-        (FrameTee::new(sink.clone(), Some(no_takeover)), sink)
+        (
+            FrameTee::new(Some(sink.clone()), &[], Some(no_takeover))
+                .expect("a sink is a consumer"),
+            sink,
+        )
+    }
+
+    /// A tee that only SCANS: no capture sink at all, which is the shape a launch has when it
+    /// configures a secret and does not capture. Nothing about the leak scan may depend on the
+    /// capture being on — that would make a security check follow a debugging setting.
+    fn scanning_tee(needles: &[SecretNeedle], deflate: Option<bool>) -> FrameTee {
+        FrameTee::new(None, needles, deflate).expect("needles are a consumer")
     }
 
     /// Compressor flags for RAW deflate (negative window bits) at a level that genuinely compresses.
@@ -1089,5 +1317,139 @@ mod tests {
         let got = captured(&sink);
         assert_eq!(got.bytes, b"12345678");
         assert!(got.truncated, "the cut is reported, never silent");
+    }
+
+    /// A needle for the leak-scan tests. The value is long enough to clear the redaction floor, and
+    /// distinctive enough that a match cannot be a coincidence.
+    fn needle() -> SecretNeedle {
+        SecretNeedle::named("demo-token", b"SECRET-VALUE-0123456789".to_vec())
+    }
+
+    /// The scan reports a configured secret it sees crossing, and reports it by NAME. Teeth: the
+    /// tee has NO capture sink, so this proves the enforcement path does not ride on the capture
+    /// being enabled — a security check that followed a debugging setting would be worthless.
+    #[test]
+    fn a_secret_crossing_a_frame_is_seen_with_no_capture_configured() {
+        let mut t = scanning_tee(&[needle()], None);
+        t.push(&frame(0x1, b"{\"auth\":\"SECRET-VALUE-0123456789\"}", None));
+        assert_eq!(
+            t.sightings(),
+            vec!["demo-token".to_string()],
+            "the credential is named, and nothing else is"
+        );
+    }
+
+    /// The same value crossing again says nothing new, so it is reported once. Without this an
+    /// alarm on a chatty tunnel would amend its event on every message and drown the log it is
+    /// meant to stand out in.
+    #[test]
+    fn a_secret_seen_twice_is_reported_once() {
+        let mut t = scanning_tee(&[needle()], None);
+        t.push(&frame(0x1, b"first SECRET-VALUE-0123456789", None));
+        assert_eq!(t.sightings().len(), 1);
+        t.push(&frame(0x1, b"again SECRET-VALUE-0123456789", None));
+        assert!(
+            t.sightings().is_empty(),
+            "a repeat carries no new information and must not re-alarm"
+        );
+    }
+
+    /// A value split across two frames of ONE message is still seen: the pieces of a message are
+    /// contiguous, so the scan carries the tail across them. A frame boundary is not a place a
+    /// secret gets to hide.
+    #[test]
+    fn a_secret_split_across_two_frames_of_one_message_is_still_seen() {
+        let mut t = scanning_tee(&[needle()], None);
+        // A fragmented text message: first frame not final, then a continuation that ends it.
+        let mut wire = frame_with_fin(0x1, b"prefix SECRET-VALUE-", None, false);
+        wire.extend_from_slice(&frame_with_fin(0x0, b"0123456789 suffix", None, true));
+        t.push(&wire);
+        assert_eq!(t.sightings(), vec!["demo-token".to_string()]);
+    }
+
+    /// A value split across two SEPARATE messages is NOT reported. Two messages are two application
+    /// payloads, so a match spanning them would be an artefact of concatenation, not a secret that
+    /// crossed — and a false alarm in a security tool costs more than a missed byte-exact split,
+    /// which the documented scope already excludes (as it excludes a re-encoded value).
+    #[test]
+    fn a_value_split_across_two_messages_is_not_reported() {
+        let mut t = scanning_tee(&[needle()], None);
+        t.push(&frame(0x1, b"prefix SECRET-VALUE-", None));
+        t.push(&frame(0x1, b"0123456789 suffix", None));
+        assert!(
+            t.sightings().is_empty(),
+            "a match across a message boundary is a concatenation artefact, not a sighting"
+        );
+    }
+
+    /// A masked frame — every frame the cage sends is masked — is unmasked before it is scanned.
+    /// Without that the outbound direction would never match anything at all.
+    #[test]
+    fn a_masked_outbound_frame_is_unmasked_before_it_is_scanned() {
+        let mut t = scanning_tee(&[needle()], None);
+        t.push(&frame(
+            0x1,
+            b"take SECRET-VALUE-0123456789",
+            Some([0x37, 0xfa, 0x21, 0x3d]),
+        ));
+        assert_eq!(t.sightings(), vec!["demo-token".to_string()]);
+    }
+
+    /// A secret inside a `permessage-deflate` message is seen: the message is inflated before it is
+    /// scanned. Teeth: the payload is asserted absent from the wire bytes first, so a decoder that
+    /// silently stopped compressing would fail here rather than pass vacuously.
+    #[test]
+    fn a_secret_inside_a_compressed_message_is_seen() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        let mut comp = CompressorOxide::new(raw_deflate_flags());
+        // Padded into genuinely compressible shape: a short, high-entropy payload is emitted as a
+        // STORED block, which would leave the secret readable on the wire and make the guard below
+        // pass for the wrong reason.
+        let mut payload = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".repeat(20);
+        payload.extend_from_slice(br#"{"authorization":"Bearer SECRET-VALUE-0123456789"}"#);
+        let wire = deflated_frame(&payload, &mut comp);
+        assert!(
+            !wire
+                .windows(b"SECRET-VALUE-0123456789".len())
+                .any(|w| w == b"SECRET-VALUE-0123456789"),
+            "the secret must be compressed on the wire, else this test proves nothing"
+        );
+        let mut t = scanning_tee(&[needle()], Some(false));
+        t.push(&wire);
+        assert_eq!(t.sightings(), vec!["demo-token".to_string()]);
+    }
+
+    /// Ordinary traffic raises nothing. The obvious property, asserted because a scan that reported
+    /// on everything would be indistinguishable from one that worked.
+    #[test]
+    fn traffic_carrying_no_secret_raises_nothing() {
+        let mut t = scanning_tee(&[needle()], None);
+        t.push(&frame(0x1, b"{\"type\":\"ping\",\"n\":1}", None));
+        assert!(t.sightings().is_empty());
+    }
+
+    /// With neither a capture sink nor a needle there is no consumer, so no decoder is built at all
+    /// and the tunnel is relayed without its framing being followed. The cost of both features is
+    /// exactly zero for a launch that uses neither.
+    #[test]
+    fn a_tunnel_with_nothing_to_do_builds_no_decoder() {
+        assert!(FrameTee::new(None, &[], None).is_none());
+    }
+
+    /// A capture that has filled does not stop the scan: the decoder keeps following the framing for
+    /// as long as a consumer still wants bytes. Teeth: the secret is sent AFTER the sink's cap is
+    /// exhausted, so a decoder that quit when the capture filled would miss it.
+    #[test]
+    fn a_full_capture_does_not_blind_the_scan() {
+        let sink = Arc::new(CapBuf::new(4));
+        let mut t = FrameTee::new(Some(sink.clone()), &[needle()], None).expect("two consumers");
+        t.push(&frame(0x1, b"aaaaaaaaaaaa", None));
+        assert!(captured(&sink).truncated, "the capture is full by now");
+        t.push(&frame(0x1, b"late SECRET-VALUE-0123456789", None));
+        assert_eq!(
+            t.sightings(),
+            vec!["demo-token".to_string()],
+            "the scan outlives the capture it shares a decoder with"
+        );
     }
 }

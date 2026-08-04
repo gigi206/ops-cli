@@ -2108,15 +2108,23 @@ const PAGES: &[Page] = &[
             bytes are stored) and any credential sbx injects (the head recorded is the client\'s own,\n\
             taken before the injection — the injected headers are listed by NAME only).\n\
             \n\
+            SECRET SIGHTINGS: separately from the capture, and shown with NO flag asked for, a `!`\n\
+            line under an event reports a configured secret seen crossing that exchange's WebSocket,\n\
+            by name and direction. It is a report, not a verdict: an open tunnel is relayed\n\
+            byte-exact, so unlike an outbound `403` or a masked response NOTHING was blocked or\n\
+            masked, and the line says so. Each credential is reported once per direction, so a\n\
+            tunnel adds at most two lines per configured secret on top of the four below. It runs\n\
+            whenever a secret is configured, whether or not the launch captures.\n\
+            \n\
             Every inspected path is covered: HTTPS, inspected cleartext, HTTP/2 and gRPC\n\
             (`[network] http2` — its head is rendered rather than copied, keeping the real\n\
             pseudo-header names and no invented reason phrase), and a WebSocket (its handshake\n\
             including the upstream `101`, then the messages each direction carried, UNMASKED; control\n\
             frames carry no application data and are skipped). A WebSocket is shown in steps because\n\
             a tunnel outlives its handshake: the handshake at the `101`, then EACH DIRECTION as its\n\
-            capture fills, then once more at close if that changed anything — four lines over a\n\
-            tunnel's whole life at the very most, never showing what it already showed, and a\n\
-            transcript shown while the tunnel is open is marked cut. What a capture does not\n\
+            capture fills, then once more at close if that changed anything — four lines of\n\
+            traffic over a tunnel's whole life at the very most, never showing what it already\n\
+            showed, and a transcript shown while the tunnel is open is marked cut. What a capture does not\n\
             cover: a `tcp://` splice (no HTTP head exists to read) and a refused request (nothing\n\
             was forwarded). A `permessage-deflate` WebSocket is decompressed, so a compressed tunnel\n\
             reads like a plain one. A body is shown as text when it is text, and summarized as\n\

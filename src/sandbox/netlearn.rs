@@ -316,6 +316,7 @@ mod tests {
             status: None,
             amend_seq: None,
             awaiting_capture: false,
+            secrets_seen: Vec::new(),
         }
     }
 
