@@ -4575,25 +4575,22 @@ fn build(
         path
     });
 
-    // Environment, lowest precedence first: host passthrough, then sbx's hermetic CA bundle, then
-    // the Wayland GUI keys, then the non-nix auto-equip variable, then a trusted project's mise
-    // `[env]`, then the egress machinery (proxy + CA), then the task plane's discovery handles, then
-    // the `.sbx.toml` `[env]` (the sbx-native config has the final say). The structural
-    // HOME/PATH/... are added by the assembler, which upserts all of these over them. An
-    // untrusted config has already lost its reserved keys upstream — including the proxy and
-    // CA keys — so it can neither redirect the egress nor swap the CA; a trusted config
-    // overriding them only harms its own cage.
-    let extra_env = extra_cage_env(
-        passthrough_env(),
-        binds::cacert_env(),
-        gui_env,
-        autoequip_env,
-        mise_env(prep)?,
-        egress_env,
-        sshagent_env,
-        task_env,
-        &prep.cfg.env,
-    );
+    // Environment. Each source is tagged with where it belongs, and `EnvLayer` — not this list's
+    // order — decides which one wins a shared key. The structural HOME/PATH/... are added by the
+    // assembler, which upserts all of these over them. An untrusted config has already lost its
+    // reserved keys upstream — including the proxy and CA keys — so it can neither redirect the
+    // egress nor swap the CA; a trusted config overriding them only harms its own cage.
+    let extra_env = extra_cage_env(vec![
+        (EnvLayer::Passthrough, passthrough_env()),
+        (EnvLayer::Cacert, binds::cacert_env()),
+        (EnvLayer::Gui, gui_env),
+        (EnvLayer::AutoEquip, autoequip_env),
+        (EnvLayer::Mise, mise_env(prep)?),
+        (EnvLayer::Egress, egress_env),
+        (EnvLayer::SshAgent, sshagent_env),
+        (EnvLayer::Task, task_env),
+        (EnvLayer::Config, prep.cfg.env.clone()),
+    ]);
 
     let overlay = binds::Overlay {
         env: &extra_env,
@@ -5458,41 +5455,49 @@ fn keep_passthrough(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(St
         .collect()
 }
 
-/// Layer the cage's extra environment, lowest precedence first: host passthrough, then sbx's
-/// hermetic CA bundle, then the Wayland GUI hole, then the non-`nix:` auto-equip variable, then a
-/// trusted project's mise `[env]`, then the egress machinery, then the ssh-agent broker's socket,
-/// then the `.sbx.toml` `[env]`. The
-/// assembler upserts these over the structural defaults and takes the last occurrence of a key,
-/// so a later layer wins: the egress proxy's per-session CA overrides the structural cacert under
-/// an allowlist, and a trusted config has the final say (self-harm only). The CA bundle sits
-/// above passthrough on purpose — passthrough is a separate channel, not filtered by the
-/// untrusted-config denylist, so a host CA variable could otherwise clobber sbx's hermetic
-/// bundle. The GUI keys (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) collide with nothing else, so their
-/// position is immaterial; they sit here for a single, documented precedence order.
-// One parameter per environment *source*, in precedence order: the whole point is that the order is
-// visible at the call site, which a bundling struct would hide.
-#[allow(clippy::too_many_arguments)]
-fn extra_cage_env(
-    passthrough: Vec<(String, String)>,
-    cacert: Vec<(String, String)>,
-    gui: Vec<(String, String)>,
-    autoequip: Vec<(String, String)>,
-    mise: Vec<(String, String)>,
-    egress: Vec<(String, String)>,
-    ssh_agent: Vec<(String, String)>,
-    task: Vec<(String, String)>,
-    config: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut env = passthrough;
-    env.extend(cacert);
-    env.extend(gui);
-    env.extend(autoequip);
-    env.extend(mise);
-    env.extend(egress);
-    env.extend(ssh_agent);
-    env.extend(task);
-    env.extend(config.iter().cloned());
-    env
+/// Where a source of cage environment sits in the precedence order, lowest first. The assembler
+/// upserts these over the structural defaults and takes the last occurrence of a key, so a later
+/// variant wins.
+///
+/// The order lives in this declaration rather than in the order a caller happens to list its
+/// layers. Every layer is a `Vec<(String, String)>`, so two of them swapped at a call site would
+/// compile in silence and change which CA the cage trusts; sorting by this enum makes the
+/// precedence a property of one documented place instead of a property of an argument list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EnvLayer {
+    /// The host variables carried through unchanged. Lowest on purpose: passthrough is a separate
+    /// channel, not filtered by the untrusted-config denylist, so a host CA variable must not be
+    /// able to clobber sbx's hermetic bundle.
+    Passthrough,
+    /// sbx's hermetic CA bundle.
+    Cacert,
+    /// The Wayland GUI hole. Its keys (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) collide with nothing
+    /// else, so the position is immaterial; it sits here to keep one documented order.
+    Gui,
+    /// The non-`nix:` auto-equip variable.
+    AutoEquip,
+    /// A trusted project's mise `[env]`.
+    Mise,
+    /// The egress machinery: the proxy variables and the per-session MITM CA, which must beat
+    /// [`EnvLayer::Cacert`] so a cage under an allowlist trusts the proxy standing in for its
+    /// servers.
+    Egress,
+    /// The ssh-agent broker's socket.
+    SshAgent,
+    /// The task plane's discovery handles.
+    Task,
+    /// The `.sbx.toml` `[env]`: the sbx-native config has the final say. An untrusted one has
+    /// already lost its reserved keys upstream, so overriding here is self-harm only.
+    Config,
+}
+
+/// Layer the cage's extra environment by [`EnvLayer`] precedence, lowest first.
+///
+/// The caller may list its layers in any order — they are sorted here. Two entries carrying the
+/// same layer keep the order they were given, since the sort is stable.
+fn extra_cage_env(mut layers: Vec<(EnvLayer, Vec<(String, String)>)>) -> Vec<(String, String)> {
+    layers.sort_by_key(|(layer, _)| *layer);
+    layers.into_iter().flat_map(|(_, env)| env).collect()
 }
 
 fn missing(what: &str) -> ExitCode {
@@ -6166,40 +6171,35 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
                 .map(|(_, v)| v.clone())
         };
 
-        let cacert = vec![(
-            "SSL_CERT_FILE".into(),
-            "/etc/ssl/certs/ca-bundle.crt".into(),
-        )];
-        let egress = vec![("SSL_CERT_FILE".into(), "/opt/sbx/egress-ca.pem".into())];
-        let env = extra_cage_env(
-            vec![],
-            cacert.clone(),
-            vec![],
-            vec![],
-            vec![],
-            egress.clone(),
-            vec![],
-            vec![],
-            &[],
-        );
+        let cacert = || {
+            vec![(
+                "SSL_CERT_FILE".to_string(),
+                "/etc/ssl/certs/ca-bundle.crt".to_string(),
+            )]
+        };
+        let egress = || {
+            vec![(
+                "SSL_CERT_FILE".to_string(),
+                "/opt/sbx/egress-ca.pem".to_string(),
+            )]
+        };
+
+        let env = extra_cage_env(vec![
+            (EnvLayer::Cacert, cacert()),
+            (EnvLayer::Egress, egress()),
+        ]);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/opt/sbx/egress-ca.pem"),
             "egress CA must override the structural cacert"
         );
 
-        let cfg = vec![("SSL_CERT_FILE".into(), "/cfg/ca.pem".into())];
-        let env = extra_cage_env(
-            vec![],
-            cacert,
-            vec![],
-            vec![],
-            vec![],
-            egress,
-            vec![],
-            vec![],
-            &cfg,
-        );
+        let cfg = vec![("SSL_CERT_FILE".to_string(), "/cfg/ca.pem".to_string())];
+        let env = extra_cage_env(vec![
+            (EnvLayer::Cacert, cacert()),
+            (EnvLayer::Egress, egress()),
+            (EnvLayer::Config, cfg),
+        ]);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/cfg/ca.pem"),
@@ -6207,26 +6207,56 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         );
 
         // with no egress (shared/isolated posture) the structural cacert stands
-        let cacert = vec![(
-            "SSL_CERT_FILE".into(),
-            "/etc/ssl/certs/ca-bundle.crt".into(),
-        )];
-        let env = extra_cage_env(
-            vec![],
-            cacert,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            &[],
-        );
+        let env = extra_cage_env(vec![(EnvLayer::Cacert, cacert())]);
         assert_eq!(
             winner(&env).as_deref(),
             Some("/etc/ssl/certs/ca-bundle.crt"),
             "without egress the hermetic cacert is the trust anchor"
         );
+    }
+
+    /// The precedence is the enum's, not the caller's. Listing the layers backwards must produce
+    /// exactly the same environment as listing them in order — that is the whole reason the sources
+    /// carry a tag instead of riding an argument list, where two of them swapped would compile in
+    /// silence and change which CA the cage trusts.
+    #[test]
+    fn the_layer_decides_precedence_not_the_order_the_caller_lists_them_in() {
+        let key = "SSL_CERT_FILE".to_string();
+        let in_order = vec![
+            (EnvLayer::Passthrough, vec![(key.clone(), "/host".into())]),
+            (EnvLayer::Cacert, vec![(key.clone(), "/hermetic".into())]),
+            (EnvLayer::Egress, vec![(key.clone(), "/mitm".into())]),
+            (EnvLayer::Config, vec![(key.clone(), "/cfg".into())]),
+        ];
+        let mut backwards = in_order.clone();
+        backwards.reverse();
+
+        assert_eq!(
+            extra_cage_env(in_order.clone()),
+            extra_cage_env(backwards)
+        );
+        assert_eq!(
+            extra_cage_env(in_order).last().map(|(_, v)| v.clone()),
+            Some("/cfg".to_string()),
+            "the config layer stays last however the caller lists it"
+        );
+    }
+
+    /// A caller contributing one layer in two pieces must keep the pieces in the order it gave
+    /// them: within a layer there is no precedence to derive, so only a stable sort is correct.
+    #[test]
+    fn two_pieces_of_one_layer_keep_the_order_they_were_given() {
+        let env = extra_cage_env(vec![
+            (EnvLayer::Gui, vec![("WAYLAND_DISPLAY".into(), "a".into())]),
+            (EnvLayer::Cacert, vec![("SSL_CERT_FILE".into(), "ca".into())]),
+            (EnvLayer::Gui, vec![("WAYLAND_DISPLAY".into(), "b".into())]),
+        ]);
+        let seen: Vec<&str> = env
+            .iter()
+            .filter(|(k, _)| k == "WAYLAND_DISPLAY")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(seen, ["a", "b"]);
     }
 
     #[test]
