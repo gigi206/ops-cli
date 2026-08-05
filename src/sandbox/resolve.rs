@@ -11,6 +11,7 @@
 //! own way.
 
 use super::spec::{Mount, NetPolicy, SandboxSpec};
+use crate::store::Layout;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,65 @@ pub(crate) struct ResolveCage<'a> {
     /// The `PATH` bin directories (logical store paths): sbx's base tools plus the app's `nix:` package
     /// bins, so a resolve command can use e.g. `jq` by declaring `jq = "nix:jq"`.
     pub(crate) bins: Vec<PathBuf>,
+}
+
+/// The owning counterpart of [`ResolveCage`], for `sbx upgrade`. A [`ResolveCage`] borrows its
+/// engine, shell and CA bundle, so something must hold them for the whole upgrade; this is that
+/// something. Every prebuilt backend needs the identical set, so it is assembled once here rather
+/// than three times.
+pub(crate) struct UpgradeCage {
+    bwrap: PathBuf,
+    store_src: PathBuf,
+    shell_bin: PathBuf,
+    ca_bundle: PathBuf,
+    bins: Vec<PathBuf>,
+}
+
+impl UpgradeCage {
+    /// Assemble the resolver sandbox for `sbx upgrade` — the same hermetic base userland plus the
+    /// project's `nix:` package bins a launch gives a resolve command, so a command runs identically
+    /// at first launch and at upgrade. Best-effort: `None` when the host cannot resolve an engine or
+    /// a sandbox, and the caller then reports each resolver reference as un-rollable rather than
+    /// silently frozen.
+    pub(crate) fn build(
+        nix: &Path,
+        layout: &Layout,
+        project: &Path,
+        cfg: &crate::config::Resolved,
+    ) -> Option<Self> {
+        let bwrap = crate::store::resolve_bwrap(Some(layout))?.path;
+        let nixpkgs = super::launch::effective_lock_target(project, layout, cfg)
+            .ok()?
+            .resolve(nix, layout)
+            .ok()?;
+        let engine_ref =
+            crate::store::resolve_engine_ref(nix, layout, cfg.nixpkgs_global.as_deref()).ok()?;
+        let userland = super::fhs::resolve_userland(nix, layout, &nixpkgs, &engine_ref).ok()?;
+        let mut bins = userland.bin_paths.clone();
+        // The app's `nix:` bins, so a resolve command using e.g. `jq` resolves at upgrade time
+        // exactly as it does at launch. Best-effort — the base tools are always present regardless.
+        if let Ok(p) = super::packages::provision(nix, layout, project, &nixpkgs, &cfg.packages) {
+            bins.extend(p.bins);
+        }
+        Some(UpgradeCage {
+            bwrap,
+            store_src: crate::store::physical_path(layout, Path::new("/nix")),
+            shell_bin: userland.shell_bin.clone(),
+            ca_bundle: userland.ca_bundle_src.clone(),
+            bins,
+        })
+    }
+
+    /// Lend the borrowed cage a resolve command runs in, valid for as long as this value lives.
+    pub(crate) fn as_cage(&self) -> ResolveCage<'_> {
+        ResolveCage {
+            bwrap: self.bwrap.as_path(),
+            store_src: self.store_src.clone(),
+            shell_bin: self.shell_bin.as_path(),
+            ca_bundle: self.ca_bundle.as_path(),
+            bins: self.bins.clone(),
+        }
+    }
 }
 
 /// Build the sandbox spec for one resolve-command run. Pure (the cage inputs in, a [`SandboxSpec`]

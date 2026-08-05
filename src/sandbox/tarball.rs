@@ -417,16 +417,6 @@ pub(crate) fn upgrade(
     Ok(outcomes)
 }
 
-/// The owned pieces a `tarball:resolve` upgrade cage borrows from — held across the [`upgrade`] call
-/// so the [`ResolveCage`]'s references stay valid.
-struct ResolveCageParts {
-    bwrap: PathBuf,
-    store_src: PathBuf,
-    shell_bin: PathBuf,
-    ca_bundle: PathBuf,
-    bins: Vec<PathBuf>,
-}
-
 /// Whether the project (baseline or any app) declares a trusted `tarball:resolve` package — so the
 /// upgrade path builds the (heavy) resolver sandbox only when it is actually needed.
 fn has_resolve_ref(cfg: &crate::config::Resolved) -> bool {
@@ -441,39 +431,6 @@ fn has_resolve_ref(cfg: &crate::config::Resolved) -> bool {
         })
 }
 
-/// Assemble the resolver sandbox for `sbx upgrade` — the same hermetic base userland + the project's
-/// `nix:` package bins a launch gives a resolve command, so a command runs identically at first launch
-/// and at upgrade. Best-effort: if the host cannot resolve an engine or sandbox, this returns `None`
-/// and [`upgrade_project`] reports each resolver reference as un-rollable rather than silently frozen.
-fn build_resolve_cage_parts(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    cfg: &crate::config::Resolved,
-) -> Option<ResolveCageParts> {
-    let bwrap = crate::store::resolve_bwrap(Some(layout))?.path;
-    let nixpkgs = super::launch::effective_lock_target(project, layout, cfg)
-        .ok()?
-        .resolve(nix, layout)
-        .ok()?;
-    let engine_ref =
-        crate::store::resolve_engine_ref(nix, layout, cfg.nixpkgs_global.as_deref()).ok()?;
-    let userland = super::fhs::resolve_userland(nix, layout, &nixpkgs, &engine_ref).ok()?;
-    let mut bins = userland.bin_paths.clone();
-    // The app's `nix:` bins, so a resolve command using e.g. `jq` resolves at upgrade time exactly as
-    // it does at launch. Best-effort — the base tools are always present regardless.
-    if let Ok(p) = super::packages::provision(nix, layout, project, &nixpkgs, &cfg.packages) {
-        bins.extend(p.bins);
-    }
-    Some(ResolveCageParts {
-        bwrap,
-        store_src: crate::store::physical_path(layout, Path::new("/nix")),
-        shell_bin: userland.shell_bin.clone(),
-        ca_bundle: userland.ca_bundle_src.clone(),
-        bins,
-    })
-}
-
 /// `sbx upgrade tarball`: roll a project's declared `tarball:` packages forward. Builds the resolver
 /// sandbox (only when a `tarball:resolve` package is declared) and delegates to [`upgrade`]. A
 /// direct-only project keeps the cheap path (no base-userland build).
@@ -483,18 +440,12 @@ pub(crate) fn upgrade_project(
     project: &Path,
     cfg: &crate::config::Resolved,
 ) -> io::Result<Vec<TarballUpgrade>> {
-    let parts = if has_resolve_ref(cfg) {
-        build_resolve_cage_parts(nix, layout, project, cfg)
+    let held = if has_resolve_ref(cfg) {
+        super::resolve::UpgradeCage::build(nix, layout, project, cfg)
     } else {
         None
     };
-    let cage = parts.as_ref().map(|p| ResolveCage {
-        bwrap: p.bwrap.as_path(),
-        store_src: p.store_src.clone(),
-        shell_bin: p.shell_bin.as_path(),
-        ca_bundle: p.ca_bundle.as_path(),
-        bins: p.bins.clone(),
-    });
+    let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
     upgrade(nix, layout, project, cfg, cage.as_ref())
 }
 
