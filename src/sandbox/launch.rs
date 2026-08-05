@@ -2520,6 +2520,17 @@ pub(crate) fn superseded_reclaimable_hint(
     }
 }
 
+/// The context this project's prebuilt (`deb:`/`appimage:`/`tarball:`) packages are provisioned in.
+/// See [`super::prebuilt::Ctx`].
+fn prebuilt_ctx(prep: &Prepared) -> super::prebuilt::Ctx<'_> {
+    super::prebuilt::Ctx {
+        nix: &prep.nix,
+        layout: &prep.layout,
+        project: &prep.cwd,
+        nixpkgs: &prep.nixpkgs,
+    }
+}
+
 /// Provision the project's declared tools and seed its store, returning the store. Mirrors
 /// the provisioning a launch does — native `[packages]`, `nix:` tools, and (under the GUI
 /// hole) fonts — so the seed gc-roots the same set a launch would, but stops at the seed: gc
@@ -2547,124 +2558,40 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         crate::diag::warn(warning);
     }
 
-    // `deb:` packages are host-side like `nix:`, so their roots must be part of the gc seed too —
-    // otherwise the per-project store copy would be collected and re-provisioned every launch. When
-    // warm (pinned + built) this is a fast no-op; it mirrors the launch path's deb provisioning.
-    for (name, url) in super::packages::deb_packages(&prep.cfg.packages) {
-        match super::deb::provision(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &url,
-        ) {
-            Ok((_, root)) => packages.roots.push(root),
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx gc: cannot provision deb package `{name}` ({url}): {e}"
-                ));
-                return Err(ExitCode::FAILURE);
+    // The prebuilt backends are host-side like `nix:`, so their roots must be part of the gc seed
+    // too — otherwise the per-project store copy would be collected and re-provisioned every launch.
+    // When warm (pinned + built) this is a fast no-op; it mirrors the launch path's provisioning.
+    let ctx = prebuilt_ctx(prep);
+    for kind in super::prebuilt::DIRECT_ORDER {
+        for (name, url) in kind.packages(&prep.cfg.packages) {
+            match super::prebuilt::provision(kind, &ctx, &name, &url) {
+                Ok((_, root)) => packages.roots.push(root),
+                Err(e) => {
+                    crate::diag::error(&format!(
+                        "sbx gc: cannot provision {} package `{name}` ({url}): {e}",
+                        kind.name()
+                    ));
+                    return Err(ExitCode::FAILURE);
+                }
             }
         }
     }
 
-    // `appimage:` packages are host-side like `deb:`/`nix:`, so their roots join the gc seed too.
-    for (name, url) in super::packages::appimage_packages(&prep.cfg.packages) {
-        match super::appimage::provision(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &url,
-        ) {
-            Ok((_, root)) => packages.roots.push(root),
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx gc: cannot provision appimage package `{name}` ({url}): {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-
-    for (name, url) in super::packages::tarball_packages(&prep.cfg.packages) {
-        match super::tarball::provision(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &url,
-        ) {
-            Ok((_, root)) => packages.roots.push(root),
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx gc: cannot provision tarball package `{name}` ({url}): {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-
-    // A `tarball:resolve` package: build from its EXISTING pin only — gc must never run the resolve
+    // A `<backend>:resolve` package: build from its EXISTING pin only — gc must never run the resolve
     // command or touch the network. An unpinned package (never launched) has nothing built to keep,
     // so it is skipped rather than resolved.
-    for (name, _command) in super::packages::tarball_resolve_packages(&prep.cfg.packages) {
-        match super::tarball::provision_resolve_pinned(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-        ) {
-            Ok(Some((_, root))) => packages.roots.push(root),
-            Ok(None) => {}
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx gc: cannot build the pinned tarball resolver package `{name}`: {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-
-    // A `deb:resolve` package: build from its EXISTING pin only, exactly like `tarball:resolve` above
-    // (never run the command or touch the network; an unpinned package is skipped).
-    for (name, _command) in super::packages::deb_resolve_packages(&prep.cfg.packages) {
-        match super::deb::provision_resolve_pinned(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-        ) {
-            Ok(Some((_, root))) => packages.roots.push(root),
-            Ok(None) => {}
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx gc: cannot build the pinned deb resolver package `{name}`: {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-    for (name, _command) in super::packages::appimage_resolve_packages(&prep.cfg.packages) {
-        match super::appimage::provision_resolve_pinned(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-        ) {
-            Ok(Some((_, root))) => packages.roots.push(root),
-            Ok(None) => {}
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx gc: cannot build the pinned appimage resolver package `{name}`: {e}"
-                ));
-                return Err(ExitCode::FAILURE);
+    for kind in super::prebuilt::RESOLVE_ORDER {
+        for (name, _command) in kind.resolve_packages(&prep.cfg.packages) {
+            match super::prebuilt::provision_resolve_pinned(kind, &ctx, &name) {
+                Ok(Some((_, root))) => packages.roots.push(root),
+                Ok(None) => {}
+                Err(e) => {
+                    crate::diag::error(&format!(
+                        "sbx gc: cannot build the pinned {} resolver package `{name}`: {e}",
+                        kind.name()
+                    ));
+                    return Err(ExitCode::FAILURE);
+                }
             }
         }
     }
@@ -3585,92 +3512,39 @@ fn build(
     let mut bin_paths = tools.bins;
     bin_paths.extend(packages.bins);
 
-    // `deb:` packages are provisioned host-side too (like `nix:`, not in-cage like `flake:`): sbx
-    // resolves the `.deb` URL to a hash (pinned in the per-project lock), builds the generated
-    // unpack+autoPatchelf derivation into sbx's store, prepends its bin to PATH, and seeds its
-    // closure (its root joins `packages.roots`). A declared package is a requirement — a
-    // provisioning failure aborts the launch naming it, never runs without it.
-    for (name, url) in super::packages::deb_packages(&prep.cfg.packages) {
-        match super::deb::provision(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &url,
-        ) {
-            Ok((bin, root)) => {
-                bin_paths.push(bin);
-                packages.roots.push(root);
-            }
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx: cannot provision deb package `{name}` ({url}): {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-
-    // `appimage:` packages are provisioned host-side too (the exact `deb:` shape — the AppImage's
-    // squashfs is extracted at build time, never self-mounted at runtime, which the seccomp cage
-    // forbids): resolve the URL to a hash (pinned in the per-project lock), build the generated
-    // extract+autoPatchelf derivation into sbx's store, prepend its bin to PATH, and seed its
-    // closure. A declared package is a requirement — a provisioning failure aborts the launch.
-    for (name, url) in super::packages::appimage_packages(&prep.cfg.packages) {
-        match super::appimage::provision(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &url,
-        ) {
-            Ok((bin, root)) => {
-                bin_paths.push(bin);
-                packages.roots.push(root);
-            }
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx: cannot provision appimage package `{name}` ({url}): {e}"
-                ));
-                return Err(ExitCode::FAILURE);
+    // The prebuilt backends — `deb:`, `appimage:`, `tarball:` — are provisioned host-side (like
+    // `nix:`, not in-cage like `flake:`): sbx resolves each declared locator to a hash (pinned in the
+    // per-project lock), builds the generated unpack+autoPatchelf derivation into sbx's store,
+    // prepends its bin to PATH, and seeds its closure (its root joins `packages.roots`). All three
+    // unpack at *build* time — an AppImage's squashfs is never self-mounted at runtime, which the
+    // seccomp cage forbids anyway. A declared package is a requirement: a provisioning failure aborts
+    // the launch naming it, never runs without it.
+    let ctx = prebuilt_ctx(prep);
+    for kind in super::prebuilt::DIRECT_ORDER {
+        for (name, url) in kind.packages(&prep.cfg.packages) {
+            match super::prebuilt::provision(kind, &ctx, &name, &url) {
+                Ok((bin, root)) => {
+                    bin_paths.push(bin);
+                    packages.roots.push(root);
+                }
+                Err(e) => {
+                    crate::diag::error(&format!(
+                        "sbx: cannot provision {} package `{name}` ({url}): {e}",
+                        kind.name()
+                    ));
+                    return Err(ExitCode::FAILURE);
+                }
             }
         }
     }
 
-    // `tarball:` packages are provisioned host-side too (the exact `deb:`/`appimage:` shape — a plain
-    // `.tar.gz` is extracted at build time, never self-mounted at runtime): resolve the URL to a hash
-    // (pinned in the per-project lock), build the generated extract+autoPatchelf derivation into sbx's
-    // store, prepend its bin to PATH, and seed its closure. A declared package is a requirement — a
-    // provisioning failure aborts the launch.
-    for (name, url) in super::packages::tarball_packages(&prep.cfg.packages) {
-        match super::tarball::provision(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &url,
-        ) {
-            Ok((bin, root)) => {
-                bin_paths.push(bin);
-                packages.roots.push(root);
-            }
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx: cannot provision tarball package `{name}` ({url}): {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-
-    // `tarball:resolve` packages are the auto-upgrade form: sbx runs the profile's resolve command in
-    // a hermetic sandbox to discover the newest download URL, then resolves+builds it exactly like the
-    // direct form (same per-project lock and gcroot). A warm launch reuses the pin offline and does NOT
-    // run the command. The command runs with sbx's base tools plus the app's own `nix:` bins on PATH
-    // (so a command that needs e.g. `jq` declares it), and sbx's own store + CA bundle bound.
+    // The `<backend>:resolve` packages are the auto-upgrade form: sbx runs the profile's resolve
+    // command in a hermetic sandbox to discover the newest download URL, then resolves+builds it
+    // exactly like the direct form (same per-project lock and gcroot). A warm launch reuses the pin
+    // offline and does NOT run the command. The command runs with sbx's base tools plus the app's own
+    // `nix:` bins and every direct package's bin on PATH (so a command that needs e.g. `jq` declares
+    // it), and sbx's own store + CA bundle bound. The cage is built once, here: a resolver never sees
+    // another resolver's bin, only the direct layer's.
     let resolve_cage = {
         let mut bins = prep.userland.bin_paths.clone();
         bins.extend(bin_paths.iter().cloned());
@@ -3682,77 +3556,20 @@ fn build(
             bins,
         }
     };
-    for (name, command) in super::packages::tarball_resolve_packages(&prep.cfg.packages) {
-        match super::tarball::provision_resolve(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &command,
-            &resolve_cage,
-        ) {
-            Ok((bin, root)) => {
-                bin_paths.push(bin);
-                packages.roots.push(root);
-            }
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx: cannot provision tarball resolver package `{name}`: {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-
-    // `deb:resolve` packages — the `deb:` auto-upgrade twin of `tarball:resolve`, provisioned through
-    // the same hermetic resolve cage (its command prints the newest `.deb` URL, then sbx builds it
-    // exactly like a direct `deb:`). A warm launch reuses the pin and does NOT run the command.
-    for (name, command) in super::packages::deb_resolve_packages(&prep.cfg.packages) {
-        match super::deb::provision_resolve(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &command,
-            &resolve_cage,
-        ) {
-            Ok((bin, root)) => {
-                bin_paths.push(bin);
-                packages.roots.push(root);
-            }
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx: cannot provision deb resolver package `{name}`: {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-
-    // `appimage:resolve` packages — the `appimage:` auto-upgrade twin, provisioned through the same
-    // hermetic resolve cage (its command prints the newest `.AppImage` URL, then sbx builds it exactly
-    // like a direct `appimage:`). A warm launch reuses the pin and does NOT run the command.
-    for (name, command) in super::packages::appimage_resolve_packages(&prep.cfg.packages) {
-        match super::appimage::provision_resolve(
-            &prep.nix,
-            &prep.layout,
-            &prep.cwd,
-            &prep.nixpkgs,
-            &name,
-            &command,
-            &resolve_cage,
-        ) {
-            Ok((bin, root)) => {
-                bin_paths.push(bin);
-                packages.roots.push(root);
-            }
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx: cannot provision appimage resolver package `{name}`: {e}"
-                ));
-                return Err(ExitCode::FAILURE);
+    for kind in super::prebuilt::RESOLVE_ORDER {
+        for (name, command) in kind.resolve_packages(&prep.cfg.packages) {
+            match super::prebuilt::provision_resolve(kind, &ctx, &name, &command, &resolve_cage) {
+                Ok((bin, root)) => {
+                    bin_paths.push(bin);
+                    packages.roots.push(root);
+                }
+                Err(e) => {
+                    crate::diag::error(&format!(
+                        "sbx: cannot provision {} resolver package `{name}`: {e}",
+                        kind.name()
+                    ));
+                    return Err(ExitCode::FAILURE);
+                }
             }
         }
     }

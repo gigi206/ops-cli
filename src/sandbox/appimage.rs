@@ -27,7 +27,7 @@ use super::prebuilt::{self, ELECTRON_LIBS};
 use crate::store::Layout;
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The AppImage's own bundled legacy tray/indicator/GConf shims (`usr/lib/libappindicator.so.1`,
 /// `libindicator.so.7`, `libgconf-2.so.4`) reference these old GTK2-era libraries. The main Electron
@@ -77,7 +77,7 @@ pub(crate) type AppImageUpgrade = prebuilt::Upgrade;
 /// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
 /// the same path for the tests that assert the on-disk format.
 #[cfg(test)]
-fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
+fn lock_path(layout: &Layout, project_id: &str) -> std::path::PathBuf {
     prebuilt::lock_path(layout, project_id, &prebuilt::lock_file(&AppImage))
 }
 
@@ -290,69 +290,6 @@ impl prebuilt::Kind for AppImage {
             | crate::config::Backend::TarballResolve { .. } => None,
         }
     }
-}
-
-/// The context an `appimage:` provisioning call runs in. See [`prebuilt::Ctx`].
-fn ctx<'a>(
-    nix: &'a Path,
-    layout: &'a Layout,
-    project: &'a Path,
-    nixpkgs: &'a str,
-) -> prebuilt::Ctx<'a> {
-    prebuilt::Ctx {
-        nix,
-        layout,
-        project,
-        nixpkgs,
-    }
-}
-
-/// Provision one `appimage:` package host-side. See [`prebuilt::provision`].
-pub(crate) fn provision(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-    locator: &str,
-) -> io::Result<(PathBuf, PathBuf)> {
-    prebuilt::provision(
-        &AppImage,
-        &ctx(nix, layout, project, nixpkgs),
-        name,
-        locator,
-    )
-}
-
-/// Provision one `appimage:resolve` package host-side. See [`prebuilt::provision_resolve`].
-pub(crate) fn provision_resolve(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-    command: &[String],
-    cage: &super::resolve::ResolveCage,
-) -> io::Result<(PathBuf, PathBuf)> {
-    prebuilt::provision_resolve(
-        &AppImage,
-        &ctx(nix, layout, project, nixpkgs),
-        name,
-        command,
-        cage,
-    )
-}
-
-/// Build an `appimage:resolve` package from its existing pin only, for the gc keep path. See
-/// [`prebuilt::provision_resolve_pinned`].
-pub(crate) fn provision_resolve_pinned(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    prebuilt::provision_resolve_pinned(&AppImage, &ctx(nix, layout, project, nixpkgs), name)
 }
 
 /// `sbx upgrade appimage`: roll a project's declared `appimage:` packages forward. See

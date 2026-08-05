@@ -30,12 +30,11 @@
 //! newest release URL is unchanged.
 
 use super::prebuilt::{self, ELECTRON_LIBS};
-use super::resolve::ResolveCage;
 use crate::config::is_valid_tarball_url;
 use crate::store::Layout;
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A locked `tarball:` package, keyed in the lock by its declared *locator* — the `.tar.gz` URL for
 /// a direct package, or `resolve:<name>` for a `tarball:resolve` package, whose `url` is then the
@@ -50,7 +49,7 @@ pub(crate) type TarballUpgrade = prebuilt::Upgrade;
 /// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
 /// the same path for the tests that assert the on-disk format.
 #[cfg(test)]
-fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
+fn lock_path(layout: &Layout, project_id: &str) -> std::path::PathBuf {
     prebuilt::lock_path(layout, project_id, &prebuilt::lock_file(&Tarball))
 }
 
@@ -221,64 +220,6 @@ impl prebuilt::Kind for Tarball {
             | crate::config::Backend::AppImageResolve { .. } => None,
         }
     }
-}
-
-/// The context a `tarball:` provisioning call runs in. See [`prebuilt::Ctx`].
-fn ctx<'a>(
-    nix: &'a Path,
-    layout: &'a Layout,
-    project: &'a Path,
-    nixpkgs: &'a str,
-) -> prebuilt::Ctx<'a> {
-    prebuilt::Ctx {
-        nix,
-        layout,
-        project,
-        nixpkgs,
-    }
-}
-
-/// Provision one `tarball:` package host-side. See [`prebuilt::provision`].
-pub(crate) fn provision(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-    locator: &str,
-) -> io::Result<(PathBuf, PathBuf)> {
-    prebuilt::provision(&Tarball, &ctx(nix, layout, project, nixpkgs), name, locator)
-}
-
-/// Provision one `tarball:resolve` package host-side. See [`prebuilt::provision_resolve`].
-pub(crate) fn provision_resolve(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-    command: &[String],
-    cage: &ResolveCage,
-) -> io::Result<(PathBuf, PathBuf)> {
-    prebuilt::provision_resolve(
-        &Tarball,
-        &ctx(nix, layout, project, nixpkgs),
-        name,
-        command,
-        cage,
-    )
-}
-
-/// Build a `tarball:resolve` package from its existing pin only, for the gc keep path. See
-/// [`prebuilt::provision_resolve_pinned`].
-pub(crate) fn provision_resolve_pinned(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    prebuilt::provision_resolve_pinned(&Tarball, &ctx(nix, layout, project, nixpkgs), name)
 }
 
 /// `sbx upgrade tarball`: roll a project's declared `tarball:` packages forward. See

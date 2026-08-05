@@ -429,6 +429,29 @@ pub(crate) trait Kind {
     fn lock_key(&self, package: &crate::config::Package) -> Option<String>;
 }
 
+/// The three backends in the order a launch provisions their **direct** packages. Both arrays must
+/// name every backend — one missing entry means its packages are silently never provisioned — and
+/// their order is load-bearing twice over: each provisioned `bin` directory is pushed onto the list
+/// that becomes the sandbox `PATH`, so this order arbitrates between two packages shipping the same
+/// binary name, and everything here is provisioned **before** anything in [`RESOLVE_ORDER`] because
+/// the resolve cage is built from the bins collected so far — a resolve command runs with every
+/// direct package's bin on `PATH`. The two groups therefore cannot be interleaved into one walk.
+/// [`super::launch`]'s gc seed walks the same two arrays for consistency, but there the order is
+/// cosmetic: it collects store roots (a set), and its resolve path never builds a cage.
+pub(crate) const DIRECT_ORDER: [&dyn Kind; 3] = [
+    &super::deb::Deb,
+    &super::appimage::AppImage,
+    &super::tarball::Tarball,
+];
+
+/// The three backends in the order a launch provisions their `<backend>:resolve` packages. Differs
+/// from [`DIRECT_ORDER`] — see there for what the order decides.
+pub(crate) const RESOLVE_ORDER: [&dyn Kind; 3] = [
+    &super::tarball::Tarball,
+    &super::deb::Deb,
+    &super::appimage::AppImage,
+];
+
 /// The host-side context every prebuilt package build shares: sbx's nix engine and store layout, the
 /// project whose lock and gcroots are keyed by it, and the pinned `nixpkgs` the generated derivation
 /// evaluates against. They are always all four or none, so they travel as one value.
@@ -969,6 +992,73 @@ mod tests {
             kind.fresh.get(),
             None,
             "a resolver never reaches the locator resolver"
+        );
+    }
+
+    /// One package of every prebuilt form, declared in an order that matches neither walk, so a test
+    /// reading the walks back cannot pass by echoing the declaration order.
+    fn one_of_each_form() -> Vec<crate::config::Package> {
+        use crate::config::Backend;
+        let command = || vec!["print-the-newest-url".to_string()];
+        [
+            (
+                "one",
+                Backend::Tarball("https://example.com/x.tar.gz".into()),
+            ),
+            ("two", Backend::Deb("https://example.com/x.deb".into())),
+            (
+                "three",
+                Backend::AppImage("https://example.com/x.AppImage".into()),
+            ),
+            ("four", Backend::AppImageResolve { command: command() }),
+            ("five", Backend::TarballResolve { command: command() }),
+            ("six", Backend::DebResolve { command: command() }),
+        ]
+        .into_iter()
+        .map(|(name, backend)| crate::config::Package {
+            name: name.into(),
+            backend,
+            state: crate::trust::TrustState::Trusted,
+        })
+        .collect()
+    }
+
+    /// The two walk orders are what the launcher provisions through, and neither property they carry
+    /// is checked by the compiler: a backend missing from an array would simply never be provisioned,
+    /// and a reordered array would silently change which of two packages shipping the same binary name
+    /// wins on `PATH`. One assertion per array pins both — the set and the sequence.
+    #[test]
+    fn the_two_walk_orders_cover_every_backend_and_hold_their_path_precedence() {
+        let packages = one_of_each_form();
+        let walk = |order: [&dyn Kind; 3], resolve: bool| -> Vec<String> {
+            order
+                .into_iter()
+                .flat_map(|kind| {
+                    let names = if resolve {
+                        kind.resolve_packages(&packages)
+                            .into_iter()
+                            .map(|(name, _)| name)
+                            .collect::<Vec<_>>()
+                    } else {
+                        kind.packages(&packages)
+                            .into_iter()
+                            .map(|(name, _)| name)
+                            .collect::<Vec<_>>()
+                    };
+                    names
+                        .into_iter()
+                        .map(|name| format!("{}:{name}", kind.name()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(
+            walk(DIRECT_ORDER, false),
+            ["deb:two", "appimage:three", "tarball:one"]
+        );
+        assert_eq!(
+            walk(RESOLVE_ORDER, true),
+            ["tarball:five", "deb:six", "appimage:four"]
         );
     }
 

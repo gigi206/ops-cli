@@ -31,7 +31,7 @@ use super::prebuilt::{self, ELECTRON_LIBS};
 use crate::store::Layout;
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A locked `deb:` package, keyed in the lock by its declared *locator* (the `.deb` URL, a
 /// `github:<owner>/<repo>`, or an `apt:` index). Its `url` is the concrete `.deb` the pin resolved
@@ -76,7 +76,7 @@ pub(crate) type DebUpgrade = prebuilt::Upgrade;
 /// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
 /// the same path for the tests that assert the on-disk format.
 #[cfg(test)]
-fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
+fn lock_path(layout: &Layout, project_id: &str) -> std::path::PathBuf {
     prebuilt::lock_path(layout, project_id, &prebuilt::lock_file(&Deb))
 }
 
@@ -409,64 +409,6 @@ impl prebuilt::Kind for Deb {
             | crate::config::Backend::TarballResolve { .. } => None,
         }
     }
-}
-
-/// The context a `deb:` provisioning call runs in. See [`prebuilt::Ctx`].
-fn ctx<'a>(
-    nix: &'a Path,
-    layout: &'a Layout,
-    project: &'a Path,
-    nixpkgs: &'a str,
-) -> prebuilt::Ctx<'a> {
-    prebuilt::Ctx {
-        nix,
-        layout,
-        project,
-        nixpkgs,
-    }
-}
-
-/// Provision one `deb:` package host-side. See [`prebuilt::provision`].
-pub(crate) fn provision(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-    locator: &str,
-) -> io::Result<(PathBuf, PathBuf)> {
-    prebuilt::provision(&Deb, &ctx(nix, layout, project, nixpkgs), name, locator)
-}
-
-/// Provision one `deb:resolve` package host-side. See [`prebuilt::provision_resolve`].
-pub(crate) fn provision_resolve(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-    command: &[String],
-    cage: &super::resolve::ResolveCage,
-) -> io::Result<(PathBuf, PathBuf)> {
-    prebuilt::provision_resolve(
-        &Deb,
-        &ctx(nix, layout, project, nixpkgs),
-        name,
-        command,
-        cage,
-    )
-}
-
-/// Build a `deb:resolve` package from its existing pin only, for the gc keep path. See
-/// [`prebuilt::provision_resolve_pinned`].
-pub(crate) fn provision_resolve_pinned(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    prebuilt::provision_resolve_pinned(&Deb, &ctx(nix, layout, project, nixpkgs), name)
 }
 
 /// `sbx upgrade deb`: roll a project's declared `deb:` packages forward. See
