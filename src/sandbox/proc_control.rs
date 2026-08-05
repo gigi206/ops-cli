@@ -107,7 +107,7 @@ impl super::lens::Event for ExecEvent {
 pub(crate) type ExecSnapshot = super::lens::Snapshot<ExecEvent>;
 
 /// A bounded ring of recent exec events. Shared (via `Arc`) between the observer thread (which
-/// [`push`](ExecRing::push)es) and the control serve thread (which [`snapshot`](ExecRing::snapshot)s
+/// [`push`](ExecRing::push)es) and the control serve thread (which [`snapshot`](super::lens::Ring::snapshot)s
 /// for `sbx proc logs`). The sequencing and eviction are [`super::lens::Ring`]'s; what this adds is
 /// the shape of an exec event, and the two ways one arrives.
 pub(crate) struct ExecRing(super::lens::Ring<ExecEvent>);

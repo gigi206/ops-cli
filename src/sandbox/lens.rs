@@ -7,6 +7,12 @@
 //! owns its own ring and its own socket, so a failure to stand one up never takes another down. What
 //! they share is *shape*, and the shape lives here.
 //!
+//! The two socket primitives at the bottom reach a little wider than the three rings do:
+//! [`ensure_control_dir`] and [`bind_and_serve`] are also what stand up the exec supervisor's
+//! notification socket and the ssh-agent broker's, neither of which is a reader's. They are the
+//! mechanics of a per-session socket under the data dir, not of a lens, and each caller keeps its
+//! own view of what a failure to bind one costs.
+//!
 //! The egress control plane ([`super::control`]) is not one of them, and folding it in here would be
 //! the wrong trade: its ring keeps a separate muted ring, a second monotonic cursor for retroactive
 //! amendments, captured traffic and secret sightings. That is a superset, and the three lenses that

@@ -138,7 +138,7 @@ fn sanitize_detail(s: &str) -> String {
 
 /// A bounded ring of recent broker decisions. Shared (via `Arc`) between the broker's per-connection
 /// threads (which [`push`](AgentRing::push)) and the control serve thread (which
-/// [`snapshot`](AgentRing::snapshot)s for `sbx ssh-agent log`). The sequencing and eviction are
+/// [`snapshot`](super::lens::Ring::snapshot)s for `sbx ssh-agent log`). The sequencing and eviction are
 /// [`super::lens::Ring`]'s; what this adds is the shape of a decision — and the announcement a
 /// refusal makes on its way in.
 pub(crate) struct AgentRing {

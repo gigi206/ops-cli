@@ -118,7 +118,7 @@ impl super::lens::Event for FsEvent {
 pub(crate) type FsSnapshot = super::lens::Snapshot<FsEvent>;
 
 /// A bounded ring of recent filesystem events. Shared (via `Arc`) between the watcher thread (which
-/// [`push`](FsRing::push)es) and the control serve thread (which [`snapshot`](FsRing::snapshot)s for
+/// [`push`](FsRing::push)es) and the control serve thread (which [`snapshot`](super::lens::Ring::snapshot)s for
 /// `sbx fs logs`). The sequencing and eviction are [`super::lens::Ring`]'s; what this adds is the
 /// shape of a write event.
 pub(crate) struct FsRing(super::lens::Ring<FsEvent>);

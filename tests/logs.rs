@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 /// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
 /// `SBX_TEST_TMPDIR`. Deliberately not `/tmp`, whose tmpfs inode cap is shared machine-wide.
@@ -77,16 +78,37 @@ fn write_session_record(data: &Path, pid: u32, project: &Path) {
     std::fs::write(dir.join(format!("{pid}-{start}")), rec).unwrap();
 }
 
-/// Bind `<data>/sbx/<lens>/control-<pid>.sock` and answer one `LOG` on it with `events`, framed the
-/// way a session frames it: the `head=` cursor, one `event …` line each, then `ok`.
-///
-/// One connection is enough — the views under test read the retained window once when `--follow` is
-/// not asked for. The thread is detached and dies with the test process.
-fn serve_lens(data: &Path, lens: &str, pid: u32, events: &'static [&'static str]) -> PathBuf {
+/// The commands a stand-in socket was asked, in order — how a test sees the cursor the view walked.
+type Asked = Arc<Mutex<Vec<String>>>;
+
+/// Frame `events` the way a session frames a `LOG` reply: the `head=` cursor, one `event …` line
+/// each, then `ok`.
+fn frame(events: &[&str]) -> String {
+    let mut reply = format!("head={}\n", events.len());
+    for e in events {
+        reply.push_str(e);
+        reply.push('\n');
+    }
+    reply.push_str("ok\n");
+    reply
+}
+
+/// Bind `<data>/sbx/<lens>/control-<pid>.sock` — where that lens says its socket lives, which is
+/// half of what these tests are checking.
+fn bind_lens_socket(data: &Path, lens: &str, pid: u32) -> (PathBuf, UnixListener) {
     let dir = data.join("sbx").join(lens);
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join(format!("control-{pid}.sock"));
     let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
+    (socket, listener)
+}
+
+/// Answer every read with the same window, for as long as anything asks. A view that is not
+/// following still reads more than once across a test (the human pass and the `--json` pass are two
+/// runs of the command), and the protocol is one command per connection.
+fn serve_lens(data: &Path, lens: &str, pid: u32, events: &[&str]) {
+    let (_, listener) = bind_lens_socket(data, lens, pid);
+    let reply = frame(events);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
@@ -94,17 +116,40 @@ fn serve_lens(data: &Path, lens: &str, pid: u32, events: &'static [&'static str]
             if BufReader::new(&stream).read_line(&mut line).is_err() {
                 continue;
             }
-            let mut reply = format!("head={}\n", events.len());
-            for e in events {
-                reply.push_str(e);
-                reply.push('\n');
-            }
-            reply.push_str("ok\n");
             let _ = (&stream).write_all(reply.as_bytes());
             let _ = (&stream).flush();
         }
     });
-    socket
+}
+
+/// Answer `replies` one per connection — which is one per read — and then stop.
+///
+/// When the script runs out the socket is unlinked and the listener dropped, which is exactly how a
+/// session ends: its guard unlinks on drop and the next connect simply fails. That is what a
+/// `--follow` view reads as end-of-session.
+///
+/// Returns the commands the view sent, so a test can assert the cursor it carried forward.
+fn serve_script(data: &Path, lens: &str, pid: u32, replies: Vec<String>) -> Asked {
+    let (socket, listener) = bind_lens_socket(data, lens, pid);
+    let asked: Asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&asked);
+    std::thread::spawn(move || {
+        for reply in replies {
+            let Ok((stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            seen.lock().unwrap().push(line.trim_end().to_string());
+            let _ = (&stream).write_all(reply.as_bytes());
+            let _ = (&stream).flush();
+        }
+        let _ = std::fs::remove_file(&socket);
+        drop(listener);
+    });
+    asked
 }
 
 /// A live pid to hang a session record on, and the guard that reaps it.
@@ -257,6 +302,51 @@ fn the_ssh_agent_lens_reads_its_own_socket_and_renders_its_own_rows() {
     assert!(
         json.contains(r#""detail":"a key the grant does not name""#),
         "{json}"
+    );
+}
+
+/// `--follow` is the half of the view a single read never exercises, and the half where a mistake
+/// is silent: the cursor it carries forward, the gap it admits to when the ring moved on without it,
+/// and how it decides the session is over. All three are asserted from the outside — the cursor by
+/// what the socket was actually asked.
+#[test]
+fn a_follow_walks_its_cursor_reports_the_gap_and_stops_when_the_session_ends() {
+    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let child = Standin::new();
+    write_session_record(data.path(), child.pid(), project.path());
+    let asked = serve_script(
+        data.path(),
+        "fs",
+        child.pid(),
+        vec![
+            // The opening tail: one event, cursor now at 1.
+            frame(&["event seq=1 at=1700000000123 kind=write path=first.rs"]),
+            // The ring moved on while the view was between polls: three events fell off unseen,
+            // and the one it does get is seq 5, so the cursor must jump to 5 and not to 2.
+            "dropped=3\nhead=5\nevent seq=5 at=1700000000456 kind=create path=later.rs\nok\n"
+                .to_string(),
+            // Nothing new. The cursor must be unchanged, not rewound.
+            "head=5\nok\n".to_string(),
+        ],
+    );
+    let pid = child.pid().to_string();
+
+    let feed = read_feed(data.path(), &["fs", "logs", &pid, "--follow"]);
+    assert!(feed.contains("write   first.rs"), "{feed}");
+    assert!(
+        feed.contains("(3 earlier event(s) evicted from the ring before this poll)"),
+        "a gap is surfaced, never silently swallowed: {feed}"
+    );
+    assert!(feed.contains("create  later.rs"), "{feed}");
+    assert!(
+        feed.contains(&format!("(session {pid} ended)")),
+        "an absent socket after a good first read is the end of the session, not an error: {feed}"
+    );
+
+    assert_eq!(
+        *asked.lock().unwrap(),
+        ["LOG", "LOG after=1", "LOG after=5"],
+        "each poll resumes from the head the last one reported"
     );
 }
 
