@@ -823,6 +823,111 @@ mod tests {
     use super::super::deb::Deb;
     use super::super::tarball::Tarball;
     use super::*;
+    use crate::testutil::{resolved, TmpDir};
+
+    /// A backend that records what [`upgrade`] asked of it and answers with a canned pin, so the
+    /// generic roll can be exercised without a nix engine or a network. It borrows `tarball:`'s
+    /// config shape (the plainest of the three) and nothing else.
+    #[derive(Default)]
+    struct Recording {
+        fresh: std::cell::Cell<Option<bool>>,
+    }
+
+    const RECORDED_HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
+
+    impl Kind for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn artefact(&self) -> &'static str {
+            "`.tar.gz`"
+        }
+        fn url_validator(&self) -> fn(&str) -> bool {
+            crate::config::is_valid_tarball_url
+        }
+        fn resolve_source(
+            &self,
+            _nix: &Path,
+            _layout: &Layout,
+            locator: &str,
+            _system: &str,
+            fresh: bool,
+        ) -> io::Result<(String, String)> {
+            self.fresh.set(Some(fresh));
+            Ok((locator.to_string(), RECORDED_HASH.to_string()))
+        }
+        fn derivation_expr(
+            &self,
+            _nixpkgs: &str,
+            _system: &str,
+            _name: &str,
+            _url: &str,
+            _hash: &str,
+        ) -> String {
+            unreachable!("upgrade never builds a derivation")
+        }
+        fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)> {
+            Tarball.packages(packages)
+        }
+        fn resolve_packages(
+            &self,
+            packages: &[crate::config::Package],
+        ) -> Vec<(String, Vec<String>)> {
+            Tarball.resolve_packages(packages)
+        }
+        fn lock_key(&self, package: &crate::config::Package) -> Option<String> {
+            Tarball.lock_key(package)
+        }
+    }
+
+    #[test]
+    fn a_roll_resolves_past_the_fetch_cache_and_records_the_pin() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let kind = Recording::default();
+        let url = "https://example.com/demo-app.tar.gz";
+        let cfg = resolved(
+            vec![crate::config::Package {
+                name: "demo-app".to_string(),
+                backend: crate::config::Backend::Tarball(url.to_string()),
+                state: crate::trust::TrustState::Trusted,
+            }],
+            vec![],
+        );
+
+        let outcomes = upgrade(
+            &kind,
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+        )
+        .expect("the roll writes its lock");
+
+        // `fresh` is what separates an upgrade from a re-read: without it a no-op `sbx upgrade`
+        // answers from the fetch cache and silently stops seeing new releases. Nothing else fails
+        // when it flips, which is why it is asserted here rather than trusted.
+        assert_eq!(
+            kind.fresh.get(),
+            Some(true),
+            "an upgrade must resolve past the fetch cache"
+        );
+        assert!(
+            matches!(outcomes.as_slice(), [Upgrade::Pinned { url: u, hash }]
+                     if u == url && hash == RECORDED_HASH),
+            "a first roll pins the declared locator"
+        );
+
+        let id = super::super::binds::project_runtime_id(project.path()).unwrap();
+        let lock = pins(&layout, &id, &lock_file(&kind));
+        assert_eq!(
+            lock.get(url).map(|p| p.hash.as_str()),
+            Some(RECORDED_HASH),
+            "the pin reached the lock the backend's name spells"
+        );
+    }
 
     #[test]
     fn is_sri_accepts_prefetch_output_and_rejects_junk() {

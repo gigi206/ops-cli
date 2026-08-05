@@ -6029,50 +6029,12 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     }
 
     /// A minimal resolved config carrying only the channel choices the builder reads.
+    /// A config whose only interesting fields are the two `nixpkgs` pins these tests vary.
     fn resolved(global: Option<&str>, project: Option<&str>) -> crate::config::Resolved {
-        crate::config::Resolved {
-            fs: Default::default(),
-            fs_origin: crate::config::Provenance::Default,
-            notify: Default::default(),
-            notify_origin: Default::default(),
-            ssh_agent_confirm: false,
-            env: vec![],
-            env_layer: Default::default(),
-            binds: vec![],
-            bind_layer: Default::default(),
-            packages: vec![],
-            nixpkgs_global: global.map(String::from),
-            nixpkgs_project: project.map(String::from),
-            mise: None,
-            network: crate::config::NetworkPolicy::Shared,
-            network_origin: Default::default(),
-            egress_stats: true,
-            gui: crate::config::GuiPolicy::default(),
-            gui_origin: Default::default(),
-            proc: Default::default(),
-            proc_origin: Default::default(),
-            gpu: false,
-            audio: false,
-            dbus: false,
-            gpu_origin: Default::default(),
-            audio_origin: Default::default(),
-            dbus_origin: Default::default(),
-            forward: vec![],
-            forward_origin: Default::default(),
-            limits: Default::default(),
-            limits_origin: Default::default(),
-            secrets: vec![],
-            tasks: vec![],
-            seccomp: Default::default(),
-            seccomp_origin: Default::default(),
-            devices: Vec::new(),
-            devices_origin: Default::default(),
-            ssh_agent: vec![],
-            ssh_agent_origin: Default::default(),
-            declared_secrets: vec![],
-            apps: std::collections::BTreeMap::new(),
-            warnings: vec![],
-        }
+        let mut cfg = crate::testutil::resolved(vec![], vec![]);
+        cfg.nixpkgs_global = global.map(String::from);
+        cfg.nixpkgs_project = project.map(String::from);
+        cfg
     }
 
     fn mise_pkg(name: &str, token: &str, trusted: bool) -> crate::config::Package {
