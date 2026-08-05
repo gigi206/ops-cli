@@ -531,7 +531,7 @@ fn deb_upgrade_summary(
     withheld: usize,
     pal: &style::Palette,
 ) -> Vec<String> {
-    use sandbox::DebUpgrade::*;
+    use sandbox::PrebuiltUpgrade::*;
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
@@ -616,7 +616,7 @@ fn appimage_upgrade_summary(
     withheld: usize,
     pal: &style::Palette,
 ) -> Vec<String> {
-    use sandbox::AppImageUpgrade::*;
+    use sandbox::PrebuiltUpgrade::*;
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
@@ -699,7 +699,7 @@ fn tarball_upgrade_summary(
     withheld: usize,
     pal: &style::Palette,
 ) -> Vec<String> {
-    use sandbox::TarballUpgrade::*;
+    use sandbox::PrebuiltUpgrade::*;
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
@@ -1272,7 +1272,7 @@ mod tests {
 
     #[test]
     fn deb_upgrade_summary_distinguishes_the_outcomes() {
-        use sandbox::DebUpgrade::*;
+        use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no deb: packages) says so plainly; an untrusted one names the withheld
         let empty = deb_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
@@ -1319,7 +1319,7 @@ mod tests {
 
     #[test]
     fn appimage_upgrade_summary_distinguishes_the_outcomes() {
-        use sandbox::AppImageUpgrade::*;
+        use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no appimage: packages) says so plainly; an untrusted one names the withheld
         let empty = appimage_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
@@ -1369,7 +1369,7 @@ mod tests {
 
     #[test]
     fn tarball_upgrade_summary_distinguishes_the_outcomes() {
-        use sandbox::TarballUpgrade::*;
+        use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no tarball: packages) says so plainly; an untrusted one names the withheld
         let empty = tarball_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");

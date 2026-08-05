@@ -110,6 +110,10 @@ pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};
 pub(crate) use netns::run_holder;
 pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
+/// The one outcome type the three prebuilt backends share. `DebUpgrade` and its siblings are
+/// aliases of it, so a caller matching on outcomes names the variants through this — a `use` path
+/// resolves through modules, and an alias is not one.
+pub(crate) use prebuilt::Upgrade as PrebuiltUpgrade;
 #[cfg(test)]
 pub(crate) use projectstore::PROJECT_MARKER;
 pub(crate) use projectstore::{reflink_verdict, supports_reflink};

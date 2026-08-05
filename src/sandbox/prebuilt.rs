@@ -665,6 +665,158 @@ pub(crate) fn provision_resolve_pinned(
     build_pinned(kind, ctx, project_id.as_str(), name, &pin.url, &pin.hash).map(Some)
 }
 
+/// The outcome of re-resolving one declared reference during `sbx upgrade`. `url` is the lock *key*
+/// (the declared locator, or `resolve:<name>`) rather than the resolved download URL, so the summary
+/// names each entry the way the config declared it.
+pub(crate) enum Upgrade {
+    Pinned {
+        url: String,
+        hash: String,
+    },
+    Rolled {
+        url: String,
+        from: String,
+        to: String,
+    },
+    Unchanged {
+        url: String,
+        hash: String,
+    },
+    Pruned {
+        url: String,
+    },
+    Failed {
+        url: String,
+        error: String,
+    },
+}
+
+/// Re-resolve a project's declared references for one backend and rewrite its per-project lock —
+/// pinning new ones, rolling changed ones forward, and pruning entries no longer declared (so a
+/// removed-then-readded package never reuses a stale pin). Resolution is best-effort per reference:
+/// a failure keeps the prior pin and is reported, and the lock is rewritten once at the end.
+///
+/// Every resolution here runs with `fresh` set, which is what makes this an *upgrade* rather than a
+/// re-read: it bypasses the fetch cache so a new GitHub release, a new apt index entry, or new
+/// content behind a stable URL is actually seen. The provisioning path deliberately does the
+/// opposite.
+///
+/// `cage` is the sandbox resolve commands run in. When it is `None` (the host cannot sandbox), a
+/// resolver reference is reported as failed rather than silently frozen at its current pin.
+pub(crate) fn upgrade(
+    kind: &dyn Kind,
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    cfg: &crate::config::Resolved,
+    cage: Option<&super::resolve::ResolveCage>,
+) -> io::Result<Vec<Upgrade>> {
+    let project_id = super::binds::project_runtime_id(project)?;
+    let project_id = project_id.as_str();
+    let lock_file = lock_file(kind);
+    // One walk of the layers yields both the trusted roll set and the trust-agnostic prune universe.
+    let Declared {
+        trusted: declared,
+        all: universe,
+    } = declared(kind, cfg);
+    let system = super::current_system();
+    let mut lock = pins(layout, project_id, &lock_file);
+    let mut outcomes = Vec::new();
+
+    // Prune entries whose locator is no longer declared (across ALL layers regardless of trust, so a
+    // withheld project's still-declared package keeps its pin rather than being silently unpinned).
+    let stale: Vec<String> = lock
+        .keys()
+        .filter(|k| !universe.contains(k.as_str()))
+        .cloned()
+        .collect();
+    for url in stale {
+        lock.remove(&url);
+        outcomes.push(Upgrade::Pruned { url });
+    }
+
+    for reference in &declared {
+        let key = reference.key();
+        let previous = lock.get(&key).cloned();
+        let resolved = match reference {
+            // A locator: always re-resolve, since its source can move (a `latest` alias, a new
+            // release, a new apt index entry) and even a fixed URL's content can change.
+            Ref::Locator(locator) => kind.resolve_source(nix, layout, locator, &system, true),
+            // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
+            // reuse the pinned hash rather than prefetching the (large) artefact again.
+            Ref::Resolve { name, command } => match cage {
+                None => Err(io::Error::other(
+                    "cannot run the resolve command (no usable sandbox on this host)",
+                )),
+                Some(cage) => match super::resolve::resolve_url(
+                    cage,
+                    name,
+                    command,
+                    kind.url_validator(),
+                    kind.artefact(),
+                ) {
+                    Ok(url) => match &previous {
+                        Some(pin) if pin.url == url => Ok((url, pin.hash.clone())),
+                        _ => prefetch_hash(nix, layout, &url, true).map(|h| (url, h)),
+                    },
+                    Err(e) => Err(e),
+                },
+            },
+        };
+        match resolved {
+            Ok((url, hash)) => {
+                let outcome = match &previous {
+                    Some(pin) if pin.hash == hash => Upgrade::Unchanged {
+                        url: key.clone(),
+                        hash: hash.clone(),
+                    },
+                    Some(pin) => Upgrade::Rolled {
+                        url: key.clone(),
+                        from: pin.hash.clone(),
+                        to: hash.clone(),
+                    },
+                    None => Upgrade::Pinned {
+                        url: key.clone(),
+                        hash: hash.clone(),
+                    },
+                };
+                lock.insert(key, Pin { hash, url });
+                outcomes.push(outcome);
+            }
+            Err(e) => outcomes.push(Upgrade::Failed {
+                url: key,
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    write_pins(layout, project_id, &lock_file, &lock)?;
+    Ok(outcomes)
+}
+
+/// `sbx upgrade <backend>`: roll a project's declared packages forward. Builds the resolver sandbox
+/// only when a `<backend>:resolve` package is actually declared, so a locator-only project keeps the
+/// cheap path (no base-userland build), then delegates to [`upgrade`].
+///
+/// When the sandbox is needed but cannot be built, the `None` is handed to [`upgrade`] rather than
+/// short-circuiting: the resolver references are then reported as failed, which is the fail-closed
+/// reading. Skipping them would leave a project looking rolled while its resolvers stood still.
+pub(crate) fn upgrade_project(
+    kind: &dyn Kind,
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    cfg: &crate::config::Resolved,
+) -> io::Result<Vec<Upgrade>> {
+    let held = if has_resolve_ref(kind, cfg) {
+        super::resolve::UpgradeCage::build(nix, layout, project, cfg)
+    } else {
+        None
+    };
+    let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
+    upgrade(kind, nix, layout, project, cfg, cage.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::appimage::AppImage;

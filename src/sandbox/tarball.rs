@@ -30,70 +30,52 @@
 //! newest release URL is unchanged.
 
 use super::prebuilt::{self, ELECTRON_LIBS};
-use super::resolve::{resolve_url, ResolveCage};
+use super::resolve::ResolveCage;
 use crate::config::is_valid_tarball_url;
 use crate::store::Layout;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const TARBALL_LOCK: &str = "tarball-packages.lock";
-
 /// A locked `tarball:` package, keyed in the lock by its declared *locator* — the `.tar.gz` URL for
 /// a direct package, or `resolve:<name>` for a `tarball:resolve` package, whose `url` is then the
 /// command-resolved download URL. See [`prebuilt::Pin`].
-pub(crate) type TarballPin = prebuilt::Pin;
+#[cfg(test)]
+type TarballPin = prebuilt::Pin;
 
 /// The outcome of re-resolving one declared `tarball:` reference during `sbx upgrade`.
-pub(crate) enum TarballUpgrade {
-    Pinned {
-        url: String,
-        hash: String,
-    },
-    Rolled {
-        url: String,
-        from: String,
-        to: String,
-    },
-    Unchanged {
-        url: String,
-        hash: String,
-    },
-    Pruned {
-        url: String,
-    },
-    Failed {
-        url: String,
-        error: String,
-    },
-}
+/// See [`prebuilt::Upgrade`].
+pub(crate) type TarballUpgrade = prebuilt::Upgrade;
 
 /// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
 /// the same path for the tests that assert the on-disk format.
 #[cfg(test)]
 fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
-    prebuilt::lock_path(layout, project_id, TARBALL_LOCK)
+    prebuilt::lock_path(layout, project_id, &prebuilt::lock_file(&Tarball))
 }
 
 /// Read the per-project tarball lock. A three-column line is a `tarball:resolve` pin
 /// (`resolve:<name>` key, hash, the command-resolved URL); see [`prebuilt::pins`] for the format.
-pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, TarballPin> {
-    prebuilt::pins(layout, project_id, TARBALL_LOCK)
+#[cfg(test)]
+fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, TarballPin> {
+    prebuilt::pins(layout, project_id, &prebuilt::lock_file(&Tarball))
 }
 
 /// The pinned content hashes for a project's `tarball:` packages, keyed by the declared locator.
 /// See [`prebuilt::pinned_hashes`].
 pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
-    prebuilt::pinned_hashes(cwd, TARBALL_LOCK)
+    prebuilt::pinned_hashes(cwd, &prebuilt::lock_file(&Tarball))
 }
 
-/// Write the per-project tarball lock atomically. See [`prebuilt::write_pins`].
+/// Write the per-project tarball lock atomically, for the tests that assert the on-disk
+/// format. Production writes it through [`prebuilt::upgrade`].
+#[cfg(test)]
 fn write_pins(
     layout: &Layout,
     project_id: &str,
     lock: &BTreeMap<String, TarballPin>,
 ) -> io::Result<()> {
-    prebuilt::write_pins(layout, project_id, TARBALL_LOCK, lock)
+    prebuilt::write_pins(layout, project_id, &prebuilt::lock_file(&Tarball), lock)
 }
 
 /// Resolve a declared `tarball:` locator to `(concrete .tar.gz url, SRI content hash)`. A direct URL
@@ -289,112 +271,15 @@ pub(crate) fn provision_resolve_pinned(
     prebuilt::provision_resolve_pinned(&Tarball, &ctx(nix, layout, project, nixpkgs), name)
 }
 
-/// Re-resolve a project's declared `tarball:` references and rewrite the per-project lock — pinning
-/// new ones, rolling changed ones forward, and pruning entries no longer declared. Mirrors
-/// [`super::deb::upgrade`]: references collected generically across the baseline and each app,
-/// resolution best-effort per reference, lock rewritten once at the end. A direct URL always
-/// re-prefetches (its content can move); a `tarball:resolve` first re-runs its command to re-derive
-/// the download URL and **skips the heavy tarball prefetch when that URL is unchanged**, so a no-op
-/// `sbx upgrade` does not re-download a large versioned asset. `cage` is the sandbox resolve commands
-/// run in; when it is `None` (the host cannot sandbox), a resolver reference cannot be rolled and is
-/// reported as failed rather than silently frozen.
-pub(crate) fn upgrade(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    cfg: &crate::config::Resolved,
-    cage: Option<&ResolveCage>,
-) -> io::Result<Vec<TarballUpgrade>> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    let prebuilt::Declared {
-        trusted: declared,
-        all: universe,
-    } = prebuilt::declared(&Tarball, cfg);
-    let mut lock = pins(layout, project_id.as_str());
-    let mut outcomes = Vec::new();
-
-    // Prune entries whose locator is no longer declared (across ALL layers regardless of trust, so
-    // a withheld project's still-declared package keeps its pin rather than being silently unpinned).
-    let stale: Vec<String> = lock
-        .keys()
-        .filter(|k| !universe.contains(k.as_str()))
-        .cloned()
-        .collect();
-    for url in stale {
-        lock.remove(&url);
-        outcomes.push(TarballUpgrade::Pruned { url });
-    }
-
-    for reference in &declared {
-        let key = reference.key();
-        let previous = lock.get(&key).cloned();
-        let resolved = match reference {
-            // A direct URL: always re-prefetch (a stable URL's content can change).
-            prebuilt::Ref::Locator(url) => resolve_source(nix, layout, url, true),
-            // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
-            // reuse the pinned hash without prefetching the (large) tarball again.
-            prebuilt::Ref::Resolve { name, command } => match cage {
-                None => Err(io::Error::other(
-                    "cannot run the resolve command (no usable sandbox on this host)",
-                )),
-                Some(cage) => {
-                    match resolve_url(cage, name, command, is_valid_tarball_url, "`.tar.gz`") {
-                        Ok(url) => match &previous {
-                            Some(pin) if pin.url == url => Ok((url, pin.hash.clone())),
-                            _ => prebuilt::prefetch_hash(nix, layout, &url, true).map(|h| (url, h)),
-                        },
-                        Err(e) => Err(e),
-                    }
-                }
-            },
-        };
-        match resolved {
-            Ok((url, hash)) => {
-                let outcome = match &previous {
-                    Some(pin) if pin.hash == hash => TarballUpgrade::Unchanged {
-                        url: key.clone(),
-                        hash: hash.clone(),
-                    },
-                    Some(pin) => TarballUpgrade::Rolled {
-                        url: key.clone(),
-                        from: pin.hash.clone(),
-                        to: hash.clone(),
-                    },
-                    None => TarballUpgrade::Pinned {
-                        url: key.clone(),
-                        hash: hash.clone(),
-                    },
-                };
-                lock.insert(key, TarballPin { hash, url });
-                outcomes.push(outcome);
-            }
-            Err(e) => outcomes.push(TarballUpgrade::Failed {
-                url: key,
-                error: e.to_string(),
-            }),
-        }
-    }
-
-    write_pins(layout, project_id.as_str(), &lock)?;
-    Ok(outcomes)
-}
-
-/// `sbx upgrade tarball`: roll a project's declared `tarball:` packages forward. Builds the resolver
-/// sandbox (only when a `tarball:resolve` package is declared) and delegates to [`upgrade`]. A
-/// direct-only project keeps the cheap path (no base-userland build).
+/// `sbx upgrade tarball`: roll a project's declared `tarball:` packages forward. See
+/// [`prebuilt::upgrade_project`].
 pub(crate) fn upgrade_project(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
 ) -> io::Result<Vec<TarballUpgrade>> {
-    let held = if prebuilt::has_resolve_ref(&Tarball, cfg) {
-        super::resolve::UpgradeCage::build(nix, layout, project, cfg)
-    } else {
-        None
-    };
-    let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
-    upgrade(nix, layout, project, cfg, cage.as_ref())
+    prebuilt::upgrade_project(&Tarball, nix, layout, project, cfg)
 }
 
 /// How many declared `tarball:` packages are withheld for being untrusted. See

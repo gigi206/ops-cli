@@ -33,13 +33,12 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const DEB_LOCK: &str = "deb-packages.lock";
-
 /// A locked `deb:` package, keyed in the lock by its declared *locator* (the `.deb` URL, a
 /// `github:<owner>/<repo>`, or an `apt:` index). Its `url` is the concrete `.deb` the pin resolved
 /// to — the locator itself for a direct URL, the selected release asset for a `github:` locator —
 /// so a warm launch builds it offline without re-querying GitHub. See [`prebuilt::Pin`].
-pub(crate) type DebPin = prebuilt::Pin;
+#[cfg(test)]
+type DebPin = prebuilt::Pin;
 
 /// The shapes a declared `deb:` locator can take, dispatched from its prefix.
 enum DebSource {
@@ -71,55 +70,38 @@ fn parse_source(locator: &str) -> DebSource {
 }
 
 /// The outcome of re-resolving one declared `deb:` reference during `sbx upgrade`.
-pub(crate) enum DebUpgrade {
-    Pinned {
-        url: String,
-        hash: String,
-    },
-    Rolled {
-        url: String,
-        from: String,
-        to: String,
-    },
-    Unchanged {
-        url: String,
-        hash: String,
-    },
-    Pruned {
-        url: String,
-    },
-    Failed {
-        url: String,
-        error: String,
-    },
-}
+/// See [`prebuilt::Upgrade`].
+pub(crate) type DebUpgrade = prebuilt::Upgrade;
 
 /// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
 /// the same path for the tests that assert the on-disk format.
 #[cfg(test)]
 fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
-    prebuilt::lock_path(layout, project_id, DEB_LOCK)
+    prebuilt::lock_path(layout, project_id, &prebuilt::lock_file(&Deb))
 }
 
 /// Read the per-project deb lock. A three-column line is a `github:`/`apt:` pin, whose resolved
 /// asset URL differs from its key; see [`prebuilt::pins`] for the format.
-pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, DebPin> {
-    prebuilt::pins(layout, project_id, DEB_LOCK)
+#[cfg(test)]
+fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, DebPin> {
+    prebuilt::pins(layout, project_id, &prebuilt::lock_file(&Deb))
 }
 
 /// The pinned content hashes for a project's `deb:` packages, keyed by the declared locator so
 /// `sbx config` can look each up directly. See [`prebuilt::pinned_hashes`].
 pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
-    prebuilt::pinned_hashes(cwd, DEB_LOCK)
+    prebuilt::pinned_hashes(cwd, &prebuilt::lock_file(&Deb))
 }
 
-/// Write the per-project deb lock atomically. See [`prebuilt::write_pins`].
+/// Write the per-project deb lock atomically, for the tests that assert the on-disk
+/// format. Production writes it through [`prebuilt::upgrade`].
+#[cfg(test)]
 fn write_pins(
     layout: &Layout,
     project_id: &str,
     lock: &BTreeMap<String, DebPin>,
 ) -> io::Result<()> {
-    prebuilt::write_pins(layout, project_id, DEB_LOCK, lock)
+    prebuilt::write_pins(layout, project_id, &prebuilt::lock_file(&Deb), lock)
 }
 
 /// Resolve a declared `deb:` locator to `(concrete .deb url, SRI content hash)`. A direct URL
@@ -477,120 +459,15 @@ pub(crate) fn provision_resolve_pinned(
     prebuilt::provision_resolve_pinned(&Deb, &ctx(nix, layout, project, nixpkgs), name)
 }
 
-/// Re-resolve a project's declared `deb:` references and rewrite the per-project lock — pinning new
-/// ones, rolling changed ones forward, and pruning entries no longer declared. Mirrors
-/// [`super::tarball::upgrade`]: references collected generically across the baseline and each app,
-/// resolution best-effort per reference, lock rewritten once at the end. A locator form always
-/// re-resolves (a `latest`/`github:`/`apt:` source can move); a `deb:resolve` first re-runs its
-/// command to re-derive the download URL and **skips the heavy `.deb` prefetch when that URL is
-/// unchanged**, so a no-op `sbx upgrade` does not re-download a large versioned asset. `cage` is the
-/// sandbox resolve commands run in; when it is `None` (the host cannot sandbox), a resolver reference
-/// cannot be rolled and is reported as failed rather than silently frozen.
-pub(crate) fn upgrade(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    cfg: &crate::config::Resolved,
-    cage: Option<&super::resolve::ResolveCage>,
-) -> io::Result<Vec<DebUpgrade>> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    // One walk of the layers yields both the trusted roll set and the trust-agnostic prune universe.
-    let prebuilt::Declared {
-        trusted: declared,
-        all: universe,
-    } = prebuilt::declared(&Deb, cfg);
-    let system = super::current_system();
-    let mut lock = pins(layout, project_id.as_str());
-    let mut outcomes = Vec::new();
-
-    // Prune entries whose locator is no longer declared (across ALL layers regardless of trust, so
-    // a withheld project's still-declared package keeps its pin rather than being silently unpinned).
-    let stale: Vec<String> = lock
-        .keys()
-        .filter(|k| !universe.contains(k.as_str()))
-        .cloned()
-        .collect();
-    for url in stale {
-        lock.remove(&url);
-        outcomes.push(DebUpgrade::Pruned { url });
-    }
-
-    for reference in &declared {
-        let key = reference.key();
-        let previous = lock.get(&key).cloned();
-        let resolved = match reference {
-            // A locator: always re-resolve (a `latest`/`github:`/`apt:` source can move). `fresh`
-            // re-queries GitHub / the apt index past the fetch cache so a new release is seen; the
-            // lock records the resolved asset URL, not the locator.
-            prebuilt::Ref::Locator(locator) => resolve_source(nix, layout, locator, &system, true),
-            // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
-            // reuse the pinned hash without prefetching the (large) `.deb` again.
-            prebuilt::Ref::Resolve { name, command } => match cage {
-                None => Err(io::Error::other(
-                    "cannot run the resolve command (no usable sandbox on this host)",
-                )),
-                Some(cage) => match super::resolve::resolve_url(
-                    cage,
-                    name,
-                    command,
-                    crate::config::is_valid_deb_url,
-                    "`.deb`",
-                ) {
-                    Ok(url) => match &previous {
-                        Some(pin) if pin.url == url => Ok((url, pin.hash.clone())),
-                        _ => prebuilt::prefetch_hash(nix, layout, &url, true).map(|h| (url, h)),
-                    },
-                    Err(e) => Err(e),
-                },
-            },
-        };
-        match resolved {
-            Ok((url, hash)) => {
-                let outcome = match &previous {
-                    Some(pin) if pin.hash == hash => DebUpgrade::Unchanged {
-                        url: key.clone(),
-                        hash: hash.clone(),
-                    },
-                    Some(pin) => DebUpgrade::Rolled {
-                        url: key.clone(),
-                        from: pin.hash.clone(),
-                        to: hash.clone(),
-                    },
-                    None => DebUpgrade::Pinned {
-                        url: key.clone(),
-                        hash: hash.clone(),
-                    },
-                };
-                lock.insert(key, DebPin { hash, url });
-                outcomes.push(outcome);
-            }
-            Err(e) => outcomes.push(DebUpgrade::Failed {
-                url: key,
-                error: e.to_string(),
-            }),
-        }
-    }
-
-    write_pins(layout, project_id.as_str(), &lock)?;
-    Ok(outcomes)
-}
-
-/// `sbx upgrade deb`: roll a project's declared `deb:` packages forward. Builds the resolver sandbox
-/// (only when a `deb:resolve` package is declared) and delegates to [`upgrade`]. A locator-only
-/// project keeps the cheap path (no base-userland build).
+/// `sbx upgrade deb`: roll a project's declared `deb:` packages forward. See
+/// [`prebuilt::upgrade_project`].
 pub(crate) fn upgrade_project(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
 ) -> io::Result<Vec<DebUpgrade>> {
-    let held = if prebuilt::has_resolve_ref(&Deb, cfg) {
-        super::resolve::UpgradeCage::build(nix, layout, project, cfg)
-    } else {
-        None
-    };
-    let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
-    upgrade(nix, layout, project, cfg, cage.as_ref())
+    prebuilt::upgrade_project(&Deb, nix, layout, project, cfg)
 }
 
 /// How many declared `deb:` packages are withheld for being untrusted. See [`prebuilt::withheld`].

@@ -29,8 +29,6 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const APPIMAGE_LOCK: &str = "appimage-packages.lock";
-
 /// The AppImage's own bundled legacy tray/indicator/GConf shims (`usr/lib/libappindicator.so.1`,
 /// `libindicator.so.7`, `libgconf-2.so.4`) reference these old GTK2-era libraries. The main Electron
 /// binary does not need them and a hermetic cage has no system tray, so they are ignored rather than
@@ -48,7 +46,8 @@ const APPIMAGE_IGNORE_MISSING: &[&str] = &[
 /// or a `github:<owner>/<repo>`). Its `url` is the concrete `.AppImage` the pin resolved to — the
 /// locator itself for a direct URL, the selected release asset for a `github:` locator — so a warm
 /// launch builds it offline without re-querying GitHub. See [`prebuilt::Pin`].
-pub(crate) type AppImagePin = prebuilt::Pin;
+#[cfg(test)]
+type AppImagePin = prebuilt::Pin;
 
 /// The two shapes a declared `appimage:` locator can take, dispatched from its prefix.
 enum AppImageSource {
@@ -72,55 +71,38 @@ fn parse_source(locator: &str) -> AppImageSource {
 }
 
 /// The outcome of re-resolving one declared `appimage:` reference during `sbx upgrade`.
-pub(crate) enum AppImageUpgrade {
-    Pinned {
-        url: String,
-        hash: String,
-    },
-    Rolled {
-        url: String,
-        from: String,
-        to: String,
-    },
-    Unchanged {
-        url: String,
-        hash: String,
-    },
-    Pruned {
-        url: String,
-    },
-    Failed {
-        url: String,
-        error: String,
-    },
-}
+/// See [`prebuilt::Upgrade`].
+pub(crate) type AppImageUpgrade = prebuilt::Upgrade;
 
 /// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
 /// the same path for the tests that assert the on-disk format.
 #[cfg(test)]
 fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
-    prebuilt::lock_path(layout, project_id, APPIMAGE_LOCK)
+    prebuilt::lock_path(layout, project_id, &prebuilt::lock_file(&AppImage))
 }
 
 /// Read the per-project appimage lock. A three-column line is a `github:` pin, whose resolved asset
 /// URL differs from its key; see [`prebuilt::pins`] for the format.
-pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, AppImagePin> {
-    prebuilt::pins(layout, project_id, APPIMAGE_LOCK)
+#[cfg(test)]
+fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, AppImagePin> {
+    prebuilt::pins(layout, project_id, &prebuilt::lock_file(&AppImage))
 }
 
 /// The pinned content hashes for a project's `appimage:` packages, keyed by the declared locator so
 /// `sbx config` can look each up directly. See [`prebuilt::pinned_hashes`].
 pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
-    prebuilt::pinned_hashes(cwd, APPIMAGE_LOCK)
+    prebuilt::pinned_hashes(cwd, &prebuilt::lock_file(&AppImage))
 }
 
-/// Write the per-project appimage lock atomically. See [`prebuilt::write_pins`].
+/// Write the per-project appimage lock atomically, for the tests that assert the on-disk
+/// format. Production writes it through [`prebuilt::upgrade`].
+#[cfg(test)]
 fn write_pins(
     layout: &Layout,
     project_id: &str,
     lock: &BTreeMap<String, AppImagePin>,
 ) -> io::Result<()> {
-    prebuilt::write_pins(layout, project_id, APPIMAGE_LOCK, lock)
+    prebuilt::write_pins(layout, project_id, &prebuilt::lock_file(&AppImage), lock)
 }
 
 /// Resolve a declared `appimage:` locator to `(concrete .AppImage url, SRI content hash)`. A direct
@@ -363,118 +345,15 @@ pub(crate) fn provision_resolve_pinned(
     prebuilt::provision_resolve_pinned(&AppImage, &ctx(nix, layout, project, nixpkgs), name)
 }
 
-/// Re-resolve a project's declared `appimage:` references and rewrite the per-project lock — pinning
-/// new ones, rolling changed ones forward, and pruning entries no longer declared. Mirrors
-/// [`super::deb::upgrade`]: references collected generically across the baseline and each app,
-/// resolution best-effort per reference, lock rewritten once at the end. A locator form always
-/// re-resolves (a `latest`/`github:` source can move); an `appimage:resolve` first re-runs its
-/// command to re-derive the download URL and **skips the heavy `.AppImage` prefetch when that URL is
-/// unchanged**, so a no-op `sbx upgrade` does not re-download a large versioned asset. `cage` is the
-/// sandbox resolve commands run in; when it is `None` (the host cannot sandbox), a resolver reference
-/// cannot be rolled and is reported as failed rather than silently frozen.
-pub(crate) fn upgrade(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    cfg: &crate::config::Resolved,
-    cage: Option<&super::resolve::ResolveCage>,
-) -> io::Result<Vec<AppImageUpgrade>> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    let prebuilt::Declared {
-        trusted: declared,
-        all: universe,
-    } = prebuilt::declared(&AppImage, cfg);
-    let system = super::current_system();
-    let mut lock = pins(layout, project_id.as_str());
-    let mut outcomes = Vec::new();
-
-    // Prune entries whose locator is no longer declared (across ALL layers regardless of trust, so a
-    // withheld project's still-declared package keeps its pin rather than being silently unpinned).
-    let stale: Vec<String> = lock
-        .keys()
-        .filter(|k| !universe.contains(k.as_str()))
-        .cloned()
-        .collect();
-    for url in stale {
-        lock.remove(&url);
-        outcomes.push(AppImageUpgrade::Pruned { url });
-    }
-
-    for reference in &declared {
-        let key = reference.key();
-        let previous = lock.get(&key).cloned();
-        let resolved = match reference {
-            // A locator: always re-resolve (a `latest`/`github:` source can move). `fresh` re-queries
-            // GitHub past the fetch cache; the lock records the resolved asset URL, not the locator.
-            prebuilt::Ref::Locator(locator) => resolve_source(nix, layout, locator, &system, true),
-            // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
-            // reuse the pinned hash without prefetching the (large) `.AppImage` again.
-            prebuilt::Ref::Resolve { name, command } => match cage {
-                None => Err(io::Error::other(
-                    "cannot run the resolve command (no usable sandbox on this host)",
-                )),
-                Some(cage) => match super::resolve::resolve_url(
-                    cage,
-                    name,
-                    command,
-                    crate::config::is_valid_appimage_url,
-                    "`.AppImage`",
-                ) {
-                    Ok(url) => match &previous {
-                        Some(pin) if pin.url == url => Ok((url, pin.hash.clone())),
-                        _ => prebuilt::prefetch_hash(nix, layout, &url, true).map(|h| (url, h)),
-                    },
-                    Err(e) => Err(e),
-                },
-            },
-        };
-        match resolved {
-            Ok((url, hash)) => {
-                let outcome = match &previous {
-                    Some(pin) if pin.hash == hash => AppImageUpgrade::Unchanged {
-                        url: key.clone(),
-                        hash: hash.clone(),
-                    },
-                    Some(pin) => AppImageUpgrade::Rolled {
-                        url: key.clone(),
-                        from: pin.hash.clone(),
-                        to: hash.clone(),
-                    },
-                    None => AppImageUpgrade::Pinned {
-                        url: key.clone(),
-                        hash: hash.clone(),
-                    },
-                };
-                lock.insert(key, AppImagePin { hash, url });
-                outcomes.push(outcome);
-            }
-            Err(e) => outcomes.push(AppImageUpgrade::Failed {
-                url: key,
-                error: e.to_string(),
-            }),
-        }
-    }
-
-    write_pins(layout, project_id.as_str(), &lock)?;
-    Ok(outcomes)
-}
-
-/// `sbx upgrade appimage`: roll a project's declared `appimage:` packages forward. Builds the resolver
-/// sandbox (only when an `appimage:resolve` package is declared) and delegates to [`upgrade`]. A
-/// locator-only project keeps the cheap path (no base-userland build).
+/// `sbx upgrade appimage`: roll a project's declared `appimage:` packages forward. See
+/// [`prebuilt::upgrade_project`].
 pub(crate) fn upgrade_project(
     nix: &Path,
     layout: &Layout,
     project: &Path,
     cfg: &crate::config::Resolved,
 ) -> io::Result<Vec<AppImageUpgrade>> {
-    let held = if prebuilt::has_resolve_ref(&AppImage, cfg) {
-        super::resolve::UpgradeCage::build(nix, layout, project, cfg)
-    } else {
-        None
-    };
-    let cage = held.as_ref().map(super::resolve::UpgradeCage::as_cage);
-    upgrade(nix, layout, project, cfg, cage.as_ref())
+    prebuilt::upgrade_project(&AppImage, nix, layout, project, cfg)
 }
 
 /// How many declared `appimage:` packages are withheld for being untrusted. See
