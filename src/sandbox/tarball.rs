@@ -32,7 +32,7 @@
 use super::prebuilt::{self, ELECTRON_LIBS};
 use super::resolve::{resolve_url, ResolveCage};
 use crate::config::is_valid_tarball_url;
-use crate::store::{self, Layout};
+use crate::store::Layout;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -114,100 +114,6 @@ pub(crate) fn resolve_source(
     Ok((url, hash))
 }
 
-/// The per-project lock key of a `tarball:resolve` package: prefixed by `resolve:` so its key space
-/// is disjoint from a direct package's `.tar.gz` URL (which never contains a bare `resolve:` prefix),
-/// and keyed by the package name (unique per resolved config) so a warm launch and `sbx gc` can find
-/// the pin without re-running the resolver command.
-fn resolve_key(name: &str) -> String {
-    format!("resolve:{name}")
-}
-
-/// Build one already-resolved `tarball:` package (direct or resolver form) into sbx's store and
-/// return `(bin dir, store root)`. Shared by [`provision`], [`provision_resolve`], and the gc keep
-/// path, so the derivation + per-package gcroot are identical across forms.
-fn build_pinned(
-    nix: &Path,
-    layout: &Layout,
-    project_id: &str,
-    nixpkgs: &str,
-    name: &str,
-    url: &str,
-    hash: &str,
-) -> io::Result<(PathBuf, PathBuf)> {
-    let system = super::current_system();
-    let expr = derivation_expr(nixpkgs, &system, name, url, hash);
-    let gcroot = layout
-        .data_dir()
-        .join("gcroots")
-        .join("projects")
-        .join(project_id)
-        .join(format!("tarball-{name}"));
-    let logical = store::provision_expr(nix, layout, &gcroot, &expr, name, "bin")?;
-    Ok((logical.join("bin"), logical))
-}
-
-/// Provision one `tarball:resolve` package host-side — the auto-upgrade twin of [`provision`]. The
-/// per-project lock is keyed by `resolve:<name>`; on a **warm** launch the pinned `(url, hash)` is
-/// reused offline and the resolve command is **not run** (the offline invariant), and only a first
-/// launch or `sbx upgrade` runs it. Builds the same derivation and per-package gcroot as the direct
-/// form, so the two forms provision identically once resolved.
-pub(crate) fn provision_resolve(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-    command: &[String],
-    cage: &ResolveCage,
-) -> io::Result<(PathBuf, PathBuf)> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    let key = resolve_key(name);
-    let mut lock = pins(layout, project_id.as_str());
-    let (url, hash) = match lock.get(&key) {
-        Some(pin) => (pin.url.clone(), pin.hash.clone()),
-        None => {
-            let u = resolve_url(cage, name, command, is_valid_tarball_url, "`.tar.gz`")?;
-            let h = prebuilt::prefetch_hash(nix, layout, &u, false)?;
-            lock.insert(
-                key,
-                TarballPin {
-                    hash: h.clone(),
-                    url: u.clone(),
-                },
-            );
-            write_pins(layout, project_id.as_str(), &lock)?;
-            (u, h)
-        }
-    };
-    build_pinned(nix, layout, project_id.as_str(), nixpkgs, name, &url, &hash)
-}
-
-/// Build a `tarball:resolve` package from its EXISTING pin only — for the gc keep path, which must
-/// never run the resolve command or touch the network. Returns `None` when the package is not yet
-/// pinned (nothing has been built to keep), so gc skips it rather than resolving.
-pub(crate) fn provision_resolve_pinned(
-    nix: &Path,
-    layout: &Layout,
-    project: &Path,
-    nixpkgs: &str,
-    name: &str,
-) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    let Some(pin) = pins(layout, project_id.as_str()).remove(&resolve_key(name)) else {
-        return Ok(None);
-    };
-    build_pinned(
-        nix,
-        layout,
-        project_id.as_str(),
-        nixpkgs,
-        name,
-        &pin.url,
-        &pin.hash,
-    )
-    .map(Some)
-}
-
 /// The generated nix expression building one `tarball:` package: fetch the pinned `.tar.gz`, extract
 /// it, and autoPatchelf it against [`ELECTRON_LIBS`] from the pinned `nixpkgs`. The install phase is
 /// generic for an Electron layout — [`prebuilt::launcher_wrap`] locates the app directory by its
@@ -266,10 +172,63 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
         .replace("@NAME@", name)
 }
 
-/// Provision one `tarball:` package host-side: resolve the URL to a hash (pinning it on first use),
-/// build the generated derivation into sbx's store, and return `(bin directory, store root)` — the
-/// bin dir to prepend to the sandbox `PATH`, the root whose closure the project store seeds. Mirrors
-/// [`super::deb::provision`]'s per-package gcroot, name-keyed under the project.
+/// The `tarball:` backend — the two decisions [`prebuilt::Kind`] leaves to it are its locator form (a
+/// direct URL, always its own download URL) and a plain `tar -xz` unpack. It is the plainest of the
+/// three, so it takes no `system`: a `.tar.gz` locator names one artefact, with no asset to select.
+pub(crate) struct Tarball;
+
+impl prebuilt::Kind for Tarball {
+    fn name(&self) -> &'static str {
+        "tarball"
+    }
+
+    fn artefact(&self) -> &'static str {
+        "`.tar.gz`"
+    }
+
+    fn url_validator(&self) -> fn(&str) -> bool {
+        is_valid_tarball_url
+    }
+
+    fn resolve_source(
+        &self,
+        nix: &Path,
+        layout: &Layout,
+        locator: &str,
+        _system: &str,
+        fresh: bool,
+    ) -> io::Result<(String, String)> {
+        resolve_source(nix, layout, locator, fresh)
+    }
+
+    fn derivation_expr(
+        &self,
+        nixpkgs: &str,
+        system: &str,
+        name: &str,
+        url: &str,
+        hash: &str,
+    ) -> String {
+        derivation_expr(nixpkgs, system, name, url, hash)
+    }
+}
+
+/// The context a `tarball:` provisioning call runs in. See [`prebuilt::Ctx`].
+fn ctx<'a>(
+    nix: &'a Path,
+    layout: &'a Layout,
+    project: &'a Path,
+    nixpkgs: &'a str,
+) -> prebuilt::Ctx<'a> {
+    prebuilt::Ctx {
+        nix,
+        layout,
+        project,
+        nixpkgs,
+    }
+}
+
+/// Provision one `tarball:` package host-side. See [`prebuilt::provision`].
 pub(crate) fn provision(
     nix: &Path,
     layout: &Layout,
@@ -278,33 +237,38 @@ pub(crate) fn provision(
     name: &str,
     locator: &str,
 ) -> io::Result<(PathBuf, PathBuf)> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    let system = super::current_system();
-    let mut lock = pins(layout, project_id.as_str());
-    let (url, hash) = match lock.get(locator) {
-        Some(pin) => (pin.url.clone(), pin.hash.clone()),
-        None => {
-            let (u, h) = resolve_source(nix, layout, locator, false)?;
-            lock.insert(
-                locator.to_string(),
-                TarballPin {
-                    hash: h.clone(),
-                    url: u.clone(),
-                },
-            );
-            write_pins(layout, project_id.as_str(), &lock)?;
-            (u, h)
-        }
-    };
-    let expr = derivation_expr(nixpkgs, &system, name, &url, &hash);
-    let gcroot = layout
-        .data_dir()
-        .join("gcroots")
-        .join("projects")
-        .join(project_id.as_str())
-        .join(format!("tarball-{name}"));
-    let logical = store::provision_expr(nix, layout, &gcroot, &expr, name, "bin")?;
-    Ok((logical.join("bin"), logical))
+    prebuilt::provision(&Tarball, &ctx(nix, layout, project, nixpkgs), name, locator)
+}
+
+/// Provision one `tarball:resolve` package host-side. See [`prebuilt::provision_resolve`].
+pub(crate) fn provision_resolve(
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    nixpkgs: &str,
+    name: &str,
+    command: &[String],
+    cage: &ResolveCage,
+) -> io::Result<(PathBuf, PathBuf)> {
+    prebuilt::provision_resolve(
+        &Tarball,
+        &ctx(nix, layout, project, nixpkgs),
+        name,
+        command,
+        cage,
+    )
+}
+
+/// Build a `tarball:resolve` package from its existing pin only, for the gc keep path. See
+/// [`prebuilt::provision_resolve_pinned`].
+pub(crate) fn provision_resolve_pinned(
+    nix: &Path,
+    layout: &Layout,
+    project: &Path,
+    nixpkgs: &str,
+    name: &str,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    prebuilt::provision_resolve_pinned(&Tarball, &ctx(nix, layout, project, nixpkgs), name)
 }
 
 /// A declared `tarball:` reference to roll forward, in either form. The lock is keyed by [`Self::key`]
@@ -322,7 +286,7 @@ impl TarballRef {
     fn key(&self) -> String {
         match self {
             TarballRef::Direct(url) => url.clone(),
-            TarballRef::Resolve { name, .. } => resolve_key(name),
+            TarballRef::Resolve { name, .. } => prebuilt::resolve_key(name),
         }
     }
 }
@@ -475,7 +439,7 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
             }
         }
         for (name, command) in super::packages::tarball_resolve_packages(pkgs) {
-            if seen.insert(resolve_key(&name)) {
+            if seen.insert(prebuilt::resolve_key(&name)) {
                 trusted.push(TarballRef::Resolve { name, command });
             }
         }
@@ -485,7 +449,7 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
                     all.insert(url.clone());
                 }
                 crate::config::Backend::TarballResolve { .. } => {
-                    all.insert(resolve_key(&p.name));
+                    all.insert(prebuilt::resolve_key(&p.name));
                 }
                 _ => {}
             }
@@ -601,7 +565,7 @@ mod tests {
         let id = "projr";
         // the lock key is `resolve:<name>`; the resolved url is the concrete versioned tarball, so
         // key != url and the pin needs the third column.
-        let key = resolve_key("demo-app");
+        let key = prebuilt::resolve_key("demo-app");
         let concrete = "https://cdn.example.com/app/2.1.1-6123990880747520/linux-x64/App.tar.gz";
         let mut lock = BTreeMap::new();
         lock.insert(
@@ -768,7 +732,7 @@ mod tests {
             keys,
             vec![
                 "https://e/a.tar.gz".to_string(),
-                resolve_key("res"),
+                prebuilt::resolve_key("res"),
                 "https://e/b.tar.gz".to_string(),
             ]
         );
@@ -795,7 +759,7 @@ mod tests {
             universe.contains("https://e/evil.tar.gz"),
             "a withheld-but-declared url must survive pruning"
         );
-        assert!(universe.contains(&resolve_key("badres")));
+        assert!(universe.contains(&prebuilt::resolve_key("badres")));
         assert!(universe.contains("https://e/c.tar.gz"));
         // `withheld` counts every untrusted tarball package (both forms), across baseline and apps.
         assert_eq!(

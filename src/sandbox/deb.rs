@@ -28,7 +28,7 @@
 //! form) and rewrites the lock.
 
 use super::prebuilt::{self, ELECTRON_LIBS};
-use crate::store::{self, Layout};
+use crate::store::Layout;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -363,10 +363,62 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
         .replace("@NAME@", name)
 }
 
-/// Provision one `deb:` package host-side: resolve the URL to a hash (pinning it on first use),
-/// build the generated derivation into sbx's store, and return `(bin directory, store root)` — the
-/// bin dir to prepend to the sandbox `PATH`, the root whose closure the project store seeds. Mirrors
-/// [`super::packages::provision`]'s per-package gcroot, name-keyed under the project.
+/// The `deb:` backend — the two decisions [`prebuilt::Kind`] leaves to it are its locator forms (a
+/// direct URL, `github:`, `apt:`) and unpacking the `.deb`'s data tarball.
+pub(crate) struct Deb;
+
+impl prebuilt::Kind for Deb {
+    fn name(&self) -> &'static str {
+        "deb"
+    }
+
+    fn artefact(&self) -> &'static str {
+        "`.deb`"
+    }
+
+    fn url_validator(&self) -> fn(&str) -> bool {
+        crate::config::is_valid_deb_url
+    }
+
+    fn resolve_source(
+        &self,
+        nix: &Path,
+        layout: &Layout,
+        locator: &str,
+        system: &str,
+        fresh: bool,
+    ) -> io::Result<(String, String)> {
+        resolve_source(nix, layout, locator, system, fresh)
+    }
+
+    fn derivation_expr(
+        &self,
+        nixpkgs: &str,
+        system: &str,
+        name: &str,
+        url: &str,
+        hash: &str,
+    ) -> String {
+        derivation_expr(nixpkgs, system, name, url, hash)
+    }
+}
+
+/// The context a `deb:` provisioning call runs in. See [`prebuilt::Ctx`].
+fn ctx<'a>(
+    nix: &'a Path,
+    layout: &'a Layout,
+    project: &'a Path,
+    nixpkgs: &'a str,
+) -> prebuilt::Ctx<'a> {
+    prebuilt::Ctx {
+        nix,
+        layout,
+        project,
+        nixpkgs,
+    }
+}
+
+/// Provision one `deb:` package host-side. See [`prebuilt::provision`].
 pub(crate) fn provision(
     nix: &Path,
     layout: &Layout,
@@ -375,63 +427,10 @@ pub(crate) fn provision(
     name: &str,
     locator: &str,
 ) -> io::Result<(PathBuf, PathBuf)> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    let system = super::current_system();
-    let mut lock = pins(layout, project_id.as_str());
-    let (url, hash) = match lock.get(locator) {
-        Some(pin) => (pin.url.clone(), pin.hash.clone()),
-        None => {
-            let (u, h) = resolve_source(nix, layout, locator, &system, false)?;
-            lock.insert(
-                locator.to_string(),
-                DebPin {
-                    hash: h.clone(),
-                    url: u.clone(),
-                },
-            );
-            write_pins(layout, project_id.as_str(), &lock)?;
-            (u, h)
-        }
-    };
-    build_pinned(nix, layout, project_id.as_str(), nixpkgs, name, &url, &hash)
+    prebuilt::provision(&Deb, &ctx(nix, layout, project, nixpkgs), name, locator)
 }
 
-/// The lock key for a `deb:resolve` package — `resolve:<name>`, keyed by the package name (unique per
-/// resolved config) rather than a URL, so a warm launch and `sbx gc`/`sbx upgrade` find the pin
-/// without re-running the resolver command.
-fn resolve_key(name: &str) -> String {
-    format!("resolve:{name}")
-}
-
-/// Build one already-resolved `deb:` package (direct or resolver form) into sbx's store and return
-/// `(bin dir, store root)`. Shared by [`provision`], [`provision_resolve`], and the gc keep path, so
-/// the derivation + per-package gcroot (`deb-<name>`) are identical across forms.
-fn build_pinned(
-    nix: &Path,
-    layout: &Layout,
-    project_id: &str,
-    nixpkgs: &str,
-    name: &str,
-    url: &str,
-    hash: &str,
-) -> io::Result<(PathBuf, PathBuf)> {
-    let system = super::current_system();
-    let expr = derivation_expr(nixpkgs, &system, name, url, hash);
-    let gcroot = layout
-        .data_dir()
-        .join("gcroots")
-        .join("projects")
-        .join(project_id)
-        .join(format!("deb-{name}"));
-    let logical = store::provision_expr(nix, layout, &gcroot, &expr, name, "bin")?;
-    Ok((logical.join("bin"), logical))
-}
-
-/// Provision one `deb:resolve` package host-side — the auto-upgrade twin of [`provision`]. The
-/// per-project lock is keyed by `resolve:<name>`; on a **warm** launch the pinned `(url, hash)` is
-/// reused offline and the resolve command is **not run** (the offline invariant), and only a first
-/// launch or `sbx upgrade` runs it. Builds the same derivation and per-package gcroot as the direct
-/// form, so the two forms provision identically once resolved.
+/// Provision one `deb:resolve` package host-side. See [`prebuilt::provision_resolve`].
 pub(crate) fn provision_resolve(
     nix: &Path,
     layout: &Layout,
@@ -441,37 +440,17 @@ pub(crate) fn provision_resolve(
     command: &[String],
     cage: &super::resolve::ResolveCage,
 ) -> io::Result<(PathBuf, PathBuf)> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    let key = resolve_key(name);
-    let mut lock = pins(layout, project_id.as_str());
-    let (url, hash) = match lock.get(&key) {
-        Some(pin) => (pin.url.clone(), pin.hash.clone()),
-        None => {
-            let u = super::resolve::resolve_url(
-                cage,
-                name,
-                command,
-                crate::config::is_valid_deb_url,
-                "`.deb`",
-            )?;
-            let h = prebuilt::prefetch_hash(nix, layout, &u, false)?;
-            lock.insert(
-                key,
-                DebPin {
-                    hash: h.clone(),
-                    url: u.clone(),
-                },
-            );
-            write_pins(layout, project_id.as_str(), &lock)?;
-            (u, h)
-        }
-    };
-    build_pinned(nix, layout, project_id.as_str(), nixpkgs, name, &url, &hash)
+    prebuilt::provision_resolve(
+        &Deb,
+        &ctx(nix, layout, project, nixpkgs),
+        name,
+        command,
+        cage,
+    )
 }
 
-/// Build a `deb:resolve` package from its EXISTING pin only — for the gc keep path, which must never
-/// run the resolve command or touch the network. Returns `None` when the package is not yet pinned
-/// (nothing has been built to keep), so gc skips it rather than resolving.
+/// Build a `deb:resolve` package from its existing pin only, for the gc keep path. See
+/// [`prebuilt::provision_resolve_pinned`].
 pub(crate) fn provision_resolve_pinned(
     nix: &Path,
     layout: &Layout,
@@ -479,20 +458,7 @@ pub(crate) fn provision_resolve_pinned(
     nixpkgs: &str,
     name: &str,
 ) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    let project_id = super::binds::project_runtime_id(project)?;
-    let Some(pin) = pins(layout, project_id.as_str()).remove(&resolve_key(name)) else {
-        return Ok(None);
-    };
-    build_pinned(
-        nix,
-        layout,
-        project_id.as_str(),
-        nixpkgs,
-        name,
-        &pin.url,
-        &pin.hash,
-    )
-    .map(Some)
+    prebuilt::provision_resolve_pinned(&Deb, &ctx(nix, layout, project, nixpkgs), name)
 }
 
 /// A declared `deb:` reference to roll forward, in either form. The lock is keyed by [`Self::key`] —
@@ -512,7 +478,7 @@ impl DebRef {
     fn key(&self) -> String {
         match self {
             DebRef::Locator(locator) => locator.clone(),
-            DebRef::Resolve { name, .. } => resolve_key(name),
+            DebRef::Resolve { name, .. } => prebuilt::resolve_key(name),
         }
     }
 }
@@ -672,7 +638,7 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
             }
         }
         for (name, command) in super::packages::deb_resolve_packages(pkgs) {
-            if seen.insert(resolve_key(&name)) {
+            if seen.insert(prebuilt::resolve_key(&name)) {
                 trusted.push(DebRef::Resolve { name, command });
             }
         }
@@ -682,7 +648,7 @@ fn declared(cfg: &crate::config::Resolved) -> Declared {
                     all.insert(url.clone());
                 }
                 crate::config::Backend::DebResolve { .. } => {
-                    all.insert(resolve_key(&p.name));
+                    all.insert(prebuilt::resolve_key(&p.name));
                 }
                 _ => {}
             }
@@ -722,6 +688,7 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store;
     use crate::testutil::TmpDir;
 
     const HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";

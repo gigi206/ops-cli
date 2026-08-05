@@ -367,8 +367,196 @@ pub(crate) fn arch_label(system: &str) -> &'static str {
     }
 }
 
+/// One prebuilt host-side package backend: `deb:`, `appimage:` or `tarball:`. The three share their
+/// whole lifecycle — pin the source on first use, build offline from that pin ever after, one gcroot
+/// per package — and differ only in where the artefact comes from and how the generated derivation
+/// unpacks it. Implementing this on a unit struct per backend is what lets that lifecycle be written
+/// once below rather than three times, so the three cannot silently drift apart.
+pub(crate) trait Kind {
+    /// `deb` / `appimage` / `tarball`. **On-disk state, not a label**: it spells this backend's
+    /// per-project lock (`<name>-packages.lock`) and every package's gcroot (`<name>-<package>`), so
+    /// renaming it strands every existing pin and every existing gcroot. [`super::packages`] and
+    /// [`super::inspect`] spell the same two strings out independently, which is why a test pins them.
+    fn name(&self) -> &'static str;
+
+    /// How this backend's artefact is named when a resolve command's output is refused — `` `.deb` ``,
+    /// `` `.AppImage` ``, `` `.tar.gz` ``. See [`super::resolve::resolve_url`].
+    fn artefact(&self) -> &'static str;
+
+    /// The charset barrier a resolve command's URL must pass before sbx fetches it or interpolates it
+    /// into a generated derivation, so an arbitrary command cannot point sbx at a non-`https` or
+    /// injecting source.
+    fn url_validator(&self) -> fn(&str) -> bool;
+
+    /// Resolve a declared locator to `(concrete artefact url, SRI content hash)`. A direct URL
+    /// resolves to itself; a `github:`/`apt:` locator queries its source and re-validates what comes
+    /// back. `fresh` bypasses the fetch cache (set on `sbx upgrade`, so a new release is seen).
+    /// `system` selects the release asset for this host — a backend with a single asset form ignores
+    /// it.
+    fn resolve_source(
+        &self,
+        nix: &Path,
+        layout: &Layout,
+        locator: &str,
+        system: &str,
+        fresh: bool,
+    ) -> io::Result<(String, String)>;
+
+    /// The generated nix expression that fetches the pinned artefact, unpacks it this backend's own
+    /// way (a `dpkg-deb` data tarball, an AppImage squashfs, a plain `.tar.gz`) and autoPatchelfs the
+    /// result — the one step that is genuinely a backend's own.
+    fn derivation_expr(
+        &self,
+        nixpkgs: &str,
+        system: &str,
+        name: &str,
+        url: &str,
+        hash: &str,
+    ) -> String;
+}
+
+/// The host-side context every prebuilt package build shares: sbx's nix engine and store layout, the
+/// project whose lock and gcroots are keyed by it, and the pinned `nixpkgs` the generated derivation
+/// evaluates against. They are always all four or none, so they travel as one value.
+pub(crate) struct Ctx<'a> {
+    pub(crate) nix: &'a Path,
+    pub(crate) layout: &'a Layout,
+    pub(crate) project: &'a Path,
+    pub(crate) nixpkgs: &'a str,
+}
+
+/// One backend's per-project lock file name, derived from [`Kind::name`] — see [`lock_path`].
+pub(crate) fn lock_file(kind: &dyn Kind) -> String {
+    format!("{}-packages.lock", kind.name())
+}
+
+/// The per-project lock key of a `<backend>:resolve` package: prefixed by `resolve:` so its key space
+/// is disjoint from a direct package's download URL (which never carries a bare `resolve:` prefix),
+/// and keyed by the package name (unique per resolved config) rather than a URL, so a warm launch and
+/// `sbx gc`/`sbx upgrade` find the pin without re-running the resolve command.
+pub(crate) fn resolve_key(name: &str) -> String {
+    format!("resolve:{name}")
+}
+
+/// Build one already-resolved package (either form) into sbx's store and return `(bin dir, store
+/// root)`. Every provisioning entry point below funnels through here, so the generated derivation and
+/// the per-package gcroot (`<backend>-<name>`) are identical whichever form pinned it.
+fn build_pinned(
+    kind: &dyn Kind,
+    ctx: &Ctx,
+    project_id: &str,
+    name: &str,
+    url: &str,
+    hash: &str,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let system = super::current_system();
+    let expr = kind.derivation_expr(ctx.nixpkgs, &system, name, url, hash);
+    let gcroot = ctx
+        .layout
+        .data_dir()
+        .join("gcroots")
+        .join("projects")
+        .join(project_id)
+        .join(format!("{}-{name}", kind.name()));
+    let logical = store::provision_expr(ctx.nix, ctx.layout, &gcroot, &expr, name, "bin")?;
+    Ok((logical.join("bin"), logical))
+}
+
+/// Provision one declared package host-side: resolve its locator to a hash (pinning it on first use),
+/// build the generated derivation into sbx's store, and return `(bin directory, store root)` — the
+/// bin dir to prepend to the sandbox `PATH`, the root whose closure the project store seeds. Mirrors
+/// [`super::packages::provision`]'s per-package gcroot, name-keyed under the project.
+pub(crate) fn provision(
+    kind: &dyn Kind,
+    ctx: &Ctx,
+    name: &str,
+    locator: &str,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let project_id = super::binds::project_runtime_id(ctx.project)?;
+    let lock_file = lock_file(kind);
+    let mut lock = pins(ctx.layout, project_id.as_str(), &lock_file);
+    let (url, hash) = match lock.get(locator) {
+        Some(pin) => (pin.url.clone(), pin.hash.clone()),
+        None => {
+            let system = super::current_system();
+            let (u, h) = kind.resolve_source(ctx.nix, ctx.layout, locator, &system, false)?;
+            lock.insert(
+                locator.to_string(),
+                Pin {
+                    hash: h.clone(),
+                    url: u.clone(),
+                },
+            );
+            write_pins(ctx.layout, project_id.as_str(), &lock_file, &lock)?;
+            (u, h)
+        }
+    };
+    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash)
+}
+
+/// Provision one `<backend>:resolve` package host-side — the auto-upgrade twin of [`provision`]. The
+/// per-project lock is keyed by [`resolve_key`]; on a **warm** launch the pinned `(url, hash)` is
+/// reused offline and the resolve command is **not run** (the offline invariant), so only a first
+/// launch or `sbx upgrade` runs it. Builds the same derivation and per-package gcroot as the direct
+/// form, so the two forms provision identically once resolved.
+pub(crate) fn provision_resolve(
+    kind: &dyn Kind,
+    ctx: &Ctx,
+    name: &str,
+    command: &[String],
+    cage: &super::resolve::ResolveCage,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let project_id = super::binds::project_runtime_id(ctx.project)?;
+    let lock_file = lock_file(kind);
+    let key = resolve_key(name);
+    let mut lock = pins(ctx.layout, project_id.as_str(), &lock_file);
+    let (url, hash) = match lock.get(&key) {
+        Some(pin) => (pin.url.clone(), pin.hash.clone()),
+        None => {
+            let u = super::resolve::resolve_url(
+                cage,
+                name,
+                command,
+                kind.url_validator(),
+                kind.artefact(),
+            )?;
+            let h = prefetch_hash(ctx.nix, ctx.layout, &u, false)?;
+            lock.insert(
+                key,
+                Pin {
+                    hash: h.clone(),
+                    url: u.clone(),
+                },
+            );
+            write_pins(ctx.layout, project_id.as_str(), &lock_file, &lock)?;
+            (u, h)
+        }
+    };
+    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash)
+}
+
+/// Build a `<backend>:resolve` package from its EXISTING pin only — for the gc keep path, which must
+/// never run the resolve command or touch the network. Returns `None` when the package is not yet
+/// pinned (nothing has been built to keep), so gc skips it rather than resolving.
+pub(crate) fn provision_resolve_pinned(
+    kind: &dyn Kind,
+    ctx: &Ctx,
+    name: &str,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    let project_id = super::binds::project_runtime_id(ctx.project)?;
+    let Some(pin) =
+        pins(ctx.layout, project_id.as_str(), &lock_file(kind)).remove(&resolve_key(name))
+    else {
+        return Ok(None);
+    };
+    build_pinned(kind, ctx, project_id.as_str(), name, &pin.url, &pin.hash).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::appimage::AppImage;
+    use super::super::deb::Deb;
+    use super::super::tarball::Tarball;
     use super::*;
 
     #[test]
@@ -480,6 +668,23 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         // The wrapper is named after the `[packages]` key, which is the derivation's mainProgram —
         // so a profile's `cmd` is that key, whatever the vendor called the file inside the archive.
         assert!(wrap.contains("$out/bin/demo-cli"));
+    }
+
+    #[test]
+    fn the_derived_lock_and_gcroot_names_are_the_ones_already_on_disk() {
+        // `Kind::name` is on-disk state: it spells the per-project lock a project's existing pins
+        // live in, and the prefix of every per-package gcroot. Nothing else pins those strings from
+        // this side -- every lock test round-trips through `pins`/`write_pins`, which both read the
+        // derived name, so renaming `name()` would strand a user's pins and gcroots with the whole
+        // suite still green. `super::packages` (the gc keep set) and `super::inspect` (the config
+        // view) write the same strings out as literals, so this is where the two sides are tied.
+        assert_eq!(lock_file(&Deb), "deb-packages.lock");
+        assert_eq!(lock_file(&AppImage), "appimage-packages.lock");
+        assert_eq!(lock_file(&Tarball), "tarball-packages.lock");
+        assert_eq!(
+            [Deb.name(), AppImage.name(), Tarball.name()],
+            ["deb", "appimage", "tarball"]
+        );
     }
 
     #[test]
