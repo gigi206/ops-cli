@@ -7162,6 +7162,111 @@ fn a_trusted_field_lands_in_its_own_slot_and_moves_no_other() {
     }
 }
 
+/// The app layer's fields land in their own slots too — a second, independent walk over the same
+/// ten fields, wired against `Option` slots rather than plain ones.
+///
+/// Half of the gated sites are here, and they are the half where the wiring is least mechanical (an
+/// app's scalar is an `Option`, so its layering wraps). Nothing else looks at an app's slot/origin
+/// pairing: the refusal test sees a gate opened or closed, never a value put in the wrong place.
+#[test]
+fn a_trusted_apps_field_lands_in_its_own_slot_and_moves_no_other() {
+    fn claimed(app: &ResolvedApp) -> Vec<&'static str> {
+        [
+            ("network", app.network_origin),
+            ("proc", app.proc_origin),
+            ("notify", app.notify_origin),
+            ("gui", app.gui_origin),
+            ("gpu", app.gpu_origin),
+            ("audio", app.audio_origin),
+            ("dbus", app.dbus_origin),
+            ("forward", app.forward_origin),
+            ("devices", app.devices_origin),
+            ("ssh_agent", app.ssh_agent_origin),
+        ]
+        .into_iter()
+        .filter(|(_, o)| *o == Provenance::Project)
+        .map(|(n, _)| n)
+        .collect()
+    }
+
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, &str, Box<dyn Fn(&ResolvedApp) -> bool>)> = vec![
+        (
+            "network",
+            "network = \"shared\"",
+            Box::new(|a: &ResolvedApp| matches!(a.network, Some(NetworkPolicy::Shared))),
+        ),
+        (
+            "proc",
+            "proc = \"enforce\"",
+            Box::new(|a: &ResolvedApp| {
+                a.proc.as_ref().map(|p| p.mode) == Some(crate::proc_policy::ProcMode::Enforce)
+            }),
+        ),
+        (
+            "notify",
+            "notify = \"off\"",
+            Box::new(|a: &ResolvedApp| {
+                a.notify
+                    .as_ref()
+                    .map(|n| n.mode_for(crate::notify::NotifyEvent::Network))
+                    == Some(crate::notify::NotifyMode::Off)
+            }),
+        ),
+        (
+            "gui",
+            "gui = \"wayland\"",
+            Box::new(|a: &ResolvedApp| a.gui.map(|g| g.renders()) == Some(true)),
+        ),
+        (
+            "gpu",
+            "gpu = true",
+            Box::new(|a: &ResolvedApp| a.gpu == Some(true)),
+        ),
+        (
+            "audio",
+            "audio = true",
+            Box::new(|a: &ResolvedApp| a.audio == Some(true)),
+        ),
+        (
+            "dbus",
+            "dbus = true",
+            Box::new(|a: &ResolvedApp| a.dbus == Some(true)),
+        ),
+        (
+            "forward",
+            "forward = [8080]",
+            Box::new(|a: &ResolvedApp| a.forward == vec![8080]),
+        ),
+        (
+            "devices",
+            "[app.mine.devices]\nallow = [\"/dev/kvm\"]",
+            Box::new(|a: &ResolvedApp| a.devices == vec![PathBuf::from("/dev/kvm")]),
+        ),
+        (
+            "ssh_agent",
+            "[app.mine.ssh_agent]\nallow = [\"deploy@example\"]",
+            Box::new(|a: &ResolvedApp| a.ssh_agent == vec!["deploy@example".to_string()]),
+        ),
+    ];
+
+    for (field, decl, landed) in cases {
+        let src = format!("[app.mine]\ncmd = \"demo-app\"\n{decl}");
+        let project: RawConfig = toml::from_str(&src).unwrap();
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+        let app = &r.apps["mine"];
+        assert!(
+            landed(app),
+            "an app's `{field}` was declared by a trusted project and did not arrive in its own slot"
+        );
+        assert_eq!(
+            claimed(app),
+            vec![field],
+            "declaring an app's `{field}` alone must stamp `{field}` and nothing else"
+        );
+    }
+}
+
 /// A real resolution of an untrusted project: every warning about a dropped security field is
 /// recognised, so the launch announces all of them and not merely the ones phrased one way.
 #[test]
