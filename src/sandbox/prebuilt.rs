@@ -930,6 +930,49 @@ mod tests {
     }
 
     #[test]
+    fn a_resolver_with_no_sandbox_is_reported_failed_rather_than_left_standing() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let kind = Recording::default();
+        let cfg = resolved(
+            vec![crate::config::Package {
+                name: "demo-app".to_string(),
+                backend: crate::config::Backend::TarballResolve {
+                    command: vec!["sh".into(), "-c".into(), "echo https://e/a.tar.gz".into()],
+                },
+                state: crate::trust::TrustState::Trusted,
+            }],
+            vec![],
+        );
+
+        let outcomes = upgrade(
+            &kind,
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+        )
+        .expect("the roll still rewrites its lock");
+
+        // A host that cannot sandbox cannot re-run a resolve command. Reporting that as a failure is
+        // the fail-closed reading; skipping the reference instead would leave the summary looking
+        // rolled while the package stood still at whatever it was last pinned to.
+        assert!(
+            matches!(outcomes.as_slice(), [Upgrade::Failed { url, .. }]
+                     if url == &resolve_key("demo-app")),
+            "a resolver must be reported, not silently skipped: got {} outcome(s)",
+            outcomes.len()
+        );
+        assert_eq!(
+            kind.fresh.get(),
+            None,
+            "a resolver never reaches the locator resolver"
+        );
+    }
+
+    #[test]
     fn is_sri_accepts_prefetch_output_and_rejects_junk() {
         assert!(is_sri(
             "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w="

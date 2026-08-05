@@ -396,7 +396,17 @@ impl prebuilt::Kind for Deb {
         match &package.backend {
             crate::config::Backend::Deb(url) => Some(url.clone()),
             crate::config::Backend::DebResolve { .. } => Some(prebuilt::resolve_key(&package.name)),
-            _ => None,
+            // Spelled out rather than `_`: a new backend variant must fail to compile here. Falling
+            // through to `None` would leave its packages out of the prune universe, and `upgrade`
+            // would drop a still-declared pin without a word.
+            crate::config::Backend::Nix(_)
+            | crate::config::Backend::Mise(_)
+            | crate::config::Backend::Flake(_)
+            | crate::config::Backend::FlakeInline { .. }
+            | crate::config::Backend::AppImage(_)
+            | crate::config::Backend::Tarball(_)
+            | crate::config::Backend::AppImageResolve { .. }
+            | crate::config::Backend::TarballResolve { .. } => None,
         }
     }
 }

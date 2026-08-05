@@ -277,7 +277,17 @@ impl prebuilt::Kind for AppImage {
             crate::config::Backend::AppImageResolve { .. } => {
                 Some(prebuilt::resolve_key(&package.name))
             }
-            _ => None,
+            // Spelled out rather than `_`: a new backend variant must fail to compile here. Falling
+            // through to `None` would leave its packages out of the prune universe, and `upgrade`
+            // would drop a still-declared pin without a word.
+            crate::config::Backend::Nix(_)
+            | crate::config::Backend::Mise(_)
+            | crate::config::Backend::Flake(_)
+            | crate::config::Backend::FlakeInline { .. }
+            | crate::config::Backend::Deb(_)
+            | crate::config::Backend::Tarball(_)
+            | crate::config::Backend::DebResolve { .. }
+            | crate::config::Backend::TarballResolve { .. } => None,
         }
     }
 }
