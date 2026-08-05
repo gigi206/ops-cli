@@ -44,15 +44,11 @@ const APPIMAGE_IGNORE_MISSING: &[&str] = &[
     "libdbus-glib-1.so.2",
 ];
 
-/// A locked `appimage:` package, keyed in the lock by its declared *locator* (the `.AppImage` URL, or
-/// a `github:<owner>/<repo>`). `url` is the concrete `.AppImage` the pin resolved to (== the locator
-/// for a direct URL, the selected release asset for a `github:` locator), and `hash` its SRI content
-/// hash — so a warm launch fetches and builds the pinned asset offline without re-querying GitHub.
-#[derive(Clone)]
-pub(crate) struct AppImagePin {
-    pub(crate) hash: String,
-    pub(crate) url: String,
-}
+/// A locked `appimage:` package, keyed in the lock by its declared *locator* (the `.AppImage` URL,
+/// or a `github:<owner>/<repo>`). Its `url` is the concrete `.AppImage` the pin resolved to — the
+/// locator itself for a direct URL, the selected release asset for a `github:` locator — so a warm
+/// launch builds it offline without re-querying GitHub. See [`prebuilt::Pin`].
+pub(crate) type AppImagePin = prebuilt::Pin;
 
 /// The two shapes a declared `appimage:` locator can take, dispatched from its prefix.
 enum AppImageSource {
@@ -99,102 +95,32 @@ pub(crate) enum AppImageUpgrade {
     },
 }
 
+/// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
+/// the same path for the tests that assert the on-disk format.
+#[cfg(test)]
 fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
-    layout
-        .data_dir()
-        .join("projects")
-        .join(project_id)
-        .join(APPIMAGE_LOCK)
+    prebuilt::lock_path(layout, project_id, APPIMAGE_LOCK)
 }
 
-/// Read the per-project appimage lock. Each line is `key\thash` or `key\thash\turl`: a two-column
-/// line (a direct-URL pin) takes the key as its resolved URL; a three-column line (a `github:` pin)
-/// carries the resolved asset URL separately. A corrupt line self-heals by being dropped; an absent
-/// lock is an empty map (the unpinned state).
+/// Read the per-project appimage lock. A three-column line is a `github:` pin, whose resolved asset
+/// URL differs from its key; see [`prebuilt::pins`] for the format.
 pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, AppImagePin> {
-    let mut map = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(lock_path(layout, project_id)) else {
-        return map;
-    };
-    for line in text.lines() {
-        let mut it = line.splitn(3, '\t');
-        if let (Some(key), Some(hash)) = (it.next(), it.next()) {
-            if !key.is_empty() && prebuilt::is_sri(hash) {
-                let url = it.next().filter(|u| !u.is_empty()).unwrap_or(key);
-                map.insert(
-                    key.to_string(),
-                    AppImagePin {
-                        hash: hash.to_string(),
-                        url: url.to_string(),
-                    },
-                );
-            }
-        }
-    }
-    map
+    prebuilt::pins(layout, project_id, APPIMAGE_LOCK)
 }
 
-/// The pinned content hashes for a project's `appimage:` packages, keyed by the declared URL (a
-/// package's locator, so `sbx config` can look each up directly), shortened for display. Reads only
-/// the per-project lock — surfaces a pin without resolving or building — so the config view stays
-/// side-effect-free, exactly like [`super::deb::pinned_hashes`].
+/// The pinned content hashes for a project's `appimage:` packages, keyed by the declared locator so
+/// `sbx config` can look each up directly. See [`prebuilt::pinned_hashes`].
 pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
-    let Some(layout) = Layout::from_env() else {
-        return BTreeMap::new();
-    };
-    let Ok(id) = super::binds::project_runtime_id(cwd) else {
-        return BTreeMap::new();
-    };
-    pins(&layout, &id)
-        .into_iter()
-        .map(|(url, pin)| {
-            let short: String = pin
-                .hash
-                .strip_prefix("sha256-")
-                .unwrap_or(&pin.hash)
-                .chars()
-                .take(8)
-                .collect();
-            (url, short)
-        })
-        .collect()
+    prebuilt::pinned_hashes(cwd, APPIMAGE_LOCK)
 }
 
-/// Write the per-project appimage lock atomically (temp + rename), so a concurrent same-project
-/// launch never observes a half-written file.
+/// Write the per-project appimage lock atomically. See [`prebuilt::write_pins`].
 fn write_pins(
     layout: &Layout,
     project_id: &str,
     lock: &BTreeMap<String, AppImagePin>,
 ) -> io::Result<()> {
-    let path = lock_path(layout, project_id);
-    if let Some(parent) = path.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
-    let mut body = String::new();
-    for (key, pin) in lock {
-        // A direct-URL pin keeps the compact two-column form (key == resolved url); a `github:` pin,
-        // whose resolved asset url differs from its key, needs the third column.
-        if pin.url == *key {
-            body.push_str(&format!("{key}\t{}\n", pin.hash));
-        } else {
-            body.push_str(&format!("{key}\t{}\t{}\n", pin.hash, pin.url));
-        }
-    }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    prebuilt::write_pins(layout, project_id, APPIMAGE_LOCK, lock)
 }
 
 /// Resolve a declared `appimage:` locator to `(concrete .AppImage url, SRI content hash)`. A direct

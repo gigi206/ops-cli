@@ -1,11 +1,12 @@
-//! Shared building blocks for the two "prebuilt host-side desktop package" backends — `deb:` and
-//! `appimage:`. Both fetch a prebuilt Electron/Chromium bundle from an `https://` source, unpack it
-//! (no build script runs — safe to evaluate host-side, unlike an arbitrary `flake:`), autoPatchelf
-//! the ELF binaries against a curated library set, and wrap the launcher located by its
-//! `resources/app.asar` signature. Only the *unpack* differs between the two backends (a `dpkg-deb`
-//! data tarball vs an AppImage squashfs); everything drift-dangerous — the library set, the
-//! app-locating/launcher-wrapping install phase, the fetch-to-hash helper, the release-asset arch
-//! tokens — lives here so the two backends cannot silently diverge.
+//! Shared building blocks for the "prebuilt host-side package" backends — `deb:`, `appimage:` and
+//! `tarball:`. Each fetches a prebuilt bundle from an `https://` source, unpacks it (no build script
+//! runs — safe to evaluate host-side, unlike an arbitrary `flake:`), autoPatchelfs the ELF binaries
+//! against a curated library set, and wraps the launcher located by its `resources/app.asar`
+//! signature. Only two decisions are a backend's own: *where the artefact comes from* (its locator
+//! forms) and *how it is unpacked* (a `dpkg-deb` data tarball, an AppImage squashfs, a plain
+//! `.tar.gz`). Everything else — the library set, the app-locating/launcher-wrapping install phase,
+//! the fetch-to-hash helper, the release-asset arch tokens, and the per-project pin lock — lives
+//! here so the backends cannot silently diverge.
 //!
 //! **Why unpack at BUILD time, never at runtime.** `wrapType2`, `appimage-run`, and running the raw
 //! `.AppImage` all create a mount/user namespace at runtime (a `bwrap` or a FUSE self-mount). The
@@ -16,8 +17,9 @@
 //! runs inside the cage, which is exactly why the `.deb` approach ports to the AppImage.
 
 use crate::store::{self, Layout};
+use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 /// The Electron/Chromium runtime library set the generated derivations autoPatchelf a desktop bundle
@@ -122,6 +124,120 @@ pub(crate) fn is_sri(s: &str) -> bool {
             && b.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
     })
+}
+
+/// A locked prebuilt package, keyed in its backend's lock by the declared *locator*. `url` is the
+/// concrete artefact the pin resolved to — equal to the key when the locator already IS the download
+/// URL, and the separately resolved asset otherwise (a `github:` release asset, an `apt:` index
+/// selection, a `resolve:` command's output) — and `hash` its SRI content hash. Together they let a
+/// warm launch fetch and build the pinned artefact offline, without re-querying the source.
+#[derive(Clone)]
+pub(crate) struct Pin {
+    pub(crate) hash: String,
+    pub(crate) url: String,
+}
+
+/// One backend's per-project lock file, named by `lock_file` (`deb-packages.lock`,
+/// `tarball-packages.lock`, …). A file per backend keeps their key spaces disjoint, so the same
+/// URL declared under two backends pins independently.
+pub(crate) fn lock_path(layout: &Layout, project_id: &str, lock_file: &str) -> PathBuf {
+    layout
+        .data_dir()
+        .join("projects")
+        .join(project_id)
+        .join(lock_file)
+}
+
+/// Read one backend's per-project lock. Each line is `key\thash` or `key\thash\turl`: a two-column
+/// line (the locator IS its resolved URL, and the legacy format) takes the key as that URL; a
+/// three-column line carries the separately resolved URL. A corrupt line self-heals by being
+/// dropped; an absent lock is an empty map — the unpinned state.
+pub(crate) fn pins(layout: &Layout, project_id: &str, lock_file: &str) -> BTreeMap<String, Pin> {
+    let mut map = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(lock_path(layout, project_id, lock_file)) else {
+        return map;
+    };
+    for line in text.lines() {
+        let mut it = line.splitn(3, '\t');
+        if let (Some(key), Some(hash)) = (it.next(), it.next()) {
+            if !key.is_empty() && is_sri(hash) {
+                let url = it.next().filter(|u| !u.is_empty()).unwrap_or(key);
+                map.insert(
+                    key.to_string(),
+                    Pin {
+                        hash: hash.to_string(),
+                        url: url.to_string(),
+                    },
+                );
+            }
+        }
+    }
+    map
+}
+
+/// Write one backend's per-project lock atomically (temp + rename), so a concurrent same-project
+/// launch never observes a half-written file.
+pub(crate) fn write_pins(
+    layout: &Layout,
+    project_id: &str,
+    lock_file: &str,
+    lock: &BTreeMap<String, Pin>,
+) -> io::Result<()> {
+    let path = lock_path(layout, project_id, lock_file);
+    if let Some(parent) = path.parent() {
+        use std::fs::DirBuilder;
+        use std::os::unix::fs::DirBuilderExt;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let mut body = String::new();
+    for (key, pin) in lock {
+        // A pin whose locator is its own download URL keeps the compact two-column form,
+        // byte-identical to the legacy lock; one whose resolved URL differs from its key needs the
+        // third column.
+        if pin.url == *key {
+            body.push_str(&format!("{key}\t{}\n", pin.hash));
+        } else {
+            body.push_str(&format!("{key}\t{}\t{}\n", pin.hash, pin.url));
+        }
+    }
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, body)?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// The pinned content hashes for a project's packages under one backend, keyed by the declared
+/// locator (so `sbx config` can look each up directly) and shortened for display. Reads only the
+/// per-project lock — surfaces a pin without resolving or building — so the config view stays
+/// side-effect-free, exactly like [`super::flake::pinned_revs`].
+pub(crate) fn pinned_hashes(cwd: &Path, lock_file: &str) -> BTreeMap<String, String> {
+    let Some(layout) = Layout::from_env() else {
+        return BTreeMap::new();
+    };
+    let Ok(id) = super::binds::project_runtime_id(cwd) else {
+        return BTreeMap::new();
+    };
+    pins(&layout, &id, lock_file)
+        .into_iter()
+        .map(|(url, pin)| {
+            let short: String = pin
+                .hash
+                .strip_prefix("sha256-")
+                .unwrap_or(&pin.hash)
+                .chars()
+                .take(8)
+                .collect();
+            (url, short)
+        })
+        .collect()
 }
 
 /// A nix store-path name derived from a URL's last path segment, sanitized to the store's legal

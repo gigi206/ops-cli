@@ -35,15 +35,11 @@ use std::path::{Path, PathBuf};
 
 const DEB_LOCK: &str = "deb-packages.lock";
 
-/// A locked `deb:` package, keyed in the lock by its declared *locator* (the `.deb` URL, or a
-/// `github:<owner>/<repo>`). `url` is the concrete `.deb` the pin resolved to (== the locator for a
-/// direct URL, the selected release asset for a `github:` locator), and `hash` its SRI content hash
-/// — so a warm launch fetches and builds the pinned asset offline without re-querying GitHub.
-#[derive(Clone)]
-pub(crate) struct DebPin {
-    pub(crate) hash: String,
-    pub(crate) url: String,
-}
+/// A locked `deb:` package, keyed in the lock by its declared *locator* (the `.deb` URL, a
+/// `github:<owner>/<repo>`, or an `apt:` index). Its `url` is the concrete `.deb` the pin resolved
+/// to — the locator itself for a direct URL, the selected release asset for a `github:` locator —
+/// so a warm launch builds it offline without re-querying GitHub. See [`prebuilt::Pin`].
+pub(crate) type DebPin = prebuilt::Pin;
 
 /// The shapes a declared `deb:` locator can take, dispatched from its prefix.
 enum DebSource {
@@ -98,103 +94,32 @@ pub(crate) enum DebUpgrade {
     },
 }
 
+/// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
+/// the same path for the tests that assert the on-disk format.
+#[cfg(test)]
 fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
-    layout
-        .data_dir()
-        .join("projects")
-        .join(project_id)
-        .join(DEB_LOCK)
+    prebuilt::lock_path(layout, project_id, DEB_LOCK)
 }
 
-/// Read the per-project deb lock. Each line is `key\thash` or `key\thash\turl`: a two-column line
-/// (a direct-URL pin, and the legacy format) takes the key as its resolved URL; a three-column line
-/// (a `github:` pin) carries the resolved asset URL separately. A corrupt line self-heals by being
-/// dropped; an absent lock is an empty map (the unpinned state).
+/// Read the per-project deb lock. A three-column line is a `github:`/`apt:` pin, whose resolved
+/// asset URL differs from its key; see [`prebuilt::pins`] for the format.
 pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, DebPin> {
-    let mut map = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(lock_path(layout, project_id)) else {
-        return map;
-    };
-    for line in text.lines() {
-        let mut it = line.splitn(3, '\t');
-        if let (Some(key), Some(hash)) = (it.next(), it.next()) {
-            if !key.is_empty() && prebuilt::is_sri(hash) {
-                let url = it.next().filter(|u| !u.is_empty()).unwrap_or(key);
-                map.insert(
-                    key.to_string(),
-                    DebPin {
-                        hash: hash.to_string(),
-                        url: url.to_string(),
-                    },
-                );
-            }
-        }
-    }
-    map
+    prebuilt::pins(layout, project_id, DEB_LOCK)
 }
 
-/// The pinned content hashes for a project's `deb:` packages, keyed by the declared URL (a
-/// package's locator, so `sbx config` can look each up directly), shortened for display. Reads
-/// only the per-project lock — surfaces a pin without resolving or building — so the config view
-/// stays side-effect-free, exactly like [`super::flake::pinned_revs`].
+/// The pinned content hashes for a project's `deb:` packages, keyed by the declared locator so
+/// `sbx config` can look each up directly. See [`prebuilt::pinned_hashes`].
 pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
-    let Some(layout) = Layout::from_env() else {
-        return BTreeMap::new();
-    };
-    let Ok(id) = super::binds::project_runtime_id(cwd) else {
-        return BTreeMap::new();
-    };
-    pins(&layout, &id)
-        .into_iter()
-        .map(|(url, pin)| {
-            let short: String = pin
-                .hash
-                .strip_prefix("sha256-")
-                .unwrap_or(&pin.hash)
-                .chars()
-                .take(8)
-                .collect();
-            (url, short)
-        })
-        .collect()
+    prebuilt::pinned_hashes(cwd, DEB_LOCK)
 }
 
-/// Write the per-project deb lock atomically (temp + rename), so a concurrent same-project launch
-/// never observes a half-written file.
+/// Write the per-project deb lock atomically. See [`prebuilt::write_pins`].
 fn write_pins(
     layout: &Layout,
     project_id: &str,
     lock: &BTreeMap<String, DebPin>,
 ) -> io::Result<()> {
-    let path = lock_path(layout, project_id);
-    if let Some(parent) = path.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
-    let mut body = String::new();
-    for (key, pin) in lock {
-        // A direct-URL pin keeps the compact two-column form (key == resolved url), byte-identical
-        // to the legacy lock; a `github:` pin, whose resolved asset url differs from its key, needs
-        // the third column.
-        if pin.url == *key {
-            body.push_str(&format!("{key}\t{}\n", pin.hash));
-        } else {
-            body.push_str(&format!("{key}\t{}\t{}\n", pin.hash, pin.url));
-        }
-    }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    prebuilt::write_pins(layout, project_id, DEB_LOCK, lock)
 }
 
 /// Resolve a declared `deb:` locator to `(concrete .deb url, SRI content hash)`. A direct URL

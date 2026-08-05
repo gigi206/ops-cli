@@ -40,15 +40,9 @@ use std::path::{Path, PathBuf};
 const TARBALL_LOCK: &str = "tarball-packages.lock";
 
 /// A locked `tarball:` package, keyed in the lock by its declared *locator* — the `.tar.gz` URL for
-/// a direct package, or `resolve:<name>` for a `tarball:resolve` package. `url` is the concrete
-/// tarball the pin resolved to (== the key for a direct URL, the command-resolved download URL for a
-/// resolver) and `hash` its SRI content hash — so a warm launch fetches and builds the pinned asset
-/// offline.
-#[derive(Clone)]
-pub(crate) struct TarballPin {
-    pub(crate) hash: String,
-    pub(crate) url: String,
-}
+/// a direct package, or `resolve:<name>` for a `tarball:resolve` package, whose `url` is then the
+/// command-resolved download URL. See [`prebuilt::Pin`].
+pub(crate) type TarballPin = prebuilt::Pin;
 
 /// The outcome of re-resolving one declared `tarball:` reference during `sbx upgrade`.
 pub(crate) enum TarballUpgrade {
@@ -74,102 +68,32 @@ pub(crate) enum TarballUpgrade {
     },
 }
 
+/// Where this backend's lock lives. Production reads and writes it through [`prebuilt`]; this names
+/// the same path for the tests that assert the on-disk format.
+#[cfg(test)]
 fn lock_path(layout: &Layout, project_id: &str) -> PathBuf {
-    layout
-        .data_dir()
-        .join("projects")
-        .join(project_id)
-        .join(TARBALL_LOCK)
+    prebuilt::lock_path(layout, project_id, TARBALL_LOCK)
 }
 
-/// Read the per-project tarball lock. Each line is `key\thash` (a direct-URL pin, whose key IS its
-/// resolved URL). A corrupt line self-heals by being dropped; an absent lock is an empty map (the
-/// unpinned state). A direct-URL pin is two-column (its key equals its resolved URL); a
-/// `tarball:resolve` pin is three-column (`resolve:<name>` key, hash, the command-resolved URL), and
-/// the third column's resolved URL wins.
+/// Read the per-project tarball lock. A three-column line is a `tarball:resolve` pin
+/// (`resolve:<name>` key, hash, the command-resolved URL); see [`prebuilt::pins`] for the format.
 pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, TarballPin> {
-    let mut map = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(lock_path(layout, project_id)) else {
-        return map;
-    };
-    for line in text.lines() {
-        let mut it = line.splitn(3, '\t');
-        if let (Some(key), Some(hash)) = (it.next(), it.next()) {
-            if !key.is_empty() && prebuilt::is_sri(hash) {
-                let url = it.next().filter(|u| !u.is_empty()).unwrap_or(key);
-                map.insert(
-                    key.to_string(),
-                    TarballPin {
-                        hash: hash.to_string(),
-                        url: url.to_string(),
-                    },
-                );
-            }
-        }
-    }
-    map
+    prebuilt::pins(layout, project_id, TARBALL_LOCK)
 }
 
-/// The pinned content hashes for a project's `tarball:` packages, keyed by the declared URL and
-/// shortened for display. Reads only the per-project lock — surfaces a pin without resolving or
-/// building — so the config view stays side-effect-free, exactly like [`super::deb::pinned_hashes`].
+/// The pinned content hashes for a project's `tarball:` packages, keyed by the declared locator.
+/// See [`prebuilt::pinned_hashes`].
 pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
-    let Some(layout) = Layout::from_env() else {
-        return BTreeMap::new();
-    };
-    let Ok(id) = super::binds::project_runtime_id(cwd) else {
-        return BTreeMap::new();
-    };
-    pins(&layout, &id)
-        .into_iter()
-        .map(|(url, pin)| {
-            let short: String = pin
-                .hash
-                .strip_prefix("sha256-")
-                .unwrap_or(&pin.hash)
-                .chars()
-                .take(8)
-                .collect();
-            (url, short)
-        })
-        .collect()
+    prebuilt::pinned_hashes(cwd, TARBALL_LOCK)
 }
 
-/// Write the per-project tarball lock atomically (temp + rename), so a concurrent same-project launch
-/// never observes a half-written file.
+/// Write the per-project tarball lock atomically. See [`prebuilt::write_pins`].
 fn write_pins(
     layout: &Layout,
     project_id: &str,
     lock: &BTreeMap<String, TarballPin>,
 ) -> io::Result<()> {
-    let path = lock_path(layout, project_id);
-    if let Some(parent) = path.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
-    let mut body = String::new();
-    for (key, pin) in lock {
-        // A direct-URL pin keeps the compact two-column form (key == resolved url); a form whose
-        // resolved url differs from its key (a `resolve:<name>` locator) uses the third column.
-        if pin.url == *key {
-            body.push_str(&format!("{key}\t{}\n", pin.hash));
-        } else {
-            body.push_str(&format!("{key}\t{}\t{}\n", pin.hash, pin.url));
-        }
-    }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    prebuilt::write_pins(layout, project_id, TARBALL_LOCK, lock)
 }
 
 /// Resolve a declared `tarball:` locator to `(concrete .tar.gz url, SRI content hash)`. A direct URL
