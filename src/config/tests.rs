@@ -6955,6 +6955,108 @@ fn every_dropped_security_field_warning_is_recognised_as_a_trust_drop() {
     ));
 }
 
+/// Every bare key comes before the first `[table]` header: a key written after one folds into that
+/// table, and the field would never reach its trust gate at all.
+const EVERY_GATED_FIELD: &str = "nixpkgs = \"nixos-25.05\"\n\
+     network = \"shared\"\n\
+     proc = \"enforce\"\n\
+     notify = \"off\"\n\
+     gui = \"wayland\"\n\
+     gpu = true\n\
+     audio = true\n\
+     dbus = true\n\
+     forward = [8080]\n\
+     [limits]\nmemory = \"1G\"\n\
+     [seccomp]\nallow = [\"userfaultfd\"]\n\
+     [devices]\nallow = [\"/dev/kvm\"]\n\
+     [ssh_agent]\nallow = [\"deploy@example\"]\n\
+     [secret.\"api.example.com\"]\n\
+     from = \"env://DEMO_API_KEY\"\nheader = \"x-api-key\"\ntype = \"raw\"\n\
+     [task.build]\ncmd = [\"cargo\", \"build\"]\n";
+
+/// How each trust-gated field names itself when it is refused, in the order the resolver walks them.
+///
+/// The nouns are deliberately not uniform — `gpu` has a "posture", `forward` has "ports",
+/// `[devices]` has none — and that is what a user reads, so it is pinned rather than tidied.
+const GATED_REFUSALS: &[&str] = &[
+    "`nixpkgs` override",
+    "`network` policy",
+    "`proc` policy",
+    "`notify` policy",
+    "`gui` posture",
+    "`gpu` posture",
+    "`audio` posture",
+    "`dbus` posture",
+    "`forward` ports",
+    "`[limits]`",
+    "`[seccomp]`",
+    "`[devices]`",
+    "`[ssh_agent]`",
+    "1 secret(s)",
+    "1 task(s)",
+];
+
+/// Every trust-gated field of an untrusted project says which field it dropped, verbatim.
+///
+/// The refusal is the only user-visible output of the gate: nothing else tells anyone that a
+/// declared field is not in effect. A change to how the gate is written would otherwise compile,
+/// keep every provenance assertion green, and quietly reword — or drop — what the launch says.
+#[test]
+fn every_trust_gated_project_field_names_itself_in_its_refusal() {
+    for state in [TrustState::Untrusted, TrustState::Changed] {
+        let project: RawConfig = toml::from_str(EVERY_GATED_FIELD).unwrap();
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, state)));
+        let reason = super::untrusted_reason(state);
+        for what in GATED_REFUSALS {
+            let expected = format!("{PROJECT_CONFIG}: ignoring {what} ({reason})");
+            assert!(
+                r.warnings.contains(&expected),
+                "{state:?}: expected exactly {expected:?}\ngot {:#?}",
+                r.warnings
+            );
+        }
+    }
+}
+
+/// The app layer refuses in the same words, naming the app's own source instead of the project file.
+///
+/// It is a second, independent walk over the same fields, so a change that fixed one block and not
+/// the other would leave an app's refusals worded differently from a project's — invisible to
+/// anything that only resolves a project.
+#[test]
+fn every_trust_gated_app_field_names_itself_in_its_refusal() {
+    let toml_src = format!(
+        "[app.mine]\ncmd = \"demo-app\"\n{}",
+        EVERY_GATED_FIELD
+            .lines()
+            // `nixpkgs` is not an app field, and the app's own tables nest under `[app.mine.<t>]`.
+            .filter(|l| !l.starts_with("nixpkgs"))
+            .map(|l| match l.strip_prefix('[') {
+                Some(rest) => format!("[app.mine.{rest}"),
+                None => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let project: RawConfig = toml::from_str(&toml_src).unwrap();
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((project, TrustState::Untrusted)),
+    );
+    let app = &r.apps["mine"];
+    let reason = super::untrusted_reason(TrustState::Untrusted);
+    for what in GATED_REFUSALS.iter().filter(|w| !w.contains("nixpkgs")) {
+        assert!(
+            app.warnings
+                .iter()
+                .any(|w| w.ends_with(&format!(": ignoring {what} ({reason})"))),
+            "expected an app refusal ending in {:?}\ngot {:#?}",
+            format!(": ignoring {what} ({reason})"),
+            app.warnings
+        );
+    }
+}
+
 /// A real resolution of an untrusted project: every warning about a dropped security field is
 /// recognised, so the launch announces all of them and not merely the ones phrased one way.
 #[test]
