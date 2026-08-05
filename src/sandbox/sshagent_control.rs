@@ -20,12 +20,11 @@
 //! by the reader; [`sanitize_detail`] strips it of control characters first, so it can never inject
 //! a second line.
 
-use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// How many recent broker decisions a session retains. An ssh session asks for one signature per
 /// authentication, so this is a deep window in practice — deeper than the egress ring needs to be,
@@ -87,15 +86,14 @@ pub(crate) struct AgentEvent {
     pub(crate) detail: String,
 }
 
-/// The result of a `LOG` query: the events past the caller's cursor, how many fell off the ring
-/// before it, and the newest sequence number (the cursor to pass next time, even when `events` is
-/// empty).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentSnapshot {
-    pub(crate) events: Vec<AgentEvent>,
-    pub(crate) dropped: u64,
-    pub(crate) head: u64,
+impl super::lens::Event for AgentEvent {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
 }
+
+/// The result of a `LOG` query over this lens. See [`super::lens::Snapshot`].
+pub(crate) type AgentSnapshot = super::lens::Snapshot<AgentEvent>;
 
 /// Strip a detail of anything that could forge a second wire line or a terminal escape, and cap its
 /// length. A key comment is free-form text from the user's own agent; a refusal reason is one of a
@@ -113,39 +111,27 @@ fn sanitize_detail(s: &str) -> String {
     out
 }
 
-/// A bounded ring of recent broker decisions, newest appended, oldest evicted past `cap`. Shared
-/// (via `Arc`) between the broker's per-connection threads (which [`push`](AgentRing::push)) and the
-/// control serve thread (which [`snapshot`](AgentRing::snapshot)s for `sbx ssh-agent log`). Sequence
-/// numbers start at 1 and never repeat within a session, so a `--follow` cursor of 0 means "from the
-/// beginning" and can never collide with a real event.
+/// A bounded ring of recent broker decisions. Shared (via `Arc`) between the broker's per-connection
+/// threads (which [`push`](AgentRing::push)) and the control serve thread (which
+/// [`snapshot`](AgentRing::snapshot)s for `sbx ssh-agent log`). The sequencing and eviction are
+/// [`super::lens::Ring`]'s; what this adds is the shape of a decision — and the announcement a
+/// refusal makes on its way in.
 pub(crate) struct AgentRing {
-    inner: Mutex<AgentInner>,
-    cap: usize,
+    ring: super::lens::Ring<AgentEvent>,
     /// Where a refusal is announced (`[notify] events.ssh_agent`), or `None` when the launch wired
     /// none. Consulted from [`AgentRing::push`] — the one place every outcome passes through — so a
     /// refusal added later cannot forget to announce itself.
     notifier: Option<Arc<crate::sandbox::notify_sink::Notifier>>,
 }
 
-struct AgentInner {
-    next_seq: u64,
-    events: VecDeque<AgentEvent>,
-}
-
 impl AgentRing {
     pub(crate) fn new(cap: usize) -> Self {
         AgentRing {
-            inner: Mutex::new(AgentInner {
-                next_seq: 1,
-                events: VecDeque::new(),
-            }),
-            cap: cap.max(1),
+            ring: super::lens::Ring::new(cap),
             notifier: None,
         }
     }
 
-    /// Append one decision, assigning the next sequence number and evicting the oldest if the ring
-    /// is full. Returns the assigned sequence number.
     /// Attach the launch's refusal notifier, so a withheld key is said out loud and not only
     /// recorded for whoever thinks to run `sbx ssh-agent logs`.
     pub(crate) fn with_notifier(
@@ -156,8 +142,11 @@ impl AgentRing {
         self
     }
 
+    /// Append one decision, sanitising and capping its detail. Returns the assigned sequence number.
     pub(crate) fn push(&self, kind: AgentKind, detail: &str) -> u64 {
-        // Announce a refusal from here, the single point every outcome passes through. A `list` or a
+        // Announce a refusal from here, the single point every outcome passes through, and announce
+        // it *before* the ring is touched — delivery reaches the desktop bus, and doing that under
+        // the ring's lock would stall the reader answering `sbx ssh-agent logs`. A `list` or a
         // `sign` is the channel working as granted — only a refusal is the boundary biting, and it is
         // the one outcome the cage sees as a bare protocol failure it need never mention.
         if kind == AgentKind::Refuse {
@@ -177,47 +166,16 @@ impl AgentRing {
                 });
             }
         }
-        let at_epoch_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut g = self.inner.lock().unwrap();
-        let seq = g.next_seq;
-        g.next_seq += 1;
-        g.events.push_back(AgentEvent {
+        self.ring.push_with(|seq, at_epoch_ms| AgentEvent {
             seq,
             at_epoch_ms,
             kind,
             detail: sanitize_detail(detail),
-        });
-        while g.events.len() > self.cap {
-            g.events.pop_front();
-        }
-        seq
+        })
     }
 
-    /// The events past `after`, plus the eviction gap and the newest sequence. `after = None` is a
-    /// tail read (the whole retained window; never reports a gap — a first read has nothing to
-    /// miss); `after = Some(cursor)` is a follow read.
     pub(crate) fn snapshot(&self, after: Option<u64>) -> AgentSnapshot {
-        let g = self.inner.lock().unwrap();
-        let head = g.next_seq - 1;
-        let cursor = after.unwrap_or(0);
-        let events: Vec<AgentEvent> = g
-            .events
-            .iter()
-            .filter(|e| e.seq > cursor)
-            .cloned()
-            .collect();
-        let dropped = match (after, g.events.front()) {
-            (Some(a), Some(oldest)) if oldest.seq > a + 1 => oldest.seq - a - 1,
-            _ => 0,
-        };
-        AgentSnapshot {
-            events,
-            dropped,
-            head,
-        }
+        self.ring.snapshot(after)
     }
 }
 
@@ -365,26 +323,19 @@ fn parse_event_line(line: &str) -> Option<AgentEvent> {
 mod tests {
     use super::*;
 
+    /// The ring's own sequencing and eviction are [`super::super::lens`]'s and tested there. What is
+    /// this lens's to get right is the mapping: what the broker calls a decision must land on the
+    /// fields `sbx ssh-agent logs` reads back.
     #[test]
-    fn the_ring_keeps_the_newest_and_reports_what_it_evicted() {
-        let ring = AgentRing::new(3);
-        for i in 0..5 {
-            ring.push(AgentKind::Sign, &format!("key-{i}"));
-        }
-
-        // A tail read sees the retained window and never claims a gap: a first read has nothing
-        // to have missed.
-        let tail = ring.snapshot(None);
-        assert_eq!(tail.events.len(), 3);
-        assert_eq!(tail.events[0].detail, "key-2");
-        assert_eq!(tail.head, 5);
-        assert_eq!(tail.dropped, 0);
-
-        // A follow read from a cursor the ring has since evicted past says so, rather than
-        // silently handing back a shorter list than the caller asked for.
-        let follow = ring.snapshot(Some(1));
-        assert_eq!(follow.dropped, 1, "seq 2 fell off before the cursor");
-        assert_eq!(follow.events.len(), 3);
+    fn push_maps_its_arguments_onto_the_event() {
+        let ring = AgentRing::new(8);
+        assert_eq!(ring.push(AgentKind::Sign, "deploy@example"), 1);
+        assert_eq!(ring.push(AgentKind::Refuse, "an unlisted key"), 2);
+        let snap = ring.snapshot(None);
+        assert_eq!(snap.events[0].kind, AgentKind::Sign);
+        assert_eq!(snap.events[0].detail, "deploy@example");
+        assert_eq!(snap.events[1].kind, AgentKind::Refuse);
+        assert_eq!(snap.events[1].detail, "an unlisted key");
     }
 
     /// The record of a credential channel is the wrong place for one entry to be able to write

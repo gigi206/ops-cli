@@ -21,12 +21,11 @@
 //! by the reader; the observer sanitises it of control characters, so it can never inject a second
 //! line.
 
-use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::proc_enforce::ProcOverlay;
 use crate::proc_policy::{self, ProcMode, Verdict};
@@ -64,45 +63,29 @@ pub(crate) struct ExecEvent {
     pub(crate) command: String,
 }
 
-/// The result of a `LOG` query: the events past the caller's cursor, how many fell off the ring
-/// before that cursor (surfaced, not silently dropped — a bursty agent between `--follow` polls), and
-/// the newest sequence number (the cursor to pass next time, even when `events` is empty).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExecSnapshot {
-    pub(crate) events: Vec<ExecEvent>,
-    pub(crate) dropped: u64,
-    pub(crate) head: u64,
+impl super::lens::Event for ExecEvent {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
 }
 
-/// A bounded ring of recent exec events, newest appended, oldest evicted past `cap`. Shared (via
-/// `Arc`) between the observer thread (which [`push`](ExecRing::push)es) and the control serve thread
-/// (which [`snapshot`](ExecRing::snapshot)s for `sbx proc logs`). Sequence numbers start at 1 and
-/// never repeat within a session, so a `--follow` cursor of 0 means "from the beginning" and can
-/// never collide with a real event.
-pub(crate) struct ExecRing {
-    inner: Mutex<ExecInner>,
-    cap: usize,
-}
+/// The result of a `LOG` query over this lens. See [`super::lens::Snapshot`].
+pub(crate) type ExecSnapshot = super::lens::Snapshot<ExecEvent>;
 
-struct ExecInner {
-    next_seq: u64,
-    events: VecDeque<ExecEvent>,
-}
+/// A bounded ring of recent exec events. Shared (via `Arc`) between the observer thread (which
+/// [`push`](ExecRing::push)es) and the control serve thread (which [`snapshot`](ExecRing::snapshot)s
+/// for `sbx proc logs`). The sequencing and eviction are [`super::lens::Ring`]'s; what this adds is
+/// the shape of an exec event, and the two ways one arrives.
+pub(crate) struct ExecRing(super::lens::Ring<ExecEvent>);
 
 impl ExecRing {
     pub(crate) fn new(cap: usize) -> Self {
-        ExecRing {
-            inner: Mutex::new(ExecInner {
-                next_seq: 1,
-                events: VecDeque::new(),
-            }),
-            cap: cap.max(1),
-        }
+        ExecRing(super::lens::Ring::new(cap))
     }
 
-    /// Append one observed exec (the non-enforcing `/proc` poll path — verdict `observe`), assigning the
-    /// next sequence number and evicting the oldest if the ring is full. `command` must already be
-    /// sanitised of control characters and length-capped by the caller. Returns the assigned sequence.
+    /// Append one observed exec (the non-enforcing `/proc` poll path — verdict `observe`). `command`
+    /// must already be sanitised of control characters and length-capped by the caller. Returns the
+    /// assigned sequence.
     pub(crate) fn push(&self, pid: u32, command: &str) -> u64 {
         self.push_verdict(pid, "", command, "observe")
     }
@@ -112,50 +95,18 @@ impl ExecRing {
     /// decides by target alone). `command` — here the exec target path — must already be sanitised of
     /// control characters and length-capped by the caller. Returns the assigned sequence.
     pub(crate) fn push_verdict(&self, pid: u32, caller: &str, command: &str, verdict: &str) -> u64 {
-        let at_epoch_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut g = self.inner.lock().unwrap();
-        let seq = g.next_seq;
-        g.next_seq += 1;
-        g.events.push_back(ExecEvent {
+        self.0.push_with(|seq, at_epoch_ms| ExecEvent {
             seq,
             at_epoch_ms,
             pid,
             verdict: verdict.to_string(),
             caller: caller.to_string(),
             command: command.to_string(),
-        });
-        while g.events.len() > self.cap {
-            g.events.pop_front();
-        }
-        seq
+        })
     }
 
-    /// The events past `after`, plus the eviction gap and the newest sequence. `after = None` is a
-    /// tail read (the whole retained window; never reports a gap — a first read has nothing to miss);
-    /// `after = Some(cursor)` is a follow read (events with `seq > cursor`, reporting how many between
-    /// the cursor and the retained window were evicted unseen).
     pub(crate) fn snapshot(&self, after: Option<u64>) -> ExecSnapshot {
-        let g = self.inner.lock().unwrap();
-        let head = g.next_seq - 1;
-        let cursor = after.unwrap_or(0);
-        let events: Vec<ExecEvent> = g
-            .events
-            .iter()
-            .filter(|e| e.seq > cursor)
-            .cloned()
-            .collect();
-        let dropped = match (after, g.events.front()) {
-            (Some(a), Some(oldest)) if oldest.seq > a + 1 => oldest.seq - a - 1,
-            _ => 0,
-        };
-        ExecSnapshot {
-            events,
-            dropped,
-            head,
-        }
+        self.0.snapshot(after)
     }
 }
 
@@ -593,52 +544,26 @@ fn parse_event_line(line: &str) -> Option<ExecEvent> {
 mod tests {
     use super::*;
 
+    /// The ring's own sequencing and eviction are [`super::super::lens`]'s and tested there. What is
+    /// this lens's to get right is the mapping — including that the cheap poll path tags its events
+    /// `observe` and reads no caller, which is what keeps its wire line the one it has always been.
     #[test]
-    fn push_assigns_monotonic_seqs_and_snapshot_tails_the_window() {
+    fn push_maps_its_arguments_onto_the_event() {
         let ring = ExecRing::new(10);
         assert_eq!(ring.push(100, "rg foo"), 1);
-        assert_eq!(ring.push(101, "git log"), 2);
+        assert_eq!(
+            ring.push_verdict(101, "/bin/bash", "/usr/bin/git", "deny"),
+            2
+        );
         let snap = ring.snapshot(None);
-        assert_eq!(snap.head, 2);
-        assert_eq!(snap.dropped, 0);
         assert_eq!(snap.events.len(), 2);
-        assert_eq!(snap.events[0].seq, 1);
         assert_eq!(snap.events[0].pid, 100);
         assert_eq!(snap.events[0].command, "rg foo");
-    }
-
-    #[test]
-    fn snapshot_after_returns_only_newer_events() {
-        let ring = ExecRing::new(10);
-        for i in 0..5 {
-            ring.push(100 + i, &format!("cmd{i}"));
-        }
-        let snap = ring.snapshot(Some(3));
-        assert_eq!(
-            snap.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            [4, 5]
-        );
-        assert_eq!(snap.head, 5);
-        assert_eq!(snap.dropped, 0);
-    }
-
-    #[test]
-    fn a_follow_cursor_behind_the_evicted_window_reports_the_gap() {
-        // cap 3: after pushing 6, the ring holds seq 4..=6; a follow reader at cursor 1 missed 2 and 3.
-        let ring = ExecRing::new(3);
-        for i in 0..6 {
-            ring.push(100 + i, &format!("c{i}"));
-        }
-        let snap = ring.snapshot(Some(1));
-        assert_eq!(
-            snap.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            [4, 5, 6]
-        );
-        assert_eq!(
-            snap.dropped, 2,
-            "seq 2 and 3 fell off before the cursor caught up"
-        );
-        assert_eq!(snap.head, 6);
+        assert_eq!(snap.events[0].verdict, "observe");
+        assert_eq!(snap.events[0].caller, "");
+        assert_eq!(snap.events[1].verdict, "deny");
+        assert_eq!(snap.events[1].caller, "/bin/bash");
+        assert_eq!(snap.events[1].command, "/usr/bin/git");
     }
 
     #[test]

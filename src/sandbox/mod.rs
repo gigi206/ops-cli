@@ -51,6 +51,10 @@ mod netns;
 mod proxy;
 pub(crate) mod redact;
 
+// The observation-lens substrate: the bounded event ring and the per-session control socket the
+// filesystem, process and ssh-agent lenses below are each built from.
+pub(crate) mod lens;
+
 // Credential brokers: the cage gets the capability, never the secret behind it.
 pub(crate) mod sshagent;
 pub(crate) mod sshagent_control;

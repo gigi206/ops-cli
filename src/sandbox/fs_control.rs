@@ -20,12 +20,11 @@
 //! line and taken verbatim by the reader; the watcher sanitises it of control characters, so it can
 //! never inject a second line.
 
-use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// The default number of recent filesystem events a session retains for the live feed.
 pub(crate) const FS_RING_CAP: usize = 1000;
@@ -85,88 +84,39 @@ pub(crate) struct FsEvent {
     pub(crate) path: String,
 }
 
-/// The result of a `LOG` query: the events past the caller's cursor, how many fell off the ring before
-/// that cursor (surfaced, not silently dropped — a bursty agent between `--follow` polls), and the
-/// newest sequence number (the cursor to pass next time, even when `events` is empty).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FsSnapshot {
-    pub(crate) events: Vec<FsEvent>,
-    pub(crate) dropped: u64,
-    pub(crate) head: u64,
+impl super::lens::Event for FsEvent {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
 }
 
-/// A bounded ring of recent filesystem events, newest appended, oldest evicted past `cap`. Shared (via
-/// `Arc`) between the watcher thread (which [`push`](FsRing::push)es) and the control serve thread
-/// (which [`snapshot`](FsRing::snapshot)s for `sbx fs logs`). Sequence numbers start at 1 and never
-/// repeat within a session, so a `--follow` cursor of 0 means "from the beginning" and can never
-/// collide with a real event.
-pub(crate) struct FsRing {
-    inner: Mutex<FsInner>,
-    cap: usize,
-}
+/// The result of a `LOG` query over this lens. See [`super::lens::Snapshot`].
+pub(crate) type FsSnapshot = super::lens::Snapshot<FsEvent>;
 
-struct FsInner {
-    next_seq: u64,
-    events: VecDeque<FsEvent>,
-}
+/// A bounded ring of recent filesystem events. Shared (via `Arc`) between the watcher thread (which
+/// [`push`](FsRing::push)es) and the control serve thread (which [`snapshot`](FsRing::snapshot)s for
+/// `sbx fs logs`). The sequencing and eviction are [`super::lens::Ring`]'s; what this adds is the
+/// shape of a write event.
+pub(crate) struct FsRing(super::lens::Ring<FsEvent>);
 
 impl FsRing {
     pub(crate) fn new(cap: usize) -> Self {
-        FsRing {
-            inner: Mutex::new(FsInner {
-                next_seq: 1,
-                events: VecDeque::new(),
-            }),
-            cap: cap.max(1),
-        }
+        FsRing(super::lens::Ring::new(cap))
     }
 
-    /// Append one observed change, assigning the next sequence number and evicting the oldest if the
-    /// ring is full. `path` must already be sanitised of control characters and length-capped by the
-    /// caller. Returns the assigned sequence number.
+    /// Append one observed change. `path` must already be sanitised of control characters and
+    /// length-capped by the caller. Returns the assigned sequence number.
     pub(crate) fn push(&self, kind: FsKind, path: &str) -> u64 {
-        let at_epoch_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut g = self.inner.lock().unwrap();
-        let seq = g.next_seq;
-        g.next_seq += 1;
-        g.events.push_back(FsEvent {
+        self.0.push_with(|seq, at_epoch_ms| FsEvent {
             seq,
             at_epoch_ms,
             kind,
             path: path.to_string(),
-        });
-        while g.events.len() > self.cap {
-            g.events.pop_front();
-        }
-        seq
+        })
     }
 
-    /// The events past `after`, plus the eviction gap and the newest sequence. `after = None` is a tail
-    /// read (the whole retained window; never reports a gap — a first read has nothing to miss);
-    /// `after = Some(cursor)` is a follow read (events with `seq > cursor`, reporting how many between
-    /// the cursor and the retained window were evicted unseen).
     pub(crate) fn snapshot(&self, after: Option<u64>) -> FsSnapshot {
-        let g = self.inner.lock().unwrap();
-        let head = g.next_seq - 1;
-        let cursor = after.unwrap_or(0);
-        let events: Vec<FsEvent> = g
-            .events
-            .iter()
-            .filter(|e| e.seq > cursor)
-            .cloned()
-            .collect();
-        let dropped = match (after, g.events.front()) {
-            (Some(a), Some(oldest)) if oldest.seq > a + 1 => oldest.seq - a - 1,
-            _ => 0,
-        };
-        FsSnapshot {
-            events,
-            dropped,
-            head,
-        }
+        self.0.snapshot(after)
     }
 }
 
@@ -323,52 +273,20 @@ fn parse_event_line(line: &str) -> Option<FsEvent> {
 mod tests {
     use super::*;
 
+    /// The ring's own sequencing and eviction are [`super::super::lens`]'s and tested there. What is
+    /// this lens's to get right is the mapping: the arguments `push` takes must land on the fields
+    /// the wire and the CLI read back.
     #[test]
-    fn push_assigns_monotonic_seqs_and_snapshot_tails_the_window() {
+    fn push_maps_its_arguments_onto_the_event() {
         let ring = FsRing::new(10);
         assert_eq!(ring.push(FsKind::Write, "src/main.rs"), 1);
         assert_eq!(ring.push(FsKind::Create, "src/new.rs"), 2);
         let snap = ring.snapshot(None);
-        assert_eq!(snap.head, 2);
-        assert_eq!(snap.dropped, 0);
         assert_eq!(snap.events.len(), 2);
-        assert_eq!(snap.events[0].seq, 1);
         assert_eq!(snap.events[0].kind, FsKind::Write);
         assert_eq!(snap.events[0].path, "src/main.rs");
-    }
-
-    #[test]
-    fn snapshot_after_returns_only_newer_events() {
-        let ring = FsRing::new(10);
-        for i in 0..5 {
-            ring.push(FsKind::Write, &format!("f{i}"));
-        }
-        let snap = ring.snapshot(Some(3));
-        assert_eq!(
-            snap.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            [4, 5]
-        );
-        assert_eq!(snap.head, 5);
-        assert_eq!(snap.dropped, 0);
-    }
-
-    #[test]
-    fn a_follow_cursor_behind_the_evicted_window_reports_the_gap() {
-        // cap 3: after pushing 6, the ring holds seq 4..=6; a follow reader at cursor 1 missed 2 and 3.
-        let ring = FsRing::new(3);
-        for i in 0..6 {
-            ring.push(FsKind::Write, &format!("f{i}"));
-        }
-        let snap = ring.snapshot(Some(1));
-        assert_eq!(
-            snap.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            [4, 5, 6]
-        );
-        assert_eq!(
-            snap.dropped, 2,
-            "seq 2 and 3 fell off before the cursor caught up"
-        );
-        assert_eq!(snap.head, 6);
+        assert_eq!(snap.events[1].kind, FsKind::Create);
+        assert_eq!(snap.events[1].path, "src/new.rs");
     }
 
     #[test]
