@@ -201,13 +201,13 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
 /// package's leaked out-link — and, with it, its per-project store copy — is reclaimed.
 ///
 /// Deliberately **declared-not-trusted**, unlike the trusted-only provisioning filters
-/// ([`deb_packages`] and friends): a package the user still declares but whose project trust has
-/// lapsed (an edit turns the config Changed) must **not** have its build reclaimed — for a heavy
-/// prebuilt (a multi-hundred-MB desktop app) that would force a full re-download on the next trusted
-/// launch. Only a package no longer declared at all is a removal, and a removal is absent from this
-/// set whatever its trust was. A prebuilt backend's prefix is taken from [`prebuilt::Kind::name`],
-/// the same source the write sites derive their gcroot from, so the two cannot drift; `nix:` roots
-/// under a bare `<name>` ([`provision`]).
+/// ([`super::prebuilt::Kind::packages`] and friends): a package the user still declares but whose
+/// project trust has lapsed (an edit turns the config Changed) must **not** have its build
+/// reclaimed — for a heavy prebuilt (a multi-hundred-MB desktop app) that would force a full
+/// re-download on the next trusted launch. Only a package no longer declared at all is a removal,
+/// and a removal is absent from this set whatever its trust was. A prebuilt backend's prefix is
+/// taken from [`super::prebuilt::Kind::name`], the same source the write sites derive their gcroot
+/// from, so the two cannot drift; `nix:` roots under a bare `<name>` ([`provision`]).
 pub(crate) fn project_gcroot_names(packages: &[Package]) -> Vec<String> {
     use super::prebuilt::Kind;
     packages

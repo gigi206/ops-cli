@@ -21,7 +21,7 @@
 //!   * `appimage:github:<owner>/<repo>` — query the repo's latest release and select its linux
 //!     `.AppImage` asset, so even a project whose asset name embeds the version rolls forward.
 //!
-//! Update model: pin-on-first-use (see [`provision`]) — identical to `deb:`.
+//! Update model: pin-on-first-use (see [`prebuilt::provision`]) — identical to `deb:`.
 
 use super::prebuilt::{self, ELECTRON_LIBS};
 use crate::store::Layout;
