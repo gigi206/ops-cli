@@ -413,6 +413,20 @@ pub(crate) trait Kind {
         url: &str,
         hash: &str,
     ) -> String;
+
+    /// This backend's **trusted** direct packages as `(package name, declared locator)` — the form
+    /// whose locator is resolved by [`Kind::resolve_source`].
+    fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)>;
+
+    /// This backend's **trusted** `<backend>:resolve` packages as `(package name, resolve command)` —
+    /// the form whose download URL is re-derived by running a command in a sandbox.
+    fn resolve_packages(&self, packages: &[crate::config::Package]) -> Vec<(String, Vec<String>)>;
+
+    /// The per-project lock key this package occupies, or `None` when the package belongs to another
+    /// backend. **Deliberately trust-agnostic**, unlike [`Kind::packages`]: it answers "does this
+    /// config still declare that lock entry", which is what the prune universe asks, and pruning must
+    /// not depend on trust (see [`declared`]).
+    fn lock_key(&self, package: &crate::config::Package) -> Option<String>;
 }
 
 /// The host-side context every prebuilt package build shares: sbx's nix engine and store layout, the
@@ -423,6 +437,105 @@ pub(crate) struct Ctx<'a> {
     pub(crate) layout: &'a Layout,
     pub(crate) project: &'a Path,
     pub(crate) nixpkgs: &'a str,
+}
+
+/// One declared reference of a prebuilt backend, in the form it was declared. Both forms end up at
+/// the same place (a pinned `(url, hash)` in the per-project lock); they differ only in how the
+/// concrete download URL is reached.
+pub(crate) enum Ref {
+    /// A locator resolved by [`Kind::resolve_source`] — a direct URL, or a source that is queried
+    /// (`github:<owner>/<repo>`, `apt:<index>`). A direct URL resolves to itself. Its concrete
+    /// artefact URL and content hash are re-derived on every upgrade, because the source can move.
+    Locator(String),
+    /// A `<backend>:resolve` — its download URL is re-derived by re-running the resolve command in a
+    /// sandbox, and the heavy artefact prefetch runs only when that URL differs from the stored pin.
+    Resolve { name: String, command: Vec<String> },
+}
+
+impl Ref {
+    /// The per-project lock key: the declared locator, or `resolve:<name>`.
+    pub(crate) fn key(&self) -> String {
+        match self {
+            Ref::Locator(locator) => locator.clone(),
+            Ref::Resolve { name, .. } => resolve_key(name),
+        }
+    }
+}
+
+/// The two views `sbx upgrade <backend>` needs of a project's declared references, collected in one
+/// pass over the baseline and each app overlay (see [`declared`]).
+pub(crate) struct Declared {
+    /// Deterministic, deduplicated, **trusted-only** — the set to roll forward, each in its declared
+    /// form.
+    pub(crate) trusted: Vec<Ref>,
+    /// Every declared lock key **regardless of trust** — the universe the lock is pruned against, so
+    /// an untrusted/Changed project's still-declared package keeps its pin instead of being unpinned.
+    pub(crate) all: std::collections::BTreeSet<String>,
+}
+
+/// Collect both views in a single walk of the layers. Each app overlay is materialized once (a
+/// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
+/// universe — so `sbx upgrade` walks the apps once, not twice.
+///
+/// The order of `trusted` is load-bearing for reproducibility: the baseline first, then the apps in
+/// name order, first occurrence kept. The two forms share **one** `seen` set, so a locator spelled
+/// literally `resolve:foo` and a resolver named `foo` collide on their single lock key rather than
+/// both claiming it.
+pub(crate) fn declared(kind: &dyn Kind, cfg: &crate::config::Resolved) -> Declared {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut trusted = Vec::new();
+    let mut all = std::collections::BTreeSet::new();
+    let mut absorb = |pkgs: &[crate::config::Package]| {
+        for (_, locator) in kind.packages(pkgs) {
+            if seen.insert(locator.clone()) {
+                trusted.push(Ref::Locator(locator));
+            }
+        }
+        for (name, command) in kind.resolve_packages(pkgs) {
+            if seen.insert(resolve_key(&name)) {
+                trusted.push(Ref::Resolve { name, command });
+            }
+        }
+        all.extend(pkgs.iter().filter_map(|p| kind.lock_key(p)));
+    };
+    absorb(&cfg.packages);
+    for app in cfg.apps.values() {
+        let mut merged = cfg.clone();
+        merged.merge_app(app.clone());
+        absorb(&merged.packages);
+    }
+    Declared { trusted, all }
+}
+
+/// How many of this backend's declared packages are withheld for being untrusted — across the
+/// project baseline and each app's own overlay. A count only (the per-package reason is already
+/// warned on the launch path), so `sbx upgrade` does not read as "none declared" when an untrusted
+/// project declares one. Each app is counted on its **own** package list rather than on the merged
+/// overlay, so a baseline package is not re-counted once per app.
+pub(crate) fn withheld(kind: &dyn Kind, cfg: &crate::config::Resolved) -> usize {
+    let untrusted = |pkgs: &[crate::config::Package]| {
+        pkgs.iter()
+            .filter(|p| kind.lock_key(p).is_some() && p.state != crate::trust::TrustState::Trusted)
+            .count()
+    };
+    untrusted(&cfg.packages)
+        + cfg
+            .apps
+            .values()
+            .map(|app| untrusted(&app.packages))
+            .sum::<usize>()
+}
+
+/// Whether the project (baseline or any app) declares a trusted `<backend>:resolve` package — so the
+/// upgrade path builds the (heavy) resolver sandbox only when it is actually needed.
+pub(crate) fn has_resolve_ref(kind: &dyn Kind, cfg: &crate::config::Resolved) -> bool {
+    let any = |pkgs: &[crate::config::Package]| !kind.resolve_packages(pkgs).is_empty();
+    any(&cfg.packages)
+        || cfg.apps.values().any(|app| {
+            let mut merged = cfg.clone();
+            merged.merge_app(app.clone());
+            any(&merged.packages)
+        })
 }
 
 /// One backend's per-project lock file name, derived from [`Kind::name`] — see [`lock_path`].

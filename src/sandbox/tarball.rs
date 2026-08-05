@@ -211,6 +211,24 @@ impl prebuilt::Kind for Tarball {
     ) -> String {
         derivation_expr(nixpkgs, system, name, url, hash)
     }
+
+    fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)> {
+        super::packages::tarball_packages(packages)
+    }
+
+    fn resolve_packages(&self, packages: &[crate::config::Package]) -> Vec<(String, Vec<String>)> {
+        super::packages::tarball_resolve_packages(packages)
+    }
+
+    fn lock_key(&self, package: &crate::config::Package) -> Option<String> {
+        match &package.backend {
+            crate::config::Backend::Tarball(url) => Some(url.clone()),
+            crate::config::Backend::TarballResolve { .. } => {
+                Some(prebuilt::resolve_key(&package.name))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The context a `tarball:` provisioning call runs in. See [`prebuilt::Ctx`].
@@ -271,26 +289,6 @@ pub(crate) fn provision_resolve_pinned(
     prebuilt::provision_resolve_pinned(&Tarball, &ctx(nix, layout, project, nixpkgs), name)
 }
 
-/// A declared `tarball:` reference to roll forward, in either form. The lock is keyed by [`Self::key`]
-/// — the direct URL, or `resolve:<name>` for a resolver package.
-enum TarballRef {
-    /// A direct `tarball:<url>` — resolves to itself; its content hash is always re-fetched.
-    Direct(String),
-    /// A `tarball:resolve` — its concrete download URL is re-derived by re-running the resolve
-    /// command, and the heavy tarball prefetch runs only when that URL differs from the stored pin.
-    Resolve { name: String, command: Vec<String> },
-}
-
-impl TarballRef {
-    /// The per-project lock key: the direct URL, or `resolve:<name>`.
-    fn key(&self) -> String {
-        match self {
-            TarballRef::Direct(url) => url.clone(),
-            TarballRef::Resolve { name, .. } => prebuilt::resolve_key(name),
-        }
-    }
-}
-
 /// Re-resolve a project's declared `tarball:` references and rewrite the per-project lock — pinning
 /// new ones, rolling changed ones forward, and pruning entries no longer declared. Mirrors
 /// [`super::deb::upgrade`]: references collected generically across the baseline and each app,
@@ -308,10 +306,10 @@ pub(crate) fn upgrade(
     cage: Option<&ResolveCage>,
 ) -> io::Result<Vec<TarballUpgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
-    let Declared {
+    let prebuilt::Declared {
         trusted: declared,
         all: universe,
-    } = declared(cfg);
+    } = prebuilt::declared(&Tarball, cfg);
     let mut lock = pins(layout, project_id.as_str());
     let mut outcomes = Vec::new();
 
@@ -332,10 +330,10 @@ pub(crate) fn upgrade(
         let previous = lock.get(&key).cloned();
         let resolved = match reference {
             // A direct URL: always re-prefetch (a stable URL's content can change).
-            TarballRef::Direct(url) => resolve_source(nix, layout, url, true),
+            prebuilt::Ref::Locator(url) => resolve_source(nix, layout, url, true),
             // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
             // reuse the pinned hash without prefetching the (large) tarball again.
-            TarballRef::Resolve { name, command } => match cage {
+            prebuilt::Ref::Resolve { name, command } => match cage {
                 None => Err(io::Error::other(
                     "cannot run the resolve command (no usable sandbox on this host)",
                 )),
@@ -381,20 +379,6 @@ pub(crate) fn upgrade(
     Ok(outcomes)
 }
 
-/// Whether the project (baseline or any app) declares a trusted `tarball:resolve` package — so the
-/// upgrade path builds the (heavy) resolver sandbox only when it is actually needed.
-fn has_resolve_ref(cfg: &crate::config::Resolved) -> bool {
-    let any = |pkgs: &[crate::config::Package]| {
-        !super::packages::tarball_resolve_packages(pkgs).is_empty()
-    };
-    any(&cfg.packages)
-        || cfg.apps.values().any(|app| {
-            let mut merged = cfg.clone();
-            merged.merge_app(app.clone());
-            any(&merged.packages)
-        })
-}
-
 /// `sbx upgrade tarball`: roll a project's declared `tarball:` packages forward. Builds the resolver
 /// sandbox (only when a `tarball:resolve` package is declared) and delegates to [`upgrade`]. A
 /// direct-only project keeps the cheap path (no base-userland build).
@@ -404,7 +388,7 @@ pub(crate) fn upgrade_project(
     project: &Path,
     cfg: &crate::config::Resolved,
 ) -> io::Result<Vec<TarballUpgrade>> {
-    let held = if has_resolve_ref(cfg) {
+    let held = if prebuilt::has_resolve_ref(&Tarball, cfg) {
         super::resolve::UpgradeCage::build(nix, layout, project, cfg)
     } else {
         None
@@ -413,78 +397,10 @@ pub(crate) fn upgrade_project(
     upgrade(nix, layout, project, cfg, cage.as_ref())
 }
 
-/// The two views `sbx upgrade tarball` needs of a project's declared `tarball:` references, collected
-/// in one pass over the baseline and each app overlay (see [`declared`]).
-struct Declared {
-    /// Deterministic, deduplicated, **trusted-only** — the set to roll forward (baseline first,
-    /// then apps by name), each in its declared form.
-    trusted: Vec<TarballRef>,
-    /// Every declared lock key **regardless of trust** — the universe the lock is pruned against, so
-    /// an untrusted/Changed project's still-declared package keeps its pin instead of being unpinned.
-    all: std::collections::BTreeSet<String>,
-}
-
-/// Collect both views in a single walk of the layers. Each app overlay is materialized once (a
-/// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
-/// universe — so `sbx upgrade` walks the apps once, not twice. Both `tarball:` forms are collected:
-/// a direct URL keyed by its URL, a resolver package keyed by `resolve:<name>`.
-fn declared(cfg: &crate::config::Resolved) -> Declared {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut trusted = Vec::new();
-    let mut all = std::collections::BTreeSet::new();
-    let mut absorb = |pkgs: &[crate::config::Package]| {
-        for (_, url) in super::packages::tarball_packages(pkgs) {
-            if seen.insert(url.clone()) {
-                trusted.push(TarballRef::Direct(url));
-            }
-        }
-        for (name, command) in super::packages::tarball_resolve_packages(pkgs) {
-            if seen.insert(prebuilt::resolve_key(&name)) {
-                trusted.push(TarballRef::Resolve { name, command });
-            }
-        }
-        for p in pkgs {
-            match &p.backend {
-                crate::config::Backend::Tarball(url) => {
-                    all.insert(url.clone());
-                }
-                crate::config::Backend::TarballResolve { .. } => {
-                    all.insert(prebuilt::resolve_key(&p.name));
-                }
-                _ => {}
-            }
-        }
-    };
-    absorb(&cfg.packages);
-    for app in cfg.apps.values() {
-        let mut merged = cfg.clone();
-        merged.merge_app(app.clone());
-        absorb(&merged.packages);
-    }
-    Declared { trusted, all }
-}
-
-/// How many declared `tarball:` packages are withheld for being untrusted — across the baseline and
-/// each app. A count only (the per-package reason is warned on the launch path), so `sbx upgrade`
-/// does not read as "none declared" when an untrusted project declares one.
+/// How many declared `tarball:` packages are withheld for being untrusted. See
+/// [`prebuilt::withheld`].
 pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
-    let untrusted = |pkgs: &[crate::config::Package]| {
-        pkgs.iter()
-            .filter(|p| {
-                matches!(
-                    p.backend,
-                    crate::config::Backend::Tarball(_)
-                        | crate::config::Backend::TarballResolve { .. }
-                ) && p.state != crate::trust::TrustState::Trusted
-            })
-            .count()
-    };
-    untrusted(&cfg.packages)
-        + cfg
-            .apps
-            .values()
-            .map(|app| untrusted(&app.packages))
-            .sum::<usize>()
+    prebuilt::withheld(&Tarball, cfg)
 }
 
 #[cfg(test)]
@@ -727,7 +643,11 @@ mod tests {
         );
         // Both `tarball:` forms are collected, baseline first (direct, then resolver), then the app's
         // new url; the duplicate and the untrusted one are gone.
-        let keys: Vec<String> = declared(&cfg).trusted.iter().map(TarballRef::key).collect();
+        let keys: Vec<String> = prebuilt::declared(&Tarball, &cfg)
+            .trusted
+            .iter()
+            .map(prebuilt::Ref::key)
+            .collect();
         assert_eq!(
             keys,
             vec![
@@ -753,7 +673,7 @@ mod tests {
         );
         // The prune universe keeps every declared key regardless of trust, so `sbx upgrade` on a
         // Changed project never unpins a still-declared package.
-        let universe = declared(&cfg).all;
+        let universe = prebuilt::declared(&Tarball, &cfg).all;
         assert!(universe.contains("https://e/a.tar.gz"));
         assert!(
             universe.contains("https://e/evil.tar.gz"),
@@ -772,17 +692,17 @@ mod tests {
     #[test]
     fn has_resolve_ref_detects_a_declared_resolver_in_the_baseline_or_an_app() {
         let baseline = resolved(vec![tarball_resolve_pkg("r", &["print"], true)], vec![]);
-        assert!(has_resolve_ref(&baseline));
+        assert!(prebuilt::has_resolve_ref(&Tarball, &baseline));
 
         let direct_only = resolved(vec![tarball_pkg("d", "https://e/d.tar.gz", true)], vec![]);
-        assert!(!has_resolve_ref(&direct_only));
+        assert!(!prebuilt::has_resolve_ref(&Tarball, &direct_only));
 
         let in_app = resolved(
             vec![],
             vec![("a", app_with(vec![tarball_resolve_pkg("ar", &["p"], true)]))],
         );
         assert!(
-            has_resolve_ref(&in_app),
+            prebuilt::has_resolve_ref(&Tarball, &in_app),
             "a resolver declared only inside an app overlay is still detected"
         );
     }

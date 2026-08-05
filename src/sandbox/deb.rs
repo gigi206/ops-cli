@@ -401,6 +401,22 @@ impl prebuilt::Kind for Deb {
     ) -> String {
         derivation_expr(nixpkgs, system, name, url, hash)
     }
+
+    fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)> {
+        super::packages::deb_packages(packages)
+    }
+
+    fn resolve_packages(&self, packages: &[crate::config::Package]) -> Vec<(String, Vec<String>)> {
+        super::packages::deb_resolve_packages(packages)
+    }
+
+    fn lock_key(&self, package: &crate::config::Package) -> Option<String> {
+        match &package.backend {
+            crate::config::Backend::Deb(url) => Some(url.clone()),
+            crate::config::Backend::DebResolve { .. } => Some(prebuilt::resolve_key(&package.name)),
+            _ => None,
+        }
+    }
 }
 
 /// The context a `deb:` provisioning call runs in. See [`prebuilt::Ctx`].
@@ -461,28 +477,6 @@ pub(crate) fn provision_resolve_pinned(
     prebuilt::provision_resolve_pinned(&Deb, &ctx(nix, layout, project, nixpkgs), name)
 }
 
-/// A declared `deb:` reference to roll forward, in either form. The lock is keyed by [`Self::key`] —
-/// the declared locator (a direct `.deb` URL, `github:…`, or `apt:…`), or `resolve:<name>` for a
-/// resolver package.
-enum DebRef {
-    /// A locator resolved via [`resolve_source`] — a direct URL, `github:<owner>/<repo>`, or
-    /// `apt:<index>`. Its concrete `.deb` URL and content hash are always re-derived on upgrade.
-    Locator(String),
-    /// A `deb:resolve` — its concrete download URL is re-derived by re-running the resolve command,
-    /// and the heavy `.deb` prefetch runs only when that URL differs from the stored pin.
-    Resolve { name: String, command: Vec<String> },
-}
-
-impl DebRef {
-    /// The per-project lock key: the declared locator, or `resolve:<name>`.
-    fn key(&self) -> String {
-        match self {
-            DebRef::Locator(locator) => locator.clone(),
-            DebRef::Resolve { name, .. } => prebuilt::resolve_key(name),
-        }
-    }
-}
-
 /// Re-resolve a project's declared `deb:` references and rewrite the per-project lock — pinning new
 /// ones, rolling changed ones forward, and pruning entries no longer declared. Mirrors
 /// [`super::tarball::upgrade`]: references collected generically across the baseline and each app,
@@ -501,10 +495,10 @@ pub(crate) fn upgrade(
 ) -> io::Result<Vec<DebUpgrade>> {
     let project_id = super::binds::project_runtime_id(project)?;
     // One walk of the layers yields both the trusted roll set and the trust-agnostic prune universe.
-    let Declared {
+    let prebuilt::Declared {
         trusted: declared,
         all: universe,
-    } = declared(cfg);
+    } = prebuilt::declared(&Deb, cfg);
     let system = super::current_system();
     let mut lock = pins(layout, project_id.as_str());
     let mut outcomes = Vec::new();
@@ -528,10 +522,10 @@ pub(crate) fn upgrade(
             // A locator: always re-resolve (a `latest`/`github:`/`apt:` source can move). `fresh`
             // re-queries GitHub / the apt index past the fetch cache so a new release is seen; the
             // lock records the resolved asset URL, not the locator.
-            DebRef::Locator(locator) => resolve_source(nix, layout, locator, &system, true),
+            prebuilt::Ref::Locator(locator) => resolve_source(nix, layout, locator, &system, true),
             // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
             // reuse the pinned hash without prefetching the (large) `.deb` again.
-            DebRef::Resolve { name, command } => match cage {
+            prebuilt::Ref::Resolve { name, command } => match cage {
                 None => Err(io::Error::other(
                     "cannot run the resolve command (no usable sandbox on this host)",
                 )),
@@ -581,19 +575,6 @@ pub(crate) fn upgrade(
     Ok(outcomes)
 }
 
-/// Whether the project (baseline or any app) declares a trusted `deb:resolve` package — so the
-/// upgrade path builds the (heavy) resolver sandbox only when it is actually needed.
-fn has_resolve_ref(cfg: &crate::config::Resolved) -> bool {
-    let any =
-        |pkgs: &[crate::config::Package]| !super::packages::deb_resolve_packages(pkgs).is_empty();
-    any(&cfg.packages)
-        || cfg.apps.values().any(|app| {
-            let mut merged = cfg.clone();
-            merged.merge_app(app.clone());
-            any(&merged.packages)
-        })
-}
-
 /// `sbx upgrade deb`: roll a project's declared `deb:` packages forward. Builds the resolver sandbox
 /// (only when a `deb:resolve` package is declared) and delegates to [`upgrade`]. A locator-only
 /// project keeps the cheap path (no base-userland build).
@@ -603,7 +584,7 @@ pub(crate) fn upgrade_project(
     project: &Path,
     cfg: &crate::config::Resolved,
 ) -> io::Result<Vec<DebUpgrade>> {
-    let held = if has_resolve_ref(cfg) {
+    let held = if prebuilt::has_resolve_ref(&Deb, cfg) {
         super::resolve::UpgradeCage::build(nix, layout, project, cfg)
     } else {
         None
@@ -612,77 +593,9 @@ pub(crate) fn upgrade_project(
     upgrade(nix, layout, project, cfg, cage.as_ref())
 }
 
-/// The two views `sbx upgrade deb` needs of a project's declared `deb:` references, collected in one
-/// pass over the baseline and each app overlay (see [`declared`]).
-struct Declared {
-    /// Deterministic, deduplicated, **trusted-only** — the set to roll forward (baseline first,
-    /// then apps by name), each in its declared form.
-    trusted: Vec<DebRef>,
-    /// Every declared lock key **regardless of trust** — the universe the lock is pruned against, so
-    /// an untrusted/Changed project's still-declared package keeps its pin instead of being unpinned.
-    all: std::collections::BTreeSet<String>,
-}
-
-/// Collect both views in a single walk of the layers. Each app overlay is materialized once (a
-/// `merge_app` clone), then contributes to both the trusted roll set and the trust-agnostic prune
-/// universe — so `sbx upgrade` walks the apps once, not twice. Both `deb:` forms are collected: a
-/// locator keyed by its locator string, a resolver package keyed by `resolve:<name>`.
-fn declared(cfg: &crate::config::Resolved) -> Declared {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut trusted = Vec::new();
-    let mut all = std::collections::BTreeSet::new();
-    let mut absorb = |pkgs: &[crate::config::Package]| {
-        for (_, locator) in super::packages::deb_packages(pkgs) {
-            if seen.insert(locator.clone()) {
-                trusted.push(DebRef::Locator(locator));
-            }
-        }
-        for (name, command) in super::packages::deb_resolve_packages(pkgs) {
-            if seen.insert(prebuilt::resolve_key(&name)) {
-                trusted.push(DebRef::Resolve { name, command });
-            }
-        }
-        for p in pkgs {
-            match &p.backend {
-                crate::config::Backend::Deb(url) => {
-                    all.insert(url.clone());
-                }
-                crate::config::Backend::DebResolve { .. } => {
-                    all.insert(prebuilt::resolve_key(&p.name));
-                }
-                _ => {}
-            }
-        }
-    };
-    absorb(&cfg.packages);
-    for app in cfg.apps.values() {
-        let mut merged = cfg.clone();
-        merged.merge_app(app.clone());
-        absorb(&merged.packages);
-    }
-    Declared { trusted, all }
-}
-
-/// How many declared `deb:` packages are withheld for being untrusted — across the baseline and
-/// each app. A count only (the per-package reason is warned on the launch path), so `sbx upgrade`
-/// does not read as "none declared" when an untrusted project declares one.
+/// How many declared `deb:` packages are withheld for being untrusted. See [`prebuilt::withheld`].
 pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
-    let untrusted = |pkgs: &[crate::config::Package]| {
-        pkgs.iter()
-            .filter(|p| {
-                matches!(
-                    p.backend,
-                    crate::config::Backend::Deb(_) | crate::config::Backend::DebResolve { .. }
-                ) && p.state != crate::trust::TrustState::Trusted
-            })
-            .count()
-    };
-    untrusted(&cfg.packages)
-        + cfg
-            .apps
-            .values()
-            .map(|app| untrusted(&app.packages))
-            .sum::<usize>()
+    prebuilt::withheld(&Deb, cfg)
 }
 
 #[cfg(test)]
@@ -996,7 +909,11 @@ mod tests {
             ],
         );
         // baseline first, then the app's new url; the duplicate and the untrusted one are gone.
-        let keys: Vec<String> = declared(&cfg).trusted.iter().map(DebRef::key).collect();
+        let keys: Vec<String> = prebuilt::declared(&Deb, &cfg)
+            .trusted
+            .iter()
+            .map(prebuilt::Ref::key)
+            .collect();
         assert_eq!(keys, vec!["https://e/a.deb", "https://e/b.deb"]);
     }
 
@@ -1015,7 +932,7 @@ mod tests {
                 app_with(vec![deb_pkg("c", "https://e/c.deb", false)]),
             )],
         );
-        let universe = declared(&cfg).all;
+        let universe = prebuilt::declared(&Deb, &cfg).all;
         assert!(universe.contains("https://e/a.deb"));
         assert!(
             universe.contains("https://e/evil.deb"),
