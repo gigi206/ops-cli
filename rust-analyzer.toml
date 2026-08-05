@@ -1,0 +1,18 @@
+# rust-analyzer configuration for this repository.
+#
+# Read natively by rust-analyzer as workspace-local config, so it applies to every
+# client alike -- the editor's server and Claude Code's LSP plugin.
+
+[cargo]
+# Give rust-analyzer its own target directory. Without it, its `cargo check` and its
+# initial build-script and proc-macro build lock `Cargo.lock` against the project's own
+# `cargo test` and `mise run build`, and the two starve each other -- measured here, an
+# initial index took ~25 minutes while a cage test suite was running. The cost is a
+# duplicated build tree; `/target` is already git-ignored, so nothing of it is tracked.
+targetDir = "target/rust-analyzer"
+
+[files]
+# Nothing under these is Rust the analyzer needs: the Docusaurus site, the example app
+# profiles (TOML), and the image assets. Paths are relative to the workspace root and
+# globs are not supported.
+excludeDirs = ["docs-site", "examples", "assets"]
