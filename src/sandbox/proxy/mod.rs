@@ -180,7 +180,7 @@ use ctx::effective_policy;
 pub(crate) use ctx::{builtin_allow_rules, union_with_builtin, ProxyCtx};
 pub(crate) use inject::{HeaderInjection, SecretNeedle};
 use pool::{PoolKey, UpstreamTls};
-use ssrf::ip_permitted;
+use ssrf::{checked_address, resolve_checked};
 pub(crate) use ssrf::{ip_refusal, names_exact_host, AddrRefusal};
 use websocket::*;
 use wire::*;
@@ -738,53 +738,28 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         );
     }
 
-    // 6. Resolve host-side, then the SSRF guard. A resolution failure for an allowed host is a
-    //    clean 502 (not a dropped connection), so the agent sees "the name did not resolve"
-    //    rather than an ambiguous transport error.
-    let ips = match (ctx.resolve)(&connect_host) {
-        Ok(ips) => ips,
-        Err(_) => {
-            // Allowed, but the name did not resolve: an `error`, not a refusal — the log's whole
-            // point is that this reads differently from "we said no".
-            ctx.push_log(
-                super::control::Proto::Https,
-                &connect_host,
-                port,
-                Some(&imethod),
-                Some(&itarget),
-                super::control::LogVerdict::Error,
-                "dns-failure",
-            );
+    // 6. Resolve host-side, then the SSRF guard — one call, which records the refusal whichever way
+    //    it goes. A resolution failure for an allowed host is a clean 502 (not a dropped
+    //    connection), so the agent sees "the name did not resolve" rather than an ambiguous
+    //    transport error.
+    let ip = match resolve_checked(
+        ctx,
+        super::control::Proto::Https,
+        &connect_host,
+        port,
+        Some(&imethod),
+        Some(&itarget),
+        deciding.as_ref(),
+    ) {
+        Ok(ip) => ip,
+        Err(refusal) => {
             return respond_refusal_tls(
                 &mut br,
-                "502 Bad Gateway",
-                "dns-failure",
-                &format!("DNS resolution failed for `{connect_host}`"),
-            );
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(&connect_host),
+            )
         }
-    };
-    let Some(ip) = ips
-        .into_iter()
-        .find(|ip| ip_permitted(*ip, &connect_host, deciding.as_ref()))
-    else {
-        ctx.outcome(
-            super::control::Proto::Https,
-            &connect_host,
-            port,
-            Some(&imethod),
-            Some(&itarget),
-            StatKind::Blocked,
-            "ssrf-blocked",
-        );
-        return respond_refusal_tls(
-            &mut br,
-            "403 Forbidden",
-            "ssrf-blocked",
-            &format!(
-                "`{connect_host}` resolved only to disallowed addresses (a private or \
-                 metadata range)"
-            ),
-        );
     };
 
     // 7. Match this request's host-scoped credential injections. This runs *after* the verdict, so a
@@ -1258,51 +1233,39 @@ fn splice_l4(
     // it is used directly; a hostname is resolved, and a failure is a clean 502 (not a dropped
     // connection). Then the SSRF guard against the deciding rule — a private/metadata address is
     // refused unless the rule names this exact host.
-    let ips = match connect_host.parse::<IpAddr>() {
-        Ok(ip) => vec![ip],
-        Err(_) => match (ctx.resolve)(connect_host) {
-            Ok(ips) => ips,
-            Err(_) => {
-                ctx.push_log(
-                    super::control::Proto::Tcp,
-                    connect_host,
-                    port,
-                    None,
-                    None,
-                    super::control::LogVerdict::Error,
-                    "dns-failure",
-                );
-                return write_refusal(
-                    &mut client,
-                    "502 Bad Gateway",
-                    "dns-failure",
-                    &format!("DNS resolution failed for `{connect_host}`"),
-                );
-            }
-        },
-    };
-    let Some(ip) = ips
-        .into_iter()
-        .find(|ip| ip_permitted(*ip, connect_host, Some(deciding)))
-    else {
-        ctx.outcome(
+    let checked = match connect_host.parse::<IpAddr>() {
+        // An IP-literal target: this path is the only one that accepts one, and there is nothing to
+        // resolve — the guard still decides.
+        Ok(ip) => checked_address(
+            ctx,
             super::control::Proto::Tcp,
             connect_host,
             port,
             None,
             None,
-            StatKind::Blocked,
-            "ssrf-blocked",
-        );
-        return write_refusal(
-            &mut client,
-            "403 Forbidden",
-            "ssrf-blocked",
-            &format!(
-                "`{connect_host}` resolved only to disallowed addresses (a private or \
-                 metadata range)"
-            ),
-        );
+            Some(deciding),
+            vec![ip],
+        ),
+        Err(_) => resolve_checked(
+            ctx,
+            super::control::Proto::Tcp,
+            connect_host,
+            port,
+            None,
+            None,
+            Some(deciding),
+        ),
+    };
+    let ip = match checked {
+        Ok(ip) => ip,
+        Err(refusal) => {
+            return write_refusal(
+                &mut client,
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(connect_host),
+            )
+        }
     };
 
     // Open the raw upstream to the checked address (no TLS, no certificate validation — a raw splice
@@ -1601,47 +1564,24 @@ fn handle_cleartext(
     // 6. Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata address
     //    is refused unless the `http://` rule names this exact host). A resolution failure for an
     //    allowed host is a clean 502, distinct from a refusal.
-    let ips = match (ctx.resolve)(&host) {
-        Ok(ips) => ips,
-        Err(_) => {
-            ctx.push_log(
-                super::control::Proto::Http,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
-                super::control::LogVerdict::Error,
-                "dns-failure",
-            );
+    let ip = match resolve_checked(
+        ctx,
+        super::control::Proto::Http,
+        &host,
+        port,
+        Some(method),
+        Some(&path),
+        Some(&deciding),
+    ) {
+        Ok(ip) => ip,
+        Err(refusal) => {
             return write_refusal(
                 &mut client,
-                "502 Bad Gateway",
-                "dns-failure",
-                &format!("DNS resolution failed for `{host}`"),
-            );
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(&host),
+            )
         }
-    };
-    let Some(ip) = ips
-        .into_iter()
-        .find(|ip| ip_permitted(*ip, &host, Some(&deciding)))
-    else {
-        ctx.outcome(
-            super::control::Proto::Http,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            StatKind::Blocked,
-            "ssrf-blocked",
-        );
-        return write_refusal(
-            &mut client,
-            "403 Forbidden",
-            "ssrf-blocked",
-            &format!(
-                "`{host}` resolved only to disallowed addresses (a private or metadata range)"
-            ),
-        );
     };
 
     // 7. Open the plaintext upstream to the checked address (no TLS, no certificate — an `http://`
@@ -2071,47 +2011,24 @@ fn handle_https_forward(
 
     // 6. Resolve host-side, then the SSRF guard against the deciding rule. A resolution failure for an
     //    allowed host is a clean 502, distinct from a refusal.
-    let ips = match (ctx.resolve)(&host) {
-        Ok(ips) => ips,
-        Err(_) => {
-            ctx.push_log(
-                super::control::Proto::Https,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
-                super::control::LogVerdict::Error,
-                "dns-failure",
-            );
+    let ip = match resolve_checked(
+        ctx,
+        super::control::Proto::Https,
+        &host,
+        port,
+        Some(method),
+        Some(&path),
+        deciding.as_ref(),
+    ) {
+        Ok(ip) => ip,
+        Err(refusal) => {
             return write_refusal(
                 &mut client,
-                "502 Bad Gateway",
-                "dns-failure",
-                &format!("DNS resolution failed for `{host}`"),
-            );
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(&host),
+            )
         }
-    };
-    let Some(ip) = ips
-        .into_iter()
-        .find(|ip| ip_permitted(*ip, &host, deciding.as_ref()))
-    else {
-        ctx.outcome(
-            super::control::Proto::Https,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            StatKind::Blocked,
-            "ssrf-blocked",
-        );
-        return write_refusal(
-            &mut client,
-            "403 Forbidden",
-            "ssrf-blocked",
-            &format!(
-                "`{host}` resolved only to disallowed addresses (a private or metadata range)"
-            ),
-        );
     };
 
     // 7. Match this request's host-scoped credential injection — after the verdict (a denied request
@@ -4748,7 +4665,7 @@ mod tests {
     /// sending an absolute-form `https://` request to a host that resolves into a private / cloud-
     /// metadata range must be blocked. A wildcard-matched host that resolves to loopback is an SSRF
     /// wildcard; a metadata address is refused even for an exact host. This discriminates that the
-    /// deciding rule is threaded into `ip_permitted` the same way the MITM path threads it.
+    /// deciding rule is threaded into the shared guard the same way the MITM path threads it.
     #[test]
     fn the_https_forward_path_blocks_ssrf_to_private_and_metadata_addresses() {
         // wildcard match (no exact-named host) → loopback → blocked

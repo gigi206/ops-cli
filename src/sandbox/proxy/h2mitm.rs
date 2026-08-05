@@ -17,7 +17,7 @@
 
 use super::capture::CapBuf;
 use super::{
-    carries_secret, effective_policy, ip_permitted, matching_injections, redact_in_place,
+    carries_secret, effective_policy, matching_injections, redact_in_place, resolve_checked,
     upstream_server_name, ProxyCtx, SecretNeedle, StatKind,
 };
 use crate::allowlist::{self, Decision, Rule};
@@ -303,41 +303,20 @@ async fn stream(
     // Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata
     // address is refused unless the rule names the exact host) — then connect the checked IP with
     // no re-resolution, exactly like the HTTP/1.1 path.
-    let ips = match (ctx.resolve)(connect_host) {
-        Ok(ips) => ips,
-        Err(_) => {
-            ctx.push_log(
-                Proto::Https,
-                connect_host,
-                port,
-                Some(method.as_str()),
-                Some(&path),
-                LogVerdict::Error,
-                "dns-failure",
-            );
-            let _ = refuse(respond, StatusCode::BAD_GATEWAY, "dns-failure");
-            return;
-        }
-    };
-    let ip = match ips
-        .into_iter()
-        .find(|ip| ip_permitted(*ip, connect_host, deciding.as_ref()))
-    {
-        Some(ip) => ip,
-        None => {
-            // Through `outcome`, not `push_log`: an SSRF block is a refusal, so it owes the reader
-            // the `blocked` counter and the desktop notice as well as the log line — exactly what
-            // the same guard records on the HTTP/1.1 path.
-            ctx.outcome(
-                Proto::Https,
-                connect_host,
-                port,
-                Some(method.as_str()),
-                Some(&path),
-                StatKind::Blocked,
-                "ssrf-blocked",
-            );
-            let _ = refuse(respond, StatusCode::FORBIDDEN, "ssrf-blocked");
+    let ip = match resolve_checked(
+        ctx,
+        Proto::Https,
+        connect_host,
+        port,
+        Some(method.as_str()),
+        Some(&path),
+        deciding.as_ref(),
+    ) {
+        Ok(ip) => ip,
+        Err(refusal) => {
+            // The refusal is already recorded — the shared guard counts an SSRF block and logs a
+            // resolution failure, so this path answers the client and nothing else.
+            let _ = refuse(respond, refusal.status(), refusal.tag());
             return;
         }
     };

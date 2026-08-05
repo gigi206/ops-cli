@@ -1,13 +1,18 @@
-//! The post-resolution SSRF guard: classify a resolved address as public / private / blocked, and
-//! decide whether the proxy may connect to it for a given host and deciding rule.
+//! The address a connect path is allowed to dial: resolve the host, classify what came back as
+//! public / private / blocked, and decide whether the proxy may connect to it for this host and
+//! deciding rule.
 //!
 //! The proxy runs on the host with full network reach, so an allowlisted *hostname* (or a rebound
-//! DNS answer for it) resolving to an internal address would be an SSRF vector; these functions are
-//! the post-resolution guard applied before every upstream connection.
+//! DNS answer for it) resolving to an internal address would be an SSRF vector; the guard below is
+//! applied before every upstream connection. It is reached only through [`resolve_checked`] /
+//! [`checked_address`], which record the refusal as they make it -- so a connect path cannot turn a
+//! request down here without the counter, the log and the notification saying so.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use super::{ProxyCtx, StatKind};
 use crate::allowlist::{self, Rule, RuleKind};
+use crate::sandbox::control::{LogVerdict, Proto};
 
 /// Whether a resolved address is public, a private/internal range, or one that is refused
 /// outright. The proxy runs on the host with full network reach, so an allowlisted *hostname*
@@ -105,8 +110,9 @@ pub(crate) enum AddrRefusal {
 /// via `deciding`, or `None` when it may connect. Public addresses are reachable; a private address
 /// is reachable only when the deciding rule named this exact host (a deliberate internal target —
 /// not a `*.domain`/regex/built-in match, which would turn into an SSRF wildcard); a blocked address
-/// never is. The single decision behind both callers: the proxy's [`ip_permitted`] and the
-/// `sbx test net` tester, which would otherwise mispredict a private target.
+/// never is. The single decision behind both callers: the proxy's guarded resolution
+/// ([`checked_address`]) and the `sbx test net` tester, which would otherwise mispredict a private
+/// target.
 pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Option<AddrRefusal> {
     match classify_ip(ip) {
         IpClass::Public => None,
@@ -117,9 +123,117 @@ pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Opt
 }
 
 /// Whether the proxy may connect to `ip` for a request to `host` the policy permitted via
-/// `deciding` — [`ip_refusal`] read as a boolean, which is all the connect paths need.
-pub(super) fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
+/// `deciding` — [`ip_refusal`] read as a boolean, which is all the connect paths need. Private to
+/// this module: a path reaches it through [`checked_address`], never directly, so the refusal is
+/// always recorded.
+fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
     ip_refusal(ip, host, deciding).is_none()
+}
+
+/// Why a connect path may not reach a host the policy allowed: the name did not resolve, or every
+/// address it resolved to is one the guard refuses. Both are answered to the client, so each knows
+/// the status to answer with, the stable `x-sbx-egress-reason` token, and the sentence the refusal
+/// body repeats — the four connect paths differ in how they write a refusal, not in what it says.
+pub(super) enum ConnectRefusal {
+    /// The name did not resolve. An *error*, not a refusal: the policy said yes, so it is logged as
+    /// one and moves no counter — the whole point of the distinction is that this reads differently
+    /// from "we said no".
+    Dns,
+    /// Every resolved address was private or never-reachable, and the deciding rule names no exact
+    /// host. A security guard firing, so it is counted and announced like the others.
+    Ssrf,
+}
+
+impl ConnectRefusal {
+    /// The status line the HTTP/1.1 paths write.
+    pub(super) fn status_line(&self) -> &'static str {
+        match self {
+            Self::Dns => "502 Bad Gateway",
+            Self::Ssrf => "403 Forbidden",
+        }
+    }
+
+    /// The same status for the HTTP/2 path, which frames it rather than writing it.
+    pub(super) fn status(&self) -> http::StatusCode {
+        match self {
+            Self::Dns => http::StatusCode::BAD_GATEWAY,
+            Self::Ssrf => http::StatusCode::FORBIDDEN,
+        }
+    }
+
+    /// The stable reason token: the `x-sbx-egress-reason` header, and the reason in the log.
+    pub(super) fn tag(&self) -> &'static str {
+        match self {
+            Self::Dns => "dns-failure",
+            Self::Ssrf => "ssrf-blocked",
+        }
+    }
+
+    /// The sentence the refusal body carries, naming the host the client asked for.
+    pub(super) fn message(&self, host: &str) -> String {
+        match self {
+            Self::Dns => format!("DNS resolution failed for `{host}`"),
+            Self::Ssrf => format!(
+                "`{host}` resolved only to disallowed addresses (a private or metadata range)"
+            ),
+        }
+    }
+}
+
+/// Resolve `host` host-side, then settle on the one address the proxy may dial for it: the first
+/// resolved address the guard permits for `deciding`. A resolution failure for an allowed host is
+/// an error the client is told about (a clean `502`), not a dropped connection.
+pub(super) fn resolve_checked(
+    ctx: &ProxyCtx,
+    proto: Proto,
+    host: &str,
+    port: u16,
+    method: Option<&str>,
+    path: Option<&str>,
+    deciding: Option<&Rule>,
+) -> Result<IpAddr, ConnectRefusal> {
+    let Ok(ips) = (ctx.resolve)(host) else {
+        ctx.push_log(
+            proto,
+            host,
+            port,
+            method,
+            path,
+            LogVerdict::Error,
+            ConnectRefusal::Dns.tag(),
+        );
+        return Err(ConnectRefusal::Dns);
+    };
+    checked_address(ctx, proto, host, port, method, path, deciding, ips)
+}
+
+/// The guard alone, over addresses already in hand — for the raw splice, whose target may be an IP
+/// literal it holds without resolving anything. [`resolve_checked`] is this with the resolution in
+/// front of it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn checked_address(
+    ctx: &ProxyCtx,
+    proto: Proto,
+    host: &str,
+    port: u16,
+    method: Option<&str>,
+    path: Option<&str>,
+    deciding: Option<&Rule>,
+    ips: Vec<IpAddr>,
+) -> Result<IpAddr, ConnectRefusal> {
+    let Some(ip) = ips.into_iter().find(|ip| ip_permitted(*ip, host, deciding)) else {
+        ctx.outcome(
+            proto,
+            host,
+            port,
+            method,
+            path,
+            StatKind::Blocked,
+            ConnectRefusal::Ssrf.tag(),
+        );
+        return Err(ConnectRefusal::Ssrf);
+    };
+    Ok(ip)
 }
 
 /// Whether `deciding` is an explicit, exact-host rule for `host` (not a wildcard/regex). Used to
