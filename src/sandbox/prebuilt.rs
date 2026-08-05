@@ -414,19 +414,60 @@ pub(crate) trait Kind {
         hash: &str,
     ) -> String;
 
+    /// Which of this backend's two declaration forms `package` uses, or `None` when it belongs to
+    /// another backend. The one place a backend reads a [`crate::config::Backend`], and the only one
+    /// that has to be kept exhaustive: everything below is derived from it.
+    ///
+    /// It answers about the *declaration*, never about trust — the trust filter belongs to the two
+    /// collectors below, because [`Kind::lock_key`] must stay trust-agnostic.
+    fn form(&self, package: &crate::config::Package) -> Option<Form>;
+
     /// This backend's **trusted** direct packages as `(package name, declared locator)` — the form
     /// whose locator is resolved by [`Kind::resolve_source`].
-    fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)>;
+    fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)> {
+        packages
+            .iter()
+            .filter(|p| p.state == crate::trust::TrustState::Trusted)
+            .filter_map(|p| match self.form(p) {
+                Some(Form::Direct(locator)) => Some((p.name.clone(), locator)),
+                Some(Form::Resolve(_)) | None => None,
+            })
+            .collect()
+    }
 
     /// This backend's **trusted** `<backend>:resolve` packages as `(package name, resolve command)` —
-    /// the form whose download URL is re-derived by running a command in a sandbox.
-    fn resolve_packages(&self, packages: &[crate::config::Package]) -> Vec<(String, Vec<String>)>;
+    /// the form whose download URL is re-derived by running a command in a sandbox. Withholding an
+    /// untrusted one here is what keeps its command from ever being executed.
+    fn resolve_packages(&self, packages: &[crate::config::Package]) -> Vec<(String, Vec<String>)> {
+        packages
+            .iter()
+            .filter(|p| p.state == crate::trust::TrustState::Trusted)
+            .filter_map(|p| match self.form(p) {
+                Some(Form::Resolve(command)) => Some((p.name.clone(), command)),
+                Some(Form::Direct(_)) | None => None,
+            })
+            .collect()
+    }
 
     /// The per-project lock key this package occupies, or `None` when the package belongs to another
     /// backend. **Deliberately trust-agnostic**, unlike [`Kind::packages`]: it answers "does this
     /// config still declare that lock entry", which is what the prune universe asks, and pruning must
     /// not depend on trust (see [`declared`]).
-    fn lock_key(&self, package: &crate::config::Package) -> Option<String>;
+    fn lock_key(&self, package: &crate::config::Package) -> Option<String> {
+        match self.form(package)? {
+            Form::Direct(locator) => Some(locator),
+            Form::Resolve(_) => Some(resolve_key(&package.name)),
+        }
+    }
+}
+
+/// How a package declared one of the prebuilt backends: a locator resolved by
+/// [`Kind::resolve_source`], or a command run in a sandbox to print the newest download URL. The
+/// distinction a backend's own `match` on [`crate::config::Backend`] draws, lifted out so the three
+/// things that follow from it — the two admitted-package lists and the lock key — are written once.
+pub(crate) enum Form {
+    Direct(String),
+    Resolve(Vec<String>),
 }
 
 /// The three backends in the order a launch provisions their **direct** packages. Both arrays must
@@ -889,17 +930,10 @@ mod tests {
         ) -> String {
             unreachable!("upgrade never builds a derivation")
         }
-        fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)> {
-            Tarball.packages(packages)
-        }
-        fn resolve_packages(
-            &self,
-            packages: &[crate::config::Package],
-        ) -> Vec<(String, Vec<String>)> {
-            Tarball.resolve_packages(packages)
-        }
-        fn lock_key(&self, package: &crate::config::Package) -> Option<String> {
-            Tarball.lock_key(package)
+        /// Reads a config exactly as `tarball:` does, so the three lists derived from it are the real
+        /// ones — the fake diverges from a production backend only where a test needs it to.
+        fn form(&self, package: &crate::config::Package) -> Option<Form> {
+            Tarball.form(package)
         }
     }
 
@@ -1015,12 +1049,90 @@ mod tests {
             ("six", Backend::DebResolve { command: command() }),
         ]
         .into_iter()
-        .map(|(name, backend)| crate::config::Package {
+        .map(|(name, backend)| pkg(name, backend, true))
+        .collect()
+    }
+
+    fn pkg(name: &str, backend: crate::config::Backend, trusted: bool) -> crate::config::Package {
+        crate::config::Package {
             name: name.into(),
             backend,
-            state: crate::trust::TrustState::Trusted,
-        })
-        .collect()
+            state: if trusted {
+                crate::trust::TrustState::Trusted
+            } else {
+                crate::trust::TrustState::Untrusted
+            },
+        }
+    }
+
+    /// The trust filter lives in the two admitted-package lists and nowhere else — [`Kind::lock_key`]
+    /// deliberately answers for untrusted packages too. These two tests hold that line from the
+    /// admitted side: a package the config withheld must not reach the launcher. They run through
+    /// `Tarball`, whose [`Kind::form`] is the same three-line dispatch its two siblings implement.
+    #[test]
+    fn the_direct_list_keeps_only_trusted_packages_of_that_form() {
+        let pkgs = [
+            pkg(
+                "app",
+                crate::config::Backend::Tarball("https://example.com/app.tar.gz".into()),
+                true,
+            ),
+            // a nix package belongs to no prebuilt backend
+            pkg(
+                "node",
+                crate::config::Backend::Nix("nodejs_20".into()),
+                true,
+            ),
+            pkg(
+                "evil",
+                crate::config::Backend::Tarball("https://example.com/evil.tar.gz".into()),
+                false,
+            ),
+            // the resolve form is not a direct locator
+            pkg(
+                "rz",
+                crate::config::Backend::TarballResolve {
+                    command: vec!["print-the-newest-url".into()],
+                },
+                true,
+            ),
+        ];
+        assert_eq!(
+            Tarball.packages(&pkgs),
+            vec![(
+                "app".to_string(),
+                "https://example.com/app.tar.gz".to_string()
+            )],
+            "only the trusted DIRECT locator, keyed by name; nix, resolve and untrusted excluded"
+        );
+    }
+
+    #[test]
+    fn the_resolver_list_keeps_only_trusted_packages_of_that_form() {
+        let command = || vec!["print-the-newest-url".to_string()];
+        let pkgs = [
+            pkg(
+                "keep",
+                crate::config::Backend::TarballResolve { command: command() },
+                true,
+            ),
+            pkg(
+                "direct",
+                crate::config::Backend::Tarball("https://example.com/app.tar.gz".into()),
+                true,
+            ),
+            // withheld here is what keeps an untrusted project's command from ever being executed
+            pkg(
+                "drop",
+                crate::config::Backend::TarballResolve { command: command() },
+                false,
+            ),
+        ];
+        assert_eq!(
+            Tarball.resolve_packages(&pkgs),
+            vec![("keep".to_string(), command())],
+            "only the trusted resolver (name, command); the direct form and untrusted excluded"
+        );
     }
 
     /// The two walk orders are what the launcher provisions through, and neither property they carry

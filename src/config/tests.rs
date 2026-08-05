@@ -4029,8 +4029,9 @@ fn an_empty_tarball_resolve_command_is_dropped_with_a_warning() {
 
 #[test]
 fn an_untrusted_projects_tarball_resolve_is_stamped_untrusted() {
-    // Trust is recorded, not enforced, at resolve: the launcher (`tarball_resolve_packages`,
-    // trusted-only) withholds it and NEVER runs its command, like the direct `tarball:` form.
+    // Trust is recorded, not enforced, at resolve: the launcher's admitted-resolver list is
+    // trusted-only, so it withholds this one and NEVER runs its command, like the direct
+    // `tarball:` form.
     let r = resolve_no_plugins(
         RawConfig::default(),
         Some((raw_tarball_resolve("app", CMD), TrustState::Untrusted)),
@@ -4157,8 +4158,9 @@ fn an_empty_deb_resolve_command_is_dropped_with_a_warning() {
 
 #[test]
 fn an_untrusted_projects_deb_resolve_is_stamped_untrusted() {
-    // Trust is recorded, not enforced, at resolve: the launcher (`deb_resolve_packages`,
-    // trusted-only) withholds it and NEVER runs its command, like the direct `deb:` form.
+    // Trust is recorded, not enforced, at resolve: the launcher's admitted-resolver list is
+    // trusted-only, so it withholds this one and NEVER runs its command, like the direct
+    // `deb:` form.
     let r = resolve_no_plugins(
         RawConfig::default(),
         Some((raw_deb_resolve("app", CMD), TrustState::Untrusted)),
@@ -4228,8 +4230,9 @@ fn an_orphan_appimage_sentinel_is_ignored_with_a_warning() {
 
 #[test]
 fn an_untrusted_projects_appimage_resolve_is_stamped_untrusted() {
-    // Trust is recorded, not enforced, at resolve: the launcher (`appimage_resolve_packages`,
-    // trusted-only) withholds it and NEVER runs its command, like the direct `appimage:` form.
+    // Trust is recorded, not enforced, at resolve: the launcher's admitted-resolver list is
+    // trusted-only, so it withholds this one and NEVER runs its command, like the direct
+    // `appimage:` form.
     let r = resolve_no_plugins(
         RawConfig::default(),
         Some((raw_appimage_resolve("app", CMD), TrustState::Untrusted)),

@@ -193,19 +193,13 @@ impl prebuilt::Kind for Tarball {
         derivation_expr(nixpkgs, system, name, url, hash)
     }
 
-    fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)> {
-        super::packages::tarball_packages(packages)
-    }
-
-    fn resolve_packages(&self, packages: &[crate::config::Package]) -> Vec<(String, Vec<String>)> {
-        super::packages::tarball_resolve_packages(packages)
-    }
-
-    fn lock_key(&self, package: &crate::config::Package) -> Option<String> {
+    fn form(&self, package: &crate::config::Package) -> Option<prebuilt::Form> {
         match &package.backend {
-            crate::config::Backend::Tarball(url) => Some(url.clone()),
-            crate::config::Backend::TarballResolve { .. } => {
-                Some(prebuilt::resolve_key(&package.name))
+            crate::config::Backend::Tarball(locator) => {
+                Some(prebuilt::Form::Direct(locator.clone()))
+            }
+            crate::config::Backend::TarballResolve { command } => {
+                Some(prebuilt::Form::Resolve(command.clone()))
             }
             // Spelled out rather than `_`: a new backend variant must fail to compile here. Falling
             // through to `None` would leave its packages out of the prune universe, and `upgrade`
@@ -215,8 +209,8 @@ impl prebuilt::Kind for Tarball {
             | crate::config::Backend::Flake(_)
             | crate::config::Backend::FlakeInline { .. }
             | crate::config::Backend::Deb(_)
-            | crate::config::Backend::AppImage(_)
             | crate::config::Backend::DebResolve { .. }
+            | crate::config::Backend::AppImage(_)
             | crate::config::Backend::AppImageResolve { .. } => None,
         }
     }

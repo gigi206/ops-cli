@@ -384,18 +384,12 @@ impl prebuilt::Kind for Deb {
         derivation_expr(nixpkgs, system, name, url, hash)
     }
 
-    fn packages(&self, packages: &[crate::config::Package]) -> Vec<(String, String)> {
-        super::packages::deb_packages(packages)
-    }
-
-    fn resolve_packages(&self, packages: &[crate::config::Package]) -> Vec<(String, Vec<String>)> {
-        super::packages::deb_resolve_packages(packages)
-    }
-
-    fn lock_key(&self, package: &crate::config::Package) -> Option<String> {
+    fn form(&self, package: &crate::config::Package) -> Option<prebuilt::Form> {
         match &package.backend {
-            crate::config::Backend::Deb(url) => Some(url.clone()),
-            crate::config::Backend::DebResolve { .. } => Some(prebuilt::resolve_key(&package.name)),
+            crate::config::Backend::Deb(locator) => Some(prebuilt::Form::Direct(locator.clone())),
+            crate::config::Backend::DebResolve { command } => {
+                Some(prebuilt::Form::Resolve(command.clone()))
+            }
             // Spelled out rather than `_`: a new backend variant must fail to compile here. Falling
             // through to `None` would leave its packages out of the prune universe, and `upgrade`
             // would drop a still-declared pin without a word.
@@ -404,8 +398,8 @@ impl prebuilt::Kind for Deb {
             | crate::config::Backend::Flake(_)
             | crate::config::Backend::FlakeInline { .. }
             | crate::config::Backend::AppImage(_)
-            | crate::config::Backend::Tarball(_)
             | crate::config::Backend::AppImageResolve { .. }
+            | crate::config::Backend::Tarball(_)
             | crate::config::Backend::TarballResolve { .. } => None,
         }
     }
