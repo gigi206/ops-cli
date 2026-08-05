@@ -247,6 +247,42 @@ pub(crate) fn control_socket(dir: &Path, pid: u32) -> PathBuf {
     dir.join(format!("control-{pid}.sock"))
 }
 
+/// Create a lens's control directory under the data dir, owner-only. The `0700` is the point rather
+/// than a habit: the sockets inside are how a session's record is read, and in Mode B the cage must
+/// not reach them.
+///
+/// Callers differ on what a failure means and each decides for itself — a lens stood up beside a
+/// running broker degrades to no reader, while one that owns its whole directory has nowhere to put
+/// anything and says so.
+pub(crate) fn ensure_control_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Bind one lens's per-session control socket and serve it on a detached thread.
+///
+/// A stale socket left by a crashed predecessor that reused this pid is cleared first: whatever
+/// guard normally unlinks it is skipped by a `SIGKILL`, so without this the next launch to land on
+/// that pid would fail to bind on residue rather than on anything real.
+///
+/// The thread is detached and never joined. It sits blocked in `accept` for the session's life and
+/// is reaped when the supervisor exits — the egress control thread has the same lifetime. What ends
+/// a reader's follow cleanly is the caller unlinking the socket, not this thread stopping.
+pub(crate) fn bind_and_serve(
+    socket: &Path,
+    serve: impl FnOnce(UnixListener) -> io::Result<()> + Send + 'static,
+) -> io::Result<()> {
+    let _ = std::fs::remove_file(socket);
+    let listener = UnixListener::bind(socket)?;
+    std::thread::spawn(move || {
+        let _ = serve(listener);
+    });
+    Ok(())
+}
+
 /// Read one session's lens over its control socket (`LOG`, or `LOG after=<seq>` for a follow read
 /// past a cursor). A session whose socket is absent — the lens was never stood up, or the launch is
 /// dead — fails the connect, which the caller distinguishes from an empty feed.

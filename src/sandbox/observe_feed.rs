@@ -277,80 +277,60 @@ fn start_fs(data_dir: &Path, pid: u32, project: &Path) -> (Option<FsWatcher>, Op
     (Some(watcher), socket)
 }
 
-/// Bind the per-session control socket and serve the ring on it. Returns the socket path when bound
-/// (so the guard can unlink it), or `None` (warned) when it could not be — the inline feed still runs.
-/// Mirrors the egress control socket's setup: the `<data>/proc/` dir is created owner-only, a stale
-/// socket left by a crashed predecessor that reused the pid is cleared first (a `SIGKILL` skips the
-/// guard's unlink), then the listener is bound and served on a detached thread.
-fn bind_control(data_dir: &Path, pid: u32, ring: &Arc<ExecRing>) -> Option<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    let dir = proc_control_dir(data_dir);
-    if let Err(e) = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-    {
+/// Stand up one observation lens's control socket: create its owner-only directory under the data
+/// dir, then bind and serve the socket on a detached thread. Returns the socket path when bound (so
+/// the guard can unlink it), or `None` when it could not be.
+///
+/// Either failure is warned and never fatal: the observation itself is already running, and a lens
+/// with no reader is a far smaller loss than a launch that refused to start. `lens` names the
+/// observation in prose and `reader` names the command that would have read it, so the warning says
+/// which of the two feeds went quiet — with both stood up, an unqualified one would not.
+fn bind_lens(
+    dir: PathBuf,
+    socket: PathBuf,
+    lens: &str,
+    reader: &str,
+    serve: impl FnOnce(UnixListener) -> std::io::Result<()> + Send + 'static,
+) -> Option<PathBuf> {
+    if let Err(e) = super::lens::ensure_control_dir(&dir) {
         crate::diag::warn(&format!(
-            "could not create the process-observation directory ({e}) — `sbx proc logs` will not \
-             see this session"
+            "could not create the {lens} directory ({e}) — `{reader}` will not see this session"
         ));
         return None;
     }
-    let socket = proc_control_socket(data_dir, pid);
-    let _ = std::fs::remove_file(&socket);
-    let listener = match UnixListener::bind(&socket) {
-        Ok(l) => l,
-        Err(e) => {
-            crate::diag::warn(&format!(
-                "could not bind the process-observation socket ({e}) — `sbx proc logs` will not see \
-                 this session"
-            ));
-            return None;
-        }
-    };
-    let serve_ring = ring.clone();
-    std::thread::spawn(move || {
-        let _ = proc_control::serve(listener, serve_ring);
-    });
+    if let Err(e) = super::lens::bind_and_serve(&socket, serve) {
+        crate::diag::warn(&format!(
+            "could not bind the {lens} socket ({e}) — `{reader}` will not see this session"
+        ));
+        return None;
+    }
     Some(socket)
 }
 
-/// Bind the per-session filesystem control socket and serve the fs ring on it. The filesystem sibling
-/// of [`bind_control`]: the `<data>/fs/` dir is created owner-only, a stale socket left by a crashed
-/// predecessor that reused the pid is cleared first, then the listener is bound and served on a
-/// detached thread. Returns the socket path when bound (so the guard can unlink it), or `None`
-/// (warned) when it could not be.
-fn bind_fs_control(data_dir: &Path, pid: u32, ring: &Arc<FsRing>) -> Option<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    let dir = fs_control_dir(data_dir);
-    if let Err(e) = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-    {
-        crate::diag::warn(&format!(
-            "could not create the filesystem-observation directory ({e}) — `sbx fs logs` will not \
-             see this session"
-        ));
-        return None;
-    }
-    let socket = fs_control_socket(data_dir, pid);
-    let _ = std::fs::remove_file(&socket);
-    let listener = match UnixListener::bind(&socket) {
-        Ok(l) => l,
-        Err(e) => {
-            crate::diag::warn(&format!(
-                "could not bind the filesystem-observation socket ({e}) — `sbx fs logs` will not see \
-                 this session"
-            ));
-            return None;
-        }
-    };
+/// Stand up the exec lens's control socket, so `sbx proc logs` can read the ring the observer pushes
+/// to.
+fn bind_control(data_dir: &Path, pid: u32, ring: &Arc<ExecRing>) -> Option<PathBuf> {
     let serve_ring = ring.clone();
-    std::thread::spawn(move || {
-        let _ = fs_control::serve(listener, serve_ring);
-    });
-    Some(socket)
+    bind_lens(
+        proc_control_dir(data_dir),
+        proc_control_socket(data_dir, pid),
+        "process-observation",
+        "sbx proc logs",
+        move |l| proc_control::serve(l, serve_ring),
+    )
+}
+
+/// Stand up the filesystem lens's control socket, so `sbx fs logs` can read the ring the watcher
+/// pushes to.
+fn bind_fs_control(data_dir: &Path, pid: u32, ring: &Arc<FsRing>) -> Option<PathBuf> {
+    let serve_ring = ring.clone();
+    bind_lens(
+        fs_control_dir(data_dir),
+        fs_control_socket(data_dir, pid),
+        "filesystem-observation",
+        "sbx fs logs",
+        move |l| fs_control::serve(l, serve_ring),
+    )
 }
 
 /// Sleep up to `interval`, waking early (in ~50 ms slices) if a stop is requested, so `drop` joins

@@ -328,12 +328,10 @@ fn start_inner(
     control: bool,
     notifier: Arc<crate::sandbox::notify_sink::Notifier>,
 ) -> io::Result<(ProcEnforce, Wiring)> {
-    use std::os::unix::fs::DirBuilderExt;
     let dir = super::proc_control::proc_control_dir(data_dir);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
+    // Unlike the observing path, this directory holds the notification socket enforcement itself
+    // runs on, not only the reader's — so a failure here is the launch's, not a lens going quiet.
+    super::lens::ensure_control_dir(&dir)?;
 
     let ring = Arc::new(ExecRing::new(super::proc_control::EXEC_RING_CAP));
     let pending = Arc::new(PendingExec::new());
@@ -350,17 +348,12 @@ fn start_inner(
         None
     } else {
         let control_socket = super::proc_control::proc_control_socket(data_dir, std::process::id());
-        let _ = std::fs::remove_file(&control_socket);
-        match UnixListener::bind(&control_socket) {
-            Ok(l) => {
-                let ring = ring.clone();
-                let pending = pending.clone();
-                let overlay = overlay.clone();
-                std::thread::spawn(move || {
-                    let _ = super::proc_control::serve_enforced(l, ring, pending, overlay, mode);
-                });
-                Some(control_socket)
-            }
+        let (ring, pending, overlay) = (ring.clone(), pending.clone(), overlay.clone());
+        let served = super::lens::bind_and_serve(&control_socket, move |l| {
+            super::proc_control::serve_enforced(l, ring, pending, overlay, mode)
+        });
+        match served {
+            Ok(()) => Some(control_socket),
             Err(e) => {
                 crate::diag::warn(&format!(
                     "could not bind the process-observation socket ({e}) — `sbx proc \

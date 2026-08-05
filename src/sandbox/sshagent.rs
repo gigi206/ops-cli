@@ -690,14 +690,11 @@ pub(crate) fn start(
     confirm_with: Option<PathBuf>,
     notifier: Arc<super::notify_sink::Notifier>,
 ) -> io::Result<(SshAgent, Wiring)> {
-    use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
-
     // The data directory is owner-only, and this socket is the reason it must be: anything that can
     // connect to it can ask the user's agent for a signature.
     crate::store::ensure(layout)?;
     let dir = layout.data_dir().join("ssh-agent");
-    DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    super::lens::ensure_control_dir(&dir)?;
 
     // Keyed by the launcher pid, like the egress and forward sockets, so a crashed predecessor's
     // residue is identifiable — and cleared here, since a stale file would block the bind.
@@ -713,20 +710,17 @@ pub(crate) fn start(
     // rather than to no broker at all.
     let ring =
         Arc::new(AgentRing::new(super::sshagent_control::AGENT_RING_CAP).with_notifier(notifier));
-    let control_uds = dir.join(format!("control-{}.sock", std::process::id()));
-    let _ = std::fs::remove_file(&control_uds);
-    match UnixListener::bind(&control_uds) {
-        Ok(control) => {
-            let served = ring.clone();
-            std::thread::spawn(move || {
-                let _ = super::sshagent_control::serve(control, served);
-            });
-        }
-        Err(e) => crate::diag::warn(&format!(
+    let control_uds =
+        super::sshagent_control::agent_control_socket(layout.data_dir(), std::process::id());
+    let served = ring.clone();
+    if let Err(e) = super::lens::bind_and_serve(&control_uds, move |control| {
+        super::sshagent_control::serve(control, served)
+    }) {
+        crate::diag::warn(&format!(
             "the ssh-agent broker is running, but its decisions cannot be read \
              (`{}`: {e}) — `sbx ssh-agent log` will report no broker for this session",
             control_uds.display()
-        )),
+        ));
     }
 
     let filter = Filter::new(allow);
