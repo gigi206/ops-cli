@@ -10,6 +10,7 @@ pub(crate) mod confirm;
 pub(crate) mod doctor;
 pub(crate) mod fs;
 pub(crate) mod gc;
+pub(crate) mod logs;
 pub(crate) mod net;
 pub(crate) mod plugins;
 pub(crate) mod proc;

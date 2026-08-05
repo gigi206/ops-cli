@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use crate::cli::logs;
 use crate::{config, diag, help, observe, proc_policy, sandbox, session, store, style};
 use crate::{
     egress_data_dir, format_log_time, persist_proc_rule, resolve_session_target,
@@ -690,151 +691,33 @@ fn proc_live(args: &[OsString]) -> ExitCode {
 /// the processes the agent has spawned in the cage, in order, read host-side from the session's
 /// process-observation ring over its per-session control socket. Only a session launched with
 /// observation on (`--observe`) has a ring; one without is reported as unobserved rather than empty.
-/// `<id>` is the PID `sbx session ls` shows; with no id the sole live session is used, otherwise the
-/// live sessions are listed so one can be named. `--follow` streams new events until the session ends
-/// (Ctrl+C to stop); `--json` emits one object per event (ndjson), which works in a pipe.
+/// See [`crate::cli::logs::run`] for the flags and the follow loop it shares with its sibling lenses.
 fn proc_logs(args: &[OsString]) -> ExitCode {
-    let mut json = false;
-    let mut follow = false;
-    let mut id: Option<&str> = None;
-    for a in args {
-        match a.to_str() {
-            Some("--json") => json = true,
-            Some("-f") | Some("--follow") => follow = true,
-            Some(s) if !s.starts_with('-') => {
-                if id.is_some() {
-                    diag::error("sbx: proc logs: at most one session id");
-                    return ExitCode::from(2);
-                }
-                id = Some(s);
-            }
-            other => {
-                diag::error(&format!(
-                    "sbx: proc logs: unexpected argument {:?}",
-                    other.unwrap_or_default()
-                ));
-                eprint!(
-                    "{}",
-                    help::page_usage(&["proc", "logs"]).unwrap_or_default()
-                );
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
-    };
-    let sessions = match session::Registry::at(layout.data_dir()).list() {
-        Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
-    };
-    let target = match resolve_session_target(&sessions, id, "proc") {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
-    let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), target.pid);
-
-    // The first read is a tail of the whole retained window. A connect failure means this session was
-    // not launched with observation on — there is no ring to read, distinct from an empty one.
-    let first = match sandbox::proc_control::read_exec_log(&socket, None) {
-        Ok(s) => s,
-        Err(_) => {
-            diag::error(&format!(
-                "sbx: proc logs: session {} is not being observed — relaunch it with `--observe` to \
-                 record the processes it spawns.",
-                target.pid
-            ));
-            return ExitCode::from(2);
-        }
-    };
-
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    use std::io::Write as _;
-
-    // Write the header and the tail batch through a locked, error-checked stdout: a closed downstream
-    // pipe (`… | head`) ends the view cleanly (exit 0) rather than panicking on the broken pipe — the
-    // pattern `sbx proc live` uses (Rust ignores SIGPIPE, so a bare `println!` would panic on EPIPE).
-    {
-        let mut out = std::io::stdout().lock();
-        let wrote = (|| -> std::io::Result<()> {
-            if !json {
-                let (h, r) = (pal.head, pal.reset);
-                writeln!(
-                    out,
-                    "{h}process feed — session {} [{}] {}{r}",
-                    target.pid,
-                    target.label(),
-                    target.project.display()
-                )?;
-            }
-            for e in &first.events {
-                write_exec_event(&mut out, target.pid, e, json, &pal)?;
-            }
-            out.flush()
-        })();
-        if wrote.is_err() {
-            return ExitCode::SUCCESS;
-        }
-    }
-
-    if !follow {
-        return ExitCode::SUCCESS;
-    }
-
-    // Follow: poll past the cursor until the session ends. The observer unlinks its socket on drop, so
-    // a connect failure after the first successful read is the clean end-of-session signal (a local
-    // UDS connect does not fail transiently); Ctrl+C stops it before then, and a closed downstream
-    // pipe ends it cleanly too.
-    let mut cursor = first.head;
-    loop {
-        std::thread::sleep(Duration::from_millis(400));
-        let snap = match sandbox::proc_control::read_exec_log(&socket, Some(cursor)) {
-            Ok(s) => s,
-            Err(_) => {
-                if !json {
-                    let mut out = std::io::stdout().lock();
-                    let (dim, r) = (pal.dim, pal.reset);
-                    let _ = writeln!(out, "  {dim}(session {} ended){r}", target.pid);
-                }
-                return ExitCode::SUCCESS;
-            }
-        };
-        let mut out = std::io::stdout().lock();
-        let wrote = (|| -> std::io::Result<()> {
-            if snap.dropped > 0 && !json {
-                let (dim, r) = (pal.dim, pal.reset);
-                writeln!(
-                    out,
-                    "  {dim}({} earlier event(s) evicted from the ring before this poll){r}",
-                    snap.dropped
-                )?;
-            }
-            for e in &snap.events {
-                write_exec_event(&mut out, target.pid, e, json, &pal)?;
-            }
-            out.flush()
-        })();
-        drop(out);
-        if wrote.is_err() {
-            // A closed downstream pipe (`… | head`) ends the follow cleanly.
-            return ExitCode::SUCCESS;
-        }
-        cursor = snap.head;
-    }
+    logs::run(
+        args,
+        &logs::LogView {
+            verb: "proc logs",
+            page: &["proc", "logs"],
+            session_verb: "proc",
+            feed: "process feed",
+            socket: sandbox::proc_control::proc_control_socket,
+            read: sandbox::proc_control::read_exec_log,
+            absent: |pid| {
+                format!(
+                    "sbx: proc logs: session {pid} is not being observed — relaunch it with \
+                     `--observe` to record the processes it spawns."
+                )
+            },
+            write_event: write_exec_event,
+        },
+    )
 }
 
 /// Write one exec event to `out`: a human line (`hh:mm:ss  pid  command`) or a JSON object (one per
 /// line, so a `--follow` stream is valid NDJSON). Returns the write result so the caller ends cleanly
 /// on a closed downstream pipe rather than panicking. Shared by the tail and follow reads.
 fn write_exec_event(
-    out: &mut impl std::io::Write,
+    out: &mut dyn std::io::Write,
     session_pid: u32,
     e: &sandbox::proc_control::ExecEvent,
     json: bool,

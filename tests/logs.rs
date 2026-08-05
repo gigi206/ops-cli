@@ -1,0 +1,298 @@
+//! Integration tests for the `sbx <lens> logs` views — the filesystem, process and ssh-agent
+//! observation lenses, driven through the real binary against a stand-in control socket.
+//!
+//! The three views share one implementation and differ only in a description: which socket to open,
+//! which reader to call, what to head the feed with, and how to render a row. Every one of those is
+//! a value that would compile just as happily wired to the wrong lens, and nothing inside the
+//! process can tell — so this suite goes the whole way round instead. It fabricates a session
+//! record, binds each lens's socket where that lens says its socket lives, serves the line protocol
+//! by hand, and reads the command's actual stdout back.
+//!
+//! Serving the wire by hand is the point rather than a shortcut: it is a second, independent
+//! spelling of the protocol. A change to the framing that updated both halves inside the crate
+//! would still fail here.
+//!
+//! No sandbox, no privilege, no network — a `sleep` stands in for the session's process, since all
+//! the resolver wants is a pid that is alive.
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
+/// `SBX_TEST_TMPDIR`. Deliberately not `/tmp`, whose tmpfs inode cap is shared machine-wide.
+fn fixture_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
+        return PathBuf::from(dir);
+    }
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.push("target/test-tmp");
+    d
+}
+
+struct TmpDir(PathBuf);
+
+impl TmpDir {
+    fn new() -> Self {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut d = fixture_root();
+        d.push(format!("l-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        TmpDir(d)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read a process's start-time ticks (`/proc/<pid>/stat` field 22) for the fabricated record.
+fn read_start_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read stat");
+    let after = &stat[stat.rfind(')').unwrap() + 1..];
+    after.split_whitespace().nth(19).unwrap().parse().unwrap()
+}
+
+/// Write the session record the `logs` views resolve, pointing at a live `pid`. The on-disk format
+/// is stable, and fabricating it isolates the view under test from the registration machinery.
+fn write_session_record(data: &Path, pid: u32, project: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let start = read_start_ticks(pid);
+    let dir = data.join("sbx").join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let hex: String = project
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let rec = format!("kind=run\npid={pid}\nstart={start}\nruntime=project\nproject={hex}\n");
+    std::fs::write(dir.join(format!("{pid}-{start}")), rec).unwrap();
+}
+
+/// Bind `<data>/sbx/<lens>/control-<pid>.sock` and answer one `LOG` on it with `events`, framed the
+/// way a session frames it: the `head=` cursor, one `event …` line each, then `ok`.
+///
+/// One connection is enough — the views under test read the retained window once when `--follow` is
+/// not asked for. The thread is detached and dies with the test process.
+fn serve_lens(data: &Path, lens: &str, pid: u32, events: &'static [&'static str]) -> PathBuf {
+    let dir = data.join("sbx").join(lens);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let mut reply = format!("head={}\n", events.len());
+            for e in events {
+                reply.push_str(e);
+                reply.push('\n');
+            }
+            reply.push_str("ok\n");
+            let _ = (&stream).write_all(reply.as_bytes());
+            let _ = (&stream).flush();
+        }
+    });
+    socket
+}
+
+/// A live pid to hang a session record on, and the guard that reaps it.
+struct Standin(std::process::Child);
+
+impl Standin {
+    fn new() -> Self {
+        Standin(
+            Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the stand-in process"),
+        )
+    }
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for Standin {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Run one lens's `logs` view against a session whose socket is being served, and return stdout.
+fn read_feed(data: &Path, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(args)
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("run the logs view");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The filesystem lens: its own socket directory, its own header, and a row of `kind` then path.
+#[test]
+fn the_filesystem_lens_reads_its_own_socket_and_renders_its_own_rows() {
+    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let child = Standin::new();
+    write_session_record(data.path(), child.pid(), project.path());
+    serve_lens(
+        data.path(),
+        "fs",
+        child.pid(),
+        &[
+            "event seq=1 at=1700000000123 kind=write path=src/main.rs",
+            "event seq=2 at=1700000000456 kind=remove path=a dir/with a space.txt",
+        ],
+    );
+    let pid = child.pid().to_string();
+
+    let human = read_feed(data.path(), &["fs", "logs", &pid]);
+    assert!(
+        human.contains(&format!("file-write feed — session {pid}")),
+        "the header names this lens's feed: {human}"
+    );
+    assert!(human.contains("write   src/main.rs"), "{human}");
+    assert!(
+        human.contains("remove  a dir/with a space.txt"),
+        "a path's spaces survive the wire's verbatim-last field: {human}"
+    );
+
+    let json = read_feed(data.path(), &["fs", "logs", &pid, "--json"]);
+    assert_eq!(json.lines().count(), 2, "one object per event: {json}");
+    assert!(json.contains(r#""kind":"write""#), "{json}");
+    assert!(json.contains(r#""path":"src/main.rs""#), "{json}");
+    assert!(
+        json.contains(&format!(r#""session_pid":{pid}"#)),
+        "each row carries the session it came from: {json}"
+    );
+    assert!(
+        !json.contains("file-write feed"),
+        "the header is suppressed under --json so the stream is valid NDJSON: {json}"
+    );
+}
+
+/// The process lens: a different socket directory, a different header, and a row that leads with
+/// the enforcement verdict.
+#[test]
+fn the_process_lens_reads_its_own_socket_and_renders_its_own_rows() {
+    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let child = Standin::new();
+    write_session_record(data.path(), child.pid(), project.path());
+    serve_lens(
+        data.path(),
+        "proc",
+        child.pid(),
+        &[
+            "event seq=1 at=1700000000123 pid=4242 verdict=observe cmd=rg --json needle",
+            "event seq=2 at=1700000000456 pid=4243 verdict=deny by=/bin/bash cmd=/usr/bin/curl",
+        ],
+    );
+    let pid = child.pid().to_string();
+
+    let human = read_feed(data.path(), &["proc", "logs", &pid]);
+    assert!(
+        human.contains(&format!("process feed — session {pid}")),
+        "{human}"
+    );
+    assert!(human.contains("observe 4242  rg --json needle"), "{human}");
+    assert!(human.contains("deny    4243  /usr/bin/curl"), "{human}");
+
+    let json = read_feed(data.path(), &["proc", "logs", &pid, "--json"]);
+    assert!(json.contains(r#""command":"rg --json needle""#), "{json}");
+    assert!(json.contains(r#""verdict":"deny""#), "{json}");
+    assert!(json.contains(r#""pid":4243"#), "{json}");
+}
+
+/// The ssh-agent lens: a third socket directory, a third header, and a row of `kind` then detail.
+#[test]
+fn the_ssh_agent_lens_reads_its_own_socket_and_renders_its_own_rows() {
+    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let child = Standin::new();
+    write_session_record(data.path(), child.pid(), project.path());
+    serve_lens(
+        data.path(),
+        "ssh-agent",
+        child.pid(),
+        &[
+            "event seq=1 at=1700000000123 kind=sign detail=deploy@example",
+            "event seq=2 at=1700000000456 kind=refuse detail=a key the grant does not name",
+        ],
+    );
+    let pid = child.pid().to_string();
+
+    let human = read_feed(data.path(), &["ssh-agent", "logs", &pid]);
+    assert!(
+        human.contains(&format!("ssh-agent feed — session {pid}")),
+        "{human}"
+    );
+    assert!(human.contains("sign     deploy@example"), "{human}");
+    assert!(
+        human.contains("refuse   a key the grant does not name"),
+        "{human}"
+    );
+
+    let json = read_feed(data.path(), &["ssh-agent", "logs", &pid, "--json"]);
+    assert!(json.contains(r#""kind":"refuse""#), "{json}");
+    assert!(
+        json.contains(r#""detail":"a key the grant does not name""#),
+        "{json}"
+    );
+}
+
+/// The three views take the same flags and refuse the same things in their own name. A view that
+/// borrowed a sibling's name here would be reporting the wrong command to the user.
+#[test]
+fn each_view_refuses_a_bad_argument_in_its_own_name() {
+    let data = TmpDir::new();
+    for (args, verb) in [
+        (["fs", "logs", "--nope"], "fs logs"),
+        (["proc", "logs", "--nope"], "proc logs"),
+        (["ssh-agent", "logs", "--nope"], "ssh-agent logs"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run the logs view");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(
+            err.contains(&format!("sbx: {verb}: unexpected argument")),
+            "{args:?} should name itself `{verb}`: {err}"
+        );
+    }
+
+    // Two ids is the other shared refusal, and it too must be named by the right command.
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["ssh-agent", "logs", "1", "2"])
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run the logs view");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("sbx: ssh-agent logs: at most one session id"),
+        "{err}"
+    );
+}
