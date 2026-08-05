@@ -20,20 +20,13 @@
 //! line and taken verbatim by the reader; the watcher sanitises it of control characters, so it can
 //! never inject a second line.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// The default number of recent filesystem events a session retains for the live feed.
 pub(crate) const FS_RING_CAP: usize = 1000;
-
-/// The largest control command / reply line accepted — bounded so a confused or hostile peer cannot
-/// make the reader buffer unboundedly. A command is short (`LOG after=<seq>`); a reply carries the
-/// event's path, which can be long, so the bound is generous but still finite. The peer is the
-/// owner-only, host-side control client.
-const LINE_MAX: u64 = 8 * 1024;
 
 /// The kind of filesystem change observed. A closed enum with a fixed one-word wire token, so it is a
 /// safe field before the verbatim `path=` on an event line.
@@ -88,6 +81,37 @@ impl super::lens::Event for FsEvent {
     fn seq(&self) -> u64 {
         self.seq
     }
+
+    /// The fixed fields are `key=value` tokens; `path` is emitted **last** and taken verbatim by the
+    /// reader (the path carries spaces). The watcher has stripped control characters from the path,
+    /// so it cannot inject a second line.
+    fn format_line(&self) -> String {
+        format!(
+            "event seq={} at={} kind={} path={}\n",
+            self.seq,
+            self.at_epoch_ms,
+            self.kind.token(),
+            self.path
+        )
+    }
+
+    /// Read one `event seq=… at=… kind=… path=…` line back, or `None` if malformed. An unknown kind
+    /// token fails the parse rather than being silently coerced.
+    fn parse_line(line: &str) -> Option<Self> {
+        let (mut seq, mut at, mut kind) = (None, None, None);
+        let path = super::lens::read_event_line(line, "path=", |key, value| match key {
+            "seq" => seq = value.parse().ok(),
+            "at" => at = value.parse().ok(),
+            "kind" => kind = FsKind::from_token(value),
+            _ => {}
+        })?;
+        Some(FsEvent {
+            seq: seq?,
+            at_epoch_ms: at?,
+            kind: kind?,
+            path: path.to_string(),
+        })
+    }
 }
 
 /// The result of a `LOG` query over this lens. See [`super::lens::Snapshot`].
@@ -114,81 +138,22 @@ impl FsRing {
             path: path.to_string(),
         })
     }
+}
 
-    pub(crate) fn snapshot(&self, after: Option<u64>) -> FsSnapshot {
-        self.0.snapshot(after)
+/// The ring underneath, so a snapshot reads the same on this lens as on any other: `snapshot` is
+/// [`super::lens::Ring`]'s and is reached through here, while `push` above stays this lens's own.
+impl std::ops::Deref for FsRing {
+    type Target = super::lens::Ring<FsEvent>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-/// Serve the control socket: one short-lived thread per connection, each handling exactly one command.
-/// A per-connection error is that connection's problem, never the server's. The ring is shared in (the
-/// same one the watcher pushes to).
+/// Serve the control socket, answering `LOG` from the ring the watcher pushes to. See
+/// [`super::lens::serve`].
 pub(crate) fn serve(listener: UnixListener, ring: Arc<FsRing>) -> io::Result<()> {
-    for stream in listener.incoming() {
-        let stream = stream?;
-        let ring = ring.clone();
-        std::thread::spawn(move || {
-            let _ = handle(stream, &ring);
-        });
-    }
-    Ok(())
-}
-
-/// Handle one control connection: read a single command line, dispatch it, write the response, and
-/// close. The socket is owner-only and host-side, so the peer is trusted; the bound read and the
-/// timeout are belt-and-braces against a stuck or malformed caller.
-fn handle(stream: UnixStream, ring: &FsRing) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut reader = BufReader::new((&stream).take(LINE_MAX));
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let response = dispatch(line.trim(), ring);
-    (&stream).write_all(response.as_bytes())?;
-    (&stream).flush()
-}
-
-/// Map a control command to its response. `LOG` returns the retained events (a `dropped=` line when a
-/// `--follow` cursor fell behind the ring, a `head=` cursor, then one `event …` line each) then `ok`;
-/// `LOG after=<seq>` returns only events past that cursor. `path` is emitted last on an event line so a
-/// path's spaces cannot be mistaken for a field separator (the reader takes the whole remainder).
-fn dispatch(cmd: &str, ring: &FsRing) -> String {
-    let mut parts = cmd.split_whitespace();
-    match parts.next() {
-        Some("LOG") => {
-            let mut after = None;
-            for token in parts {
-                if let Some(v) = token.strip_prefix("after=") {
-                    after = v.parse().ok();
-                }
-            }
-            let snap = ring.snapshot(after);
-            let mut out = String::new();
-            if snap.dropped > 0 {
-                out.push_str(&format!("dropped={}\n", snap.dropped));
-            }
-            out.push_str(&format!("head={}\n", snap.head));
-            for ev in &snap.events {
-                out.push_str(&format_event_line(ev));
-            }
-            out.push_str("ok\n");
-            out
-        }
-        _ => "err bad-request\n".to_string(),
-    }
-}
-
-/// Format one event as a control-wire line. The fixed fields are `key=value` tokens; `path` is emitted
-/// **last** and taken verbatim by the reader (the path carries spaces). The watcher has stripped
-/// control characters from the path, so it cannot inject a second line.
-fn format_event_line(ev: &FsEvent) -> String {
-    format!(
-        "event seq={} at={} kind={} path={}\n",
-        ev.seq,
-        ev.at_epoch_ms,
-        ev.kind.token(),
-        ev.path
-    )
+    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
 }
 
 // ── Client side (the `sbx fs logs` process) ───────────────────────────────────────────────────
@@ -201,77 +166,20 @@ pub(crate) fn fs_control_dir(data_dir: &Path) -> PathBuf {
 
 /// The control socket path for a session pid.
 pub(crate) fn fs_control_socket(data_dir: &Path, pid: u32) -> PathBuf {
-    fs_control_dir(data_dir).join(format!("control-{pid}.sock"))
+    super::lens::control_socket(&fs_control_dir(data_dir), pid)
 }
 
-/// Query one session's control socket for its filesystem events (`LOG`, or `LOG after=<seq>` for a
-/// follow read past a cursor). A session whose socket is absent (not observed, or a dead/stale launch)
-/// fails the connect, which the caller distinguishes from an empty log.
+/// Query one session's control socket for its filesystem events. A session whose socket is absent
+/// (not observed, or a dead/stale launch) fails the connect, which the caller distinguishes from an
+/// empty log. See [`super::lens::read_log`].
 pub(crate) fn read_fs_log(socket: &Path, after: Option<u64>) -> io::Result<FsSnapshot> {
-    let stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut cmd = String::from("LOG");
-    if let Some(seq) = after {
-        cmd.push_str(&format!(" after={seq}"));
-    }
-    cmd.push('\n');
-    (&stream).write_all(cmd.as_bytes())?;
-    (&stream).flush()?;
-    let mut events = Vec::new();
-    let mut dropped = 0;
-    let mut head = 0;
-    for line in BufReader::new(&stream).lines() {
-        let line = line?;
-        if line == "ok" {
-            break;
-        }
-        if let Some(v) = line.strip_prefix("dropped=") {
-            dropped = v.parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("head=") {
-            head = v.parse().unwrap_or(0);
-        } else if let Some(ev) = parse_event_line(&line) {
-            events.push(ev);
-        }
-    }
-    Ok(FsSnapshot {
-        events,
-        dropped,
-        head,
-    })
-}
-
-/// Parse one `event seq=… at=… kind=… path=…` line back into an event, or `None` if malformed. Every
-/// field but `path` is a simple `key=value` token; `path` is the verbatim remainder after the first
-/// `path=` (it carries spaces, and the fixed fields precede it, so the first `path=` is always the
-/// field marker even if the path itself contains `path=`).
-fn parse_event_line(line: &str) -> Option<FsEvent> {
-    let rest = line.strip_prefix("event ")?;
-    let (head, path) = match rest.split_once("path=") {
-        Some((h, p)) => (h, p.to_string()),
-        None => return None,
-    };
-    let (mut seq, mut at, mut kind) = (None, None, None);
-    for token in head.split_whitespace() {
-        let (key, value) = token.split_once('=')?;
-        match key {
-            "seq" => seq = value.parse().ok(),
-            "at" => at = value.parse().ok(),
-            "kind" => kind = FsKind::from_token(value),
-            _ => {}
-        }
-    }
-    Some(FsEvent {
-        seq: seq?,
-        at_epoch_ms: at?,
-        kind: kind?,
-        path,
-    })
+    super::lens::read_log(socket, after)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::lens::Event as _;
 
     /// The ring's own sequencing and eviction are [`super::super::lens`]'s and tested there. What is
     /// this lens's to get right is the mapping: the arguments `push` takes must land on the fields
@@ -298,9 +206,9 @@ mod tests {
             kind: FsKind::Rename,
             path: "a dir/with path=weird =name.txt".to_string(),
         };
-        let line = format_event_line(&ev);
+        let line = ev.format_line();
         let line = line.trim_end();
-        assert_eq!(parse_event_line(line), Some(ev));
+        assert_eq!(FsEvent::parse_line(line), Some(ev));
     }
 
     #[test]
@@ -318,10 +226,16 @@ mod tests {
 
     #[test]
     fn parse_rejects_a_line_without_a_path_field_or_the_prefix() {
-        assert_eq!(parse_event_line("event seq=1 at=2 kind=write"), None);
-        assert_eq!(parse_event_line("noise seq=1 at=2 kind=write path=x"), None);
+        assert_eq!(FsEvent::parse_line("event seq=1 at=2 kind=write"), None);
+        assert_eq!(
+            FsEvent::parse_line("noise seq=1 at=2 kind=write path=x"),
+            None
+        );
         // An unknown kind token fails the parse rather than being silently coerced.
-        assert_eq!(parse_event_line("event seq=1 at=2 kind=bogus path=x"), None);
+        assert_eq!(
+            FsEvent::parse_line("event seq=1 at=2 kind=bogus path=x"),
+            None
+        );
     }
 
     #[test]

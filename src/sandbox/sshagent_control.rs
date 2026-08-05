@@ -20,20 +20,15 @@
 //! by the reader; [`sanitize_detail`] strips it of control characters first, so it can never inject
 //! a second line.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// How many recent broker decisions a session retains. An ssh session asks for one signature per
 /// authentication, so this is a deep window in practice — deeper than the egress ring needs to be,
 /// because these events are rare and each one matters.
 pub(crate) const AGENT_RING_CAP: usize = 500;
-
-/// The largest control command / reply line accepted, bounding what a confused peer can make the
-/// reader buffer. The peer is the owner-only, host-side control client.
-const LINE_MAX: u64 = 8 * 1024;
 
 /// The longest `detail` an event carries. A key comment comes from the user's own agent and is
 /// free-form, so it is capped as well as sanitised.
@@ -89,6 +84,36 @@ pub(crate) struct AgentEvent {
 impl super::lens::Event for AgentEvent {
     fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// The fixed fields are `key=value` tokens; `detail` is emitted **last** and taken verbatim by
+    /// the reader, since it carries spaces. [`sanitize_detail`] has already stripped it of control
+    /// characters, so it cannot close the line and forge a second event.
+    fn format_line(&self) -> String {
+        format!(
+            "event seq={} at={} kind={} detail={}\n",
+            self.seq,
+            self.at_epoch_ms,
+            self.kind.token(),
+            self.detail
+        )
+    }
+
+    /// Read one `event seq=… at=… kind=… detail=…` line back, or `None` if malformed.
+    fn parse_line(line: &str) -> Option<Self> {
+        let (mut seq, mut at, mut kind) = (None, None, None);
+        let detail = super::lens::read_event_line(line, "detail=", |key, value| match key {
+            "seq" => seq = value.parse().ok(),
+            "at" => at = value.parse().ok(),
+            "kind" => kind = AgentKind::from_token(value),
+            _ => {}
+        })?;
+        Some(AgentEvent {
+            seq: seq?,
+            at_epoch_ms: at?,
+            kind: kind?,
+            detail: detail.to_string(),
+        })
     }
 }
 
@@ -173,77 +198,22 @@ impl AgentRing {
             detail: sanitize_detail(detail),
         })
     }
+}
 
-    pub(crate) fn snapshot(&self, after: Option<u64>) -> AgentSnapshot {
-        self.ring.snapshot(after)
+/// The ring underneath, so a snapshot reads the same on this lens as on any other: `snapshot` is
+/// [`super::lens::Ring`]'s and is reached through here, while `push` above stays this lens's own.
+impl std::ops::Deref for AgentRing {
+    type Target = super::lens::Ring<AgentEvent>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ring
     }
 }
 
-/// Serve the control socket: one short-lived thread per connection, each handling exactly one
-/// command. A per-connection error is that connection's problem, never the server's.
+/// Serve the control socket, answering `LOG` from the ring the broker pushes to. See
+/// [`super::lens::serve`].
 pub(crate) fn serve(listener: UnixListener, ring: Arc<AgentRing>) -> io::Result<()> {
-    for stream in listener.incoming() {
-        let stream = stream?;
-        let ring = ring.clone();
-        std::thread::spawn(move || {
-            let _ = handle(stream, &ring);
-        });
-    }
-    Ok(())
-}
-
-/// Handle one control connection: read a single command line, dispatch it, write the response, and
-/// close. The socket is owner-only and host-side, so the peer is trusted; the bounded read and the
-/// timeouts are belt-and-braces against a stuck or malformed caller.
-fn handle(stream: UnixStream, ring: &AgentRing) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut reader = BufReader::new((&stream).take(LINE_MAX));
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let response = dispatch(line.trim(), ring);
-    (&stream).write_all(response.as_bytes())?;
-    (&stream).flush()
-}
-
-/// Map a control command to its response. `LOG` returns the retained events then `ok`;
-/// `LOG after=<seq>` returns only events past that cursor.
-fn dispatch(cmd: &str, ring: &AgentRing) -> String {
-    let mut parts = cmd.split_whitespace();
-    match parts.next() {
-        Some("LOG") => {
-            let mut after = None;
-            for token in parts {
-                if let Some(v) = token.strip_prefix("after=") {
-                    after = v.parse().ok();
-                }
-            }
-            let snap = ring.snapshot(after);
-            let mut out = String::new();
-            if snap.dropped > 0 {
-                out.push_str(&format!("dropped={}\n", snap.dropped));
-            }
-            out.push_str(&format!("head={}\n", snap.head));
-            for ev in &snap.events {
-                out.push_str(&format_event_line(ev));
-            }
-            out.push_str("ok\n");
-            out
-        }
-        _ => "err bad-request\n".to_string(),
-    }
-}
-
-/// Format one event as a control-wire line. The fixed fields are `key=value` tokens; `detail` is
-/// emitted **last** and taken verbatim by the reader, since it carries spaces.
-fn format_event_line(ev: &AgentEvent) -> String {
-    format!(
-        "event seq={} at={} kind={} detail={}\n",
-        ev.seq,
-        ev.at_epoch_ms,
-        ev.kind.token(),
-        ev.detail
-    )
+    super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
 }
 
 // ── Client side (the `sbx ssh-agent log` process) ──────────────────────────────────────────────
@@ -251,77 +221,20 @@ fn format_event_line(ev: &AgentEvent) -> String {
 /// The control socket path for a session pid, under the broker's own runtime directory — the same
 /// `0700` directory its agent socket is bound in, and never a path inside any cage.
 pub(crate) fn agent_control_socket(data_dir: &Path, pid: u32) -> PathBuf {
-    data_dir
-        .join("ssh-agent")
-        .join(format!("control-{pid}.sock"))
+    super::lens::control_socket(&data_dir.join("ssh-agent"), pid)
 }
 
 /// Query one session's control socket for its broker decisions. A session whose socket is absent
 /// (no grant, or a dead launch) fails the connect, which the caller distinguishes from an empty log.
+/// See [`super::lens::read_log`].
 pub(crate) fn read_agent_log(socket: &Path, after: Option<u64>) -> io::Result<AgentSnapshot> {
-    let stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut cmd = String::from("LOG");
-    if let Some(seq) = after {
-        cmd.push_str(&format!(" after={seq}"));
-    }
-    cmd.push('\n');
-    (&stream).write_all(cmd.as_bytes())?;
-    (&stream).flush()?;
-    let mut events = Vec::new();
-    let mut dropped = 0;
-    let mut head = 0;
-    for line in BufReader::new(&stream).lines() {
-        let line = line?;
-        if line == "ok" {
-            break;
-        }
-        if let Some(v) = line.strip_prefix("dropped=") {
-            dropped = v.parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("head=") {
-            head = v.parse().unwrap_or(0);
-        } else if let Some(ev) = parse_event_line(&line) {
-            events.push(ev);
-        }
-    }
-    Ok(AgentSnapshot {
-        events,
-        dropped,
-        head,
-    })
-}
-
-/// Parse one `event seq=… at=… kind=… detail=…` line back into an event, or `None` if malformed.
-/// Every field but `detail` is a simple `key=value` token; `detail` is the verbatim remainder after
-/// the first `detail=`.
-fn parse_event_line(line: &str) -> Option<AgentEvent> {
-    let rest = line.strip_prefix("event ")?;
-    let (head, detail) = match rest.split_once("detail=") {
-        Some((h, d)) => (h, d.to_string()),
-        None => return None,
-    };
-    let (mut seq, mut at, mut kind) = (None, None, None);
-    for token in head.split_whitespace() {
-        let (key, value) = token.split_once('=')?;
-        match key {
-            "seq" => seq = value.parse().ok(),
-            "at" => at = value.parse().ok(),
-            "kind" => kind = AgentKind::from_token(value),
-            _ => {}
-        }
-    }
-    Some(AgentEvent {
-        seq: seq?,
-        at_epoch_ms: at?,
-        kind: kind?,
-        detail,
-    })
+    super::lens::read_log(socket, after)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::lens::Event as _;
 
     /// The ring's own sequencing and eviction are [`super::super::lens`]'s and tested there. What is
     /// this lens's to get right is the mapping: what the broker calls a decision must land on the
@@ -351,13 +264,13 @@ mod tests {
             .snapshot(None)
             .events
             .iter()
-            .map(format_event_line)
+            .map(crate::sandbox::lens::Event::format_line)
             .collect();
 
         // The forged text survives as *text* — that is fine and even honest. What must not happen is
         // that it becomes a line, because a line is what a reader turns back into an event.
         assert_eq!(wire.lines().count(), 1, "one event, one line: {wire:?}");
-        let parsed: Vec<AgentEvent> = wire.lines().filter_map(parse_event_line).collect();
+        let parsed: Vec<AgentEvent> = wire.lines().filter_map(AgentEvent::parse_line).collect();
         assert_eq!(parsed.len(), 1, "one event read back: {wire:?}");
         assert_eq!(parsed[0].seq, 1, "not the sequence the payload named");
         assert!(parsed[0].detail.starts_with("deploy@example "));
@@ -379,12 +292,12 @@ mod tests {
         ring.push(AgentKind::Sign, "deploy@example");
         ring.push(AgentKind::Refuse, "a key the grant does not name");
 
-        let reply = dispatch("LOG", &ring);
+        let reply = crate::sandbox::lens::dispatch_log("LOG", &ring);
         assert!(reply.ends_with("ok\n"), "{reply}");
         let parsed: Vec<AgentEvent> = reply
             .lines()
             .filter(|l| l.starts_with("event "))
-            .filter_map(parse_event_line)
+            .filter_map(AgentEvent::parse_line)
             .collect();
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[1].kind, AgentKind::Sign);
@@ -392,10 +305,13 @@ mod tests {
         assert_eq!(parsed[2].kind, AgentKind::Refuse);
 
         // A cursor past the head is a valid, empty answer that still carries the cursor.
-        let reply = dispatch("LOG after=3", &ring);
+        let reply = crate::sandbox::lens::dispatch_log("LOG after=3", &ring);
         assert!(reply.contains("head=3"), "{reply}");
         assert!(!reply.contains("event "), "{reply}");
-        assert_eq!(dispatch("NOPE", &ring), "err bad-request\n");
+        assert_eq!(
+            crate::sandbox::lens::dispatch_log("NOPE", &ring),
+            "err bad-request\n"
+        );
     }
 
     /// The whole point of the socket is that the *host* reads it. A live end-to-end pass over a real
