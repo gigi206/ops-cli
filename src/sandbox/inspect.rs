@@ -260,16 +260,22 @@ pub(crate) fn prebuilt_pin_in(tree_dir: &Path, lockfile: &str, locator: &str) ->
     None
 }
 
-/// The lock filename a prebuilt backend records its pins in, or `None` for a backend that is not a
-/// per-tree prebuilt. Only `deb:`/`appimage:` qualify: their build output lands in the **per-project
+/// The lock filename a prebuilt backend records its pins in, derived from [`super::prebuilt::Kind`]
+/// so this view and the write side cannot name different files. `None` for a backend that is not a
+/// per-tree prebuilt: their build output lands in the **per-project
 /// store**, so a per-tree lock (and the store gcroot) is their realized signal. `flake:` builds into
 /// the cage **home** instead (see [`flake_built`]); mise is per-home; nix has no lock of this shape.
-pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<&'static str> {
+pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<String> {
+    use super::prebuilt::lock_file;
     use crate::config::Backend;
     match backend {
-        Backend::Deb(_) | Backend::DebResolve { .. } => Some("deb-packages.lock"),
-        Backend::AppImage(_) | Backend::AppImageResolve { .. } => Some("appimage-packages.lock"),
-        Backend::Tarball(_) | Backend::TarballResolve { .. } => Some("tarball-packages.lock"),
+        Backend::Deb(_) | Backend::DebResolve { .. } => Some(lock_file(&super::deb::Deb)),
+        Backend::AppImage(_) | Backend::AppImageResolve { .. } => {
+            Some(lock_file(&super::appimage::AppImage))
+        }
+        Backend::Tarball(_) | Backend::TarballResolve { .. } => {
+            Some(lock_file(&super::tarball::Tarball))
+        }
         _ => None,
     }
 }

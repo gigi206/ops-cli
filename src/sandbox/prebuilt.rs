@@ -673,11 +673,10 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
     #[test]
     fn the_derived_lock_and_gcroot_names_are_the_ones_already_on_disk() {
         // `Kind::name` is on-disk state: it spells the per-project lock a project's existing pins
-        // live in, and the prefix of every per-package gcroot. Nothing else pins those strings from
-        // this side -- every lock test round-trips through `pins`/`write_pins`, which both read the
-        // derived name, so renaming `name()` would strand a user's pins and gcroots with the whole
-        // suite still green. `super::packages` (the gc keep set) and `super::inspect` (the config
-        // view) write the same strings out as literals, so this is where the two sides are tied.
+        // live in, and the prefix of every per-package gcroot. Nothing else pins those strings --
+        // every lock test round-trips through `pins`/`write_pins`, which both read the derived
+        // name, so renaming `name()` would strand a user's pins and gcroots with the whole suite
+        // still green.
         assert_eq!(lock_file(&Deb), "deb-packages.lock");
         assert_eq!(lock_file(&AppImage), "appimage-packages.lock");
         assert_eq!(lock_file(&Tarball), "tarball-packages.lock");
@@ -685,6 +684,35 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             [Deb.name(), AppImage.name(), Tarball.name()],
             ["deb", "appimage", "tarball"]
         );
+    }
+
+    #[test]
+    fn the_readers_of_a_pin_derive_the_same_names_the_writers_do() {
+        // The gc keep set and the config view both name a prebuilt package's lock and gcroot from
+        // their own side. They used to spell the strings out as literals that merely happened to
+        // agree with the write side; both now derive from `Kind::name`, and this asserts against
+        // what each actually returns rather than against a literal, so a rename cannot leave one
+        // side behind.
+        let pkg = |name: &str, backend| crate::config::Package {
+            name: name.to_string(),
+            backend,
+            state: crate::trust::TrustState::Trusted,
+        };
+        let url = "https://example.com/app".to_string();
+        for (kind, backend) in [
+            (&Deb as &dyn Kind, crate::config::Backend::Deb(url.clone())),
+            (&AppImage, crate::config::Backend::AppImage(url.clone())),
+            (&Tarball, crate::config::Backend::Tarball(url.clone())),
+        ] {
+            assert_eq!(
+                super::super::inspect::prebuilt_lockfile(&backend).as_deref(),
+                Some(lock_file(kind).as_str())
+            );
+            assert_eq!(
+                super::super::packages::project_gcroot_names(&[pkg("demo-app", backend)]),
+                vec![format!("{}-demo-app", kind.name())]
+            );
+        }
     }
 
     #[test]

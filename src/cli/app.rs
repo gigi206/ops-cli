@@ -1216,7 +1216,7 @@ fn build_app_show(
                         // A `*:resolve` package's pin is keyed `resolve:<name>`, not by the `resolve`
                         // sentinel `locator` carries — look it up by that key so a built one is found.
                         let key = sandbox::inspect::prebuilt_pin_key(&pkg.backend, &pkg.name);
-                        let hits = sandbox::inspect::prebuilt_pin_trees(data_dir, lockfile, &key);
+                        let hits = sandbox::inspect::prebuilt_pin_trees(data_dir, &lockfile, &key);
                         match hits.first() {
                             Some((_, short)) => PackageInstalled::Installed {
                                 detail: format!("pinned in {} ({short})", plural_trees(hits.len())),

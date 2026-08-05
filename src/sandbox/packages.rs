@@ -205,21 +205,24 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
 /// lapsed (an edit turns the config Changed) must **not** have its build reclaimed — for a heavy
 /// prebuilt (a multi-hundred-MB desktop app) that would force a full re-download on the next trusted
 /// launch. Only a package no longer declared at all is a removal, and a removal is absent from this
-/// set whatever its trust was. Keep the `deb-{name}`/`appimage-{name}`/`tarball-{name}` prefixes in
-/// step with the write sites (deb.rs/appimage.rs/tarball.rs) and the bare-`<name>` nix site
-/// ([`provision`]).
+/// set whatever its trust was. A prebuilt backend's prefix is taken from [`prebuilt::Kind::name`],
+/// the same source the write sites derive their gcroot from, so the two cannot drift; `nix:` roots
+/// under a bare `<name>` ([`provision`]).
 pub(crate) fn project_gcroot_names(packages: &[Package]) -> Vec<String> {
+    use super::prebuilt::Kind;
     packages
         .iter()
         .filter_map(|p| match &p.backend {
             // `nix:` and a remote `flake:` are both built host-side under a bare `<name>` out-link.
             Backend::Nix(_) | Backend::Flake(_) => Some(p.name.clone()),
-            Backend::Deb(_) | Backend::DebResolve { .. } => Some(format!("deb-{}", p.name)),
+            Backend::Deb(_) | Backend::DebResolve { .. } => {
+                Some(format!("{}-{}", super::deb::Deb.name(), p.name))
+            }
             Backend::AppImage(_) | Backend::AppImageResolve { .. } => {
-                Some(format!("appimage-{}", p.name))
+                Some(format!("{}-{}", super::appimage::AppImage.name(), p.name))
             }
             Backend::Tarball(_) | Backend::TarballResolve { .. } => {
-                Some(format!("tarball-{}", p.name))
+                Some(format!("{}-{}", super::tarball::Tarball.name(), p.name))
             }
             // `mise:` is equipped in-cage; an inline `[flakes.<name>]` roots in the project store as
             // `sbx-flake-<name>` — neither writes a data-dir out-link here.
