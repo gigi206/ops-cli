@@ -1333,6 +1333,11 @@ fn resolve(
     let mut project_secret_defaults = secret_defaults.clone();
     if let Some((proj, state)) = project {
         let trusted = state == TrustState::Trusted;
+        let gate = Gate {
+            trusted,
+            state,
+            source: PROJECT_CONFIG,
+        };
         // Reported for an untrusted project too: an unknown key is a spelling question, not a
         // capability, so withholding the answer would only leave the author guessing.
         warn_unknown_keys(&mut warnings, PROJECT_CONFIG, &proj);
@@ -1391,140 +1396,114 @@ fn resolve(
         // `network` is a security field — a trusted project may change the posture;
         // an untrusted or changed one may not narrow or widen the network.
         if let Some(value) = proj.network {
-            if trusted {
-                // The stats toggle rides the same trusted `[network]` table — honor it before the
-                // field moves into `validate_network`, so a trusted project may turn its own audit
-                // off (or back on). An untrusted project never reaches here, so it cannot.
-                if let Some(b) = network_stats_of(&value) {
-                    egress_stats = b;
-                }
-                warn_if_baseline_sets_default_methods(&mut warnings, PROJECT_CONFIG, &value);
-                // A project `[network]` table without a `mode` inherits it from the resolved global
-                // posture (`network` as it stands after the global layer).
-                if let Some(policy) =
-                    validate_network(&mut warnings, PROJECT_CONFIG, value, &net_groups, &network)
-                {
-                    network = policy;
-                    network_origin = Provenance::Project;
-                }
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `network` policy ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take_validated(
+                &mut network,
+                &mut network_origin,
+                "`network` policy",
+                &mut warnings,
+                // `parent` is the posture as it stands after the global layer: a project
+                // `[network]` table without a `mode` inherits it.
+                |w, parent| {
+                    // The stats toggle rides the same trusted `[network]` table — honor it before
+                    // the field moves into `validate_network`, so a trusted project may turn its
+                    // own audit off (or back on). An untrusted project never reaches here.
+                    if let Some(b) = network_stats_of(&value) {
+                        egress_stats = b;
+                    }
+                    warn_if_baseline_sets_default_methods(w, PROJECT_CONFIG, &value);
+                    validate_network(w, PROJECT_CONFIG, value, &net_groups, parent)
+                },
+            );
         }
         // `proc` is a security field — a trusted project may set its agent's exec posture; an
         // untrusted or changed one may not forge or loosen the enforcement of its own agent.
         if let Some(value) = proj.proc {
-            if trusted {
-                // A project `[proc]` table without a `mode` inherits it from the resolved global
-                // posture (`proc` as it stands after the global layer).
-                if let Some(policy) = validate_proc(&mut warnings, PROJECT_CONFIG, value, &proc) {
-                    proc = policy;
-                    proc_origin = Provenance::Project;
-                }
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `proc` policy ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            // `parent` is the posture after the global layer: a `[proc]` table without a `mode`
+            // inherits it.
+            gate.take_validated(
+                &mut proc,
+                &mut proc_origin,
+                "`proc` policy",
+                &mut warnings,
+                |w, parent| validate_proc(w, PROJECT_CONFIG, value, parent),
+            );
         }
         // `notify` is a security field — a trusted project may tune how loudly its own refusals are
         // announced; an untrusted one may not, since silencing the notification is the cheapest way
         // to make a boundary look like it never bit.
         if let Some(value) = proj.notify {
-            if trusted {
-                // A project `[notify]` table without a `mode` inherits per event from the resolved
-                // global policy, so refining one lens leaves the others as the global layer set them.
-                if let Some(policy) = validate_notify(&mut warnings, PROJECT_CONFIG, value, &notify)
-                {
-                    notify = policy;
-                    notify_origin = Provenance::Project;
-                }
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `notify` policy ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            // A `[notify]` table without a `mode` inherits from `parent` per event, so refining
+            // one lens leaves the others as the global layer set them.
+            gate.take_validated(
+                &mut notify,
+                &mut notify_origin,
+                "`notify` policy",
+                &mut warnings,
+                |w, parent| validate_notify(w, PROJECT_CONFIG, value, parent),
+            );
         }
         // `gui` is a security field — a trusted project may open a display; an untrusted or
         // changed one may not (exposing a compositor socket is a confidentiality and integrity
         // choice an untrusted project must not make).
         if let Some(value) = proj.gui {
-            if trusted {
-                if let Some(policy) = validate_gui(&mut warnings, PROJECT_CONFIG, value) {
-                    gui = policy;
-                    gui_origin = Provenance::Project;
-                }
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `gui` posture ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            // `gui` inherits nothing from the layer below — a posture is whole or absent.
+            gate.take_validated(
+                &mut gui,
+                &mut gui_origin,
+                "`gui` posture",
+                &mut warnings,
+                |w, _| validate_gui(w, PROJECT_CONFIG, value),
+            );
         }
         // `gpu` is a security field — a trusted project may open GPU rendering; an untrusted or
         // changed one may not (a render node and the `/sys` device tree widen the kernel attack
         // surface, a choice an untrusted project must not make).
         if let Some(value) = proj.gpu {
-            if trusted {
-                gpu = value;
-                gpu_origin = Provenance::Project;
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `gpu` posture ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take(
+                &mut gpu,
+                &mut gpu_origin,
+                "`gpu` posture",
+                value,
+                &mut warnings,
+            );
         }
         // `audio` is a security field — a trusted project may open audio; an untrusted or changed one
         // may not (the PulseAudio bus exposes the microphone and every system-audio `.monitor`
         // source, a choice an untrusted project must not make).
         if let Some(value) = proj.audio {
-            if trusted {
-                audio = value;
-                audio_origin = Provenance::Project;
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `audio` posture ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take(
+                &mut audio,
+                &mut audio_origin,
+                "`audio` posture",
+                value,
+                &mut warnings,
+            );
         }
         // `dbus` is a security field — a trusted project may stand up the in-cage portal; an
         // untrusted or changed one may not (a session bus, near the keyring and the portals, is a
         // choice an untrusted project must not make).
         if let Some(value) = proj.dbus {
-            if trusted {
-                dbus = value;
-                dbus_origin = Provenance::Project;
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `dbus` posture ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take(
+                &mut dbus,
+                &mut dbus_origin,
+                "`dbus` posture",
+                value,
+                &mut warnings,
+            );
         }
         // `forward` is a security field — a trusted project may add host loopback forward ports;
         // an untrusted or changed one may not (opening a host port is a deliberate inbound hole).
         // The ports union onto the global set: a project adds, never replaces (the flagship
         // property holds because the untrusted contribution is dropped here, before the union).
         if let Some(raw) = proj.forward {
-            if trusted {
-                let project_forward = validate_forward(&mut warnings, PROJECT_CONFIG, &raw);
-                if !project_forward.is_empty() {
-                    forward_origin = Provenance::Project;
-                }
-                union_forward(&mut forward, project_forward);
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `forward` ports ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.union(
+                &mut forward,
+                &mut forward_origin,
+                "`forward` ports",
+                &mut warnings,
+                |w| validate_forward(w, PROJECT_CONFIG, &raw),
+                union_forward,
+            );
         }
         // `[limits]` is a security field — a trusted project may tune the cgroup limits; an
         // untrusted or changed one may not (loosening them weakens the anti-DoS control). The
@@ -1566,18 +1545,14 @@ fn resolve(
         // unions onto the global set: a project adds devices, never removes (the flagship property
         // holds because the untrusted contribution is dropped here, before the union).
         if let Some(raw) = proj.devices {
-            if trusted {
-                let project_devices = apply_devices(&mut warnings, PROJECT_CONFIG, Some(raw));
-                if !project_devices.is_empty() {
-                    devices_origin = Provenance::Project;
-                }
-                union_devices(&mut devices, project_devices);
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `[devices]` ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.union(
+                &mut devices,
+                &mut devices_origin,
+                "`[devices]`",
+                &mut warnings,
+                |w| apply_devices(w, PROJECT_CONFIG, Some(raw)),
+                union_devices,
+            );
         }
         // `[fs]` is the one table with no trust gate: it can only take access away from the cage
         // the project itself declares, so an untrusted project closing its own files off gains
@@ -1595,20 +1570,20 @@ fn resolve(
         // with; an untrusted or changed one may not, because that signature authenticates as the
         // user on every host that trusts the key. Unions onto the global set, like `[devices]`.
         if let Some(raw) = proj.ssh_agent {
-            if trusted {
-                let (project_keys, confirm) =
-                    apply_ssh_agent(&mut warnings, PROJECT_CONFIG, Some(raw));
-                ssh_agent_confirm |= confirm;
-                if !project_keys.is_empty() {
-                    ssh_agent_origin = Provenance::Project;
-                }
-                union_ssh_agent(&mut ssh_agent, project_keys);
-            } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `[ssh_agent]` ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.union(
+                &mut ssh_agent,
+                &mut ssh_agent_origin,
+                "`[ssh_agent]`",
+                &mut warnings,
+                |w| {
+                    // `confirm` rides the same table but is not part of the key set, so it is
+                    // folded here, where it is produced, rather than smuggled through the union.
+                    let (keys, confirm) = apply_ssh_agent(w, PROJECT_CONFIG, Some(raw));
+                    ssh_agent_confirm |= confirm;
+                    keys
+                },
+                union_ssh_agent,
+            );
         }
         // The `[secret]` section is a security field — a trusted project may inject
         // credentials (and extend the resolver defaults); an untrusted or changed one may
@@ -2558,6 +2533,11 @@ fn resolve_app(
     if let Some((app, state)) = project {
         let trusted = state == TrustState::Trusted;
         let source = app_source(PROJECT_CONFIG, name);
+        let gate = Gate {
+            trusted,
+            state,
+            source: &source,
+        };
         // A trusted layer's `use` was already folded into the fields above, before resolution, so
         // the references are only reported here — as the per-app note the untrusted case owes the
         // user, in the same place and shape as the `network` one below. Without it, the drop would
@@ -2596,115 +2576,100 @@ fn resolve_app(
             !trusted,
         );
         if let Some(field) = app.network {
-            if trusted {
-                warn_if_app_sets_stats(&mut warnings, &source, &field);
-                let raw_dm = network_default_methods_of(&field).cloned();
-                // A mode-less table inherits from whatever posture is in effect so far — the app's
-                // own global layer if it set one, else the baseline.
-                let parent = network.as_ref().unwrap_or(baseline_network);
-                let resolved = validate_network(&mut warnings, &source, field, net_groups, parent);
-                if let Some(policy) = resolved {
-                    network = Some(policy);
-                    network_origin = Provenance::Project;
-                    if let Some(m) = resolve_app_default_methods(&mut warnings, &source, raw_dm) {
+            gate.take_validated(
+                &mut network,
+                &mut network_origin,
+                "`network` policy",
+                &mut warnings,
+                |w, current| {
+                    warn_if_app_sets_stats(w, &source, &field);
+                    let raw_dm = network_default_methods_of(&field).cloned();
+                    // A mode-less table inherits from whatever posture is in effect so far — the
+                    // app's own global layer if it set one, else the baseline.
+                    let parent = current.as_ref().unwrap_or(baseline_network);
+                    let policy = validate_network(w, &source, field, net_groups, parent)?;
+                    // Only once the policy stands: the verb posture belongs to a policy that exists.
+                    if let Some(m) = resolve_app_default_methods(w, &source, raw_dm) {
                         default_methods = m;
                     }
-                }
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `network` policy ({})",
-                    untrusted_reason(state)
-                ));
-            }
+                    Some(Some(policy))
+                },
+            );
         }
         // `proc` mirrors `network`: an untrusted project may not set an exec posture, on its own app
         // or by overriding a trusted one (the flagship property — an agent runs *on* untrusted code
         // without that code being able to forge or loosen the enforcement of its own agent).
         if let Some(field) = app.proc {
-            if trusted {
-                let parent = proc.as_ref().unwrap_or(baseline_proc);
-                if let Some(policy) = validate_proc(&mut warnings, &source, field, parent) {
-                    proc = Some(policy);
-                    proc_origin = Provenance::Project;
-                }
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `proc` policy ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take_validated(
+                &mut proc,
+                &mut proc_origin,
+                "`proc` policy",
+                &mut warnings,
+                |w, current| {
+                    let parent = current.as_ref().unwrap_or(baseline_proc);
+                    validate_proc(w, &source, field, parent).map(Some)
+                },
+            );
         }
         // `notify` mirrors `proc`: an untrusted project may not quieten an app's refusals, on its own
         // app or by overriding a trusted one — the announcement is how a refusal is seen at all.
         if let Some(field) = app.notify {
-            if trusted {
-                let parent = notify.as_ref().unwrap_or(baseline_notify);
-                if let Some(policy) = validate_notify(&mut warnings, &source, field, parent) {
-                    notify = Some(policy);
-                    notify_origin = Provenance::Project;
-                }
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `notify` policy ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take_validated(
+                &mut notify,
+                &mut notify_origin,
+                "`notify` policy",
+                &mut warnings,
+                |w, current| {
+                    let parent = current.as_ref().unwrap_or(baseline_notify);
+                    validate_notify(w, &source, field, parent).map(Some)
+                },
+            );
         }
         // `gui` mirrors `network`: an untrusted project may not open a display, on its own app
         // or by overriding a trusted one (the flagship property — an agent runs *on* untrusted
         // code without that code being able to expose the user's compositor).
         if let Some(value) = app.gui {
-            if trusted {
-                if let Some(policy) = validate_gui(&mut warnings, &source, value) {
-                    gui = Some(policy);
-                    gui_origin = Provenance::Project;
-                }
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `gui` posture ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take_validated(
+                &mut gui,
+                &mut gui_origin,
+                "`gui` posture",
+                &mut warnings,
+                |w, _| validate_gui(w, &source, value).map(Some),
+            );
         }
         // `gpu` mirrors `gui`: an untrusted project may not open GPU rendering, on its own app or
         // by overriding a trusted one (a render node and the `/sys` device tree widen the kernel
         // attack surface).
         if let Some(value) = app.gpu {
-            if trusted {
-                gpu = Some(value);
-                gpu_origin = Provenance::Project;
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `gpu` posture ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take(
+                &mut gpu,
+                &mut gpu_origin,
+                "`gpu` posture",
+                Some(value),
+                &mut warnings,
+            );
         }
         // `audio` mirrors `gpu`: an untrusted project may not open audio, on its own app or by
         // overriding a trusted one (the PulseAudio bus exposes the microphone and all system audio).
         if let Some(value) = app.audio {
-            if trusted {
-                audio = Some(value);
-                audio_origin = Provenance::Project;
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `audio` posture ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take(
+                &mut audio,
+                &mut audio_origin,
+                "`audio` posture",
+                Some(value),
+                &mut warnings,
+            );
         }
         // `dbus` mirrors `gpu`: an untrusted project may not stand up the in-cage portal, on its own
         // app or by overriding a trusted one (a bus sits near the keyring and the portals).
         if let Some(value) = app.dbus {
-            if trusted {
-                dbus = Some(value);
-                dbus_origin = Provenance::Project;
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `dbus` posture ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.take(
+                &mut dbus,
+                &mut dbus_origin,
+                "`dbus` posture",
+                Some(value),
+                &mut warnings,
+            );
         }
         // `[limits]` mirrors `network`/`gui`: a trusted project may tune the cage's limits, on its
         // own app or by overriding a trusted one; an untrusted project may not (loosening them
@@ -2745,18 +2710,14 @@ fn resolve_app(
         // Dropping the untrusted layer here — before the union — is what keeps a global app's device
         // grant from being widened by an untrusted project.
         if let Some(raw) = app.devices {
-            if trusted {
-                let project_devices = apply_devices(&mut warnings, &source, Some(raw));
-                if !project_devices.is_empty() {
-                    devices_origin = Provenance::Project;
-                }
-                union_devices(&mut devices, project_devices);
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `[devices]` ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.union(
+                &mut devices,
+                &mut devices_origin,
+                "`[devices]`",
+                &mut warnings,
+                |w| apply_devices(w, &source, Some(raw)),
+                union_devices,
+            );
         }
         // `[fs]` is ungated here for the reason it is ungated everywhere: an app's masks only take
         // access away from that app's own cage, so an untrusted project declaring them buys nothing.
@@ -2772,37 +2733,31 @@ fn resolve_app(
         // that trusts it. Dropped before the union, so an untrusted project cannot widen the grant a
         // global app was given.
         if let Some(raw) = app.ssh_agent {
-            if trusted {
-                let (project_ssh_agent, confirm) =
-                    apply_ssh_agent(&mut warnings, &source, Some(raw));
-                ssh_agent_confirm |= confirm;
-                if !project_ssh_agent.is_empty() {
-                    ssh_agent_origin = Provenance::Project;
-                }
-                union_ssh_agent(&mut ssh_agent, project_ssh_agent);
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `[ssh_agent]` ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.union(
+                &mut ssh_agent,
+                &mut ssh_agent_origin,
+                "`[ssh_agent]`",
+                &mut warnings,
+                |w| {
+                    let (keys, confirm) = apply_ssh_agent(w, &source, Some(raw));
+                    ssh_agent_confirm |= confirm;
+                    keys
+                },
+                union_ssh_agent,
+            );
         }
         // `forward` mirrors `network`/`gui`: a trusted project may add forward ports to its own
         // app or a trusted one; an untrusted project may not (opening a host port is an inbound
         // hole). The ports union onto the app's own set, so the project adds, never replaces.
         if let Some(raw) = app.forward {
-            if trusted {
-                let project_forward = validate_forward(&mut warnings, &source, &raw);
-                if !project_forward.is_empty() {
-                    forward_origin = Provenance::Project;
-                }
-                union_forward(&mut forward, project_forward);
-            } else {
-                warnings.push(format!(
-                    "{source}: ignoring `forward` ports ({})",
-                    untrusted_reason(state)
-                ));
-            }
+            gate.union(
+                &mut forward,
+                &mut forward_origin,
+                "`forward` ports",
+                &mut warnings,
+                |w| validate_forward(w, &source, &raw),
+                union_forward,
+            );
         }
         if let Some(section) = app.secret {
             if trusted {
@@ -3601,6 +3556,107 @@ fn upsert_package(out: &mut Vec<Package>, name: String, backend: Backend, state:
 /// for the action it implies: a since-*changed* project points at re-approval, a
 /// never-trusted one at first approval. Shared by the package launcher and
 /// `sbx config` so the two never phrase the same verdict differently.
+/// The trust verdict one configuration layer is subject to, and what names that layer when it has
+/// to refuse a field.
+///
+/// A security field is honoured only from a trusted layer; an untrusted or changed one gets a
+/// warning and the value accumulated so far stands. Every gated field asks that same question, so
+/// the layer carries one of these and the decision is made in a single place rather than spelled
+/// out once per field — and a field added without its gate has nowhere to hide.
+struct Gate<'a> {
+    trusted: bool,
+    state: TrustState,
+    /// What names this layer in a warning: the project file, or an app's own source.
+    source: &'a str,
+}
+
+impl Gate<'_> {
+    /// Refuse a field, naming it and the remedy.
+    ///
+    /// `what` is the whole phrase, passed verbatim by the caller — "`gpu` posture", "`forward`
+    /// ports", "`[devices]`". The nouns differ per field and that is deliberate: this sentence is
+    /// what a user reads, so it is the caller's to spell, never something derived from a field name
+    /// here.
+    fn refuse(&self, what: &str, warnings: &mut Vec<String>) {
+        warnings.push(format!(
+            "{}: ignoring {what} ({})",
+            self.source,
+            untrusted_reason(self.state)
+        ));
+    }
+
+    /// Take `value` outright when the layer is trusted, and record the layer as where it came from.
+    ///
+    /// For a posture that needs no validation past parsing.
+    fn take<T>(
+        &self,
+        slot: &mut T,
+        origin: &mut Provenance,
+        what: &str,
+        value: T,
+        warnings: &mut Vec<String>,
+    ) {
+        if !self.trusted {
+            self.refuse(what, warnings);
+            return;
+        }
+        *slot = value;
+        *origin = Provenance::Project;
+    }
+
+    /// Take a validated replacement when the layer is trusted and validation produced one.
+    ///
+    /// `validate` sees the value accumulated so far, because a layer's table without a `mode`
+    /// inherits it from the layer below. One that returns `None` has already said why in
+    /// `warnings`, and the accumulated value stands — so provenance moves only when a value
+    /// actually arrives.
+    fn take_validated<T>(
+        &self,
+        slot: &mut T,
+        origin: &mut Provenance,
+        what: &str,
+        warnings: &mut Vec<String>,
+        validate: impl FnOnce(&mut Vec<String>, &T) -> Option<T>,
+    ) {
+        if !self.trusted {
+            self.refuse(what, warnings);
+            return;
+        }
+        if let Some(value) = validate(warnings, slot) {
+            *slot = value;
+            *origin = Provenance::Project;
+        }
+    }
+
+    /// Fold a trusted layer's contribution into an accumulating set.
+    ///
+    /// Provenance moves only when the layer actually contributed something: an empty contribution
+    /// claiming it would make `config show` point at a layer that added nothing.
+    ///
+    /// `union` is named at the call site rather than assumed, because each set has its own idea of
+    /// merging — and because these unions sort the accumulated value as a side effect, so a refused
+    /// layer must not reach one at all.
+    fn union<T>(
+        &self,
+        acc: &mut Vec<T>,
+        origin: &mut Provenance,
+        what: &str,
+        warnings: &mut Vec<String>,
+        contribute: impl FnOnce(&mut Vec<String>) -> Vec<T>,
+        union: fn(&mut Vec<T>, Vec<T>),
+    ) {
+        if !self.trusted {
+            self.refuse(what, warnings);
+            return;
+        }
+        let contributed = contribute(warnings);
+        if !contributed.is_empty() {
+            *origin = Provenance::Project;
+        }
+        union(acc, contributed);
+    }
+}
+
 pub(crate) fn untrusted_reason(state: TrustState) -> &'static str {
     match state {
         TrustState::Changed => "changed since it was trusted — re-run `sbx trust`",

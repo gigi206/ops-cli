@@ -7039,10 +7039,7 @@ fn every_trust_gated_app_field_names_itself_in_its_refusal() {
             .join("\n")
     );
     let project: RawConfig = toml::from_str(&toml_src).unwrap();
-    let r = resolve_no_plugins(
-        RawConfig::default(),
-        Some((project, TrustState::Untrusted)),
-    );
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
     let app = &r.apps["mine"];
     let reason = super::untrusted_reason(TrustState::Untrusted);
     for what in GATED_REFUSALS.iter().filter(|w| !w.contains("nixpkgs")) {
@@ -7053,6 +7050,114 @@ fn every_trust_gated_app_field_names_itself_in_its_refusal() {
             "expected an app refusal ending in {:?}\ngot {:#?}",
             format!(": ignoring {what} ({reason})"),
             app.warnings
+        );
+    }
+}
+
+/// Every trust-gated field lands in its own slot, stamps its own provenance, and moves nothing else.
+///
+/// A gated field is wired by naming a value slot and a provenance slot side by side. Naming a
+/// neighbour's compiles, keeps every refusal green, and silently writes one field's value over
+/// another's — a mis-wiring no test that only resolves untrusted configs can see. So the check is
+/// that declaring one field **alone**, on a trusted project, moves exactly that field: its value
+/// arrives, its provenance says `Project`, and every other gated field is still untouched at
+/// `Default`.
+#[test]
+fn a_trusted_field_lands_in_its_own_slot_and_moves_no_other() {
+    /// Which gated fields this resolution claims came from the project layer.
+    fn claimed(r: &Resolved) -> Vec<&'static str> {
+        [
+            ("network", r.network_origin),
+            ("proc", r.proc_origin),
+            ("notify", r.notify_origin),
+            ("gui", r.gui_origin),
+            ("gpu", r.gpu_origin),
+            ("audio", r.audio_origin),
+            ("dbus", r.dbus_origin),
+            ("forward", r.forward_origin),
+            ("devices", r.devices_origin),
+            ("ssh_agent", r.ssh_agent_origin),
+        ]
+        .into_iter()
+        .filter(|(_, o)| *o == Provenance::Project)
+        .map(|(n, _)| n)
+        .collect()
+    }
+
+    // One field per case, declared alone, with what proves *that* field's value arrived.
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, &str, Box<dyn Fn(&Resolved) -> bool>)> = vec![
+        (
+            "network",
+            "network = \"shared\"",
+            Box::new(|r: &Resolved| matches!(r.network, NetworkPolicy::Shared)),
+        ),
+        (
+            "proc",
+            "proc = \"enforce\"",
+            Box::new(|r: &Resolved| r.proc.mode == crate::proc_policy::ProcMode::Enforce),
+        ),
+        (
+            "notify",
+            "notify = \"off\"",
+            Box::new(|r: &Resolved| {
+                r.notify.mode_for(crate::notify::NotifyEvent::Network)
+                    == crate::notify::NotifyMode::Off
+            }),
+        ),
+        (
+            "gui",
+            "gui = \"wayland\"",
+            Box::new(|r: &Resolved| r.gui.renders()),
+        ),
+        ("gpu", "gpu = true", Box::new(|r: &Resolved| r.gpu)),
+        ("audio", "audio = true", Box::new(|r: &Resolved| r.audio)),
+        ("dbus", "dbus = true", Box::new(|r: &Resolved| r.dbus)),
+        (
+            "forward",
+            "forward = [8080]",
+            Box::new(|r: &Resolved| r.forward == vec![8080]),
+        ),
+        (
+            "devices",
+            "[devices]\nallow = [\"/dev/kvm\"]",
+            Box::new(|r: &Resolved| r.devices == vec![PathBuf::from("/dev/kvm")]),
+        ),
+        (
+            "ssh_agent",
+            "[ssh_agent]\nallow = [\"deploy@example\"]",
+            Box::new(|r: &Resolved| r.ssh_agent == vec!["deploy@example".to_string()]),
+        ),
+    ];
+
+    for (field, toml_src, landed) in cases {
+        let project: RawConfig = toml::from_str(toml_src).unwrap();
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+        assert!(
+            landed(&r),
+            "`{field}` was declared by a trusted project and did not arrive in its own slot"
+        );
+        assert_eq!(
+            claimed(&r),
+            vec![field],
+            "declaring `{field}` alone must stamp `{field}` and nothing else"
+        );
+    }
+
+    // A trusted layer that declares a set and contributes nothing to it claims no provenance:
+    // `config show` would otherwise point at a layer that added nothing. Every empty-set spelling,
+    // since each one reaches the union by a different route.
+    for empty in [
+        "forward = []",
+        "[devices]\nallow = []",
+        "[ssh_agent]\nallow = []",
+    ] {
+        let project: RawConfig = toml::from_str(empty).unwrap();
+        let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+        assert!(
+            claimed(&r).is_empty(),
+            "an empty {empty:?} contributed nothing and must claim nothing; claimed {:?}",
+            claimed(&r)
         );
     }
 }
