@@ -325,13 +325,16 @@ async fn stream(
     {
         Some(ip) => ip,
         None => {
-            ctx.push_log(
+            // Through `outcome`, not `push_log`: an SSRF block is a refusal, so it owes the reader
+            // the `blocked` counter and the desktop notice as well as the log line — exactly what
+            // the same guard records on the HTTP/1.1 path.
+            ctx.outcome(
                 Proto::Https,
                 connect_host,
                 port,
                 Some(method.as_str()),
                 Some(&path),
-                LogVerdict::Blocked,
+                StatKind::Blocked,
                 "ssrf-blocked",
             );
             let _ = refuse(respond, StatusCode::FORBIDDEN, "ssrf-blocked");
@@ -812,6 +815,105 @@ fn forbidden_response_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An SSRF refusal on the HTTP/2 path must be *accounted for* the way the HTTP/1.1 one is, not
+    /// merely written into the log: the `blocked` bucket `sbx net stats` reports, and — because
+    /// [`ProxyCtx::outcome`] is the one chokepoint that announces a refusal — the desktop notice
+    /// too. A guard that turns a request down without counting it is the single refusal no reader
+    /// of sbx can see, which is the opposite of what a guard is for.
+    ///
+    /// [`stream`] is driven over an in-memory duplex, so this is the real request path
+    /// (`:authority` re-check → verdict → resolve → guard); only the TLS the tunnel already
+    /// terminated is absent.
+    #[test]
+    fn an_h2_stream_the_ssrf_guard_refuses_is_counted_like_the_http1_one() {
+        use crate::allowlist::{classify, EgressPolicy};
+        use crate::sandbox::control::{LogRing, LOG_RING_CAP};
+        use crate::sandbox::egress_stats::{Counts, EgressStats};
+        use crate::testutil::TmpDir;
+        use std::time::Duration;
+
+        let dir = TmpDir::new();
+        let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = ProxyCtx::new(
+            Arc::new(super::super::Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+        )
+        .unwrap()
+        .with_stats(Arc::clone(&stats))
+        .with_log(Arc::clone(&log))
+        // the cloud-metadata address: refused whatever the rule, this exact-host one included
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])])));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = rt.block_on(async {
+            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+            // The client leg: handshake, one POST, read back whatever the proxy answers.
+            let client = async {
+                let (mut send, conn) = h2::client::handshake(client_io).await.unwrap();
+                let driver = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri("https://grpc.test/pkg.Svc/Method")
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let (resp, _body) = send.send_request(req, true).unwrap();
+                let status = resp.await.unwrap().status();
+                driver.abort();
+                status
+            };
+            // The proxy leg: accept the one stream, run it through the real handler, then keep
+            // polling the connection so the queued refusal is actually written back. It never ends
+            // on its own — the client's answer is what ends the exchange, so it is simply dropped.
+            let proxy = async {
+                let mut conn = h2::server::handshake(server_io).await.unwrap();
+                let (req, respond) = conn.accept().await.unwrap().unwrap();
+                stream(req, respond, "grpc.test", 443, &ctx).await;
+                while conn.accept().await.is_some() {}
+            };
+            // A bound so a regression that stalls the exchange fails the test instead of hanging
+            // the whole suite; the real exchange is in-memory and takes microseconds.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::select! {
+                    status = client => status,
+                    () = proxy => panic!("the proxy leg ended before the client had its answer"),
+                }
+            })
+            .await
+            .expect("the in-memory h2 exchange must not stall")
+        });
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "the stream is refused");
+        assert_eq!(
+            stats
+                .snapshot()
+                .get("grpc.test")
+                .copied()
+                .unwrap_or_default(),
+            Counts {
+                blocked: 1,
+                ..Default::default()
+            },
+            "an SSRF block counts in the `blocked` bucket, exactly as it does on HTTP/1.1"
+        );
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events.len(), 1, "one event for one decision: {events:?}");
+        assert_eq!(
+            (
+                events[0].host.as_str(),
+                events[0].verdict,
+                events[0].reason.as_str()
+            ),
+            ("grpc.test", LogVerdict::Blocked, "ssrf-blocked")
+        );
+    }
 
     #[test]
     fn redact_header_map_masks_a_reflected_secret_in_a_header_value() {
