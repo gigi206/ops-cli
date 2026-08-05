@@ -3862,7 +3862,9 @@ fn build(
     // told to trust the project config so they resolve through the shims on PATH. Both fetch, so
     // both wrap the command *before* the egress wrap below — under an allowlist the forwarder is
     // up before either install — and both are skipped under `network = "none"`.
-    let mut cmd = cmd;
+    // The wraps each block below contributes. They are nested by `WrapLayer`, not by the order the
+    // blocks run in, so a block may register its wrap wherever the value it needs becomes available.
+    let mut wraps: Vec<(WrapLayer, CommandWrap)> = Vec::new();
 
     // Exec enforcement (`[proc] mode = enforce|ask`): stand up the seccomp user-notification
     // supervisor and wrap the command with the in-cage shim, **innermost** — so only the agent
@@ -3937,7 +3939,10 @@ fn build(
             eprintln!("sbx: cannot start exec enforcement: {e}");
             ExitCode::FAILURE
         })?;
-        cmd = super::proc_enforce::wrap_command(cmd);
+        wraps.push((
+            WrapLayer::ProcEnforce,
+            Box::new(super::proc_enforce::wrap_command),
+        ));
         proc_binds = wiring.binds;
         proc_enforce_guard = Some(guard);
     }
@@ -3975,16 +3980,21 @@ fn build(
                         auto_equip.join(", ")
                     );
                 }
-                cmd = wrap_mise_equip(
-                    &prep.userland.mise_bin,
-                    &prep.userland.shell_bin,
-                    "install",
-                    &auto_equip,
-                    // Lane 2 (project `.mise.toml` tools) runs under the ambient primary — the
-                    // per-project pool for a global app, which is where these belong.
-                    None,
-                    cmd,
-                );
+                wraps.push((
+                    WrapLayer::MiseEquip,
+                    Box::new(move |cmd| {
+                        wrap_mise_equip(
+                            &prep.userland.mise_bin,
+                            &prep.userland.shell_bin,
+                            "install",
+                            &auto_equip,
+                            // Lane 2 (project `.mise.toml` tools) runs under the ambient primary —
+                            // the per-project pool for a global app, which is where these belong.
+                            None,
+                            cmd,
+                        )
+                    }),
+                ));
                 // Tell the in-cage mise to trust the project config so the installed tools
                 // resolve. This applies for the whole launch, so an agent's own `sbx mise` in a
                 // project that declares non-`nix:` tools also trusts the project config — a
@@ -4003,16 +4013,22 @@ fn build(
                         global_mise.join(", ")
                     );
                 }
-                cmd = wrap_mise_equip(
-                    &prep.userland.mise_bin,
-                    &prep.userland.shell_bin,
-                    "use -g",
-                    &global_mise,
-                    // Pin the install to the app-global home pool for a global app (see above);
-                    // None for other runtimes, where the ambient primary is already app-global.
-                    app_global_mise_dir.as_deref(),
-                    cmd,
-                );
+                wraps.push((
+                    WrapLayer::MiseEquip,
+                    Box::new(move |cmd| {
+                        wrap_mise_equip(
+                            &prep.userland.mise_bin,
+                            &prep.userland.shell_bin,
+                            "use -g",
+                            &global_mise,
+                            // Pin the install to the app-global home pool for a global app (see
+                            // above); None for other runtimes, where the ambient primary is already
+                            // app-global.
+                            app_global_mise_dir.as_deref(),
+                            cmd,
+                        )
+                    }),
+                ));
             }
         }
     }
@@ -4037,13 +4053,18 @@ fn build(
                  host must be in [network].allow under an allowlist)",
                 inline_flake_names.join(", ")
             );
-            cmd = wrap_flake_equip(
-                &prep.userland.nix_bin,
-                &prep.userland.shell_bin,
-                &binds::flake_roots_dir(),
-                &flake_pairs,
-                cmd,
-            );
+            wraps.push((
+                WrapLayer::FlakeEquip,
+                Box::new(|cmd| {
+                    wrap_flake_equip(
+                        &prep.userland.nix_bin,
+                        &prep.userland.shell_bin,
+                        &binds::flake_roots_dir(),
+                        &flake_pairs,
+                        cmd,
+                    )
+                }),
+            ));
         }
     }
 
@@ -4088,12 +4109,18 @@ fn build(
                     eprintln!("sbx: {e}");
                     ExitCode::FAILURE
                 })?;
-            cmd = forward::wrap_command(
-                &prep.userland.socat_bin,
-                &prep.userland.shell_bin,
-                &wiring.forwards,
-                cmd,
-            );
+            let forwards = wiring.forwards;
+            wraps.push((
+                WrapLayer::Forward,
+                Box::new(move |cmd| {
+                    forward::wrap_command(
+                        &prep.userland.socat_bin,
+                        &prep.userland.shell_bin,
+                        &forwards,
+                        cmd,
+                    )
+                }),
+            ));
             forward_binds = wiring.binds;
             forward_guard = Some(guard);
         }
@@ -4151,19 +4178,36 @@ fn build(
             eprintln!("sbx: cannot start the egress filtering proxy: {e}");
             ExitCode::FAILURE
         })?;
-        cmd = egress::wrap_command(
-            &prep.userland.socat_bin,
-            &prep.userland.shell_bin,
-            cmd,
-            &tcp_plan.destinations,
-        );
+        // The wrap owns its copy: `tcp_plan` is read again further down, when the same destinations
+        // become the cage's `/etc/hosts` entries.
+        let destinations = tcp_plan.destinations.clone();
+        wraps.push((
+            WrapLayer::Egress,
+            Box::new(move |cmd| {
+                egress::wrap_command(
+                    &prep.userland.socat_bin,
+                    &prep.userland.shell_bin,
+                    cmd,
+                    &destinations,
+                )
+            }),
+        ));
         // For a GUI cage, import sbx's MITM CA into the cage's NSS db before the app runs, so a
-        // Chromium/Electron app trusts the egress proxy (it ignores the CA-file env vars). This
-        // is the outermost wrap — it runs, then execs the egress-wrapped command. Only present
+        // Chromium/Electron app trusts the egress proxy (it ignores the CA-file env vars). It sits
+        // outside the egress wrap — it runs, then execs the egress-wrapped command. Only present
         // when `ca_trust` was provisioned (gui = "wayland" under this allowlist).
         if let Some(ct) = &ca_trust {
-            cmd =
-                super::catrust::wrap(&ct.certutil, &prep.userland.shell_bin, egress::CAGE_CA, cmd);
+            wraps.push((
+                WrapLayer::CaTrust,
+                Box::new(|cmd| {
+                    super::catrust::wrap(
+                        &ct.certutil,
+                        &prep.userland.shell_bin,
+                        egress::CAGE_CA,
+                        cmd,
+                    )
+                }),
+            ));
         }
         egress_binds = wiring.binds;
         egress_env = wiring.env;
@@ -4432,21 +4476,29 @@ fn build(
     }
 
     // In-cage portal: wrap the command so the private session bus is stood up before the app runs.
-    // This is the **outermost** wrap — applied after every other command wrap (mise/flake/forward/
-    // egress/catrust) — so its preamble (`dbus-daemon --fork`, which blocks until the socket is
-    // ready) runs first, then execs the rest of the wrapped command. Only present under
+    // The **outermost** layer, so its preamble (`dbus-daemon --fork`, which blocks until the socket
+    // is ready) runs first, then execs the rest of the wrapped command. Only present under
     // `gui = "wayland"` + `dbus = true` with a successful provision.
     if let Some(p) = &portal {
-        cmd = super::portal::wrap_command(
-            &prep.userland.shell_bin,
-            &p.dbus_daemon,
-            &p.xdp_root,
-            &p.gtk_root,
-            &p.update_desktop_db,
-            portal_scheme.as_deref(),
-            cmd,
-        );
+        wraps.push((
+            WrapLayer::Portal,
+            Box::new(|cmd| {
+                super::portal::wrap_command(
+                    &prep.userland.shell_bin,
+                    &p.dbus_daemon,
+                    &p.xdp_root,
+                    &p.gtk_root,
+                    &p.update_desktop_db,
+                    portal_scheme.as_deref(),
+                    cmd,
+                )
+            }),
+        ));
     }
+
+    // Every wrap this launch contributed, nested by `WrapLayer` rather than by the order the blocks
+    // above happened to run in.
+    let cmd = wrap_cage_command(cmd, wraps);
 
     // The launcher's extra binds, emitted after the structural mounts: the egress machinery
     // (socket + CA) and the GUI socket. Their destinations are sbx's or the host's, never a
@@ -5455,6 +5507,56 @@ fn keep_passthrough(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(St
         .collect()
 }
 
+/// Where a command wrap sits in the nesting a launch builds around the cage's command, innermost
+/// first.
+///
+/// Every wrap prepends a preamble that starts something inside the cage and then `exec`s what it
+/// wraps, so the **last** one applied is the outermost and its preamble runs **first**. The
+/// constraints the wraps have on each other are pairwise (a forwarder up before the fetch that needs
+/// it, a CA imported after the proxy whose CA it is), and each variant below carries the one it is
+/// subject to. Ordering by this enum is what keeps those constraints from depending on where in
+/// [`build`] each block happens to sit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WrapLayer {
+    /// The exec-enforcement shim. Innermost, so it filters the agent command and its children and
+    /// not the provisioning and egress plumbing wrapped around it.
+    ProcEnforce,
+    /// A mise equip lane. Both lanes fetch, so they sit inside the egress wrap: under an allowlist
+    /// the forwarder is up before either install runs.
+    MiseEquip,
+    /// The inline `[flakes.<name>]` build. Fetches its inputs, so it sits inside the egress wrap for
+    /// the same reason as [`WrapLayer::MiseEquip`].
+    FlakeEquip,
+    /// The loopback forwarders. Inside the egress wrap, so under an allowlist both forwarders are up
+    /// before the command runs.
+    Forward,
+    /// The egress forwarder.
+    Egress,
+    /// The MITM CA's import into the cage's NSS db, for a Chromium/Electron app that ignores the
+    /// CA-file environment. Outside the egress wrap, since it is that proxy's per-session CA it
+    /// imports.
+    CaTrust,
+    /// The in-cage portal's private session bus. Outermost, so `dbus-daemon --fork` — which blocks
+    /// until its socket is ready — has finished before anything else in the cage starts.
+    Portal,
+}
+
+/// One contributed wrap: it takes the command built so far and returns it wrapped.
+type CommandWrap<'a> = Box<dyn FnOnce(Vec<OsString>) -> Vec<OsString> + 'a>;
+
+/// Nest the wraps a launch contributed around `cmd`, innermost [`WrapLayer`] first.
+///
+/// The caller registers them wherever its blocks happen to run; the nesting is this function's, not
+/// the caller's. The sort is stable, so two wraps of the same layer — the two mise equip lanes —
+/// nest in the order they were registered.
+fn wrap_cage_command(
+    cmd: Vec<OsString>,
+    mut wraps: Vec<(WrapLayer, CommandWrap<'_>)>,
+) -> Vec<OsString> {
+    wraps.sort_by_key(|(layer, _)| *layer);
+    wraps.into_iter().fold(cmd, |cmd, (_, wrap)| wrap(cmd))
+}
+
 /// Where a source of cage environment sits in the precedence order, lowest first. The assembler
 /// upserts these over the structural defaults and takes the last occurrence of a key, so a later
 /// variant wins.
@@ -6215,6 +6317,60 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         );
     }
 
+    /// The nesting is the enum's, not the order the blocks in `build` happen to run in.
+    ///
+    /// Each marker wrap prepends its own name, so the composed argv reads outermost first — which is
+    /// also the order the preambles run in. Registering them shuffled and still getting that order
+    /// is what the layer tag buys: the four constraints below used to hold only because their blocks
+    /// sat in the right places, hundreds of lines apart, and nothing checked it.
+    #[test]
+    fn the_wraps_nest_by_layer_however_the_blocks_registered_them() {
+        let marker = |name: &'static str| -> CommandWrap<'static> {
+            Box::new(move |cmd: Vec<OsString>| {
+                let mut out = vec![OsString::from(name)];
+                out.extend(cmd);
+                out
+            })
+        };
+
+        // Deliberately not in layer order, and with the two mise lanes registered in the order
+        // `build` registers them: lane 2 (`install`) then lane 1 (`use -g`).
+        let wraps = vec![
+            (WrapLayer::Portal, marker("portal")),
+            (WrapLayer::MiseEquip, marker("mise-install")),
+            (WrapLayer::Egress, marker("egress")),
+            (WrapLayer::ProcEnforce, marker("proc")),
+            (WrapLayer::MiseEquip, marker("mise-use-g")),
+            (WrapLayer::CaTrust, marker("catrust")),
+            (WrapLayer::FlakeEquip, marker("flake")),
+            (WrapLayer::Forward, marker("forward")),
+        ];
+        let out = wrap_cage_command(vec![OsString::from("the-command")], wraps);
+
+        assert_eq!(
+            out,
+            [
+                "portal",
+                "catrust",
+                "egress",
+                "forward",
+                "flake",
+                "mise-use-g",
+                "mise-install",
+                "proc",
+                "the-command",
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    /// A launch that contributes nothing runs its command bare — no preamble, no shell.
+    #[test]
+    fn a_launch_with_no_wraps_leaves_the_command_untouched() {
+        let cmd = vec![OsString::from("jq"), OsString::from("--version")];
+        assert_eq!(wrap_cage_command(cmd.clone(), vec![]), cmd);
+    }
+
     /// The precedence is the enum's, not the caller's. Listing the layers backwards must produce
     /// exactly the same environment as listing them in order — that is the whole reason the sources
     /// carry a tag instead of riding an argument list, where two of them swapped would compile in
@@ -6231,10 +6387,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         let mut backwards = in_order.clone();
         backwards.reverse();
 
-        assert_eq!(
-            extra_cage_env(in_order.clone()),
-            extra_cage_env(backwards)
-        );
+        assert_eq!(extra_cage_env(in_order.clone()), extra_cage_env(backwards));
         assert_eq!(
             extra_cage_env(in_order).last().map(|(_, v)| v.clone()),
             Some("/cfg".to_string()),
@@ -6248,7 +6401,10 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     fn two_pieces_of_one_layer_keep_the_order_they_were_given() {
         let env = extra_cage_env(vec![
             (EnvLayer::Gui, vec![("WAYLAND_DISPLAY".into(), "a".into())]),
-            (EnvLayer::Cacert, vec![("SSL_CERT_FILE".into(), "ca".into())]),
+            (
+                EnvLayer::Cacert,
+                vec![("SSL_CERT_FILE".into(), "ca".into())],
+            ),
             (EnvLayer::Gui, vec![("WAYLAND_DISPLAY".into(), "b".into())]),
         ]);
         let seen: Vec<&str> = env
