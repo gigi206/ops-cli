@@ -4512,6 +4512,92 @@ mod tests {
         );
     }
 
+    /// The SSRF guard holds on the inspected-cleartext (`http://`) path too, and is refused through
+    /// the counting chokepoint — the `blocked` bucket and the log line, like every other guard. This
+    /// is the path a tool takes with `http_proxy` set and no CONNECT, so a wildcard `http://` rule
+    /// covering a name that resolves into loopback is exactly the SSRF wildcard the guard closes; a
+    /// metadata address is refused even when the rule names the host outright.
+    #[test]
+    fn the_cleartext_path_blocks_ssrf_to_private_and_metadata_addresses() {
+        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        use crate::sandbox::egress_stats::{Counts, EgressStats};
+
+        // wildcard match (no exact-named host) → loopback → blocked
+        let dir = TmpDir::new();
+        let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["http://*.corp.test"]),
+            )
+            .unwrap()
+            .with_stats(Arc::clone(&stats))
+            .with_log(Arc::clone(&log))
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"POST http://internal.corp.test/admin HTTP/1.1\r\nHost: internal.corp.test\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains(" 403 ") && resp.contains("ssrf-blocked"),
+            "a wildcard-matched private target is an SSRF wildcard and must be blocked: {resp:?}"
+        );
+        assert_eq!(
+            stats
+                .snapshot()
+                .get("internal.corp.test")
+                .copied()
+                .unwrap_or_default(),
+            Counts {
+                blocked: 1,
+                ..Default::default()
+            },
+            "an SSRF block is counted, not merely refused"
+        );
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events.len(), 1, "one event for one decision: {events:?}");
+        assert_eq!(
+            (
+                events[0].host.as_str(),
+                events[0].verdict,
+                events[0].reason.as_str(),
+                events[0].method.as_deref(),
+                events[0].path.as_deref()
+            ),
+            (
+                "internal.corp.test",
+                LogVerdict::Blocked,
+                "ssrf-blocked",
+                Some("POST"),
+                Some("/admin")
+            )
+        );
+
+        // exact host, but the address is cloud metadata → blocked even though explicit
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["http://meta.test"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"GET http://meta.test/latest/meta-data/ HTTP/1.1\r\nHost: meta.test\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains(" 403 ") && resp.contains("ssrf-blocked"),
+            "the cloud-metadata address must be blocked even for an exact host: {resp:?}"
+        );
+    }
+
     /// A top-level **absolute-form `https://`** request (no CONNECT) to an allowed host is forwarded
     /// over a *validated TLS* upstream, and the upstream receives it in **origin-form** with a forced
     /// `Connection: close` — the "secure web proxy" transport the Kiro IDE's token exchange uses,
