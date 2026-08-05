@@ -201,7 +201,20 @@ fn config_json_is_a_valid_document_carrying_the_resolved_model() {
     // An untrusted project withholds its package — the JSON carries the same verdict the human
     // render shows (the field is the model, not a re-derivation).
     assert_eq!(doc["packages"][0]["trusted"], false);
-    assert_eq!(doc["network"], "Shared");
+    // No config names a posture, so this is the built-in one: a filtering allowlist carrying no
+    // rules of its own, not the host network. It is serialized as the tagged variant rather than a
+    // bare string, which is what makes the JSON say *which* filtering shape a launch would use.
+    assert_eq!(doc["network"]["Allowlist"]["default_action"], "Deny");
+    assert_eq!(
+        doc["network"]["Allowlist"]["allow"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "the built-in posture declares no rule of its own"
+    );
+    // Connection reuse rides on it: an unconfigured cage must not pay a fresh upstream handshake
+    // per request. This is the assertion a `derive(Default)` once broke without a word.
+    assert_eq!(doc["network"]["Allowlist"]["pool"], true);
 }
 
 #[test]
@@ -238,7 +251,7 @@ fn config_show_reflects_and_tags_an_ambient_override() {
     );
     // and the shown posture falls back to the untouched baseline (not the bad value).
     assert!(
-        String::from_utf8_lossy(&bad.stdout).contains("network: shared"),
+        String::from_utf8_lossy(&bad.stdout).contains("network: deny"),
         "the baseline posture must stand when the override is invalid"
     );
 }
@@ -738,6 +751,20 @@ fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
         stdout.contains("dns cache: off"),
         "`dns_cache_ttl = 0` must render as an explicit off:\n{stdout}"
     );
+
+    // `--details` reports the effective posture rather than only the exceptions, so a reader who
+    // does not already know the product defaults still learns what this launch gets. `fx2` is the
+    // default-posture project, which prints neither line in the baseline view above.
+    let out = fx2.run(&["config", "show", "--details"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("connection reuse: on"),
+        "--details must name the reuse default:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dns cache: 60s (built-in default;"),
+        "--details must name the built-in resolver cache, marked as built-in:\n{stdout}"
+    );
 }
 
 #[test]
@@ -962,14 +989,14 @@ fn the_network_posture_is_a_trust_gated_security_field() {
     let fx = Fixture::new();
     fx.write_project("network = \"none\"\n");
 
-    // Untrusted: the posture is dropped to the default (shared), and the drop is
+    // Untrusted: the posture is dropped to the default (the `deny` allowlist), and the drop is
     // explained — an untrusted project may not cut (or reopen) the network.
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "untrusted config must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("network: shared"),
+        stdout.contains("network: deny"),
         "an untrusted network posture must fall back to the default:\n{stdout}"
     );
     assert!(
@@ -994,14 +1021,17 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
         "[network]\nmode = \"deny\"\nallow = [\"github.com\", \"*.nixos.org\", \"example.com/exact\"]\ndeny = [\"evil.nixos.org\"]\n",
     );
 
-    // Untrusted: the allowlist is dropped to the default (shared), with an explanation.
+    // Untrusted: the allowlist is dropped to the default, with an explanation. The default is a
+    // `deny` allowlist too, so the mode word alone proves nothing — what proves the rules were
+    // dropped is that a host only this project named (`example.com`, absent from the built-in
+    // self-equip set) does not appear in the resolved view.
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "untrusted config must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("network: shared"),
-        "an untrusted allowlist must fall back to the default:\n{stdout}"
+        stdout.contains("network: deny") && !stdout.contains("example.com"),
+        "an untrusted allowlist must fall back to the ruleless default:\n{stdout}"
     );
     assert!(
         stderr.contains("network") && stderr.contains("untrusted"),
@@ -1081,16 +1111,16 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
     fx.write_project("[network]\nmode = \"allow\"\ndeny = [\"evil.example/secret\"]\n");
 
     // Security boundary: an UNTRUSTED project must not be able to *open* egress with allow mode —
-    // it falls back to the default (shared) with an explanation. Opening egress is exactly the
-    // capability an untrusted project may not gain; `allow` is a filtering posture but still a
-    // trust-gated security field, gated identically to `none`/`shared`/`deny`/`ask`.
+    // it falls back to the default (the `deny` allowlist) with an explanation. Opening egress is
+    // exactly the capability an untrusted project may not gain; `allow` is a filtering posture but
+    // still a trust-gated security field, gated identically to `none`/`shared`/`deny`/`ask`.
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "untrusted config must not hard-fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("network: shared") && !stdout.contains("network: allow"),
-        "an untrusted `allow` mode must fall back to shared, not open egress:\n{stdout}"
+        stdout.contains("network: deny") && !stdout.contains("network: allow"),
+        "an untrusted `allow` mode must fall back to the default, not open egress:\n{stdout}"
     );
     assert!(
         stderr.contains("network") && stderr.contains("untrusted"),
@@ -2393,7 +2423,7 @@ fn config_show_single_source_views_restrict_to_one_layer() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("PROJECT_VAR=p  (project)")
-            && stdout.contains("network: shared")
+            && stdout.contains("network: deny")
             && stdout.contains("(default)"),
         "--local shows the project's contributions over the defaults:\n{stdout}"
     );
@@ -2411,7 +2441,7 @@ fn config_show_single_source_views_restrict_to_one_layer() {
         "--default shows neither config layer:\n{stdout}"
     );
     assert!(
-        stdout.contains("network: shared") && stdout.contains("(default)"),
+        stdout.contains("network: deny") && stdout.contains("(default)"),
         "--default shows the built-in default network:\n{stdout}"
     );
 }
@@ -3532,7 +3562,7 @@ fn config_set_a_security_field_on_an_untrusted_project_is_noted_and_withheld() {
     // And the launch would not honor it: the resolved view still shows the default.
     let view = fx.run(&["config", "show"]);
     assert!(
-        String::from_utf8_lossy(&view.stdout).contains("network: shared"),
+        String::from_utf8_lossy(&view.stdout).contains("network: deny"),
         "an untrusted network choice is withheld"
     );
 }
@@ -3613,9 +3643,120 @@ fn config_set_into_a_non_scalar_field_is_refused() {
         !out.status.success(),
         "setting an array as a scalar must fail"
     );
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("edit"),
-        "the error should point at `sbx config edit`"
+        err.contains("edit") && err.contains("config add"),
+        "the error should name the ways out, `edit` included: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap(),
+        "binds = [\"/tmp\"]\n",
+        "a refused set leaves the list intact"
+    );
+}
+
+#[test]
+fn config_show_lists_declared_operations_only_once_trusted() {
+    // `[task]` had no static surface at all: `sbx task ls` reads a *running* session, so the only
+    // way to learn a block survived validation was to launch one. It is also trust-gated, and this
+    // pins both halves — invisible until trusted, listed with its origin after.
+    let fx = Fixture::new();
+    fx.write_project(
+        "[task.build]\ndescription = \"Build the project\"\ncmd = [\"cargo\", \"build\"]\n\n\
+         [task.fmt]\ncmd = [\"cargo\", \"fmt\"]\n",
+    );
+
+    let untrusted = fx.run(&["config", "show"]);
+    assert!(
+        !String::from_utf8_lossy(&untrusted.stdout).contains("tasks ("),
+        "an untrusted project declares no operation: {}",
+        String::from_utf8_lossy(&untrusted.stdout)
+    );
+
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    let shown = fx.run(&["config", "show"]);
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        text.contains("tasks (declared operations a cage may run):"),
+        "the section appears once trusted:\n{text}"
+    );
+    assert!(
+        text.contains("build") && text.contains("Build the project") && text.contains("fmt"),
+        "both operations, described where they say so:\n{text}"
+    );
+    // The command stays out: `sbx task show` is where the whole contract is read.
+    assert!(
+        !text.contains("cargo build"),
+        "the argv must not appear in the config view:\n{text}"
+    );
+
+    // The JSON carries the same, with `null` for a missing description — absent is not empty.
+    let json = fx.run(&["config", "show", "--json"]);
+    let doc: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("config show --json is a document");
+    let tasks = doc["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 2, "{tasks:?}");
+    assert_eq!(tasks[0]["name"], "build");
+    assert_eq!(tasks[0]["origin"], "project");
+    assert!(tasks[1]["description"].is_null(), "{:?}", tasks[1]);
+}
+
+#[test]
+fn config_set_add_and_rm_edit_a_list_through_the_real_binary() {
+    // The list half of the config verbs, end to end: `set` replaces a whole list from a TOML array,
+    // `add`/`rm` move one entry without restating the rest, and a no-op says so. The no-op case is
+    // the one worth an e2e rather than a unit test: it must leave the file (and therefore its trust
+    // marker) untouched, which is what keeps a repeated command from disarming a trusted config.
+    let fx = Fixture::new();
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+    let read = || std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+
+    assert!(fx
+        .run(&["config", "set", "fs.deny", r#"[".env", "old.key"]"#])
+        .status
+        .success());
+    assert!(
+        read().contains(r#"deny = [".env", "old.key"]"#),
+        "a TOML array sets the whole list:\n{}",
+        read()
+    );
+
+    assert!(fx
+        .run(&["config", "rm", "fs.deny", "old.key"])
+        .status
+        .success());
+    assert!(fx
+        .run(&["config", "add", "fs.deny", "secrets/"])
+        .status
+        .success());
+    assert!(
+        read().contains(r#"deny = [".env", "secrets/"]"#),
+        "add/rm move one entry and leave the rest:\n{}",
+        read()
+    );
+    // The key set before any of this is still there: these verbs edit one list, not the file.
+    assert!(read().contains("nixpkgs = \"nixos-23.11\""), "{}", read());
+
+    let before = read();
+    let noop = fx.run(&["config", "add", "fs.deny", "secrets/"]);
+    assert!(noop.status.success(), "a redundant add is not an error");
+    assert!(
+        String::from_utf8_lossy(&noop.stdout).contains("no change"),
+        "the no-op is reported: {}",
+        String::from_utf8_lossy(&noop.stdout)
+    );
+    assert_eq!(read(), before, "a no-op add must not touch the file");
+
+    // An egress rule carries a posture, so `add` names the verb that sets one; `rm` still works.
+    let redirected = fx.run(&["config", "add", "network.allow", "api.example.com"]);
+    assert!(
+        !redirected.status.success(),
+        "an egress add is refused here"
+    );
+    assert!(
+        String::from_utf8_lossy(&redirected.stderr).contains("sbx net allow"),
+        "it must name the verb: {}",
+        String::from_utf8_lossy(&redirected.stderr)
     );
 }
 
@@ -4079,5 +4220,50 @@ fn a_stale_string_dbus_value_is_rejected_never_silently_opening_a_portal() {
     assert!(
         !stdout.contains("dbus:"),
         "a stale string `dbus` value must leave no portal, never silently apply:\n{stdout}"
+    );
+}
+
+#[test]
+fn fs_masks_are_honored_untrusted_and_surfaced_in_config_show() {
+    // `[fs]` inverts the rule every other security table follows: it is honored from an *untrusted*
+    // project, because it can only close paths of the project it is declared in. Dropping it there
+    // would leave open exactly the file that project asked to close. Run through the real binary, so
+    // the whole path is exercised: parse, gate, view, render.
+    let fx = Fixture::new();
+    fx.write_project(
+        "[network]\nmode = \"deny\"\n\n[fs]\ndeny = [\"prod.key\"]\nreadonly = [\"Cargo.lock\"]\n",
+    );
+
+    // Untrusted: `[network]` is dropped (the ordinary rule), `[fs]` is not (the exception).
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("fs deny: prod.key"),
+        "an untrusted project's masks must still apply:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("fs readonly: Cargo.lock"),
+        "`readonly` rides the same ungated path as `deny`:\n{stdout}"
+    );
+
+    // Trusting it changes nothing about `[fs]` — there is no gate to open.
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    let out = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("fs deny: prod.key"), "{stdout}");
+
+    // A refused entry is dropped with a warning that says what the drop costs: the path stays open.
+    let fx = Fixture::new();
+    fx.write_project("[fs]\ndeny = [\"**/*.pem\"]\n");
+    let out = fx.run(&["config", "show"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stays open to the cage"),
+        "a dropped mask fails open, so the warning has to say so:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("fs deny:"),
+        "the refused entry must not be presented as effective"
     );
 }

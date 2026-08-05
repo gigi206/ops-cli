@@ -399,6 +399,33 @@ impl Rule {
     fn matches_mute(&self, req: &Request, method: &str) -> bool {
         self.methods.admits(method) && self.kind.matches_any_port(req)
     }
+
+    /// Whether this rule's host match admits **every** host: the reach a bare `*` would have if the
+    /// grammar had one (it does not — [`Slot`] and the catch-all refusal see to that). Only a `re:`
+    /// regex can express it; every other kind names a concrete host, an IP, or a bounded `*.domain`
+    /// suffix. Used for **labelling**, never for a verdict: a catch-all rule is legitimate, it is
+    /// just the one rule whose reach its own text does not show, so the surfaces that display a
+    /// policy say so out loud.
+    ///
+    /// Answered by asking the regex itself against sentinel URLs sharing no host, port, or path, and
+    /// deliberately **not** by inspecting the pattern: whether a regex matches everything is not
+    /// decidable by reading it, and `re:.*`, a bare `re:` (the empty pattern matches anything), and
+    /// `re:^https://` are the same reach written three ways. A sentinel miss is a definite no; all
+    /// three matching is as close to yes as the matcher itself can get, since the matcher only ever
+    /// sees canonical URLs of this shape. The method set is not consulted — a `{GET} re:.*` still
+    /// opens every host, for that verb.
+    pub(crate) fn opens_every_host(&self) -> bool {
+        let RuleKind::Regex { re, .. } = &self.kind else {
+            return false;
+        };
+        [
+            Request::new("a.invalid", 443, "/"),
+            Request::new("2001:db8::1", 9, "/x?y=1"),
+            Request::new("host.example", 8443, "/deep/path"),
+        ]
+        .iter()
+        .all(|req| re.is_match(&req.url))
+    }
 }
 
 impl RuleKind {
@@ -758,7 +785,16 @@ impl Http2Host {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// How long the proxy's resolver holds a resolved address when no layer set `[network]
+/// dns_cache_ttl`.
+///
+/// Named rather than written twice because two places must agree on it and they are far apart: the
+/// resolver that enforces it, and `sbx config show --details`, which reports the posture a launch
+/// actually gets. A number restated in prose in one of them and changed in the other is a silent
+/// lie about what the cage does.
+pub(crate) const DEFAULT_DNS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
     deny: Vec<Rule>,
@@ -772,8 +808,9 @@ pub(crate) struct EgressPolicy {
     /// Stored inverted so the derived `Default` (and [`Self::new`]) both mean "notice shown".
     /// Read via [`Self::ask_notice`].
     suppress_ask_notice: bool,
-    /// DNS cache TTL for the proxy's host-side resolver. `None` means the default (60s) is applied at
-    /// the resolver build site; `Some(0)` disables the cache. Read via [`Self::dns_cache_ttl`].
+    /// DNS cache TTL for the proxy's host-side resolver. `None` means [`DEFAULT_DNS_CACHE_TTL`] is
+    /// applied at the resolver build site; `Some(0)` disables the cache. Read via
+    /// [`Self::dns_cache_ttl`].
     dns_cache_ttl: Option<std::time::Duration>,
     /// The `[network] http2` hosts: CONNECT targets the proxy man-in-the-middles as **HTTP/2**
     /// (ALPN `h2`, for gRPC) instead of the default HTTP/1.1. Consulted only at connection time via
@@ -791,6 +828,19 @@ pub(crate) struct EgressPolicy {
     /// request left behind (`[network] pool`). On by default, and never a verdict — it changes how
     /// a request that is already allowed is carried, not whether it is. Read via [`Self::pool`].
     pool: bool,
+}
+
+impl Default for EgressPolicy {
+    /// Delegates to [`Self::new`] rather than deriving, and that is the whole point: a derived
+    /// `Default` fills every field with *its own type's* default, which silently diverges from the
+    /// constructor the moment one of them is not the neutral value. `pool` was exactly that —
+    /// `new` sets it `true`, a derive set it `false` — and it stayed invisible while the built-in
+    /// network posture was `shared`, since this policy was then never the one a launch used. The
+    /// day the default posture became an allowlist, every unconfigured cage silently lost
+    /// connection reuse. One constructor, no second list of fields to keep in step.
+    fn default() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
 }
 
 impl EgressPolicy {
@@ -858,15 +908,18 @@ impl EgressPolicy {
         self.ask_timeout
     }
 
-    /// The DNS cache TTL for the proxy's resolver — `None` means "apply the default at build time"
-    /// (the resolver treats it as 60s), `Some(0)` disables the cache. Set from `[network]
+    /// The DNS cache TTL for the proxy's resolver — `None` means "apply
+    /// [`DEFAULT_DNS_CACHE_TTL`] at build time", `Some(0)` disables the cache. Set from `[network]
     /// dns_cache_ttl`.
     pub(crate) fn with_dns_cache_ttl(mut self, ttl: Option<std::time::Duration>) -> Self {
         self.dns_cache_ttl = ttl;
         self
     }
 
-    /// The configured DNS cache TTL (raw `Option` — the resolver applies the 60s default for `None`).
+    /// The **configured** DNS cache TTL, raw: `None` says no layer set one, not that there is no
+    /// cache. Kept distinct from the effective value because a reader that reports the posture has
+    /// to tell "unset" from "set to the same number" — the resolver applies
+    /// [`DEFAULT_DNS_CACHE_TTL`] for `None`.
     pub(crate) fn dns_cache_ttl(&self) -> Option<std::time::Duration> {
         self.dns_cache_ttl
     }
@@ -1288,6 +1341,29 @@ mod tests {
 
     fn rule(s: &str) -> Rule {
         classify(s).unwrap_or_else(|e| panic!("classify({s:?}) failed: {e}"))
+    }
+
+    #[test]
+    fn the_default_policy_is_the_constructor_and_keeps_connection_reuse() {
+        // The regression this replaced a `derive(Default)` for: a derived default fills each field
+        // with its *type's* default, so `pool` came out `false` while `new` sets it `true`. It was
+        // invisible while the built-in posture was `shared` (this policy was never the one a launch
+        // used); the day the default posture became an allowlist, every unconfigured cage lost
+        // connection reuse and paid a fresh upstream handshake per request, silently.
+        assert_eq!(
+            EgressPolicy::default(),
+            EgressPolicy::new(Vec::new(), Vec::new())
+        );
+        assert!(
+            EgressPolicy::default().pool(),
+            "an unconfigured cage keeps connection reuse"
+        );
+        // And the posture a config-less launch resolves to carries it too, which is the path that
+        // actually broke.
+        match crate::config::NetworkPolicy::default() {
+            crate::config::NetworkPolicy::Allowlist(p) => assert!(p.pool()),
+            other => panic!("the built-in posture is a filtering one: {other:?}"),
+        }
     }
 
     /// An allow-only policy (no deny rules), for the single-list matching tests.
@@ -1965,19 +2041,119 @@ mod tests {
         }
     }
 
+    /// Every scheme-free spelling of the bare `*` host: plain, with a port spec, and as a path rule.
+    /// (A *scheme*-prefixed `*` is rejected one step earlier by the scheme guard — see
+    /// `rejects_a_scheme_in_an_entry`.)
+    const CATCH_ALL_SPELLINGS: [&str; 5] = ["*", "*:*", "*:80", "*/path", "*:*/admin"];
+
     #[test]
     fn rejects_the_catch_all_wildcard_with_a_pointer_to_shared() {
-        // every scheme-free spelling of the bare `*` host — plain, with a port spec, and as a
-        // path rule — is rejected, and the message points at the posture switch `mode = "shared"`
-        // rather than the generic error. (A *scheme*-prefixed `*` is rejected one step earlier by
-        // the scheme guard — see `rejects_a_scheme_in_an_entry`.)
-        for bad in ["*", "*:*", "*:80", "*/path", "*:*/admin"] {
+        // The default slot is `allow`, where opening everything is what the author meant: the
+        // message points at the posture switch `mode = "shared"` rather than the generic error.
+        for bad in CATCH_ALL_SPELLINGS {
             let err = classify(bad).unwrap_err();
             assert!(
                 err.contains("mode = \"shared\""),
                 "{bad:?} should be rejected with a pointer to `mode = \"shared\"`, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn the_catch_all_refusal_points_where_each_list_was_going() {
+        // The refusal is one syntax check serving four slots, so the way out it offers must be the
+        // one *that* author was reaching for. The load-bearing case is `deny`: a `deny = ["*"]`
+        // author wants everything **closed**, and a shared message telling them to set
+        // `mode = "shared"` points the exact opposite way. Nor may a mute — which changes no
+        // verdict — or a test *target* be answered with a posture switch at all.
+        for bad in CATCH_ALL_SPELLINGS {
+            let deny = classify_in(bad, Slot::Deny).unwrap_err();
+            assert!(
+                deny.contains("mode = \"none\"") && !deny.contains("shared"),
+                "a deny `{bad}` must be pointed at closing the network, never at opening it: {deny}"
+            );
+
+            let mute = classify_in(bad, Slot::Mute).unwrap_err();
+            assert!(
+                mute.contains("re:.*") && !mute.contains("mode ="),
+                "a mute `{bad}` is a log filter, so it gets no posture switch: {mute}"
+            );
+
+            let target = classify_in(bad, Slot::Target).unwrap_err();
+            assert!(
+                target.contains("not a host") && !target.contains("mode ="),
+                "a test target `{bad}` is a request, not a declaration: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_catch_all_refusal_does_not_overclaim() {
+        // The message the `allow` slot once carried said a catch-all is something "an allowlist
+        // cannot express" — which `re:.*` disproves: it is accepted, and it does match every host.
+        // The refusal is a legibility guardrail, not a boundary, so the text must not claim a reach
+        // it has not got, and must name the escape hatch it leaves open.
+        let err = classify("*").unwrap_err();
+        assert!(
+            !err.contains("cannot express"),
+            "the message must not claim an allowlist cannot express a catch-all: {err}"
+        );
+        assert!(
+            err.contains("re:.*"),
+            "the message must name the regex escape hatch it leaves open: {err}"
+        );
+        let catch_all = classify("re:.*").expect("a catch-all regex stays accepted");
+        assert!(
+            rule_matches(&catch_all, "anything.example.test", 443, "/"),
+            "`re:.*` matches every host — the very thing the `*` refusal cannot prevent"
+        );
+    }
+
+    #[test]
+    fn a_catch_all_regex_is_recognised_however_it_is_spelled() {
+        // The refusal of `*` buys legibility, which a catch-all regex would quietly spend: these
+        // three spellings have the same reach and none of them says so. `re:` is the sharp one —
+        // an empty pattern matches every string, so a bare `re:` *is* `re:.*`.
+        for spelling in ["re:.*", "re:", "re:^https://", "re:.", "{GET} re:.*"] {
+            assert!(
+                classify(spelling).unwrap().opens_every_host(),
+                "{spelling:?} opens every host and must be recognised as such"
+            );
+        }
+        // A pattern that pins any part of the host is not a catch-all, and neither is any kind that
+        // names its host — including the bounded subdomain wildcard, the widest non-regex rule.
+        for bounded in [
+            "re:^https://github\\.com/",
+            "re:\\.example\\.test",
+            "*.nixos.org",
+            "github.com:*",
+            "10.0.0.5",
+            "example.com/api/*",
+            "tcp://db.internal:5432",
+        ] {
+            assert!(
+                !classify(bounded).unwrap().opens_every_host(),
+                "{bounded:?} is bounded and must not be labelled a catch-all"
+            );
+        }
+    }
+
+    #[test]
+    fn a_catch_all_test_target_is_refused_as_a_request() {
+        // The request parsers share the same guard, and there the entry is not a rule at all: no
+        // list to point at, no posture to switch, just "name one concrete destination".
+        for target in ["https://*", "https://*:8443/x"] {
+            let err = parse_url_target(target).unwrap_err();
+            assert!(
+                err.contains("not a host") && !err.contains("mode ="),
+                "{target:?} is a request, so it gets no posture advice: {err}"
+            );
+        }
+        let err = parse_tcp_target("tcp://*:22").unwrap_err();
+        assert!(
+            err.contains("not a host") && !err.contains("mode ="),
+            "a tcp:// target gets the same request-shaped refusal: {err}"
+        );
     }
 
     #[test]

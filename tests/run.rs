@@ -7552,3 +7552,293 @@ fn upgrade_hints_at_reclaimable_superseded_builds() {
         "the upgrade hint removed a root instead of only reporting it"
     );
 }
+
+#[test]
+fn fs_masks_close_a_project_path_while_its_name_stays_visible() {
+    // The `[fs]` headline, end to end through the real binary: a denied file keeps its name in a
+    // listing and refuses to open, a denied directory reads as empty, a `readonly` entry stays
+    // readable and refuses writes, and the host's own files are untouched by all of it.
+    //
+    // The cage cannot undo any of it either — `rm` over a mask is `EBUSY` and a hard link out of one
+    // is `EXDEV`, which is what makes the mask hold against in-cage code rather than merely against
+    // an honest reader. Skips (never fails) where the host cannot sandbox.
+    let project = TmpDir::new("fsmask-proj");
+    let data = TmpDir::new("fsmask-data");
+    let p = project.path();
+    std::fs::create_dir_all(p.join("certs")).unwrap();
+    std::fs::create_dir_all(p.join("secrets")).unwrap();
+    std::fs::write(p.join("prod.key"), b"PRIVATE-KEY\n").unwrap();
+    std::fs::write(p.join("certs/a.pem"), b"CERT-A\n").unwrap();
+    std::fs::write(p.join("certs/b.pem"), b"CERT-B\n").unwrap();
+    std::fs::write(p.join("secrets/token"), b"TOKEN\n").unwrap();
+    std::fs::write(p.join("README.md"), b"readme\n").unwrap();
+    std::fs::write(p.join("Cargo.lock"), b"lock\n").unwrap();
+    // Ungated on purpose: this project is never trusted, and the masks must apply anyway — a table
+    // that can only take access away is one an untrusted project is allowed to declare.
+    std::fs::write(
+        p.join(".sbx.toml"),
+        "[fs]\ndeny = [\"prod.key\", \"certs/*.pem\", \"secrets/\"]\nreadonly = [\"Cargo.lock\"]\n",
+    )
+    .unwrap();
+
+    let probe = run_in(p, data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping fs-mask e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // The name is still there — the whole point of a mask over a removal.
+    let ls = run_in(p, data.path(), &["ls", "certs"]);
+    let listed = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        listed.contains("a.pem") && listed.contains("b.pem"),
+        "a masked file must keep its name in a listing: {listed}"
+    );
+
+    // …and the content is not.
+    for path in ["prod.key", "certs/a.pem", "certs/b.pem"] {
+        let out = run_in(p, data.path(), &["cat", path]);
+        assert!(
+            !out.status.success(),
+            "`{path}` is denied but the cage read it: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("CERT")
+                && !String::from_utf8_lossy(&out.stdout).contains("PRIVATE"),
+            "the masked content leaked for `{path}`"
+        );
+    }
+
+    // A denied directory reads as empty, which is a stronger answer than a refusal: nothing in it
+    // is even nameable, including anything created there later in the session.
+    let inside = run_in(p, data.path(), &["cat", "secrets/token"]);
+    assert!(
+        !inside.status.success(),
+        "a denied directory's contents must not open"
+    );
+    let listing = run_in(p, data.path(), &["ls", "secrets"]);
+    assert!(
+        listing.status.success() && String::from_utf8_lossy(&listing.stdout).trim().is_empty(),
+        "a denied directory must list as empty: {}",
+        String::from_utf8_lossy(&listing.stdout)
+    );
+
+    // An unmasked file is untouched, and `readonly` is readable but not writable.
+    let readme = run_in(p, data.path(), &["cat", "README.md"]);
+    assert!(
+        String::from_utf8_lossy(&readme.stdout).contains("readme"),
+        "an unmasked file must stay readable"
+    );
+    let lock = run_in(p, data.path(), &["cat", "Cargo.lock"]);
+    assert!(
+        String::from_utf8_lossy(&lock.stdout).contains("lock"),
+        "a `readonly` entry stays readable — that is what separates it from `deny`"
+    );
+    let write_ro = run_in(p, data.path(), &["sh", "-c", "echo x >> Cargo.lock"]);
+    assert!(
+        !write_ro.status.success(),
+        "a `readonly` entry must refuse a write"
+    );
+    let write_ok = run_in(p, data.path(), &["sh", "-c", "echo x >> README.md"]);
+    assert!(
+        write_ok.status.success(),
+        "the rest of the project stays writable: {}",
+        String::from_utf8_lossy(&write_ok.stderr)
+    );
+
+    // In-cage code cannot take a mask apart: removing it is `EBUSY` (it is a mount point) and
+    // linking around it is `EXDEV` (the link would cross the mask's own mount boundary).
+    let rm = run_in(p, data.path(), &["rm", "-f", "prod.key"]);
+    assert!(
+        !rm.status.success(),
+        "a mask must not be removable from inside the cage"
+    );
+    let link = run_in(p, data.path(), &["ln", "prod.key", "stolen.key"]);
+    assert!(
+        !link.status.success(),
+        "the cage must not be able to link around a mask"
+    );
+
+    // The host keeps every byte: a mask is a mount inside the cage, never an edit.
+    assert_eq!(std::fs::read(p.join("prod.key")).unwrap(), b"PRIVATE-KEY\n");
+    assert_eq!(std::fs::read(p.join("certs/a.pem")).unwrap(), b"CERT-A\n");
+    assert_eq!(std::fs::read(p.join("secrets/token")).unwrap(), b"TOKEN\n");
+    assert!(!p.join("stolen.key").exists());
+}
+
+#[test]
+fn a_task_reads_the_key_its_own_unmask_names_and_nothing_else() {
+    // The invariant the whole `[task] unmask` field exists for: a masked path is closed in *every*
+    // cage the session builds, and one task lifts one path for itself. So the operation that needs
+    // the key reads it, the agent that invokes that operation never can, and a second task with no
+    // `unmask` is refused the same file.
+    //
+    // Trust matters here in one direction only: `[fs]` applies whatever the project's trust, but
+    // `[task]` is a security field, so the project has to be trusted for the tasks to exist at all.
+    let project = TmpDir::new("unmask-proj");
+    let data = TmpDir::new("unmask-data");
+    let state = TmpDir::new("unmask-state");
+    let p = project.path();
+    std::fs::create_dir_all(p.join("certs")).unwrap();
+    std::fs::write(p.join("prod.key"), b"THE-KEY\n").unwrap();
+    std::fs::write(p.join("certs/a.pem"), b"CERT-A\n").unwrap();
+    std::fs::write(p.join("certs/b.pem"), b"CERT-B\n").unwrap();
+    std::fs::write(
+        p.join(".sbx.toml"),
+        "[fs]\ndeny = [\"prod.key\", \"certs/*.pem\"]\n\n\
+         [task.readkey]\ncmd = [\"cat\", \"prod.key\"]\nunmask = [\"prod.key\"]\n\n\
+         [task.readcert]\ncmd = [\"cat\", \"{cert}\"]\n\
+         params = { cert = '^certs/[a-z]+\\.pem$' }\nunmask = [\"certs/a.pem\"]\n\n\
+         [task.blind]\ncmd = [\"cat\", \"prod.key\"]\n",
+    )
+    .unwrap();
+
+    let probe = run_in(p, data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping unmask e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    assert!(
+        sbx_in(p, data.path(), state.path(), &["trust", ".sbx.toml"])
+            .status
+            .success(),
+        "the project must be trusted for its `[task]` blocks to be honored"
+    );
+
+    let in_cage = |script: &str| -> String {
+        let out = sbx()
+            .args(["run", "--", "sh", "-c", script])
+            .current_dir(p)
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("spawn sbx run");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // The agent's own cage: closed.
+    let direct = in_cage("cat prod.key");
+    assert!(
+        !direct.contains("THE-KEY"),
+        "the agent's cage must not read the masked key: {direct}"
+    );
+
+    // The task that names it: open, and only to that task.
+    let via_task = in_cage("sbx task run readkey");
+    assert!(
+        via_task.contains("THE-KEY"),
+        "the task's own `unmask` must lift the mask for it: {via_task}"
+    );
+    let blind = in_cage("sbx task run blind");
+    assert!(
+        !blind.contains("THE-KEY"),
+        "a task with no `unmask` sees the mask like the agent does: {blind}"
+    );
+
+    // Per *path*, not per task: one task lifts one certificate out of a wildcard mask and is still
+    // refused the other.
+    let lifted = in_cage("sbx task run readcert -p cert=certs/a.pem");
+    assert!(
+        lifted.contains("CERT-A"),
+        "the unmasked certificate must be readable by that task: {lifted}"
+    );
+    let still_masked = in_cage("sbx task run readcert -p cert=certs/b.pem");
+    assert!(
+        !still_masked.contains("CERT-B"),
+        "a path the task did not unmask stays closed to it too: {still_masked}"
+    );
+}
+
+#[test]
+fn a_one_shot_config_mask_closes_the_path_and_unions_with_the_project() {
+    // `[fs]` has no typed flag, so `--config` is the only way to close a path for a single launch —
+    // and it shipped broken: the override fold carried every other table and dropped this one, so the
+    // blob resolved, printed, and then never reached the cage. The failure was silent and in the
+    // dangerous direction (the file the invoker asked to close stayed readable), which is why the
+    // whole path is pinned here through the real binary rather than at the fold alone.
+    let project = TmpDir::new("fsov-proj");
+    let data = TmpDir::new("fsov-data");
+    let p = project.path();
+    std::fs::write(p.join(".env"), b"SECRET=hunter2\n").unwrap();
+    std::fs::write(p.join("from-file.key"), b"FILE-KEY\n").unwrap();
+    std::fs::write(p.join("README.md"), b"readme\n").unwrap();
+    std::fs::write(p.join(".sbx.toml"), "[fs]\ndeny = [\"from-file.key\"]\n").unwrap();
+
+    let probe = run_in(p, data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping one-shot fs-mask e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let cat = |flags: &[&str], path: &str| -> String {
+        let out = sbx()
+            .arg("run")
+            .args(flags)
+            .args(["--", "cat", path])
+            .current_dir(p)
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("spawn sbx run");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // Without the override the file is an ordinary project file — the control that makes the next
+    // assertion mean something.
+    assert!(
+        cat(&[], ".env").contains("hunter2"),
+        "the control read must succeed, or the test proves nothing"
+    );
+
+    let blob = "[fs]\ndeny = [\".env\"]";
+    assert!(
+        !cat(&["--config", blob], ".env").contains("hunter2"),
+        "a `--config` mask must close the path for this launch"
+    );
+
+    // The layers union rather than replace: the blob adds to what the project closed, and neither
+    // side may unseat the other. A mask that could be *dropped* by adding an override would make the
+    // override a way to reopen a path, which no layer has.
+    assert!(
+        !cat(&["--config", blob], "from-file.key").contains("FILE-KEY"),
+        "an override must not unseat the project's own mask"
+    );
+    assert!(
+        cat(&["--config", blob], "README.md").contains("readme"),
+        "an unnamed path stays open"
+    );
+
+    // The ambient side of the fold reaches the cage too, and it is the side that used to work by
+    // accident of position — pin it so a future fold cannot swap which one survives.
+    let ambient = sbx()
+        .args(["run", "--", "cat", ".env"])
+        .current_dir(p)
+        .env("XDG_DATA_HOME", data.path())
+        .env("SBX_CONFIG", blob)
+        .output()
+        .expect("spawn sbx run");
+    assert!(
+        !String::from_utf8_lossy(&ambient.stdout).contains("hunter2"),
+        "an `SBX_CONFIG` mask must close the path too"
+    );
+
+    // The host file is untouched by any of it.
+    assert_eq!(std::fs::read(p.join(".env")).unwrap(), b"SECRET=hunter2\n");
+}

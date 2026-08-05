@@ -14,6 +14,7 @@
 //! a project's bytes, its trust verdict, and its parse together so all three act
 //! on the same inode.
 
+pub(crate) mod fspolicy;
 mod load;
 pub(crate) mod manage;
 pub(crate) mod overrides;
@@ -49,9 +50,10 @@ use secrets::{validate_header_shape, validate_host_secret, validate_secret_targe
 #[cfg(test)]
 use load::merge_profile_apps;
 
-use crate::allowlist::{Layer, Methods, Rule, RuleKind};
+use crate::allowlist::{Layer, Methods, Rule, RuleKind, Slot};
 use crate::plugins::PluginRegistry;
 use crate::trust::{self, TrustState};
+use fspolicy::FsPolicy;
 use schema::{
     NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawHostSecret, RawHostSecrets,
     RawInlineFlake, RawResolve, RawSecretDefaults, RawTask, RawTaskDefaults, RawTaskParam,
@@ -282,6 +284,16 @@ pub(crate) struct Resolved {
     /// (`Default` when neither config did), like `forward_origin`. A display affordance for
     /// `sbx config`; the launcher ignores it.
     pub(crate) devices_origin: Provenance,
+    /// The project paths closed off inside the cage, from any layer's `[fs]`. The one security
+    /// field that is **not** trust-gated: every entry only ever subtracts access from the cage, so
+    /// an untrusted project closing its own files off is not a capability it could turn on the
+    /// user. The layering unions (a project adds to the global set), like `devices` — which is also
+    /// the fail-closed direction here, since a layer can only close more.
+    pub(crate) fs: fspolicy::FsPolicy,
+    /// Which layer supplied the mask set — the highest-trust layer that closed anything
+    /// (`Default` when no config did), like `devices_origin`. A display affordance for
+    /// `sbx config`; the launcher ignores it.
+    pub(crate) fs_origin: Provenance,
     /// The ssh-agent keys a trusted `[ssh_agent] allow` grants the cage, each entry naming one key
     /// by its `SHA256:…` fingerprint or its comment. A security field, gated like
     /// `devices`/`seccomp` — a key the cage can sign with authenticates as the user wherever that
@@ -399,6 +411,11 @@ pub(crate) struct ResolvedApp {
     /// A security field, gated like the baseline `[ssh_agent]` — and the field that makes a deploy
     /// key grantable to one app rather than to every cage the project launches.
     pub(crate) ssh_agent: Vec<String>,
+    /// The app's own `[fs]` masks. Unions onto the baseline at [`merge_app`]; empty means the app
+    /// closes nothing of its own. Ungated like the baseline `[fs]` — it only subtracts access — and
+    /// the union direction means an app can close more of the tree for its own tool without being
+    /// able to reopen what the project already closed.
+    pub(crate) fs: fspolicy::FsPolicy,
     /// The app's own host loopback forward ports, set only from a trusted source (an untrusted
     /// project's app `forward` is dropped, like its `network`/`gui`). The set **unions** onto the
     /// baseline's at [`merge_app`]; an empty vec means the app adds none and inherits the baseline
@@ -439,6 +456,9 @@ pub(crate) struct ResolvedApp {
     /// Which app layer (`Global`/`Project`) supplied the app's own device grant, or `Default` when
     /// the app declared none. The merged effective grant is the app's own ∪ the baseline's.
     pub(crate) devices_origin: Provenance,
+    /// Which app layer (`Global`/`Project`) supplied the app's own `[fs]` masks, or `Default` when
+    /// the app declared none. The merged effective set is the app's own ∪ the baseline's.
+    pub(crate) fs_origin: Provenance,
     /// Which app layer (`Global`/`Project`) supplied the app's own ssh-agent grant, or `Default`
     /// when the app declared none. The merged effective grant is the app's own ∪ the baseline's.
     pub(crate) ssh_agent_origin: Provenance,
@@ -521,6 +541,10 @@ impl Resolved {
         // The app's device grant unions onto the baseline's — an app adds devices, never removes
         // the trusted baseline's (the same flagship property, holding for the same reason).
         union_devices(&mut self.devices, app.devices);
+        // The app's `[fs]` masks union onto the baseline's — an app closes more of the project, and
+        // can never reopen what the baseline closed. Ungated, so this holds whatever the project's
+        // trust: the union direction, not the gate, is what makes it safe.
+        self.fs.union(app.fs);
         // The app's ssh-agent grant unions onto the baseline's, for the same reason and with the
         // same property: an app adds a key it needs, and cannot take away one the trusted baseline
         // granted. A key named by only one app is therefore granted to that app's cage alone — every
@@ -632,6 +656,7 @@ impl Resolved {
             seccomp,
             devices,
             ssh_agent,
+            fs,
             proc,
             notify,
             // The channel is applied earlier (before the lock is chosen); groups/apps/bundles are
@@ -814,6 +839,16 @@ impl Resolved {
             if !over.is_empty() {
                 union_devices(&mut self.devices, over);
                 self.devices_origin = Provenance::Override;
+            }
+        }
+        // `[fs]` — additive like the two above, and the one field where "trusted by invocation"
+        // carries no weight either way: an override can only close more of the project for this
+        // launch, never reopen what a config layer closed.
+        if fs.is_some() {
+            let over = apply_fs(&mut self.warnings, OVERRIDE_SOURCE, fs);
+            if !over.is_empty() {
+                self.fs.union(over);
+                self.fs_origin = Provenance::Override;
             }
         }
         if ssh_agent.is_some() {
@@ -1092,8 +1127,9 @@ fn resolve(
         .nixpkgs
         .and_then(|v| validate_nixpkgs(&mut warnings, GLOBAL_CONFIG, v));
     // The network posture is trusted by location at the global layer; an invalid or
-    // unset value falls back to the default (shared). The origin is recorded as `Global` only
-    // when the layer actually supplied a valid posture, so a `Default` is never mistaken for one.
+    // unset value falls back to the default (the deny-by-default allowlist). The origin is
+    // recorded as `Global` only when the layer actually supplied a valid posture, so a `Default`
+    // is never mistaken for one.
     let mut network_origin = Provenance::Default;
     // The egress-stats toggle rides the `[network]` table (the global layer is trusted by location);
     // extract it before the field moves into `validate_network`. Default on.
@@ -1104,8 +1140,8 @@ fn resolve(
     if let Some(field) = global.network.as_ref() {
         warn_if_baseline_sets_default_methods(&mut warnings, GLOBAL_CONFIG, field);
     }
-    // The parent of the global layer is sbx's built-in default (`Shared`): a global `[network]`
-    // table that omits `mode` has no lower posture to inherit, so it falls back to `deny`.
+    // The parent of the global layer is sbx's built-in default (the `deny` allowlist): a global
+    // `[network]` table that omits `mode` has no lower posture to inherit, so it stays on `deny`.
     let mut network = match global.network.and_then(|v| {
         validate_network(
             &mut warnings,
@@ -1225,6 +1261,14 @@ fn resolve(
     // layer actually granted a device.
     let mut devices = apply_devices(&mut warnings, GLOBAL_CONFIG, global.devices);
     let mut devices_origin = if devices.is_empty() {
+        Provenance::Default
+    } else {
+        Provenance::Global
+    };
+    // The `[fs]` masks from the global layer. Ungated (they only close paths), and layered like the
+    // device grant: a project's set unions onto this, so a layer can close more and never less.
+    let mut fs = apply_fs(&mut warnings, GLOBAL_CONFIG, global.fs);
+    let mut fs_origin = if fs.is_empty() {
         Provenance::Default
     } else {
         Provenance::Global
@@ -1535,6 +1579,18 @@ fn resolve(
                 ));
             }
         }
+        // `[fs]` is the one table with no trust gate: it can only take access away from the cage
+        // the project itself declares, so an untrusted project closing its own files off gains
+        // nothing it could turn on the user — while dropping it would leave a file the project
+        // asked to close wide open, which is the failure that actually matters. Unions onto the
+        // global set, like `[devices]`.
+        if let Some(raw) = proj.fs {
+            let project_fs = apply_fs(&mut warnings, PROJECT_CONFIG, Some(raw));
+            if !project_fs.is_empty() {
+                fs_origin = Provenance::Project;
+            }
+            fs.union(project_fs);
+        }
         // `[ssh_agent]` is a security field — a trusted project may grant a key the cage can sign
         // with; an untrusted or changed one may not, because that signature authenticates as the
         // user on every host that trusts the key. Unions onto the global set, like `[devices]`.
@@ -1680,6 +1736,8 @@ fn resolve(
         seccomp_origin,
         devices,
         devices_origin,
+        fs,
+        fs_origin,
         ssh_agent,
         ssh_agent_origin,
         ssh_agent_confirm,
@@ -1878,6 +1936,38 @@ fn apply_devices(
     devices.sort();
     devices.dedup();
     devices
+}
+
+/// Read one layer's `[fs]` table into the resolved policy, dropping each entry the grammar refuses
+/// with a warning that says why.
+///
+/// No trust gate anywhere near this: unlike every other table here, `[fs]` cannot grant. Each entry
+/// takes something away from the cage it declares, so the worst an untrusted project can do with it
+/// is close its own files — and a dropped entry fails closed by leaving the file *exposed*, which
+/// is why the warning matters more here than the drop.
+fn apply_fs(warnings: &mut Vec<String>, source: &str, raw: Option<schema::RawFs>) -> FsPolicy {
+    let mut policy = FsPolicy::default();
+    let Some(raw) = raw else {
+        return policy;
+    };
+    for (field, entries, out) in [
+        ("deny", &raw.deny, &mut policy.deny),
+        ("readonly", &raw.readonly, &mut policy.readonly),
+    ]
+    .map(|(f, e, o)| (f, e.clone(), o))
+    {
+        for entry in entries {
+            match fspolicy::validate_entry(&entry) {
+                Ok(ok) if out.contains(&ok) => {}
+                Ok(ok) => out.push(ok),
+                Err(reason) => warnings.push(format!(
+                    "{source}: ignoring `[fs] {field}` entry `{entry}` ({reason}) — that path stays \
+                     open to the cage"
+                )),
+            }
+        }
+    }
+    policy
 }
 
 /// Validate one `[devices]` entry lexically: an absolute path *strictly under* `/dev/`, with no `..`
@@ -2284,6 +2374,8 @@ fn resolve_app(
     // trusted project unions, an untrusted one dropped. Empty means the app inherits the baseline's.
     let mut devices: Vec<PathBuf> = Vec::new();
     let mut devices_origin = Provenance::Default;
+    let mut fs = FsPolicy::default();
+    let mut fs_origin = Provenance::Default;
     let mut ssh_agent: Vec<String> = Vec::new();
     let mut ssh_agent_origin = Provenance::Default;
     let mut ssh_agent_confirm = false;
@@ -2410,6 +2502,11 @@ fn resolve_app(
             devices_origin = Provenance::Global;
         }
         union_devices(&mut devices, global_devices);
+        let global_fs = apply_fs(&mut warnings, &source, app.fs);
+        if !global_fs.is_empty() {
+            fs_origin = Provenance::Global;
+        }
+        fs.union(global_fs);
         let (global_ssh_agent, confirm) = apply_ssh_agent(&mut warnings, &source, app.ssh_agent);
         ssh_agent_confirm |= confirm;
         if !global_ssh_agent.is_empty() {
@@ -2661,6 +2758,15 @@ fn resolve_app(
                 ));
             }
         }
+        // `[fs]` is ungated here for the reason it is ungated everywhere: an app's masks only take
+        // access away from that app's own cage, so an untrusted project declaring them buys nothing.
+        if let Some(raw) = app.fs {
+            let project_fs = apply_fs(&mut warnings, &source, Some(raw));
+            if !project_fs.is_empty() {
+                fs_origin = Provenance::Project;
+            }
+            fs.union(project_fs);
+        }
         // `[ssh_agent]` mirrors `[devices]`: a trusted project may grant its own app a key to sign
         // with; an untrusted one may not, because such a key authenticates as the user on every host
         // that trusts it. Dropped before the union, so an untrusted project cannot widen the grant a
@@ -2792,6 +2898,7 @@ fn resolve_app(
         limits,
         seccomp,
         devices,
+        fs,
         ssh_agent,
         ssh_agent_confirm,
         forward,
@@ -2809,6 +2916,7 @@ fn resolve_app(
         forward_origin,
         seccomp_origin,
         devices_origin,
+        fs_origin,
         ssh_agent_origin,
         limits_origin,
         home_scope_origin,
@@ -3845,12 +3953,12 @@ fn validate_network_table(
         }
         None => mode_from_parent(parent),
     };
-    let allow = classify_entries(warnings, source_label, "allow", table.allow, groups);
-    let deny = classify_entries(warnings, source_label, "deny", table.deny, groups);
+    let allow = classify_entries(warnings, source_label, Slot::Allow, table.allow, groups);
+    let deny = classify_entries(warnings, source_label, Slot::Deny, table.deny, groups);
     // `mute` (SELinux `dontaudit`) suppresses a *denied* request's log line — never a verdict — so
     // it classifies with the same grammar as `allow`/`deny` (including `@group` expansion) and is
     // carried on the policy for the proxy to consult at logging time.
-    let mute = classify_entries(warnings, source_label, "mute", table.mute, groups);
+    let mute = classify_entries(warnings, source_label, Slot::Mute, table.mute, groups);
     // `http2` names the hosts the proxy speaks HTTP/2 to (ALPN `h2`, for gRPC). It is not an egress
     // rule (no path/method/verdict) — just a host[:port] the proxy MITMs as h2 — so it parses on its
     // own, dropping a malformed entry with a warning (fail-closed: that host keeps HTTP/1.1).
@@ -3951,20 +4059,23 @@ fn parse_duration(raw: &str) -> Result<Option<std::time::Duration>, String> {
 /// when a `[network]` `allow`/`deny` list references a group with `@<name>`.
 type NetGroups = BTreeMap<String, Vec<crate::allowlist::Rule>>;
 
-/// Classify the entries of one egress list (`allow` or `deny`), expanding a leading `@<name>`
-/// into the rules of that named group (from `[net.groups]`). A malformed entry is dropped with
-/// a warning that names which list it was in; an unknown `@<name>` reference is dropped with a
-/// *loud* warning — a miss in a `deny` list silently drops a carve-out (the host would no longer
-/// be blocked), the one case where a typo fails open in intent, so an unresolved reference must
-/// never pass unnoticed. Only a leading `@` is a reference: a `@` anywhere else (a URL path like
-/// `host/@user`, a `re:` pattern) is a legitimate part of the entry and is classified as written.
+/// Classify the entries of one egress list (`allow`, `deny`, or `mute`), expanding a leading
+/// `@<name>` into the rules of that named group (from `[net.groups]`). A malformed entry is dropped
+/// with a warning that names which list it was in, and it is classified *as* that list, so a
+/// refusal that offers a way out (the bare `*` catch-all) offers the one this list's author wanted.
+/// An unknown `@<name>` reference is dropped with a *loud* warning — a miss in a `deny` list
+/// silently drops a carve-out (the host would no longer be blocked), the one case where a typo fails
+/// open in intent, so an unresolved reference must never pass unnoticed. Only a leading `@` is a
+/// reference: a `@` anywhere else (a URL path like `host/@user`, a `re:` pattern) is a legitimate
+/// part of the entry and is classified as written.
 fn classify_entries(
     warnings: &mut Vec<String>,
     source_label: &str,
-    list: &str,
+    slot: Slot,
     entries: Vec<String>,
     groups: &NetGroups,
 ) -> Vec<crate::allowlist::Rule> {
+    let list = slot.label();
     let mut rules = Vec::new();
     for entry in entries {
         if let Some(name) = entry.trim().strip_prefix('@') {
@@ -3974,12 +4085,16 @@ fn classify_entries(
                     "{source_label}: {list} references undefined group `@{name}` — define it under \
                      `[net.groups]` in the global config, or remove the reference (the entry is \
                      ignored, so nothing is {} for it)",
-                    if list == "deny" { "denied" } else { "allowed" }
+                    match slot {
+                        Slot::Deny => "denied",
+                        Slot::Mute => "muted",
+                        _ => "allowed",
+                    }
                 )),
             }
             continue;
         }
-        match crate::allowlist::classify(&entry) {
+        match crate::allowlist::classify_in(&entry, slot) {
             Ok(rule) => rules.push(rule),
             Err(e) => warnings.push(format!("{source_label}: ignoring {list} entry — {e}")),
         }
@@ -3994,6 +4109,13 @@ fn classify_entries(
 /// egress entries in this version, so an unbounded or cyclic expansion is impossible by
 /// construction. Building every defined group here (not only referenced ones) surfaces a typo in
 /// an unused group early rather than only when some app first references it.
+///
+/// A group is built **before** anything references it, so which list it will land in is not known
+/// here: entries classify as [`Slot::Allow`], the shape a group is written for (a reusable set of
+/// destinations to open). The one visible consequence is the wording of a rejected `*` catch-all —
+/// a group entry written as `*` is answered as if it sat in an `allow` list even when the group is
+/// only ever referenced from a `deny`. The verdict is identical either way (the entry is dropped
+/// with a warning naming the group); only the way out it suggests could point at the wrong posture.
 fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String>>) -> NetGroups {
     let mut groups = NetGroups::new();
     for (name, entries) in raw {

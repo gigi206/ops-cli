@@ -895,6 +895,8 @@ mod tests {
 
     fn app_with(packages: Vec<crate::config::Package>) -> crate::config::ResolvedApp {
         crate::config::ResolvedApp {
+            fs: Default::default(),
+            fs_origin: crate::config::Provenance::Default,
             notify: None,
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -939,6 +941,8 @@ mod tests {
         apps: Vec<(&str, crate::config::ResolvedApp)>,
     ) -> crate::config::Resolved {
         crate::config::Resolved {
+            fs: Default::default(),
+            fs_origin: crate::config::Provenance::Default,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -950,7 +954,7 @@ mod tests {
             nixpkgs_global: None,
             nixpkgs_project: None,
             mise: None,
-            network: crate::config::NetworkPolicy::default(),
+            network: crate::config::NetworkPolicy::Shared,
             network_origin: Default::default(),
             egress_stats: true,
             gui: crate::config::GuiPolicy::default(),

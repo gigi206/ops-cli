@@ -181,9 +181,14 @@ One uniform rule across all four tiers:
 - **Scalars** (`nixpkgs`, `network`, `gui`, `proc`, `notify`) are **replaced** by the highest
   tier that sets them.
 - **Collections** (`env`, `packages`, `binds`, `forward`, `limits`, `seccomp`,
-  `devices`) are **unioned**, the higher tier winning per key/entry: so `--bind` *adds*
+  `devices`, `[fs]`) are **unioned**, the higher tier winning per key/entry: so `--bind` *adds*
   to whatever the blobs bound, and `--limit tasks_max=…` tunes one limit without dropping
   a blob's `memory_max`.
+
+`[fs]` is the one collection where the union is not just a merge convention but the whole
+guarantee: an override can close *more* of the project for one launch
+(`--config '[fs] deny = ["scratch.key"]'`), and there is no spelling that reopens what a
+config layer closed.
 
 ## Fail-closed on an invalid value
 

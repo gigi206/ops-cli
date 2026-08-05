@@ -36,6 +36,12 @@ session` queries live `ask`-session rules remembered from `--session` answers (`
 is accepted as an alias). Under
 `shared`/`none` there are no rules. See [Observability](../networking/observability).
 
+A rule that matches **every** host is tagged as such — `allow re:.* (config, matches
+every host)`, and `"catch_all": true` under `--json`. The reach of a `re:` rule lives in
+its pattern, not in the text you read, and a bare `re:` or `re:.` is the same
+catch-all as `re:.*`; the tag makes it visible without changing any verdict. See [the
+catch-all spellings](../networking/rules#the-catch-all-spellings).
+
 ## `sbx net groups`
 
 ```
@@ -60,6 +66,11 @@ Validates the rule, then persists it to a config file. `allow` on a fresh config
 **bootstraps a deny-by-default allowlist**; `deny` needs an existing filtering posture
 (it will not open one). Writing the project config re-trusts it; the global config and
 `-a <name>` app profile are trusted by location. See the [rule grammar](../networking/rules).
+
+The validation is the same one the config resolver applies, and it knows which verb you
+typed: a bare `*` is [rejected in every list](../networking/rules#no-catch-all), and the
+error names the posture *that* verb was reaching for (`allow` is pointed at opening the
+network, `deny` at closing it).
 
 `--session` instead loads the rule into the **live overlay** of the running session(s),
 which the proxy folds into its effective policy: so it takes effect **immediately**, on an

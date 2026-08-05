@@ -5,7 +5,7 @@ binary on your `PATH` (see [Installation](installation)).
 
 See also: [What sbx is](../concepts/overview) · [Configuration overview](../configuration/).
 
-## 1. Check the prerequisites
+## Check the prerequisites
 
 ```sh
 sbx doctor
@@ -16,7 +16,7 @@ namespaces, the bubblewrap engine, and nix, and reports the store location and
 channel revision. A missing requirement is a hard failure with a remediation hint,
 never a silent fallback.
 
-## 2. Run a command in the sandbox
+## Run a command in the sandbox
 
 ```sh
 sbx run -- id
@@ -30,7 +30,7 @@ command's exit status is propagated.
 The `--` separates `sbx`'s own flags from the command's, so `sbx run -- --version`
 runs the literal `--version`.
 
-## 3. Open an interactive shell
+## Open an interactive shell
 
 ```sh
 sbx run
@@ -39,7 +39,7 @@ sbx run
 A real interactive shell with job control, inside the same sandbox. Useful for
 exploring what a tool sees.
 
-## 4. Give the project a toolchain
+## Give the project a toolchain
 
 Create an `.sbx.toml` in your project root:
 
@@ -61,7 +61,7 @@ Use [`sbx search <query>`](../cli/search) to discover the attribute names, and
 see [`packages`](../configuration/packages) for the `nix:` / `mise:` / `flake:`
 backends.
 
-## 5. Launch an AI agent as an app
+## Launch an AI agent as an app
 
 An **app** is a named, reusable launcher with its own isolated `$HOME`, package set,
 network allowlist, and host-side credential injection. The repository ships
@@ -91,7 +91,7 @@ Uncomment that block and the `ANTHROPIC_API_KEY` placeholder beside it in `[env]
 swaps it onto the wire. What the agent holds in its environment is the placeholder; the
 real key exists only in `sbx`'s host process. See [Injection](../secrets/injection).
 
-## 6. See what it is allowed to reach, and what it reached
+## See what it is allowed to reach, and what it reached
 
 The two commands that make the previous step's posture visible:
 
@@ -111,7 +111,7 @@ the cage has an **empty network namespace**, so its only route out is the host p
 that just decided. See [Network modes](../networking/modes) and
 [Architecture](../networking/architecture).
 
-## 7. Inspect the resolved configuration
+## Inspect the resolved configuration
 
 ```sh
 sbx config show

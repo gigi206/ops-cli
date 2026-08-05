@@ -991,6 +991,8 @@ mod tests {
         let rev_a = "a".repeat(40);
         let rev_b = "b".repeat(40);
         let cfg = |global: &str| config::Resolved {
+            fs: Default::default(),
+            fs_origin: crate::config::Provenance::Default,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -1002,7 +1004,7 @@ mod tests {
             nixpkgs_global: Some(global.to_string()),
             nixpkgs_project: None,
             mise: None,
-            network: config::NetworkPolicy::default(),
+            network: config::NetworkPolicy::Shared,
             network_origin: Default::default(),
             egress_stats: true,
             gui: config::GuiPolicy::default(),

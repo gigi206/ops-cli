@@ -50,7 +50,7 @@
 
 use super::schema::{
     self, NetworkField, NetworkTable, NotifyField, ProcField, RawBind, RawBindTable, RawConfig,
-    RawDevices, RawLimit, RawLimits, RawSeccomp,
+    RawDevices, RawFs, RawLimit, RawLimits, RawSeccomp,
 };
 
 /// The environment-variable prefix that sets one cage environment variable per key:
@@ -453,45 +453,106 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
 /// for repeated `--config` blobs, for folding a typed fragment onto a blob, and for merging the two
 /// precedence sides. `[net.groups]`/`[app.*]` ride along (ignored downstream but noticed).
 fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
-    base.env.extend(higher.env);
-    base.packages.extend(higher.packages);
-    base.binds = union_binds(base.binds, higher.binds);
-    base.limits = union_limits(base.limits, higher.limits);
-    if higher.nixpkgs.is_some() {
-        base.nixpkgs = higher.nixpkgs;
+    // `higher` is destructured **exhaustively**, and that is the point of writing it this way. This
+    // fold is a hand-written list of fields with nothing above it checking the list is complete, and
+    // it has now dropped a field in silence three times (`limits`, then `[fs]` twice over). Naming
+    // every field makes the compiler refuse the next schema addition until this function says what
+    // becomes of it — the one guard that cannot itself be forgotten, where a test only catches what
+    // someone remembered to write. A field the override deliberately does not carry is bound to `_`
+    // with its reason, never omitted.
+    let RawConfig {
+        env,
+        binds,
+        packages,
+        nixpkgs,
+        network,
+        proc,
+        notify,
+        gui,
+        gpu,
+        audio,
+        dbus,
+        forward,
+        secret,
+        app,
+        limits,
+        seccomp,
+        devices,
+        ssh_agent,
+        fs,
+        net,
+        bundle,
+        // Carried no further on purpose: `apply_override` refuses each of these outright, so folding
+        // them would only move the drop to a later line. An inline `flake.nix`, an auto-upgrade
+        // resolver command, and a declared operation are all vetted where they are read and listed,
+        // not assembled on a command line for one launch. `rest` is the unknown-key bag, which each
+        // blob reports at parse time, before any of this.
+        flakes: _,
+        tarball: _,
+        deb: _,
+        appimage: _,
+        task: _,
+        rest: _,
+    } = higher;
+
+    base.env.extend(env);
+    base.packages.extend(packages);
+    base.binds = union_binds(base.binds, binds);
+    base.limits = union_limits(base.limits, limits);
+    if nixpkgs.is_some() {
+        base.nixpkgs = nixpkgs;
     }
-    if higher.network.is_some() {
-        base.network = higher.network;
+    if network.is_some() {
+        base.network = network;
     }
-    if higher.gui.is_some() {
-        base.gui = higher.gui;
+    if gui.is_some() {
+        base.gui = gui;
     }
-    if higher.proc.is_some() {
-        base.proc = higher.proc;
+    if proc.is_some() {
+        base.proc = proc;
     }
-    if higher.notify.is_some() {
-        base.notify = higher.notify;
+    if notify.is_some() {
+        base.notify = notify;
     }
-    if higher.gpu.is_some() {
-        base.gpu = higher.gpu;
+    if gpu.is_some() {
+        base.gpu = gpu;
     }
-    if higher.audio.is_some() {
-        base.audio = higher.audio;
+    if audio.is_some() {
+        base.audio = audio;
     }
-    if higher.dbus.is_some() {
-        base.dbus = higher.dbus;
+    if dbus.is_some() {
+        base.dbus = dbus;
     }
-    if higher.secret.is_some() {
-        base.secret = higher.secret;
+    if secret.is_some() {
+        base.secret = secret;
     }
-    base.forward = union_forward_opt(base.forward, higher.forward);
-    base.seccomp = union_allow_opt(base.seccomp, higher.seccomp, |s| &mut s.allow);
-    base.devices = union_allow_opt(base.devices, higher.devices, |d| &mut d.allow);
-    base.ssh_agent = union_allow_opt(base.ssh_agent, higher.ssh_agent, |s| &mut s.allow);
-    base.net.groups.extend(higher.net.groups);
-    base.app.extend(higher.app);
-    base.bundle.extend(higher.bundle);
+    base.forward = union_forward_opt(base.forward, forward);
+    base.fs = union_fs_opt(base.fs, fs);
+    base.seccomp = union_allow_opt(base.seccomp, seccomp, |s| &mut s.allow);
+    base.devices = union_allow_opt(base.devices, devices, |d| &mut d.allow);
+    base.ssh_agent = union_allow_opt(base.ssh_agent, ssh_agent, |s| &mut s.allow);
+    base.net.groups.extend(net.groups);
+    base.app.extend(app);
+    base.bundle.extend(bundle);
     base
+}
+
+/// Union two `[fs]` tables, a higher tier's entries appended onto a lower's. Both lists only ever
+/// *close* a path, so appending is the fail-closed direction and matches how the config layers
+/// themselves fold: a repeated `--config` blob, and the two precedence sides, accumulate masks
+/// instead of one silently replacing the other's. `apply_fs` validates and dedups downstream, so a
+/// plain append is enough. Unknown keys ride along so the table's own report still sees them.
+fn union_fs_opt(base: Option<RawFs>, higher: Option<RawFs>) -> Option<RawFs> {
+    match (base, higher) {
+        (b, None) => b,
+        (None, h) => h,
+        (Some(mut b), Some(h)) => {
+            b.deny.extend(h.deny);
+            b.readonly.extend(h.readonly);
+            b.rest.extend(h.rest);
+            Some(b)
+        }
+    }
 }
 
 /// Union two optional `{ allow: Vec<String> }` tables (`[seccomp]` / `[devices]` / `[ssh_agent]`), a higher tier's
@@ -741,7 +802,29 @@ fn parse_net(value: &str, label: &str) -> Result<NetworkField, String> {
 
 /// Split a comma-separated host list, trimming each and rejecting an empty result (a `--net allow=`
 /// with no hosts is a structural error, not a silent all-deny).
+///
+/// The comma is the separator, which a `re:` pattern may legitimately contain (a `{n,m}` quantifier,
+/// an alternation list) — and nothing here can tell a separator from a pattern's own comma, since
+/// `re:a,b` is genuinely both readings. What *is* decidable is the damage: a split that leaves a
+/// `re:` fragment which no longer compiles was a pattern cut in half. Rather than pass the halves on
+/// as two unrelated malformed entries (`re:a{1` and `2}`, reported as a bad regex and a bad
+/// hostname), the value is refused whole, pointing at the form that can carry it. A comma-free regex
+/// is unaffected — `--net 'allow=re:.*'` is a perfectly good one-shot catch-all — and so is a list
+/// mixing hosts with an intact pattern (`allow=github.com,re:^https://api\.`).
 fn split_hosts(hosts: &str, label: &str, kind: &str) -> Result<Vec<String>, String> {
+    if hosts.contains(',')
+        && hosts
+            .split(',')
+            .map(str::trim)
+            .any(|p| p.starts_with("re:") && crate::allowlist::classify(p).is_err())
+    {
+        return Err(format!(
+            "{label}: a `re:` pattern containing a comma cannot go through `{kind}=` — the value is \
+             split on commas, which cut `{hosts}` into fragments that are no longer a valid \
+             pattern. Pass it as config instead: `--config '[network] {kind} = [\"re:…\"]'` (a \
+             comma-free regex is fine here, e.g. `{kind}=re:.*`)"
+        ));
+    }
     let list: Vec<String> = hosts
         .split(',')
         .map(str::trim)
@@ -926,6 +1009,79 @@ mod tests {
     fn an_empty_override_is_a_no_op() {
         let ov = collect_cli(Cli::default()).unwrap();
         assert!(ov.is_empty());
+    }
+
+    /// A blob populating every field `overlay_into` carries. The five it deliberately drops
+    /// (`flakes`/`tarball`/`deb`/`appimage`/`task`) are absent on purpose: including one would
+    /// assert the opposite of the documented fail-closed behavior.
+    const FULLY_POPULATED_BLOB: &str = r#"
+        nixpkgs = "nixos-23.11"
+        network = "none"
+        gui = "wayland"
+        proc = "enforce"
+        notify = "once"
+        gpu = true
+        audio = false
+        dbus = true
+        forward = [1455]
+        binds = ["/opt/data"]
+        [env]
+        E = "1"
+        [packages]
+        p = "nix:hello"
+        [limits]
+        tasks_max = 4096
+        [seccomp]
+        allow = ["ptrace"]
+        [devices]
+        allow = ["/dev/kvm"]
+        [ssh_agent]
+        allow = ["deploy-key"]
+        [fs]
+        deny = [".env"]
+        readonly = ["Cargo.lock"]
+        [secret."api.example.com"]
+        from = "env://K"
+        header = "X"
+        type = "raw"
+        [net.groups]
+        infra = ["example.com"]
+        [app.demo]
+        network = "none"
+        [bundle.tool]
+        packages = { hello = "nix:hello" }
+    "#;
+
+    #[test]
+    fn every_carried_field_survives_a_fold_onto_an_empty_base() {
+        // The companion to the exhaustive destructuring in `overlay_into`. The compiler forces every
+        // field to be *named* there; it cannot force one to be *carried*, and a field named and then
+        // quietly ignored still compiles. So: fold a fully populated blob onto an empty base and
+        // require the result back unchanged. A field the fold forgets to assign comes back at its
+        // default and fails the comparison by name.
+        let folded = overlay_into(
+            RawConfig::default(),
+            parse_blob(FULLY_POPULATED_BLOB).unwrap(),
+        );
+        assert_eq!(
+            folded,
+            parse_blob(FULLY_POPULATED_BLOB).unwrap(),
+            "a field `overlay_into` names but does not carry is dropped in silence"
+        );
+    }
+
+    #[test]
+    fn a_populated_base_keeps_every_field_when_the_higher_side_is_empty() {
+        // The mirror case, and the one that catches an assignment written the wrong way round: an
+        // empty higher side must not blank a field the base holds. `--config` on its own tier folds
+        // onto an empty typed fragment, so this is the every-launch path, not a corner.
+        let base = parse_blob(FULLY_POPULATED_BLOB).unwrap();
+        let folded = overlay_into(base, RawConfig::default());
+        assert_eq!(
+            folded,
+            parse_blob(FULLY_POPULATED_BLOB).unwrap(),
+            "an empty higher side must leave the base intact"
+        );
     }
 
     #[test]
@@ -1310,6 +1466,38 @@ mod tests {
     }
 
     #[test]
+    fn a_comma_bearing_regex_is_refused_whole_rather_than_split_into_fragments() {
+        // `re:a{1,2}` splits into `re:a{1` and `2}` — a bad regex and a bad hostname, two errors
+        // that name neither the cause nor the cure. Refused as one value instead, pointing at
+        // `--config`, the form that can carry a comma.
+        let err = collect_cli(Cli {
+            net: &["allow=re:a{1,2}"],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--config") && err.contains("comma"),
+            "the refusal must name the cause and the cure: {err}"
+        );
+
+        // The guard keys on *damage*, not on the presence of a regex: a list mixing hosts with an
+        // intact pattern still parses, and so does a comma-free catch-all.
+        for ok in [
+            "allow=github.com,re:^https://api\\.example\\.test",
+            "allow=re:.*",
+        ] {
+            assert!(
+                collect_cli(Cli {
+                    net: &[ok],
+                    ..Default::default()
+                })
+                .is_ok(),
+                "`{ok}` is unambiguous and must still parse"
+            );
+        }
+    }
+
+    #[test]
     fn a_bare_net_allow_or_deny_is_refused_as_ambiguous() {
         let err = collect_cli(Cli {
             net: &["allow"],
@@ -1646,6 +1834,52 @@ mod tests {
         assert_eq!(
             ov.raw.ssh_agent.as_ref().map(|s| s.allow.as_slice()),
             Some(&["deploy-key".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn a_config_blob_fs_mask_survives_every_side_of_the_fold() {
+        // Third occurrence of the bug the test above guards, and the one that got through it: `[fs]`
+        // is not `allow`-shaped, so it was absent from `overlay_into` while `apply_override` read it
+        // — a `--config` mask was dropped in silence, and silence on this table means the path the
+        // invoker asked to close stays READABLE. One blob alone could not catch it (an empty base
+        // takes the higher side wholesale); it takes a second blob, or the ambient side, to expose
+        // which position is thrown away. Both are pinned here.
+        let repeated = collect_cli(Cli {
+            config: &[
+                "[fs]\ndeny = [\".env\"]\nreadonly = [\"Cargo.lock\"]",
+                "[fs]\ndeny = [\"prod.key\"]",
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        let fs = repeated.raw.fs.as_ref().expect("fs present");
+        assert!(
+            fs.deny.contains(&".env".to_string()) && fs.deny.contains(&"prod.key".to_string()),
+            "a repeated blob accumulates masks: {:?}",
+            fs.deny
+        );
+        assert_eq!(fs.readonly, vec!["Cargo.lock".to_string()]);
+
+        // The two precedence sides: `SBX_CONFIG` is the base and `--config` the higher one, which is
+        // the exact asymmetry that let the ambient mask apply while the command line's vanished.
+        let both = collect_from(
+            &CliOverrides {
+                config: owned(&["[fs]\ndeny = [\"cli.key\"]"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                config: Some("[fs]\ndeny = [\"ambient.key\"]".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fs = both.raw.fs.as_ref().expect("fs present");
+        assert!(
+            fs.deny.contains(&"cli.key".to_string())
+                && fs.deny.contains(&"ambient.key".to_string()),
+            "neither side may be dropped: {:?}",
+            fs.deny
         );
     }
 

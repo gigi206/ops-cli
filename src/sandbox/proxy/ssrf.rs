@@ -90,23 +90,43 @@ fn classify_v6(v6: Ipv6Addr) -> IpClass {
     IpClass::Public
 }
 
-/// Whether the proxy may connect to `ip` for a request to `host` that the policy permitted via
-/// `deciding`. Public addresses are reachable; a private address is reachable only when the
-/// deciding rule named this exact host (a deliberate internal target — not a `*.domain`/regex/
-/// built-in match, which would turn into an SSRF wildcard); a blocked address never is.
-pub(super) fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
+/// Why the post-resolution guard refuses an address the policy permitted. Carried out of
+/// [`ip_refusal`] so a caller can say *which* guard fired: the proxy only needs the boolean, but
+/// `sbx test net` reports the reason, and both read it from the one decision below.
+pub(crate) enum AddrRefusal {
+    /// A private/loopback address whose deciding rule does not name that exact host.
+    PrivateWithoutExactHost,
+    /// Link-local (incl. cloud metadata), multicast, or the unspecified address: never reachable,
+    /// however the policy is written.
+    NeverReachable,
+}
+
+/// Why the proxy would refuse to connect to `ip` for a request to `host` that the policy permitted
+/// via `deciding`, or `None` when it may connect. Public addresses are reachable; a private address
+/// is reachable only when the deciding rule named this exact host (a deliberate internal target —
+/// not a `*.domain`/regex/built-in match, which would turn into an SSRF wildcard); a blocked address
+/// never is. The single decision behind both callers: the proxy's [`ip_permitted`] and the
+/// `sbx test net` tester, which would otherwise mispredict a private target.
+pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Option<AddrRefusal> {
     match classify_ip(ip) {
-        IpClass::Public => true,
-        IpClass::Blocked => false,
-        IpClass::Private => names_exact_host(host, deciding),
+        IpClass::Public => None,
+        IpClass::Blocked => Some(AddrRefusal::NeverReachable),
+        IpClass::Private if names_exact_host(host, deciding) => None,
+        IpClass::Private => Some(AddrRefusal::PrivateWithoutExactHost),
     }
+}
+
+/// Whether the proxy may connect to `ip` for a request to `host` the policy permitted via
+/// `deciding` — [`ip_refusal`] read as a boolean, which is all the connect paths need.
+pub(super) fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
+    ip_refusal(ip, host, deciding).is_none()
 }
 
 /// Whether `deciding` is an explicit, exact-host rule for `host` (not a wildcard/regex). Used to
 /// gate the private-IP exception. With no deciding rule — an allow-by-default verdict — the
 /// exception never applies, so a private/loopback address is refused (a denylist opens public
 /// egress, not the host's own internal services).
-pub(super) fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
+pub(crate) fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
     let Some(deciding) = deciding else {
         return false;
     };
@@ -122,6 +142,42 @@ pub(super) fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_connect_boolean_and_the_reported_reason_are_one_decision() {
+        // The proxy reads a boolean and `sbx test net` reads the reason; if they ever came from two
+        // decisions the tester would mispredict exactly what it exists to predict. Pin them to the
+        // same call across all three classes and both sides of the exact-host exception.
+        let exact = allowlist::classify("10.0.0.5").unwrap();
+        let wild = allowlist::classify("re:.*").unwrap();
+        for (ip, host, deciding) in [
+            ("93.184.216.34", "93.184.216.34", Some(&wild)),
+            ("10.0.0.5", "10.0.0.5", Some(&exact)),
+            ("10.0.0.5", "10.0.0.5", Some(&wild)),
+            ("127.0.0.1", "127.0.0.1", None),
+            ("169.254.169.254", "169.254.169.254", Some(&exact)),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(
+                ip_permitted(ip, host, deciding),
+                ip_refusal(ip, host, deciding).is_none(),
+                "the two readings of the guard disagree on {ip} for {host}"
+            );
+        }
+        // And the reason discriminates the two refusing classes, which is what the reader needs.
+        assert!(matches!(
+            ip_refusal("10.0.0.5".parse().unwrap(), "10.0.0.5", Some(&wild)),
+            Some(AddrRefusal::PrivateWithoutExactHost)
+        ));
+        assert!(matches!(
+            ip_refusal(
+                "169.254.169.254".parse().unwrap(),
+                "169.254.169.254",
+                Some(&exact)
+            ),
+            Some(AddrRefusal::NeverReachable)
+        ));
+    }
 
     #[test]
     fn classify_ip_unwraps_v6_embedded_v4_translation_forms() {

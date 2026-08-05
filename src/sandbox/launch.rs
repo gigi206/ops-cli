@@ -4641,6 +4641,39 @@ fn build(
     extra_binds.extend(inline_flake_binds);
     extra_binds.extend(proc_binds);
 
+    // Close the project paths `[fs]` names. Emitted among the launcher's extra binds — that is,
+    // *after* the structural mounts — because a mask emitted before the project's own mount would
+    // be covered by it, which is exactly why a `binds` entry aimed inside the project masks nothing
+    // today. Unlike the rest of this block their destinations *are* project paths, which is the
+    // point: they are the only binds here meant to land on one.
+    let fs_masks = super::fsmask::expand(&prep.cwd, &prep.cfg.fs);
+    for warning in &fs_masks.warnings {
+        crate::diag::warn(warning);
+    }
+    if let Some(reason) = &fs_masks.refused {
+        eprintln!("sbx: {reason}");
+        return Err(ExitCode::FAILURE);
+    }
+    let fs_decoys = if fs_masks.is_empty() {
+        None
+    } else {
+        let dir = super::fsmask::mask_dir(prep.layout.data_dir(), std::process::id());
+        match super::fsmask::stage_decoys(&dir) {
+            Ok(decoys) => {
+                extra_binds.extend(super::fsmask::agent_binds(&fs_masks, &decoys));
+                Some(decoys)
+            }
+            Err(e) => {
+                // Fail closed: without the decoys nothing masks those paths, and a session that
+                // ran anyway would leave open exactly the files the config asked to close.
+                eprintln!(
+                    "sbx: cannot stage the `[fs]` masks ({e}) — the paths they name would stay open"
+                );
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    };
+
     // Pin sbx's own control plane in place whenever a read-write bind contains it: each root's host
     // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
     // code cannot rename a writable parent to move a control-plane root aside and recreate a forged
@@ -4846,6 +4879,14 @@ fn build(
                 },
             )
             .with_notifier(Arc::clone(&notify_wiring));
+            // Carry the session's `[fs]` masks into every task cage, so a denied path is closed
+            // there too unless the task's own `unmask` names it. The decoys are the ones this
+            // launch already staged: a task cage is derived from the agent's, and pointing it at a
+            // second set would be two answers to one question.
+            let engine = match (&fs_decoys, fs_masks.is_empty()) {
+                (Some(decoys), false) => engine.with_fs_masks(fs_masks.clone(), decoys.clone()),
+                _ => engine,
+            };
             // The task tool pool, when any task declares a `mise:` tool. Filled host-side now — a
             // cold fill is minutes long, so it belongs at launch where the user is watching, not
             // inside the first invocation. Best-effort, unlike the `nix:` package path: a pool tool
@@ -5990,6 +6031,8 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     /// A minimal resolved config carrying only the channel choices the builder reads.
     fn resolved(global: Option<&str>, project: Option<&str>) -> crate::config::Resolved {
         crate::config::Resolved {
+            fs: Default::default(),
+            fs_origin: crate::config::Provenance::Default,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -6001,7 +6044,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             nixpkgs_global: global.map(String::from),
             nixpkgs_project: project.map(String::from),
             mise: None,
-            network: crate::config::NetworkPolicy::default(),
+            network: crate::config::NetworkPolicy::Shared,
             network_origin: Default::default(),
             egress_stats: true,
             gui: crate::config::GuiPolicy::default(),
@@ -6058,6 +6101,8 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         packages: Vec<crate::config::Package>,
     ) -> crate::config::ResolvedApp {
         crate::config::ResolvedApp {
+            fs: Default::default(),
+            fs_origin: crate::config::Provenance::Default,
             notify: None,
             notify_origin: Default::default(),
             ssh_agent_confirm: false,

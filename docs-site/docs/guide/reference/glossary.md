@@ -15,8 +15,8 @@ with (all namespaces, `no_new_privs`, all capabilities dropped). See
 FHS, a synthetic identity, and the enforcement stack.
 
 **Confidentiality by absence**: the principle that a secret is protected by being
-**absent** from the cage, not merely read-only: a consequence of the
-[same-uid](#same-uid) model. See [Security model](../concepts/security-model).
+**absent** from the cage, not merely read-only: a consequence of the same-uid
+model. See [Security model](../concepts/security-model).
 
 **Control plane**, `sbx`'s own state (its config, data, and trust directories). Pinned
 read-only even inside a broad read-write bind. See [Security model](../concepts/security-model#the-control-plane-is-pinned).
@@ -24,7 +24,7 @@ read-only even inside a broad read-write bind. See [Security model](../concepts/
 **Egress**, outbound network traffic. Filtered by the [network posture](../networking/modes).
 
 **Free field**, a config field applied even from an untrusted project (only `env`). The
-opposite of a [security field](#security-field). See [The trust gate](../concepts/trust).
+opposite of a security field. See [The trust gate](../concepts/trust).
 
 **Hermetic FHS**, the minimal, self-contained filesystem the cage presents (`/bin/sh`,
 `/usr/bin/env`, `/nix`, a synthetic `/etc`), with no host `/usr` or ambient libraries.
@@ -50,17 +50,13 @@ deliberately. See [Portable profiles](../apps/profiles).
 plugin scheme). Distinct from the [broker](../secrets/injection) (the sink). See
 [Resolvers](../secrets/resolvers).
 
-### Same-uid
-
-The cage runs as *your* user id, not a separate
-identity, so a bound file is readable, and the bind layout is the boundary. See
+**Same-uid**, the cage runs as *your* user id, not a separate identity, so a bound
+file is readable, and the bind layout is the boundary. See
 [Security model](../concepts/security-model).
 
-### Security field
-
-A config field honored only from a
-trusted source (binds, network, secrets, packages, nixpkgs, gui, limits, apps, net
-groups). See [The trust gate](../concepts/trust).
+**Security field**, a config field honored only from a trusted source (binds, network,
+secrets, packages, nixpkgs, gui, limits, apps, net groups). See
+[The trust gate](../concepts/trust).
 
 **Self-equip**, an agent installing its own toolchain from inside the cage, into the
 per-project store. See [`sbx mise`](../cli/mise).
@@ -68,8 +64,8 @@ per-project store. See [`sbx mise`](../cli/mise).
 **Synthetic identity**, the `uid=1000(sandbox)` user (and synthetic `/etc/passwd`) the
 cage presents, generated outside every writable mount.
 
-**Trust gate**, the mechanism binding a project config's [security fields](#security-field)
-to a content hash, on the direnv model. See [The trust gate](../concepts/trust).
+**Trust gate**, the mechanism binding a project config's security fields to a content
+hash, on the direnv model. See [The trust gate](../concepts/trust).
 
 **Trusted by location / by content**: the global config and app profiles are trusted
 because you placed them (location); a project `.sbx.toml` is trusted by

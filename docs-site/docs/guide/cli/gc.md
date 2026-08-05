@@ -34,7 +34,8 @@ See also: [`sbx store`](store) · [`sbx projects`](projects) · [Garbage collect
 A launch stands up per-launch plumbing under the data directory: the egress MITM CA and
 its proxy/control sockets, the inbound forwarder's and the in-cage portal's runtime
 directories, the process-observation sockets, the declared-operations plane's socket
-directory. Each is unlinked when the launch exits
+directory, and the two decoys an [`[fs]`](../configuration/fs) policy mounts over the
+project paths it closes. Each is unlinked when the launch exits
 cleanly, but a cage normally ends on a **signal** (Ctrl-C, `sbx session stop`, a
 detached session killed later), and the cleanup does not run then.
 

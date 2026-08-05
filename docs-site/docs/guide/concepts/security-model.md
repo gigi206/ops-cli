@@ -24,6 +24,13 @@ default; only what a *trusted* config explicitly binds appears.
 This is why `sbx` is not a container manager: there is no separate identity to lean
 on. The mount set *is* the boundary.
 
+The same reasoning runs inward. The project tree is mounted, so everything in it is
+readable, including the `.env` or the private key that lives beside the code. Moving those
+files out is the answer that matches the model exactly (absent beats unreadable); when they
+have to stay, [`[fs] deny`](../configuration/fs) mounts a decoy over the path so the cage
+reads nothing through it. That is a **reduction of exposure**, not the same guarantee as
+absence, and its page names the three things it does not cover.
+
 ## The hard requirement
 
 There is no security boundary without **capability-bearing unprivileged user
@@ -142,6 +149,7 @@ from the environment.
 Beyond the bind layout, every cage runs with an always-on [enforcement
 stack](enforcement): bubblewrap drops all capabilities and sets `no_new_privs`, a
 seccomp denylist removes the kernel-LPE syscall surface, and cgroup v2 limits bound
-resource use where the host supports them. Network egress can be narrowed from the
-host network to a [deny-by-default allowlist](../networking/) enforced by a
-host-side proxy.
+resource use where the host supports them. Network egress defaults to a
+[deny-by-default allowlist](../networking/) enforced by a host-side proxy, so a cage
+nobody configured reaches only the self-equip set; opening it back up to the host
+network is the deliberate act.

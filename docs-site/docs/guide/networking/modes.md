@@ -8,10 +8,10 @@ run the [Model-B egress proxy](architecture) and honor the
 ```toml
 # the two simple postures
 network = "none"     # empty network namespace: nothing reaches out
-network = "shared"   # the host network, unfiltered (the default)
+network = "shared"   # the host network, unfiltered
 
 # the three filtering postures (string form: no carve-outs yet)
-network = "deny"     # allowlist: only what you allow reaches
+network = "deny"     # allowlist: only what you allow reaches (the default)
 network = "allow"    # denylist: every public host reaches except what you deny
 network = "ask"      # park-and-confirm: undecided hosts block for your answer
 ```
@@ -46,17 +46,17 @@ in the per-project store.
 ## `shared`
 
 The host network, unfiltered: the cage shares your network namespace and reaches
-whatever your host can. This is the **default** when `network` is unset. It is the
-right posture for your own interactive shell (`sbx run`) and for trusted work
-where filtering would only get in the way. There is no proxy, so no rules, stats,
-or log apply.
+whatever your host can. It is the right posture for your own interactive shell
+(`sbx run`) and for trusted work where filtering would only get in the way. There is
+no proxy, so no rules, stats, or log apply. It is also the only posture that reaches
+your **host loopback** (a local database, a model server, a dev server) and your
+**LAN**, which no filtering posture ever exposes.
 
-`shared` is also the documented **escape hatch**: set `network = "shared"` in your
-global config to make open networking the default for every project, overriding
-whatever `sbx`'s built-in default becomes. An untrusted project still cannot reach
-this posture (see [the security gate](#security-gated)). For how it compares with the
-two filtering ways to let everything through, see
-[Opening the network wide](#opening-the-network-wide).
+`shared` is the documented **escape hatch** from the filtering default: set
+`network = "shared"` in your global config to make open networking the baseline for
+every project. An untrusted project still cannot reach this posture (see [the security
+gate](#security-gated)). For how it compares with the two filtering ways to let
+everything through, see [Opening the network wide](#opening-the-network-wide).
 
 ## `deny`
 
@@ -75,6 +75,25 @@ Under `deny`, the [built-in self-equip set](#the-built-in-self-equip-set) is
 unioned in so the project can still provision from the nix cache and GitHub: you
 do not have to list those yourself. A `deny` entry can carve a hole back out of any
 allow (including a built-in one): `deny` always wins.
+
+### `deny` is the default
+
+With no `network` anywhere, this is the posture you get, carrying no rules of its own.
+A cage nobody configured therefore reaches the built-in self-equip set and nothing
+else. Two consequences are worth stating outright:
+
+- **An untrusted project lands here.** Its own `network` is dropped whichever way it
+  points (see [the security gate](#security-gated)), so this default is what a
+  repository sbx knows nothing about actually runs under. It reaches neither your host
+  loopback nor your LAN.
+- **A tool you never named will not fetch.** A `mise:` package whose backend downloads
+  from a host outside the self-equip set (npm, PyPI, crates.io) cannot install until
+  you allow that host. The refusal names it and prints the `sbx net allow` line that
+  admits it, and [`--net-learn`](../cli/app#learning-an-apps-egress---net-learn) writes
+  those rules for you. The launch itself is not blocked: the tool is simply absent.
+
+Set `network = "shared"` in your global config if you would rather have the open host
+network as your baseline.
 
 ## `allow`
 
@@ -127,7 +146,9 @@ The full workflow is on the [ask mode](ask) page.
 
 Three spellings are used to "let everything through", and they are **not**
 equivalent. Only `shared` removes the proxy; the other two keep every byte flowing
-through it and merely widen what the policy permits:
+through it and merely widen what the policy permits. (A fourth spelling, `allow =
+["*"]`, does not exist: it is [rejected](rules#no-catch-all) in favour of these, which
+say in the posture what they do.)
 
 ```bash
 sbx run --net shared -- ./x.sh                   # no proxy at all: the host's network
@@ -186,10 +207,10 @@ proxy's structural guards are untouched, so three refusals survive both:
   admits a private or loopback address only when the *deciding rule names that exact
   host*: a regex never does, and an allow-by-default verdict has no deciding rule at
   all. Under a filtering posture the cage cannot even route to them (its namespace is
-  empty), and the host-side proxy answers `403` at CONNECT time. Note that
-  [`sbx test net`](../cli/test) reports the *policy* verdict, so under either of these
-  two spellings it answers `ALLOWED` on a private address where the live proxy refuses
-  at CONNECT time. (With an exact-host rule, the one the guard admits, the two agree.)
+  empty), and the host-side proxy answers `403` at CONNECT time.
+  [`sbx test net`](../cli/test#private-and-internal-addresses) replays that guard: it
+  reports the refusal outright for an IP literal, and, since it resolves nothing, notes
+  the condition for a name no rule covers exactly.
 
 To reach one internal host on purpose, name it exactly (`allow = ["db.internal"]`,
 `allow = ["tcp://db.internal:5432"]`), which is the deliberate act the guard is
@@ -207,7 +228,10 @@ Two practical notes on the catch-all form:
 
 - `--net allow=…` splits its value on **commas**, so a regex containing one (a
   `{n,m}` quantifier, an alternation list) must go through
-  `--config '[network] allow = ["re:…"]'` instead.
+  `--config '[network] allow = ["re:…"]'` instead. You do not have to remember it:
+  a value whose split would break a `re:` pattern is refused whole, naming the cure.
+  A comma-free regex (`--net 'allow=re:.*'`) and a list mixing hosts with an intact
+  pattern (`--net 'allow=github.com,re:^https://api\.'`) are unaffected.
 - In an **app profile**, a bare `allow = ["re:.*"]` inherits the app
   [read-by-default posture](#default_methods-apps-only) and resolves to
   `{GET,HEAD} re:.*`, so a POST is still refused. Write `allow = ["{*} re:.*"]` (or

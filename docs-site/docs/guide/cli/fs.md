@@ -10,6 +10,10 @@ running session, sibling of [`sbx proc`](proc) (processes) and [`sbx net`](net) 
 in order, for a session started with observation on
 ([`sbx run --observe`](run#observing-a-run---observe)).
 
+This is the **observation** side of the filesystem. The one that closes paths off is the
+[`[fs]` config table](../configuration/fs), which is a different thing entirely: `sbx fs logs`
+reports what the agent wrote, `[fs] deny` decides what it can read.
+
 See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx proc`](proc) · [`sbx net`](net) · [`sbx session`](session).
 
 ## `logs`
@@ -105,14 +109,13 @@ Honest limits:
   surfaced with a one-time warning rather than hidden.
 - The filtered trees are an **observation blind spot**, not just noise: because the cage runs an
   untrusted agent, anything it writes under `.git`, `node_modules`, `target`, or `.venv` is not shown.
-  This is a v1 cost/coverage trade (those trees would flood the feed and slow the launch), not a
-  security hole, the cage is the boundary, this is only visibility. A configurable ignore-set is a
-  natural follow-on.
-- A **directory renamed** while the session runs keeps its old path in the feed for later writes under
-  it (move-tracking is deferred); the event still fires, only its path can be stale.
+  They are filtered because they would flood the feed and slow the launch. It is not a security
+  hole, the cage is the boundary and this is only visibility, but it is a gap worth knowing.
+- A **directory renamed** while the session runs keeps its old path in the feed for later writes
+  under it: the event still fires, only its reported path can be stale.
 - The feed watches the **project tree on disk**, so it reports every writer to it: if two sessions
   share one project, each also sees the other's writes. For the intended single-agent run this is
   exactly "what the agent wrote".
 
-Precise per-syscall capture, and the ability to **block** a write, is a later increment (seccomp
-user-notification); this is the cheap, unprivileged first cut.
+The feed observes; it never blocks. What a cage may **not** write is decided by its mount set and
+by [`[fs]`](../configuration/fs), not here.

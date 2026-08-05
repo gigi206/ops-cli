@@ -558,6 +558,20 @@ const PAGES: &[Page] = &[
             deletes, or moves in its project tree, observed host-side with inotify — available for a\n\
             session launched with observation on (`sbx run --observe`).\n\
             \n\
+            This verb only reports. Closing a path off is the config table of the same name: a\n\
+            `[fs] deny` entry makes a project path unreadable in every cage the session builds (the\n\
+            name stays visible, opening it returns EACCES; a denied directory reads empty, and\n\
+            everything under it is ENOENT), while `[fs] readonly` leaves the real content readable\n\
+            and refuses writes (EROFS). Both mask by mounting over the path inside the cage, so the\n\
+            host file is never modified, moved, or copied.\n\
+            \n\
+            `[fs]` is the one security table honored from an untrusted project too: it can only\n\
+            close a path of the project that declares it, and there is no syntax for reopening one.\n\
+            Its entries are lists, so they are written with `sbx config edit` and not with\n\
+            `sbx config set`, and `sbx config show` prints the effective masks with the layer each\n\
+            came from. A single launch takes one in a `--config` blob (there is no typed flag), and\n\
+            one declared operation may read through a mask with `[task.<name>] unmask`.\n\
+            \n\
             Run one of the subcommands below.",
     },
     Page {
@@ -1077,7 +1091,9 @@ const PAGES: &[Page] = &[
         ],
         details: "Vouches for a config's current contents, so its security-relevant fields are\n\
             honored until the file changes again. Trust is bound to the file's contents, so\n\
-            any edit re-arms the gate.",
+            any edit re-arms the gate. `[fs]` is the one table this does not govern: it can only\n\
+            close project paths off inside the cage, so it applies whether or not the file is\n\
+            trusted.",
     },
     Page {
         path: &["untrust"],
@@ -1096,7 +1112,7 @@ const PAGES: &[Page] = &[
         details:
             "Inspect or edit the configuration for the current project. `sbx config show` prints\n\
             the resolved, trust-gated view a launch would use (add --json for the machine-readable\n\
-            model); get/set/unset read and edit a single raw layer file; path prints which file a\n\
+            model); get/set/add/rm/unset read and edit a single raw layer file; path prints which file a\n\
             scope targets; and edit opens it in your editor.\n\
             \n\
             Run `sbx config show` for the resolved configuration, or one of the subcommands below.",
@@ -1132,7 +1148,10 @@ const PAGES: &[Page] = &[
         summary: "set a value in a config file (comments preserved)",
         options: &[
             ("<key>", "a dotted key, e.g. env.FOO or network"),
-            ("<value>", "the string value to set"),
+            (
+                "<value>",
+                "the value to set; a TOML array (e.g. '[\"a\", \"b\"]') sets a whole list",
+            ),
             ("-l, --local", "the project .sbx.toml (the default)"),
             ("-g, --global", "the global sbx.toml"),
             ("-c <file>", "an explicit config file"),
@@ -1146,8 +1165,15 @@ const PAGES: &[Page] = &[
             ),
         ],
         details:
-            "Writes a string value at a dotted key, preserving the file's other keys, comments,\n\
-            and formatting. Creates the file and intermediate tables as needed.\n\
+            "Writes a value at a dotted key, preserving the file's other keys, comments, and\n\
+            formatting. Creates the file and intermediate tables as needed.\n\
+            \n\
+            The value is written in the type the schema expects: `true`/`false` become booleans and\n\
+            a bare number becomes an integer, so `set network.stats false` writes a real boolean\n\
+            rather than the string that would make the loader drop the whole layer. A value written\n\
+            as a TOML array sets a **whole list** — `set fs.deny '[\".env\", \"secrets/\"]'` — and\n\
+            replaces whatever was there. Handing a list a single value is refused rather than\n\
+            dropping its other entries; to change one entry, use `sbx config add`/`sbx config rm`.\n\
             \n\
             --app <name> addresses an app's config: inline (a project .sbx.toml) it writes\n\
             app.<name>.<key>; with -g it writes the top-level key into the app's profile file\n\
@@ -1161,6 +1187,78 @@ const PAGES: &[Page] = &[
             and app profiles are trusted by location, so a write to either needs no trust. A free\n\
             env value needs no trust. Array and table fields (binds, an allowlist, secrets, apps)\n\
             are edited with `sbx config edit`.",
+    },
+    Page {
+        path: &["config", "add"],
+        synopsis: "sbx config add <key> <entry> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
+        summary: "add one entry to a list field, leaving the rest of the list alone",
+        options: &[
+            ("<key>", "a dotted key holding a list, e.g. fs.deny or seccomp.allow"),
+            ("<entry>", "the entry to add; already present is a no-op"),
+            ("-l, --local", "the project .sbx.toml (the default)"),
+            ("-g, --global", "the global sbx.toml"),
+            ("-c <file>", "an explicit config file"),
+            (
+                "-a, --app <name>",
+                "address the key under that app (app.<name>.<key> inline, or -g writes its profile)",
+            ),
+            (
+                "--trust",
+                "re-trust the file after writing (applies its security fields at once)",
+            ),
+        ],
+        details:
+            "Appends one entry to the list at <key>, creating the list (and its table) if absent.\n\
+            The rest of the list, the file's other keys, and its comments are untouched — which is\n\
+            what separates this from `sbx config set <key> '[…]'`, where you restate the whole list\n\
+            and can drop an entry by omission.\n\
+            \n\
+            An entry already in the list changes nothing and says so. That is worth knowing rather\n\
+            than assuming: an unchanged file keeps its trust marker, so repeating the command cannot\n\
+            disarm a trusted config's security fields.\n\
+            \n\
+            Egress and exec rules are not added here. `[network]` and `[proc]` gate their rules\n\
+            behind a posture, and `sbx net allow`/`deny`/`mute` and `sbx proc allow`/`deny` carry\n\
+            that matrix: they bootstrap the restrictive posture when there is none, and refuse a\n\
+            rule that would sit inert under the current mode. Writing one here would look set and\n\
+            decide nothing, so it is refused with the verb to use. Removal is not redirected —\n\
+            `sbx config rm` is in fact the only way to take an `allow`/`deny` rule back out.\n\
+            \n\
+            The trust gate hashes the whole file, so a write re-arms it; --trust re-blesses the file\n\
+            in one step (the global config and app profiles are trusted by location and need none).",
+    },
+    Page {
+        path: &["config", "rm"],
+        synopsis: "sbx config rm <key> <entry> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
+        summary: "remove one entry from a list field",
+        options: &[
+            ("<key>", "a dotted key holding a list, e.g. fs.deny or network.allow"),
+            ("<entry>", "the entry to remove; not present is a no-op"),
+            ("-l, --local", "the project .sbx.toml (the default)"),
+            ("-g, --global", "the global sbx.toml"),
+            ("-c <file>", "an explicit config file"),
+            (
+                "-a, --app <name>",
+                "address the key under that app (app.<name>.<key> inline, or -g edits its profile)",
+            ),
+            (
+                "--trust",
+                "re-trust the file after writing (applies its security fields at once)",
+            ),
+        ],
+        details:
+            "Removes one entry from the list at <key>, leaving the other entries and the file's\n\
+            comments in place. An entry that is not there changes nothing (and so never re-arms\n\
+            trust), the same as `sbx config unset` on a key that was not set.\n\
+            \n\
+            Removing the last entry leaves an empty list rather than deleting the key: `deny = []`\n\
+            states that nothing is closed here, which is a different claim from the key being\n\
+            absent and a parent layer's entries standing alone. Use `sbx config unset <key>` for\n\
+            that.\n\
+            \n\
+            Unlike `add`, this works on `[network]` and `[proc]` rule lists — taking a rule out\n\
+            cannot leave an inert one behind, and it is the only way to remove an `allow`/`deny`\n\
+            rule from a config file (`sbx net` removes only a mute, with `unmute`).",
     },
     Page {
         path: &["config", "unset"],
@@ -1203,7 +1301,7 @@ const PAGES: &[Page] = &[
             "With no scope flag, lists the config files a launch resolves — the global sbx.toml\n\
             (the base) then the project .sbx.toml (which overlays it) — and whether each exists,\n\
             so it is clear where sbx looks even before any file is created. With a scope flag,\n\
-            prints just that file's path (the one get/set/unset/edit would touch) — for scripting\n\
+            prints just that file's path (the one get/set/add/rm/unset/edit would touch) — for scripting\n\
             and for locating the global config. For resolved values, see `sbx config show`.",
     },
     Page {
@@ -1260,9 +1358,9 @@ const PAGES: &[Page] = &[
         ],
         details:
             "Shows the resolved configuration for the current project — the layered global and\n\
-            project environment, binds, packages, tools, network, GUI, secrets, resource\n\
-            limits, the seccomp relaxation, the host device grant, the ssh-agent grant, and app\n\
-            profiles, after the\n\
+            project environment, binds, packages, tools, network, GUI, secrets, the closed and\n\
+            read-only project paths, the declared operations, resource limits, the seccomp\n\
+            relaxation, the host device grant, the ssh-agent grant, and app profiles, after the\n\
             trust gate has dropped\n\
             anything an untrusted project may not set. Each value is tagged with where it came\n\
             from — (default), (global), or\n\

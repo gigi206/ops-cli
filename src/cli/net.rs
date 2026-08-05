@@ -2606,6 +2606,13 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
             continue; // the session ended between the registry read and the query
         };
         for row in rows {
+            // A live rule crosses the control socket as text, so its reach is re-derived here
+            // through the same classifier that admitted it. An unclassifiable row cannot be in the
+            // overlay (the loader validates first), so the fallback is unreachable in practice and
+            // errs toward the unlabelled, never toward a false "opens every host".
+            let catch_all = crate::allowlist::classify(&row.rule)
+                .map(|r| r.opens_every_host())
+                .unwrap_or(false);
             let view = NetRuleView {
                 kind: match row.kind {
                     sandbox::control::ManualKind::Allow => NetRuleKind::Allow,
@@ -2615,6 +2622,7 @@ fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: b
                 source: RuleSourceView::Manual,
                 rule: row.rule,
                 group: None,
+                catch_all,
             };
             if !rules
                 .iter()
@@ -2749,6 +2757,15 @@ fn render_net_rules(
             Some(g) if rule.rule != format!("@{g}") => format!("{source}, @{g}"),
             _ => source.to_string(),
         };
+        // A catch-all regex is the one rule whose text does not show its reach — `re:.*`, a bare
+        // `re:`, `re:^https://` all read as "a pattern" and mean "every host". The grammar refuses a
+        // bare `*` so that a policy reads as what it does; saying so here keeps that promise for the
+        // spelling it does accept. Verdict-neutral: the rule is listed exactly as declared.
+        let tag = if rule.catch_all {
+            format!("{tag}, matches every host")
+        } else {
+            tag
+        };
         match rule.kind {
             NetRuleKind::Allow => {
                 let _ = writeln!(o, "  {ok}allow{r} {n}{}{r}  {dim}({tag}){r}", rule.rule);
@@ -2774,11 +2791,15 @@ fn render_net_rules(
 /// (no gate). `--app <name>` targets the app's own `[app.<name>.network]`.
 fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode {
     use config::manage;
-    let verb = match list {
-        manage::EgressList::Allow => "allow",
-        manage::EgressList::Deny => "deny",
-        manage::EgressList::Mute => "mute",
+    // The list is also the rule's classification slot: a refused `*` catch-all then names the escape
+    // hatch this verb's author was reaching for, rather than one shared pointer that fits only
+    // `allow` (and tells a `deny` author to open the network — the exact opposite of the intent).
+    let slot = match list {
+        manage::EgressList::Allow => allowlist::Slot::Allow,
+        manage::EgressList::Deny => allowlist::Slot::Deny,
+        manage::EgressList::Mute => allowlist::Slot::Mute,
     };
+    let verb = slot.label();
 
     // `--session` (load the rule into the live overlay of the running session(s) instead of a config
     // file) and its `--all` scope widener are extracted before `split_scope`, which rejects any flag
@@ -2832,7 +2853,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             ));
             return ExitCode::from(2);
         }
-    } else if let Err(e) = allowlist::classify(&rule) {
+    } else if let Err(e) = allowlist::classify_in(&rule, slot) {
         diag::error(&format!("sbx: invalid rule {rule:?}: {e}"));
         return ExitCode::from(2);
     }
@@ -3422,6 +3443,7 @@ mod tests {
             source,
             rule: rule.into(),
             group: None,
+            catch_all: false,
         };
         let rules = [
             mk(NetRuleKind::Allow, RuleSourceView::Config, "github.com"),
@@ -3484,6 +3506,7 @@ mod tests {
             source: RuleSourceView::Config,
             rule: "@mcp".into(),
             group: Some("mcp".into()),
+            catch_all: false,
         };
         let out = render_net_rules("deny", "", &[&collapsed], 1, &p);
         assert!(out.contains("allow @mcp  (config)"), "{out}");
@@ -3492,12 +3515,28 @@ mod tests {
             "no redundant annotation:\n{out}"
         );
 
+        // A catch-all regex — listed exactly as declared (the tag never changes a verdict), with
+        // its reach spelled out beside the source, since `re:.*` does not read as "every host".
+        let wide = NetRuleView {
+            kind: NetRuleKind::Allow,
+            source: RuleSourceView::Config,
+            rule: "re:.*".into(),
+            group: None,
+            catch_all: true,
+        };
+        let out = render_net_rules("deny", "", &[&wide], 1, &p);
+        assert!(
+            out.contains("allow re:.*  (config, matches every host)"),
+            "a catch-all must carry its reach in the listing:\n{out}"
+        );
+
         // An expanded group row — the rule is the host, so the source tag notes its `@mcp` origin.
         let expanded = NetRuleView {
             kind: NetRuleKind::Allow,
             source: RuleSourceView::Config,
             rule: "{*} https://a.example.com".into(),
             group: Some("mcp".into()),
+            catch_all: false,
         };
         let out = render_net_rules("deny", "", &[&expanded], 1, &p);
         assert!(

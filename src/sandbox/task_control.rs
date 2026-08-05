@@ -1331,6 +1331,7 @@ mod tests {
 
     fn probe_task() -> TaskSpec {
         TaskSpec {
+            unmask: Vec::new(),
             name: "probe".into(),
             description: Some("a declared operation for the wire".into()),
             cmd: vec!["/nonexistent/program".into(), "{sql}".into()],

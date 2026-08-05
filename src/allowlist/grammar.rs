@@ -5,7 +5,44 @@
 
 use super::*;
 
-/// Classify one declared entry (allow or deny) by its syntax, or report why it is malformed. The
+/// Where an entry was written, so the one refusal that offers a way out — the bare `*` catch-all,
+/// see [`reject_catch_all`] — offers the way out that *that* list's author was reaching for. Every
+/// other diagnostic is list-agnostic (a malformed port is malformed wherever it sits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Slot {
+    /// An `allow` list: the entries a filtering posture lets through.
+    Allow,
+    /// A `deny` list: the entries subtracted from what the allow side lets through.
+    Deny,
+    /// A `mute` list: a log filter that changes no verdict.
+    Mute,
+    /// Not a rule at all — the concrete host or URL `sbx test net` tests a policy against.
+    Target,
+}
+
+impl Slot {
+    /// The config key this slot is written under, for a diagnostic that names the list an entry sat
+    /// in. [`Slot::Target`] has no key (it is a request, not a declaration) and renders as `target`.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Slot::Allow => "allow",
+            Slot::Deny => "deny",
+            Slot::Mute => "mute",
+            Slot::Target => "target",
+        }
+    }
+}
+
+/// Classify one declared entry by its syntax, or report why it is malformed, as a [`Slot::Allow`]
+/// entry — the shape every caller that names one destination declares (a task's `network` list, a
+/// secret's `to`, a synthesized learned rule). The `allow`/`deny`/`mute` lists of a `[network]`
+/// table, and the `sbx net allow|deny|mute` write path, go through [`classify_in`] instead so a
+/// refused catch-all names their own escape hatch.
+pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
+    classify_in(entry, Slot::Allow)
+}
+
+/// Classify one declared entry (in `slot`'s list) by its syntax, or report why it is malformed. The
 /// optional pieces are peeled in order: a leading `{VERB,...}` method prefix, then — for a non-`re:`
 /// entry — a `tcp://`/`http://`/`https://` scheme that selects the enforcement [`Layer`]. A `re:`
 /// regex is never scheme-split (its pattern may itself contain `://`) and is always inspected over
@@ -13,7 +50,7 @@ use super::*;
 /// stream has no HTTP), so either is rejected. An `http://` (cleartext L7) rule carries the full HTTP
 /// vocabulary (method, path) like the default inspected layer, only on a plaintext transport. A value
 /// that fits no kind is rejected so it can never be read as an unintended kind.
-pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
+pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
     let (methods, rest) = split_method_prefix(entry.trim())?;
     let rest = rest.trim();
     // `re:` patterns may contain `://`, so they are never scheme-split — always inspected over TLS.
@@ -32,7 +69,7 @@ pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
     let (layer, body) = split_scheme(rest)?;
     // The scheme carries the default port (443 for `https`/bare, 80 for `http`); a `:port` in the
     // body overrides it. L4 requires an explicit port, so its default is inert.
-    let kind = classify_kind(body.trim(), layer.default_port())?;
+    let kind = classify_kind(body.trim(), layer.default_port(), slot)?;
     if layer == Layer::L4 {
         if methods != Methods::Unspecified {
             return Err(format!(
@@ -177,16 +214,16 @@ pub(crate) fn parse_default_methods(verbs: &[String]) -> Result<Methods, String>
 /// scheme's default (443 for `https`/bare, 80 for `http`), used for a host that names no explicit
 /// `:port`. Order matters: a `/`-bearing `host[:ports]/path` URL rule, then the `*.` wildcard, then
 /// an IP literal, then a bare hostname.
-fn classify_kind(s: &str, default_port: u16) -> Result<RuleKind, String> {
+fn classify_kind(s: &str, default_port: u16, slot: Slot) -> Result<RuleKind, String> {
     if s.is_empty() {
         return Err("empty entry".to_string());
     }
     // A `/` marks a `host[:ports]/path` URL rule; without one the entry is host-level.
     if let Some(i) = s.find('/') {
-        return parse_path_rule(s, i, default_port);
+        return parse_path_rule(s, i, default_port, slot);
     }
     let (host, ports) = split_host_ports(s, default_port)?;
-    reject_catch_all(host)?;
+    reject_catch_all(host, slot)?;
     if let Some(domain) = host.strip_prefix("*.") {
         if is_valid_hostname(domain) {
             return Ok(RuleKind::Subdomain(domain.to_ascii_lowercase(), ports));
@@ -204,21 +241,53 @@ fn classify_kind(s: &str, default_port: u16) -> Result<RuleKind, String> {
     ))
 }
 
-/// `*` as a host is a request to allow *every* host, which an allowlist entry deliberately
-/// cannot express — the point of `mode = "deny"` is deny-by-construction. Catch the bare
-/// wildcard in any port form (`*`, `*:*`, `*:80`, and the `https://`/`tcp://` equivalents after the
-/// scheme is stripped) and point the author at the posture switch instead of the generic
-/// "unrecognized entry"/"invalid port" message. `*.domain` is a *bounded* subdomain wildcard and is
-/// unaffected (its host is `*.domain`, not `*`).
-fn reject_catch_all(host: &str) -> Result<(), String> {
-    if host == "*" {
-        return Err(
-            "`*` matches every host, which an allowlist cannot express; to open the \
-                    network fully set `[network] mode = \"shared\"`"
-                .to_string(),
-        );
+/// `*` as a host is a request to match *every* host. The grammar deliberately has no such spelling:
+/// widening or closing a whole posture is what `[network] mode` is for, and a rule that quietly did
+/// it would make the mode unreadable. Catch the bare wildcard in any port form (`*`, `*:*`, `*:80`,
+/// and the `https://`/`tcp://` equivalents after the scheme is stripped) rather than let it fall
+/// through to the generic "unrecognized entry"/"invalid port" message. `*.domain` is a *bounded*
+/// subdomain wildcard and is unaffected (its host is `*.domain`, not `*`).
+///
+/// The refusal is **not** a security boundary, and the message says so honestly rather than claiming
+/// a reach it does not have: `re:.*` (or any regex that matches everything) is accepted and does
+/// widen an allow list to every host. What it buys is that opening or closing everything stays an
+/// explicit act, spelled where a reader looks for it. So each [`Slot`] is answered with the escape
+/// hatch its own author was reaching for — an `allow` catch-all wants a wider posture, a `deny`
+/// catch-all wants a *narrower* one (telling that author to open the network, as one shared message
+/// once did, points the exact wrong way), a `mute` changes no verdict at all, and a
+/// [`Slot::Target`] is not a rule in the first place.
+fn reject_catch_all(host: &str, slot: Slot) -> Result<(), String> {
+    if host != "*" {
+        return Ok(());
     }
-    Ok(())
+    Err(match slot {
+        Slot::Allow => {
+            "`*` matches every host: as an allow entry it would widen the list to everything, \
+             which is a posture rather than a rule. To open the network fully set `[network] mode \
+             = \"shared\"` (no proxy at all, the host's own network); to allow everything but keep \
+             every request proxied, logged, and refusable by a `deny` entry, set `mode = \"allow\"`. \
+             The catch-all regex `re:.*` reaches just as far and is accepted — it is a rule, so each \
+             request it lets through names it — but prefer the posture, which reads as what it does"
+        }
+        Slot::Deny => {
+            "`*` matches every host: as a deny entry it would close everything, which is a posture \
+             rather than a carve-out (a deny entry subtracts from what the allow side lets \
+             through). To let nothing out at all set `[network] mode = \"none\"`; to let through \
+             only what you name, set `mode = \"deny\"` and list those hosts in `allow`"
+        }
+        Slot::Mute => {
+            "`*` matches every host: as a mute entry it would silence every refusal, leaving the \
+             log empty of the thing it exists to show. Name the noisy hosts, or — deliberately — \
+             write the catch-all regex `re:.*` (a mute changes no verdict, only what `sbx net logs` \
+             shows by default; `--all` brings muted lines back either way)"
+        }
+        Slot::Target => {
+            "`*` is not a host: a target names the one concrete host or URL to test the policy \
+             against (a *rule* may carry a wildcard; the request it is tested with may not). Test \
+             a real destination, e.g. `sbx test net https://github.com`"
+        }
+    }
+    .to_string())
 }
 
 /// The scheme prefix length and default port for a URL entry, or `None` if it is not a
@@ -378,7 +447,7 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
             Some((h, p)) => (h, Some(p)),
             None => (authority, None),
         };
-        reject_catch_all(h)?;
+        reject_catch_all(h, Slot::Target)?;
         let port = match port_spec {
             Some(p) => p
                 .parse::<u16>()
@@ -432,7 +501,7 @@ pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
         let (h, p) = authority.rsplit_once(':').ok_or_else(|| {
             format!("tcp:// target `{target}` needs an explicit `:port` (e.g. `tcp://host:22`)")
         })?;
-        reject_catch_all(h)?;
+        reject_catch_all(h, Slot::Target)?;
         let port = p
             .parse::<u16>()
             .map_err(|_| format!("tcp:// target `{target}` has an invalid port `{p}`"))?;
@@ -458,13 +527,18 @@ pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
 /// the leading `/`, is the path. The host must be concrete — an exact hostname or IP literal
 /// (bracketed for IPv6); a `*.domain` wildcard with a path is rejected (use `re:`). A trailing `/*`
 /// marks a subtree rule (the path and everything under it); without it the path matches exactly.
-fn parse_path_rule(s: &str, slash: usize, default_port: u16) -> Result<RuleKind, String> {
+fn parse_path_rule(
+    s: &str,
+    slash: usize,
+    default_port: u16,
+    slot: Slot,
+) -> Result<RuleKind, String> {
     let (authority, path) = (&s[..slash], &s[slash..]);
     if authority.is_empty() {
         return Err(format!("entry `{s}` has no host before the path"));
     }
     let (host, ports) = split_host_ports(authority, default_port)?;
-    reject_catch_all(host)?;
+    reject_catch_all(host, slot)?;
     if !(is_valid_hostname(host) || host.parse::<IpAddr>().is_ok()) {
         return Err(format!(
             "entry `{s}` has an invalid host `{host}` before the path (a path rule needs a \

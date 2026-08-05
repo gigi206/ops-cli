@@ -1,6 +1,9 @@
 import type { Config } from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 import prismKeep from './src/prism-keep';
+import numberHeadings, {
+  styleHeadingNumbers,
+} from './src/plugins/number-headings';
 
 const config: Config = {
   title: 'sbx',
@@ -15,6 +18,11 @@ const config: Config = {
   projectName: 'ops-cli',
 
   onBrokenLinks: 'throw',
+  // Docusaurus only warns by default (it plans to throw in v4). A heading
+  // renamed here leaves its cross-references pointing nowhere, and the guide
+  // cross-references heavily: a warning in a long build log is a link nobody
+  // fixes.
+  onBrokenAnchors: 'throw',
   markdown: {
     hooks: {
       onBrokenMarkdownLinks: 'throw',
@@ -41,6 +49,14 @@ const config: Config = {
           // them care where the tree is mounted.
           routeBasePath: 'docs',
           sidebarPath: './sidebars.ts',
+          // Numbers the section headings of each page (h2 → 1., h3 → 1.1, ...)
+          // at build time. Runs before the default plugins so the number shows
+          // up in the "On this page" TOC too, while the anchors are pre-set
+          // from the unnumbered text and stay stable.
+          beforeDefaultRemarkPlugins: [numberHeadings],
+          // Wraps the number in a span for display (see custom.css
+          // `.section-number`); the text is already in the heading.
+          beforeDefaultRehypePlugins: [styleHeadingNumbers],
           editUrl:
             'https://github.com/gigi206/ops-cli/tree/docs/docusaurus/docs-site/',
         },

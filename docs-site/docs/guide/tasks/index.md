@@ -84,6 +84,10 @@ overwrite the very binary a task is about to run. A task cage instead gets:
 - `/nix` **read-only from the shared store** (immutable, built host-side);
 - the project **read-only**, a fresh tmpfs `$HOME`, its own pid namespace (so the agent cannot read
   the task's `/proc/<pid>/environ`), an empty network namespace, no stdin, no tty;
+- every [`[fs] deny`](../configuration/fs) path closed here too, not only in the agent's cage. A task
+  that legitimately needs one names it in its own
+  [`unmask`](../configuration/fs#opening-a-path-for-one-operation), which lifts it for that task and
+  no other: the operation reads the key, and the agent that invokes it never can;
 - **nothing else**, a `[binds]` path, a Wayland or D-Bus socket, a granted device, the session's
   egress socket: none of them are in a task cage.
 
@@ -100,12 +104,27 @@ oracle over the credential. What sbx enforces is that a bound is *declared*: whe
 anything is yours to write, and [a pattern matching everything](parameters#a-pattern-that-matches-everything-possible-not-recommended)
 is accepted with the consequences that come with it.
 
+## Checking a block was kept
+
+`[task]` is trust-gated, and a block the validation rejects is dropped with a warning rather
+than silently half-applied. [`sbx config show`](../cli/config#sbx-config-show) lists what
+survived, without launching anything:
+
+```
+  tasks (declared operations a cage may run):
+    build  Build the project  (project)
+```
+
+An operation you declared and do not see there was either dropped (read the warnings) or is
+waiting on [`sbx trust`](../cli/trust). [`sbx task ls`](../cli/task) answers a different
+question: what a session running *now* is offering.
+
 ## The quota, and the honest residual
 
 Each session allows a bounded number of invocations (500). It is refused past that rather than
 degraded, because an exit-status oracle over a credential gets cheaper the more calls it can make.
-The quota, and the 512-invocation log ring behind [`sbx task logs`](../cli/task#logs), are **fixed
-for now**, unlike the per-task [`timeout` and `max_output` ceilings](../configuration/task#section-defaults):
+The quota, and the 512-invocation log ring behind [`sbx task logs`](../cli/task#logs), are
+**fixed**: unlike the per-task [`timeout` and `max_output` ceilings](../configuration/task#section-defaults),
 they are not `[task.defaults]` knobs.
 
 The residual to know: the socket a caller reaches is bound into the cage, and same-uid gives **no

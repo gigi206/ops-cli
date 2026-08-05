@@ -188,20 +188,29 @@ pub(crate) struct MiseConfig {
 
 /// The sandbox's resolved network posture. A security choice: honored from the
 /// global config (trusted by location) or a trusted project, ignored from an
-/// untrusted one. The default keeps the host network — there is no confidentiality
-/// guarantee until the filtered-egress allowlist is enforced, so cutting the network
-/// off entirely is the one posture that fully contains exfiltration today.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// untrusted one. The default is the filtering allowlist, so a cage nobody configured
+/// reaches only the built-in self-equip set: a project sbx knows nothing about — an
+/// untrusted one included, whose own posture is dropped either way — reaches neither
+/// the host's loopback, nor its LAN, nor an arbitrary internet host. `Shared` remains
+/// one line of global config away for whoever wants the open host network back.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NetworkPolicy {
-    /// Keep the host network namespace (the default).
-    #[default]
+    /// Keep the host network namespace.
     Shared,
     /// A fresh, empty network namespace: the sandbox has no connectivity at all.
     Isolated,
     /// Filtered egress: the cage reaches only what the policy permits (an allow list with
-    /// deny carve-outs), through a host-side proxy. Until that proxy is wired, the launcher
-    /// treats this fail-closed (full isolation), never fail-open.
+    /// deny carve-outs), through a host-side proxy.
     Allowlist(crate::allowlist::EgressPolicy),
+}
+
+impl Default for NetworkPolicy {
+    /// Deny-by-default with no rules of its own: every host the cage reaches has to be named,
+    /// save the built-in self-equip set the proxy unions into every policy. Written by hand
+    /// because the default variant carries a payload, which `#[derive(Default)]` cannot express.
+    fn default() -> Self {
+        Self::Allowlist(crate::allowlist::EgressPolicy::default())
+    }
 }
 
 /// The sandbox's resolved GUI posture. A security choice, gated exactly like
@@ -497,6 +506,13 @@ pub(crate) struct TaskSpec {
     /// Whether the invocation gets a writable output directory that outlives it, which `{out}` and
     /// `SBX_TASK_OUT` point at. Everything else a task cage can write dies with the invocation.
     pub(crate) output: bool,
+    /// The `[fs] deny` entries this task's cage may read, as declared. A denied path is closed in
+    /// every cage the session builds; this is how the one operation that legitimately needs the
+    /// file says so, without the agent's own cage ever seeing it.
+    ///
+    /// Held as declaration text, like `spawn`: what it may name is decided against the resolved
+    /// `[fs] deny` list at launch, which is where both lists are in hand.
+    pub(crate) unmask: Vec<String>,
     /// What the command may run beside itself, as declared. `None` is no exec supervision at all —
     /// the command runs as it always has. `Some` stands up a supervisor and confines the cage to the
     /// command plus these entries, **including when the list is empty** (a command that must run

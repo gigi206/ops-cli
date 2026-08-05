@@ -64,6 +64,7 @@ const sidebars: SidebarsConfig = {
             'configuration/limits',
             'configuration/seccomp',
             'configuration/devices',
+            'configuration/fs',
             'configuration/proc',
             'configuration/notify',
           ],

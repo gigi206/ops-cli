@@ -144,13 +144,18 @@ pinning a host, prefer the exact `Host`/`Subdomain` kinds, which cannot be fumbl
 reach for `re:` when you genuinely need a query- or path-shaped match a structured
 rule cannot express.
 
-Two `re:` caveats:
+Three `re:` caveats:
 
 - Its path is decoded but **not** `.`/`..`-resolved, so a `re:` deny *can* be dodged
   by `/foo/../secret`. Anchor and structure the pattern accordingly, or use a
   structured URL rule when a dot-segment-proof deny is what you need.
 - Because the reconstructed URL omits the port when it is 443, a pattern that tries
   to match `:443` explicitly (`re:…:443/…`) will never fire.
+- **An empty pattern matches everything.** A bare `re:` is not "a regex that matches
+  nothing" and not a typo the parser will catch: it is exactly `re:.*`, an
+  [allow-everything rule](#the-catch-all-spellings). So are `re:.` and
+  `re:^https://`, since the matcher only ever sees URLs of that shape. Every listing
+  labels such a rule (see below), so a slip is visible rather than silent.
 
 A `re:` rule is never scheme-split (its pattern may itself contain `://`) and is
 always inspected L7. A leading `{` in a `re:` body is part of the regex (a `{n,m}`
@@ -371,16 +376,70 @@ scoped to the wrong port does not block a host outright: a bare `deny evil.com`
 
 ## No catch-all
 
-There is deliberately **no** "allow every host" rule. A bare `*` in any port form
-(`*`, `*:*`, `*:80`) is **rejected**: the point of `mode = "deny"` is
-deny-by-construction, and a catch-all would defeat it. The error points you at the
-posture switch instead:
-
-> to open the network fully set `[network] mode = "shared"`
+There is deliberately **no** `*` rule. A bare `*` in any port form (`*`, `*:*`,
+`*:80`, `*/path`) is **rejected**, in an `allow` list, in a `deny` list, in a `mute`
+list, and as an `sbx test net` target. Widening or narrowing a whole posture is what
+[`mode`](modes) is for, and a rule that quietly did it would make the mode unreadable.
 
 The bounded `*.domain` subdomain wildcard is unaffected (its host is `*.domain`, not
-`*`). If you truly want everything, that is the `shared` posture, not an allow rule.
-The nearest allow-mode escape hatch is `re:.*`, but reach for `shared` first.
+`*`).
+
+Each list is pointed at the way out **its own author** was reaching for:
+
+| where you wrote `*` | what you probably meant | what the error says |
+|---|---|---|
+| `allow` | let everything through | `mode = "shared"` (no proxy), or `mode = "allow"` to stay proxied |
+| `deny` | let nothing through | `mode = "none"`, or `mode = "deny"` with the hosts you want in `allow` |
+| `mute` | silence every refusal | name the noisy hosts, or write `re:.*` |
+| `sbx test net *` | (nothing: a target is not a rule) | test one concrete host or URL |
+
+### It is a guardrail, not a boundary
+
+The check is **syntactic**: it matches the host `*`, nothing else. A regex that
+matches everything is accepted, and it really does open every host:
+
+```toml
+allow = ["re:.*"]     # accepted, and equivalent in reach to the rejected `*`
+```
+
+That is not a hole being papered over, it is the line the check draws: opening or
+closing everything stays an **explicit, legible act**, spelled where a reader of the
+config looks for it. A `re:.*` is that act written out; `*` slipped into a long allow
+list is the same reach with none of the visibility. What actually bounds a catch-all
+allow rule is elsewhere and unaffected by any of this: cleartext stays opt-in, a raw
+`tcp://` splice stays opt-in, and the [SSRF guard](architecture#the-ssrf-guard) still
+demands a rule naming the exact host. See [opening the network
+wide](modes#opening-the-network-wide) for what each spelling really buys.
+
+### The catch-all spellings
+
+`re:.*` is not the only one, and the others are easier to write by accident:
+
+| rule | reach | why |
+|---|---|---|
+| `re:.*` | every host | the explicit catch-all |
+| `re:` | every host | **an empty pattern matches every string** — a bare `re:` *is* `re:.*` |
+| `re:.` | every host | one arbitrary character, which every URL has |
+| `re:^https://` | every host | every URL the matcher sees starts with it |
+| `{GET} re:.*` | every host, for GET | the method prefix narrows the verb, never the host |
+
+Because the reach is in the *pattern* and not in the text you read, every surface that
+shows a rule **labels it**:
+
+```console
+$ sbx net rules
+  allow re:.*  (config, matches every host)
+
+$ sbx test net https://anything.example.test
+ALLOWED  https://anything.example.test
+  by allow rule: re:.*
+  note: that rule matches every host — this URL is not what makes it pass
+```
+
+The label is decided by asking the pattern itself, not by recognising `.*`: a rule is
+tested against sentinel URLs sharing no host, port, or path, and one that admits them
+all admits anything. It never changes a verdict — a catch-all rule is legitimate, it
+is just the one rule whose text does not show what it does.
 
 ---
 

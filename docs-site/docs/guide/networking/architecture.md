@@ -1,9 +1,8 @@
 # Architecture: Model B
 
 This page explains how a [filtering egress posture](modes) works under the hood, the
-design called **Model B**, and why it was chosen. It is the *why* behind the
-[modes](modes) and [rules](rules) pages. The full evidence, a throwaway spike that
-tested both architectures live, is recorded in the threat model's egress section.
+design called **Model B**, and why it holds. It is the *why* behind the
+[modes](modes) and [rules](rules) pages.
 
 ---
 
@@ -95,8 +94,8 @@ it is why there is nothing to *remember* to disable.
 
 ### Why not Model P (pasta NAT)?
 
-The rejected alternative, **Model P**, gives the cage a real NAT uplink (via `pasta`)
-and *then* filters. The spike settled it decisively against P:
+The alternative, **Model P**, gives the cage a real NAT uplink (via `pasta`) and *then*
+filters. Three properties rule it out:
 
 - **P leaks by default.** Out of the box a pasta cage reaches the host's own loopback
   services by **two** paths and would reach cloud metadata (`169.254.169.254`).
@@ -110,10 +109,9 @@ and *then* filters. The spike settled it decisively against P:
   is Model B's work *plus* a NAT topology *plus* a fail-open default.
 
 Model B, by contrast, gets all of that isolation: no route, no DNS, no metadata, no
-host-loopback, **for free**, and a misconfiguration fails closed. That is why it was
-chosen. The CVE-2026-47128 incident (in the namespace-free, Landlock-first cohort we
-surveyed), a no-namespace setup escaping via `systemd-run --user`, is a live validation
-of the all-namespaces, empty-netns approach.
+host-loopback, **for free**, and a misconfiguration fails closed. The failure mode it rules out is
+not hypothetical: CVE-2026-47128 is a sandbox without namespaces escaping through
+`systemd-run --user`, which an empty network namespace makes unreachable.
 
 ---
 
@@ -159,8 +157,8 @@ inject/redact secrets), the proxy **terminates the TLS**: it presents a leaf
 certificate for the requested host, signed by a **per-session CA** that is trusted
 **only inside the cage** (never added to the host trust store; the CA's private key is
 owner-only and ephemeral). It decrypts, applies the policy, and re-encrypts to the
-upstream. This is the capability that makes an *exact-URL* rule possible; the spike
-proved that nix and curl both fetch cleanly through it once the cage trusts the CA.
+upstream. This is the capability that makes an *exact-URL* rule possible, and it is transparent to
+ordinary clients: `nix` and `curl` both fetch cleanly through it once the cage trusts the CA.
 
 A [`tcp://` L4 rule](rules#raw-l4-splice-tcp) opts out of this: the proxy splices the
 raw byte stream without terminating TLS, for non-HTTP protocols. That is why a raw

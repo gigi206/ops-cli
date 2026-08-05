@@ -8,13 +8,16 @@ paths and methods) an in-cage tool may talk to. A **gRPC** service (HTTP/2) is
 supported too: list its host under [`http2`](../configuration/network#http2-and-grpc)
 and each RPC is inspected and filtered by `:path` (`/package.Service/Method`) like any HTTP request.
 
-The default posture is **`shared`** (the host network, unfiltered). Everything on
-this page is about the *filtering* postures you opt into for an agent you do not
-fully trust: `deny` (an allowlist), `allow` (a denylist), and `ask`
-(park-and-confirm). All of them are built on one architecture, **Model B**, and
-all of them are [security-gated](modes#security-gated): the network posture is
-honored only from the global config or a **trusted** project, never from an
-untrusted one.
+The default posture is **`deny`** (an allowlist carrying no rules of its own, so a
+cage nobody configured reaches only the [self-equip set](modes#the-built-in-self-equip-set)).
+This page is about the three *filtering* postures: `deny` (an allowlist), `allow`
+(a denylist), and `ask` (park-and-confirm). All of them are built on one
+architecture, **Model B**, and all of them are
+[security-gated](modes#security-gated): the network posture is honored only from
+the global config or a **trusted** project, never from an untrusted one. That gate
+is why the default matters as much as it does, since an untrusted project's own
+posture is dropped and this is what it runs under. To make the open host network
+your baseline instead, set [`network = "shared"`](modes#shared) in your global config.
 
 ---
 
@@ -23,8 +26,8 @@ untrusted one.
 | Mode | What reaches the cage | Filtering proxy? | Typical use |
 |---|---|---|---|
 | [`none`](modes#none) | nothing, an empty network namespace | no | fully offline work; a tool that must not phone home |
-| [`shared`](modes#shared) | the whole host network, unfiltered (the default) | no | trusted, interactive work; your own shell |
-| [`deny`](modes#deny) | only the hosts you allow (an **allowlist**) | yes | the agent default: reach a provider and the nix cache, nothing else |
+| [`shared`](modes#shared) | the whole host network, unfiltered | no | trusted, interactive work; your own shell |
+| [`deny`](modes#deny) | only the hosts you allow (an **allowlist**) | yes | **the default**: reach a provider and the nix cache, nothing else |
 | [`allow`](modes#allow) | every public host except the ones you deny (a **denylist**) | yes | broad access with a few carve-outs blocked |
 | [`ask`](modes#ask) | allow/deny listed hosts decide immediately; anything else **parks** for your live decision | yes | discovering what an agent needs; interactive triage |
 

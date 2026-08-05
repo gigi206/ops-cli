@@ -71,6 +71,7 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
+        fs: None,
         notify: None,
         rest: Default::default(),
         task: None,
@@ -235,6 +236,28 @@ fn an_undefined_group_reference_is_dropped_with_a_loud_warning() {
     assert!(
         w[0].contains("nothing is denied"),
         "the warning spells out the deny-list consequence: {}",
+        w[0]
+    );
+}
+
+#[test]
+fn an_undefined_group_in_a_mute_list_says_nothing_is_muted() {
+    // The same drop, in the third list. A `mute` reference that resolves to nothing changes no
+    // verdict — the refusals it would have silenced simply keep being logged — so the warning must
+    // say *muted*, not borrow the allow list's "nothing is allowed for it", which reads as a host
+    // being cut off. Each list states its own consequence.
+    let (g, _) = make_groups(&[("mcp", &["a.example.com:443"])]);
+    let mut w = Vec::new();
+    let mut field = net_field("deny", &["github.com"], &[]);
+    let NetworkField::Table(t) = &mut field else {
+        panic!("net_field builds a table");
+    };
+    t.mute = vec!["@noisy".into()];
+    super::validate_network(&mut w, GLOBAL_CONFIG, field, &g, &NetworkPolicy::default()).unwrap();
+    assert_eq!(w.len(), 1, "exactly one warning: {w:?}");
+    assert!(
+        w[0].contains("undefined group `@noisy`") && w[0].contains("nothing is muted"),
+        "a mute miss states the mute consequence, not the allow one: {}",
         w[0]
     );
 }
@@ -599,6 +622,7 @@ fn raw_app(
     network: Option<NetworkField>,
 ) -> RawApp {
     RawApp {
+        fs: None,
         notify: None,
         ssh_agent: None,
         task: None,
@@ -918,9 +942,10 @@ fn network_modes_set_the_egress_default_action() {
 
     assert!(w.is_empty(), "every valid mode warns nothing: {w:?}");
 
-    // An unknown mode warns and yields nothing. This is *not* fail-closed: a dropped network
-    // field resolves to `NetworkPolicy::default()` == `Shared` (the open host network), so an
-    // invalid posture reopens the network — which is why the warning must be loud.
+    // An unknown mode warns and yields nothing, which now *is* fail-closed: a dropped network
+    // field resolves to `NetworkPolicy::default()`, the deny-by-default allowlist. A typo costs
+    // the reach the author meant to grant rather than the confinement they meant to keep — the
+    // warning stays loud, but it no longer stands between a typo and the open host network.
     assert!(
         validate_network(&mut w, GLOBAL_CONFIG, NetworkField::Posture("yolo".into())).is_none()
     );
@@ -945,6 +970,28 @@ fn network_modes_set_the_egress_default_action() {
         wr.iter().any(|m| m.contains("unknown network mode")),
         "rejecting `allowlist` must warn by name: {wr:?}"
     );
+}
+
+#[test]
+fn an_unconfigured_cage_defaults_to_the_ruleless_deny_allowlist() {
+    use crate::allowlist::DefaultAction;
+    // The built-in posture, pinned. With neither layer saying anything about the network, a cage
+    // filters. This is also the posture an *untrusted* project actually gets, since its own
+    // `network` is dropped whichever way it points — so this one value decides whether a repository
+    // sbx knows nothing about reaches the host's loopback and LAN (`Shared`) or only the self-equip
+    // set the proxy unions in (a `deny` allowlist carrying no rules of its own).
+    let r = resolve_no_plugins(RawConfig::default(), None);
+    assert!(
+        matches!(&r.network, NetworkPolicy::Allowlist(p)
+            if p.default_action() == DefaultAction::Deny
+                && p.allow_rules().is_empty()
+                && p.deny_rules().is_empty()),
+        "the built-in default must be the ruleless deny allowlist: {:?}",
+        r.network
+    );
+    // And it must read as the default rather than as a layer's choice, so `sbx config show` does
+    // not credit a config that said nothing.
+    assert_eq!(r.network_origin, Provenance::Default);
 }
 
 #[test]
@@ -2503,6 +2550,8 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
     // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
     base.dbus = false;
     let app = ResolvedApp {
+        fs: Default::default(),
+        fs_origin: crate::config::Provenance::Default,
         notify: None,
         notify_origin: Default::default(),
         ssh_agent_confirm: false,
@@ -2581,6 +2630,8 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
 fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        fs: Default::default(),
+        fs_origin: crate::config::Provenance::Default,
         notify: None,
         notify_origin: Default::default(),
         ssh_agent_confirm: false,
@@ -2630,6 +2681,8 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
 fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        fs: Default::default(),
+        fs_origin: crate::config::Provenance::Default,
         notify: None,
         notify_origin: Default::default(),
         ssh_agent_confirm: false,
@@ -2679,6 +2732,8 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     use crate::allowlist::{classify, EgressPolicy, Methods};
     let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
     let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
+        fs: Default::default(),
+        fs_origin: crate::config::Provenance::Default,
         notify: None,
         notify_origin: Default::default(),
         ssh_agent_confirm: false,
@@ -2822,6 +2877,8 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
+        fs: Default::default(),
+        fs_origin: crate::config::Provenance::Default,
         notify: None,
         notify_origin: Default::default(),
         ssh_agent_confirm: false,
@@ -2879,6 +2936,8 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         "the baseline-effective set is cleared under a shared posture"
     );
     let app = ResolvedApp {
+        fs: Default::default(),
+        fs_origin: crate::config::Provenance::Default,
         notify: None,
         notify_origin: Default::default(),
         ssh_agent_confirm: false,
@@ -4294,16 +4353,6 @@ fn a_malformed_nixpkgs_source_is_dropped() {
 }
 
 #[test]
-fn the_default_network_posture_is_shared() {
-    // No declared posture anywhere means the host network — the documented
-    // default until the egress allowlist ships.
-    assert_eq!(
-        resolve_no_plugins(RawConfig::default(), None).network,
-        NetworkPolicy::Shared
-    );
-}
-
-#[test]
 fn a_global_network_posture_is_honored_a_trusted_project_overrides_it() {
     // global is trusted by location
     let r = resolve_no_plugins(raw_network("none"), None);
@@ -4322,12 +4371,15 @@ fn a_global_network_posture_is_honored_a_trusted_project_overrides_it() {
 #[test]
 fn an_untrusted_project_network_posture_is_dropped_with_a_warning() {
     // an untrusted project may not change the network — its choice is dropped and
-    // the default (or the global posture) stands.
+    // the default (or the global posture) stands. What it falls back *to* is the whole point of
+    // the built-in default: the project asking to isolate itself is refused, and what it gets is
+    // the filtering allowlist, not the open host network its own declaration was never trusted
+    // to leave behind.
     for state in [TrustState::Untrusted, TrustState::Changed] {
         let r = resolve_no_plugins(RawConfig::default(), Some((raw_network("none"), state)));
         assert_eq!(
             r.network,
-            NetworkPolicy::Shared,
+            NetworkPolicy::default(),
             "an untrusted project may not narrow the network"
         );
         assert_eq!(r.warnings.len(), 1);
@@ -4350,9 +4402,11 @@ fn an_untrusted_project_cannot_widen_a_globally_isolated_network() {
 
 #[test]
 fn an_unknown_network_posture_is_dropped_with_a_warning() {
-    // a typo must not silently leave the network in the wrong posture
+    // a typo must not silently leave the network in the wrong posture: the value is dropped, and
+    // what stands is the built-in default, so `offline` costs its author reach rather than
+    // confinement.
     let r = resolve_no_plugins(raw_network("offline"), None);
-    assert_eq!(r.network, NetworkPolicy::Shared);
+    assert_eq!(r.network, NetworkPolicy::default());
     assert_eq!(r.warnings.len(), 1);
     assert!(r.warnings[0].contains("unknown network policy `offline`"));
 }
@@ -4534,6 +4588,106 @@ fn the_default_devices_grant_is_empty() {
     assert!(resolve_no_plugins(RawConfig::default(), None)
         .devices
         .is_empty());
+}
+
+/// A `RawConfig` declaring an `[fs]` table from the given deny/readonly entries.
+fn raw_fs(deny: &[&str], readonly: &[&str]) -> RawConfig {
+    RawConfig {
+        fs: Some(schema::RawFs {
+            rest: Default::default(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            readonly: readonly.iter().map(|s| s.to_string()).collect(),
+        }),
+        ..RawConfig::default()
+    }
+}
+
+#[test]
+fn an_untrusted_projects_fs_masks_are_honored() {
+    // The property that separates `[fs]` from every other security table: it can only *close*
+    // paths, so an untrusted project declaring one gains nothing it could turn on the user — while
+    // dropping it would leave a file the project asked to close wide open. Honored from both
+    // untrusted states, and unioned onto whatever the global layer closed.
+    for state in [TrustState::Untrusted, TrustState::Changed] {
+        let r = resolve_no_plugins(
+            raw_fs(&["global.key"], &[]),
+            Some((raw_fs(&["local.key"], &["Cargo.lock"]), state)),
+        );
+        assert_eq!(
+            r.fs.deny,
+            vec!["global.key".to_string(), "local.key".to_string()],
+            "an untrusted project closes its own files; the global mask survives"
+        );
+        assert_eq!(r.fs.readonly, vec!["Cargo.lock".to_string()]);
+        assert_eq!(r.fs_origin, Provenance::Project);
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("[fs]")),
+            "nothing was dropped, so nothing warns: {:?}",
+            r.warnings
+        );
+    }
+}
+
+#[test]
+fn a_project_can_never_reopen_what_the_global_layer_closed() {
+    // The union direction is the whole safety story: there is no syntax for removal, so a project
+    // repeating the global entry changes nothing and adding one only closes more.
+    let r = resolve_no_plugins(
+        raw_fs(&["shared.key"], &["Cargo.lock"]),
+        Some((raw_fs(&["shared.key"], &[]), TrustState::Untrusted)),
+    );
+    assert_eq!(r.fs.deny, vec!["shared.key".to_string()], "deduped");
+    assert_eq!(
+        r.fs.readonly,
+        vec!["Cargo.lock".to_string()],
+        "still closed"
+    );
+}
+
+#[test]
+fn a_refused_fs_entry_is_dropped_with_a_warning_that_says_the_path_stays_open() {
+    // A dropped mask fails *open* — the file stays readable — so the warning has to say so rather
+    // than read like a tidy-up note.
+    let r = resolve_no_plugins(
+        raw_fs(&["**/*.pem", "/etc/shadow", "../up.key"], &["ok.txt"]),
+        None,
+    );
+    assert!(
+        r.fs.deny.is_empty(),
+        "every bad entry dropped: {:?}",
+        r.fs.deny
+    );
+    assert_eq!(
+        r.fs.readonly,
+        vec!["ok.txt".to_string()],
+        "the good one stays"
+    );
+    let warned: Vec<&String> = r.warnings.iter().filter(|w| w.contains("[fs]")).collect();
+    assert_eq!(warned.len(), 3, "one warning per refused entry: {warned:?}");
+    assert!(
+        warned.iter().all(|w| w.contains("stays open to the cage")),
+        "each warning says what the drop costs: {warned:?}"
+    );
+}
+
+#[test]
+fn an_apps_fs_masks_union_onto_the_baseline() {
+    // An app closes more of the project for its own cage, and can never reopen what the baseline
+    // closed. Ungated like the baseline table.
+    let global = raw_with_app(
+        "demo-app",
+        RawApp {
+            fs: Some(schema::RawFs {
+                rest: Default::default(),
+                deny: vec!["app-only.key".into()],
+                readonly: vec![],
+            }),
+            ..raw_app(&["demo-app"], &[], &[], &[], None)
+        },
+    );
+    let r = resolve_no_plugins(global, None);
+    assert_eq!(r.apps["demo-app"].fs.deny, vec!["app-only.key".to_string()]);
+    assert_eq!(r.apps["demo-app"].fs_origin, Provenance::Global);
 }
 
 #[test]
@@ -4724,9 +4878,12 @@ fn an_untrusted_project_allowlist_is_dropped_with_a_warning() {
             RawConfig::default(),
             Some((raw_network_allow(&["github.com"]), state)),
         );
+        // The built-in default is a `deny` allowlist too, so equality against it — rather than a
+        // `matches!` on the variant — is what proves the *rules* were dropped: the resolved policy
+        // carries no allow entry, and `github.com` reaches nothing the built-in set does not.
         assert_eq!(
             r.network,
-            NetworkPolicy::Shared,
+            NetworkPolicy::default(),
             "an untrusted project may not set an egress allowlist"
         );
         assert_eq!(r.warnings.len(), 1);
@@ -4807,7 +4964,7 @@ fn an_unknown_network_mode_is_dropped_with_a_warning() {
         },
         None,
     );
-    assert_eq!(r.network, NetworkPolicy::Shared);
+    assert_eq!(r.network, NetworkPolicy::default());
     assert_eq!(r.warnings.len(), 1);
     assert!(r.warnings[0].contains("unknown network mode"));
 }
@@ -5051,7 +5208,10 @@ fn with_override(mut resolved: Resolved, raw: RawConfig) -> Resolved {
 fn a_set_but_invalid_override_security_value_is_a_hard_error_and_mutates_nothing() {
     // The fail-closed contract on the security half: a typo'd `network` value has no safe
     // fallback — it must be a hard error, never a silent revert to the (possibly wider) baseline.
-    let mut resolved = resolve_no_plugins(RawConfig::default(), None);
+    // The baseline is declared `shared` rather than left to the (filtering) built-in default, so a
+    // silent revert would be visible: reverting to the default would *narrow* the posture, and the
+    // contract is that nothing moves at all.
+    let mut resolved = resolve_no_plugins(raw_network("shared"), None);
     assert_eq!(resolved.network, NetworkPolicy::Shared);
     let errs = resolved
         .apply_override(Override::for_test(RawConfig {
@@ -5065,7 +5225,7 @@ fn a_set_but_invalid_override_security_value_is_a_hard_error_and_mutates_nothing
     );
     // and nothing was applied — the baseline posture stands (never a silent wider fallback).
     assert_eq!(resolved.network, NetworkPolicy::Shared);
-    assert_eq!(resolved.network_origin, Provenance::Default);
+    assert_eq!(resolved.network_origin, Provenance::Global);
 }
 
 #[test]
@@ -6371,8 +6531,10 @@ fn an_untrusted_project_secret_is_dropped_with_a_warning() {
 
 #[test]
 fn a_secret_without_an_allowlist_is_dropped_with_a_warning() {
-    // a secret declared while the network stays shared (no filtering proxy) has
-    // nowhere to inject; it is cleared with a warning, never a silent no-op.
+    // a secret declared while the network is shared (no filtering proxy) has nowhere to inject;
+    // it is cleared with a warning, never a silent no-op. The posture is spelled out because the
+    // built-in default now filters: leaving it implicit would test the opposite case, where the
+    // proxy exists and the secret is honored.
     let r = resolve_no_plugins(
         RawConfig {
             secret: Some(raw_secret_section(vec![raw_secret(
@@ -6383,7 +6545,7 @@ fn a_secret_without_an_allowlist_is_dropped_with_a_warning() {
                 Some("bearer"),
                 None,
             )])),
-            ..RawConfig::default()
+            ..raw_network("shared")
         },
         None,
     );

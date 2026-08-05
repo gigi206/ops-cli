@@ -90,6 +90,16 @@ pub(crate) struct ConfigView {
     pub(crate) devices: Vec<String>,
     /// Which layer supplied the device grant (`Default` when neither config did).
     pub(crate) devices_origin: ProvenanceView,
+    /// The project paths closed inside the cage (`[fs] deny`), and those it may read but not write
+    /// (`[fs] readonly`), each as the entry that declared it. Empty when no layer closed anything.
+    pub(crate) fs_deny: Vec<String>,
+    pub(crate) fs_readonly: Vec<String>,
+    /// Which layer supplied the masks (`Default` when no config did).
+    pub(crate) fs_origin: ProvenanceView,
+    /// The declared operations (`[task.<name>]`) a cage would offer, after the trust gate. This is
+    /// the *static* view: `sbx task ls` reads a running session, so without it there was no way to
+    /// confirm a `[task]` block survived validation short of launching one.
+    pub(crate) tasks: Vec<TaskView>,
     /// The ssh-agent keys the cage may sign with (`[ssh_agent] allow`), each naming one key by its
     /// `SHA256:…` fingerprint or its comment. Empty when the cage gets no agent at all.
     pub(crate) ssh_agent: Vec<String>,
@@ -331,6 +341,13 @@ pub(crate) enum RuleSourceView {
 /// a rule expanded from a `[net.groups]` group — the group's name (`None` otherwise). In the default
 /// (collapsed) view a contiguous run of one group's rules is a single row whose `rule` is `@<name>`;
 /// under `--expand` each rule is its own row carrying `group` so the renderer can note its origin.
+///
+/// `catch_all` marks the one rule whose reach its own text does not show: a `re:` regex that matches
+/// every host (see [`crate::allowlist::Rule::opens_every_host`]). The grammar refuses a bare `*`
+/// precisely so a policy reads as what it does, and a catch-all regex is the accepted way to say the
+/// same thing — so it is labelled here rather than left to be spotted. False for every other rule,
+/// and for a collapsed `@<group>` row, whose text names no pattern to judge (`--expand` shows the
+/// members, each judged on its own).
 #[derive(Serialize, Clone)]
 pub(crate) struct NetRuleView {
     pub(crate) kind: NetRuleKind,
@@ -338,6 +355,8 @@ pub(crate) struct NetRuleView {
     pub(crate) rule: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) group: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) catch_all: bool,
 }
 
 /// Project one config list (allow or deny) into rows. Collapsed (`expand == false`): a maximal
@@ -357,6 +376,7 @@ fn project_config_rules(
                 source: RuleSourceView::Config,
                 rule: r.to_string(),
                 group: r.group.clone(),
+                catch_all: r.opens_every_host(),
             });
         }
         return;
@@ -374,6 +394,7 @@ fn project_config_rules(
                     source: RuleSourceView::Config,
                     rule: format!("@{g}"),
                     group: Some(g.clone()),
+                    catch_all: false,
                 });
                 i = j;
             }
@@ -383,6 +404,7 @@ fn project_config_rules(
                     source: RuleSourceView::Config,
                     rule: rules[i].to_string(),
                     group: None,
+                    catch_all: rules[i].opens_every_host(),
                 });
                 i += 1;
             }
@@ -412,6 +434,9 @@ pub(crate) fn net_rules_view(
             source: RuleSourceView::Builtin,
             rule: r.to_string(),
             group: None,
+            // The built-in self-equip set names its hosts; asked anyway, so the label follows the
+            // rule rather than an assumption about which list it sits in.
+            catch_all: r.opens_every_host(),
         });
     }
     rules
@@ -485,6 +510,21 @@ pub(crate) struct LimitsView {
 pub(crate) struct LimitView {
     pub(crate) value: String,
     pub(crate) origin: ProvenanceView,
+}
+
+/// One declared operation, as the static view shows it: what it is called, what it says it does,
+/// and which layer declared it. The command is deliberately absent — an operation is a *fixed*
+/// command plus a credential the caller never holds, and `sbx task show` is where the whole
+/// contract (params, secrets, output disposition) is read. Here the question is only whether the
+/// block survived validation, and where it came from.
+#[derive(Serialize)]
+pub(crate) struct TaskView {
+    pub(crate) name: String,
+    /// `null` when the operation declared none, which is a different fact from an empty string.
+    pub(crate) description: Option<String>,
+    /// `global`, `project`, `app:<name>` or `bundle:<name>` — the same `kind:name` token the rest
+    /// of sbx uses for a kind and its instance.
+    pub(crate) origin: String,
 }
 
 /// An injected credential, by destination and source — never the plaintext, which sbx reads only
@@ -591,6 +631,10 @@ pub(crate) struct AppView {
     /// baseline-merged set. Empty when it grants none; the merge unions it with the baseline only for
     /// the launch itself.
     pub(crate) devices: Vec<String>,
+    /// The project paths this overlay closes over the baseline — its *own* entries, not the
+    /// baseline-merged set. Empty when it closes none.
+    pub(crate) fs_deny: Vec<String>,
+    pub(crate) fs_readonly: Vec<String>,
     /// The ssh-agent keys this overlay grants over the baseline — its *own* entries, not the
     /// baseline-merged set. Empty when it names none; the merge unions it with the baseline only for
     /// the launch itself.
@@ -662,6 +706,11 @@ pub(crate) struct AppDetailView {
     /// is `Inherited` when the app added none of its own (it takes the baseline's grant).
     pub(crate) devices: Vec<String>,
     pub(crate) devices_origin: ProvenanceView,
+    /// The effective mask set — the app's own ∪ the baseline's. The origin is `Inherited` when the
+    /// app closed nothing of its own (it takes the baseline's masks).
+    pub(crate) fs_deny: Vec<String>,
+    pub(crate) fs_readonly: Vec<String>,
+    pub(crate) fs_origin: ProvenanceView,
     /// The effective ssh-agent grant — the app's own ∪ the baseline's. The origin is `Inherited`
     /// when the app named no key of its own (it signs with whatever the baseline granted).
     pub(crate) ssh_agent: Vec<String>,
@@ -846,6 +895,10 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         seccomp_origin: resolved.seccomp_origin.into(),
         devices: device_paths(&resolved.devices),
         devices_origin: resolved.devices_origin.into(),
+        fs_deny: resolved.fs.deny.clone(),
+        fs_readonly: resolved.fs.readonly.clone(),
+        fs_origin: resolved.fs_origin.into(),
+        tasks: task_views(&resolved.tasks),
         ssh_agent: resolved.ssh_agent.clone(),
         ssh_agent_origin: resolved.ssh_agent_origin.into(),
         ssh_agent_confirm: resolved.ssh_agent_confirm,
@@ -860,6 +913,20 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
 /// the baseline, per-app, and `--app` effective views render a device path identically.
 fn device_paths(devices: &[std::path::PathBuf]) -> Vec<String> {
     devices.iter().map(|p| p.display().to_string()).collect()
+}
+
+/// Project the declared operations for the static view. Ordering is the resolver's, which already
+/// folds an app's and a bundle's blocks onto the baseline, so the list reads as the launch would
+/// offer it.
+fn task_views(tasks: &[super::TaskSpec]) -> Vec<TaskView> {
+    tasks
+        .iter()
+        .map(|t| TaskView {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            origin: t.origin.label(),
+        })
+        .collect()
 }
 
 /// Project one declared package, recording its backend, how it is realised, the trust verdict,
@@ -1140,6 +1207,8 @@ fn app_view(
         forward: app.forward.clone(),
         seccomp: app.seccomp.tokens(),
         devices: device_paths(&app.devices),
+        fs_deny: app.fs.deny.clone(),
+        fs_readonly: app.fs.readonly.clone(),
         ssh_agent: app.ssh_agent.clone(),
         limits: app_limits_view(&app.limits),
         secrets: if injects {
@@ -1252,6 +1321,11 @@ fn app_detail_view(
     let mut eff_devices = baseline.devices.clone();
     super::union_devices(&mut eff_devices, app.devices.clone());
     let devices_origin = origin_or_inherited(!app.devices.is_empty(), app.devices_origin);
+    // Effective masks: the app's own ∪ the baseline's — the same union `merge_app` performs, and
+    // the same direction (an app closes more, never less).
+    let mut eff_fs = baseline.fs.clone();
+    eff_fs.union(app.fs.clone());
+    let fs_origin = origin_or_inherited(!app.fs.is_empty(), app.fs_origin);
 
     // Effective ssh-agent grant: the app's own ∪ the baseline's — the same union `merge_app`
     // performs — with the origin `Inherited` when the app named no key of its own.
@@ -1346,6 +1420,9 @@ fn app_detail_view(
         seccomp_origin,
         devices: device_paths(&eff_devices),
         devices_origin,
+        fs_deny: eff_fs.deny,
+        fs_readonly: eff_fs.readonly,
+        fs_origin,
         ssh_agent: eff_ssh_agent,
         ssh_agent_origin,
         // ORed, like the merge: an app may ask for the prompt, and cannot remove the baseline's.
@@ -1526,6 +1603,10 @@ mod tests {
     #[test]
     fn the_view_model_serializes_to_a_json_object() {
         let view = ConfigView {
+            tasks: Vec::new(),
+            fs_deny: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -1602,6 +1683,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                fs_deny: Vec::new(),
+                fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -1785,6 +1868,8 @@ mod tests {
 
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
+            fs: Default::default(),
+            fs_origin: crate::config::Provenance::Default,
             notify: None,
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -1857,6 +1942,8 @@ mod tests {
         // A baseline credential the app inherits — and that the app's narrowed network drops, the
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
+            fs: Default::default(),
+            fs_origin: crate::config::Provenance::Default,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -1913,6 +2000,8 @@ mod tests {
         };
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
+            fs: Default::default(),
+            fs_origin: crate::config::Provenance::Default,
             notify: None,
             notify_origin: Default::default(),
             ssh_agent_confirm: false,

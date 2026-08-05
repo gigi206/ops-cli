@@ -182,6 +182,15 @@ h4 {
   margin-top: 2.6rem;
 }
 
+/* The automatic section numbers stand a step off the title, so a long chain
+   ("10.1.3") reads as a counter rather than as part of the sentence. The span
+   already ends on the separating space, so the margin only widens it: the two
+   together make up the step. */
+.markdown .section-number {
+  margin-right: 0.25em;
+  font-variant-numeric: tabular-nums;
+}
+
 .markdown h3 {
   font-weight: 600;
   margin-top: 2rem;
@@ -1307,23 +1316,10 @@ html[data-theme='dark']:root .home {
   margin-bottom: 1.25rem;
 }
 
-/* Bounded so the note can stand beside the title rather than being pushed onto
-   its own line by a heading that would otherwise take the whole measure. */
+/* Bounded so a section title keeps a readable measure rather than running the
+   full width of the section. */
 .home__section-head > :first-child {
   max-width: 40rem;
-}
-
-/* The standing condition, stated next to the claim it qualifies. */
-.home__note {
-  max-width: 20rem;
-  margin: 0;
-  padding: 0.625rem 0.875rem;
-  border: 1px solid var(--keep-border);
-  border-radius: 8px;
-  font-family: var(--ifm-font-family-monospace);
-  font-size: 0.8125rem;
-  line-height: 1.5;
-  color: var(--keep-faint);
 }
 
 .home__aside {
@@ -1770,11 +1766,6 @@ html[data-theme='dark']:root .home {
 
   .home__command-text {
     font-size: 0.8125rem;
-  }
-
-  /* The note has the measure to itself once it drops under the title. */
-  .home__note {
-    max-width: none;
   }
 }
 

@@ -252,6 +252,7 @@ pub(super) fn validate_task(
         .transpose()?;
     let exec = validate_task_exec(name, &raw.cmd, spawn.as_ref(), raw.exec)?;
     let packages = validate_task_packages(&raw.packages)?;
+    let unmask = validate_unmask(&raw.unmask)?;
 
     Ok(TaskSpec {
         name: name.to_string(),
@@ -272,6 +273,7 @@ pub(super) fn validate_task(
         spawn,
         exec,
         output: raw.output,
+        unmask,
         // A bundle folded into an app keeps the bundle's name: the fold made the entry look like
         // the app's own, and the bundle is where a reader would go to change it.
         origin: match raw.from_bundle {
@@ -464,6 +466,29 @@ fn validate_task_exec(
         ));
     }
     Ok(graph)
+}
+
+/// Validate a task's `unmask` entries against the same grammar `[fs]` uses, so an entry that could
+/// never name a mask is refused where it is written rather than shrugged off at launch.
+///
+/// This checks the *spelling* only. Whether an entry names a path the `[fs] deny` list actually
+/// carries is decided at launch, in the one place both lists are in hand — and it is a warning
+/// there, not an error, because an entry that matches no mask lifts nothing: the path stays closed.
+fn validate_unmask(raw: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        match crate::config::fspolicy::validate_entry(entry) {
+            Ok(ok) if out.contains(&ok) => {}
+            Ok(ok) => out.push(ok),
+            Err(reason) => {
+                return Err(format!(
+                "`unmask` entry `{entry}` {reason} — it names an `[fs] deny` entry, in the same \
+                     form that list is written in"
+            ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Validate a task's `packages` and return the bare mise tokens (the `mise:` prefix stripped).

@@ -416,7 +416,7 @@ impl Caution {
             Caution::TerminalInjection => "terminal input injection",
             Caution::ControlPlane => {
                 "tearing down a mount (can defeat a control-plane pin when sbx's control plane is \
-                 bound read-write)"
+                 bound read-write, and every `[fs]` mask, which is a mount over a project path)"
             }
         }
     }

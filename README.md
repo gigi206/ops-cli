@@ -20,7 +20,7 @@ as your user, but the **bind layout is the security control** — the host
 filesystem and your secrets are absent from the cage unless explicitly and
 trustedly granted. The agent self-equips a per-project Nix store it cannot use to
 escape, behind an always-on seccomp filter and best-effort resource limits; egress
-is the host network by default and can be narrowed to a deny-by-default allowlist.
+is a deny-by-default allowlist and can be opened back up to the host network.
 
 ## Security model (the essentials)
 
@@ -34,9 +34,10 @@ is the host network by default and can be narrowed to a deny-by-default allowlis
 - Always-on enforcement: bubblewrap (all namespaces + `no_new_privs` + drop all
   capabilities) and a **seccomp** denylist; **cgroup v2** resource limits where the
   host supports them (best-effort, never the boundary).
-- Network egress is the **host network by default**; opt into `network = "allowlist"`
-  for a deny-by-default filter enforced by a host-side TLS-terminating proxy reached
-  over a bound socket from an empty network namespace.
+- Network egress is a **deny-by-default allowlist**, enforced by a host-side
+  TLS-terminating proxy reached over a bound socket from an empty network namespace.
+  A cage nobody configured reaches only the built-in self-equip set; `network = "shared"`
+  opts back into the unfiltered host network.
 - An untrusted project's `.sbx.toml` **cannot** touch security-relevant fields
   (binds, network, secrets, packages, app definitions); the trust gate binds
   approval to the file's content hash — the direnv model (`sbx trust`).

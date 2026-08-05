@@ -48,7 +48,7 @@ user-notification gate that blocks a denied `execve` before it runs. It is a
 **guardrail** (it vetoes what an agent *spawns*, not what it does in-process),
 layered on top of the three always-on controls, not a replacement for them.
 
-## 1. bubblewrap hardening
+## bubblewrap hardening
 
 The base cage is a non-setuid [bubblewrap](https://github.com/containers/bubblewrap)
 process. On a modern kernel bwrap runs through unprivileged user namespaces, so
@@ -78,10 +78,16 @@ a VPN tunnel, KVM, or FUSE can bind a specific device node with a trusted
 [`[devices]`](../configuration/devices) grant; like the seccomp relaxation below, this is
 trusted-only surface reduction undone, not a change to the namespace/capability boundary.
 
+Mounts are also what closes a path *inside* the project tree. An [`[fs]`](../configuration/fs)
+entry mounts a decoy over a project path (an empty mode-000 file, or an empty directory), or
+re-binds it read-only over itself. The cage cannot take one apart: removing it is `EBUSY`, and
+`umount2`/`mount`/`unshare` are refused by the filter below. It is the one table that is **not**
+trust-gated, because it can only close a path of the project it is declared in.
+
 The absence of a capability-bearing user namespace is a **hard failure**, never a
 silent fallback to a weaker engine. See [`sbx doctor`](../getting-started/doctor).
 
-## 2. The seccomp denylist (Posture A)
+## The seccomp denylist (Posture A)
 
 bwrap ships no default seccomp filter; `sbx` compiles its own with
 [`seccompiler`](https://crates.io/crates/seccompiler) (pure Rust, so the static
@@ -176,7 +182,7 @@ filter cannot load, and the launch **fails closed**: seccomp is a mandatory cont
 here, not best-effort. It is loaded on every launch path, including the `sbx doctor`
 smoke, so `doctor` proves the real launch path *with* the filter active.
 
-## 3. The environment is loaded off the argument list
+## The environment is loaded off the argument list
 
 A process's **environment** is private (`/proc/<pid>/environ` is mode `400`, readable
 only by the process's own uid), but its **arguments** are not
@@ -213,7 +219,7 @@ plumbing (`PATH`, `HOME`) loses to the plumbing. The skeleton bwrap argv is **pu
 memfd write. A test rejects any name or value carrying a NUL, and asserts that
 credentials are spliced in declaration order ahead of plain environment entries.
 
-## 4. cgroup v2 resource limits (anti-DoS)
+## cgroup v2 resource limits (anti-DoS)
 
 Nothing in the namespace, seccomp, or egress layers bounds *resource consumption*, an in-cage agent could fork-bomb, exhaust memory, or peg the CPU. `sbx` wraps the
 cage in a **transient systemd user scope**
@@ -252,23 +258,6 @@ a project config (and per app), tuned per field. Loosening your own anti-DoS cap
 only self-harms, but it is still gated trusted/global-only. See
 [`limits`](../configuration/limits).
 
-## 5. Landlock is not (yet) a layer
-
-Landlock (a filesystem access LSM) is a **deferred** defense-in-depth option, **not
-a shipped layer**. The hermetic FHS already does the confidentiality job Landlock
-would: a secret is *absent* from the cage rather than merely read-only, so a
-Landlock ruleset would mostly re-police paths that are not mounted at all. It may be
-added later as an extra layer, but the shipped enforcement stack is the three layers
-above.
-
-A feasibility spike also confirmed the feature that would have justified it: a
-read-only subdirectory (`.git/`, lockfiles) *inside* the read-write project tree: is
-**not expressible**: Landlock resolves an access by the *union* of every matching
-ancestor rule, so a child rule can only add access, never carve it out. Landlock can
-whitelist which trees are writable and restrict per-operation rights (deny delete /
-symlink / rename), but it cannot protect a subtree of a directory the agent is meant
-to write.
-
 ## GUI exposure is Wayland-only
 
 When a cage opens the optional GUI hole, exposure is **Wayland, never X11**. A
@@ -278,8 +267,8 @@ the boundary, replacing Chromium's redundant sandbox rather than removing a
 protection. Under a compositor such as Mutter, an ordinary Wayland client is not
 advertised the dangerous protocols (screen copy, virtual-keyboard input injection,
 clipboard snooping, foreign-toplevel control), which is the basis for the
-"Wayland, never X11" rule. (This isolation is compositor-dependent; see the design
-spike for the residuals.)
+"Wayland, never X11" rule. That isolation is **compositor-dependent**: a compositor that
+advertises those protocols to ordinary clients weakens it, and sbx cannot detect the difference.
 
 ## See also
 

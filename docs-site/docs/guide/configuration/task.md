@@ -42,6 +42,7 @@ See also: [Declared operations](../tasks/) · [`sbx task`](../cli/task) · [`[se
 | `spawn` | the programs the command may run [beside itself](../tasks/execution#what-the-command-may-run-spawn), absent means no supervision |
 | `[exec.<program>]` | what one of those programs may run [in turn](../tasks/execution#what-each-program-may-run-in-turn-execprogram) |
 | `output` | give the invocation a [writable directory](../tasks/output#producing-a-file-output) whose contents outlive it |
+| `unmask` | the [`[fs] deny`](fs#opening-a-path-for-one-operation) paths **this** task may read, and it alone |
 
 ## Section defaults
 

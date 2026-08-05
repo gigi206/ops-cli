@@ -25,6 +25,43 @@ pub(crate) fn render_config_write(
     )
 }
 
+/// The confirmation that `sbx config add`/`rm` changed one entry of a list: the entry and the key it
+/// moved in or out of, over the file it was written to. A pure presenter.
+pub(crate) fn render_list_edit(
+    done: &str,
+    preposition: &str,
+    entry: &str,
+    key: &str,
+    path: &Path,
+    pal: &style::Palette,
+) -> String {
+    let (ok, n, r) = (pal.ok, pal.name, pal.reset);
+    format!(
+        "sbx: {ok}{done}{r} {} {preposition} {} in {n}{}{r}",
+        style::paint_spans(&format!("`{entry}`"), pal.name, "", pal),
+        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
+        path.display()
+    )
+}
+
+/// The no-op confirmation for `sbx config add`/`rm` when the list already reads that way — dimmed,
+/// since nothing changed and so trust is not re-armed. A pure presenter.
+pub(crate) fn render_list_unchanged(
+    entry: &str,
+    why: &str,
+    key: &str,
+    path: &Path,
+    pal: &style::Palette,
+) -> String {
+    let (dim, r) = (pal.dim, pal.reset);
+    format!(
+        "sbx: {} {dim}{why}{r} {} {dim}in {} (no change){r}",
+        style::paint_spans(&format!("`{entry}`"), pal.name, "", pal),
+        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
+        path.display()
+    )
+}
+
 /// The no-op confirmation for `sbx config unset` on a key that was not set — dimmed, since nothing
 /// changed (and so trust is never re-armed). A pure presenter.
 pub(crate) fn render_config_unchanged(key: &str, path: &Path, pal: &style::Palette) -> String {

@@ -93,7 +93,7 @@ On a **non-interactive foreground run** the process events are *also* echoed inl
 - For **precise per-exec capture and blocking**, set [`[proc] mode = "enforce"`/`"ask"`](../configuration/proc)
   (a trusted-only security field): the process feed then comes from a seccomp user-notification
   supervisor that captures every exec exactly and can refuse a denied one before it runs. The
-  `--observe` poll above is the cheap, always-available first cut; `[proc]` is the enforcing one.
+  `--observe` poll above costs nothing and needs no trust; `[proc]` is the one that can refuse.
 
 ```sh
 sbx run --observe -- ./build.sh

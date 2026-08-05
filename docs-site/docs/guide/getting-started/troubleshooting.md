@@ -31,11 +31,13 @@ ignored until you approve it:
 
 ```text
 sbx: warning: .sbx.toml: ignoring `network` policy (untrusted — run `sbx trust`)
-network: shared (host network) — every URL is reachable; no allowlist to test
+network: deny (allowlist — only listed and built-in hosts reach)
 ```
 
-Nothing is broken: the sandbox fell back to host networking because you have not yet
-trusted the project. Run `sbx trust` and the policy takes effect:
+Nothing is broken: the sandbox dropped the project's own posture and fell back to the
+built-in default, which filters and carries no rules, so only the
+[self-equip set](../networking/modes#the-built-in-self-equip-set) reaches. This is why
+your `allow` list appears to have no effect. Run `sbx trust` and the policy takes effect:
 
 ```text
 sbx: trusted .sbx.toml

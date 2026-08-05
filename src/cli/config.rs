@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::cli::confirm::{
-    render_config_unchanged, render_config_write, render_trusted_whole_file,
+    render_config_unchanged, render_config_write, render_list_edit, render_list_unchanged,
+    render_trusted_whole_file,
 };
 use crate::{config, diag, help, style, trust};
 use crate::{config_cwd, net_mode_word, short_rev, split_scope, ScopeArgs};
@@ -30,6 +31,8 @@ pub(crate) fn config_cmd(args: Vec<OsString>) -> ExitCode {
         Some("show") => config_show(&args[1..]),
         Some("get") => config_get(&args[1..]),
         Some("set") => config_set(&args[1..]),
+        Some("add") => config_list_edit(&args[1..], ListEdit::Add),
+        Some("rm") => config_list_edit(&args[1..], ListEdit::Remove),
         Some("unset") => config_unset(&args[1..]),
         Some("path") => config_path_cmd(&args[1..]),
         Some("edit") => config_edit(&args[1..]),
@@ -313,38 +316,48 @@ fn bind_mode_tag(writable: bool, pal: &style::Palette) -> String {
 }
 
 /// The two `[network]` settings that decide how a permitted request is carried rather than whether
-/// it is carried: connection reuse and the resolver cache. Written only when a layer moved one off
-/// its default, in the same spirit as the capture line — never a silent property of a launch.
+/// it is carried: connection reuse and the resolver cache.
 ///
 /// They earn their line for a sharper reason than the other transport settings do. The whole table
 /// is trusted/global-only, and neither is observable from inside the cage: a client cannot see that
 /// its connection was reused, nor how old the address it reached was. `sbx config` is where a
 /// project learns that a trusted layer set them.
+///
+/// The baseline view names only what a layer moved off its default, in the same spirit as the
+/// capture line — never a silent property of a launch, never noise for the common posture.
+/// `--details` names the **effective** posture instead, defaults included, because the baseline's
+/// silence is ambiguous to a reader who does not already know the product defaults: nothing printed
+/// means "reuse is on and the cache is the built-in one", which is exactly what someone asking for
+/// details wants spelled out. Only the resolver cache can say *which* of the two it is, because the
+/// view keeps its unset state (`None`) while `pool` arrives already collapsed to a `bool`.
 fn write_net_transport(
     o: &mut String,
     pool: bool,
     dns_cache_ttl: Option<u64>,
+    details: bool,
     pal: &style::Palette,
 ) {
     use std::fmt::Write as _;
+    let mut line = |s: &str| {
+        let _ = writeln!(o, "    {}", style::dim_prose(s, pal));
+    };
     if !pool {
-        let _ = writeln!(
-            o,
-            "    {}",
-            style::dim_prose(
-                "connection reuse: off (every request opens and validates its own upstream \
-                 connection)",
-                pal
-            )
+        line(
+            "connection reuse: off (every request opens and validates its own upstream connection)",
         );
+    } else if details {
+        line("connection reuse: on (a request may ride an upstream connection an earlier one left behind)");
     }
-    if let Some(secs) = dns_cache_ttl {
-        let shown = if secs == 0 {
-            "dns cache: off (every request re-resolves)".to_string()
-        } else {
-            format!("dns cache: {secs}s (a resolved address stands for that long)")
-        };
-        let _ = writeln!(o, "    {}", style::dim_prose(&shown, pal));
+    match dns_cache_ttl {
+        Some(0) => line("dns cache: off (every request re-resolves)"),
+        Some(secs) => line(&format!(
+            "dns cache: {secs}s (a resolved address stands for that long)"
+        )),
+        None if details => line(&format!(
+            "dns cache: {}s (built-in default; a resolved address stands for that long)",
+            crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs()
+        )),
+        None => {}
     }
 }
 
@@ -548,7 +561,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     )
                 );
             }
-            write_net_transport(&mut o, *pool, *dns_cache_ttl, pal);
+            write_net_transport(&mut o, *pool, *dns_cache_ttl, details, pal);
             match default_action {
                 // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
                 NetDefaultView::Deny => {
@@ -833,6 +846,26 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         );
     }
 
+    // The `[fs]` masks — shown only when a layer closed something, so a project that closed
+    // nothing stays uncluttered. The entries read as written, since that is what a reader edits;
+    // which paths each covers is settled at launch, and reported there.
+    if !view.fs_deny.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}fs deny:{r} {} {dim}(closed to the cage; the name stays visible){r}{}",
+            view.fs_deny.join(", "),
+            provenance_tag(view.fs_origin, pal)
+        );
+    }
+    if !view.fs_readonly.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}fs readonly:{r} {} {dim}(readable in the cage, not writable){r}{}",
+            view.fs_readonly.join(", "),
+            provenance_tag(view.fs_origin, pal)
+        );
+    }
+
     // ssh-agent grant — shown only when a trusted `[ssh_agent] allow` names a key, so the default
     // (no agent in the cage at all) stays uncluttered. The entries read as written; which of them
     // the host agent actually holds is settled at launch, and reported there.
@@ -861,6 +894,28 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                 o,
                 "    {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
                 s.header, s.to, s.shape, s.sources
+            );
+        }
+    }
+
+    // Declared operations, the static counterpart to `sbx task ls` (which reads a running session).
+    // Name, what it says it does, and which layer declared it — not the command, which is the whole
+    // contract `sbx task show` prints. Without this there was no way to confirm a `[task]` block
+    // survived validation short of launching a session and asking it.
+    if !view.tasks.is_empty() {
+        let _ = writeln!(o, "  {h}tasks (declared operations a cage may run):{r}");
+        let width = view.tasks.iter().map(|t| t.name.len()).max().unwrap_or(0);
+        for t in &view.tasks {
+            let described = match &t.description {
+                Some(d) => format!("  {d}"),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                o,
+                "    {n}{:<width$}{r}{described}  {dim}({}){r}",
+                t.name,
+                t.origin,
+                width = width
             );
         }
     }
@@ -1104,6 +1159,16 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             if !app.devices.is_empty() {
                 let _ = writeln!(o, "      {dim}devices:{r} {}", app.devices.join(", "));
             }
+            if !app.fs_deny.is_empty() {
+                let _ = writeln!(o, "      {dim}fs deny:{r} {}", app.fs_deny.join(", "));
+            }
+            if !app.fs_readonly.is_empty() {
+                let _ = writeln!(
+                    o,
+                    "      {dim}fs readonly:{r} {}",
+                    app.fs_readonly.join(", ")
+                );
+            }
             // The ssh-agent keys this overlay grants (its own entries, not the merged set) — the
             // whole point of the per-app field is that one app may sign where another may not, so a
             // listing that folded it into the baseline would hide exactly what it is for.
@@ -1244,7 +1309,7 @@ fn render_app_detail(
                     )
                 );
             }
-            write_net_transport(&mut o, *pool, *dns_cache_ttl, pal);
+            write_net_transport(&mut o, *pool, *dns_cache_ttl, details, pal);
             if details {
                 for rule in allow {
                     let _ = writeln!(o, "    allow {n}{rule}{r}");
@@ -1418,6 +1483,24 @@ fn render_app_detail(
             o,
             "  {h}devices:{r} {} {dim}(host device nodes exposed){r}{devices_tag}",
             view.devices.join(", ")
+        );
+    }
+
+    // The effective mask set — the app's own ∪ the baseline's. Shown only when something is
+    // closed: "none" would say nothing a reader does not already assume.
+    let fs_tag = app_provenance_tag(view.fs_origin, pal);
+    if !view.fs_deny.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}fs deny:{r} {} {dim}(closed to the cage){r}{fs_tag}",
+            view.fs_deny.join(", ")
+        );
+    }
+    if !view.fs_readonly.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}fs readonly:{r} {} {dim}(readable, not writable){r}{fs_tag}",
+            view.fs_readonly.join(", ")
         );
     }
 
@@ -1762,6 +1845,96 @@ fn config_set(args: &[OsString]) -> ExitCode {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write(verb, &key, &path, &pal));
             report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            diag::error(&format!("sbx: config: {e}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Which end of a list `config add`/`config rm` works on. The two verbs differ only in the call and
+/// the words they print, so they share one implementation — the scope parsing, the trust capture,
+/// and the no-op reporting are the parts that must not drift between them.
+#[derive(Clone, Copy)]
+enum ListEdit {
+    Add,
+    Remove,
+}
+
+/// `sbx config add <key> <entry>` / `sbx config rm <key> <entry>`: edit ONE entry of a list field,
+/// leaving the rest of the list (and the file's comments) alone. This is the ergonomic half of
+/// `set`, which replaces a whole list: adding a mask or a host is the common act, and doing it by
+/// rewriting the entire array invites dropping an entry by mistake.
+///
+/// An entry already present (or already absent, for `rm`) leaves the file untouched and says so.
+/// That is a security property, not a nicety: an unchanged file keeps its trust marker, so repeating
+/// a command cannot disarm a trusted config's security fields behind the user's back.
+fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
+    let verb = match op {
+        ListEdit::Add => "add",
+        ListEdit::Remove => "rm",
+    };
+    let ScopeArgs {
+        positionals,
+        scope,
+        trust,
+        app,
+        ..
+    } = match split_scope(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            diag::error(&format!("sbx: config {verb}: {e}"));
+            return config_usage(verb);
+        }
+    };
+    if positionals.len() != 2 {
+        return config_usage(verb);
+    }
+    let entry = &positionals[1];
+    let cwd = match config_cwd() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let (path, key, gated) =
+        match resolve_key_target(verb, &scope, app.as_deref(), &positionals[0], &cwd) {
+            Ok(t) => t,
+            Err(code) => return code,
+        };
+    // Read the trust verdict before the write, exactly as `set` does: the write changes the file and
+    // so its verdict, and a no-op must not report a re-arming that did not happen.
+    let store_dir = trust::default_store_dir();
+    let was_trusted = gated
+        && store_dir
+            .as_deref()
+            .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+
+    let outcome = match op {
+        ListEdit::Add => config::manage::add(&path, &key, entry),
+        ListEdit::Remove => config::manage::remove(&path, &key, entry),
+    };
+    match outcome {
+        Ok(true) => {
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            let (done, preposition) = match op {
+                ListEdit::Add => ("added", "to"),
+                ListEdit::Remove => ("removed", "from"),
+            };
+            println!(
+                "{}",
+                render_list_edit(done, preposition, entry, &key, &path, &pal)
+            );
+            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated);
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            let why = match op {
+                ListEdit::Add => "is already in",
+                ListEdit::Remove => "is not in",
+            };
+            println!("{}", render_list_unchanged(entry, why, &key, &path, &pal));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -2210,6 +2383,10 @@ mod tests {
     fn sample_config_view() -> config::view::ConfigView {
         use config::view::*;
         ConfigView {
+            fs_deny: Vec::new(),
+            tasks: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -2403,6 +2580,52 @@ mod tests {
     }
 
     #[test]
+    fn declared_operations_render_with_their_origin_and_no_command() {
+        // The static view of `[task]`, and the reason it exists: `sbx task ls` reads a *running*
+        // session, so a declared operation had no surface at all until a cage was launched. What it
+        // must NOT print is the command — an operation is a fixed program plus a credential the
+        // caller never holds, and putting that argv in the layered config view invites reading it as
+        // something the user may edit here.
+        use config::view::TaskView;
+        let plain = style::Palette::plain();
+        let mut view = sample_config_view();
+        view.tasks = vec![
+            TaskView {
+                name: "build".into(),
+                description: Some("Build the project".into()),
+                origin: "project".into(),
+            },
+            TaskView {
+                name: "deploy".into(),
+                description: None,
+                origin: "app:demo".into(),
+            },
+        ];
+        let out = render_config(&view, &plain, false);
+        assert!(
+            out.contains("tasks (declared operations a cage may run):"),
+            "the section is titled:\n{out}"
+        );
+        assert!(
+            out.contains("build") && out.contains("Build the project") && out.contains("(project)"),
+            "name, description and origin:\n{out}"
+        );
+        // An operation with no description still lists, with its origin — absent is not empty.
+        assert!(
+            out.contains("deploy") && out.contains("(app:demo)"),
+            "a description-less operation still shows:\n{out}"
+        );
+
+        // No operations, no section: an empty heading would read like something was dropped.
+        let mut none = sample_config_view();
+        none.tasks = Vec::new();
+        assert!(
+            !render_config(&none, &plain, false).contains("tasks ("),
+            "no section when nothing is declared"
+        );
+    }
+
+    #[test]
     fn config_render_tags_the_network_and_gui_posture_with_their_origin() {
         use config::view::{GuiView, ProvenanceView};
         let plain = style::Palette::plain();
@@ -2483,11 +2706,56 @@ mod tests {
         );
     }
 
+    /// The baseline view's silence means "both are at their default", which only helps a reader who
+    /// already knows what the defaults are. `--details` reports the effective posture instead, so
+    /// the resolver cache a launch actually gets is a number on the screen rather than product
+    /// knowledge the reader is assumed to have.
+    #[test]
+    fn config_render_details_names_the_transport_defaults_it_otherwise_leaves_silent() {
+        use config::view::NetworkView;
+        let plain = style::Palette::plain();
+
+        let out = render_config(&sample_config_view(), &plain, true);
+        assert!(
+            out.contains("connection reuse: on"),
+            "the reuse default must be named under --details:\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "dns cache: {}s (built-in default;",
+                crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs()
+            )),
+            "the built-in resolver cache must be named, and marked as the built-in:\n{out}"
+        );
+
+        // A layer-set value keeps its own wording: it is not a default and must not read as one,
+        // even where the number happens to match.
+        let mut view = sample_config_view();
+        if let NetworkView::Allowlist { dns_cache_ttl, .. } = &mut view.network {
+            *dns_cache_ttl = Some(crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs());
+        }
+        let out = render_config(&view, &plain, true);
+        assert!(
+            !out.contains("built-in default"),
+            "a value a layer set must not be reported as the built-in:\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "dns cache: {}s (a resolved address",
+                crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs()
+            )),
+            "a layer-set value must still name its duration:\n{out}"
+        );
+    }
+
     #[test]
     fn render_app_detail_shows_effective_values_tagged_inherited_or_app_set() {
         use config::view::*;
         let p = style::Palette::plain();
         let view = AppDetailView {
+            fs_deny: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -2672,6 +2940,8 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let app = |name: &str, limits: Option<AppLimitsView>| AppView {
+            fs_deny: Vec::new(),
+            fs_readonly: Vec::new(),
             ssh_agent: Vec::new(),
             name: name.into(),
             cmd: Some(name.into()),
@@ -2729,6 +2999,10 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            fs_deny: Vec::new(),
+            tasks: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -2791,6 +3065,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                fs_deny: Vec::new(),
+                fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -2849,6 +3125,10 @@ mod tests {
         // a profile's app-overlay allowlist surfaces what `sbx app <name>` can actually reach.
         use config::view::*;
         let view = ConfigView {
+            fs_deny: Vec::new(),
+            tasks: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -2892,6 +3172,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                fs_deny: Vec::new(),
+                fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -2965,6 +3247,8 @@ mod tests {
         // with or without `--details` — the default render is enough to pin them.
         use config::view::*;
         let app = |name: &str, network: Option<AppNetworkView>, gui: Option<GuiView>| AppView {
+            fs_deny: Vec::new(),
+            fs_readonly: Vec::new(),
             ssh_agent: Vec::new(),
             name: name.into(),
             cmd: Some(name.into()),
@@ -2985,6 +3269,10 @@ mod tests {
             notes: vec![],
         };
         let view = ConfigView {
+            fs_deny: Vec::new(),
+            tasks: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -3060,6 +3348,10 @@ mod tests {
         // profile's credential surfaces in `sbx config` (the baseline `secrets` section is empty).
         use config::view::*;
         let view = ConfigView {
+            fs_deny: Vec::new(),
+            tasks: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -3103,6 +3395,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                fs_deny: Vec::new(),
+                fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -3172,6 +3466,10 @@ mod tests {
         // profile's overlay env/binds surface, mirroring the baseline `env`/`binds` sections.
         use config::view::*;
         let view = ConfigView {
+            fs_deny: Vec::new(),
+            tasks: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -3215,6 +3513,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                fs_deny: Vec::new(),
+                fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -3284,6 +3584,10 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            fs_deny: Vec::new(),
+            tasks: Vec::new(),
+            fs_origin: Default::default(),
+            fs_readonly: Vec::new(),
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -3327,6 +3631,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                fs_deny: Vec::new(),
+                fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),

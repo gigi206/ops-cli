@@ -26,7 +26,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [What sbx is (and is not)](concepts/overview): the reference class, the two actor modes.
 - [Security model](concepts/security-model): same-uid, confidentiality by absence, the bind layout.
 - [The trust gate](concepts/trust): the direnv content-hash model, free vs security fields.
-- [Enforcement stack](concepts/enforcement): bubblewrap, seccomp, cgroups (and why Landlock is not a layer).
+- [Enforcement stack](concepts/enforcement): bubblewrap, seccomp, cgroups, and the egress firewall.
 - [Observability](concepts/observability): the process and filesystem lenses on a running cage.
 - [Provisioning model](concepts/provisioning): the rolling nix channel, the per-project store, self-equip.
 - [Directory layout](concepts/directory-layout): where the config, data, and trust state live.
@@ -156,6 +156,5 @@ rationale and threat analysis behind each subsystem, each section links out to t
 ## Design documents
 
 The guide is the *what* and *how*. The `docs/*.md` design documents in the
-repository are the *why*: the feasibility spikes, the threat model, and the
-architecture decisions. They are referenced from the relevant guide pages; on
+repository are the *why*: the threat model and the architecture decisions behind it. They are referenced from the relevant guide pages; on
 GitHub, browse them in the repository's `docs/` directory.

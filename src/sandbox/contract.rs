@@ -210,7 +210,7 @@ This process runs in an isolated network namespace with no egress at all: no hos
 reachable, DNS does not resolve, and `ping` fails (there is no route). This is by\n\
 design — the sandbox was launched with the network cut off.\n";
 
-/// The contract for `network = "shared"` (the default): the host network is shared, so
+/// The contract for `network = "shared"`: the host network is shared, so
 /// outbound TCP/UDP works normally. ICMP is *not* asserted — capabilities are dropped
 /// unconditionally, so a raw `ping` may still fail; the note steers to a TCP test rather
 /// than claiming ICMP works.
@@ -246,6 +246,7 @@ mod tests {
     fn demo_task() -> TaskSpec {
         use crate::config::{Encoding, HeaderSecret, SecretSource, TaskParam, TaskSecret};
         TaskSpec {
+            unmask: Vec::new(),
             name: "db-query".into(),
             description: Some("Read-only SQL against staging".into()),
             cmd: vec!["psql".into(), "-c".into(), "{sql}".into()],

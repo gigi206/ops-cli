@@ -202,6 +202,10 @@ mute  = ["play.googleapis.com", "*.datadoghq.com", "antigravity-unleash.goog"]
 project cannot blind you to what its agent tried to reach). `sbx net rules` and
 `sbx config show` both list the mute rules, so the suppression is never silent.
 
+That includes the [rejected bare `*`](rules#no-catch-all): a mute list has no
+catch-all spelling either. To silence everything on purpose, write `re:.*` and read it
+back in `sbx net rules` (`--all` still brings every muted line back).
+
 You can edit the list from the CLI instead of the TOML, with the same scopes as
 `allow`/`deny` (a project write re-trusts; `-a <app>`/`-g` target a profile or the global
 config):

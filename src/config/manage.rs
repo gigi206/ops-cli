@@ -42,6 +42,24 @@ pub(crate) enum ManageError {
     BadKey(String),
     /// The key resolves onto or through a non-scalar (an array or a table) — use `$EDITOR`.
     NotScalar(String),
+    /// `set` was handed a single value for a key that already holds a list. Replacing a list with a
+    /// scalar is almost always a slip (the whole list would be lost), so it is refused and the three
+    /// ways to say what was meant are named.
+    ListNeedsArray(String),
+    /// `add`/`rm` was aimed at a key that holds a single value, not a list.
+    NotAList(String),
+    /// A key on the way to the list holds a single value rather than a table, so the list cannot be
+    /// reached. `network = "deny"` under `network.allow` is the case worth a distinct message: the
+    /// posture has a table form, and the egress verb promotes it.
+    ParentNotTable(String, String),
+    /// `add` was aimed at a `[network]` or `[proc]` rule list. Those have their own verbs, and those
+    /// carry a posture matrix this generic path does not: an `allow` on a config with no posture
+    /// bootstraps the restrictive one, a rule that would be inert under the current mode is refused
+    /// rather than written, and a deliberate non-filtering choice is never flipped in silence.
+    /// Writing the entry here would produce a rule that looks set and decides nothing, so the verb
+    /// that knows better is named instead. Removal is not redirected: taking a rule out cannot
+    /// create an inert one, and neither `sbx net` nor `sbx proc` has a verb that removes one.
+    UseRuleVerb(String, String),
     /// The value would make the whole layer unparseable (a type the schema rejects), so the write
     /// was refused rather than committed — a committed invalid layer is silently dropped at load.
     InvalidValue(String, String),
@@ -142,10 +160,32 @@ impl std::fmt::Display for ManageError {
                 f,
                 "{k} is not a single value (it is an array or table) — edit it with `sbx config edit`"
             ),
+            ManageError::ListNeedsArray(k) => write!(
+                f,
+                "{k} is a list — pass a TOML array (e.g. `'[\"a\", \"b\"]'`), add one entry with \
+                 `sbx config add {k} <entry>`, or edit it with `sbx config edit`"
+            ),
+            ManageError::NotAList(k) => write!(
+                f,
+                "{k} is a single value, not a list — set it with `sbx config set {k} <value>`"
+            ),
+            ManageError::ParentNotTable(parent, k) => write!(
+                f,
+                "{parent} holds a single value, so {k} cannot be reached — give {parent} its table \
+                 form first (`sbx config edit`), or use the verb that promotes it (`sbx net allow` \
+                 for an egress rule)"
+            ),
+            ManageError::UseRuleVerb(k, verb) => write!(
+                f,
+                "{k} is a rule list — add to it with `sbx {verb} <rule>`, which also sets the \
+                 posture the rule needs (a rule written without one decides nothing). \
+                 `sbx config rm {k} <rule>` still removes one."
+            ),
             ManageError::InvalidValue(k, detail) => write!(
                 f,
                 "the value for {k} is not valid there ({detail}) — nothing was written; \
-                 check the expected type with `sbx config edit`"
+                 check the expected type with `sbx config edit`, or add one entry to a list with \
+                 `sbx config add`"
             ),
             ManageError::DenyNeedsPosture => write!(
                 f,
@@ -262,7 +302,7 @@ pub(crate) fn get(path: &Path, key: &str) -> Result<Option<String>, ManageError>
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
     let mut table: &dyn TableLike = doc.as_table();
-    for seg in parents {
+    for seg in parents.iter().map(String::as_str) {
         // Descend through both regular and inline tables, so a key inside `network = { ... }` is
         // read, not misreported as absent.
         match table.get(seg).and_then(Item::as_table_like) {
@@ -270,7 +310,7 @@ pub(crate) fn get(path: &Path, key: &str) -> Result<Option<String>, ManageError>
             None => return Ok(None),
         }
     }
-    match table.get(leaf[0]) {
+    match table.get(leaf[0].as_str()) {
         None => Ok(None),
         Some(Item::Value(v)) if v.is_str() => Ok(v.as_str().map(str::to_string)),
         Some(Item::Value(v)) if !v.is_array() && !v.is_inline_table() => {
@@ -296,10 +336,24 @@ pub(crate) fn get(path: &Path, key: &str) -> Result<Option<String>, ManageError>
 /// egress), so this fails closed and loud rather than reporting success over a broken file.
 pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<bool, ManageError> {
     let mut doc = read_or_empty(path)?;
-    let created = put_scalar(&mut doc, key, scalar_value(val))?;
+    // A value written as a TOML array is taken as one, so a list field is settable in a single
+    // command. It is tried first and never falls back to a string: someone who typed brackets meant
+    // a list, and silently storing `[".env"]` as the *text* `[".env"]` would be a config that looks
+    // right and behaves wrong.
+    if let Some(array) = parsed_array(val) {
+        put_value(&mut doc, key, array)?;
+        return match validate_layer(&doc) {
+            Ok(()) => {
+                write_doc(path, &doc)?;
+                Ok(true)
+            }
+            Err(detail) => Err(ManageError::InvalidValue(key.to_string(), detail)),
+        };
+    }
+    let created = put_value(&mut doc, key, scalar_value(val))?;
     if validate_layer(&doc).is_err() {
         // The natural type broke the layer — write the value as a string instead.
-        put_scalar(&mut doc, key, Value::from(val))?;
+        put_value(&mut doc, key, Value::from(val))?;
         if let Err(detail) = validate_layer(&doc) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
@@ -308,39 +362,214 @@ pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<bool, ManageError
     Ok(created)
 }
 
-/// Insert or replace a scalar leaf at a dotted `key`, creating intermediate tables as needed.
-/// Returns whether the leaf was created (vs replaced in place, keeping its surrounding comments).
-fn put_scalar(doc: &mut DocumentMut, key: &str, v: Value) -> Result<bool, ManageError> {
+/// `sbx config add <key> <entry>`: append one entry to the list at `key`, creating the list if it is
+/// absent. Returns whether the file changed — an entry already present is a no-op, which matters
+/// beyond tidiness: an unchanged file keeps its trust marker valid, so re-running the command cannot
+/// silently disarm a trusted config's security fields.
+///
+/// The entry is always written as a **string**. Every list the schema carries is a list of strings
+/// (paths, hosts, syscall tokens, key names) except `forward` (ports) and `binds` (which also takes
+/// tables) — the layer validation catches the mismatch and refuses, rather than this guessing.
+pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<bool, ManageError> {
+    if let Some(verb) = rule_list_verb(key) {
+        return Err(ManageError::UseRuleVerb(key.to_string(), verb));
+    }
+    let mut doc = read_or_empty(path)?;
+    let list = list_at(&mut doc, key)?;
+    if list
+        .iter()
+        .any(|v| v.as_str().is_some_and(|s| s == entry) || render_value(v) == entry)
+    {
+        return Ok(false);
+    }
+    // The entry takes its natural type, the same guess `set` makes for a single value: `forward` is
+    // a list of *ports*, so a string entry there would fail validation and leave the field with no
+    // way in at all. The guess is validated below and retried as a string, so an over-eager one
+    // (a host that looks like a number) is never committed.
+    list.push_formatted(scalar_value(entry).into());
+    // Keep the rendering readable: `toml_edit` leaves an appended entry flush against the previous
+    // one, so a list built by repeated `add` would read `["a","b"]`.
+    space_entries(list);
+    if validate_layer(&doc).is_err() {
+        let list = list_at(&mut doc, key)?;
+        let last = list.len() - 1;
+        list.remove(last);
+        list.push_formatted(Value::from(entry).into());
+        space_entries(list);
+        if let Err(detail) = validate_layer(&doc) {
+            return Err(ManageError::InvalidValue(key.to_string(), detail));
+        }
+    }
+    write_doc(path, &doc)?;
+    Ok(true)
+}
+
+/// `sbx config rm <key> <entry>`: remove one entry from the list at `key`. Returns whether the file
+/// changed; an entry that is not there is a no-op, like [`unset`] on an absent key. The now-empty
+/// list is left in place rather than deleted: `deny = []` states "nothing is closed here" and is a
+/// different claim from the key being absent, which a parent layer may still fill.
+pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<bool, ManageError> {
+    let mut doc = read_or_empty(path)?;
+    let list = list_at(&mut doc, key)?;
+    let Some(idx) = list
+        .iter()
+        .position(|v| v.as_str().is_some_and(|s| s == entry) || render_value(v) == entry)
+    else {
+        return Ok(false);
+    };
+    list.remove(idx);
+    space_entries(list);
+    match validate_layer(&doc) {
+        Ok(()) => {
+            write_doc(path, &doc)?;
+            Ok(true)
+        }
+        Err(detail) => Err(ManageError::InvalidValue(key.to_string(), detail)),
+    }
+}
+
+/// The array at a dotted `key`, for `add`/`rm`. A missing key (and any missing parent table) is
+/// materialized as an empty array, so `add` creates the list and `rm` simply finds nothing in it.
+/// The document is only written when the operation actually changed something, so materializing here
+/// never reaches the file on its own. A key holding anything else is refused by name, never coerced.
+fn list_at<'d>(doc: &'d mut DocumentMut, key: &str) -> Result<&'d mut Array, ManageError> {
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
     let mut table: &mut dyn TableLike = doc.as_table_mut();
-    for seg in parents {
+    for seg in parents.iter().map(String::as_str) {
+        if !table.contains_key(seg) {
+            // Implicit: a parent created only to reach the list must not render as an empty header
+            // of its own. Without this, `add net.groups.infra …` writes a bare `[net]` above
+            // `[net.groups]`, which reads like a table someone meant to fill.
+            let mut created = Table::new();
+            created.set_implicit(true);
+            table.insert(seg, Item::Table(created));
+        }
+        table = table
+            .get_mut(seg)
+            .and_then(Item::as_table_like_mut)
+            // The parent is a value, not a table — `network = "deny"` on the way to `network.allow`
+            // is the case that matters, and saying "the list is a single value" about the *leaf*
+            // would point at the wrong key entirely.
+            .ok_or_else(|| ManageError::ParentNotTable(seg.to_string(), key.to_string()))?;
+    }
+    if !table.contains_key(leaf[0].as_str()) {
+        table.insert(leaf[0].as_str(), Item::Value(Value::Array(Array::new())));
+    }
+    match table.get_mut(leaf[0].as_str()) {
+        Some(Item::Value(Value::Array(a))) => Ok(a),
+        // A key holding a single value: `add` is not the verb for it, and saying so beats turning a
+        // scalar into a one-element list behind the user's back.
+        _ => Err(ManageError::NotAList(key.to_string())),
+    }
+}
+
+/// The `sbx` verb owning a rule list, if `key` names one — matched on the tail so an app's own list
+/// (`app.demo.network.allow`) is caught alongside the baseline's.
+///
+/// Both `[network]` and `[proc]` gate their rules behind a posture, and the two dedicated verbs
+/// carry that matrix: an `allow` on a config with no posture bootstraps the restrictive one, a rule
+/// that would be inert under the current mode is refused rather than written, and a deliberate
+/// non-filtering choice is never flipped in silence. `[net.groups]` is deliberately absent: a group
+/// is a named set of entries with no posture of its own, so adding to one cannot produce an inert
+/// rule.
+fn rule_list_verb(key: &str) -> Option<String> {
+    for (table, verbs) in [
+        ("network.", &["allow", "deny", "mute"][..]),
+        ("proc.", &["allow", "deny"][..]),
+    ] {
+        if let Some(tail) = key.rsplit_once(table).map(|(_, tail)| tail) {
+            if let Some(verb) = verbs.iter().find(|v| **v == tail) {
+                let namespace = table.trim_end_matches('.');
+                let namespace = if namespace == "network" {
+                    "net"
+                } else {
+                    namespace
+                };
+                return Some(format!("{namespace} {verb}"));
+            }
+        }
+    }
+    None
+}
+
+/// Render a TOML value the way it is written, so `add`/`rm` can match a non-string entry (a port in
+/// `forward`, an inline table in `binds`) by the text the user would type.
+fn render_value(v: &Value) -> String {
+    v.to_string().trim().to_string()
+}
+
+/// Put one space before every entry but the first, so a list stays readable however it was built.
+fn space_entries(list: &mut Array) {
+    for (i, entry) in list.iter_mut().enumerate() {
+        entry.decor_mut().set_prefix(if i == 0 { "" } else { " " });
+    }
+}
+
+/// Parse a command-line value that is written as a TOML array (`'["a", "b"]'`), for `set` on a list
+/// field. Returns `None` for anything that is not bracketed, so an ordinary value is untouched.
+fn parsed_array(val: &str) -> Option<Value> {
+    let trimmed = val.trim();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let doc: DocumentMut = format!("x = {trimmed}").parse().ok()?;
+    doc.get("x")?.as_value().filter(|v| v.is_array()).map(|v| {
+        let mut v = v.clone();
+        v.decor_mut().clear();
+        v
+    })
+}
+
+/// Insert or replace a leaf at a dotted `key`, creating intermediate tables as needed. Returns
+/// whether the leaf was created (vs replaced in place, keeping its surrounding comments). A leaf
+/// holding a list may only be replaced by another list: overwriting one with a single value would
+/// drop every entry, which is a slip far more often than an intent.
+fn put_value(doc: &mut DocumentMut, key: &str, v: Value) -> Result<bool, ManageError> {
+    let segments = split_key(key)?;
+    let (parents, leaf) = segments.split_at(segments.len() - 1);
+
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
+    for seg in parents.iter().map(String::as_str) {
         // Create a missing parent as a regular table; descend through an existing regular OR inline
         // table, so a scalar can be set inside `network = { ... }` instead of failing as non-scalar.
+        // Implicit, so a parent created only to reach the leaf does not render as an empty header of
+        // its own: `set task.build.description …` wrote a bare `[task]` above `[task.build]`, which
+        // reads like a table someone meant to fill.
         if !table.contains_key(seg) {
-            table.insert(seg, Item::Table(Table::new()));
+            let mut created = Table::new();
+            created.set_implicit(true);
+            table.insert(seg, Item::Table(created));
         }
         table = table
             .get_mut(seg)
             .and_then(Item::as_table_like_mut)
             .ok_or_else(|| ManageError::NotScalar(key.to_string()))?;
     }
-    match table.get_mut(leaf[0]) {
+    match table.get_mut(leaf[0].as_str()) {
         // A new key: insert it with default formatting.
         None => {
-            table.insert(leaf[0], Item::Value(v));
+            table.insert(leaf[0].as_str(), Item::Value(v));
             Ok(true)
         }
-        // An existing scalar: replace only its content, keeping the surrounding decor (the
-        // comments and whitespace around it) — a plain `insert` would drop them.
-        Some(Item::Value(existing)) if !existing.is_array() && !existing.is_inline_table() => {
+        // An existing leaf we can replace: a scalar always, and a list only by another list.
+        // Replacing only the content keeps the surrounding decor (the comments and whitespace
+        // around it) — a plain `insert` would drop them.
+        Some(Item::Value(existing))
+            if (!existing.is_array() && !existing.is_inline_table())
+                || (existing.is_array() && v.is_array()) =>
+        {
             let mut replacement = v;
             *replacement.decor_mut() = existing.decor().clone();
             *existing = replacement;
             Ok(false)
         }
-        // An array or table leaf: refuse rather than silently drop what the user meant to edit.
+        // A list handed a single value: name the three ways to say what was meant.
+        Some(Item::Value(existing)) if existing.is_array() => {
+            Err(ManageError::ListNeedsArray(key.to_string()))
+        }
+        // A table leaf: refuse rather than silently drop what the user meant to edit.
         Some(_) => Err(ManageError::NotScalar(key.to_string())),
     }
 }
@@ -377,7 +606,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
     let mut table: &mut dyn TableLike = doc.as_table_mut();
-    for seg in parents {
+    for seg in parents.iter().map(String::as_str) {
         // Descend through both regular and inline tables, so a key inside `network = { ... }` is
         // removed, not reported as already-absent.
         match table.get_mut(seg).and_then(Item::as_table_like_mut) {
@@ -385,7 +614,7 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
             None => return Ok(false),
         }
     }
-    let existed = table.remove(leaf[0]).is_some();
+    let existed = table.remove(leaf[0].as_str()).is_some();
     if existed {
         write_doc(path, &doc)?;
     }
@@ -795,12 +1024,30 @@ fn push_outcome(arr: &mut Array, rule: &str) -> AddOutcome {
 }
 
 /// Split a dotted key into its segments, rejecting an empty key or an empty segment (`a..b`).
-fn split_key(key: &str) -> Result<Vec<&str>, ManageError> {
+fn split_key(key: &str) -> Result<Vec<String>, ManageError> {
     if key.is_empty() {
         return Err(ManageError::BadKey(key.to_string()));
     }
-    let segments: Vec<&str> = key.split('.').collect();
-    if segments.iter().any(|s| s.is_empty()) {
+    // A quoted segment keeps its dots, which is the only way to address a key that contains one —
+    // and every secret does, since it is keyed by host: `secret."api.example.com".from`. Splitting
+    // on every dot used to walk straight through the quotes and build `secret.'"api'.example…`,
+    // a nonsense table the schema happened to accept, so the write was reported as a success.
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for c in key.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '.' if !quoted => segments.push(std::mem::take(&mut current)),
+            c => current.push(c),
+        }
+    }
+    if quoted {
+        // An unbalanced quote would otherwise swallow the rest of the key into one segment.
+        return Err(ManageError::BadKey(key.to_string()));
+    }
+    segments.push(current);
+    if segments.iter().any(String::is_empty) {
         return Err(ManageError::BadKey(key.to_string()));
     }
     Ok(segments)
@@ -1104,9 +1351,11 @@ mod tests {
     fn set_refuses_to_clobber_a_table_or_array() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "binds = [\"/a\"]\n[env]\nFOO = \"x\"\n");
+        // A list handed a single value has its own message, since there are three ways to say what
+        // was meant; a table has only `$EDITOR`.
         assert!(matches!(
             set(&p, "binds", "y"),
-            Err(ManageError::NotScalar(_))
+            Err(ManageError::ListNeedsArray(_))
         ));
         assert!(matches!(
             set(&p, "env", "y"),
@@ -1148,6 +1397,259 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             before,
             "a refused set must leave the file byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn set_replaces_a_whole_list_when_handed_a_toml_array() {
+        // The list half of `set`: brackets mean a list, and it is never quietly stored as the *text*
+        // of one — a config that looks right and behaves wrong is the worst outcome here.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[fs]\ndeny = [\"old.key\"]\n");
+        assert!(set(&p, "fs.deny", r#"[".env", "secrets/"]"#).is_ok());
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains(r#"deny = [".env", "secrets/"]"#),
+            "written as a real array:\n{after}"
+        );
+        assert!(
+            super::super::schema::parse(after.as_bytes()).is_ok(),
+            "the edited layer still parses:\n{after}"
+        );
+    }
+
+    #[test]
+    fn set_refuses_a_single_value_for_a_list_rather_than_dropping_it() {
+        // Handing `set` one value for a list would throw every other entry away. It is refused, and
+        // the error names the three ways to say what was meant.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[fs]\ndeny = [\"a.key\", \"b.key\"]\n");
+        let before = std::fs::read_to_string(&p).unwrap();
+        let err = set(&p, "fs.deny", ".env").unwrap_err();
+        assert!(matches!(err, ManageError::ListNeedsArray(_)), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config add") && msg.contains("config edit") && msg.contains("TOML array"),
+            "the error must name all three ways out: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "nothing written"
+        );
+    }
+
+    #[test]
+    fn add_creates_the_list_appends_to_it_and_is_idempotent() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        assert!(add(&p, "fs.deny", ".env").unwrap(), "created the list");
+        assert!(add(&p, "fs.deny", "secrets/").unwrap(), "appended");
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains(r#"deny = [".env", "secrets/"]"#),
+            "entries are spaced, not run together:\n{after}"
+        );
+        // The idempotence is a trust property, not tidiness: an unchanged file keeps its marker, so
+        // re-running a command cannot disarm a trusted config's security fields.
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert!(!add(&p, "fs.deny", ".env").unwrap(), "already present");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a no-op add must leave the file byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn rm_takes_one_entry_out_and_leaves_the_empty_list_in_place() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[fs]\ndeny = [\"a.key\", \"b.key\"]\n");
+        assert!(remove(&p, "fs.deny", "a.key").unwrap());
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains(r#"deny = ["b.key"]"#),
+            "the other entry survives"
+        );
+        assert!(remove(&p, "fs.deny", "b.key").unwrap());
+        // `deny = []` says "nothing is closed here", which is a different claim from the key being
+        // absent — an absent key lets a parent layer's masks stand alone.
+        assert!(
+            std::fs::read_to_string(&p).unwrap().contains("deny = []"),
+            "the emptied list stays, rather than the key vanishing"
+        );
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !remove(&p, "fs.deny", "never.there").unwrap(),
+            "absent entry"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "no-op");
+    }
+
+    #[test]
+    fn add_and_rm_refuse_a_key_that_is_not_a_list() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "gpu = true\n[env]\nFOO = \"x\"\n");
+        assert!(matches!(
+            add(&p, "gpu", "true"),
+            Err(ManageError::NotAList(_))
+        ));
+        // A table is not a list either: `[env]` is edited by key, with `set env.FOO`.
+        assert!(matches!(
+            add(&p, "env", "FOO"),
+            Err(ManageError::NotAList(_))
+        ));
+    }
+
+    #[test]
+    fn a_parent_holding_a_single_value_is_named_as_the_obstacle() {
+        // `network = "deny"` on the way to `network.allow`: the leaf is not the problem, the posture
+        // being in its bare form is. Naming the leaf would send the user to fix the wrong key.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "network = \"deny\"\n");
+        let err = remove(&p, "network.allow", "example.com").unwrap_err();
+        assert!(matches!(err, ManageError::ParentNotTable(_, _)), "{err}");
+        assert!(
+            err.to_string().contains("network holds a single value"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn add_sends_a_rule_to_its_own_verb_while_rm_stays_open() {
+        // `sbx net allow` carries a posture matrix this generic path has no idea about (bootstrap a
+        // deny-by-default posture, refuse a deny that would be inert, never flip a deliberate
+        // `shared`). So adding is redirected there. Removal is not: taking a rule out cannot create
+        // an inert one, and `sbx net` has no verb that removes an allow/deny rule at all.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(
+            tmp.path(),
+            "[network]\nmode = \"deny\"\nallow = [\"a.example.com\", \"b.example.com\"]\n",
+        );
+        let err = add(&p, "network.allow", "c.example.com").unwrap_err();
+        assert!(matches!(err, ManageError::UseRuleVerb(_, _)), "{err}");
+        assert!(err.to_string().contains("sbx net allow"), "{err}");
+        // An app's own list is caught by the same rule.
+        assert!(matches!(
+            add(&p, "app.demo.network.deny", "x.example.com"),
+            Err(ManageError::UseRuleVerb(_, _))
+        ));
+        // `[proc]` gates its rules behind a mode the same way, so it is redirected too.
+        let proc_err = add(&p, "proc.deny", "/usr/bin/curl").unwrap_err();
+        assert!(
+            matches!(proc_err, ManageError::UseRuleVerb(_, _)),
+            "{proc_err}"
+        );
+        assert!(proc_err.to_string().contains("sbx proc deny"), "{proc_err}");
+        // A group has no posture of its own, so it is not redirected.
+        assert!(add(&p, "net.groups.infra", "a.example.com").is_ok());
+        assert!(remove(&p, "network.allow", "a.example.com").unwrap());
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains(r#"allow = ["b.example.com"]"#),
+            "rm removes the named rule and leaves the rest"
+        );
+    }
+
+    #[test]
+    fn a_list_edit_that_would_invalidate_the_layer_writes_nothing() {
+        // Same fail-closed rule as `set`: a committed invalid layer is dropped WHOLE at load, taking
+        // every security field with it, so the write is validated before it lands.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "forward = [1455]\n");
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert!(matches!(
+            add(&p, "forward", "not-a-port"),
+            Err(ManageError::InvalidValue(_, _))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a refused list edit must leave the file byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn a_quoted_key_segment_keeps_its_dots() {
+        // Every secret is keyed by host, so every secret key contains dots — and splitting on all of
+        // them walked straight through the quotes and built `secret.'"api'.example.'com"'`, a
+        // nonsense table the schema accepted, so the write was *reported as a success*. A silent
+        // wrong write on a credential is the worst shape a bug can take here.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        assert!(set(&p, r#"secret."api.example.com".from"#, "env://K").is_ok());
+        assert!(set(&p, r#"secret."api.example.com".header"#, "X-Key").is_ok());
+        assert!(set(&p, r#"secret."api.example.com".type"#, "raw").is_ok());
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains(r#"[secret."api.example.com"]"#),
+            "the host stays one segment:\n{after}"
+        );
+        assert!(
+            !after.contains(r#"'"api'"#),
+            "no segment may be split mid-quote:\n{after}"
+        );
+        assert!(
+            super::super::schema::parse(after.as_bytes()).is_ok(),
+            "and the layer parses:\n{after}"
+        );
+        // It reads back through the same path, and unsets through it.
+        assert_eq!(
+            get(&p, r#"secret."api.example.com".from"#)
+                .unwrap()
+                .as_deref(),
+            Some("env://K")
+        );
+        assert!(unset(&p, r#"secret."api.example.com".header"#).unwrap());
+        // An unbalanced quote is refused rather than swallowing the rest of the key.
+        assert!(matches!(
+            set(&p, r#"secret."api.example.com.from"#, "x"),
+            Err(ManageError::BadKey(_))
+        ));
+    }
+
+    #[test]
+    fn add_writes_an_entry_in_its_natural_type() {
+        // `forward` is a list of ports. A string entry there fails validation, which would leave the
+        // field with no CLI way in at all — so an entry takes the same natural type `set` gives a
+        // single value, and falls back to a string when that does not validate.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        assert!(add(&p, "forward", "1455").unwrap());
+        assert!(add(&p, "forward", "8080").unwrap());
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains("forward = [1455, 8080]"),
+            "ports are integers, not strings:\n{after}"
+        );
+        // A list of strings is unaffected: the guess is validated, not trusted.
+        assert!(add(&p, "seccomp.allow", "ptrace").unwrap());
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains(r#"allow = ["ptrace"]"#),
+            "a string entry stays a string"
+        );
+    }
+
+    #[test]
+    fn a_parent_created_only_to_reach_a_leaf_renders_no_empty_header() {
+        // `[task]` above `[task.build]`, or `[net]` above `[net.groups]`, reads like a table someone
+        // started and left blank. The parent exists to be walked through, so it is implicit.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        assert!(set(&p, "task.build.description", "Build").is_ok());
+        assert!(add(&p, "net.groups.infra", "api.example.com").unwrap());
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !after.contains("[task]\n") && !after.contains("[net]\n"),
+            "no empty parent header:\n{after}"
+        );
+        assert!(
+            after.contains("[task.build]") && after.contains("[net.groups]"),
+            "{after}"
         );
     }
 

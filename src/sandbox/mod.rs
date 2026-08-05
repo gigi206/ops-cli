@@ -64,6 +64,7 @@ pub(crate) mod seccomp;
 // Filesystem observability.
 pub(crate) mod fs_control;
 mod fs_watch;
+mod fsmask;
 
 // Desktop / GUI holes: Wayland, GPU, audio, the D-Bus portal, theme/notifications.
 mod audio;
@@ -112,7 +113,9 @@ pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgr
 #[cfg(test)]
 pub(crate) use projectstore::PROJECT_MARKER;
 pub(crate) use projectstore::{reflink_verdict, supports_reflink};
-pub(crate) use proxy::{builtin_allow_rules, union_with_builtin};
+pub(crate) use proxy::{
+    builtin_allow_rules, ip_refusal, names_exact_host, union_with_builtin, AddrRefusal,
+};
 pub(crate) use search::run as search;
 pub(crate) use smoke::run as smoke;
 pub(crate) use tarball::{

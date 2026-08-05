@@ -159,9 +159,9 @@ $ sbx storage init --size 500G     # or 1T, or a plain byte count
 You rarely need to change it afterwards, and that is fortunate, because **growing a volume in
 place requires root**. Everything else sbx does is unprivileged, but a resize is the exception:
 its two steps, telling the kernel the backing file has grown, and telling btrfs to use the new
-room, are both privileged, and `udisks` grants neither unattended. A spike confirmed this on a
-real volume: `losetup --set-capacity` and `btrfs filesystem resize` each returned *Operation not
-permitted* for an ordinary user.
+room, are both privileged, and `udisks` grants neither unattended: on a real volume,
+`losetup --set-capacity` and `btrfs filesystem resize` each return *Operation not permitted* for an
+ordinary user.
 
 So the size is really settled **once, at `init`**: pick it high the first time. If you
 genuinely must grow an existing volume and you have root (and the host carries `util-linux` and

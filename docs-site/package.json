@@ -9,7 +9,8 @@
     "postbuild": "pagefind --site build",
     "clear": "docusaurus clear",
     "serve": "docusaurus serve",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "test": "node --test 'src/plugins/*.test.mjs'"
   },
   "dependencies": {
     "@docusaurus/core": "3.10.2",

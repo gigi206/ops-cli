@@ -1152,6 +1152,9 @@ const RUNTIME_DIRS: &[(&str, &[&str])] = &[
     ("forward", &["fwd-"]),
     ("portal", &[""]),
     ("proc", &["control-", "notif-"]),
+    // The filesystem lens's control socket, and the directory a launch stages its `[fs]` mask
+    // decoys in (two entries, whatever the size of the policy).
+    ("fs", &["control-", "mask-"]),
     ("tasks", &[""]),
     ("dbus", &["proxy-"]),
 ];
@@ -1355,12 +1358,15 @@ mod tests {
 
     #[test]
     fn sweep_runtime_dirs_removes_only_the_entries_of_dead_launches() {
+        use std::os::unix::fs::PermissionsExt;
         let data = TmpDir::new();
         let root = data.path();
         let egress = root.join("egress");
         let forward = root.join("forward");
         let portal = root.join("portal");
         let sshagent = root.join("ssh-agent");
+        let fs = root.join("fs");
+        std::fs::create_dir_all(&fs).unwrap();
         std::fs::create_dir_all(&egress).unwrap();
         std::fs::create_dir_all(&forward).unwrap();
         std::fs::create_dir_all(&portal).unwrap();
@@ -1385,6 +1391,17 @@ mod tests {
         // …and its decision-log socket beside it, which is left behind the same way.
         std::fs::write(sshagent.join("control-1.sock"), b"x").unwrap();
         std::fs::write(sshagent.join("control-2.sock"), b"x").unwrap();
+        // The filesystem lens's log socket, and the `[fs]` mask decoys — a directory holding a
+        // mode-000 file, which the removal has to cope with rather than trip on.
+        std::fs::write(fs.join("control-1.sock"), b"x").unwrap();
+        std::fs::write(fs.join("control-2.sock"), b"x").unwrap();
+        for pid in [1, 2] {
+            let dir = fs.join(format!("mask-{pid}"));
+            std::fs::create_dir_all(dir.join("dir")).unwrap();
+            std::fs::write(dir.join("file"), b"").unwrap();
+            std::fs::set_permissions(dir.join("file"), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }
 
         let live = |pid: u32| pid == 1;
 
@@ -1392,8 +1409,9 @@ mod tests {
         let listed = sweep_runtime_dirs_with(root, false, &live);
         assert_eq!(
             listed.len(),
-            6,
-            "ca-2, control-2, fwd-2, portal/2, agent-2, ssh-agent/control-2: {listed:?}"
+            8,
+            "ca-2, control-2, fwd-2, portal/2, agent-2, ssh-agent/control-2, fs/control-2, \
+             fs/mask-2: {listed:?}"
         );
         assert!(
             egress.join("ca-2.pem").exists(),
@@ -1403,7 +1421,16 @@ mod tests {
 
         // The sweep removes exactly those four — files and directories alike.
         let removed = sweep_runtime_dirs_with(root, true, &live);
-        assert_eq!(removed.len(), 6);
+        assert_eq!(removed.len(), 8);
+        assert!(
+            !fs.join("mask-2").exists(),
+            "a dead launch's mask decoys go, mode-000 file and all"
+        );
+        assert!(!fs.join("control-2.sock").exists());
+        assert!(
+            fs.join("mask-1").exists() && fs.join("control-1.sock").exists(),
+            "a live launch keeps the decoys its cage is mounted from"
+        );
         assert!(!egress.join("ca-2.pem").exists());
         assert!(!egress.join("control-2.sock").exists());
         assert!(!sshagent.join("agent-2.sock").exists());

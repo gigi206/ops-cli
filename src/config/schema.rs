@@ -73,8 +73,9 @@ pub(crate) struct RawConfig {
     /// untrusted one (the source is a supply-chain-relevant choice).
     pub(crate) nixpkgs: Option<String>,
     /// The sandbox's network posture. Either a simple string — `"none"` (a fresh, empty
-    /// network namespace), `"shared"` (the host network, the default when unset), `"deny"`
-    /// (filtered egress, deny-by-default — only the built-in hosts reach), or `"allow"`
+    /// network namespace), `"shared"` (the host network), `"deny"`
+    /// (filtered egress, deny-by-default — only the built-in hosts reach, and the posture a config
+    /// that names none falls back to), or `"allow"`
     /// (filtered egress, allow-by-default — a denylist, every public host reaches except the
     /// carve-outs), or `"ask"` (filtered egress, park-and-confirm — an undecided host blocks until
     /// you answer) — or a table that adds the `allow`/`deny` carve-out lists to a
@@ -199,6 +200,12 @@ pub(crate) struct RawConfig {
     /// trusted, a choice an untrusted project may not make. Empty or absent leaves the cage with no
     /// agent at all.
     pub(crate) ssh_agent: Option<RawSshAgent>,
+    /// Paths of the project tree the cage may not read (`deny`) or may not write (`readonly`),
+    /// declared as the `[fs]` table. Unlike every other security field this one only ever
+    /// *subtracts* access, so it is honored from any source — an untrusted project closing its own
+    /// files off is not a capability it could abuse. Empty or absent leaves the project tree as the
+    /// launch mounts it.
+    pub(crate) fs: Option<RawFs>,
     /// Network-scoped config that is not itself a posture — currently the reusable egress
     /// groups (`[net.groups]`). A group is a named list of egress entries that any `[network]`
     /// `allow`/`deny` list may reference with `@<name>`, so a set of hosts is declared once and
@@ -409,6 +416,35 @@ pub(crate) struct RawDevices {
     pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
+/// The `[fs]` table: parts of the project tree closed off inside the cage.
+///
+/// Each entry is a path **relative to the project root**, and the two lists differ in what they
+/// close: a `deny` entry becomes unreadable (its *name* stays visible, so nothing about the
+/// project's shape changes) while a `readonly` entry stays readable and refuses writes. Both are
+/// applied by mounting over the path inside the cage, so the host file is never touched and the
+/// rest of the tree stays writable.
+///
+/// The grammar is deliberately narrow, because the cost of matching a pattern is paid by walking
+/// the project: the first component must be literal (no leading `*`), a `*` may appear only in the
+/// last component, and `**` is refused outright. A trailing `/` says the entry is a directory. An
+/// entry matching nothing is a warning, never a failed launch.
+///
+/// This is a **reduction of exposure**, not a boundary of the same class as `[network] deny`. What
+/// it does not cover is named in the guide: a second hard link to the same file, a file that
+/// appears mid-session outside a denied *directory*, and a path nobody thought to list.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawFs {
+    /// Project paths the cage may not read. The name stays visible; opening it is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) deny: Vec<String>,
+    /// Project paths the cage may read but not write, in an otherwise writable tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) readonly: Vec<String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
 /// The `[ssh_agent]` table: which of the host agent's keys the cage may sign with. Each `allow`
 /// entry names **one** key, by the `SHA256:…` fingerprint or by the comment `ssh-add -l` prints
 /// beside it. There is no wildcard: a grant that could not be read off a listing would not be a
@@ -548,6 +584,11 @@ pub(crate) struct RawApp {
     /// so an untrusted project's app `[devices]` is dropped. An unset `Option` is omitted on export,
     /// so an app that needs no device carries no `[devices]` table.
     pub(crate) devices: Option<RawDevices>,
+    /// Project paths this app closes off, unioned onto the baseline's `[fs]`. An app adds masks and
+    /// never removes one, so a profile can close what *its* tool would otherwise read without
+    /// having to know what the project already closed. Ungated like the baseline `[fs]` — it only
+    /// subtracts access. An unset `Option` is omitted on export.
+    pub(crate) fs: Option<RawFs>,
     /// The ssh-agent keys this app's cage may sign with, unioned onto the baseline's. A security
     /// field, gated like the baseline `[ssh_agent]` (a key the cage can sign with authenticates as
     /// the user on every host that trusts it), so an untrusted project's app `[ssh_agent]` is
@@ -820,6 +861,16 @@ pub(crate) struct RawTask {
     pub(crate) timeout: Option<String>,
     /// This task's captured-output ceiling, overriding `[task.defaults] max_output`.
     pub(crate) max_output: Option<String>,
+    /// The `[fs] deny` entries **this** task's cage may read, and it alone.
+    ///
+    /// A denied path is closed in every cage the session builds, the agent's and each task's, so a
+    /// task that needs the file it is about — the key a decrypt command reads — says so here. It
+    /// lifts a mask, it never exposes anything new: an entry naming a path the `[fs] deny` list
+    /// does not carry is dropped with a warning, since granting it would make this a second `binds`
+    /// with none of that field's gating. A security field like the rest of `[task]`: honored only
+    /// from a trusted source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unmask: Vec<String>,
     /// Whether this task gets a writable output directory that outlives the invocation.
     ///
     /// A task cage is otherwise entirely ephemeral — a tmpfs `$HOME`, a tmpfs `/tmp`, a read-only
@@ -1976,8 +2027,10 @@ mod tests {
         // The schema is deliberately additive (unknown fields ignored) so a config using a *newer*
         // sbx field still loads on an older sbx. `[network]` must not break that: `NetworkField` is
         // an untagged enum, so a parse error there fails the WHOLE `RawConfig` → the loader drops the
-        // entire layer → the network silently reverts to the open `shared` default (a fail-OPEN on a
-        // security field). So an unknown `[network]` field is ignored, and the table still parses.
+        // entire layer → every rule the layer carried is silently gone, and a cage that was reaching
+        // named hosts through a filtering posture reaches only the built-in set (or, where a layer
+        // below opened it, whatever that one says). So an unknown `[network]` field is ignored, and
+        // the table still parses.
         // (A `mode` typo therefore lands here too — the table parses mode-less and *inherits*,
         // resolving to `deny`/`ask`, never `shared`: it fails safe.)
         let cfg = parse(b"[network]\nmode = \"deny\"\nfuturefield = 1\n").unwrap();

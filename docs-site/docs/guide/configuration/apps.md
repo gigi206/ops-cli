@@ -64,6 +64,7 @@ tasks_max = 4096
 | `task` | security | this app's declared operations, `[app.<name>.task.<task>]`, unioned onto the baseline's (see [task](task)) |
 | `limits` | security | per-field override of the baseline cgroup limits |
 | `seccomp`, `devices`, `ssh_agent` | security | unioned onto the baseline's, which is how a deploy key is granted to *one* agent rather than every cage (see [seccomp](seccomp), [devices](devices), [ssh-agent](ssh-agent)) |
+| `fs` | ungated | project paths this app closes, **unioned** onto the baseline's: an app closes more for its own cage and can never reopen what the project closed (see [fs](fs)) |
 | `home_scope` | integrity-gated | `"global"` (default) or `"project"`: see [Per-app home](../apps/home) |
 
 ## Layering and gating

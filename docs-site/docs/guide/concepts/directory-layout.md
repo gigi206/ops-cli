@@ -42,6 +42,7 @@ The important subtrees:
 | `apps/<name>/home/` | an app's persistent isolated `$HOME` (`home_scope = "global"`) |
 | `sessions/` | the daemonless session registry ([`sbx session ls`](../concepts/sessions)) |
 | `egress/` | per-launch egress proxy sockets and CA material |
+| `fs/` | per-launch filesystem plumbing: the observation socket, and `mask-<pid>/` holding the two decoys an [`[fs]`](../configuration/fs) policy mounts |
 | `mise/`, `mise-plugin/` | the host-side mise home and the embedded `nix:` backend plugin |
 | `plugins/` | installed [resolver plugins](../secrets/plugins) |
 | `stores/<name>/` | cached, verified remote [plugin stores](../secrets/plugins) |

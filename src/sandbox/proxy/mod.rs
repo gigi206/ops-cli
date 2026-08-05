@@ -180,7 +180,8 @@ use ctx::effective_policy;
 pub(crate) use ctx::{builtin_allow_rules, union_with_builtin, ProxyCtx};
 pub(crate) use inject::{HeaderInjection, SecretNeedle};
 use pool::{PoolKey, UpstreamTls};
-use ssrf::{ip_permitted, names_exact_host};
+use ssrf::ip_permitted;
+pub(crate) use ssrf::{ip_refusal, names_exact_host, AddrRefusal};
 use websocket::*;
 use wire::*;
 

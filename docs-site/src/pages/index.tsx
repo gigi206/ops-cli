@@ -55,13 +55,17 @@ const ABSENT = [
   'egress, under a filtering mode',
 ];
 
-// Three always-on layers (Landlock is a deferred option in this codebase, not a
-// layer that runs today), plus the egress firewall, which is opt-in by posture.
+// Three always-on layers, plus the egress firewall, which is opt-in by posture. Landlock is not a
+// fourth: its union semantics cannot carve a closed path out of a readable project without making
+// everything the agent later creates at the project root unreadable too. See concepts/enforcement.
+// `[fs]` is deliberately not a fifth entry: it is mount work, so it belongs to layer 01,
+// and listing it beside the seccomp filter would promise a boundary it does not provide.
 const LAYERS: { n: string; tag?: string; name: string; detail: string; to: string; delay: number }[] = [
   {
     n: '01',
     name: 'bubblewrap',
-    detail: 'All namespaces, no_new_privs, capabilities dropped.',
+    detail:
+      'All namespaces, no_new_privs, capabilities dropped. The mount set is the boundary, and [fs] closes paths inside it.',
     to: '/docs/concepts/enforcement',
     delay: 60,
   },
@@ -462,7 +466,13 @@ export default function Home(): ReactNode {
               <p className="home__aside home__aside--lead">
                 sbx runs as your uid, and same-uid means read-only is not a boundary. The host
                 filesystem and your credentials simply are not in the cage unless a{' '}
-                <Link to="/docs/concepts/trust">trusted config</Link> grants them.
+                <Link to="/docs/concepts/trust">trusted config</Link> grants them. The project
+                itself is the exception: it is all there, key and <code>.env</code> included, so{' '}
+                <Link to="/docs/configuration/fs">
+                  <code>[fs] deny</code>
+                </Link>{' '}
+                closes the paths that have to stay where they are. The name still lists; the
+                contents do not open.
               </p>
             </div>
             <div className="home__cage">
@@ -495,9 +505,6 @@ export default function Home(): ReactNode {
                   Four layers, three of them always on.
                 </h2>
               </div>
-              <p className="home__note">
-                requires capability-bearing unprivileged userns · no emulation fallback
-              </p>
             </div>
             <p className="home__aside home__aside--lead">
               Every launch goes through them, and none is a toggle. The network posture is the

@@ -10,12 +10,12 @@ See also: [`sbx trust` / `untrust`](../cli/trust) · [Security model](security-m
 
 The config schema is split by the trust gate, not by two schemas:
 
-| | Free | Security |
-|---|---|---|
-| Fields | `env` | `binds`, `network`, `secret`, `packages`, `nixpkgs`, `forward`, `gui`, `gpu`, `audio`, `dbus`, `[proc]`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[notify]`, `[task.<name>]`, `[app.<name>]`, `[net.groups]`, `[bundle.<name>]` |
-| From an untrusted project | applied (minus a reserved-key denylist) | **dropped**, with a warning |
-| From the global config | applied | applied (trusted by location) |
-| From a trusted project | applied | applied¹ |
+| | Free | Closing | Security |
+|---|---|---|---|
+| Fields | `env` | `[fs]` | `binds`, `network`, `secret`, `packages`, `nixpkgs`, `forward`, `gui`, `gpu`, `audio`, `dbus`, `[proc]`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[notify]`, `[task.<name>]`, `[app.<name>]`, `[net.groups]`, `[bundle.<name>]` |
+| From an untrusted project | applied (minus a reserved-key denylist) | applied | **dropped**, with a warning |
+| From the global config | applied | applied | applied (trusted by location) |
+| From a trusted project | applied | applied | applied¹ |
 
 ¹ Two are **global-only** rather than merely trusted-only: `[net.groups]` and
 `[bundle.<name>]` are ignored from *any* project, trusted or not. They are declared once
@@ -27,8 +27,18 @@ denylist** blocks loader-control variables (`LD_*`, `NIX_LD`, `GCONV_PATH`, `PAT
 `HOME`, the proxy-control variables, …) so an untrusted project cannot subvert your
 later interactive sessions. See [`env`](../configuration/env).
 
+[`[fs]`](../configuration/fs) is the one *closing* field, and the only one outside the split.
+It names project paths the cage may not read or may not write, so every entry **subtracts**
+access and there is no syntax for granting any. The gate exists to decide who may widen what
+the cage can reach; a table that can only narrow it has nothing for the gate to decide, and
+dropping it from an untrusted project would leave open exactly the file that project asked to
+close. Layers union, so no layer can reopen what another closed.
+
 Every other field is a *security* field: it changes what the cage can see, reach, or
-do, so it is honored only from a trusted source.
+do, so it is honored only from a trusted source. One nuance worth knowing: `[fs]` closes a
+path in **every** cage the session builds, including a declared operation's, and lifting one
+for a single task ([`unmask`](../configuration/fs#opening-a-path-for-one-operation)) *is*
+gated, because that one does grant.
 
 ## Trusted by location vs trusted by content
 

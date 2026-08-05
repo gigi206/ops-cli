@@ -151,6 +151,25 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     }
                 };
                 let l4 = effective.l4_decision(&host, port);
+                // A spliced connection meets the same post-resolution address guard as an inspected
+                // one, so replay it on an IP literal (no resolution needed) rather than report a
+                // splice the proxy would refuse. A `tcp://` rule always names its host exactly, so
+                // the private-address exception applies here; only a never-reachable address (a
+                // link-local, the cloud metadata one, multicast) is refused.
+                if let allowlist::L4Decision::Splice(rule) = &l4 {
+                    if let Some(refusal) = literal_addr_refusal(&host, Some(rule)) {
+                        print!(
+                            "{}",
+                            render_addr_refusal(
+                                target,
+                                &format!("a tcp:// rule allows the splice ({rule})"),
+                                &refusal,
+                                &pal
+                            )
+                        );
+                        return ExitCode::SUCCESS;
+                    }
+                }
                 print!("{}", render_l4_decision(target, &l4, &pal));
                 return ExitCode::SUCCESS;
             }
@@ -188,7 +207,37 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
             );
             let builtin = matches!(decision, allowlist::Decision::AllowedBy(_)) && !user_allowed;
+            // The policy verdict is only half of what the wire does: the proxy resolves the host and
+            // runs the address guard before connecting. Replay that guard here so the tester does not
+            // promise a pass the proxy refuses. On an **IP literal** the answer is exact and needs no
+            // resolution, so it replaces the verdict; on a **name** the tester resolves nothing (no
+            // network), so it can only note the condition, and only when the deciding rule does not
+            // name the host exactly (the one shape the guard admits for a private address).
+            let deciding = match &decision {
+                allowlist::Decision::AllowedBy(rule) => Some(*rule),
+                _ => None,
+            };
+            let allowed = matches!(
+                decision,
+                allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
+            );
+            if allowed {
+                if let Some(refusal) = literal_addr_refusal(&host, deciding) {
+                    let by = match deciding {
+                        Some(rule) => format!("the policy allows it (allow rule: {rule})"),
+                        None => "the policy allows it (allow-by-default)".to_string(),
+                    };
+                    print!("{}", render_addr_refusal(&url, &by, &refusal, &pal));
+                    return ExitCode::SUCCESS;
+                }
+            }
             print!("{}", render_net_decision(&url, &decision, builtin, &pal));
+            if allowed
+                && host.parse::<std::net::IpAddr>().is_err()
+                && !sandbox::names_exact_host(&host, deciding)
+            {
+                print!("{}", render_private_name_note(&pal));
+            }
             // On an allowed request, surface any credential the proxy would inject for this exact
             // destination — by header and source locator only, never the value, and with no I/O. A
             // **cleartext** (`http://`) request never receives an injection (a bearer is not sent in
@@ -232,6 +281,16 @@ fn render_net_decision(
                 let _ = writeln!(o, "  {dim}by allow rule (built-in):{r} {n}{rule}{r}");
             } else {
                 let _ = writeln!(o, "  {dim}by allow rule:{r} {n}{rule}{r}");
+            }
+            // Testing one URL against a catch-all proves nothing about *this* URL: the rule admits
+            // every host, so the pass would look identical for a destination the author never meant
+            // to open. Say it here, where a reader is asking exactly "why did this pass".
+            if rule.opens_every_host() {
+                let _ = writeln!(
+                    o,
+                    "  {dim}note: that rule matches every host — this URL is not what makes it \
+                     pass{r}"
+                );
             }
         }
         allowlist::Decision::DeniedBy(rule) => {
@@ -308,6 +367,67 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
     o
 }
 
+/// The post-resolution address guard's verdict for a target whose host is an **IP literal**, or
+/// `None` when the host is a name (nothing to classify without resolving it, which this command
+/// never does) or the address is reachable. Delegates to the same `ip_refusal` the proxy's connect
+/// paths use, so the tester cannot drift from the wire.
+fn literal_addr_refusal(
+    host: &str,
+    deciding: Option<&allowlist::Rule>,
+) -> Option<sandbox::AddrRefusal> {
+    let ip = host.parse::<std::net::IpAddr>().ok()?;
+    sandbox::ip_refusal(ip, host, deciding)
+}
+
+/// Render a target the policy permits but the proxy's address guard refuses before connecting — a
+/// pure presenter (its color is asserted in a test). The verdict line is the *wire's* answer
+/// (DENIED), and the reason carries both halves: which rule permitted it, and why the address is
+/// refused anyway. Every span is empty under a non-terminal, so a capture is plain text.
+fn render_addr_refusal(
+    target: &str,
+    permitted_by: &str,
+    refusal: &sandbox::AddrRefusal,
+    pal: &style::Palette,
+) -> String {
+    use std::fmt::Write as _;
+    let (n, err, r) = (pal.name, pal.err, pal.reset);
+    let why = match refusal {
+        sandbox::AddrRefusal::PrivateWithoutExactHost => {
+            "a private or loopback address is reachable only when the deciding rule names that \
+             exact host"
+        }
+        sandbox::AddrRefusal::NeverReachable => {
+            "a link-local (the cloud metadata address among them), multicast or unspecified \
+             address is never reachable, however the policy is written"
+        }
+    };
+    let mut o = String::new();
+    let _ = writeln!(o, "{err}DENIED{r}   {n}{target}{r}");
+    let _ = writeln!(
+        o,
+        "  {}",
+        style::dim_prose(
+            &format!("{permitted_by}, but the proxy refuses the address at connect time: {why}"),
+            pal
+        )
+    );
+    o
+}
+
+/// Render the dim "this name may resolve to an address the guard refuses" note — the honest answer
+/// for a **name** under a rule that does not name it exactly, since resolving it is the one thing
+/// this command will not do. A pure presenter (its color is asserted in a test).
+fn render_private_name_note(pal: &style::Palette) -> String {
+    format!(
+        "  {}\n",
+        style::dim_prose(
+            "note: if this name resolves to a private or loopback address, the proxy refuses it at \
+             connect time (no rule names this exact host)",
+            pal
+        )
+    )
+}
+
 /// Render the dim "+ a credential would be injected" note for a secret whose destination matches
 /// the tested request — by header name and source locator only (never the plaintext, and with no
 /// I/O), mirroring how `sbx config` describes a credential. A pure presenter (its color is asserted
@@ -342,6 +462,37 @@ mod tests {
     }
 
     #[test]
+    fn an_allow_by_catch_all_says_the_url_is_not_what_made_it_pass() {
+        // Testing a URL against `re:.*` reads as a green light for *that* URL; it is a green light
+        // for every URL. The tester says so, or it quietly certifies a destination nobody vetted.
+        let p = style::Palette::plain();
+        let wide = allowlist::classify("re:.*").unwrap();
+        let out = render_net_decision(
+            "https://anything.example.test/x",
+            &allowlist::Decision::AllowedBy(&wide),
+            false,
+            &p,
+        );
+        assert!(
+            out.contains("matches every host"),
+            "a catch-all pass must be qualified:\n{out}"
+        );
+
+        // A rule that names its host carries no such note — it passed *because of* this URL.
+        let exact = allowlist::classify("github.com").unwrap();
+        let out = render_net_decision(
+            "https://github.com/x",
+            &allowlist::Decision::AllowedBy(&exact),
+            false,
+            &p,
+        );
+        assert!(
+            !out.contains("matches every host"),
+            "an exact-host pass must stay unqualified:\n{out}"
+        );
+    }
+
+    #[test]
     fn net_decision_colors_the_verdict_and_resets() {
         // The ON path: DENIED is wrapped in the error span and closed with a reset, the URL in
         // the name span — a mis-mapped verdict or a dropped reset would only ever show here.
@@ -359,6 +510,86 @@ mod tests {
         assert!(
             denied.contains(&format!("{}https://x/y{}", p.name, p.reset)),
             "the URL must be wrapped in the name span:\n{denied}"
+        );
+    }
+
+    #[test]
+    fn literal_addr_refusal_replays_the_proxy_guard_only_on_an_ip_literal() {
+        // The tester resolves nothing, so a name is never classified (no verdict to give), while an
+        // IP literal is classified exactly as the proxy's connect paths do.
+        let catch_all = allowlist::classify("re:.*").unwrap();
+        assert!(
+            literal_addr_refusal("intranet.example.com", Some(&catch_all)).is_none(),
+            "a name must stay unclassified: resolving it is what this command does not do"
+        );
+        // A private address under a rule that does not name the host exactly: refused, as the wire
+        // refuses it (a 403 at CONNECT).
+        assert!(matches!(
+            literal_addr_refusal("192.168.1.10", Some(&catch_all)),
+            Some(sandbox::AddrRefusal::PrivateWithoutExactHost)
+        ));
+        // The same address named exactly is the deliberate internal target the guard admits.
+        let exact = allowlist::classify("192.168.1.10").unwrap();
+        assert!(literal_addr_refusal("192.168.1.10", Some(&exact)).is_none());
+        // The cloud metadata address is refused however the policy is written, exact rule included.
+        let meta = allowlist::classify("169.254.169.254").unwrap();
+        assert!(matches!(
+            literal_addr_refusal("169.254.169.254", Some(&meta)),
+            Some(sandbox::AddrRefusal::NeverReachable)
+        ));
+        // An allow-by-default verdict has no deciding rule, so the exception never applies.
+        assert!(matches!(
+            literal_addr_refusal("127.0.0.1", None),
+            Some(sandbox::AddrRefusal::PrivateWithoutExactHost)
+        ));
+        // A public address is the ordinary pass: no refusal to report.
+        assert!(literal_addr_refusal("93.184.216.34", Some(&catch_all)).is_none());
+    }
+
+    #[test]
+    fn addr_refusal_reads_as_the_wire_verdict_with_both_halves_of_the_reason() {
+        // The verdict line is what the launch would do (DENIED), and the reason names the rule that
+        // permitted it *and* the guard that refuses it — a bare ALLOWED here would mispredict.
+        let p = style::Palette::plain();
+        let out = render_addr_refusal(
+            "https://127.0.0.1/",
+            "the policy allows it (allow rule: re:.*)",
+            &sandbox::AddrRefusal::PrivateWithoutExactHost,
+            &p,
+        );
+        assert_eq!(
+            out,
+            "DENIED   https://127.0.0.1/\n  the policy allows it (allow rule: re:.*), but the \
+             proxy refuses the address at connect time: a private or loopback address is reachable \
+             only when the deciding rule names that exact host\n"
+        );
+        let colored = render_addr_refusal(
+            "https://127.0.0.1/",
+            "the policy allows it (allow-by-default)",
+            &sandbox::AddrRefusal::NeverReachable,
+            &style::Palette::colored(),
+        );
+        let c = style::Palette::colored();
+        assert!(
+            colored.contains(&format!("{}DENIED{}", c.err, c.reset)),
+            "the refusal must wear the error span, like every other DENIED:\n{colored}"
+        );
+        assert!(
+            colored.contains("never reachable"),
+            "the never-reachable class must say so:\n{colored}"
+        );
+    }
+
+    #[test]
+    fn private_name_note_states_the_condition_it_cannot_resolve() {
+        // For a name the honest answer is conditional: the note must say what would refuse it and
+        // why the tester cannot tell, without claiming a verdict.
+        let p = style::Palette::plain();
+        let note = render_private_name_note(&p);
+        assert_eq!(
+            note,
+            "  note: if this name resolves to a private or loopback address, the proxy refuses it \
+             at connect time (no rule names this exact host)\n"
         );
     }
 

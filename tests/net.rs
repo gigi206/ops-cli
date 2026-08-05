@@ -992,6 +992,93 @@ fn net_allow_rejects_an_invalid_rule_before_writing() {
     );
 }
 
+#[test]
+fn a_catch_all_rule_carries_its_reach_from_the_config_to_the_listing() {
+    // The whole chain, through the real binary: a `re:` in the config, classified, projected into
+    // the listing view, rendered, and serialized. `re:` rather than `re:.*` on purpose — the empty
+    // pattern is the spelling a reader is least likely to recognise as "every host", which is the
+    // reason the label exists at all.
+    let fx = Fixture::new();
+    fx.write_project("[network]\nmode = \"deny\"\nallow = [\"re:\", \"github.com\"]\n");
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+
+    let out = fx.run(&["net", "rules"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("allow re:  (config, matches every host)"),
+        "the catch-all must carry its reach in the listing:\n{s}"
+    );
+    assert!(
+        s.contains("allow https://github.com  (config)"),
+        "a rule that names its host stays unlabelled:\n{s}"
+    );
+
+    // The same fact in the machine-readable view, where a reader is a script.
+    let json = fx.run(&["net", "rules", "--json"]);
+    let j = String::from_utf8_lossy(&json.stdout);
+    assert_eq!(
+        j.matches("\"catch_all\":true").count() + j.matches("\"catch_all\": true").count(),
+        1,
+        "exactly the one catch-all rule is flagged in --json:\n{j}"
+    );
+
+    // And the tester qualifies a pass it decided: the URL is not what made it through.
+    let tested = fx.run(&["test", "net", "https://anything.example.test"]);
+    let t = String::from_utf8_lossy(&tested.stdout);
+    assert!(
+        t.contains("matches every host"),
+        "a catch-all pass must be qualified by the tester:\n{t}"
+    );
+}
+
+#[test]
+fn the_catch_all_refusal_names_each_verbs_own_way_out() {
+    // One syntax check serves four entry points, and each must send its author the way *they* were
+    // going. Pinned through the real binary because the wiring is what breaks: the grammar knows
+    // how to phrase each refusal only if the CLI hands it the verb it was called with.
+    let fx = Fixture::new();
+    let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).to_string();
+
+    // `allow *` wants everything open, and is pointed at the posture that really opens it.
+    let allow = stderr(&fx.run(&["net", "allow", "*"]));
+    assert!(
+        allow.contains("mode = \"shared\""),
+        "an allow catch-all is pointed at opening the network:\n{allow}"
+    );
+
+    // `deny *` wants everything closed. Pointing *this* author at `shared` would tell them to open
+    // the network they just asked to shut — the defect this test exists to keep out.
+    let deny = stderr(&fx.run(&["net", "deny", "*"]));
+    assert!(
+        deny.contains("mode = \"none\"") && !deny.contains("shared"),
+        "a deny catch-all is pointed at closing the network, never at opening it:\n{deny}"
+    );
+
+    // A mute changes no verdict, so no posture switch answers it at all.
+    let mute = stderr(&fx.run(&["net", "mute", "*"]));
+    assert!(
+        mute.contains("re:.*") && !mute.contains("mode ="),
+        "a mute catch-all gets the log-filter answer, not a posture:\n{mute}"
+    );
+
+    assert!(
+        !fx.proj.path().join(".sbx.toml").exists(),
+        "every one of these is refused before any write"
+    );
+
+    // And a tested target is a request, not a declaration: there is no list to advise about. This
+    // needs its own project with a **filtering** posture: the default is `shared`, where the tester
+    // answers "every URL is reachable" without ever looking at the target it was handed.
+    let filtered = Fixture::new();
+    filtered.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
+    assert!(filtered.run(&["trust", ".sbx.toml"]).status.success());
+    let target = stderr(&filtered.run(&["test", "net", "https://*"]));
+    assert!(
+        target.contains("not a host") && !target.contains("mode ="),
+        "a test target is refused as a request:\n{target}"
+    );
+}
+
 // ── increment 4: the `ask` posture + the live pending control plane ────────────────────────────
 
 #[test]

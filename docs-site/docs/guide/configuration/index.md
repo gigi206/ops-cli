@@ -19,15 +19,46 @@ then a [one-shot override](overrides) as the final word. Use
 [`sbx config show`](../cli/config) to see the resolved result, with each value
 tagged by the layer it came from.
 
+## Global defaults: what applies everywhere
+
+The **global** config (`~/.config/sbx/sbx.toml`) is the one place to declare
+something **once** and have it apply to every launch — every project, and every
+app (an app resolves `global → project → app`, inheriting the layers below it).
+So "make tool X available everywhere" is a [`[packages]`](packages) declaration
+in the global config:
+
+```toml
+# ~/.config/sbx/sbx.toml — applies to every project and every app
+[packages]
+rg = "nix:ripgrep"
+```
+
+```sh
+sbx run -- rg --version      # any project
+sbx app run review           # any app: rg is on PATH there too
+sbx config show -g           # what the global layer contributes
+sbx config show -a review    # rg tagged "inherited" in the app's effective config
+```
+
+By contrast, a project's mise files ([`[tools]`](tools)) are **project-local by
+design**: declare a tool there and it equips that project only. The usual split
+is a global `[packages]` for tools you want everywhere, plus the project's mise
+file for its own toolchain. Note that the global config is **trusted by
+location**, so its `[packages]` apply regardless of any project's trust state.
+
 ## Free fields vs security fields
 
 The schema is split by the [trust gate](../concepts/trust), not by two schemas:
 
 - **Free field**, [`env`](env), applies from any project (minus a reserved-key
   denylist).
-- **Security fields**, everything else, apply only from a **trusted** source (the
+- **Security fields**, almost everything else, apply only from a **trusted** source (the
   global config, an app profile, or a project you have run [`sbx trust`](../cli/trust)
   on).
+- **[`[fs]`](fs)** sits outside the split, and it is the only field that does. Every other
+  table can grant something, which is what the gate is there to decide; `[fs]` can only
+  close a path of the project it is declared in, so it applies from any source. Dropping it
+  from an untrusted project would leave open exactly the file that project asked to close.
 
 The global config and imported app profiles are **trusted by location**; a project
 `.sbx.toml` is **trusted by content**.
@@ -45,6 +76,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[limits]` | security | [limits](limits) |
 | `[seccomp]` | security | [seccomp](seccomp) |
 | `[devices]` | security | [devices](devices) |
+| `[fs]` | ungated (only closes) | [fs](fs) |
 | `[ssh_agent]` | security | [ssh-agent](ssh-agent) |
 | `gui` | security | [gui](gui) |
 | `gpu` | security | [gpu](gpu) |

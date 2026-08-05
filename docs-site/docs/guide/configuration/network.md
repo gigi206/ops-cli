@@ -36,8 +36,8 @@ deny  = ["evil.example.com"]
 | Mode | What reaches |
 |---|---|
 | `none` | nothing (an empty network namespace) |
-| `shared` | the host network (the default when unset) |
-| `deny` | **deny-by-default**: only `allow`-listed hosts reach (an allowlist) |
+| `shared` | the host network |
+| `deny` | **deny-by-default**: only `allow`-listed hosts reach (an allowlist). The default when unset, then carrying no rules of its own |
 | `allow` | **allow-by-default**: every host reaches except `deny`-listed ones (a denylist) |
 | `ask` | park-and-confirm: an undecided host blocks until you answer |
 
@@ -107,7 +107,9 @@ would otherwise re-resolve the same host on every request. The proxy therefore *
 address for `dns_cache_ttl` seconds (default 60; `0` disables it, resolving every request). The
 per-request SSRF address check still runs on the cached address: the cache only skips re-resolving,
 never the security check. It is trusted/global-only like the rest of the table, and invisible from
-inside the cage in the same way, so [`sbx config`](../cli/config) names it whenever a layer set one.
+inside the cage in the same way, so [`sbx config`](../cli/config) names it whenever a layer set one,
+and `sbx config show --details` names the built-in 60 seconds as well, so the effective posture is
+on the screen rather than something you have to know.
 (There is no proxy-level retry: the client, `nix`/`git`/`curl`, already retries the whole request,
 which re-triggers resolution, so a retry here would be redundant.)
 
@@ -132,6 +134,9 @@ mode  = "deny"
 allow = ["cache.nixos.org", "api.example.com"]
 pool  = false   # every request opens its own connection
 ```
+
+Because it is on by default, [`sbx config`](../cli/config) prints a line only for a launch that
+turned it **off**; `sbx config show --details` states the posture either way.
 
 Measured on loopback, with the client side unchanged, a small request costs about **470 µs**
 with reuse against **730 µs** without it. Against a real host the saving is far larger,

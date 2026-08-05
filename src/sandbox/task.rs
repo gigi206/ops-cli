@@ -228,6 +228,9 @@ pub(crate) struct TaskEngine {
     /// or test engine, which announces nothing; the launch attaches the real wiring with
     /// [`TaskEngine::with_notifier`].
     notify: Option<Arc<super::notify_sink::NotifyWiring>>,
+    /// The session's `[fs]` masks and the decoys they mount, when the config declared any. Every
+    /// task cage re-emits them over its own project bind, minus what that task's `unmask` lifts.
+    fs_masks: Option<(super::fsmask::Expanded, super::fsmask::Decoys)>,
 }
 
 /// The two cage programs a task's egress forwarder is built from, named rather than passed as a pair
@@ -367,6 +370,7 @@ impl TaskEngine {
             output_held: Arc::new(Mutex::new(BTreeSet::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
             notify: None,
+            fs_masks: None,
         }
     }
 
@@ -374,6 +378,24 @@ impl TaskEngine {
     /// announced exactly like one the session's own exec policy stops.
     pub(crate) fn with_notifier(mut self, notify: Arc<super::notify_sink::NotifyWiring>) -> Self {
         self.notify = Some(notify);
+        self
+    }
+
+    /// Carry the session's `[fs]` masks into every task cage this engine builds.
+    ///
+    /// A masked path is closed in the agent's cage and in each task's, and a task that needs one
+    /// lifts it with its own `unmask` — that split is what lets a credential-bearing operation read
+    /// a key the agent invoking it never can. Separate from [`TaskEngine::from_cage`] because a
+    /// session with no `[fs]` policy has nothing to carry, and because the masks are **not**
+    /// inherited through the base mounts: those are filtered to a fixed destination list that holds
+    /// no project path (see `KEPT_DESTS`), and a task cage binds the project itself, so the masks
+    /// have to be re-emitted over it.
+    pub(crate) fn with_fs_masks(
+        mut self,
+        masks: super::fsmask::Expanded,
+        decoys: super::fsmask::Decoys,
+    ) -> Self {
+        self.fs_masks = Some((masks, decoys));
         self
     }
 
@@ -957,6 +979,20 @@ impl TaskEngine {
             src: self.project.clone(),
             dest: self.project.clone(),
         });
+
+        // The session's `[fs]` masks, re-emitted over that bind — after it, or the project mount
+        // would cover them. Default-closed: a task sees every masked path closed unless its own
+        // `unmask` names it, so declaring a mask does not quietly open it to whatever operations
+        // the session happens to offer. Only `deny` is carried; the project is already read-only
+        // here, so a `readonly` entry would restate what this cage's shape says.
+        if let Some((masks, decoys)) = &self.fs_masks {
+            let (mask_mounts, unused) =
+                super::fsmask::task_mounts(masks, decoys, &self.project, &task.unmask);
+            for warning in unused {
+                crate::diag::warn(&format!("task `{}`: {warning}", task.name));
+            }
+            mounts.extend(mask_mounts);
+        }
         SandboxSpec::new(
             self.project.clone(),
             mounts,
@@ -2059,6 +2095,7 @@ impl TaskEngine {
     /// in-cage client be tested against the real plane rather than a stand-in for it.
     pub(crate) fn inventory_only(tasks: Vec<crate::config::TaskSpec>) -> Self {
         Self {
+            fs_masks: None,
             notify: None,
             bwrap: PathBuf::from("/nonexistent/bwrap"),
             forwarder: CageForwarder {
@@ -2210,6 +2247,7 @@ mod smoke {
     /// A task that prints its credential and its parameter, so both paths are observable at once.
     fn echo_task(shell: &str) -> TaskSpec {
         TaskSpec {
+            unmask: Vec::new(),
             name: "echo-secret".into(),
             description: Some("prints the credential and the parameter".into()),
             cmd: vec![
@@ -2526,6 +2564,7 @@ mod smoke {
         }
 
         let spec = TaskSpec {
+            unmask: Vec::new(),
             name: "pool-tool".into(),
             description: None,
             cmd: vec!["demo-tool".into()],
@@ -2650,6 +2689,7 @@ mod tests {
 
     fn task() -> TaskSpec {
         TaskSpec {
+            unmask: Vec::new(),
             name: "db-query".into(),
             description: None,
             cmd: vec!["psql".into(), "-c".into(), "{sql}".into()],
@@ -3044,6 +3084,7 @@ mod tests {
     /// needs neither nix nor a kernel.
     fn engine_with_pool(pool: &Path, tasks: Vec<TaskSpec>) -> TaskEngine {
         TaskEngine {
+            fs_masks: None,
             notify: None,
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             forwarder: CageForwarder {

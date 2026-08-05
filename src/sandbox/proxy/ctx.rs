@@ -162,9 +162,13 @@ impl ProxyCtx {
         let policy = union_with_builtin(user_policy);
         // The proxy re-resolves per request; a long build fetching one host thousands of times would
         // re-hit the resolver each time (and any hiccup fails a fetch). A short-TTL cache resolves
-        // each host once and reuses it — tunable via `[network] dns_cache_ttl` (default 60s, `0`
-        // disables the cache).
-        let resolve = caching_resolver(policy.dns_cache_ttl().unwrap_or(Duration::from_secs(60)));
+        // each host once and reuses it — tunable via `[network] dns_cache_ttl`, where `0` disables
+        // the cache and an unset field takes the named default.
+        let resolve = caching_resolver(
+            policy
+                .dns_cache_ttl()
+                .unwrap_or(crate::allowlist::DEFAULT_DNS_CACHE_TTL),
+        );
         // Built only when the launch asks for reuse, so a launch that does not is byte-for-byte the
         // connection-per-request path and cannot inherit any of reuse's failure modes.
         let pool = policy.pool().then(super::pool::UpstreamPool::new);

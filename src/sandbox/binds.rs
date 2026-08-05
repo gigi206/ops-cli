@@ -481,9 +481,14 @@ fn assemble(
     }));
 
     // Launcher-injected binds, emitted last so they neither shadow a structural mount nor
-    // are shadowed by one. Their destinations are sbx's (the egress socket under the tmpfs,
-    // the proxy CA under `/opt/sbx`), never a project path; their parents are already
-    // mounted above (the tmpfs for the socket, the userland binds' `/opt/sbx`).
+    // are shadowed by one. Most are sbx's own destinations (the egress socket under the tmpfs,
+    // the proxy CA under `/opt/sbx`), whose parents are already mounted above (the tmpfs for the
+    // socket, the userland binds' `/opt/sbx`).
+    //
+    // Two kinds deliberately land *on* a host path the structural block already mounted, and both
+    // depend on arriving after it: the control-plane pins, which freeze sbx's own roots inside a
+    // read-write bind, and the `[fs]` masks, which close a project path by mounting a decoy over
+    // it. For those, "emitted last" is not tidiness but the mechanism.
     mounts.extend(extra_binds.iter().map(|b| {
         if b.writable {
             Mount::Bind {
