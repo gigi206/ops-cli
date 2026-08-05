@@ -1,14 +1,14 @@
 //! The HTTP/2 (gRPC) man-in-the-middle path, for a CONNECT to a designated `[network] http2` host.
 //!
-//! It is a sibling of the synchronous HTTP/1.1 tail of [`handle_client`], not a rewrite of it: the
+//! It is a sibling of the synchronous HTTP/1.1 tail of [`handle_client`](super::handle_client), not a rewrite of it: the
 //! sync path is untouched. Because the `h2` crate is async (tokio-based), the whole branch runs on a
 //! **per-connection current-thread tokio runtime** built and dropped inside [`handle`], so tokio
 //! never leaks into sbx's std-thread world.
 //!
 //! Security parity with the HTTP/1.1 path is the invariant: every stream is checked against the same
-//! [`effective_policy`]/[`EgressPolicy::explain`] chokepoint (host/`:path`/method), the `:authority`
+//! [`effective_policy`]/[`EgressPolicy::explain`](crate::allowlist::EgressPolicy::explain) chokepoint (host/`:path`/method), the `:authority`
 //! is re-verified against the CONNECT host **per stream** (h2 lets a client vary it), the SSRF guard
-//! resolves and validates the address exactly as [`connect_upstream`] does (connect the checked IP,
+//! resolves and validates the address exactly as [`connect_upstream`](super::connect_upstream) does (connect the checked IP,
 //! no re-resolve, validate the upstream cert), and gRPC is HTTP/2 end-to-end (no downgrade). The
 //! secret machinery is replicated too: the outbound tripwire ([`carries_secret`]) refuses a request
 //! whose head carries a configured secret verbatim, matching host-scoped credentials are injected

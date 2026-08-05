@@ -2,7 +2,7 @@
 //!
 //! This module owns the *grammar* — what a mask entry may look like — and nothing else. Turning an
 //! entry into the paths it actually covers needs the project on disk, so it belongs to the launch
-//! (see [`crate::sandbox::fsmask`]); keeping the two apart is what lets the grammar be checked
+//! (see `crate::sandbox::fsmask`); keeping the two apart is what lets the grammar be checked
 //! without touching the filesystem, here and in the task loader, from one definition.
 //!
 //! The grammar is narrow on purpose. Every glob costs a directory read at launch, and a recursive

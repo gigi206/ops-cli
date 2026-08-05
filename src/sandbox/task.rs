@@ -115,7 +115,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// one answer whichever side of the spawn it arrives on.
 const STOPPED_EXIT: i32 = 128 + libc::SIGKILL;
 
-/// How long [`TaskEngine::await_stop`] waits for a stop it requested to actually take effect.
+/// How long [`TaskEngine::stop`] waits for a stop it requested to actually take effect.
 ///
 /// Bounded because it cannot be unbounded honestly: a stop is a request the runner honors at its
 /// next poll, and everything before the spawn — a credential resolving through `sops`, a proxy being
@@ -134,7 +134,7 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// Every entry must be a destination the agent cage actually emits, or it silently keeps nothing:
 /// the entries are matched **exactly**, so `/bin` would not keep `/bin/sh` and `/etc/ssl` would not
 /// keep the CA bundle. The names are taken from [`super::binds`]'s own constants rather than
-/// retyped, and [`every_kept_destination_is_one_the_cage_emits`] fails on any entry the structural
+/// retyped, and `every_kept_destination_is_one_the_cage_emits` fails on any entry the structural
 /// set does not carry.
 const KEPT_DESTS: &[&str] = &[
     "/nix",
@@ -1724,7 +1724,7 @@ struct Running {
     /// and reused between the read and the signal, and the target of that race is another process
     /// entirely.
     pid: Option<u32>,
-    /// Set by [`TaskEngine::request_stop`]; read by the runner on its next poll.
+    /// Set by [`TaskEngine::stop`]; read by the runner on its next poll.
     stop: bool,
     /// Whether the caller that started this one is no longer waiting for it. Recorded because it is
     /// the only thing a reader cannot infer: a detached invocation looks exactly like an attached one

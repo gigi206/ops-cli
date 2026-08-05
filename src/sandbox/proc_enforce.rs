@@ -32,7 +32,7 @@
 //! is permitted only to an ancestor of the target — which the supervisor (a thread in the launching
 //! sbx process) is: the cage is its descendant in host pid-space for the whole live run (the
 //! `systemd-run --scope` wrapper exec-chains, so bwrap stays a child of sbx; reparenting onto the
-//! systemd manager only happens at teardown, after the run). [`SECCOMP_IOCTL_NOTIF_ID_VALID`] guards
+//! systemd manager only happens at teardown, after the run). [`notif_id_valid`] guards
 //! the read against a reaped-and-reused pid.
 //!
 //! ## The single-listener discipline (no serialization deadlock)

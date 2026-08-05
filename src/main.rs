@@ -510,7 +510,7 @@ fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
 }
 
 /// Resolve where an egress-rule write lands and how to name it, shared by the single-rule
-/// [`persist_egress_rule`] and the bulk [`net_pending_drain_and_save`] so the two can never disagree
+/// [`persist_egress_rule`] and the bulk `net_pending_drain_and_save` so the two can never disagree
 /// about the file or the target its summary reports. Returns the file to edit, the in-file app key
 /// (`None` writes a top-level `[network]` — a profile's shape, or a baseline config; `Some(name)`
 /// writes `[app.<name>.network]` — a project overlay), and the human target description (which

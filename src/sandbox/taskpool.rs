@@ -22,7 +22,7 @@
 //! bakes absolute paths into what it writes (npm shims, python console-script shebangs, venv
 //! `pyvenv.cfg`, mise's own backend metadata). A pool installed under one path and read under
 //! another yields tools that fail with `ENOENT` on their own interpreter — a failure that reads as
-//! "the install broke", not "the mount moved". [`the_install_and_task_cages_agree_on_the_pool_path`]
+//! "the install broke", not "the mount moved". `the_install_and_task_cages_agree_on_the_pool_path`
 //! pins it.
 //!
 //! # Where the network comes from

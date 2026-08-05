@@ -27,7 +27,7 @@
 //! relayed is reduced to one bounded line first — a plugin is third-party code, and a diagnostic
 //! is the wrong place to let it drive the user's terminal with escape sequences.
 //!
-//! The cage is built from the audited [`SandboxSpec`]/[`to_argv`] keystone, so every cage gets
+//! The cage is built from the audited [`SandboxSpec`]/[`to_argv`](super::argv::to_argv) keystone, so every cage gets
 //! the unconditional hardening (all namespaces, dropped capabilities, a cleared environment, a
 //! fresh session, die-with-parent) for free; the runner only adds the manifest's grant on top.
 
@@ -240,7 +240,7 @@ fn cage_spec(
     });
 
     // The grant's extra read-only paths, layered over the structural mounts above. Each becomes a
-    // separate `--ro-bind-try <src> <dest>` argv pair (see [`to_argv`]) — never interpolated into a
+    // separate `--ro-bind-try <src> <dest>` argv pair (see [`to_argv`](super::argv::to_argv)) — never interpolated into a
     // shell string — so a residual `$` a manifest's small path expansion left behind is an inert
     // literal here, not an injection. `try` keeps a manifest portable: a path that names a runtime
     // artifact (e.g. the gpg-agent socket directory under `$XDG_RUNTIME_DIR`) is skipped where it is

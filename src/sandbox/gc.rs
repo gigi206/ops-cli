@@ -92,7 +92,7 @@ pub(crate) fn prune_flake_roots(
 /// `nix:` package roots `<name>` **and** siblings like `<name>-man`/`<name>-dev`. A sibling shares
 /// the `<name>-` prefix, so it is kept whenever its base package is declared — otherwise a live
 /// package's man/dev output would be deleted on every gc. A pruned prebuilt root's sibling `.expr`
-/// stamp (a plain file [`super::store::provision_expr`] writes beside it) is removed with it; the
+/// stamp (a plain file [`provision_expr`](crate::store::provision_expr) writes beside it) is removed with it; the
 /// stamp of a *kept* root is a non-symlink and is never touched. Destructive only when `prune`.
 pub(crate) fn prune_project_package_roots(
     data_gcroots: &Path,
@@ -183,7 +183,7 @@ pub(crate) fn project_keep_roots(
 }
 
 /// Prune — or, in a dry run, list — the per-project store's accumulated **seed** gc roots for
-/// superseded builds, returning the roots dropped. [`super::projectstore::gcroot_roots`] is
+/// superseded builds, returning the roots dropped. `gcroot_roots` is
 /// add-only: every seeded or provisioned path gets a permanent `gcroots/<hash-name>` root and a
 /// newer build's root never displaces the older one, so each version a project ever provisioned
 /// stays rooted and a plain `nix-store --gc` reports zero dead however many are superseded (its mark
@@ -1064,7 +1064,7 @@ pub(crate) fn tree_size(path: &Path) -> u64 {
 /// directory whose runtime tree under `projects_dir` is gone, are stale: dropping the root lets the
 /// following `nix-store --gc` collect the closure it held. Destructive only when `prune`. The live
 /// sets must be computed *before* this runs (and after any dead-tree reap, so a reaped project's
-/// pin no longer counts) — see [`crate::store::live_base_revisions`] / [`live_mise_revisions`].
+/// pin no longer counts) — see [`crate::store::live_base_revisions`] / [`live_mise_revisions`](crate::store::live_mise_revisions).
 pub(crate) fn prune_shared_gcroots(
     gcroots_dir: &Path,
     projects_dir: &Path,

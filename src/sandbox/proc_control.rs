@@ -158,7 +158,7 @@ pub(crate) fn serve(listener: UnixListener, ring: Arc<ExecRing>) -> io::Result<(
 
 /// Serve the control socket for an **enforcing** session (`[proc] mode = enforce|ask`): like
 /// [`serve`], but the dispatch also answers the `ask` decision verbs (`LIST` the parked `execve`s,
-/// `ALLOW`/`DENY <id>` or `*` to decide them) against the shared [`PendingExec`].
+/// `ALLOW`/`DENY <id>` or `*` to decide them) against the shared [`PendingExec`](super::proc_enforce::PendingExec).
 pub(crate) fn serve_enforced(
     listener: UnixListener,
     ring: Arc<ExecRing>,

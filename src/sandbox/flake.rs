@@ -32,7 +32,7 @@ pub(crate) struct FlakePin {
 
 /// A git revision: exactly 40 lowercase hex characters. Validated before a stored value flows
 /// back into a flake reference or an on-disk path component. Lowercase-only, matching how nix and
-/// [`crate::store::valid_revision`] spell a rev — an off-case value is a corrupt lock line, refused.
+/// `crate::store::valid_revision` spell a rev — an off-case value is a corrupt lock line, refused.
 fn is_rev(s: &str) -> bool {
     s.len() == 40
         && s.bytes()

@@ -48,7 +48,7 @@
 //! this is refused `405`, stranding such a tool (observed: the Kiro IDE's OAuth token exchange).
 //! [`handle_https_forward`] serves it as the plaintext-client sibling of the MITM path: the
 //! client→proxy leg is cleartext (the cage loopback), but the verdict is the *ordinary* `https` policy
-//! ([`EgressPolicy::explain`], NOT the opt-in `http://` scheme — so a normal allow rule covers it,
+//! ([`EgressPolicy::explain`](crate::allowlist::EgressPolicy::explain), NOT the opt-in `http://` scheme — so a normal allow rule covers it,
 //! exactly as an equivalent `CONNECT` would, `ask` park included), the upstream leg is a **validated
 //! TLS** connection (a forged upstream is a `502`, never downgraded), and — unlike the cleartext path
 //! — a host-scoped **credential IS injected** (it rides only the encrypted upstream leg, and a
@@ -1220,7 +1220,7 @@ impl Drop for SpliceGuard<'_> {
 }
 
 /// Handle a raw L4 (`tcp://`) splice: a `tcp://` allow rule opted this host:port into an uninspected
-/// tunnel ([`EgressPolicy::l4_decision`]). The connection keeps the controls a raw stream can carry —
+/// tunnel ([`EgressPolicy::l4_decision`](crate::allowlist::EgressPolicy::l4_decision)). The connection keeps the controls a raw stream can carry —
 /// the host:port allowlist (already matched), host-side DNS, the open-splice cap, and the SSRF guard
 /// — but **loses** TLS termination, path/method matching, Host/SNI anti-fronting, and secret
 /// redaction (there is no HTTP head to inspect). Failures before the tunnel is accepted are reported
@@ -1778,7 +1778,7 @@ fn handle_cleartext(
 /// (an `http://` proxy connection), but policy is terminated the SAME way and the proxy makes a
 /// **validated TLS** connection to the real upstream. Differences from [`handle_cleartext`] (the
 /// opt-in `http://` scheme):
-///   - the verdict uses [`EgressPolicy::explain`] — a normal `https` allow rule permits it, so this
+///   - the verdict uses [`EgressPolicy::explain`](crate::allowlist::EgressPolicy::explain) — a normal `https` allow rule permits it, so this
 ///     is NOT a separate opt-in (it is exactly the egress an equivalent `CONNECT` would have gotten,
 ///     down to parking an `ask`-undecided host for `sbx net pending`);
 ///   - the upstream leg is TLS with certificate validation (never downgraded — a forged upstream is a

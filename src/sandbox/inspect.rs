@@ -282,7 +282,7 @@ pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<Stri
 
 /// The key a prebuilt package's pin is stored under in its per-tree lock: the declared locator for a
 /// direct form (its URL / `github:` / `apt:` locator), or `resolve:<name>` for a `*:resolve` package
-/// — whose pin is keyed by name, not by the one-line `resolve` sentinel [`Backend::locator`] returns.
+/// — whose pin is keyed by name, not by the one-line `resolve` sentinel [`Backend::locator`](crate::config::Backend::locator) returns.
 /// So a built `deb:resolve` / `appimage:resolve` / `tarball:resolve` package is found in its lock,
 /// not reported as un-built.
 pub(crate) fn prebuilt_pin_key(backend: &crate::config::Backend, name: &str) -> String {
@@ -296,7 +296,7 @@ pub(crate) fn prebuilt_pin_key(backend: &crate::config::Backend, name: &str) -> 
 }
 
 /// The out-link directory a home built before the `ops`→`sbx` rename still carries. A launch now
-/// writes the out-link to [`binds::FLAKE_ROOTS_REL`] (`.local/state/sbx/flake`), but a home last built
+/// writes the out-link to [`binds::FLAKE_ROOTS_REL`](super::binds::FLAKE_ROOTS_REL) (`.local/state/sbx/flake`), but a home last built
 /// under the old name keeps it here until its next relaunch rebuilds into the current dir — so the
 /// read side checks both, current first, to report such a home accurately through the transition.
 const FLAKE_ROOTS_REL_LEGACY: &str = ".local/state/ops/flake";
@@ -306,7 +306,7 @@ const FLAKE_ROOTS_REL_LEGACY: &str = ".local/state/ops/flake";
 /// out-link's target store path lives in the per-project store the launch bound at `/nix`. The
 /// out-link *symlink* is the realized signal a launch leaves in the home (a *floating* flake has an
 /// out-link but no lock entry at all, which a lock scan would miss). The current relative path is
-/// [`binds::FLAKE_ROOTS_REL`] — the same constant the launch writes to, so the read side cannot drift
+/// [`binds::FLAKE_ROOTS_REL`](super::binds::FLAKE_ROOTS_REL) — the same constant the launch writes to, so the read side cannot drift
 /// from the write side — with the pre-rename [`FLAKE_ROOTS_REL_LEGACY`] as a fallback for a home built
 /// before the rename. Returns the out-link target's store-path label (e.g. `demo-agent-0.18.2`, the
 /// basename minus the store hash) for display, or `None` when no out-link exists. Read-only.

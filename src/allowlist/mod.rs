@@ -949,7 +949,7 @@ impl EgressPolicy {
         self
     }
 
-    /// How much of each inspected exchange this launch captures — [`CaptureLevel::Off`] by default.
+    /// How much of each inspected exchange this launch captures — [`CaptureLevel::Off`](crate::sandbox::control::CaptureLevel::Off) by default.
     pub(crate) fn capture_level(&self) -> crate::sandbox::control::CaptureLevel {
         self.capture
     }

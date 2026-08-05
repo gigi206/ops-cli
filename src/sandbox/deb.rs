@@ -148,7 +148,7 @@ pub(crate) fn resolve_source(
 /// package — the one network+derivation step `deb:apt:` adds over a direct `deb:` URL, kept as a
 /// seam so it is testable against a real index without the heavy `.deb` prefetch. Fetches the index
 /// (fresh past the cache on `sbx upgrade`), selects the newest version, resolves its `Filename:`
-/// against the repo root, and **re-validates that derived URL through [`is_valid_deb_url`]** — the
+/// against the repo root, and **re-validates that derived URL through [`is_valid_deb_url`](crate::config::is_valid_deb_url)** — the
 /// index is remote-controlled, so this is the injection boundary before the URL is fetched or
 /// interpolated into the generated derivation. Fail-closed at every step.
 fn resolve_apt_deb_url(

@@ -45,7 +45,7 @@ pub(crate) enum Backend {
     /// `github:<owner>/<repo>` — which queries the repo's latest release and selects its linux
     /// `.deb` asset, so a project whose asset name embeds the version still rolls forward on
     /// `sbx upgrade`. The stored string is the raw locator (the URL or `github:<owner>/<repo>`);
-    /// [`super::sandbox::deb`] dispatches on its shape.
+    /// `crate::sandbox::deb` dispatches on its shape.
     Deb(String),
     /// `appimage:<url>` — a prebuilt AppImage at an `https://` URL, provisioned **host-side** into
     /// sbx's store exactly like `deb:` (seeded, offline-reusable): sbx resolves the URL to a content
@@ -57,7 +57,7 @@ pub(crate) enum Backend {
     /// direct `https://…/….AppImage` URL, or `github:<owner>/<repo>` — which queries the repo's
     /// latest release and selects its linux `.AppImage` asset, so a project whose asset name embeds
     /// the version still rolls forward on `sbx upgrade`. The stored string is the raw locator (the URL
-    /// or `github:<owner>/<repo>`); [`super::sandbox::appimage`] dispatches on its shape.
+    /// or `github:<owner>/<repo>`); `crate::sandbox::appimage` dispatches on its shape.
     AppImage(String),
     /// `tarball:<url>` — a prebuilt application `.tar.gz`/`.tgz` at an `https://` URL, provisioned
     /// **host-side** into sbx's store exactly like `deb:`/`appimage:` (seeded, offline-reusable): sbx
@@ -67,7 +67,7 @@ pub(crate) enum Backend {
     /// runtime namespace op — the FUSE/namespace path is blocked in-cage), so evaluating it host-side
     /// is safe. Meant for a GUI/desktop app distributed only as a plain tarball. One form: a direct
     /// `https://…/….tar.gz` URL — the stored string is the raw locator;
-    /// [`super::sandbox::tarball`] resolves and builds it.
+    /// `crate::sandbox::tarball` resolves and builds it.
     Tarball(String),
     /// `tarball:resolve` — the auto-upgrade form of [`Backend::Tarball`], for a prebuilt `.tar.gz`
     /// app whose download URL is version-stamped (no stable `latest` alias). Declared as a

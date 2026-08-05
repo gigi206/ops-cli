@@ -70,7 +70,7 @@ pub(crate) struct ProxyCtx {
     pub(super) server_config: Arc<ServerConfig>,
     /// The cage-facing TLS config for a designated `[network] http2` host: identical to
     /// `server_config` but advertising ALPN `h2` only, so the client speaks HTTP/2 (gRPC). Built
-    /// once; used solely by the h2 branch ([`h2mitm`]).
+    /// once; used solely by the h2 branch ([`h2mitm`](super::h2mitm)).
     pub(super) server_config_h2: Arc<ServerConfig>,
     pub(super) upstream: Arc<ClientConfig>,
     /// The upstream-validation config for the h2 branch: like `upstream` but advertising ALPN `h2`,
@@ -111,12 +111,12 @@ pub(crate) struct ProxyCtx {
     pub(super) flows: Option<Arc<crate::sandbox::control::FlowRegistry>>,
     /// The number of raw L4 (`tcp://`) splices currently open. Each splice holds a host thread (and
     /// its fds) for the connection's lifetime, so this caps how many an in-cage agent can open at
-    /// once (see [`MAX_CONCURRENT_SPLICES`]); the inspected L7 path never touches it. Shared across
+    /// once (see [`MAX_CONCURRENT_SPLICES`](super::MAX_CONCURRENT_SPLICES)); the inspected L7 path never touches it. Shared across
     /// connection threads through the [`Arc<ProxyCtx>`] the serve loop clones.
     pub(super) splices: AtomicUsize,
     /// The number of connection-handling threads currently live. Each in-cage connection spawns a
     /// host thread (and holds host fds), so this caps how many an in-cage agent can open at once
-    /// (see [`MAX_CONCURRENT_CONNS`]) — a burst of connections cannot exhaust host threads/fds and
+    /// (see [`MAX_CONCURRENT_CONNS`](super::MAX_CONCURRENT_CONNS)) — a burst of connections cannot exhaust host threads/fds and
     /// take the whole session's egress down. Shared through the `Arc<ProxyCtx>`.
     pub(super) conns: AtomicUsize,
     /// The `sbx app <name>` this launch runs, if any — used only to scope the `sbx net allow`
@@ -301,7 +301,7 @@ impl ProxyCtx {
         }
     }
 
-    /// The single decision chokepoint every site in [`handle_client`] calls: it both counts the
+    /// The single decision chokepoint every site in [`handle_client`](super::handle_client) calls: it both counts the
     /// outcome for `sbx net stats` and pushes one event for the live `sbx net log`, so the two can
     /// never drift and a missed site is a missed *pair*, not a silent stats/log mismatch. `method`
     /// and `path` are the inspected request's (absent for an early-CONNECT block or a raw `tcp://`

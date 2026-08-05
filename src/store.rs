@@ -1260,7 +1260,7 @@ pub(crate) fn physical_path(layout: &Layout, logical: &Path) -> PathBuf {
 
 /// Provision `<flake_ref>#<attr>` into the user-owned store and return its
 /// *logical* store path, rooting it against garbage collection with an out-link
-/// at `gcroot`. `flake_ref` is the pinned reference from [`nixpkgs_ref`].
+/// at `gcroot`. `flake_ref` is the pinned reference from [`LockTarget::resolve`].
 ///
 /// The build runs daemonless with the build sandbox on (safe here, in plain host
 /// context outside the agent's cap-dropped cage). A derivation can have several

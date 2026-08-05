@@ -392,44 +392,44 @@ pub(crate) struct ResolvedApp {
     pub(crate) dbus: Option<bool>,
     /// The app's own cgroup limit overrides, set only from a trusted source (an untrusted
     /// project's app `[limits]` is dropped whole, like its `network`/`gui`). Each set field
-    /// overrides the baseline at [`merge_app`]; an unset one keeps the baseline value. All-`None`
+    /// overrides the baseline at [`merge_app`](Resolved::merge_app); an unset one keeps the baseline value. All-`None`
     /// means the app tunes nothing and inherits the baseline limits.
     pub(crate) limits: crate::sandbox::cgroup::Limits,
     /// The app's own seccomp relaxation, set only from a trusted source (an untrusted project's app
     /// `[seccomp]` is dropped, like its `network`/`limits`). Unions onto the baseline at
-    /// [`merge_app`]; empty means the app relaxes nothing and inherits the baseline relaxation. A
+    /// [`merge_app`](Resolved::merge_app); empty means the app relaxes nothing and inherits the baseline relaxation. A
     /// security field, gated like the baseline `[seccomp]`.
     pub(crate) seccomp: crate::sandbox::seccomp::SeccompPolicy,
     /// The app's own host device grant, set only from a trusted source (an untrusted project's app
     /// `[devices]` is dropped, like its `network`/`seccomp`). Unions onto the baseline at
-    /// [`merge_app`]; empty means the app grants no device and inherits the baseline grant. A
+    /// [`merge_app`](Resolved::merge_app); empty means the app grants no device and inherits the baseline grant. A
     /// security field, gated like the baseline `[devices]`.
     pub(crate) devices: Vec<PathBuf>,
     /// The app's own ssh-agent grant, set only from a trusted source (an untrusted project's app
     /// `[ssh_agent]` is dropped, like its `network`/`devices`). Unions onto the baseline at
-    /// [`merge_app`]; empty means the app names no key of its own and inherits the baseline grant.
+    /// [`merge_app`](Resolved::merge_app); empty means the app names no key of its own and inherits the baseline grant.
     /// A security field, gated like the baseline `[ssh_agent]` — and the field that makes a deploy
     /// key grantable to one app rather than to every cage the project launches.
     pub(crate) ssh_agent: Vec<String>,
-    /// The app's own `[fs]` masks. Unions onto the baseline at [`merge_app`]; empty means the app
+    /// The app's own `[fs]` masks. Unions onto the baseline at [`merge_app`](Resolved::merge_app); empty means the app
     /// closes nothing of its own. Ungated like the baseline `[fs]` — it only subtracts access — and
     /// the union direction means an app can close more of the tree for its own tool without being
     /// able to reopen what the project already closed.
     pub(crate) fs: fspolicy::FsPolicy,
     /// The app's own host loopback forward ports, set only from a trusted source (an untrusted
     /// project's app `forward` is dropped, like its `network`/`gui`). The set **unions** onto the
-    /// baseline's at [`merge_app`]; an empty vec means the app adds none and inherits the baseline
+    /// baseline's at [`merge_app`](Resolved::merge_app); an empty vec means the app adds none and inherits the baseline
     /// set. A security field, gated like the baseline `forward`.
     pub(crate) forward: Vec<u16>,
     /// Credentials to inject for this app (gated; the plaintext never enters the cage).
     pub(crate) secrets: Vec<HeaderSecret>,
-    /// Declared operations this app contributes, unioned onto the baseline's at [`merge_app`] (the
+    /// Declared operations this app contributes, unioned onto the baseline's at [`merge_app`](Resolved::merge_app) (the
     /// app wins on a name collision). A security field, gated like the app's `secrets`.
     pub(crate) tasks: Vec<TaskSpec>,
     /// The verbs this app's unscoped (`{...}`-less) allow rules default to — its read-by-default
     /// posture. Every Mode-B app defaults to `Only(["GET","HEAD"])`; an `[app.<name>.network]
     /// default_methods` override sets a different set (or `Any` for `["*"]`, all verbs). Applied to
-    /// the app's effective allowlist at [`merge_app`]; the baseline `sbx run` never gets
+    /// the app's effective allowlist at [`merge_app`](Resolved::merge_app); the baseline `sbx run` never gets
     /// it (Mode A stays all-verbs).
     pub(crate) default_methods: crate::allowlist::Methods,
     /// Per-field provenance of this app's *scalar* overlay fields, for the per-app `sbx config`
@@ -463,7 +463,7 @@ pub(crate) struct ResolvedApp {
     /// when the app declared none. The merged effective grant is the app's own ∪ the baseline's.
     pub(crate) ssh_agent_origin: Provenance,
     /// Whether this app asks for a per-signature confirmation (`[app.<name>.ssh_agent] confirm`).
-    /// ORed onto the baseline's at [`merge_app`], never subtracted.
+    /// ORed onto the baseline's at [`merge_app`](Resolved::merge_app), never subtracted.
     pub(crate) ssh_agent_confirm: bool,
     pub(crate) home_scope_origin: Option<Provenance>,
     /// Notes about what this app's resolution dropped or ignored — surfaced when the app is
@@ -1864,7 +1864,7 @@ fn overlay_limits(base: &mut crate::sandbox::cgroup::Limits, over: crate::sandbo
     }
 }
 
-/// Resolve a `[seccomp] allow` table into a [`SeccompPolicy`]: split each string on commas, trim,
+/// Resolve a `[seccomp] allow` table into a [`SeccompPolicy`](crate::sandbox::seccomp::SeccompPolicy): split each string on commas, trim,
 /// and resolve each token against the mandatory denylist. A malformed or unknown entry is dropped
 /// with a warning (fail-closed — an unrecognized token loosens nothing); an entry that reopens a
 /// real escape surface is accepted but flagged with a caution. A collection field — drop-bad-entry,
@@ -3664,7 +3664,7 @@ fn validate_gui(
 }
 
 /// Validate a `proc` field — either a bare mode string or a `[proc]` table — mapping it to a
-/// [`ProcPolicy`] and warning on an unknown mode. A typo must never silently leave enforcement in the
+/// [`ProcPolicy`](crate::proc_policy::ProcPolicy) and warning on an unknown mode. A typo must never silently leave enforcement in the
 /// wrong posture; returning `None` keeps the prior (default or parent) policy rather than guessing.
 /// `parent` is the policy of the layer immediately below: a `[proc]` table that omits `mode` inherits
 /// its mode from `parent` while keeping its own `allow`/`deny` rules.
