@@ -1,0 +1,213 @@
+# muse — Muse Code, Meta's terminal coding agent (Muse Spark), sandboxed by sbx.
+#
+#   sbx app import examples/app/muse.toml
+#   sbx app run muse
+#
+# PACKAGING — a bootstrap install, NOT a clean sbx backend. Meta distributes Muse
+# Code ONLY as a two-stage `curl …/install.sh | bash` bootstrap:
+#
+#   1. `install.sh` (dev.meta.ai/install.sh) downloads the LAUNCHER script from
+#      `api.meta.ai/muse-launcher.sh` into `~/.local/bin/muse` and runs it once
+#      (`MUSE_LAUNCHER_INSTALL=1`), which
+#   2. reads the channel manifest `api.meta.ai/muse-code/channels/muse-stable`,
+#      resolves this platform's release artifact (with a published size + sha256),
+#      and downloads the binary from Meta's `lookaside.facebook.com` CDN into
+#      `~/.local/bin/muse-bin-<version>` next to the launcher.
+#
+# So the installed artifact is the LAUNCHER; every `muse` run goes through it. There
+# is no nixpkgs attribute, no GitHub release, and no mise/aqua package for the
+# standalone binary, so none of `nix:`/`mise:`/`flake:`/`deb:` fit — the same reason
+# `cursor-agent`, `pool`, `rovo` and `devin` use the bootstrap pattern. The `cmd`
+# below runs Meta's OWN installer INSIDE the cage on the first launch, contained by
+# bubblewrap + seccomp + the empty netns + the egress allowlist.
+#
+# No toolchain package needed: the launcher's whole toolchain — `curl`, `date`,
+# `mktemp`, `uname`, `wc`, `sha256sum` — is the sbx base toolset (coreutils + a
+# curated `curl`; the curated tools are in src/sandbox/fhs.rs). Unlike `pool`/`rovo`,
+# no tarball is extracted, so no `nix:gnutar`/`nix:gzip` either: the binary arrives
+# unarchived and is `chmod +x`'d into place by `update_binary` (verified in the
+# launcher source, downloaded fresh for this profile). The single `[packages]` entry
+# below serves the cage, not the launcher: it is the zone database (see TIMEZONE).
+#
+# TIMEZONE — the CLI's cron store resolves the local zone the FHS way, by reading
+# `/etc/localtime`, which a hermetic cage does not carry. The wrapper links it (and
+# `/usr/share/zoneinfo`, the directory the resolver reads zone names under) to the
+# `tzdata` provisioned below. The zone defaults to UTC; select yours with
+#     sbx app run muse --env TZ=Europe/Paris
+# which then governs the cage's own `date` too.
+#
+# VERSION / UPGRADE — the launcher normally re-checks the channel hourly and rolls
+# the binary in the background; that would silently move the version, breaking the
+# "versions move only on an explicit upgrade" contract every profile here keeps. So
+# the profile pins the launcher behavior with `MUSE_NO_AUTO_UPDATE=1` and refreshes
+# only on an explicit one-launch override:
+#     sbx app run muse --env MUSE_SBX_UPDATE=1
+# (`--env` is an authoritative one-shot override read on the HOST). The override is
+# the same contract as `--env POOL_SBX_UPDATE=1` on `pool.toml`:
+# the wrapper re-runs the installer, which re-resolves the channel and re-downloads
+# the binary only if the channel version changed (the launcher short-circuits when
+# `.muse-version` matches and `<dir>/muse-bin-<version>` exists).
+# `sbx upgrade` does NOT reach this binary, and cannot: it rolls managed channels
+# (`nix`/`mise`/`flake`/`deb`/`appimage`/`tarball`), and a bootstrap exposes no
+# download URL for a `<backend>:resolve` to re-resolve — Meta's launcher resolves
+# the channel itself, which is exactly what the override above re-runs. The one
+# thing here `sbx upgrade` does move is the `tzdata` below, with the nixpkgs
+# channel (`sbx upgrade nix`).
+#
+# CREDENTIAL POSTURE — two ways in, headless-first:
+#
+#   - **BYOK API key (RECOMMENDED for the cage)** — Meta Model API key in
+#     `$META_API_KEY` on the HOST, injected host-side by the egress proxy (the
+#     commented `[env]` + `[secret]` blocks below). The key goes to
+#     `api.meta.ai/v1` as `Authorization: Bearer`; get it from the Model API /
+#     dev.meta.ai dashboard. Completely headless: no browser, no lingering token.
+#
+#   - **Account / device login** — Muse's own sign-in is a **device flow**, not a
+#     localhost OAuth callback: the launcher POSTs `auth.meta.com/oidc/device
+#     /authorization/`, prints a verification URL + short code on stderr, and polls
+#     `…/oidc/device/token/` until you approve **on your own host-side browser**.
+#     The hermetic cage needs no browser, and no `localhost` callback crosses the
+#     empty netns — the flow is entirely outbound, so it works in-cage as-is.
+#     The CLI's interactive `muse` sign-in may instead spawn a browser; if it does,
+#     run the device flow for the download lane only:
+#       sbx app run muse --env MUSE_LOGIN=1 -- <args>
+#     (`MUSE_LOGIN=1` forces the launcher to run its device login even when stderr
+#     is not a tty). The token it writes to `~/.config/muse/auth.json`
+#     (`$XDG_CONFIG_HOME/muse/auth.json`) lets later downloads authenticate; it
+#     persists in the app's isolated home.
+#
+# EGRESS — honest scope. The four hosts below are GROUNDED: `dev.meta.ai`
+# (the installer, fetched to build this profile), `api.meta.ai` (launcher script +
+# channel manifest + the Model API base the CLI POSTs to), `lookaside.facebook.com`
+# (the CDN the release manifest and binary come from), and `auth.meta.com` (the
+# OIDC device endpoints). What is NOT yet grounded is the CLI's own runtime set —
+# whether `muse` talks only to `api.meta.ai` or also to other Meta hosts (billing,
+# connectors, MCP). The bootstrap itself is verified under this allowlist, from a
+# cold app home through to a headless `exec --provider echo` answer, so the first
+# three hosts are exercised; `auth.meta.com` is allowed but untried, and a real
+# model prompt is the standing open claim. If a request is refused, the proxy NAMES
+# the host: add it to `allow` (or check ahead with `sbx test net <url>`, or run
+# once with `--net-learn` to have the refusals propose the rules).
+# Note: the installer itself can answer `403` with "muse is available to Meta
+# employees" — that is the VENDOR's gate on the release channel, not sandbox
+# gating, and a bare host gets the same refusal when the serving account is not
+# eligible for the released feed.
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+bin="$HOME/.local/bin/muse"
+# A hermetic cage carries no `/etc/localtime`, and the CLI's cron store fails to
+# start without one:
+#   tbh-cron: cron timezone reconcile failed: cron store backend error:
+#   local timezone could not be determined
+# So point both FHS names at the provisioned zone database. Both are needed: the
+# resolver reads the zone NAME from the `/etc/localtime` link, and re-resolves a
+# `$TZ` it is given under `/usr/share/zoneinfo` — a `TZ` alone, without these
+# links, leaves the cage worse off than unset (the CLI still fails, and the cage's
+# `date` reads the name as a bare POSIX abbreviation at UTC). Guarded end to end: a
+# zone name the database does not carry leaves the cron warning in place rather
+# than failing the launch, and an `/etc/localtime` that already exists is left
+# alone, so the profile defers to whatever provided it. The glob spans tzdata's
+# other outputs (`-bin`, `-man`) as well, which is why the loop tests for the zone
+# file itself and moves on: it is that test, not the glob, that picks the output
+# carrying the database.
+zone="${TZ:-UTC}"
+if [ ! -e /etc/localtime ]; then
+  for zi in /nix/store/*-tzdata-*/share/zoneinfo; do
+    [ -f "$zi/$zone" ] || continue
+    { mkdir -p /usr/share \
+      && { [ -e /usr/share/zoneinfo ] || ln -s "$zi" /usr/share/zoneinfo; } \
+      && ln -sfn "/usr/share/zoneinfo/$zone" /etc/localtime; } || true
+    break
+  done
+fi
+# First launch only: run Meta's official installer into the isolated home
+# (contained by the sandbox + the egress allowlist), so the per-project build
+# that `mise:` backends automate is instead carried by the vendor's own script.
+# `MUSE_INSTALL_DIR` pins the launcher to ~/.local/bin; `MUSE_NO_MODIFY_PATH=1`
+# stops the installer from editing shell rc files (there is nothing worth adding
+# PATH to — the profile exports it below anyway). Both sit on the `bash` that runs
+# the script, NOT in front of `curl`: an environment prefix binds to its own
+# command, so on the left of the pipe the installer would never see either, and it
+# would append its own PATH line to the isolated home's `~/.profile`. Later
+# launches reuse the installed launcher. If the installer script changes upstream,
+# only this line changes; the launcher + binary resolve themselves from the channel.
+if [ ! -x "$bin" ] || [ -n "$MUSE_SBX_UPDATE" ]; then
+  curl -fsSL https://dev.meta.ai/install.sh \
+    | MUSE_INSTALL_DIR="$HOME/.local/bin" MUSE_NO_MODIFY_PATH=1 bash
+fi
+export PATH="$HOME/.local/bin:$PATH"
+exec "$bin" "$@"
+    ''',
+    # `$0` placeholder: `sbx app run muse -- <args>` appends <args> to this cmd
+    # array, so they arrive as `$1 $2 …` and reach the CLI verbatim via
+    # `exec … "$@"`.
+    "muse",
+]
+
+# Your host Meta Code config/auth, mounted read-write at its real absolute
+# paths. `binds` is a security field, honored only because this profile lives in
+# your trusted config dir; `mode = "rw"` lets the caged `muse` read and write
+# these host files (config, auth.json, history). Uncomment to share your host
+# setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/muse", mode = "rw" },
+#]
+
+# The zone database the wrapper links `/etc/localtime` to. Only its `share/zoneinfo`
+# is what this profile wants, but nix's tzdata also ships a `bin` output, and sbx
+# puts that on the cage PATH: the agent therefore also gains `zic` and `zdump` (the
+# zone compiler and its dumper — both local, neither reaching the host or the
+# network). Declared rather than assumed — tzdata reaches a store only as a
+# transitive dependency of whatever else was built there, so without this entry the
+# wrapper's lookup is a lottery on which packages the project happens to carry.
+[packages]
+tzdata = "nix:tzdata"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
+# prompts / model traffic / device login) is opened to all verbs with `{*}`. The
+# pure download host stays `{GET}` (least privilege — the agent can only *read*
+# from it, never POST or upload).
+[network]
+mode = "deny"
+allow = [
+    # Bootstrap: `install.sh` is served from here (the one line the wrapper curls).
+    "{GET} https://dev.meta.ai",
+    # Install + runtime in one host: the launcher script, the channel manifest, and
+    # the Model API (`api.meta.ai/v1`, OpenAI-compatible Responses — SSE over
+    # HTTPS, NOT a WebSocket) share the `api.meta.ai` apex. Opened to all verbs
+    # because model traffic is POST. If the CLI's live traffic diverges, the proxy
+    # names the new host in `sbx net logs -a muse`.
+    "{*}   https://api.meta.ai",
+    # Release binary + release manifest: the channel manifest points at
+    # `lookaside.facebook.com` as the download host (the URL is retargeted so the
+    # DOWNLOAD never touches api.meta.ai). Read-only. If Meta ever moves the CDN
+    # host, the launcher's `MUSE_DOWNLOAD_HOST` override tells you: the vendor
+    # reads it from `MUSE_DOWNLOAD_HOST`, and it will surface as a refused host
+    # named in `sbx net logs`.
+    "{GET}  https://lookaside.facebook.com",
+    # Account / device login: the OIDC device endpoints (`/oidc/device
+    # authorization/` and `…/token/`), both POST. Only needed for the account
+    # posture; the BYOK path never touches it (comment it out if you keep the
+    # defaults and never sign in).
+    "{*}   https://auth.meta.com",
+]
+
+[env]
+# Cut the CLI's background behavior that moves the version without asking:
+# disables the launcher's hourly auto-check + background re-download, so a
+# long-lived project store keeps the version it was installed at until you run
+# `--env MUSE_SBX_UPDATE=1`. Complementing the [network] deny-by-construction
+# backstop for whatever else the CLI tries to reach at startup.
+MUSE_NO_AUTO_UPDATE = "1"
+# BYOK API key (commented, headless) — the in-cage placeholder lets `muse` start
+# and issue its first request; the egress proxy strips it and substitutes the real
+# key, read on the HOST (as $META_API_KEY), on the wire to `api.meta.ai`.
+# META_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.meta.ai"]
+#from = "env://META_API_KEY"
+#header = "Authorization"
+#type = "bearer"

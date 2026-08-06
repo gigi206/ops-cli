@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/) directory ships **63 importable
+The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/) directory ships **64 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -15,7 +15,7 @@ terminal agent, a desktop window, or a UI served in your host browser. The per-p
 packaging notes and the "not here yet, and why" triage live in
 [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/).
 
-## Terminal agents (44)
+## Terminal agents (45)
 
 The common case: a CLI or TUI that runs in the terminal you launched it from.
 
@@ -48,6 +48,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `kilocode` | `mise:github:Kilo-Org/kilocode` | provider-dependent (BYOK) |
 | `kimi` | `nix:nodejs` (+ `mise:npm:@moonshot-ai/kimi-code`) | `api.kimi.com` (`KIMI_API_KEY` / Moonshot account) |
 | `mimo` | `nix:nodejs` (+ `mise:npm:@mimo-ai/cli`) | `api.xiaomimimo.com` (MiMo Auto / Xiaomi account) |
+| `muse` | bootstrap installer (`cmd` wrapper) + `nix:tzdata` (zone database, no toolchain package) | `api.meta.ai` (Meta Model API / Muse Spark BYOK) or a Meta account (device login) |
 | `nova` | `nix:nodejs` (+ `mise:npm:@compass-ai/nova`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
 | `omp` | `mise:github:can1357/oh-my-pi` (a high-capability fork of Pi — this repo's `pi`) | provider-dependent (BYOK) |
 | `openclaude` | `nix:nodejs` (+ `mise:npm:@gitlawb/openclaude`) | provider-dependent (BYOK: OpenAI-compatible / Anthropic / Gemini) |

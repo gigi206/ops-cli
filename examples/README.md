@@ -83,6 +83,7 @@ step is skipped for its `@vscode/ripgrep` dependency, yet it needs no wrapper �
 | `vibe`            | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, `nix:chromium`, `gui = "wayland"`) | `console.mistral.ai` (Mistral account SSO, in-cage browser) / `api.mistral.ai` (BYOK) |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
 | `mimo`            | `mise:npm:@mimo-ai/cli` (+ `nix:nodejs`) — a Node shim over a ~124 MB prebuilt binary; the vendor's `postinstall` only caches it and mise's `--ignore-scripts` skips it (the `dirac` near-miss: the shim resolves the binary itself) | `api.xiaomimimo.com` (MiMo Auto anonymous channel / Xiaomi MiMo Platform OAuth account) + BYOK |
+| `muse`            | bootstrap installer (`cmd` wrapper) — Meta's own `curl …/install.sh | bash` two-stage bootstrap (a launcher script + `muse-bin-<version>` in `~/.local/bin`, the binary verified by the size + sha256 the channel publishes); no toolchain package: the whole toolchain (`curl` + coreutils incl. `sha256sum`) is the base userland, and no tarball is extracted, so the one `[packages]` entry is the data-only `nix:tzdata` its wrapper links `/etc/localtime` to | `api.meta.ai` (Meta Model API / Muse Spark BYOK, `META_API_KEY`) or a Meta account device login (`auth.meta.com`, printed verification URL — no in-cage browser) |
 | `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
 | `cline`           | `mise:npm:cline` (+ `nix:nodejs`)                | `openrouter.ai` (BYOK)  |
 | `droid`           | `mise:npm:droid` (+ `nix:nodejs`)                | `*.factory.ai` (account) |
@@ -241,6 +242,29 @@ in [the worked example](../docs-site/docs/guide/configuration/secret.md#worked-e
 > allowlist, the profile header documents the one-launch `--net shared` fallback and the exact
 > failure signatures to read from `sbx net logs -a cursor-agent`.
 >
+> `muse` (Meta's Muse Code terminal agent) is a **bootstrap** profile in the `pool` mould, with a
+> lighter packaging story: Meta's `install.sh` needs only the base userland (its `curl` + coreutils
+> `sha256sum`/`date`/`uname`/`wc`/`mktemp`), so the profile declares **no toolchain package at
+> all**, and the launcher downloads the release binary unarchived (verified size + sha256) — no
+> `tar`/`gzip` either. Its one `[packages]` entry serves the cage rather than the launcher:
+> `nix:tzdata`, because the CLI's cron store reads `/etc/localtime` and a hermetic cage carries none
+> (without it every launch prints `tbh-cron: cron timezone reconcile failed: … local timezone could
+> not be determined`). The wrapper links both `/etc/localtime` and `/usr/share/zoneinfo` to that
+> database, defaulting to UTC; `--env TZ=Europe/Paris` selects the zone, for the agent and the
+> cage's own `date` alike. Side effect worth knowing: nix's tzdata also ships a `bin` output, which
+> sbx puts on the cage PATH, so the agent gains `zic` and `zdump`.
+> The egress hosts are grounded in the vendor's installer + launcher (`dev.meta.ai`,
+> `api.meta.ai`, `lookaside.facebook.com`, `auth.meta.com`), and the launcher's hourly auto-update
+> is disabled (`MUSE_NO_AUTO_UPDATE=1`) so the version moves only on `--env MUSE_SBX_UPDATE=1`.
+> The live bootstrap **is** verified, on a cold app home and under the allowlist: `install.sh`, the
+> launcher, the channel manifest and the binary download all land, and the CLI then answers a
+> headless `exec --provider echo` run, which grounds `dev.meta.ai`, `api.meta.ai` and
+> `lookaside.facebook.com`. **Its unverified set**: a real model prompt under the allowlist (is
+> `api.meta.ai` the CLI's only runtime host?), the `META_API_KEY` proxy injection, and the device
+> login (`auth.meta.com` is allowed but was never exercised) — and one vendor-side gate to be aware
+> of: the release channel can answer `403` ("muse is available to Meta employees") when the account
+> is not eligible, on a bare host too.
+>
 > `cursor` (the Cursor desktop **editor** — the GUI sibling of `cursor-agent`) is an Electron
 > profile in the `opencode-desktop` / `claude-desktop` mould: packaged from Cursor's prebuilt `.deb`
 > via the `deb:` backend (autoPatchelf'd host-side), displayed with `gui = "wayland"` + `gpu` +
@@ -353,6 +377,7 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | `aider`       | `mise:pipx:aider-chat` (+ `nix:uv`, `nix:python312`) | aider's own PyPI package (`aider-chat`, bin `aider`, Python >=3.10,<3.15 — the classic pair-programming REPL; model-prefix routing, e.g. `--model openrouter/…`) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
 | `mimo`        | `mise:npm:@mimo-ai/cli`                          | Xiaomi's own npm scope (bin `mimo`): a JS shim that resolves the platform binary (`@mimo-ai/mimocode-linux-x64`, a `-musl`/`-baseline` variant) from `node_modules` — plain optional deps, node at runtime |
+| `muse`        | bootstrap installer (no sbx backend — `cmd` wrapper) | Meta's own two-stage bootstrap: `install.sh` (served from `dev.meta.ai`) drops the `muse-launcher.sh` launcher into `~/.local/bin/muse`, then the launcher resolves the channel manifest (`api.meta.ai/muse-code/channels/muse-stable`), downloads the release binary (size + sha256 verified against the manifest) from `lookaside.facebook.com` into `~/.local/bin/muse-bin-<version>`, and execs it. Re-run with `sbx app run muse --env MUSE_SBX_UPDATE=1` to advance — the launcher's hourly auto-update is disabled with `MUSE_NO_AUTO_UPDATE=1` so the version moves only on that explicit override |
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
 | `cline`       | `mise:npm:cline` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
@@ -418,6 +443,7 @@ through a one-shot env override instead:
 | ------- | ------- |
 | `cursor-agent` | `sbx app run cursor-agent --env CURSOR_AGENT_SBX_UPDATE=1` |
 | `pool` | `sbx app run pool --env POOL_SBX_UPDATE=1` |
+| `muse` | `sbx app run muse --env MUSE_SBX_UPDATE=1` |
 | `open-design` | `sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1` |
 | `odysseus` | `sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1` |
 
