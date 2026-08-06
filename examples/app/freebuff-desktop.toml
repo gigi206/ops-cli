@@ -66,7 +66,11 @@
 # the driver needs) — without it a Chromium/Electron app on Wayland often produces no buffer and no window
 # maps, so it is on. mesa covers Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (renders,
 # slower). `dbus = true` gives the cage its OWN private desktop portal (needed for the OpenURI handler
-# above), a file picker that opens IN-CAGE, notification relaying, and host light/dark theme following. The
+# above), a file picker that opens IN-CAGE, notification relaying, and host light/dark theme following —
+# though this app stays dark whatever your desktop does, and that is upstream's choice, not a cage
+# limit: its UI stylesheet carries no `prefers-color-scheme` at all and hard-codes one dark palette
+# (`--bg: #0e0e0e`), with no theme setting in its preferences either. The file picker it opens still
+# follows your desktop. The
 # Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp + the empty netns
 # IS the boundary (it replaces Chromium's own redundant sandbox); `--ozone-platform=wayland` selects the
 # Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
