@@ -1,0 +1,106 @@
+# mimo — MiMo Code, Xiaomi's agentic coding CLI (a fork of opencode), sandboxed by sbx.
+#
+#   sbx app import examples/app/mimo.toml
+#   sbx app run mimo
+#
+# MiMo Code is a terminal-native AI coding assistant distributed as a CLI (bin `mimo`), shipped
+# on npm as `@mimo-ai/cli`. It is a fork of opencode: the same TUI, LSP, MCP and plugin stack,
+# plus persistent memory, context management, subagent orchestration and the Compose workflows.
+# It is equipped fresh from upstream via mise's npm backend — no nixpkgs lag — at the latest
+# upstream version on the first launch in a project; `sbx upgrade mise` rolls it forward.
+#
+# PACKAGING — npm + platform optional-dep (the `cline`/`droid`/`reasonix` mould, with a moot
+# postinstall). `@mimo-ai/cli` is a thin Node shim (`bin/mimo`) that probes the CPU (AVX2) and
+# libc (musl), resolves the matching platform binary — `@mimo-ai/mimocode-linux-x64`, or a
+# `-musl` / `-baseline` variant — from the shared `node_modules`, and `exec`s it. The vendor's
+# `postinstall` only hardlinks a `.mimocode` cache next to the shim and prints a migration
+# notice; mise's npm backend skips scripts, the cache is not needed, and no `cmd` wrapper is
+# required (the `dirac` near-miss, resolved PATH-first, in reverse: the shim resolves the
+# binary itself). Because the launched file IS the JS shim, **node is needed at RUNTIME**
+# (`nix:nodejs` below), not only to install — like reasonix.
+#
+# CREDENTIALS — three postures, matching the first-launch wizard:
+#
+#  - **MiMo Auto** (built-in, free for a limited time): anonymous and zero-config — the CLI
+#    talks to the Xiaomi MiMo platform backend below. Nothing to inject, nothing to log in to.
+#  - **Xiaomi MiMo Platform** (account): OAuth at `platform.xiaomimimo.com`. Complete the login
+#    once inside the cage and the token persists in the app's isolated `$HOME`
+#    (`~/.local/share/mimocode/auth.json`), never in the project shell. The allowlist opens
+#    the OAuth host.
+#  - **BYOK** (provider list / custom provider in the TUI): any OpenAI-compatible API. Point
+#    the allowlist and a `[secret]` block at that provider's host — the OpenRouter example is
+#    wired up commented at the bottom.
+#
+# Because mimo is MULTI-PROVIDER its egress depends on the model you actually use. The
+# allowlist below is the MiMo-flavored default. If a request is blocked, the proxy reports the
+# refused host — add it to `allow` (or check ahead with `sbx test net <url>`).
+cmd = "mimo"
+
+# Your host mimo config/data, mounted read-write at their real absolute paths. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir;
+# `mode = "rw"` lets the caged `mimo` read and write these host files (login, settings,
+# history). MiMo's config lives under ~/.config/mimocode and its data (auth.json, sessions,
+# memory) under ~/.local/share/mimocode in the app's isolated home by default; uncomment to
+# share your host setup with the cage instead.
+#binds = [
+#    { path = "~/.config/mimocode", mode = "rw" },
+#    { path = "~/.local/share/mimocode", mode = "rw" },
+#    { path = "~/.cache/mimocode", mode = "rw" },
+#]
+
+[packages]
+# A node runtime (the `bin/mimo` Node shim is what launches — needed at RUNTIME, not only to
+# install), plus MiMo Code itself via mise's npm backend. Both are trusted-only [packages];
+# this profile is trusted by location once imported. `sbx upgrade mise` rolls the CLI forward.
+nodejs = "nix:nodejs"
+mimo = "mise:npm:@mimo-ai/cli"
+
+# Egress is denied by construction except the hosts the MiMo-flavored setup hits. Grounded in
+# the upstream source (packages/opencode), not guessed:
+#
+#  - api.xiaomimimo.com      the Xiaomi MiMo Open Platform API, OpenAI-compatible, base /v1 —
+#                            all model traffic (completions POSTs plus the built-in web search,
+#                            which POSTs /chat/completions to the same host). Opened to every
+#                            verb with `{*}` (an app is read-by-default {GET,HEAD}).
+#  - platform.xiaomimimo.com the OAuth login host, the plugin console, and the token-plan
+#                            management page — the account posture (opened to `{*}`).
+#  - models.dev              the model catalogue, a read-only fetch (opencode heredity).
+#  - registry.npmjs.org      installing the CLI via mise's npm backend (the shim's packument +
+#                            tarball and the platform optional-dep binary).
+#  - mimo.xiaomi.com         the config/tui/theme `$schema` and the docs (auto-injected by the
+#                            CLI for your editor; optional in a cage — read-only).
+#  - mimocode.cnbj1.mi-fds.com  the self-update binary CDN, hit by `mimo upgrade` (read-only).
+#
+# ── Alternate providers (uncomment the host(s) you actually use, and pair each with a
+#    matching [secret] block — the OpenRouter one is at the bottom) ──────────────────────────
+[network]
+mode = "deny"
+allow = [
+    "{*} https://api.xiaomimimo.com",
+    "{*} https://platform.xiaomimimo.com",
+    "{GET} https://mimo.xiaomi.com",
+    "{GET} https://models.dev",
+    "{GET} https://registry.npmjs.org",
+    "{GET} https://mimocode.cnbj1.mi-fds.com",
+    #"{*} https://openrouter.ai",
+    #"{*} https://api.openai.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): nothing grounded
+# yet — a host the CLI reaches that is not listed returns a 403 naming `sbx net allow <host>`,
+# so add any the proxy surfaces (and mute the ones you deliberately leave denied).
+#mute = [
+#]
+
+# BYOK path (alternate providers): the real key is read on the HOST and injected by the egress
+# proxy — never in the cage. Provide it on the host as $OPENROUTER_API_KEY (or point `from` at
+# a resolver, e.g. sops://secrets.yaml#openrouter), uncomment the host in [network] allow
+# above and this block, and add the placeholder below. The in-cage placeholder lets the CLI
+# start and issue the request; the proxy strips it and substitutes the real key on the wire.
+#[env]
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

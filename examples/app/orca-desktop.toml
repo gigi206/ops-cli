@@ -1,0 +1,176 @@
+# orca-desktop — the Orca Agent Development Environment (ADE), sandboxed by sbx (with a Wayland
+# display).
+#
+#   sbx app import examples/app/orca-desktop.toml
+#   sbx app run orca-desktop
+#
+# Orca (github.com/stablyai/orca, MIT, onorca.dev) is a DESKTOP "ADE": an Electron app that runs
+# agent CLIs side by side — Claude Code, Codex, OpenCode, … — each in its own isolated git
+# worktree, with Ghostty-class terminals, an embedded Chromium browser, an editor and an account/
+# usage pane. Orca itself ships no model runtime: every "agent" in a worktree is a CLI installed
+# in the cage. This profile therefore also equips ONE pilot agent — `opencode` — in `[packages]`,
+# so `orca worktree create --agent opencode --prompt "…"` works out of the box (Orca
+# preconfigures OpenCode; other TUI agents resolve by name once installed in the cage — add them
+# to `[packages]` the same way). Orca's own CLI — `orca-ide` — is the SAME Electron binary run
+# with `ELECTRON_RUN_AS_NODE=1 out/cli/index.js` (upstream packages the CLI entrypoint outside
+# app.asar); the GUI and the CLI share one process model inside the cage.
+#
+# THE `deb:github:` BACKEND (no third party, tracks upstream automatically). This profile names the
+# GitHub repo — `deb:github:stablyai/orca` — and sbx queries the repo's LATEST release, selects
+# its linux-amd64 `.deb` asset (`orca-ide_<version>_amd64.deb`; a `.rpm` and AppImage are also
+# shipped but the `.deb` is the one sbx packages), resolves it to a content hash (asset URL and
+# hash both pinned in the per-project deb lock), and builds a generated derivation that unpacks
+# the `.deb` and `autoPatchelfHook`s the Electron binaries against a curated library set. The
+# binary lives at `/opt/Orca/orca-ide` in the package (upstream's `executableName` — bare `orca`
+# on Linux is the GNOME screen reader, which is why the cage only ever calls it `orca-ide` or, on
+# PATH, the wrapped `orca-desktop`); the derivation wraps it generically from its `resources/`
+# signature. The build is HOST-SIDE and offline-reusable; pin-on-first-use, rolled forward by
+# `sbx upgrade deb`. No manual version bump, no community flake. First launch pulls the Electron
+# closure over your host network (a couple of minutes); later launches reuse the pinned build.
+# Orca's own auto-update checks (GitHub releases) ride the built-in github allow-set; sbx owns
+# the version here.
+#
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
+# database (`~/.pki/nssdb`), so a Chromium app would otherwise fail every HTTPS with
+# `ERR_CERT_AUTHORITY_INVALID`. For a `gui = "wayland"` cage under a filtering posture, sbx seeds
+# its MITM CA into the cage's NSS db automatically (part of the GUI hole, like fonts) — the app
+# only has to be told to consult that store, hence `--use-system-ca`.
+#
+# DISPLAY + GPU. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and
+# provisions fonts, so the Electron window maps on your compositor. X11 is never offered.
+# Isolation is compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland)
+# expose screen-capture/input-injection to ordinary clients (see docs-site/docs/guide/configuration/gui.md).
+# `gpu = true` opens hardware-accelerated rendering (mesa drivers, the render node under
+# `/dev/dri`, the minimal `/sys` DRM subtree — see docs-site/docs/guide/configuration/gpu.md);
+# without it a Chromium/Electron app on Wayland often fails to produce a buffer and no window
+# maps. mesa covers Intel/AMD/nouveau; an NVIDIA-only machine falls back to software rendering.
+# The Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp +
+# the empty netns IS the boundary; `--ozone-platform=wayland` selects the Wayland backend;
+# `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
+#
+# DBUS. `dbus = true` gives the cage its OWN private desktop portal (a `dbus-daemon` +
+# `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER
+# opens IN-CAGE and lists the cage filesystem (the project bind + the app's isolated home). It
+# also relays desktop notifications and host light/dark theme. Requires `gui = "wayland"`. The
+# login keyring is never exposed.
+#
+# SIGN-IN. Where the tool's sign-in opens an external browser, the profile wires an in-cage
+# Chromium as the `xdg-open` handler so the whole login closes inside the cage (see the `cmd`
+# wrapper below). That matters for the Orca ACCOUNT flow (`login.onorca.dev`) and for any interior
+# agent that re-authenticates via a web page; the pilot `opencode` agent is BYOK (env var) and
+# needs no browser. The Orca account host stays DENIED by default — open `{*} https://login.onorca.dev`
+# the day you sign in to your Orca account (the in-cage Chromium renders the page). `relay.onorca.dev`
+# (the mobile/remote pairing relay) stays denied too; open it only if you pair the companion app.
+#
+# TELEMETRY. Orca phones home to PostHog (`us.i.posthog.com`) for usage/feature events. The app
+# honors `ORCA_TELEMETRY_DISABLED` (and `orca_telemetry_disabled`) — set below — and there is a
+# first-run consent (`settings.telemetry`). The host is denied AND muted below; a `mute` never
+# changes the verdict (still refused) and never hides a count (`sbx net stats` still tallies it).
+# Remove the env var and the mute entry the day you decide to allow telemetry.
+#
+# UNVERIFIED (like every profile until run): the live deb build, the Wayland window mapping, and
+# the interior `opencode` launch from an Orca worktree. Grounded here: the packaging (release
+# assets `orca-ide_*_amd64.deb`, `/opt/Orca/orca-ide`, the `resources/bin/orca-ide` launcher, the
+# `ELECTRON_RUN_AS_NODE` CLI entrypoint — read out of the v1.4.173 artifact), the telemetry opt-out
+# and hosts (read out of app.asar), and Orca's known agent ids (`--agent opencode`, per upstream's
+# CLI skill guide).
+cmd = [
+    "bash",
+    "-c",
+    '''
+# xdg-open routing: the Orca-account sign-in and any interior-agent web auth open their URL
+# through Electron's `shell.openExternal` -> `xdg-open`. Route every http(s) URL to the IN-CAGE
+# Chromium so the login closes inside the cage (MIMEAPPS registration below routes the desktop
+# portal's OpenURI through the same wrapper; the Exec path is ABSOLUTE because the portal-launched
+# handler does not inherit this shell's PATH). Orca has no app deep-link scheme to route.
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
+#!/bin/sh
+case "$1" in
+  http://*|https://*)
+    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
+      --no-first-run --no-default-browser-check "$@" ;;
+  *)
+    echo "xdg-open: no handler for $1" >&2
+    exit 1 ;;
+esac
+WRAP
+chmod +x "$HOME/.local/bin/xdg-open"
+export PATH="$HOME/.local/bin:$PATH"
+mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
+cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=sbx URL handler
+Exec=$HOME/.local/bin/xdg-open %U
+MimeType=x-scheme-handler/http;x-scheme-handler/https;
+NoDisplay=true
+Terminal=false
+EOF
+cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
+[Default Applications]
+x-scheme-handler/http=sbx-open-uri.desktop
+x-scheme-handler/https=sbx-open-uri.desktop
+MIMEAPPS
+
+exec orca-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --use-system-ca
+''',
+]
+
+gui = "wayland"
+gpu = true
+dbus = true
+
+[packages]
+# The ADE itself, from upstream's GitHub release (see "THE `deb:github:` BACKEND" above).
+orca-desktop = "deb:github:stablyai/orca"
+# In-cage Chromium as the `xdg-open` handler for sign-in flows (see the cmd wrapper above).
+chromium = "nix:chromium"
+# The PILOT interior agent — the same `opencode` the CLI profile equips (`mise:opencode`), so
+# `orca worktree create --agent opencode --prompt "…"` has something to launch. Add other agent
+# CLIs (claude-code, codex, …) here the same way; Orca resolves any installed TUI agent by name.
+opencode = "mise:opencode"
+
+[network]
+mode = "deny"
+# Egress by construction, refused except what you open. The pilot `opencode` agent talks to the
+# same hosts as the `opencode` CLI profile (models.dev is the read-only model catalogue; opencode.ai
+# is the gateway/auth/schemas — opened to all verbs with `{*}` because an app is read-by-default
+# and completions are a POST; registry.npmjs.org is opencode's runtime plugin fetch). For a DIRECT
+# provider instead of the gateway, add its host (`{*} https://api.anthropic.com`,
+# `{*} https://api.openai.com`, or `{*} https://openrouter.ai`) and fill the [secret] block.
+# Orca's own hosts (`login.onorca.dev` account sign-in, `relay.onorca.dev` mobile pairing relay,
+# `www.onorca.dev` docs/update metadata) are denied by default; open the ones you use.
+# If a request is refused, the proxy names the host — watch `sbx net logs -a orca-desktop` and
+# add it here (or check ahead with `sbx test net <url>`).
+allow = [
+    "{GET} https://models.dev",
+    "{*} https://registry.npmjs.org",
+    "{*} https://opencode.ai",
+    # Direct-OpenRouter BYOK for the pilot opencode agent: uncomment together with the [secret]
+    # block below.
+    #"{*} https://openrouter.ai",
+    # Orca account sign-in (rendered by the in-cage Chromium) and mobile/remote pairing relay.
+    #"{*} https://login.onorca.dev",
+    #"{*} https://relay.onorca.dev",
+]
+# Silence the denied telemetry: Orca POSTs usage/feature events to PostHog, which the allowlist
+# already refuses (`denied-default`). `mute` keeps those refusals out of the default `sbx net logs`
+# (still denied, still counted in `sbx net stats`; see them with `--all`).
+mute = [
+    "us.i.posthog.com",
+]
+
+# Telemetry: opt-out from the start (the app also honors `orca_telemetry_disabled` and the
+# first-run `settings.telemetry` consent). The provider-key placeholder below stays commented —
+# the real key never enters the cage: the proxy strips the placeholder and substitutes the key,
+# read on the HOST, on the wire, for the pilot `opencode` agent.
+[env]
+ORCA_TELEMETRY_DISABLED = "1"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

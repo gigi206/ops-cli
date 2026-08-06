@@ -3,26 +3,32 @@
 #   sbx app import examples/app/amp.toml
 #   sbx app run amp
 #
-# Amp ships on npm as `@ampcode/cli` — a thin wrapper package whose real payload is a prebuilt
-# native binary published as a platform optional dependency (`@ampcode/cli-linux-x64`). Note the
-# rename: the older `@sourcegraph/amp` still resolves but upstream now publishes `@ampcode/cli`,
-# which is what this profile equips. sbx installs it in-cage with mise's npm backend over a node
+# Amp ships on npm as `@ampcode/cli` — a small JS wrapper whose real payload is a single-file
+# native binary published as a PLATFORM OPTIONAL DEPENDENCY (`@ampcode/cli-linux-x64`, an ELF
+# compiled by Bun, ~111 MiB). Verified against the published tarball at
+# `@ampcode/cli@0.0.1785961745-gfab117`: the wrapper at `bin/amp.exe` is a 141-byte ASCII
+# placeholder; the package's `install.cjs` (its `postinstall` script) hardlinks or copies the
+# platform binary from the optional dep over the placeholder — after which `bin/amp.exe` IS the
+# ELF, and `amp` runs it directly. sbx installs it in-cage with mise's npm backend over a node
 # runtime; `sbx upgrade mise` rolls it forward.
 #
-# WHY `cmd` IS A WRAPPER, NOT A BARE `amp`. The npm wrapper ships a small placeholder at
-# `bin/amp.exe` and replaces it with the real binary in a **postinstall** script (`install.cjs`,
-# which hardlinks the platform package's `amp` over the placeholder). mise's npm backend installs
-# with `--ignore-scripts=true` — a deliberate security default: it will not run arbitrary package
-# scripts — so a plain install leaves the placeholder in place and `amp` exits with
-# "Error: Amp native binary not installed." The wrapper below heals exactly that, and only that:
-# on the first launch (and again after `sbx upgrade mise` rolls Amp to a version whose fresh
-# install dir has a new placeholder) it runs the package's own `install.cjs`, which copies the
-# binary that is ALREADY on disk beside it — no download, no network, and nothing but the vendor's
-# own script. The guard makes it idempotent. Same shape as `openfox.toml`'s `npm rebuild` step.
-# (`mise where` accepts a SCOPED package name and answers with the install directory, whose layout
-# is `lib/node_modules/<scope>/<name>` — both checked against a real scoped install rather than
-# assumed. If the query ever fails, `set -eu` aborts the launch with mise's own message instead of
-# running a half-installed CLI.)
+# The previous package name `@sourcegraph/amp` was an alias to `@ampcode/cli` and was removed on
+# 2026-06-15 (per `ampcode.com/news/npm-package-changes`); this profile only refers to the new
+# name.
+#
+# WHY `cmd` IS A WRAPPER, NOT A BARE `amp`. mise's npm backend installs with
+# `--ignore-scripts=true` — a deliberate security default: it will not run arbitrary package
+# scripts. The Amp `postinstall` is exactly the kind of script this default blocks, so a plain
+# install leaves the 141-byte placeholder in place and `amp` exits with an error. The wrapper
+# below simply runs the package's OWN FALLBACK — `cli-wrapper.cjs`, which `require.resolve` the
+# platform optional dep and `spawnSync` its `amp` binary. No placement, no file copy, no extra
+# network: the optional dep was already on disk after mise fetched it, and the wrapper hands
+# `argv` straight to the native binary. The same shape works whether or not `install.cjs` ever
+# ran (e.g. after a future `sbx upgrade mise` that re-fetches the wrapper with a fresh
+# placeholder). `mise where` accepts a SCOPED package name and answers with the install
+# directory, whose layout is `lib/node_modules/<scope>/<name>` — verified against a real scoped
+# install. If the query ever fails, `set -eu` aborts the launch with mise's own message instead
+# of running a half-installed CLI.
 #
 # CREDENTIAL POSTURE — an Amp account, with a headless key. `amp login` opens a browser (which the
 # hermetic cage does not have), so the practical path is `AMP_API_KEY`, documented in the Amp
@@ -30,38 +36,41 @@
 #   - host-side injection (the sbx way, key never in the cage): uncomment the `[env]` placeholder
 #     and the `[secret]` block below;
 #   - or pass it for a single launch: `sbx app run amp --env AMP_API_KEY=…` (never baked in here).
-# Settings live at `~/.config/amp/settings.json` inside the app's isolated home.
+# Settings live at `~/.config/amp/settings.json` inside the app's isolated home; AGENTS.md files
+# at `~/.config/amp/AGENTS.md` and `~/.config/AGENTS.md` are auto-included.
 #
 # UNVERIFIED (like every profile until run with a real account): the live authentication and the
-# model traffic through sbx's MITM. Grounded here: the packaging and its postinstall trap (read out
-# of the published package), the `AMP_*` environment keys and the `ampcode.com` endpoints (read out
-# of the shipped binary), and the bearer-token shape of the `Authorization` header.
+# model traffic through sbx's MITM. Grounded here: the packaging and its `cli-wrapper.cjs`
+# fallback (read out of the published tarball), the `AMP_*` environment keys and the `ampcode.com`
+# endpoints (read out of the shipped binary), and the bearer-token shape of the `Authorization`
+# header.
 cmd = [
     "bash",
     "-c",
     """
 set -eu
 amp="$(mise where 'npm:@ampcode/cli')/lib/node_modules/@ampcode/cli"
-if [ ! -e "$amp/bin/amp.exe" ] || [ "$(stat -c %s "$amp/bin/amp.exe")" -lt 4096 ]; then
-  echo "amp: placing the native binary that mise's --ignore-scripts skipped …" >&2
-  node "$amp/install.cjs"
-fi
-exec amp "$@"
+# Skip the vendor's postinstall (mise blocks scripts on purpose) and use the package's own JS
+# fallback, which require.resolve's the platform optional dep and spawns the native binary
+# directly. No placement, no network — the binary is already on disk beside it.
+exec node "$amp/cli-wrapper.cjs" "$@"
 """,
     "amp",
 ]
 
 # Your host Amp settings, mounted read-write at their real absolute path. `binds` is a security
-# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
-# caged `amp` read and write these host files (settings, login). Uncomment to share your host Amp
-# setup with the cage instead of the app's isolated home (the default).
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `amp` read and write these host files (settings, AGENTS.md, login). Uncomment to
+# share your host Amp setup with the cage instead of the app's isolated home (the default).
 #binds = [
 #    { path = "~/.config/amp", mode = "rw" },
+#    { path = "~/.config/AGENTS.md", mode = "rw" },
 #]
 
 [packages]
-# A node runtime — needed both to install the npm package and to run the vendor's `install.cjs`
-# placement step above (the executed `amp` itself is a native binary and needs no node).
+# A node runtime — needed both to install the npm package and to run the vendor's
+# `cli-wrapper.cjs` fallback in `cmd` (the executed `amp` itself is a native binary and needs no
+# node).
 nodejs = "nix:nodejs"
 amp = "mise:npm:@ampcode/cli"
 

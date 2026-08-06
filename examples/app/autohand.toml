@@ -1,0 +1,134 @@
+# autohand — Autohand Code CLI (autohandai/code-cli), sandboxed by sbx.
+#
+#   sbx app import examples/app/autohand.toml
+#   sbx app run autohand
+#
+# Autohand Code (autohand.ai/code) is "the open, composable, self-evolving coding
+# agent" — a Bun-compiled TypeScript CLI distributed on npm as `autohand-cli`
+# (verified v0.9.3 — Apache-2.0, package `name=autohand-cli`, `engines.node >= 22`,
+# three bin aliases — `agent`, `autohand`, `autohand-code` — all pointing to the
+# same `dist/index.js` entrypoint). The npm-published variant is the tsup-built
+# Node runtime (the vendor also ships Bun-`--compile`d single-file binaries on
+# GitHub releases as `autohand-linux-x64` / `autohand-macos-arm64` / etc., built
+# with `bun build ./src/index.ts --compile --target=bun-linux-x64`; the npm
+# package is the Node-portable form for `npm i -g` users).
+#
+# Equipped in-cage with mise's `npm` backend over a nix node (the mould `openclaude
+# .toml` / `command-code.toml` use). `sbx upgrade mise` rolls it forward. The package
+# declares a `postinstall` script (`node scripts/ensure-node-pty-helper-permissions
+# .mjs` — chmods `+x` on the bundled node-pty `spawn-helper` if the prebuilt binary
+# is not already executable; node-pty is in `trustedDependencies` so npm's
+# build-script check is satisfied) — mise's npm backend installs with
+# `--ignore-scripts=true` and skips it, which is SAFE here because node-pty@1.1.0
+# publishes its prebuilt `spawn-helper` already executable. The wrapper below
+# `chmod +x` defensively in case the host (or a future node-pty version) ships
+# the helper without the bit.
+#
+# DEPENDENCIES — heavy (verified 28 runtime deps): `ink` (React TUI), `sharp`
+# (image processing for screenshots), `node-pty` (PTY for the TUI), `qrcode`
+# (the OAuth flow shows a QR code), `@aws-sdk/client-bedrock` + `@aws-sdk/
+# client-bedrock-runtime` (BYOK AWS Bedrock), `@agentclientprotocol/sdk` (the
+# ACP adapter that lets Autohand plug into Zed, VS Code, JetBrains), `@ff-labs/
+# fff-bun` (Bun runtime helpers used at startup).
+#
+# CREDENTIAL POSTURE — an Autohand account, not a BYOK provider key. `autohand
+# login` (or its in-app `/login` slash) opens a browser to the vendor's auth
+# endpoint and persists the session in the app's isolated home (the `AUTOHAND_*
+# env vars — `AUTOHAND_API_URL`, `AUTOHAND_AUTH_URL`, `AUTOHAND_HOME`,
+# `AUTOHAND_CONFIG` — let you override the API host and config directory; the
+# default API host is `api.autohand.ai`). The headless path is to pre-authenticate
+# on the HOST and bind the resulting config dir into the cage (the config dir
+# lives at `AUTOHAND_CONFIG`/`AUTOHAND_HOME` or, by default, under the app's
+# isolated home — the bind below covers both common paths).
+#
+# Providers — the first-party `code.autohand.ai` is the conservative default and
+# is what the allowlist opens; Autohand also supports many BYOK routes for the
+# underlying LLM (verified in `dist/` — `api.openai.com`, `api.x.ai`,
+# `api.deepseek.com`, `api.cerebras.ai`, `api.z.ai`, AWS Bedrock, GCP Vertex,
+# NVIDIA NIM, Sakana, Parallel, Exa, Brave, llmgateway). The profile leaves
+# provider hosts commented — add the one(s) the model you actually call uses.
+# Some providers also have an OAuth path (Codex → `auth.openai.com`,
+# xAI/Grok → `auth.x.ai`); the browser-based OAuth flow is broken by the empty
+# netns, so prefer the provider's API-key path or the first-party route.
+#
+# CONFIG + STATE — `~/.config/autohand/` (or `$AUTOHAND_CONFIG`) holds the
+# authenticated session, plus project-level `.autohand/` config the CLI reads
+# (skills, automode rules, MCP). All project-level config rides the project
+# bind; the rest lives in the isolated home.
+#
+# TELEMETRY — no third-party error tracker / analytics host appears in the
+# published bundle's outbound URL table (no Sentry, no PostHog, no Segment).
+# The package has `node-notifier` for desktop notifications and `sharp` for
+# image processing, both first-party. Nothing to deny or mute on the telemetry
+# front (the cage's deny-default still keeps every other host refused).
+#
+# MCP — `autohand mcp add <name> -- <command>` (stdio) or `<url>` (HTTP/SSE).
+# The profile does NOT pre-open MCP server hosts — add the host of any server
+# you actually configure (the cage's deny-default is the point).
+#
+# UNVERIFIED (like every profile until run with a real account): the live
+# equip + first prompt under the allowlist, the `autohand` TUI on a real
+# project, and the postinstall-skip chmod fallback. Grounded here: the npm
+# packaging (bin aliases, engines `>= 22`, 28 deps, postinstall + trusted
+# list — read out of `package.json`), the host set (read out of
+# `dist/index.js` + the bundled chunks), the env-var overrides (read out of
+# the `dev` script), and the Apache-2.0 license.
+cmd = "autohand"
+
+# Your host Autohand config/auth, mounted read-write at its real absolute paths.
+# `binds` is a security field, honored only because this profile lives in your
+# trusted config dir; `mode = "rw"` lets the caged `autohand` read and write
+# these host files (config, auth, history). Uncomment to share your host
+# Autohand setup with the cage instead of the app's isolated home (the default).
+# Pre-authenticate on the HOST (`autohand login` there), then bind the config
+# directory; the headless cage has no browser for the OAuth flow.
+#binds = [
+#    { path = "~/.config/autohand", mode = "rw" },
+#    { path = "~/.autohand",       mode = "rw" },
+#]
+
+[packages]
+# A node runtime (Autohand Code requires `node >= 22` per its `engines` field)
+# plus the package itself via mise's npm backend, so `sbx upgrade mise` rolls
+# it forward.
+nodejs       = "nix:nodejs"
+autohand-cli = "mise:npm:autohand-cli"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
+# prompts / context, reading completions) is opened to all verbs with `{*}`.
+# Hosts are from the shipped bundle (`api.autohand.ai`, `code.autohand.ai`,
+# providers, GitHub for the install-time fetch) and the vendor docs.
+[network]
+mode = "deny"
+allow = [
+    # First-party Autohand API — auth, account, the `code.autohand.ai` agent
+    # loop, the `api.autohand.ai` backend (verified in `dist/index.js`).
+    "{*} https://api.autohand.ai",
+    "{*} https://code.autohand.ai",
+    # Provider BYOK — uncomment the ONE(s) the model you call with `autohand
+    # --model <model>` picks. The first-party `code.autohand.ai` above is
+    # enough for the default route; open another only if you switch models.
+    #"{*} https://api.openai.com",
+    #"{*} https://api.x.ai",
+    #"{*} https://api.deepseek.com",
+    #"{*} https://api.cerebras.ai",
+    #"{*} https://api.z.ai",
+    #"{*} https://bedrock-runtime.us-east-1.amazonaws.com",
+    #"{*} https://aiplatform.googleapis.com",
+    #"{*} https://build.nvidia.com",
+    #"{*} https://api.sakana.ai",
+    #"{*} https://api.parallel.ai",
+    #"{*} https://api.exa.ai",
+    #"{*} https://api.search.brave.com",
+    #"{*} https://api.llmgateway.io",
+    # Install: mise's npm backend fetches the packument (version resolution, also used
+    # by `sbx upgrade mise`) and the tarball IN-CAGE, so the registry is subject to this
+    # policy — the built-in self-equip allow-set covers the nix cache, GitHub and mise's
+    # version index, never npm. Opened read-only as a whole, like the other npm-backed
+    # profiles.
+    "{GET} https://registry.npmjs.org",
+    # GitHub — MCP server installs and the slash-command/skill fetches the agent runs
+    # from inside the cage. `{GET}` only (a git-over-HTTPS clone would also need POST).
+    "{GET} https://api.github.com",
+    "{GET} https://github.com",
+]

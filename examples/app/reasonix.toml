@@ -1,0 +1,111 @@
+# reasonix — a DeepSeek-native AI coding agent (reasonix.io), sandboxed by sbx.
+#
+#   sbx app import examples/app/reasonix.toml
+#   sbx app run reasonix
+#
+# Reasonix is a config- and plugin-driven coding harness: a single static Go binary
+# whose append-only session history is aligned to DeepSeek's prefix cache, so long
+# sessions keep a 90%+ cache-hit and cheap input tokens. It ships a DeepSeek provider
+# preset out of the box (`api.deepseek.com`, model `deepseek-flash` → `deepseek-v4-flash`
+# today) and accepts any OpenAI-compatible base_url as a config entry.
+#
+# PACKAGING — npm + platform optional-dep (the `cline`/`droid` mould, with one twist).
+# The npm `reasonix` package (0 dependencies) is a thin JS shim (`bin/reasonix.js`) that
+# spawnSync's a platform-specific optional dependency (`@reasonix/cli-linux-x64` …), each
+# a single ~33 MB **statically linked Go binary** with no extra runtime libs. There is no
+# postinstall and no first-run download. Unlike `cline`/`droid` the executed binary's
+# launcher is the JS shim, so **node is needed at RUNTIME** (engines >= 18), not only to
+# install — hence `nix:nodejs` stays in the launch environment. sbx equips it fresh via
+# mise's npm backend; the first launch in a project fetches shim + binary from
+# registry.npmjs.org (the allowlist below), then pins the version until `sbx upgrade mise`.
+#
+# CREDENTIAL — BYOK, but with a catch unique to Reasonix. It resolves its provider key
+# ONLY from Reasonix home's global `~/.reasonix/.env` (verified in the upstream source:
+# `ProviderEntry.APIKey()` reads `storedCredentialValue(api_key_env)`, and CONFIG_PATHS.md
+# states that process environment variables are never a runtime fallback). `DEEPSEEK_API_KEY`
+# set in the process environment is consumed only by Reasonix's setup probe). sbx cannot
+# inject an env var into the cage's requests, so the standard `[env] + [secret]` substitution alone would not reach the request — the real key never enters the cage: the `cmd` wrapper below pre-seeds `.env` with the PROXY PLACEHOLDER on first launch, and the egress proxy strip-and-replaces it on the wire to api.deepseek.com.
+#
+#   export DEEPSEEK_API_KEY=sk-…   # on the HOST; the proxy injects it on the wire
+#
+# The alternative is the upstream-documented path: run `reasonix setup` interactively in the
+# cage once, and the real key persists in the app's isolated home `.env` (the "account"
+# posture — the secret then lives inside the cage, never in the project shell).
+#
+# CONFIG + STATE — v1.8.1+ home is `~/.reasonix` (config.toml, global `.env`, sessions,
+# memory, checkpoints), kept in the app's persistent isolated home and shared across
+# projects (home_scope default). Versions move only on `sbx upgrade mise` — never on an
+# sbx binary update. 
+#
+# If a request is blocked, the proxy names the host — add it to `allow` (or check ahead
+# with `sbx test net <url>`).
+cmd = ["bash", "-lc", '''
+# First-run bootstrap: Reasonix resolves provider keys ONLY from its global
+# ~/.reasonix/.env, never from the process environment at runtime. Seed that file
+# from the injected placeholder env var when it does not exist, so the egress proxy
+# can strip-and-replace on the wire; if it already exists (e.g. a prior `reasonix
+# setup` wrote the real key), leave it untouched. A security field: this profile is
+# trusted by location once imported.
+if [ -n "$DEEPSEEK_API_KEY" ] && [ ! -f "$HOME/.reasonix/.env" ]; then
+    mkdir -p "$HOME/.reasonix"
+    chmod 700 "$HOME/.reasonix"
+    umask 077
+    printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY" > "$HOME/.reasonix/.env"
+fi
+exec reasonix "$@"
+''', "reasonix"]
+
+# Your host Reasonix home, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `reasonix` read and write your host config, keys, and sessions. Uncomment to share
+# your host Reasonix with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.reasonix", mode = "rw" },
+#]
+
+[packages]
+# Node for the JS shim (runtime, unlike most npm-native CLIs — see the header), then Reasonix
+# itself via mise's npm backend (shim on registry, binary via the platform optional dep).
+# Both are trusted-only [packages]; this profile is trusted by location once imported.
+nodejs = "nix:nodejs"
+reasonix = "mise:npm:reasonix"
+
+# An app is read-by-default ({GET,HEAD}); the completions/balance endpoints are POSTs, so the
+# provider host is opened to all verbs with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Install: the shim's packument and tarball plus the platform binary optional dep — npm
+    # spreads these across sibling paths, so the registry host is opened read-only as a whole
+    # (like the other npm-backed profiles), not path-scoped.
+    "{GET} https://registry.npmjs.org",
+    # Runtime: DeepSeek's OpenAI-compatible endpoint — `POST /chat/completions` for prompts
+    # (the prefix-cache loop keeps replaying the same growing prefix), plus the optional
+    # `GET /user/balance` balance check. A direct provider is still any OpenAI-compatible
+    # base_url in `reasonix.toml`; add its host here if you configure one.
+    "{*} https://api.deepseek.com",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit POST at
+# install time, and Reasonix's own telemetry/upgrade gateway (`crash.reasonix.io` — a daily
+# /ping and /metrics the CLI sends only with your in-TUI consent, plus the host `reasonix
+# upgrade` resolves its release list from). Both stay DENIED and tallied (`sbx net stats` still
+# counts them); `mute` only keeps their otherwise-noisy `denied-default` lines out of the default
+# log. See them anytime with `sbx net log --all -a reasonix`.
+mute = [
+    "crash.reasonix.io",                            # Reasonix telemetry consent/upgrade gateway (denied)
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
+]
+
+# The real API key is read on the HOST and injected by the egress proxy — never in the cage.
+# The in-cage `.env` carries the placeholder (seeded by the cmd wrapper above) so Reasonix can
+# start and issue the request; the proxy strips it and substitutes the real key on the wire to
+# api.deepseek.com. Provide the key on the host as $DEEPSEEK_API_KEY (or point `from` at a
+# resolver, e.g. sops://secrets.yaml#deepseek).
+#[env]
+#DEEPSEEK_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#
+#[secret."api.deepseek.com"]
+#from = "env://DEEPSEEK_API_KEY"
+#header = "Authorization"
+#type = "bearer"

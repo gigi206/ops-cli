@@ -1,0 +1,118 @@
+# aider — the AI pair-programming CLI (aider-ai/aider), sandboxed by sbx.
+#
+#   sbx app import examples/app/aider.toml
+#   sbx app run aider
+#
+# Aider is the original open-source pair-programming agent: a Python terminal REPL that works
+# DIRECTLY on your git repo (edits go through commits you review; `git diff` drives the workflow).
+# It routes to any provider via model-name prefixes (`--model sonnet`, `--model openrouter/…`,
+# `--model gemini/…`, `--model groq/…`, `--model ollama/…` …), so it needs a git repo in the
+# project bind and ONE provider key.
+#
+# The tool is equipped fresh from upstream: mise's `pipx` backend runs `uv tool install
+# aider-chat` (the same clean path `vibe` uses — `nix:uv` puts uv on PATH, `nix:python312`
+# supplies an interpreter in the `>=3.10,<3.15` range the project requires), resolving the
+# wheels from PyPI on first launch and reusing them offline after. `sbx upgrade mise` rolls it
+# forward. No nixpkgs lag, no source build, no vendor SDK shim.
+#
+# CONFIG + STATE — `.aider.conf.yml` in the project (or `~/.aider.conf.yml`), plus the model
+# repo cache `.aider.model.settings.yml` / `.aider.model.metadata.json`; session history under
+# the app's isolated home. All project-level config rides the project bind; the isolated home
+# keeps the rest.
+#
+# CREDENTIALS — BYOK, one env var per provider (the proxy names a host the flow reaches that is
+# not in `allow`; check ahead with `sbx test net <url>`):
+#
+#  - **OpenAI-compatible**: `OPENAI_API_KEY` (api.openai.com) — or OpenRouter via
+#    `OPENROUTER_API_KEY`; either works, pick the ONE you use in `allow` + `[secret]`.
+#  - **Anthropic**: `ANTHROPIC_API_KEY` → api.anthropic.com (`--model sonnet` and friends).
+#  - **Gemini**: `GEMINI_API_KEY` → generativelanguage.googleapis.com.
+#  - **Local** (Ollama/LM Studio on the HOST loopback): name the port with a `tcp://localhost:<port>`
+#    allow rule (ollama :11434, LM Studio :1234). sbx opens a listener inside the cage on that exact
+#    port and relays it to the service on YOUR loopback, so `--model ollama_chat/…` works with the
+#    allowlist intact — one port at a time, no `network = "shared"` (see `openfox.toml`).
+# The keys are read on the HOST and injected by the egress proxy on the wire — they never
+# enter the cage (see the [secret] blocks below).
+#
+# ANALYTICS — aider asks once on first run (opt-in, random by default) and posts usage events
+# to PostHog (`us.i.posthog.com`); `--analytics-disable` opts out permanently, or answer the
+# prompt "no". The host is DENIED and muted below — a `mute` never changes the verdict (still
+# refused) and never hides a count (`sbx net stats` still tallies it). Aider survives the
+# failure (it disables PostHog on post errors — aider/analytics.py `posthog_error`).
+#
+# UNVERIFIED (like every profile until run with a real key): the live equip + first prompt
+# under the allowlist. Grounded here: the PyPI packaging (name `aider-chat`, bin `aider`,
+# `requires-python >=3.10,<3.15` — pyproject.toml), the config file names (aider/main.py:
+# `.aider.conf.yml`, `.aider.model.settings.yml`, `.aider.model.metadata.json`), the analytics
+# flags and PostHog host (aider/args.py, aider/analytics.py), and the provider model-prefix
+# routing (README/`aider --help`).
+cmd = "aider"
+
+# Your host aider config, mounted read-write at its real absolute paths. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets
+# the caged `aider` read and write these host files (config, model cache). Uncomment to share
+# your host setup instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.aider.conf.yml", mode = "rw" },
+#    { path = "~/.aider.model.settings.yml", mode = "rw" },
+#    { path = "~/.aider.model.metadata.json", mode = "rw" },
+#]
+
+[packages]
+# Aider itself via mise's pipx backend (`uv tool install aider-chat` — uv from nix, Python from
+# nix), so `sbx upgrade mise` rolls it forward. Same mould as the `vibe` profile.
+aider = "mise:pipx:aider-chat"
+uv = "nix:uv"
+python = "nix:python312"
+
+[network]
+mode = "deny"
+# Egress is denied by construction except the ONE provider you actually use (the model host the
+# agent POSTs to is opened to all verbs with `{*}`; an app is read-by-default). The PyPI hosts
+# are the install-time fetch (same as `vibe`); the self-update/`aider --version` check rides the
+# built-in github allow-set.
+allow = [
+    # Install-time (mise's `uv tool install`): the Python wheels and the package index.
+    "{GET} https://files.pythonhosted.org",
+    "{GET} https://pypi.org",
+    # BYOK provider — uncomment the ONE you use, with the matching [secret] block below.
+    #"{*} https://api.openai.com",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://openrouter.ai",
+    #"{*} https://generativelanguage.googleapis.com",
+]
+# Silence the DENIED analytics: aider posts usage events to PostHog, refused by the allowlist
+# (`denied-default`). `mute` keeps those refusals out of the default `sbx net log` (still
+# denied, still counted in `sbx net stats`; see them with `--all`). Aider disables PostHog
+# automatically when the post fails, so the first-run consent question still behaves.
+mute = [
+    "us.i.posthog.com",
+]
+
+# BYOK: the real key is read on the HOST and injected by the egress proxy — never in the cage.
+# The in-cage placeholder lets `aider` start and issue the request; the proxy strips it and
+# substitutes the real key on the wire to the matching host. Uncomment the pair matching the
+# ONE provider `allow` opens (aider picks the provider from the model prefix, the key from the
+# env var — e.g. `--model openrouter/anthropic/claude-sonnet-4`).
+[env]
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+#GEMINI_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."generativelanguage.googleapis.com"]
+#from = "env://GEMINI_API_KEY"
+#header = "x-goog-api-key"
+#type = "raw"

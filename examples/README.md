@@ -66,39 +66,53 @@ step is skipped for its `@vscode/ripgrep` dependency, yet it needs no wrapper �
 | `kiro`            | `nix:kiro-cli` (nixpkgs native CLI — AWS's rebranded Amazon Q CLI; `unfree`) | `*.kiro.dev` services (browser login / BYOK) |
 | `kiro-desktop`    | `tarball:resolve` prebuilt `.tar.gz` (Electron GUI IDE / VS Code fork, `gui`/`gpu`/`dbus`, auto-upgraded) | `*.kiro.dev` services + Open VSX (account, in-cage browser — see note on the upstream login bug) |
 | `opencode`        | `mise:opencode`                      | provider-dependent      |
+| `openclaude`      | `nix:nodejs` (+ `mise:npm:@gitlawb/openclaude`) — a Claude-Code fork for any LLM: plain JS shim, no postinstall, 3 deps | provider-dependent (BYOK: OpenAI-compatible / Anthropic / Gemini) |
+| `aider`           | `mise:pipx:aider-chat` (+ `nix:uv`, `nix:python312`) — the classic Python pair-programming REPL, git-native | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / any OpenAI-compatible) |
 | `opencode-web`    | `mise:opencode` (`opencode web` + `forward`) | provider-dependent |
 | `opencode-desktop`| `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | provider-dependent |
+| `orca-desktop`   | `deb:github:stablyai/orca` (Electron ADE orchestrating agent CLIs in git worktrees, `gui`/`gpu`/`dbus`) + pilot interior agent `opencode` (`mise:opencode`) | provider-dependent (BYOK via the pilot agent) |
 | `claude-desktop`  | `deb:` prebuilt `.deb` (Electron GUI, `gui = "wayland"`) | `api.anthropic.com` / `claude.ai` (account) |
 | `pi`              | `mise:aqua:earendil-works/pi`        | provider-dependent      |
 | `omp`            | `mise:github:can1357/oh-my-pi` (can1357's complement to `pi`: the same multi-provider agent with a heavier in-process harness — one Bun-built standalone `omp` binary, glibc only; mise verifies the release's attestations + SLSA) | provider-dependent (BYOK) |
 | `qwen-code`       | `mise:npm:@qwen-code/qwen-code` (+ `nix:nodejs`) | `dashscope.aliyuncs.com` (Dashscope / Alibaba BYOK; OpenRouter/Anthropic/OpenAI/Gemini documented) |
+| `reasonix`        | `mise:npm:reasonix` (+ `nix:nodejs`) — a JS shim over a ~33 MB static Go binary | `api.deepseek.com` (DeepSeek BYOK, `DEEPSEEK_API_KEY` — host-side, injected on the wire) |
+| `reasonix-desktop`| `deb:resolve` (`gui`/`gpu`/`audio`/`dbus`) — the desktop face of the same Go kernel, a **Wails/WebKit2GTK** shell rather than an Electron one, so its `[deb.…]` table names the extra `libs` (webkitgtk, libsoup, GStreamer, …) its ELFs need; the resolver picks the newest `desktop-v*` tag, since this repo alternates two release trains | `api.deepseek.com` (DeepSeek BYOK, `DEEPSEEK_API_KEY` — host-side, injected on the wire) |
+| `rovo`            | bootstrap installer (`cmd` wrapper; + `nix:gnutar`, `nix:gzip`) — Atlassian's static Go ACLI binary (`acli rovodev run`), downloaded from `acli.atlassian.com/linux/latest/acli_linux_<arch>.tar.gz` | `api.atlassian.com` + `*.atlassian.net` (Atlassian API token from `go.atlassian.com/rovo-dev-api-token`, basic-auth over the API; `--site mysite.atlassian.net` on `acli rovodev auth login`) |
 | `hermes`          | `flake:…/hermes-agent#default` (built host-side) | `openrouter.ai` (BYOK) / Nous account |
 | `hermes-webui`    | `flake:…/nesquena/hermes-webui#default` + `…/hermes-agent#default` (community web UI + `forward`) | `openrouter.ai` (BYOK) / Nous account |
 | `vibe`            | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, `nix:chromium`, `gui = "wayland"`) | `console.mistral.ai` (Mistral account SSO, in-cage browser) / `api.mistral.ai` (BYOK) |
 | `kilocode`        | `mise:github:Kilo-Org/kilocode`                  | provider-dependent      |
+| `mimo`            | `mise:npm:@mimo-ai/cli` (+ `nix:nodejs`) — a Node shim over a ~124 MB prebuilt binary; the vendor's `postinstall` only caches it and mise's `--ignore-scripts` skips it (the `dirac` near-miss: the shim resolves the binary itself) | `api.xiaomimimo.com` (MiMo Auto anonymous channel / Xiaomi MiMo Platform OAuth account) + BYOK |
 | `freebuff`        | `mise:npm:freebuff` (+ `nix:nodejs`)             | `www.codebuff.com` (account) |
 | `cline`           | `mise:npm:cline` (+ `nix:nodejs`)                | `openrouter.ai` (BYOK)  |
 | `droid`           | `mise:npm:droid` (+ `nix:nodejs`)                | `*.factory.ai` (account) |
+| `devin`           | bootstrap installer (`cmd` wrapper, verifies SHA256; + `nix:gnutar`, `nix:gzip`) — Cognition's prebuilt static-pie Rust binary fetched from `static.devin.ai/cli/current/manifest.json` | `api.devin.ai` (BYOK API key from `app.devin.ai/settings/api-keys`) |
 | `agy`             | `mise:aqua:google-antigravity/antigravity-cli`  | `accounts.google.com` (Google OAuth) |
 | `antigravity-ide` | `tarball:resolve` prebuilt `.tar.gz` (Electron GUI IDE / VS Code fork, `gui`/`gpu`/`dbus`, auto-upgraded) | `cloudcode-pa.googleapis.com` (Google OAuth, in-cage browser) |
 | `auggie`          | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | `*.api.augmentcode.com` (Augment account) |
+| `autohand`        | `mise:npm:autohand-cli` (+ `nix:nodejs`) — bin `autohand` / `autohand-code` / `agent`, engines >= 22, Apache-2.0, the "self-evolving" coding agent with multi-provider BYOK + first-party `code.autohand.ai` | `api.autohand.ai` + `code.autohand.ai` (Autohand account; bind `~/.config/autohand` for the pre-authenticated session) |
+| `ante`            | `mise:github:AntigmaLabs/ante-preview` — Antigma's ~15 MB static-pie musl Rust binary (alpha preview, "self-contained agent that self-organizes"); first-class `/offline-mode` llama.cpp integration | provider-dependent (BYOK: Anthropic / OpenAI / Gemini / xAI / DeepSeek / Z.AI / OpenRouter / Hugging Face / etc.) or local (`/offline-mode` ships llama.cpp in the binary) |
 | `copilot`         | `mise:aqua:github/copilot-cli` (GitHub's release binary, no runtime deps) | `*.githubcopilot.com` + `github.com/login/*` (GitHub account: `/login` device flow or a `GH_TOKEN` PAT) |
 | `grok`            | `mise:aqua:x.ai/cli/grok` (xAI's release binary from its own artifact bucket) | `api.x.ai` (BYOK `XAI_API_KEY`) — or `accounts.x.ai` + `cli-chat-proxy.grok.com` for an xAI account |
-| `amp`             | `mise:npm:@ampcode/cli` (+ `nix:nodejs`) — native binary placed by the vendor's postinstall, run from the `cmd` wrapper | `ampcode.com` (Amp account / `AMP_API_KEY`) |
+| `amp`             | `mise:npm:@ampcode/cli` (+ `nix:nodejs`) — mise skips the vendor's postinstall, so the `cmd` wrapper runs the package's own `cli-wrapper.cjs` fallback, which spawns the platform optional dep's native binary (no placement, no download) | `ampcode.com` (Amp account / `AMP_API_KEY`) |
 | `codebuddy`       | `mise:npm:@tencent-ai/codebuddy-code` (+ `nix:nodejs`) | `*.codebuddy.ai` (CodeBuddy account; China edition on `*.codebuddy.cn`) |
+| `command-code`    | `mise:npm:command-code` (+ `nix:nodejs`) — bin `cmd` (alias) / `command-code` (full), engines >= 22, the "taste-1" first-party coding agent that learns your coding style (proprietary — npm `UNLICENSED`; source on GitHub `CommandCodeAI/command-code`) | `api.commandcode.ai` (Command Code account, `taste-1` first-party) |
 | `junie`           | `mise:npm:@jetbrains/junie` (+ `nix:nodejs`) — a shim whose postinstall downloads the JVM build, run from the `cmd` wrapper | `api.jetbrains.ai` + `junie.jetbrains.com` (JetBrains account, `JUNIE_API_KEY`, or BYOK) |
+| `jcode`           | `mise:github:1jehuang/jcode` — upstream's own Rust release binary (`jcode-linux-x86_64.tar.gz`, dynamic glibc, bundles its own libssl/libcrypto) | provider-dependent (BYOK: OpenRouter / Anthropic / OpenAI, examples in profile) or account OAuth |
 | `vtcode`          | `mise:github:vinhnx/VTCode` (Rust release binary) + `nix:ripgrep` + `nix:ast-grep` | provider-dependent (BYOK; upstream's default is OpenRouter) |
 | `dirac`           | `mise:npm:dirac-cli` (+ `nix:nodejs`) + `nix:ripgrep` (the search binary its npm dependency's skipped postinstall would have fetched — resolved from PATH) | provider-dependent (BYOK, no vendor account; `dirac.run` is telemetry only and stays denied) |
 | `nova`            | `mise:npm:@compass-ai/nova` (+ `nix:nodejs`) — the scoped name matters: mise's bare `nova` is an unrelated Kubernetes tool | `api.compassap.ai` (Compass key `COMPASS_API_KEY`, injected host-side) or BYOK |
 | `stakpak`         | `mise:github:stakpak/agent` (static Rust release binary — no runtime deps, not even nix-ld) — a **DevOps** agent, see its header on what a cage does and does not give it | `apiv2.stakpak.dev` (`STAKPAK_API_KEY`) or BYOK; `--tool-mode local` needs no key |
+| `trae`            | bootstrap installer (`cmd` wrapper; + `nix:uv`, `nix:python312`) — ByteDance's MIT research CLI (`bytedance/trae-agent`, **not** the commercial Trae Code IDE), `git clone` + `uv tool install .` into a persistent isolated home; ~280 MiB of deps on first launch (tree-sitter + textual + mcp + pyinstaller) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / OpenRouter / Doubao / Azure / Ollama) |
 | `snow`            | `mise:npm:snow-ai` (+ `nix:nodejs`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / any OpenAI-compatible) |
 | `qoder`           | `mise:npm:@qoder-ai/qodercli` (+ `nix:nodejs`, `nix:ripgrep`) — the vendor's own npm scope; command is `qodercli` | `*.qoder.sh` GLOBAL / `*.qoder.com.cn` CN (Qoder account: browser login or `QODER_PERSONAL_ACCESS_TOKEN`) |
 | `sigit`           | `mise:npm:@smbcloud/sigit` (+ `nix:nodejs`) — a JS shim over a ~78 MB prebuilt binary | **none** — the model runs in-cage (a Qwen3 GGUF pulled from Hugging Face on first launch) |
 | `cortex`          | `mise:github:CortexLM/cortex-code` (+ `nix:alsa-lib`) — mise verifies GitHub attestations + SLSA; the `cmd` wrapper supplies the one library the binary needs, see its header | `api.cortex.foundation` (`CORTEX_API_KEY`) or BYOK (`OPENAI_API_KEY`) |
+| `crush`           | `mise:github:charmbracelet/crush` — Charm's "glamourous agentic coding" TUI (Go, static-pie, 27 MiB binary + man pages + shell completions) | `hyper.charm.land` (Hyper account, ZDR + GDPR) or multi-provider BYOK (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` / `AWS_BEARER_TOKEN_BEDROCK` / etc. — 24+ providers) |
 | `cursor-agent`    | bootstrap `curl cursor.com/install` (CLI tarball — no clean backend; **not** the npm `cursor-agent`) | `*.cursor.sh` (Cursor account) |
 | `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
 | `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
-| `openfox`         | `mise:npm:openfox` (+ `nix:nodejs`) — a local-LLM web coding agent (browser UI) | **`network = "shared"`** (host-local LLM, see note ‡) |
+| `openfox`         | `mise:npm:openfox` (+ `nix:nodejs`) — a local-LLM web coding agent (browser UI) | none: a local LLM, reached under the allowlist by `tcp://localhost:<port>` (its UI comes back through `forward`) |
 | `goose`           | `mise:aqua:block/goose` (Rust release binary, no runtime deps) | provider-dependent (BYOK: OpenRouter / Anthropic / OpenAI — examples in profile) |
 | `goose-desktop`   | `deb:` prebuilt `.deb` (Electron GUI, `gui`/`gpu`/`dbus`) — the same agent with a desktop UI | provider-dependent (GUI login or BYOK — examples in profile) |
 | `pool`            | bootstrap `curl downloads.poolside.ai/pool/install.sh` (CLI tarball — no clean backend) | `*.poolside.ai` (Poolside API token, see note) |
@@ -322,30 +336,43 @@ Each profile declares its tool with a **backend-prefixed** `[packages]` value:
 | Profile       | Declaration                                  | Source                         |
 | ------------- | -------------------------------------------- | ------------------------------ |
 | `claude-code` | `mise:aqua:anthropics/claude-code`           | Anthropic's standalone release |
+| `crush`       | `mise:github:charmbracelet/crush`            | Charm's official GitHub release (asset `crush_<ver>_Linux_x86_64.tar.gz`, static-pie Go binary, man pages + shell completions bundled; FSL-1.1-MIT) |
 | `codex`       | `mise:aqua:openai/codex`                      | OpenAI's GitHub release        |
 | `kiro`        | `nix:kiro-cli`                               | nixpkgs' derivation of AWS's official Kiro CLI `.tar.gz` (native binary, `unfree`) |
 | `opencode`    | `mise:opencode`                              | opencode's standalone release  |
+| `openclaude`  | `mise:npm:@gitlawb/openclaude` (+ `nix:nodejs`) | upstream's own npm scope (bin `openclaude`, node ≥ 22 at runtime — a Claude-Code fork with **no install script** and three runtime deps, so `--ignore-scripts` costs nothing) |
 | `opencode-web`| `mise:opencode`                              | opencode's standalone release (`opencode web`) |
 | `opencode-desktop` | `deb:github:anomalyco/opencode` | opencode's prebuilt `.deb` (Electron), autoPatchelf'd host-side — tracks the repo's newest release (`sbx upgrade deb`) |
+| `orca-desktop` | `deb:github:stablyai/orca` | Orca's prebuilt `.deb` (Electron ADE), autoPatchelf'd host-side — tracks the repo's newest release (`sbx upgrade deb`). No bare `orca` name on Linux (GNOME screen reader); binary `orca-ide`, and the CLI is the same binary via `ELECTRON_RUN_AS_NODE`. Telemetry: PostHog, opt-out `ORCA_TELEMETRY_DISABLED=1`. The pilot interior `opencode` uses `mise:opencode` (see the `opencode` row) |
 | `claude-desktop` | `deb:apt:…/apt/stable/dists/stable/main/binary-amd64/Packages` | Anthropic's official prebuilt `.deb` (Electron), autoPatchelf'd host-side — tracks the apt index's newest version (`sbx upgrade deb`) |
 | `pi`          | `mise:aqua:earendil-works/pi`                | Earendil's GitHub release      |
 | `omp`         | `mise:github:can1357/oh-my-pi`                | can1357's GitHub release binary (Bun-built single file; mise verifies the release's artifact attestations + SLSA) |
 | `hermes`      | `flake:github:NousResearch/hermes-agent#default` | NousResearch flake (uv2nix + node front-ends), built host-side |
 | `hermes-webui`| `flake:github:nesquena/hermes-webui#default` (+ `…/hermes-agent#default`) | the community WebUI's own upstream flake, plus the same agent flake it runs in-process — both built host-side |
 | `vibe`        | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`) | Mistral PyPI wheel (via uv) |
+| `aider`       | `mise:pipx:aider-chat` (+ `nix:uv`, `nix:python312`) | aider's own PyPI package (`aider-chat`, bin `aider`, Python >=3.10,<3.15 — the classic pair-programming REPL; model-prefix routing, e.g. `--model openrouter/…`) |
 | `kilocode`    | `mise:github:Kilo-Org/kilocode`                  | Kilo Code's GitHub release binary  |
+| `mimo`        | `mise:npm:@mimo-ai/cli`                          | Xiaomi's own npm scope (bin `mimo`): a JS shim that resolves the platform binary (`@mimo-ai/mimocode-linux-x64`, a `-musl`/`-baseline` variant) from `node_modules` — plain optional deps, node at runtime |
 | `freebuff`    | `mise:npm:freebuff` (+ `nix:nodejs`)             | npm launcher → www.codebuff.com binary |
 | `cline`       | `mise:npm:cline` (+ `nix:nodejs`)                | npm package → native platform binary |
 | `droid`       | `mise:npm:droid` (+ `nix:nodejs`)                | npm package → native platform binary |
+| `devin`       | bootstrap installer (no sbx backend — `cmd` wrapper) | Cognition's own S3-backed CDN (`static.devin.ai/cli/<version>/devin-<version>-<triple>.tar.gz`, static-pie ELF ~48 MiB, no companion runtime) — the wrapper fetches the live release manifest, downloads, verifies the SHA256 the vendor publishes, extracts `bin/devin` into the app's persistent isolated home (`~/.local/bin/devin`), and execs it. Re-run with `sbx app run devin --env DEVIN_REINSTALL=1` to advance; `devin update` also works in-cage (allowed) |
 | `qwen-code`   | `mise:npm:@qwen-code/qwen-code` (+ `nix:nodejs`)| QwenLM npm package (pure-node CLI, node at runtime) |
+| `reasonix`    | `mise:npm:reasonix` (+ `nix:nodejs`)            | upstream's own npm scope: a JS shim (engines >= 18) dispatching to a static Go binary in a platform optional dep (no install script; node at runtime) |
+| `rovo`        | bootstrap installer (no sbx backend — `cmd` wrapper) | Atlassian's own CDN (`acli.atlassian.com/linux/latest/acli_linux_<arch>.tar.gz`, statically linked Go binary ~6.3 MiB, no companion runtime) — the wrapper downloads, extracts `*/acli` into the app's persistent isolated home (`~/.local/bin/acli`), and execs `acli rovodev`. Rovo Dev is an ACLI extension, not a separate binary (verified — `atlassian.com/cli/pkg/cmd/rovodev/auth/login` in the binary). Re-run with `sbx app run rovo --env ACLI_REINSTALL=1` to advance. Telemetry: Sentry DSN + Segment.io, both denied+muted (no per-installation opt-out env var) |
+| `trae`        | bootstrap installer (no sbx backend — `cmd` wrapper) | ByteDance's open-source `bytedance/trae-agent` repo (the research-grade CLI, **not** the commercial Trae Code IDE on `trae.ai`) — `git clone` + `uv tool install --python python3.12 .` (the project's `pyproject.toml` requires `>=3.12`) into a persistent isolated home (`~/.trae/src/`, `~/.local/bin/trae-cli`); re-run with `sbx app run trae --env TRAE_REINSTALL=1` to advance. MIT, the vendor's own deps include `openai>=1.86.0` + `anthropic>=0.54.0` + `google-genai>=1.24.0` + `ollama>=0.5.1` + `mcp==1.12.2` + `tree-sitter` (native) |
 | `agy`         | `mise:aqua:google-antigravity/antigravity-cli`  | Antigravity's GitHub release binary (native) |
+| `command-code` | `mise:npm:command-code` (+ `nix:nodejs`)        | Command Code's own npm package (bin `cmd` / `command-code` — alias + full — engines `>= 22`; 49 deps including the `@opentelemetry/*` Axiom sink and the `@ai-sdk/*` providers; no install script, plain `node` startup) |
 | `antigravity-ide` | `tarball:resolve` (+ `[tarball.antigravity-ide]`) | Google's official IDE `.tar.gz` from `edgedl.me.gvt1.com` (Electron / VS Code fork), autoPatchelf'd host-side — auto-upgraded via a sandboxed resolve command over Google's version API (`sbx upgrade tarball`) |
 | `auggie`      | `mise:npm:@augmentcode/auggie` (+ `nix:nodejs`) | Augment Code npm package (pure-node CLI, node at runtime) |
+| `autohand`    | `mise:npm:autohand-cli` (+ `nix:nodejs`)        | Autohand's own npm package (bin `autohand` / `autohand-code` / `agent` — three aliases for the same `dist/index.js`; engines `>= 22`; 28 deps including `@aws-sdk/client-bedrock`, `@agentclientprotocol/sdk`, `ink`, `sharp`, `node-pty`; the `postinstall` is a defensive `chmod +x` on node-pty's prebuilt `spawn-helper` — mise `--ignore-scripts` skips it but the prebuilt is already executable) |
+| `ante`        | `mise:github:AntigmaLabs/ante-preview`         | Antigma Labs' GitHub release (asset `ante-v0.preview.70-linux-x86_64-musl.tar.gz`, static-pie musl ELF ~15 MiB, no companion runtime; the vendor's `ante.run/install.sh` is the canonical path for the host install, this profile uses the same artefact via the GitHub release; FSL alpha — proprietary, all rights reserved; `antix.antigma.ai` is the optional Antix Console for account/billing) |
 | `copilot`     | `mise:aqua:github/copilot-cli`                  | GitHub's own release binary, verified against the release's `SHA256SUMS.txt` (no external signing infrastructure to reach) |
 | `grok`        | `mise:aqua:x.ai/cli/grok`                       | xAI's own static binary from `storage.googleapis.com/grok-build-public-artifacts` (aqua `http` package, path-scoped in the allowlist) |
 | `amp`         | `mise:npm:@ampcode/cli` (+ `nix:nodejs`)        | npm wrapper → native platform binary, **placed by the vendor's `install.cjs`** — mise's `--ignore-scripts` skips it, so the profile's `cmd` runs it once (note the upstream rename from `@sourcegraph/amp`) |
 | `codebuddy`   | `mise:npm:@tencent-ai/codebuddy-code` (+ `nix:nodejs`) | Tencent's own npm scope (node CLI, node at runtime; native pieces ship prebuilt, so no `npm rebuild` needed) |
 | `junie`       | `mise:npm:@jetbrains/junie` (+ `nix:nodejs`)    | JetBrains' npm **shim**, whose postinstall downloads the ~260 MB JVM build from `github.com/JetBrains/junie/releases` — mise's `--ignore-scripts` skips it, so the profile's `cmd` runs it once; the downloaded launcher runs under the cage's nix-ld shim (unproven) |
+| `jcode`       | `mise:github:1jehuang/jcode`                      | upstream's own Rust release binary (`jcode-linux-x86_64.tar.gz`) — dynamic glibc, bundles its own libssl/libcrypto next to the binary; runs under the cage's nix-ld shim (unproven) |
 | `vtcode`      | `mise:github:vinhnx/VTCode`                     | upstream's own Rust release binary; `ripgrep`/`ast-grep` come from nixpkgs rather than upstream's installer |
 | `dirac`       | `mise:npm:dirac-cli` (+ `nix:nodejs`)           | the vendor's own npm scope (node CLI, node at runtime). Its `@vscode/ripgrep` dependency downloads `rg` in a postinstall `--ignore-scripts` skips — but Dirac resolves that binary **PATH-first**, so `nix:ripgrep` cures it with no `cmd` wrapper (read out of the shipped bundle) |
 | `nova`        | `mise:npm:@compass-ai/nova` (+ `nix:nodejs`)    | Compass AI's own npm scope (node CLI, node at runtime). Its native pieces are prebuilt platform optional-deps with no install script, so `--ignore-scripts` costs nothing; the bare registry name `nova` resolves to an unrelated Kubernetes tool, hence the scoped token |
@@ -435,11 +462,13 @@ launch, not the cage allowlist; only the app's *runtime* egress is filtered.)
 **npm/node CLIs** are also supported: declare a `node` runtime (`nix:nodejs`) and the
 tool via mise's npm backend (`mise:npm:<pkg>`). The cage synthesises `/usr/bin/env`, so
 a tool's `#!/usr/bin/env node` shebang resolves (a hermetic cage has no host `/usr`).
-`freebuff`, `cline`, and `droid` ship this way. They differ in how the binary arrives:
+`freebuff`, `cline`, `droid`, and `reasonix` ship this way. They differ in how the binary arrives:
 `freebuff`'s npm package is a thin launcher that downloads the real binary at first run into
-the app's isolated home, while `cline` and `droid` deliver a self-contained native platform
+the app's isolated home, while `cline`, `droid`, and `reasonix` deliver a self-contained native
 binary through the npm package's optional dependencies (resolved at install, no separate
-first-run download). Like `mise:`, an npm CLI fetches at first launch (the node runtime and
+first-run download). `reasonix` adds one twist: its executed launcher is the JS shim itself, so
+node stays in the runtime graph (engines >= 18), not just to install. Like `mise:`, an npm CLI
+fetches at first launch (the node runtime and
 the package), so the first launch in a project needs the network.
 
 **Offline trade-off:** a `mise:` tool **fetches at first launch** (the price of upstream
@@ -532,10 +561,13 @@ profile's header.)*
   filtering posture (Chromium ignores the CA-file env vars other tools honour). **`t3code`** — a
   control plane driving *other* agents (`codex`/`claude`/`opencode`, already profiled as CLIs) — is
   the AppImage-backend flagship: it packages, imports, resolves, renders + logs in, and its build seam
-  is proven through `sbx run` (the launcher lands on the cage PATH). **‡ It is one of two shipped
-  profiles that ship `network = "shared"` and cannot filter egress** (the other, `openfox`, does so for
-  an unrelated reason — to reach a LLM on the host's `localhost`, which the empty netns cannot; see its
-  header) — t3code's model traffic is made by a SEPARATE,
+  is proven through `sbx run` (the launcher lands on the cage PATH). **‡ It is the ONLY shipped
+  profile that ships `network = "shared"` and cannot filter egress.** (`openfox` used to be the
+  second, for an unrelated reason — a LLM on the host's `localhost`. It no longer needs it: a
+  `tcp://localhost:<port>` allow rule gets a listener on that port inside the cage and relays it to
+  the host's service, so openfox now runs under the allowlist, verified end to end. That way out
+  does not exist for t3code, whose problem is not the loopback.) t3code's model traffic is made by a
+  SEPARATE,
   proxy-blind Node backend (`ELECTRON_RUN_AS_NODE`, Effect's undici with its own Agent) that no
   profile-level mechanism can route through the egress proxy: proxychains' `LD_PRELOAD` breaks
   Chromium's renderer (spiked 1-vs-0 rendered docs), Electron strips `NODE_OPTIONS` so a preload never
@@ -555,6 +587,13 @@ profile's header.)*
   packaging an **Electron/AppImage app inside the hermetic cage** (unproven, heavy) and
   confirming it reads its key from an **env var** rather than only its GUI config (so the
   host-side injection has a request to act on). Filed as *deferred*, not refused.
+
+- **Reasonix desktop** (the Wails/WebKitGTK app behind `reasonix.io`) is *deferred*, not
+  refused: the CLI is profiled above, but the desktop build is a native GTK app (libwebkit2gtk-4.1 +
+  libsoup-3), and the `deb:` backend fails the build when those shared libs are missing — the
+  curated lib set that profile-declared `nix:` packages feed into is base glibc/wayland only, and
+  WebKitGTK is not in it. Profiling it needs a host-side WebKitGTK provisioning mechanism first
+  (the same gap that keeps other native-GUI apps out); nothing about the app itself blocks it.
 
 For any other CLI agent: give the package (a `mise:`/`nix:`/`flake:` backend), the launch
 command, the runtime API host(s), and the credential mechanism (an injectable **header** key,

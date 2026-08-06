@@ -1,0 +1,167 @@
+# ante — Antigma's "self-contained agent that self-organizes" (AntigmaLabs/ante-preview),
+# sandboxed by sbx.
+#
+#   sbx app import examples/app/ante.toml
+#   sbx app run ante
+#   sbx app run ante -- -p "explain the README"   # headless
+#
+# Ante is "a ghost in your shell" — a self-contained Rust coding agent (~15 MB,
+# statically linked musl binary, zero runtime dependencies, single ELF with
+# everything baked in) from Antigma Labs (antigma.ai). The vendor's recommended
+# install path is `curl -fsSL https://ante.run/install.sh | bash`, which fetches
+# the latest signed tarball from the vendor's own bucket at `download.ante.run`.
+# The repo `AntigmaLabs/ante-preview` (560★, alpha preview) mirrors the same
+# tarball as GitHub release assets — verified v0.preview.70, asset
+# `ante-v0.preview.70-linux-x86_64-musl.tar.gz`. sbx equips it from the GitHub
+# release via mise's `github` backend (the mould `crush.toml` / `jcode.toml` /
+# `kilocode.toml` / `omp.toml` / `stakpak.toml` / `vtcode.toml` use): sbx reads the
+# latest release, picks the matching `_linux-x86_64-musl.tar.gz` asset,
+# downloads + extracts the `ante` binary, and puts it on PATH. `sbx upgrade mise`
+# rolls it forward.
+#
+# Alpha-preview caveats: the project is "macOS and Linux only", "expect breaking
+# changes", and the core harness is developed in a private repository during the
+# alpha — the binary you get is a prebuilt release artefact, not a source build.
+# The public repo ships only the wrapper + the libraries that have stabilised
+# (per the README: "The core harness itself is developed in a private repository
+# during the alpha and ships as a prebuilt binary via releases. Core libraries
+# from it are included here progressively as they stabilize").
+#
+# LICENSE — `Copyright © 2026 Antigma Labs, Ins. All rights reserved.` (the
+# GitHub `LICENSE.md` is the standard proprietary all-rights-reserved boilerplate;
+# the public repo's code is dual: a prebuilt-binary distribution with the source
+# of the wrapper + a few open crates). Treat the binary as proprietary, all
+# rights reserved. The user accepts a proprietary binary by running this
+# profile; the standard `~/.ante/` config is theirs.
+#
+# CREDENTIAL POSTURE — multi-provider BYOK, same shape as `aider` / `crush` /
+# `openclaude` / `vibe` / `command-code`. Ante ships with first-class support
+# for local models (a built-in `llama.cpp` integration toggled by the
+# `/offline-mode` slash — no API key, no internet, all inference on the
+# user's machine), and 8+ hosted providers verified in the binary's outbound
+# URL table. Antix Console (`antix.antigma.ai`) is the vendor's first-party
+# account dashboard — optional, used for billing and team plans; the CLI
+# itself does not require an account ("No accounts, no configuration files, no
+# setup guides" per the home page).
+#
+# Provider env vars verified in the binary + the README (`HYPER_*`-style
+# mapping is by name):
+#
+#  - **Anthropic** — `ANTHROPIC_API_KEY` → `api.anthropic.com` (the default if
+#    present)
+#  - **OpenAI** — `OPENAI_API_KEY` → `api.openai.com` (also `auth.openai.com`
+#    for Codex OAuth)
+#  - **Google Gemini / Vertex** — `GEMINI_API_KEY` (Google AI Studio) or
+#    `VERTEXAI_PROJECT`+`VERTEXAI_LOCATION` (Vertex AI, requires
+#    `gcloud auth application-default login`)
+#  - **xAI / Grok** — `XAI_API_KEY` → `api.x.ai`
+#  - **DeepSeek** — `DEEPSEEK_API_KEY` → `api.deepseek.com`
+#  - **Z.AI (GLM)** — `ZAI_API_KEY` → `api.z.ai`
+#  - **Aliyun DashScope (Qwen)** — `DASHSCOPE_API_KEY` →
+#    `coding.dashscope.aliyuncs.com`
+#  - **OpenRouter** — `OPENROUTER_API_KEY` → `openrouter.ai`
+#  - **Hugging Face Inference** — `HF_TOKEN` → `huggingface.co` (and used by
+#    `/offline-mode` to fetch GGUF weights)
+#  - **Local models** — none needed: `/offline-mode` ships llama.cpp in the
+#    binary; `/model` lets the user point at weights on disk.
+#
+# Pass a key for a single launch without baking it into the profile:
+#     sbx app run ante --env ANTHROPIC_API_KEY=…
+# (`--env` is an authoritative one-shot override read on the HOST; the value
+# reaches the cage env for that launch only, so the key never lands in the
+# committed profile.)
+#
+# LOCAL MODELS — Ollama / llama.cpp / LM Studio on the HOST loopback are reached
+# by naming their port: a `tcp://localhost:<port>` allow rule opens a listener on
+# that exact port inside the cage and relays it to your service, with the
+# allowlist intact (the shape `openfox.toml` documents). Or skip the loopback
+# entirely: `/offline-mode` runs llama.cpp IN-PROCESS
+# (the binary is statically linked) so the loopback is not needed for
+# inference, but `/offline-mode` DOES fetch GGUF weights from `huggingface.co`
+# to the cage's home; that egress is allowed below. If you keep weights
+# pre-staged in `~/.ante/models/`, the cage picks them up via the bind
+# (uncomment) and skips the network fetch entirely.
+#
+# CONFIG + STATE — `~/.ante/` (per the install script: `INSTALL_DIR` defaults
+# to `~/.ante/bin/`; config + data live under `~/.ante/` after first launch —
+# the binary creates this path on demand). Project-level state rides the
+# project bind. Logs default to the in-process ring; `ante logs` reads them.
+#
+# TELEMETRY — no third-party error tracker / analytics host appears in the
+# published binary's outbound URL table (no Sentry, no PostHog, no Segment).
+# The vendor does not advertise metrics collection; the cage's deny-default
+# still keeps every other host refused. Nothing to mute on the telemetry
+# front.
+#
+# SELF-UPDATE — `ante update` (in-cage) re-queries
+# `download.ante.run/channels/stable/manifest.json` (already covered by the
+# `download.ante.run` allow entry). sbx owns the version here; if you prefer
+# the in-cage updater, it just works on a network the profile already
+# permits.
+#
+# UNVERIFIED (like every profile until run with a real key): the live equip +
+# first prompt under the allowlist, the `ante` TUI on a real project, and
+# the alpha's frequent breakages. Grounded here: the GitHub release asset
+# shape (`ante-v0.preview.70-linux-x86_64-musl.tar.gz` — verified via the
+# GitHub API + a direct download, statically linked ELF), the first-party
+# hosts (`download.ante.run`, `antix.antigma.ai`, `huggingface.co` — read
+# out of the shipped binary's outbound URL table), the env-var names (read
+# out of the vendor docs + the binary's API-discovery code), and the
+# proprietary license.
+cmd = "ante"
+
+# Your host Ante config/models, mounted read-write at their real absolute
+# paths. `binds` is a security field, honored only because this profile lives
+# in your trusted config dir; `mode = "rw"` lets the caged `ante` read and
+# write these host files (config, sessions, history, pre-staged local
+# models). Uncomment to share your host Ante setup with the cage instead of
+# the app's isolated home (the default).
+#binds = [
+#    { path = "~/.ante", mode = "rw" },
+#]
+
+[packages]
+# Ante itself via mise's `github` backend. The release asset is the
+# `_linux-x86_64-musl.tar.gz` static-pie binary, auto-rolled by `sbx upgrade
+# mise`. No additional packages required (the binary is statically linked;
+# no `nix-ld` shim, no node runtime, no companion interpreter).
+ante = "mise:github:AntigmaLabs/ante-preview"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
+# prompts / context, reading completions) is opened to all verbs with `{*}`.
+# Hosts are from the shipped binary (`download.ante.run` for the in-cage
+# `ante update` path, `antix.antigma.ai` for the optional Antix Console,
+# `huggingface.co` for `/offline-mode` model weights) and the vendor docs.
+[network]
+mode = "deny"
+allow = [
+    # In-cage self-update — `ante update` re-queries the signed manifest at
+    # `download.ante.run/channels/stable/manifest.json` and pulls the new
+    # tarball from the same host. `{GET}` (plain download; the post-update
+    # binary install happens locally).
+    "{GET} https://download.ante.run",
+    # First-party Antix Console — the vendor's account / billing / team
+    # dashboard. Optional (the CLI does not require an Antix account); the
+    # user only hits it if they sign in from inside the cage.
+    "{*} https://antix.antigma.ai",
+    # Hugging Face — `/offline-mode` fetches GGUF weights from
+    # `huggingface.co` to the cage's home. `{GET}` (plain download).
+    # Skip this entry if you pre-stage weights on disk and bind them in
+    # (see the `binds` comment).
+    "{GET} https://huggingface.co",
+    # GitHub — MCP server installs, slash-command marketplace fetches, the
+    # stdio `npx`-style fetch. `{GET}`.
+    "{GET} https://github.com",
+    # Provider BYOK — uncomment the ONE(s) the model you call with
+    # `ante /model <id>` picks. The matching env var (e.g. `ANTHROPIC_API_KEY`)
+    # carries the key — host-side, injected on the wire, never in the cage.
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    #"{*} https://api.deepseek.com",
+    #"{*} https://api.x.ai",
+    #"{*} https://api.z.ai",
+    #"{*} https://openrouter.ai",
+    #"{*} https://generativelanguage.googleapis.com",
+    #"{*} https://aiplatform.googleapis.com",
+    #"{*} https://coding.dashscope.aliyuncs.com",
+]

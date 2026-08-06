@@ -1,0 +1,175 @@
+# trae — ByteDance's research CLI agent for general-purpose software engineering
+# tasks (bytedance/trae-agent), sandboxed by sbx.
+#
+#   sbx app import examples/app/trae.toml
+#   sbx app run trae
+#   sbx app run trae -- run "Add unit tests to utils.py"
+#
+# NOTE — `trae.ai` is ByteDance's commercial IDE product (Trae Code + Trae Work,
+# separate Electron apps with a vendor account). This profile is for the
+# research-grade, MIT-licensed, open-source CLI AGENT that ByteDance publishes
+# on GitHub at `bytedance/trae-agent` (12k★) — the modular, transparent
+# Python framework the Trae paper is built around. The two share a name and a
+# family but are different artefacts: this profile is for the OSS CLI, not
+# the Trae Code IDE.
+#
+# PACKAGING — a bootstrap install, NOT a clean sbx backend. Trae Agent is a
+# Python CLI distributed as a source-tree + `pyproject.toml` on GitHub — there
+# is NO PyPI release (`pip install trae-agent` fails; the README's
+# `trae-cli run` example trips up GitHub issues with the same error), no
+# released binary, and no flake/nixpkgs attribute. So none of sbx's
+# `nix:`/`mise:`/`deb:`/`tarball:` backends fit. Instead the `cmd` wrapper
+# below clones the repo, builds an isolated `uv` env, and runs the resulting
+# `trae-cli` from the cage's persistent isolated home — the same pattern
+# `pool.toml` / `devin.toml` / `rovo.toml` use, generalised to a source build.
+#
+# Installed once on the first launch; persistent across projects (the same
+# isolated home). Re-run the bootstrap to advance: `sbx app run trae --env
+# TRAE_REINSTALL=1` (the `--env` override is read on the HOST and authoritative
+# for that one launch — the binary moves only when you ask, matching the
+# "versions move only on an explicit upgrade" contract).
+#
+# CREDENTIAL POSTURE — multi-provider BYOK, the same shape as `crush` /
+# `aider` / `vibe` / `command-code`. Trae Agent supports OpenAI, Anthropic,
+# Doubao (ByteDance's own model family), Google Gemini, OpenRouter, Azure
+# OpenAI, and Ollama (local) — read out of the `pyproject.toml` deps
+# (`openai>=1.86.0`, `anthropic>=0.54.0`, `google-genai>=1.24.0`, `ollama
+# >=0.5.1`) and the YAML config example. There is NO first-party vendor
+# account: trae-agent routes every model through the standard provider API.
+# Configure either via `trae_config.yaml` (recommended) or via `*_API_KEY`
+# env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY,
+# OPENROUTER_API_KEY, DOUBAO_API_KEY, …).
+#
+# Pass a key for a single launch without baking it into the profile:
+#     sbx app run trae --env ANTHROPIC_API_KEY=…
+# (`--env` is an authoritative one-shot override read on the HOST; the value
+# reaches the cage env for that launch only, so the key never lands in the
+# committed profile.)
+#
+# LOCAL MODELS — Ollama on the HOST loopback is reached by naming its port:
+# a `tcp://localhost:11434` allow rule opens a listener on that exact port
+# inside the cage and relays it to your service, so the endpoint works
+# verbatim with the allowlist intact (the shape `openfox.toml` documents).
+#
+# CONFIG + STATE — `~/.trae/` (config: `trae_config.yaml` is git-ignored, plus
+# `trajectories/*.json` per-run debug logs). Project-level state rides the
+# project bind. The in-cage `uv` env lives at `~/.trae/.venv/` (host-side,
+# not seeded).
+#
+# MCP — `mcp_servers:` block in `trae_config.yaml` (stdio / http). The
+# profile does NOT pre-open MCP server hosts — add the host of any server you
+# actually configure (the cage's deny-default is the point).
+#
+# DOCKER MODE — `trae-cli run --docker-image python:3.12 …` runs the task
+# inside a container; the cage's empty netns + seccomp is the security
+# boundary, so an additional docker inside is overkill but supported (the
+# `evaluation` extras pull `docker>=7.1.0`).
+#
+# TELEMETRY — none advertised (no Sentry / PostHog / Segment in the
+# `pyproject.toml` deps or the README). Local trajectory logs are written
+# to disk under `trajectories/`. Nothing to mute on the telemetry front
+# (the cage's deny-default still keeps every other host refused).
+#
+# UNVERIFIED (like every profile until run with a real key): the live
+# bootstrap (the `git clone` + `uv sync` + `uv tool install` is the heaviest
+# first-launch of any profile — ~280 MiB of deps including `tree-sitter`
+# native modules, `textual`, `mcp`, `pyinstaller`), the `trae-cli run`
+# output, and the BYOK proxy injection. Grounded here: the source
+# `pyproject.toml` (name `trae-agent`, scripts `trae-cli =
+# trae_agent.cli:main`, requires-python `>=3.12`, deps
+# `openai>=1.86.0` + `anthropic>=0.54.0` + `google-genai>=1.24.0` +
+# `ollama>=0.5.1` + `mcp==1.12.2`), the YAML config example
+# (`trae_config.yaml.example` on main), the `Makefile` (no `install`
+# target — the docs point to `uv sync` + `make pre-commit` instead), the
+# upstream `bytedance/trae-agent` GitHub repo, and the MIT license.
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+
+# --- locate platform-independent install paths inside the app's persistent
+#     isolated home ---
+src="$HOME/.trae/src"
+bin_link="$HOME/.local/bin/trae-cli"
+repo_url="https://github.com/bytedance/trae-agent.git"
+
+if [ ! -x "$bin_link" ] || [ -n "$TRAE_REINSTALL" ]; then
+  # The repo ships an `uv`-managed venv + a `Makefile` + a `pyproject.toml` with
+  # a `trae-cli` script entrypoint. `uv tool install .` builds an ISOLATED env
+  # (so the deps never collide with anything else in the cage) and drops
+  # `trae-cli` on `~/.local/bin/`. `uv tool` is the upstream-recommended install
+  # path; `uv sync --all-extras` works too, but only `uv tool install` puts the
+  # bin on PATH.
+  git clone --depth 1 "$repo_url" "$src"
+  cd "$src"
+  # `uv tool install --python python3.12 .` — pin to a modern Python (the
+  # `pyproject.toml` requires `>=3.12`); the cage ships a `nix:python312`
+  # (see [packages]) so `python3.12` is on PATH.
+  uv tool install --python python3.12 .
+fi
+
+# Always export the install dir on PATH (in case downstream tools shell out
+# to `trae-cli` from a sub-process spawned outside the wrapper).
+export PATH="$HOME/.local/bin:$PATH"
+exec trae-cli "$@"
+    ''',
+    # `$0` placeholder: `sbx app run trae -- <args>` appends <args> to this
+    # cmd array, so they arrive as `$1 $2 …` and reach the agent verbatim
+    # via `exec … "$@"`.
+    "trae-cli",
+]
+
+# Your host Trae config/trajectories, mounted read-write at their real
+# absolute paths. `binds` is a security field, honored only because this
+# profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# `trae-cli` read and write these host files (config, trajectories). Uncomment
+# to share your host Trae setup with the cage instead of the app's isolated
+# home (the default). The `~/.trae/.venv` is host-side, NOT seeded.
+#binds = [
+#    { path = "~/.trae", mode = "rw" },
+#]
+
+[packages]
+# The wrapper above `git clone`s the repo, `uv tool install .`s it, and execs
+# `trae-cli`. `git` IS in sbx's base toolset (bash, coreutils, curl, git, less,
+# grep, sed, awk, find, jq, which), so only `uv` has to be provisioned. Python
+# 3.12 is required by the project's `pyproject.toml`; `uv tool install --python
+# python3.12` reuses a Python already on PATH, so we provision `nix:python312`.
+uv       = "nix:uv"
+python   = "nix:python312"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
+# prompts / context, reading completions) is opened to all verbs with `{*}`.
+# Hosts are from the `pyproject.toml` deps + the YAML config example (the
+# provider API hosts) and the upstream README (Doubao + Ollama routes).
+[network]
+mode = "deny"
+allow = [
+    # Provider BYOK — uncomment the ONE(s) the model you call with
+    # `trae-cli run --provider <id> --model <model>` picks. Trae routes
+    # EVERY model through the standard provider API; there is no
+    # first-party host. The matching env var (e.g. `ANTHROPIC_API_KEY`)
+    # carries the key — host-side, injected on the wire, never in the
+    # cage.
+    #"{*} https://api.openai.com",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://generativelanguage.googleapis.com",
+    #"{*} https://openrouter.ai",
+    # Doubao is ByteDance's own model family; the base URL is the
+    # Volcengine ARK gateway (per the README's env-var example).
+    #"{*} https://ark.cn-beijing.volces.com",
+    # Azure OpenAI — base_url is per-deployment, e.g.
+    # `https://<resource>.openai.azure.com`.
+    #"{*} re:^https://[a-z0-9-]+\\.openai\\.azure\\.com(/|$)",
+    # Bootstrap, first leg: `git clone` over HTTPS. Smart HTTP is NOT read-only —
+    # it GETs `/info/refs?service=git-upload-pack` and then POSTs the wants to
+    # `/git-upload-pack`, so the built-in self-equip allow-set (`{GET,HEAD}
+    # github.com`) is not enough and the clone needs the write verb explicitly.
+    "{*} https://github.com",
+    # Bootstrap, second leg: `uv tool install .` builds the source tree and
+    # resolves its dependency set (tree-sitter, textual, mcp, the provider SDKs)
+    # from PyPI — the index and the wheel host, both pure downloads.
+    "{GET} https://pypi.org",
+    "{GET} https://files.pythonhosted.org",
+]

@@ -1,0 +1,210 @@
+# crush — Charm's "glamourous agentic coding" terminal (charmbracelet/crush),
+# sandboxed by sbx.
+#
+#   sbx app import examples/app/crush.toml
+#   sbx app run crush
+#
+# Crush is Charm's "Your new coding bestie" — a Go-binary terminal coding agent (TUI)
+# distributed on GitHub releases as `crush_<ver>_Linux_x86_64.tar.gz` (verified
+# v0.88.0, static-pie ELF, ~27 MiB compressed, ~80 MiB unpacked, with man pages and
+# zsh/bash/fish completions bundled in the archive). sbx equips it from upstream via
+# mise's `github` backend (the mould `jcode.toml`/`kilocode.toml`/`omp.toml`/
+# `stakpak.toml`/`vtcode.toml` use): sbx reads the latest release, picks the matching
+# `_Linux_<arch>.tar.gz` asset, downloads + extracts the `crush` binary, and puts it
+# on PATH. `sbx upgrade mise` rolls it forward.
+#
+# The same tool is also distributed on npm as `@charmland/crush` — a small Node
+# launcher (bin `crush` → `run-crush.js`) whose `postinstall` (a GoReleaser-generated
+# `install.js`) downloads the very same GitHub release asset and verifies the
+# SHA256 the vendor publishes. mise's npm backend installs with
+# `--ignore-scripts=true` — a deliberate security default that would skip the
+# launcher-side download, leaving the bin unrun — so this profile uses the
+# `github` backend instead, which performs the same fetch + extract natively and
+# has no per-package install script to second-guess. The Hyper/OAuth flows, the
+# Catwalk auto-update, and the in-app self-update (`crush update`) all use the
+# already-fetched `crush` binary directly.
+#
+# CREDENTIAL POSTURE — multi-provider BYOK, the same shape as `aider` /
+# `openclaude` / `vibe`. The hyper.charm.land first-party provider is the
+# conservative default and is what the allowlist opens; uncomment a provider's
+# host in `allow` and supply the matching `*_API_KEY` env var (read on the HOST,
+# injected on the wire) when you switch models. The vendor's curated list of
+# environment variable names (verified in the README's `API Keys` table):
+#
+#  - **Hyper (Charm's first-party, ZDR, GDPR)** — `HYPER_API_KEY`, base
+#    `https://hyper.charm.land` (the default — comment it out only if you switch
+#    providers exclusively)
+#  - **Anthropic** — `ANTHROPIC_API_KEY` → `api.anthropic.com`
+#  - **OpenAI** — `OPENAI_API_KEY` → `api.openai.com`
+#  - **Google Gemini / Vertex** — `GEMINI_API_KEY` (Google AI Studio) or
+#    `VERTEXAI_PROJECT`+`VERTEXAI_LOCATION` (Vertex AI, requires
+#    `gcloud auth application-default login`)
+#  - **AWS Bedrock** — `AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY`+`AWS_REGION` or
+#    `AWS_BEARER_TOKEN_BEDROCK` (Bedrock API key, no expiry)
+#  - **GitHub Models / Copilot** — `GH_TOKEN` / Copilot subscription via the
+#    `api.githubcopilot.com` MCP path
+#  - **OpenRouter / Groq / DeepSeek / Cerebras / Z.AI / Hugging Face / Vercel /
+#    Moonshot / Kimi / io.net / xAI / Grok / etc.** — see the README's
+#    `Environment Variable` table for the full list (24+ providers, all driven
+#    by `*_API_KEY` env vars on the same shape).
+#
+# Pass a key for a single launch without baking it into the profile:
+#     sbx app run crush --env ANTHROPIC_API_KEY=…
+# (`--env` is an authoritative one-shot override read on the HOST; the value
+# reaches the cage env for that launch only, so the key never lands in the
+# committed profile.)
+#
+# LOCAL MODELS — Ollama, llama.cpp, LM Studio, LiteLLM, omlx on the HOST loopback
+# are reached by naming their port: a `tcp://localhost:<port>` allow rule opens a
+# listener on that exact port inside the cage and relays it to your service, with
+# the allowlist intact (the shape `openfox.toml` documents). Crush has a built-in
+# `discover_models` for the `openai-compat` providers, so the auto-discovered model
+# list refreshes once the port is declared — a probe to a port you did not name is
+# refused, which is the point.
+#
+# CONFIG + STATE — `~/.config/crush/` (config: `crushrc` is bash, plus
+# `crush.json` for the older JSON shape; MCP + LSP + skills configuration) and
+# `~/.local/share/crush/` (data: `crush.json` ephemeral state, SQLite-backed
+# session storage — override with `CRUSH_GLOBAL_CONFIG` / `CRUSH_GLOBAL_DATA`).
+# Project-level config: `.crushrc` (Bash) and `.crush/` (per-project state,
+# logs at `./.crush/logs/crush.log` per the `crush logs` command). All
+# project-level config rides the project bind; the rest lives in the isolated
+# home.
+#
+# TELEMETRY — Crush records "pseudonymous usage metrics (tied to a device-specific
+# hash)" per the README: "prompts and responses are NEVER collected". The metric
+# host is internal to Charm and is not in the published binary's outbound URL
+# table (the metric POSTs are served by `hyper.charm.land` on the same
+# infrastructure as the model API). The profile opts out at the in-cage env
+# level — `[env] CRUSH_DISABLE_METRICS = "1"` (vendor-recommended) and
+# `DO_NOT_TRACK = "1"` (the universal "respect the convention" knob) — so the
+# metrics POSTs are never sent. The cage's deny-default is the belt; the env
+# opt-out is the suspenders.
+#
+# MCP — `mcp add <name> --type stdio|http|sse …` from inside `crush` or from
+# the `crushrc` (Bash DSL). HTTP/SSE servers can use Crush's built-in OAuth
+# flow (`oauth: true` in the JSON config). The profile does NOT pre-open
+# MCP server hosts — `allow` is the tightest working set; add the host of any
+# server you actually configure (the cage's deny-default is the point).
+#
+# SELF-UPDATE — `crush update` (in-cage) re-queries the GitHub releases
+# manifest (already covered by the github allow-set). sbx owns the version
+# here; if you prefer the in-cage updater, it just works on a network the
+# profile already permits.
+#
+# UNVERIFIED (like every profile until run with a real key): the live equip +
+# first prompt under the allowlist, the hyper.charm.land auth, and the
+# in-cage `crush update`. Grounded here: the GitHub release asset shape
+# (`crush_<ver>_Linux_x86_64.tar.gz` — verified via the GitHub API at
+# `repos/charmbracelet/crush/releases/latest` and a direct download), the
+# first-party hosts (`hyper.charm.land`, `catwalk.charm.land`, `charm.land`
+# — read out of the shipped binary's outbound URL table), the env-var names
+# (read out of the README's API Keys table), and the FSL-1.1-MIT license
+# (Functional Source License 1.1, with a future-MIT grant — read out of the
+# GitHub `LICENSE.md`).
+cmd = "crush"
+
+# Your host Crush config/auth, mounted read-write at their real absolute paths.
+# `binds` is a security field, honored only because this profile lives in your
+# trusted config dir; `mode = "rw"` lets the caged `crush` read and write these
+# host files (config, sessions, history, MCP). Uncomment to share your host
+# Crush setup with the cage instead of the app's isolated home (the default).
+# `CRUSH_GLOBAL_CONFIG` / `CRUSH_GLOBAL_DATA` override the default XDG paths
+# if you set them in the host environment.
+#binds = [
+#    { path = "~/.config/crush",         mode = "rw" },   # config: crushrc, crush.json, MCP/LSP/skills
+#    { path = "~/.local/share/crush",    mode = "rw" },   # data: ephemeral state, session storage
+#]
+
+[packages]
+# Crush itself via mise's `github` backend. The release asset is the
+# `_Linux_<arch>.tar.gz` Go binary, auto-rolled by `sbx upgrade mise`. No
+# additional packages required (the binary is static-pie; no `nix-ld` shim,
+# no node runtime, no companion interpreter).
+crush = "mise:github:charmbracelet/crush"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
+# prompts / context, reading completions) is opened to all verbs with `{*}`.
+# Hosts are from the shipped binary (`hyper.charm.land` first-party,
+# `catwalk.charm.land` provider auto-update, `github.com` for the OAuth flows
+# and MCP installs) and the vendor docs.
+[network]
+mode = "deny"
+allow = [
+    # First-party Hyper — Charm's subscription model API. ZDR + GDPR, the
+    # default provider when no other `*_API_KEY` is set (verified in the
+    # binary's outbound URL table).
+    "{*} https://hyper.charm.land",
+    # Catwalk — the community-supported model registry Crush pulls on startup
+    # to refresh its provider list (auto-update can be disabled in the
+    # `crushrc` with `option provider-auto-update false`, but the cage opens
+    # it by default).
+    "{GET} https://catwalk.charm.land",
+    # GitHub — OAuth device flow (`github.com/login/device/code`),
+    # OAuth token exchange (`github.com/login/oauth/access_token`), the
+    # Copilot API (`api.githubcopilot.com`), and `api.github.com` for the
+    # MCP server catalog and any GitHub-flavored tools the user wires in.
+    # `{GET}` for the catalog and the device-code page; `{*}` for the
+    # post-flow token exchange and Copilot POSTs.
+    "{GET} https://github.com",
+    "{GET} https://api.github.com",
+    "{*} https://api.githubcopilot.com",
+    # Provider BYOK — uncomment the ONE(s) the model you call with
+    # `crush --model <model>` picks. The first-party `hyper.charm.land` above
+    # is enough for the default route; open another only if you switch
+    # providers. The matching env var (e.g. `ANTHROPIC_API_KEY`) carries
+    # the key — host-side, injected on the wire, never in the cage.
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    #"{*} https://generativelanguage.googleapis.com",
+    #"{*} https://api.deepseek.com",
+    #"{*} https://api.x.ai",
+    #"{*} https://api.groq.com",
+    #"{*} https://api.cerebras.ai",
+    #"{*} https://api.z.ai",
+    #"{*} https://openrouter.ai",
+    #"{*} https://api.fireworks.ai",
+    #"{*} https://api.moonshot.ai",
+    #"{*} https://api.kimi.com",
+    #"{*} https://api.together.xyz",
+    #"{*} https://api.galadriel.com",
+    #"{*} https://api.venice.ai",
+    #"{*} https://api.synthetic.new",
+    #"{*} https://api.atlascloud.ai",
+    #"{*} https://api.cortecs.ai",
+    #"{*} https://api.scaleway.ai",
+    #"{*} https://api.avian.io",
+    #"{*} https://api.tokenfactory.nebius.com",
+    #"{*} https://api.intelligence.io.solutions",
+    #"{*} https://api.neuralwatt.com",
+    #"{*} https://api.qnaigc.com",
+    #"{*} https://api.minimax.io",
+    #"{*} https://api.minimaxi.com",
+    # Bedrock + Vertex need different shapes (AWS signs, Vertex needs
+    # application-default creds on the host) — open only the regions you
+    # actually call.
+    #"{*} https://bedrock-runtime.us-east-1.amazonaws.com",
+    #"{*} https://aiplatform.googleapis.com",
+]
+
+# Opt out of the in-binary pseudonymous metrics at the in-cage env level.
+# The vendor publishes the opt-out knobs in the README; both are honored by
+# the binary. The cage's deny-default already refuses the metrics host
+# (whatever sub-path of `hyper.charm.land` it lives on), so these envs are
+# the suspenders to the belt.
+[env]
+CRUSH_DISABLE_METRICS = "1"
+DO_NOT_TRACK         = "1"
+
+# --- BYOK example (commented, headless). The in-cage placeholder lets
+# `crush` start and issue its first request; the egress proxy strips the
+# placeholder and substitutes the real key, read on the HOST (as
+# $ANTHROPIC_API_KEY, or via a resolver such as sops://secrets.yaml#crush),
+# on the wire to `api.anthropic.com`. Uncomment the pair matching the ONE
+# provider `allow` opens. ---
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"

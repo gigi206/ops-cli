@@ -1,0 +1,221 @@
+# devin — Devin CLI, the Rust terminal coding agent from Cognition, sandboxed by sbx.
+#
+#   sbx app import examples/app/devin.toml
+#   sbx app run devin
+#
+# PACKAGING — a bootstrap install, NOT a clean sbx backend. Devin (Cognition) ships its
+# terminal agent as a single static-pie linked Rust binary (bin `devin`, ~48 MiB
+# compressed / ~100 MiB unpacked) inside a per-platform tarball on their own S3-backed
+# CDN at `https://static.devin.ai/cli/`. Verified against `3000.3.27`: the archive
+# layout is `bin/devin` + `share/devin/docs/` (bundled reference) + `share/man/man1/
+# devin*.1` (man pages). The binary IS the agent — no node, no electron, no companion
+# runtime. Static-pie means no dynamic loader, no autoPatchelf. There is no nixpkgs
+# attribute, no GitHub release (the `DevinAI-agent/devin-AI` GitHub repo is the desktop
+# client, not the CLI), and no aqua package — so none of sbx's `tarball:` / `deb:` /
+# `nix:` / `mise:` / `flake:` backends fit (the `tarball:` backend, the closest shape,
+# is hard-coded to wrap an Electron `resources/app(.asar)` launcher — see
+# `src/sandbox/tarball.rs:101-105` — so a plain `bin/devin` archive aborts the build
+# with "no Electron resources/app(.asar)"). So this profile uses the bootstrap pattern
+# proven by `pool.toml` for Poolside's standalone CLI: the `cmd` wrapper downloads
+# the tarball, verifies the SHA256 the vendor publishes in their own live manifest,
+# extracts `bin/devin` into the app's persistent isolated home, and execs it.
+#
+# Installed once on the first launch; persistent across projects (the same isolated
+# home). Re-run the bootstrap to advance: `sbx app run devin --env DEVIN_REINSTALL=1`
+# (the `--env` override is read on the HOST and authoritative for that one launch —
+# the binary moves only when you ask, matching the "versions move only on an explicit
+# upgrade" contract). `devin update` ALSO works in-cage (its manifest URL is in
+# `allow`); the two paths are independent.
+#
+# CREDENTIAL POSTURE — three paths, headless-first (this profile is for the empty netns):
+#
+#  - **BYOK API key (RECOMMENDED for the cage)** — `devin auth login` opens a PKCE
+#    browser flow with a loopback callback on a random port (`127.0.0.1:0`, fallback
+#    `8765`), which the empty netns can't honour. The headless alternative is
+#    `DEVIN_API_KEY`, read directly by the binary (verified — `api_key_set`, `api_key`,
+#    `api_server_url` in `GetUserStatusResponse`). Provision the key on the HOST and
+#    inject via `[env]` + `[secret]` (the egress proxy strips the placeholder and
+#    substitutes the real key on the wire to `api.devin.ai`). Get the key from
+#    `https://app.devin.ai/settings/api-keys`.
+#  - **Outpost token** for hosted runners — `DEVIN_OUTPOSTS_TOKEN` (a per-environment
+#    token from `https://app.devin.ai/settings/environment?tab=outposts`), for when
+#    the caged Devin spawns a remote worker.
+#  - **Browser PKCE** — `devin auth login` from a host terminal, then `devin auth
+#    status` confirms the session lives in the app's isolated home (`~/.config/devin/
+#    credentials` and a system keyring on macOS). The loopback server can't be reached
+#    from inside the cage, so this path is for the HOST's own `devin` install, not
+#    the caged one.
+#
+# CONFIG + STATE — `~/.config/devin/config.json` (user) and `.devin/config.json`
+# (project, committed) for general settings; `~/.config/devin/mcp_config.json` and
+# `.devin/mcp_config.json` for MCP servers; `~/.config/devin/credentials` for the
+# authenticated session; `~/.local/share/devin/cli/_versions/<v>/bin/devin` for the
+# installed binary (managed by `devin update`, allowed below). All project-level
+# config rides the project bind; the rest lives in the isolated home.
+#
+# TELEMETRY — Devin CLI bakes in a Sentry DSN for crash + error reporting
+# (`https://…@o4507463137361920.ingest.us.sentry.io/4510507667685376` —
+# `sentry.rust/0.47.0`) and a first-party telemetry manager (`chisel_api::telemetry::
+# manager`, the package name in the binary). The CLI has NO per-installation opt-out
+# env var (unlike `AMP_SKIP_UPDATE_CHECK`); the org/user toggles `disable_telemetry`
+# server-side via the Devin web app, and the CLI then stops posting. The Sentry host
+# is DENIED and muted below — a `mute` never changes the verdict (still refused) and
+# never hides a count (`sbx net stats` still tallies it). Local error logs are
+# unaffected.
+#
+# MCP — `devin mcp add <name> -- <command>` (stdio) or `devin mcp add <name> <url>`
+# (SSE), configured in `mcp_config.json`. The profile does NOT pre-open MCP server
+# hosts — `allow` is the tightest working set; add the host of any server you
+# actually configure (the cage's deny-default is the point).
+#
+# UNVERIFIED (like every profile until run with a real API key): the live bootstrap +
+# first prompt under the allowlist, the `DEVIN_API_KEY` proxy injection, and the
+# wiki feature (`cognition.ai/wiki/...`, allowed but optional). Grounded here: the
+# packaging and release manifest (read out of `static.devin.ai/cli/current/manifest
+# .json`), the `DEVIN_*` env-var list and the `api.devin.ai` / `app.devin.ai` hosts
+# (read out of the shipped binary, the version-string `3000.3.27` from
+# `share/devin/docs/changelog/stable.mdx`), and the `auto_update: true` config
+# default (read out of `share/devin/docs/reference/configuration/config-file.mdx`).
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+# --- locate platform triple (linux x86_64 / aarch64 in the cage; the resolve command
+#     runs the same mapping on macOS) ---
+case "$(uname -m)" in
+  x86_64)  key="x86_64-unknown-linux" ;;
+  aarch64) key="aarch64-unknown-linux" ;;
+  *) echo "devin: unsupported arch $(uname -m)" >&2; exit 1 ;;
+esac
+
+# --- install path inside the app's persistent isolated home ---
+bin="$HOME/.local/bin/devin"
+ver_file="$HOME/.local/share/devin/.sbx-version"
+tmp="$(mktemp -d)"
+trap "rm -rf $tmp" EXIT
+
+# Skip the install if the binary exists AND the version matches AND the user did
+# not request an explicit re-install. `devin update` is a separate, in-cage path
+# that manages the vendor's own version pinning under
+# ~/.local/share/devin/cli/_versions/<v>/ — it can also promote the binary
+# forward; after a `devin update`, the wrapper's pinning is harmless (the binary
+# at $bin is a symlink to the active version when installed by `devin update`).
+if [ ! -x "$bin" ] || [ -n "$DEVIN_REINSTALL" ]; then
+  manifest_url="https://static.devin.ai/cli/current/manifest.json"
+  # Fetch the live manifest. The JSON is stable, each platform on a single line — the
+  # same shape the Homebrew Cask `livecheck` parses. First isolate the platform's
+  # object block (no nested braces), then extract url + sha256 + version with three
+  # small greps. `set -o pipefail` makes a non-matching grep fail the pipeline.
+  manifest="$(curl -fsSL "$manifest_url")"
+  block="$(printf "%s" "$manifest" | grep -oE "\"$key\":\\s*\\{[^}]*\\}" | head -1)"
+  url="$(printf "%s" "$block" | grep -oE '"url":\s*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+  expected_sha="$(printf "%s" "$block" | grep -oE '"sha256":\s*"[0-9a-f]{64}"' | head -1 | sed 's/.*"\([0-9a-f]\{64\}\)"$/\1/')"
+  version="$(printf "%s" "$manifest" | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+  if [ -z "$url" ] || [ -z "$expected_sha" ] || [ -z "$version" ]; then
+    echo "devin: failed to parse $manifest_url for $key" >&2
+    exit 1
+  fi
+  # Download, verify, extract — fail closed on any step (`set -e`, `pipefail`).
+  tarball="$tmp/devin.tar.gz"
+  curl -fsSL "$url" -o "$tarball"
+  actual_sha="$(sha256sum "$tarball" | cut -d' ' -f1)"
+  if [ "$actual_sha" != "$expected_sha" ]; then
+    echo "devin: sha256 mismatch — vendor=$expected_sha got=$actual_sha" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$bin")" "$(dirname "$ver_file")"
+  # Extract just `bin/devin` (the tarball also carries docs + man pages; the docs
+  # are bundled inside the binary as help pages, and the man pages are not
+  # mounted in-cage — keep the install minimal and verifiable).
+  tar -xzf "$tarball" -C "$tmp" bin/devin
+  install -m 0755 "$tmp/bin/devin" "$bin"
+  printf "%s" "$version" > "$ver_file"
+fi
+
+# Always export the install dir on PATH (in case downstream tools shell out to
+# `devin` from a sub-process spawned outside the wrapper).
+export PATH="$HOME/.local/bin:$PATH"
+exec "$bin" "$@"
+    ''',
+    # `$0` placeholder: `sbx app run devin -- <args>` appends <args> to this cmd
+    # array, so they arrive as `$1 $2 …` and reach the agent verbatim via
+    # `exec … "$@"`.
+    "devin",
+]
+
+# Your host Devin config/auth, mounted read-write at their real absolute paths.
+# `binds` is a security field, honored only because this profile lives in your
+# trusted config dir; `mode = "rw"` lets the caged `devin` read and write these
+# host files (config, MCP, login). Uncomment to share your host Devin setup with
+# the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.config/devin", mode = "rw" },     # user config, MCP, credentials
+#    { path = "~/.local/share/devin", mode = "rw" }, # installed binary, sessions
+#    { path = "~/.devin",       mode = "rw" },     # project config (when running in a bound project)
+#]
+
+[packages]
+# The wrapper above downloads + extracts + verifies the tarball. `curl` + `sha256sum` are
+# in sbx's base toolset; `tar` + `gzip` are NOT (same gap `pool.toml` and `cursor-agent
+# .toml` cite), so the `nix:` backend provisions them host-side, seeded, offline-reusable.
+# Devin's CLI is a single static-pie binary with no companion runtime, and the wrapper's
+# install is the source of truth for the binary's location on PATH.
+gnutar = "nix:gnutar"
+gzip   = "nix:gzip"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing prompts /
+# model traffic) is opened to all verbs with `{*}`. Hosts are from the shipped binary
+# (`api.devin.ai`, `app.devin.ai`, `cognition.ai`, `static.devin.ai`) — see the header.
+[network]
+mode = "deny"
+allow = [
+    # Bootstrap (the wrapper, on first launch or `DEVIN_REINSTALL=1`) + the in-cage
+    # `devin update` flow — both fetch the same live manifest + signed tarball from
+    # this one host.
+    "{GET} https://static.devin.ai",
+    # Runtime — model traffic, sessions, account info, telemetry, wiki. The CLI's main
+    # backend is `api.devin.ai` (verified in the binary's outbound URL table —
+    # `api_key_set`, `devin_api_url`); the web app at `app.devin.ai` is also hit during
+    # PKCE flow, even though the headless cage uses the BYOK path; the wildcards are
+    # first-party and spoof-safe.
+    "{*} https://api.devin.ai",
+    "{*} https://app.devin.ai",
+    # First-party Cognition services used by the CLI's optional features (wiki
+    # status/contents — `cognition.ai/wiki/...`, also seen in the binary's outbound
+    # URL table). The CLI degrades gracefully when these are denied (the wiki feature
+    # just doesn't populate), so opening it is opt-in via the comment below; leave
+    # commented to keep the cage quiet. Match the same `cognition.ai` apex + subdomains
+    # the binary targets.
+    #"{*} https://cognition.ai",
+    # Install via the friendly domain (`cli.devin.ai` is a CloudFront rewrite to
+    # `static.devin.ai` — see `cli.devin.ai/install.sh`); same content, no functional
+    # difference once the tarball is in the cage. Uncomment if you also want to allow
+    # `cli.devin.ai` for the install-time fetch (the wrapper above uses
+    # `static.devin.ai` already).
+    #"{GET} https://cli.devin.ai",
+]
+
+# Silence the DENIED error-reporting host. `mute` never changes the verdict (still
+# refused) and never hides a count (`sbx net stats` still tallies it; see with
+# `--all`). The Sentry endpoint is baked into the binary; the CLI has no
+# per-installation opt-out env var, so denying it here is the only cage-side lever.
+# Local error logs are unaffected — only the outbox is silent.
+mute = [
+    "o4507463137361920.ingest.us.sentry.io",  # Devin CLI's baked-in Sentry DSN host (sentry.rust/0.47.0)
+]
+
+# --- BYOK API key (commented, headless). The in-cage placeholder lets `devin auth
+# status` start and issue its first request; the egress proxy strips the placeholder
+# and substitutes the real key, read on the HOST (as $DEVIN_API_KEY) on the wire to
+# `api.devin.ai`. Generate the key at https://app.devin.ai/settings/api-keys. The model
+# selection is then `devin` and the request hits `api.devin.ai`. Uncomment the `[env]`
+# header WITH the key: a bare key line here would land inside the `[network]` table above
+# and be dropped in silence (TOML reads a key as belonging to the last table header). ---
+#[env]
+#DEVIN_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.devin.ai"]
+#from = "env://DEVIN_API_KEY"
+#header = "Authorization"
+#type = "bearer"

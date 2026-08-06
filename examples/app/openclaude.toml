@@ -1,0 +1,126 @@
+# openclaude — "Claude Code with any LLM": an open-source (MIT) agentic coding CLI by Gitlawb,
+# sandboxed by sbx.
+#
+#   sbx app import examples/app/openclaude.toml
+#   sbx app run openclaude
+#
+# OpenClaude is a Claude-Code-style terminal coding agent that routes to OpenAI-compatible APIs
+# (OpenRouter, OpenAI, DeepSeek, Groq, Mistral, LM Studio, …), Gemini, GitHub Models, Codex OAuth,
+# Ollama and partner gateways ("GitLawb Opengateway" is the startup default), with the same
+# terminal-first workflow: prompts, tools, agents, MCP, slash commands, streaming output.
+#
+# The tool is equipped fresh from upstream: mise's `npm` backend pulls `@gitlawb/openclaude`
+# (bin `openclaude`, a plain JS shim over a Node runtime — no `postinstall`, three runtime
+# dependencies, `engines.node >= 22` — per its package.json and bin/openclaude), running on a nix
+# node provisioned in-cage. No nixpkgs lag, no source build, no vendor OAuth SDK. Versioned at the
+# latest upstream on first launch in a project; `sbx upgrade mise` rolls it forward. Self-update
+# (`openclaude update` / the `/update` slash command) pulls GitHub releases, covered by sbx's
+# built-in github allow-set — sbx owns the version here.
+#
+# CONFIG + STATE — `~/.openclaude/` (settings.json saved by the `/provider` slash command,
+# credentials, projects, histories, MCP config), kept in the app's isolated home, shared across
+# projects by default (home_scope). The CLI also accepts `--provider-env-file <env>` to load
+# provider/setup variables from a file instead of the process environment.
+#
+# CREDENTIALS — three postures; pick the ONE you use (a host the flow reaches that is not in
+# `allow` returns a refusal whose body names it — add it or check ahead with `sbx test net <url>`):
+#
+#  - **BYOK OpenAI-compatible (recommended)**: uncomment `CLAUDE_CODE_USE_OPENAI = "1"`,
+#    `OPENAI_BASE_URL` and `OPENAI_MODEL` in [env], the matching `{*} <host>` in `allow`, and the
+#    corresponding [secret] block. The real key is read on the HOST and substituted by the egress
+#    proxy on the wire — it never enters the cage.
+#  - **Anthropic native**: this fork keeps the upstream Claude-Code default route — uncomment
+#    `{*} https://api.anthropic.com`, set `ANTHROPIC_API_KEY`, keep the [secret] block.
+#  - **Saved provider settings**: `/provider` stores its choice in `~/.openclaude/settings.json`
+#    inside the app's isolated home. The browser sign-in flows (Codex OAuth → ChatGPT,
+#    `/onboard-github` → GitHub) open a localhost callback the empty netns breaks — like `jcode`,
+#    prefer the env-var paths; the always-route of the saved settings works cleanly in the cage.
+#
+# (An OpenAI-compatible LOCAL server — Ollama, LM Studio — on the HOST loopback is reached by
+# naming its port: a `tcp://localhost:<port>` allow rule opens a listener on that exact port
+# inside the cage and relays it to your service, with the allowlist intact — the shape
+# `examples/app/openfox.toml` documents.)
+#
+# TELEMETRY — none: OpenClaude REMOVED telemetry from its source (`src/init.ts` — telemetry
+# initialization is a no-op). Nothing to mute or deny, and no privacy banner to click past.
+#
+# UNVERIFIED (like every profile until run with a real key): the live equip + first prompt under
+# the allowlist. Grounded here: the npm packaging (bin, engines `>= 22`, three deps, no
+# postinstall/scripts — read out of package.json and bin/openclaude), the config dir
+# (`~/.openclaude`, src/utils/envUtils.ts `resolveClaudeConfigHomeDir`), the OpenAI-compatible mode
+# and env names (`CLAUDE_CODE_USE_OPENAI`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` —
+# src/utils/providerValidation.ts, docs/quick-start-mac-linux.md), the provider list (README,
+# "Supported Providers"), and the telemetry removal (src, init.ts).
+cmd = "openclaude"
+
+# Your host OpenClaude config, mounted read-write at its real absolute paths. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `openclaude` read and write these host files (saved provider settings, credentials,
+# history). Uncomment to share your host setup instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.openclaude", mode = "rw" },
+#]
+
+[packages]
+# Node ≥ 22 from nixpkgs (the fork's runtime — the npm shim is a `#!/usr/bin/env node` bin).
+nodejs = "nix:nodejs"
+# The tool itself, from upstream's own npm scope — no postinstall scripts, installed in-cage.
+openclaude = "mise:npm:@gitlawb/openclaude"
+
+[network]
+mode = "deny"
+# Egress is denied by construction except the ONE provider you actually use (the model host the
+# agent POSTs to is opened to all verbs with `{*}`; an app is read-by-default). registry.npmjs.org
+# is the equipping-time fetch (same as the `kimi` profile); the self-update check rides the
+# built-in github allow-set.
+allow = [
+    "{GET} https://registry.npmjs.org",
+    # BYOK OpenAI-compatible host — uncomment the ONE you use, with the matching model host +
+    # model in [env] and the [secret] block below. Examples:
+    #"{*} https://openrouter.ai",
+    #"{*} https://api.openai.com",
+    #"{*} https://api.deepseek.com",
+    # Anthropic route (this fork's default upstream mode):
+    #"{*} https://api.anthropic.com",
+    # Gemini (API key only, per the README):
+    #"{*} https://generativelanguage.googleapis.com",
+    # OpenCode Zen / OpenCode Go gateways (OpenCode-API key, opencode.ai):
+    #"{*} https://opencode.ai",
+    # GitLawb's own "Open-gateway" (startup default route, needs a gitlawb.com key): stays
+    # denied unless you actually use a partner model through it:
+    #"{*} https://opengateway.gitlawb.com",
+]
+
+# This profile deliberately has NO `mute`: OpenClaude removed telemetry from its source —
+# nothing is refused except what the allowlist above deliberately does not open.
+
+# BYOK: real key read on the HOST, injected by the egress proxy — never in the cage. In the
+# cage the placeholders let the CLI start and issue the request; the proxy strips them and
+# substitutes the real keys on the wire to the matching hosts. Uncomment the pair matching the
+# ONE provider `allow` opens. (The Anthropic [secret] uses `x-api-key` with `type = "raw"`, not
+# bearer.)
+[env]
+# OpenAI-compatible BYOK mode (uncomment together with the ONE host in `allow` and its [secret]).
+#CLAUDE_CODE_USE_OPENAI = "1"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
+#OPENAI_MODEL = "deepseek-v4-flash"
+# Anthropic BYOK route (default upstream mode — uncomment with api.anthropic.com).
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.deepseek.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"

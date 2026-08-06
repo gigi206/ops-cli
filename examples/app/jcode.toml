@@ -1,0 +1,138 @@
+# jcode — a Rust terminal coding agent ("the most RAM efficient harness"), sandboxed by sbx.
+#
+#   sbx app import examples/app/jcode.toml
+#   sbx app run jcode
+#
+# jcode ships as a self-contained Rust release binary on its own GitHub releases
+# (`jcode-linux-x86_64.tar.gz`). sbx equips it fresh from upstream via mise's `github`
+# backend (the same clean path `vtcode`/`cortex` use) — no nixpkgs lag, no node. The binary
+# lands in the app's persistent isolated home, pinned at the version installed on the first
+# launch in a project; advance it with `sbx upgrade mise`. Do NOT use a built-in updater —
+# sbx owns the version here, and the upstream install script downloads from its own CDN
+# (jcode.sh/releases + the GitHub release), which stays denied below.
+#
+# The Linux artifact is a DYNAMIC glibc binary (upstream's installer patchelf's it for
+# Termux). The tarball ships a tiny launcher (sh: LD_LIBRARY_PATH=self-dir, then `exec`s
+# the sibling `.bin`) next to the real 155 MB ELF — the hermetic cage's nix-ld shim
+# provides the loader and libc, so it should start like other un-patchelf'd binaries (the
+# cursor-agent mould). UNPROVEN until verified: the equip + first launch under the allowlist.
+#
+# CONFIG + STATE — `~/.jcode/` (config.toml, auth.json, openai-auth.json, gemini_oauth.json,
+# telemetry_id, mcp.json, pending-login/) and provider env files under `~/.config/jcode/`
+# (e.g. azure-openai.env, nvidia-nim.env) — kept in the app's persistent isolated home,
+# shared across projects (home_scope default). Multi-session "swarm" and the
+# `jcode serve`/`connect` server pair work in the same cage.
+#
+# CREDENTIALS — three postures:
+#
+#  - **BYOK (recommended)**: the real key is read on the HOST and injected by the egress
+#    proxy on the wire — never in the cage. jcode reads the standard env vars
+#    (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …); uncomment the
+#    matching [env] placeholder + [secret] block below and the provider host in `allow`.
+#  - **Account OAuth**: `jcode login --provider claude|openai|openrouter|gemini|copilot|…`
+#    inside the cage. The interactive flows open a localhost callback, which the empty
+#    netns breaks — use the scriptable flags instead (verified on the v0.68.0 binary):
+#    `jcode login --no-browser --print-auth-url` prints a URL to open on the HOST and
+#    persists pending state, then `--callback-url <full URL>` or `--auth-code <code>`
+#    completes it back in the cage (`--complete` for the Copilot device flow; `--json` for
+#    machine-readable output). The token then persists in the app's isolated home. Provider
+#    auth hosts stay denied by default; open the ones you actually log in to.
+#  - **Local models**: Ollama / LM Studio on your HOST loopback — name the port with a
+#    `tcp://localhost:<port>` allow rule (:11434 / :1234). sbx opens a listener inside the
+#    cage on that exact port and relays it to the service on YOUR loopback, so the endpoint
+#    works verbatim and the allowlist stays on (the shape `examples/app/openfox.toml`
+#    documents).
+#
+# The agent's web tools (webfetch, and the built-in browser tool once `jcode browser setup`
+# wires Firefox Agent Bridge) can reach only what the allowlist opens.
+#
+# UNVERIFIED (like every profile until run with a real key): the live equip + launch under
+# the allowlist, the authentication, and the model traffic through sbx's MITM. Grounded
+# here: the packaging (upstream's own GitHub release, asset `jcode-linux-x86_64.tar.gz`,
+# launcher `jcode-linux-$(uname -m)` + ELF `.bin` — read out of the release artifact), the
+# config/state paths, the telemetry opt-out, and the provider env-var names (upstream's
+# README).
+#
+# mise names the command after the archive's binary (`jcode-linux-x86_64`,
+# `jcode-linux-aarch64`, …), not bare `jcode` like upstream's own installer renames it.
+# Resolve the real name at launch so the profile works on both archs and keeps working if
+# upstream ever publishes a bare `jcode` shim again.
+cmd = ["bash", "-lc", '''
+set -u
+for cand in "jcode-linux-$(uname -m)" "jcode"; do
+  if command -v "$cand" >/dev/null 2>&1; then
+    exec "$cand" "$@"
+  fi
+done
+echo "jcode: no equipped binary on PATH" >&2
+exit 127
+''', "jcode"]
+
+# Your host jcode config/data, mounted read-write at their real absolute paths. `binds` is a
+# security field, honored only because this profile lives in your trusted config dir;
+# `mode = "rw"` lets the caged `jcode` read and write these host files (login, settings,
+# history). Uncomment to share your host setup with the cage instead of the app's isolated
+# home (the default).
+#binds = [
+#    { path = "~/.jcode", mode = "rw" },
+#    { path = "~/.config/jcode", mode = "rw" },
+#]
+
+[packages]
+# jcode itself from upstream's GitHub release. The download rides sbx's built-in read-only
+# allow-set (github.com + *.githubusercontent.com), so the install needs no [network] entry.
+jcode = "mise:github:1jehuang/jcode"
+
+# Egress is denied by construction except the provider you actually use. An app is
+# read-by-default ({GET,HEAD}); a completions endpoint is a POST, so the model host is
+# opened to all verbs with `{*}`. Nothing else is opened — the agent reaches the web only
+# through whatever hosts you add here.
+[network]
+mode = "deny"
+allow = [
+    # Uncomment the ONE provider you use (and the matching [secret] block below).
+    #"{*} https://openrouter.ai",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    # jcode's own site (docs, update metadata, sponsored-discovery API): denied by default —
+    # sbx owns the version here. Open it read-only if a release ever needs it.
+    #"{GET} https://jcode.sh",
+]
+
+# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): jcode's telemetry
+# endpoint — fire-and-forget POSTs (install/session/feedback events; no prompts or code).
+# We opt out via the `JCODE_NO_TELEMETRY` env below AND leave the host denied; a `mute`
+# never changes the verdict (still refused) and never hides a count (`sbx net stats` still
+# tallies it). See it anytime with `sbx net log --all`; edit with `sbx net mute|unmute
+# telemetry.jcode.sh -a jcode`. Remove both the env var and this entry the day you decide to
+# allow telemetry.
+mute = [
+    "telemetry.jcode.sh",
+]
+
+# Telemetry: opt-out from the start (upstream also honors `DO_NOT_TRACK=1` and a
+# `~/.jcode/no_telemetry` file). No browser can open in the empty netns, so also suppress
+# the local browser launch outright (upstream checks `JCODE_NO_BROWSER`/`NO_BROWSER` in
+# `crates/jcode-base/src/auth/mod.rs` `browser_suppressed()`) — `login` then falls back
+# immediately to the paste/device flow instead of waiting out a callback timeout. The
+# provider-key placeholders below stay commented — the real key never enters the cage: the
+# proxy strips the placeholder and substitutes the key, read on the HOST, on the wire.
+[env]
+JCODE_NO_TELEMETRY = "1"
+JCODE_NO_BROWSER = "1"
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

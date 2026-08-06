@@ -1,0 +1,143 @@
+# reasonix-desktop — the Reasonix desktop shell (reasonix.io), sandboxed by sbx.
+#
+#   sbx app import examples/app/reasonix-desktop.toml
+#   sbx app run reasonix-desktop
+#
+# PACKAGING — a prebuilt `.deb`, but NOT an Electron one. Reasonix Desktop is a **Wails** shell
+# (GTK3 + WebKit2GTK 4.1) around the same static Go kernel `reasonix.toml` runs in the terminal.
+# Verified against `desktop-v1.20.0`: the `.deb`'s control block declares
+# `Depends: libgtk-3-0, libwebkit2gtk-4.1-0, pkexec` and its description reads "a Wails shell
+# around the Go kernel"; the payload is `usr/bin/reasonix-desktop` (the dynamically linked shell),
+# `usr/bin/reasonix` (the static Go CLI) and `usr/bin/reasonix-launcher`.
+#
+# That shape is why the `[deb.<name>]` table below carries a `libs` list: the `deb:` backend
+# autoPatchelfs against a library set shared by every prebuilt package, and that set covers the
+# Electron/Chromium shape — no webkitgtk, no libsoup, no javascriptcoregtk. Naming them here adds
+# them for THIS package only, so no Electron app pays for WebKitGTK's closure. The launcher is found
+# at `usr/bin/reasonix-desktop` by the package name, which is what keeps the CLI and the updater
+# beside it from being wrapped by mistake.
+#
+# `reasonix-launcher` is deliberately not the entry point: it resolves the shell through a writable
+# `current.json` install layout it manages itself (the vendor's own updater), while versions move
+# through `sbx upgrade deb` here.
+#
+# UPGRADES — `deb:resolve`, because this repo publishes TWO release trains from one repository (the
+# CLI as `v<x>` and the desktop as `desktop-v<x>`), so `/releases/latest` alternates between them
+# and a `deb:github:` locator would find no `.deb` at all whenever the CLI release is the newer one.
+# The command below picks the newest `desktop-v*` tag explicitly. sbx runs it in a hermetic sandbox
+# (its own base tools — `curl`, `jq`, `sed`, … — on PATH), re-validates the URL it prints, and pins
+# it with its content hash; `sbx upgrade deb` re-runs it to roll forward.
+#
+# DISPLAY — `gui = "wayland"` binds the host compositor socket read-only and provisions fonts;
+# `gpu = true` opens hardware rendering (mesa into sbx's own store, the render node under /dev/dri,
+# the minimal /sys DRM subtree). Isolation is compositor-dependent: Mutter (GNOME) is safe, wlroots
+# compositors expose screen capture and input injection to ordinary clients (see
+# docs-site/docs/guide/configuration/gui.md). On an NVIDIA card mesa cannot drive the render node
+# and EGL falls back to software (`libEGL warning: … driver (null)`): the window still draws, just
+# without acceleration — the same NVIDIA gap every GUI profile has.
+#
+# THE AGENT'S SHELL TOOL — Reasonix confines the commands its agent runs in a bubblewrap cage of
+# its own, and refuses to run them unconfined when it cannot ("bash sandbox requested but
+# unavailable on this host"). Providing `nix:bubblewrap` does NOT fix it: measured in this cage,
+# `bwrap --dev-bind / / true` fails with "No permissions to create a new namespace" — an
+# unprivileged user namespace cannot nest inside the one sbx already runs in on a host whose
+# AppArmor restricts them. The cage IS the boundary here, so the answer is to turn the vendor's own
+# nested sandbox off, in Reasonix's settings (`[sandbox] bash = "off"` in its `config.toml`, or
+# Settings -> Sandbox), and let sbx confine the shell.
+#
+# CREDENTIAL — the same DeepSeek BYOK posture as `reasonix.toml`: the real key is read on the HOST
+# and substituted by the egress proxy on the wire, never in the cage. See the `[env]` note and the
+# `[secret]` block at the bottom.
+#
+# VERIFIED on this profile: the resolve command, the host-side build, the launch, and a mapped
+# Reasonix window on a Wayland session. UNVERIFIED (like every profile until run with a real key):
+# the sign-in and the model traffic through sbx's MITM. Grounded here: the packaging (control block,
+# payload layout and the ELF NEEDED list read out of the published `.deb`).
+cmd = "reasonix-desktop"
+
+gui = "wayland"
+gpu = true
+# `audio = true` binds the host sound server so the shell can play notification sounds and page
+# media. Read the trade first: that bus exposes the MICROPHONE and every `.monitor` source, i.e.
+# what the rest of your desktop is playing — drop this line if the shell has no reason to make
+# noise. `dbus = true` gives the cage its OWN private portal (a session bus + xdg-desktop-portal
+# in-cage, never the host bus) and is what makes the app FOLLOW the desktop's light/dark scheme: the
+# portal seeds the host colour scheme at launch and sbx's theme relay rewrites the in-cage GSettings
+# keyfile on every host switch, so GTK re-themes live. It also gives the shell a real file dialog.
+# Both are security fields, honored only because this profile lives in your trusted config dir;
+# `dbus` requires `gui = "wayland"`, which is set above.
+audio = true
+dbus = true
+
+[packages]
+reasonix-desktop = "deb:resolve"
+
+[deb.reasonix-desktop]
+# Print the newest `desktop-v*` release's `.deb` URL, and nothing else. `jq` is in sbx's base
+# toolset, so the resolver cage needs no extra package.
+resolve = [
+    "sh",
+    "-c",
+    "curl -fsSL 'https://api.github.com/repos/esengine/DeepSeek-Reasonix/releases?per_page=30' | jq -r '[.[] | select(.tag_name | startswith(\"desktop-v\"))][0].assets[] | select(.name==\"Reasonix-linux-amd64.deb\") | .browser_download_url'",
+]
+# What the shell links against beyond the built-in Electron/Chromium set, read out of its ELF NEEDED
+# list: WebKit2GTK 4.1 (which also supplies libjavascriptcoregtk) and libsoup 3. The rest is the
+# runtime a GTK application looks up by path rather than by linking, which the generated wrapper
+# points at: GStreamer elements for WebKit's media pipeline, glib-networking for GIO's TLS backend
+# (without it HTTPS fails outright), librsvg for SVG icons, the desktop schemas GTK reads, and
+# `gnome-themes-extra` for the `Adwaita-dark` theme the portal names when your desktop is in dark
+# mode — GTK ships only the light Adwaita itself, so without it the shell stays light on a dark
+# desktop.
+libs = [
+    "webkitgtk_4_1",
+    "libsoup_3",
+    "glib-networking",
+    "gsettings-desktop-schemas",
+    "gnome-themes-extra",
+    "librsvg",
+    "gst_all_1.gstreamer",
+    "gst_all_1.gst-plugins-base",
+    "gst_all_1.gst-plugins-good",
+]
+
+# Wails v2 defaults GDK to the **x11** backend when `GDK_BACKEND` is unset (verified: the shell
+# panics with "failed to init GTK" and GDK reports "Trying x11 backend", while a plain GTK3 client
+# in the same cage opens the Wayland display fine). sbx never offers X11, so the backend is named
+# here — this one line is what makes the window map. Nothing names the light/dark scheme: under
+# `dbus = true` the cage's portal serves your desktop's scheme and sbx sets `GTK_USE_PORTAL=1`, which
+# is what makes GDK consult it, so the shell opens in your theme and follows a switch live (verified
+# both ways on a running window). The WEBKIT_* three turn off WebKit's own
+# bubblewrap sandbox (it cannot nest inside the cage's user namespace, and the cage IS the boundary
+# here) and its DMA-BUF renderer (it wants a device path a hermetic cage does not expose). Note the
+# spelling: `WEBKIT_FORCE_SANDBOX=0` is ignored by current WebKitGTK, which says so on stderr and
+# keeps the sandbox on.
+[env]
+GDK_BACKEND = "wayland"
+WEBKIT_DISABLE_COMPOSITING_MODE = "1"
+WEBKIT_DISABLE_DMABUF_RENDERER = "1"
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS = "1"
+
+# An app is read-by-default ({GET,HEAD}); the completions endpoint is a POST, so the provider host is
+# opened to all verbs with `{*}`. The `deb:resolve` command and the build both run HOST-SIDE, on the
+# host network, so neither needs an entry here.
+[network]
+mode = "deny"
+allow = [
+    "{*} https://api.deepseek.com",
+]
+
+mute = [
+    "crash.reasonix.io",
+]
+
+# The real API key is read on the HOST and injected by the egress proxy — never in the cage. To key
+# the provider, ADD this line to the `[env]` table above (do NOT open a second `[env]` header — a
+# duplicate table is invalid TOML and the whole profile would fail to parse), then uncomment the
+# `[secret]` block:
+#
+#   the key `DEEPSEEK_API_KEY` with the value "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#
+#[secret."api.deepseek.com"]
+#from = "env://DEEPSEEK_API_KEY"
+#header = "Authorization"
+#type = "bearer"

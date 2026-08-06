@@ -1,0 +1,146 @@
+# command-code — "the coding agent that learns your taste" (CommandCodeAI/command-code),
+# sandboxed by sbx.
+#
+#   sbx app import examples/app/command-code.toml
+#   sbx app run command-code
+#
+# The package's own short bin is `cmd` (that is what `cmd` below execs), but the app is
+# launched by its PROFILE name — `sbx app run command-code`, never `sbx app run cmd`.
+#
+# Command Code is a frontier coding agent (CLI TUI) that continuously learns the user's
+# coding style. Distributed on npm as `command-code` (verified v1.13.0): bin `cmd` (the
+# short alias) and `command-code` (the full name) point to `dist/index.mjs`, which
+# bootstraps a bundled `dist/cli.mjs`. Engines `node >= 22`. sbx equips it fresh from
+# upstream via mise's `npm` backend over a nix node; `sbx upgrade mise` rolls it
+# forward.
+#
+# The npm package's `prebuild` script references a `vsix/commandcode-vscode.vsix` (a
+# VS Code extension build artifact) — the published `vsix/` directory is empty, so the
+# `prebuild` is a NO-OP at install time; `--ignore-scripts=true` is therefore harmless
+# (read out of `package.json` + the published tarball). There is no `postinstall`, no
+# `install` script, no native binary download — mise's npm backend installs the
+# tarball verbatim and the rest is a vanilla `node` startup. No nixpkgs lag, no
+# source build, no vendor OAuth SDK.
+#
+# LICENSE — `UNLICENSED` (the npm field; the package is "all rights reserved" — there
+# is no OSI-approved license). The vendor (Langbase / Command Code, San Francisco)
+# publishes the source on GitHub at `CommandCodeAI/command-code` (3.5k★) but does
+# NOT grant redistribution rights via npm. The user accepts a proprietary binary by
+# running this profile; the standard `~/.commandcode/` config is theirs.
+#
+# CREDENTIAL POSTURE — an account key, NOT a header-injectable provider key. Command
+# Code's `cmd login` opens a browser to `auth.openai.com` (the standard OAuth path
+# for the vendor's auth flow) — the empty netns can't honour that callback, so the
+# practical headless path is to pre-authenticate on the HOST and bind the resulting
+# `~/.commandcode/auth.json` into the cage (an MCP-API-token-shaped file, generated
+# at `https://commandcode.ai/settings/api-keys` — paste it into the terminal during
+# `cmd login` to skip the browser step). `cmd status` confirms the session.
+#
+# Providers — Command Code supports many BYOK routes for the underlying LLM
+# (Anthropic, OpenAI, Google, xAI, DeepSeek, Qwen, Kimi, GLM, MiniMax, etc.) PLUS its
+# own first-party `taste-1` model on `api.commandcode.ai`. The profile opens the
+# first-party host by default (required for `taste-1` sessions and for auth/account
+# operations) and leaves provider hosts commented — add the one(s) the model you
+# actually call uses. The first-party `api.commandcode.ai` is the conservative
+# default: most users will run `taste-1` (the meta neuro-symbolic model the product
+# is built around) and that is exactly what the allowlist permits.
+#
+# CONFIG + STATE — `~/.commandcode/` (auth.json — the API-key file, plus taste
+# profile, skills, mods, sessions). The `taste push`/`taste pull` flow reaches
+# `api.github.com` and `github.com` (taste profiles are git repos in the GitHub
+# registry). All project-level config rides the project bind
+# (`.commandcode/taste/`, `.commandcode/skills/`, …); the rest lives in the
+# isolated home.
+#
+# TELEMETRY — Command Code ships `@opentelemetry/*` deps and POSTs observability
+# events to Axiom (`api.axiom.co`, the host is hard-coded in `dist/cli.mjs` — the
+# Axiom Node SDK pushes logs/events to a vendor-controlled dataset). The OTel sink
+# is denied and muted below — a `mute` never changes the verdict (still refused) and
+# never hides a count (`sbx net stats` still tallies it). The binary also has a
+# stray `https://ingestion.claicode.com` host in its strings (likely a
+# third-party/legacy telemetry endpoint, the suffix `claicode.com` is
+# commandcode.ai's pre-rename domain) — muted as well. Local session storage and
+# the in-app `/feedback` form are unaffected.
+#
+# MCP — `cmd mcp add <name> -- <command>` (stdio) or `cmd mcp add <name> <url>`
+# (SSE/HTTP). The profile does NOT pre-open MCP server hosts — `allow` is the
+# tightest working set; add the host of any server you actually configure (the
+# cage's deny-default is the point).
+#
+# UNVERIFIED (like every profile until run with a real account): the live equip +
+# first prompt under the allowlist, the `cmd status` flow after binding the host's
+# auth.json, and the OTel sink. Grounded here: the npm packaging (bin, engines
+# `>=22`, 49 deps, no postinstall/prebuild side effect at install — read out of
+# `package.json` and the published `command-code-1.13.0.tgz`), the first-party and
+# GitHub host set (read out of `dist/cli.mjs`), the `~/.commandcode/auth.json`
+# credential path (read out of the official quickstart), and the Axiom OTel sink
+# (read out of the binary's strings + the Axiom Node SDK docs).
+cmd = "cmd"
+
+# Your host Command Code config/auth, mounted read-write at its real absolute path.
+# `binds` is a security field, honored only because this profile lives in your
+# trusted config dir; `mode = "rw"` lets the caged `cmd` read and write these host
+# files (auth.json, taste profile, skills, history). Uncomment to share your host
+# Command Code setup with the cage instead of the app's isolated home (the default).
+# The auth.json is the API-key file — pre-authenticate on the HOST (`cmd login`
+# there; paste the API key from `https://commandcode.ai/settings/api-keys` to skip
+# the browser), then bind.
+#binds = [
+#    { path = "~/.commandcode", mode = "rw" },
+#]
+
+[packages]
+# A node runtime (Command Code requires `node >= 22` per its `engines` field) plus
+# the package itself via mise's npm backend, so `sbx upgrade mise` rolls it forward.
+nodejs       = "nix:nodejs"
+command-code = "mise:npm:command-code"
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing prompts /
+# context, reading completions) is opened to all verbs with `{*}`. Hosts are from the
+# shipped binary (`api.commandcode.ai` first-party, `api.github.com` + `github.com` for
+# taste push/pull) and the vendor docs.
+[network]
+mode = "deny"
+allow = [
+    # Install: mise's npm backend fetches the packument (version resolution, also used by
+    # `sbx upgrade mise`) and the tarball IN-CAGE, so the registry is subject to this policy —
+    # the built-in self-equip allow-set covers the nix cache, GitHub and mise's version index,
+    # never npm. Opened read-only as a whole, like the other npm-backed profiles.
+    "{GET} https://registry.npmjs.org",
+    # First-party Command Code API — auth, account, the `taste-1` model sessions, MCP
+    # registry. The binary POSTs to `api.commandcode.ai` for every prompt (verified in
+    # `dist/cli.mjs`). The vendor owns the dataset; the user chose to authenticate.
+    "{*} https://api.commandcode.ai",
+    # Taste push/pull — profiles are git repos in the GitHub registry; the user runs
+    # `npx taste push` to publish, `npx taste pull` to install one. `{GET,HEAD}` for
+    # `api.github.com`/`github.com` covers the LFS-less git object fetch.
+    "{GET} https://api.github.com",
+    "{GET} https://github.com",
+    # Provider BYOK — uncomment the ONE you use (the model you call with `cmd -m
+    # <model>` picks the provider; `cmd --list-models` shows the live list). The
+    # first-party `api.commandcode.ai` above is enough for `taste-1`; open another
+    # only if you switch models.
+    #"{*} https://api.openai.com",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://generativelanguage.googleapis.com",
+    #"{*} https://api.x.ai",
+    #"{*} https://api.deepseek.com",
+    #"{*} https://openrouter.ai",
+]
+
+# Silence the DENIED telemetry / staging hosts. `mute` never changes the verdict
+# (still refused) and never hides a count (`sbx net stats` still tallies it; see
+# with `--all`). The Axiom endpoint is the OTel sink; `ingestion.claicode.com` is
+# the legacy-domain (pre-rename) telemetry host; the `staging-*` siblings are
+# only used in dev.
+mute = [
+    "api.axiom.co",                  # OTel sink (Axiom.io) — `@opentelemetry/*` deps
+    "ingestion.claicode.com",         # legacy third-party telemetry host
+    "staging-api.commandcode.ai",     # vendor staging API
+    "staging.commandcode.ai",         # vendor staging UI
+    "console.anthropic.com",          # referenced in help text only (model picker links)
+    "auth.openai.com",                # referenced in the `cmd login` OAuth flow
+    "claude.ai",                      # referenced in help text only
+    "mcp.notion.com",                 # referenced as an MCP example
+    "commandcode.ai",                 # marketing / docs site
+]

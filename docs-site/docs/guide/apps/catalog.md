@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/) directory ships **49 importable
+The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/) directory ships **63 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -15,33 +15,42 @@ terminal agent, a desktop window, or a UI served in your host browser. The per-p
 packaging notes and the "not here yet, and why" triage live in
 [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/).
 
-## Terminal agents (32)
+## Terminal agents (44)
 
 The common case: a CLI or TUI that runs in the terminal you launched it from.
 
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
 | `agy` | `mise:aqua:google-antigravity/antigravity-cli` | `accounts.google.com` (Google account) |
+| `aider` | `mise:pipx:aider-chat` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / any OpenAI-compatible) |
 | `amp` | `nix:nodejs` (+ `mise:npm:@ampcode/cli`) | `ampcode.com` (account / `AMP_API_KEY`) |
+| `ante` | `mise:github:AntigmaLabs/ante-preview` | provider-dependent (BYOK) or local (`/offline-mode` llama.cpp) |
 | `auggie` | `nix:nodejs` (+ `mise:npm:@augmentcode/auggie`) | `*.api.augmentcode.com` (`AUGMENT_API_TOKEN`) |
+| `autohand` | `nix:nodejs` (+ `mise:npm:autohand-cli`) | `api.autohand.ai` + `code.autohand.ai` (Autohand account) |
 | `claude-code` | `mise:aqua:anthropics/claude-code` | `api.anthropic.com` (BYOK) |
 | `cline` | `nix:nodejs` (+ `mise:npm:cline`, `nix:hostname`) | `openrouter.ai` (BYOK) |
 | `codebuddy` | `nix:nodejs` (+ `mise:npm:@tencent-ai/codebuddy-code`) | `*.codebuddy.ai` (account) |
 | `codex` | `mise:aqua:openai/codex` | `api.openai.com` (BYOK) |
+| `command-code` | `nix:nodejs` (+ `mise:npm:command-code`) | `api.commandcode.ai` (Command Code account; `taste-1` first-party) |
 | `copilot` | `mise:aqua:github/copilot-cli` | `*.githubcopilot.com` (GitHub account / `GH_TOKEN`) |
 | `cortex` | `mise:github:CortexLM/cortex-code` (+ `nix:alsa-lib`) | `api.cortex.foundation` (`CORTEX_API_KEY`) or BYOK |
+| `crush` | `mise:github:charmbracelet/crush` | `hyper.charm.land` (Hyper account) or multi-provider BYOK |
 | `cursor-agent` | `nix:gnutar` (+ `nix:gzip`) | `*.cursor.sh` (Cursor account / `CURSOR_API_KEY`) |
+| `devin` | bootstrap installer (`cmd` wrapper, verifies SHA256; + `nix:gnutar`, `nix:gzip`) | `api.devin.ai` (BYOK API key) |
 | `dirac` | `nix:nodejs` (+ `mise:npm:dirac-cli`, `nix:ripgrep`) | provider-dependent (BYOK, no vendor account) |
 | `droid` | `nix:nodejs` (+ `mise:npm:droid`) | `*.factory.ai` (account) |
 | `freebuff` | `nix:nodejs` (+ `mise:npm:freebuff`) | `www.codebuff.com` (account) |
 | `goose` | `mise:aqua:block/goose` | provider-dependent (BYOK) |
 | `grok` | `mise:aqua:x.ai/cli/grok` | `api.x.ai` (BYOK) or an xAI account |
 | `hermes` | `flake:github:NousResearch/hermes-agent#default` (+ `nix:nodejs`, `nix:chromium`, …) | `openrouter.ai` (BYOK) |
+| `jcode` | `mise:github:1jehuang/jcode` | provider-dependent (BYOK) |
 | `junie` | `nix:nodejs` (+ `mise:npm:@jetbrains/junie`) | `api.jetbrains.ai` (JetBrains account / `JUNIE_API_KEY` / BYOK) |
 | `kilocode` | `mise:github:Kilo-Org/kilocode` | provider-dependent (BYOK) |
 | `kimi` | `nix:nodejs` (+ `mise:npm:@moonshot-ai/kimi-code`) | `api.kimi.com` (`KIMI_API_KEY` / Moonshot account) |
+| `mimo` | `nix:nodejs` (+ `mise:npm:@mimo-ai/cli`) | `api.xiaomimimo.com` (MiMo Auto / Xiaomi account) |
 | `nova` | `nix:nodejs` (+ `mise:npm:@compass-ai/nova`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
 | `omp` | `mise:github:can1357/oh-my-pi` (a high-capability fork of Pi — this repo's `pi`) | provider-dependent (BYOK) |
+| `openclaude` | `nix:nodejs` (+ `mise:npm:@gitlawb/openclaude`) | provider-dependent (BYOK: OpenAI-compatible / Anthropic / Gemini) |
 | `openclaw` | `nix:nodejs` (+ `mise:npm:openclaw`) | `api.openai.com` (BYOK) |
 | `opencode` | `mise:opencode` | provider-dependent (BYOK) |
 | `openfox` | `nix:nodejs` (+ `mise:npm:openfox`) | **none**: a local LLM you point it at |
@@ -49,14 +58,17 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `pool` | `nix:gnutar` (+ `nix:gzip`) | `*.poolside.ai` (Poolside account) |
 | `qoder` | `nix:nodejs` (+ `mise:npm:@qoder-ai/qodercli`, `nix:ripgrep`) | `*.qoder.sh` (Qoder account / `QODER_PERSONAL_ACCESS_TOKEN`) |
 | `qwen-code` | `nix:nodejs` (+ `mise:npm:@qwen-code/qwen-code`) | `dashscope.aliyuncs.com` (`DASHSCOPE_API_KEY`) |
+| `reasonix` | `nix:nodejs` (+ `mise:npm:reasonix`) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
+| `rovo` | bootstrap installer (`cmd` wrapper; + `nix:gnutar`, `nix:gzip`) | `api.atlassian.com` + `*.atlassian.net` (Atlassian API token, scoped to Rovo Dev) |
 | `sigit` | `nix:nodejs` (+ `mise:npm:@smbcloud/sigit`) | **none**: the model runs in-cage |
 | `snow` | `nix:nodejs` (+ `mise:npm:snow-ai`) | provider-dependent (BYOK) |
 | `stakpak` | `mise:github:stakpak/agent` | `apiv2.stakpak.dev` (`STAKPAK_API_KEY`) or BYOK: a DevOps agent |
+| `trae` | bootstrap installer (`cmd` wrapper; + `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / OpenRouter / Doubao / Azure / Ollama) |
 | `vtcode` | `mise:github:vinhnx/VTCode` (+ `nix:ripgrep`, `nix:ast-grep`) | provider-dependent (BYOK, default OpenRouter) |
 
-## Desktop applications (12)
+## Desktop applications (14)
 
-Electron/GUI agents. Each needs a [Wayland display](../configuration/gui)
+GUI agents: Electron for most, a Wails/WebKit2GTK shell for `reasonix-desktop`. Each needs a [Wayland display](../configuration/gui)
 (`gui = "wayland"`), and most also enable [`gpu`](../configuration/gpu) and the in-cage
 [desktop portal](../configuration/dbus) (`dbus = true`). Where the tool's sign-in opens
 an external browser, the profile wires an in-cage Chromium as the `xdg-open` handler so the
@@ -74,6 +86,8 @@ whole login closes inside the cage.
 | `kiro` | `nix:kiro-cli` (+ `nix:chromium`) | `*.kiro.dev` (AWS/Kiro account) |
 | `kiro-desktop` | `tarball:resolve` (+ `nix:chromium`) | `app.kiro.dev` (AWS/Kiro account) |
 | `opencode-desktop` | `deb:github:anomalyco/opencode` | provider-dependent (BYOK) |
+| `orca-desktop` | `deb:github:stablyai/orca` (+ `nix:chromium`; interior pilot agent `opencode` via `mise:opencode`) | provider-dependent (BYOK); Orca hosts (`login.onorca.dev`, `relay.onorca.dev`) denied by default |
+| `reasonix-desktop` | `deb:resolve` + `[deb.…] libs` (a Wails/WebKit2GTK shell, not Electron) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
 | `t3code` | `appimage:github:pingdotgg/t3code` (+ `nix:chromium`) | provider-dependent (BYOK) |
 | `vibe` | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, …) | `*.mistral.ai` (`MISTRAL_API_KEY`) |
 
