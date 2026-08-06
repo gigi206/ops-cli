@@ -584,133 +584,18 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         );
     }
 
-    // 5. The verdict — built through the SAME canonicalizer `sbx test net` uses, so enforcement
-    //    cannot drift from the tester's prediction. Evaluated against the effective policy (config +
-    //    any live `--session` overlay), so a `--session allow` opens an otherwise-default-denied host
-    //    and a `--session deny` blocks a config-allowed one (deny wins). The two denial shapes get
-    //    distinct reasons so the agent can tell "no rule allowed this" from "a deny rule blocked it".
-    let policy = effective_policy(ctx);
-    let deciding: Option<Rule> = match policy.explain(&connect_host, port, &itarget, &imethod) {
-        Decision::AllowedBy(rule) => Some(rule.clone()),
-        // Allow-by-default (denylist mode): no rule named this host, so there is no deciding
-        // rule. The SSRF guard below then treats it as unnamed (private addresses refused).
-        Decision::AllowedDefault => None,
-        Decision::DeniedBy(_) => {
-            ctx.outcome(
-                super::control::Proto::Https,
-                &connect_host,
-                port,
-                Some(&imethod),
-                Some(&itarget),
-                StatKind::Deny,
-                "denied-by-rule",
-            );
+    // 5. The verdict — the shared `https` decision ([`decide_https`]), which an absolute-form forward
+    //    to the same host reaches identically. A refusal is answered *inside* the terminated TLS, so
+    //    the client reads a real HTTP response rather than a tunnel that dies without explanation.
+    let deciding: Option<Rule> = match decide_https(ctx, &connect_host, port, &itarget, &imethod) {
+        Ok(rule) => rule,
+        Err(refusal) => {
             return respond_refusal_tls(
                 &mut br,
-                "403 Forbidden",
-                "denied-by-rule",
-                "this request matches a deny rule in the network policy",
-            );
-        }
-        Decision::DeniedDefault => {
-            // Distinguish "this host is allowed, but not for this verb" from "this host is not
-            // allowed at all": if an allow rule matches the host/path but its method set excludes
-            // the request's verb, say so, so the agent can tell a method-scoped deny apart. The
-            // reason is decided *before* the outcome is recorded, so the log carries the precise
-            // category (`denied-method`/`denied-default`), not a coarse one.
-            let method_denied = policy.method_denied(&connect_host, port, &itarget, &imethod);
-            let reason = if method_denied {
-                "denied-method"
-            } else {
-                "denied-default"
-            };
-            ctx.outcome(
-                super::control::Proto::Https,
-                &connect_host,
-                port,
-                Some(&imethod),
-                Some(&itarget),
-                StatKind::Deny,
-                reason,
-            );
-            if method_denied {
-                return respond_refusal_tls(
-                    &mut br,
-                    "403 Forbidden",
-                    "denied-method",
-                    &format!(
-                        "the `{imethod}` method is not permitted to `{connect_host}:{port}` by \
-                         the network policy"
-                    ),
-                );
-            }
-            // The refusal body carries a copy-paste `sbx net allow` — sound here because nothing
-            // allowed the host (never for an explicit deny or a security refusal). It rides the
-            // response the client already shows, so the agent gets the reason in the reply itself.
-            // The *person* running sbx is told separately, through the notification the `outcome`
-            // chokepoint raises: the agent is under no obligation to surface a `403` body, and a
-            // boundary nobody hears about is one that looks like it never bit. Scoped to the app when
-            // this is an `sbx app` launch.
-            return respond_refusal_tls(
-                &mut br,
-                "403 Forbidden",
-                "denied-default",
-                &format!(
-                    "`{connect_host}:{port}` is not allowed by the network policy. \
-                     Allow it: {}",
-                    ctx.allow_suggestion(&connect_host)
-                ),
-            );
-        }
-        // Ask-by-default: no rule in the effective policy decided (a `--session` overlay rule would
-        // have folded into it and returned Allowed/Denied above, so reaching here means the host is
-        // genuinely undecided). Park and block until a host-side `sbx net pending` answers it or the
-        // timeout elapses (deny — fail-closed). A fresh allow names this exact host:port as the
-        // deciding rule so the SSRF guard permits a deliberately-approved internal target.
-        Decision::Ask => {
-            let verdict = ctx.pending.park(
-                &connect_host,
-                port,
-                &itarget,
-                policy.ask_timeout(),
-                ASK_PENDING_CAP,
-                |seq| {
-                    if ctx.notices {
-                        let id = super::control::format_id(std::process::id(), seq);
-                        print_egress_notice(
-                            &format!(
-                                "egress decision needed [{id}] {connect_host}:{port}{itarget}"
-                            ),
-                            &[
-                                ("allow", &format!("sbx net pending allow {id}")),
-                                ("deny", &format!("sbx net pending deny {id}")),
-                            ],
-                        );
-                    }
-                },
-            );
-            match verdict {
-                super::control::Verdict::Allow => {
-                    Some(allowlist::host_port_rule(&connect_host, port))
-                }
-                super::control::Verdict::Deny => {
-                    ctx.outcome(
-                        super::control::Proto::Https,
-                        &connect_host,
-                        port,
-                        Some(&imethod),
-                        Some(&itarget),
-                        StatKind::Deny,
-                        "asked-denied",
-                    );
-                    return respond_refusal_tls(
-                        &mut br,
-                        "403 Forbidden",
-                        "asked-denied",
-                        "this request was denied by a live decision or the ask timeout elapsed",
-                    );
-                }
-            }
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(ctx, &connect_host, port, &imethod),
+            )
         }
     };
 
@@ -1896,116 +1781,18 @@ fn handle_https_forward(
         );
     }
 
-    // 5. The verdict — the full `https` policy through the SAME canonicalizer `sbx test net` uses (so
-    //    enforcement cannot drift from the tester), against the effective policy (config + any live
-    //    `--session` overlay). Deny wins; the two denial shapes get distinct reasons, and an
-    //    `ask`-undecided host parks exactly as it would through a CONNECT.
-    let policy = effective_policy(ctx);
-    let deciding: Option<Rule> = match policy.explain(&host, port, &path, method) {
-        Decision::AllowedBy(rule) => Some(rule.clone()),
-        // Allow-by-default (denylist mode): no rule named this host, so there is no deciding rule; the
-        // SSRF guard below then treats it as unnamed (private addresses refused).
-        Decision::AllowedDefault => None,
-        Decision::DeniedBy(_) => {
-            ctx.outcome(
-                super::control::Proto::Https,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
-                StatKind::Deny,
-                "denied-by-rule",
-            );
+    // 5. The verdict — the SAME `https` decision a `CONNECT` to this host gets ([`decide_https`]):
+    //    same rules, same denial shapes, same parking for an undecided host. Only the answer differs,
+    //    written on the plaintext client socket this form arrived on.
+    let deciding: Option<Rule> = match decide_https(ctx, &host, port, &path, method) {
+        Ok(rule) => rule,
+        Err(refusal) => {
             return write_refusal(
                 &mut client,
-                "403 Forbidden",
-                "denied-by-rule",
-                "this request matches a deny rule in the network policy",
-            );
-        }
-        // Deny-default: nothing opened the host (or a rule matches the host but not the verb, which
-        // gets its own reason), with the copy-paste `sbx net allow` suggestion as the next step.
-        Decision::DeniedDefault => {
-            let method_denied = policy.method_denied(&host, port, &path, method);
-            let reason = if method_denied {
-                "denied-method"
-            } else {
-                "denied-default"
-            };
-            ctx.outcome(
-                super::control::Proto::Https,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
-                StatKind::Deny,
-                reason,
-            );
-            if method_denied {
-                return write_refusal(
-                    &mut client,
-                    "403 Forbidden",
-                    "denied-method",
-                    &format!(
-                        "the `{method}` method is not permitted to `{host}:{port}` by the \
-                         network policy"
-                    ),
-                );
-            }
-            return write_refusal(
-                &mut client,
-                "403 Forbidden",
-                "denied-default",
-                &format!(
-                    "`{host}:{port}` is not allowed by the network policy. Allow it: {}",
-                    ctx.allow_suggestion(&host)
-                ),
-            );
-        }
-        // Ask-by-default: no rule in the effective policy decided, so park and block until a
-        // host-side `sbx net pending` answers or the timeout elapses (deny — fail-closed), exactly
-        // as a CONNECT to the same host does. A fresh allow names this exact host:port as the
-        // deciding rule, so the SSRF guard admits a deliberately-approved internal target.
-        Decision::Ask => {
-            let verdict = ctx.pending.park(
-                &host,
-                port,
-                &path,
-                policy.ask_timeout(),
-                ASK_PENDING_CAP,
-                |seq| {
-                    if ctx.notices {
-                        let id = super::control::format_id(std::process::id(), seq);
-                        print_egress_notice(
-                            &format!("egress decision needed [{id}] {host}:{port}{path}"),
-                            &[
-                                ("allow", &format!("sbx net pending allow {id}")),
-                                ("deny", &format!("sbx net pending deny {id}")),
-                            ],
-                        );
-                    }
-                },
-            );
-            match verdict {
-                super::control::Verdict::Allow => Some(allowlist::host_port_rule(&host, port)),
-                super::control::Verdict::Deny => {
-                    ctx.outcome(
-                        super::control::Proto::Https,
-                        &host,
-                        port,
-                        Some(method),
-                        Some(&path),
-                        StatKind::Deny,
-                        "asked-denied",
-                    );
-                    return write_refusal(
-                        &mut client,
-                        "403 Forbidden",
-                        "asked-denied",
-                        "this request was denied by a live decision or the ask timeout elapsed",
-                    );
-                }
-            }
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(ctx, &host, port, method),
+            )
         }
     };
 
@@ -2299,6 +2086,144 @@ fn handle_https_forward(
         }
     }
     Ok(())
+}
+
+/// Why the network policy refused an inspected request, for the two paths that put the same question
+/// to it: a `CONNECT` tunnel and an absolute-form `https://` forward. Modelled on
+/// [`ssrf::ConnectRefusal`]
+/// and for the same reason — the verdict records its own outcome and hands back what to answer, so
+/// the two paths differ in how they *write* a refusal (inside the terminated TLS, or on the plaintext
+/// client socket), not in what it says.
+enum PolicyRefusal {
+    /// A deny rule matched. Kept distinct from [`Self::DeniedDefault`] so the agent can tell "a rule
+    /// said no" from "no rule said yes".
+    DeniedByRule,
+    /// An allow rule matches the host and path, but its method set excludes this verb — a
+    /// method-scoped deny, not a closed host.
+    DeniedMethod,
+    /// Nothing opened the host. The one refusal that carries a copy-paste `sbx net allow`, sound
+    /// precisely because nothing allowed it — never for an explicit deny or a security guard.
+    DeniedDefault,
+    /// An `ask`-undecided host a live decision refused, or whose ask timeout elapsed.
+    AskedDenied,
+}
+
+impl PolicyRefusal {
+    /// The status line both paths write. Every policy refusal is a `403`: the request was understood
+    /// and reached a verdict, which is what separates these from the `502`s a connect failure gets.
+    fn status_line(&self) -> &'static str {
+        "403 Forbidden"
+    }
+
+    /// The stable reason token: the `x-sbx-egress-reason` header, and the reason in the log.
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::DeniedByRule => "denied-by-rule",
+            Self::DeniedMethod => "denied-method",
+            Self::DeniedDefault => "denied-default",
+            Self::AskedDenied => "asked-denied",
+        }
+    }
+
+    /// The sentence the refusal body carries, naming what the client asked for.
+    fn message(&self, ctx: &ProxyCtx, host: &str, port: u16, method: &str) -> String {
+        match self {
+            Self::DeniedByRule => {
+                "this request matches a deny rule in the network policy".to_string()
+            }
+            Self::DeniedMethod => format!(
+                "the `{method}` method is not permitted to `{host}:{port}` by the network policy"
+            ),
+            // The suggestion rides the response the client already shows, so the agent gets the next
+            // step in the reply itself. The *person* running sbx is told separately, through the
+            // notification the `outcome` chokepoint raises: the agent is under no obligation to
+            // surface a `403` body, and a boundary nobody hears about is one that looks like it never
+            // bit. Scoped to the app when this is an `sbx app` launch.
+            Self::DeniedDefault => format!(
+                "`{host}:{port}` is not allowed by the network policy. Allow it: {}",
+                ctx.allow_suggestion(host)
+            ),
+            Self::AskedDenied => {
+                "this request was denied by a live decision or the ask timeout elapsed".to_string()
+            }
+        }
+    }
+}
+
+/// The `https` policy verdict for one inspected request: the deciding rule, or the refusal to answer
+/// with. `Ok(None)` is allow-by-default (denylist mode) — no rule named the host, so there is no
+/// deciding rule and the SSRF guard downstream treats the target as unnamed.
+///
+/// Built through the SAME canonicalizer `sbx test net` uses, so enforcement cannot drift from the
+/// tester's prediction, and evaluated against the effective policy (config plus any live `--session`
+/// overlay), so a `--session allow` opens an otherwise-default-denied host and a `--session deny`
+/// blocks a config-allowed one. An `ask`-undecided host parks here and blocks until a host-side `sbx
+/// net pending` answers it or the timeout elapses (deny — fail-closed); a live allow names this exact
+/// host:port as the deciding rule, so the SSRF guard admits a deliberately-approved internal target.
+///
+/// Every refusal records its own outcome before returning, so a caller cannot answer one without
+/// counting it. The cleartext `http://` path deliberately does NOT come here: it is strictly opt-in,
+/// its `explain_clear` consults neither the default action nor the ask queue, and routing it through
+/// this verdict would widen it into a posture it was written to refuse.
+fn decide_https(
+    ctx: &ProxyCtx,
+    host: &str,
+    port: u16,
+    path: &str,
+    method: &str,
+) -> Result<Option<Rule>, PolicyRefusal> {
+    let refuse = |refusal: PolicyRefusal| {
+        ctx.outcome(
+            super::control::Proto::Https,
+            host,
+            port,
+            Some(method),
+            Some(path),
+            StatKind::Deny,
+            refusal.tag(),
+        );
+        Err(refusal)
+    };
+    let policy = effective_policy(ctx);
+    match policy.explain(host, port, path, method) {
+        Decision::AllowedBy(rule) => Ok(Some(rule.clone())),
+        Decision::AllowedDefault => Ok(None),
+        Decision::DeniedBy(_) => refuse(PolicyRefusal::DeniedByRule),
+        Decision::DeniedDefault => {
+            // Which of the two the refusal is gets decided *before* the outcome is recorded, so the
+            // log carries the precise category rather than a coarse one.
+            if policy.method_denied(host, port, path, method) {
+                refuse(PolicyRefusal::DeniedMethod)
+            } else {
+                refuse(PolicyRefusal::DeniedDefault)
+            }
+        }
+        Decision::Ask => {
+            let verdict = ctx.pending.park(
+                host,
+                port,
+                path,
+                policy.ask_timeout(),
+                ASK_PENDING_CAP,
+                |seq| {
+                    if ctx.notices {
+                        let id = super::control::format_id(std::process::id(), seq);
+                        print_egress_notice(
+                            &format!("egress decision needed [{id}] {host}:{port}{path}"),
+                            &[
+                                ("allow", &format!("sbx net pending allow {id}")),
+                                ("deny", &format!("sbx net pending deny {id}")),
+                            ],
+                        );
+                    }
+                },
+            );
+            match verdict {
+                super::control::Verdict::Allow => Ok(Some(allowlist::host_port_rule(host, port))),
+                super::control::Verdict::Deny => refuse(PolicyRefusal::AskedDenied),
+            }
+        }
+    }
 }
 
 /// Why a connection to the validated upstream could not be opened, so the refusal can name a
