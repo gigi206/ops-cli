@@ -2162,9 +2162,18 @@ impl PolicyRefusal {
 /// host:port as the deciding rule, so the SSRF guard admits a deliberately-approved internal target.
 ///
 /// Every refusal records its own outcome before returning, so a caller cannot answer one without
-/// counting it. The cleartext `http://` path deliberately does NOT come here: it is strictly opt-in,
-/// its `explain_clear` consults neither the default action nor the ask queue, and routing it through
-/// this verdict would widen it into a posture it was written to refuse.
+/// counting it.
+///
+/// Two other paths reach the same policy and do NOT come here, for opposite reasons:
+///
+/// - The cleartext `http://` path is a **deliberate** exclusion. It is strictly opt-in, its
+///   `explain_clear` consults neither the default action nor the ask queue, and routing it through
+///   this verdict would widen it into a posture it was written to refuse.
+/// - The HTTP/2 path ([`h2mitm::handle`]) is **not yet folded**. Three of its four arms are this
+///   function's verbatim; the fourth is not, because it cannot park — every stream of an h2
+///   connection is multiplexed on one current-thread runtime, so blocking for a live decision would
+///   stall its siblings, and it refuses `ask` under its own reason instead. Folding it means giving
+///   this function an explicit posture for that, not pretending the difference away.
 fn decide_https(
     ctx: &ProxyCtx,
     host: &str,
