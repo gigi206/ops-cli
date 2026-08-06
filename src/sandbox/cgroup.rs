@@ -273,17 +273,23 @@ fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsStr
     let mut prefix = vec![
         OsString::from("--user"),
         OsString::from("--scope"),
-        // Quiet (no "Running scope as unit" banner) and collect the transient unit
-        // even if it fails, so repeated launches never accumulate dead units.
+        // Quiet (no "Running scope as unit" banner) and collect the transient unit once
+        // it reaches a terminal state, so repeated launches do not accumulate dead units.
         OsString::from("-q"),
         OsString::from("--collect"),
         // Name the scope after the cage so it reads legibly in `systemctl --user`,
         // `ps`, and `systemd-cgls` instead of the opaque `run-p<pid>-i<pid>.scope`
         // systemd would auto-assign. `systemd-run` fails a launch outright on a live
         // unit-name collision, so uniqueness is load-bearing, not cosmetic: the launcher
-        // pid distinguishes two cages of one project (which share a slug), and `--collect`
-        // frees a finished cage's name so it never blocks the next. The one multi-cage
-        // path in a single process (`sbx upgrade`) runs its cages sequentially.
+        // pid distinguishes two cages of one project (which share a slug), and the one
+        // multi-cage path in a single process (`sbx upgrade`) runs its cages sequentially.
+        //
+        // Uniqueness rests on those two facts and not on `--collect`, which reclaims a
+        // name only once systemd considers the scope finished — and systemd learns that a
+        // cgroup emptied through an inotify watch on it. A host with no watch descriptors
+        // left never receives that notification: the scope stays `active running` with no
+        // tasks in it, so there is no terminal state to collect and the name stays taken
+        // for good. Reusing a name is therefore never safe on the strength of `--collect`.
         OsString::from(format!(
             "--unit={}",
             super::naming::scope_unit(cage_slug, std::process::id())
