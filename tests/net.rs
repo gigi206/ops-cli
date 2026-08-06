@@ -485,6 +485,69 @@ fn net_unallow_refuses_an_untrusted_existing_project() {
     );
 }
 
+/// The `-a <app>` scopes the help pages promise, on both of their branches: the project's own
+/// `[app.<name>.network]` table, and the separate `apps/<name>.toml` profile file a `--global` app
+/// write lands in. The removal navigates to those tables without creating them, so a mis-navigation
+/// would report a no-op for a rule that is plainly there.
+#[test]
+fn a_removal_reaches_an_app_scope_in_the_project_and_in_its_profile() {
+    let fx = Fixture::new();
+
+    // The project's own app table.
+    assert!(fx
+        .run(&["net", "allow", "api.example.com", "--app", "demo-app"])
+        .status
+        .success());
+    let out = fx.run(&["net", "unallow", "api.example.com", "--app", "demo-app"]);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("removed"),
+        "an app-scoped removal must reach the project's app table:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        !body.contains("api.example.com"),
+        "the rule must be gone from the app's table:\n{body}"
+    );
+
+    // The profile file beside the global config, with fields the removal must not disturb.
+    fx.write_profile(
+        "demo-app",
+        "cmd = \"demo\"\n\
+         \n\
+         [env]\nDEMO_MODE = \"1\"\n\
+         \n\
+         [network]\nmode = \"deny\"\nallow = [\"keep.example.com\", \"drop.example.com\"]\n",
+    );
+    let out = fx.run(&[
+        "net",
+        "unallow",
+        "drop.example.com",
+        "--app",
+        "demo-app",
+        "--global",
+    ]);
+    assert!(
+        out.status.success(),
+        "a profile removal must succeed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let profile = fx
+        .config_home
+        .path()
+        .join("sbx")
+        .join("apps")
+        .join("demo-app.toml");
+    let body = std::fs::read_to_string(&profile).unwrap();
+    assert!(
+        !body.contains("drop.example.com")
+            && body.contains("keep.example.com")
+            && body.contains("DEMO_MODE")
+            && body.contains("cmd = \"demo\""),
+        "the removal must take one rule and leave the rest of the profile intact:\n{body}"
+    );
+}
+
 /// Each removal verb names ITSELF when it refuses a session flag. The message used to be a fixed
 /// `unmute` string, which was invisible while `unmute` was the only routed removal and would have
 /// told an `undeny` user about a command they had not run.
