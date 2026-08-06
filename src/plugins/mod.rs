@@ -2040,42 +2040,4 @@ mod tests {
         assert!(stray.exists(), "a non-plugin directory must be left intact");
     }
 
-    /// Every plugin directory shipped in the repository actually installs: the manifest loads, the
-    /// directory name matches the name it installs under, and the executable it names is a real
-    /// program. They are examples users install by path, so a broken one is a repository bug that
-    /// fails here rather than at someone's first install.
-    ///
-    /// The source is copied to a throwaway tree first, with the modes an install requires. The
-    /// checkout's own modes depend on the umask that produced it (a `umask 002` clone is
-    /// group-writable), which is a fact about the machine rather than about the plugin — the
-    /// install refuses that case on purpose, and says how to fix it.
-    #[test]
-    fn every_plugin_shipped_in_the_repository_is_installable() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
-        let mut checked = 0;
-        for entry in fs::read_dir(&root).expect("the repository's plugins directory") {
-            let dir = entry.unwrap().path();
-            if !dir.is_dir() {
-                continue;
-            }
-            let name = dir.file_name().and_then(OsStr::to_str).unwrap().to_string();
-            let staging = crate::testutil::TmpDir::new();
-            let source = staging.path().join(&name);
-            copy_tree(&dir, &source).unwrap_or_else(|e| panic!("copying plugin `{name}`: {e}"));
-            canonicalize_modes(&source).unwrap();
-            fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
-
-            let data = crate::testutil::TmpDir::new();
-            let layout = crate::store::Layout::under(data.path());
-            let installed = install(&layout, &source)
-                .unwrap_or_else(|e| panic!("plugin `{name}` does not install: {e}"));
-            assert_eq!(
-                installed.name, name,
-                "a plugin installs under its manifest name, so the directory must match it"
-            );
-            checked += 1;
-        }
-        assert!(checked > 0, "the repository ships no plugin to check");
-    }
 }

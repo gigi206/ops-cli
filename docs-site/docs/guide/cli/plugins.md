@@ -99,11 +99,11 @@ and never leaves the operator's host. See
 
 ### Install a plugin from a local directory
 
-The shortest path: one of the two plugins the repository ships, then the `from`
-reference it unlocks.
+The shortest path: a plugin directory you have on disk (a checkout of one, or one
+you wrote), then the `from` reference it unlocks.
 
 ```sh
-sbx plugins install plugins/pass       # the local directory is copied in
+sbx plugins install ./my-pass-plugin   # the local directory is copied in
 sbx plugins list                       # built-in schemes + what is now installed
 sbx plugins info pass                  # its manifest, sandbox grant, and origin
 ```

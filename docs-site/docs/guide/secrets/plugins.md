@@ -186,16 +186,16 @@ the config with `unknown secret resolver scheme`. Removing all but one claimant
 (`sbx plugins rm <name>`: the **directory** name, which is what the conflict
 lists) restores it immediately.
 
-## The two reference plugins
+## The reference plugins
 
-The repository ships two working resolver plugins under
-[`plugins/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/plugins/). They are not installed
-by default: a plugin is trusted by *location*, so it only counts once it sits in
-`<data>/plugins/<name>/`:
+Ready-made resolvers are published in the signed
+[sbx-plugins](https://github.com/sbx-labs/sbx-plugins) store, not carried in this
+repository. A plugin is trusted by *location*, so none is installed by default:
+it only counts once it sits in `<data>/plugins/<name>/`.
 
 ```sh
-sbx plugins install plugins/pass    # then: from = "pass://github/token"
-sbx plugins install plugins/vault   # then: from = "vault://secret/myapp#password"
+sbx plugins store install sbx-plugins pass    # then: from = "pass://github/token"
+sbx plugins store install sbx-plugins vault   # then: from = "vault://secret/myapp#password"
 ```
 
 | Plugin | Reference form | Resolves to | Sandbox grant |
@@ -203,12 +203,12 @@ sbx plugins install plugins/vault   # then: from = "vault://secret/myapp#passwor
 | `pass` | `pass://<path>` | the **first line** of `~/.password-store/<path>.gpg` (the password by convention) | `allow_paths` on the store, `~/.gnupg`, the gpg-agent socket, and the usual install locations of `pass(1)`; **no network** |
 | `vault` | `vault://<path>#<field>` | one field of a HashiCorp Vault KV secret | `allow_env` for `VAULT_ADDR`/`VAULT_TOKEN`/`VAULT_NAMESPACE`, `allow_paths` on `~/.vault-token` and the usual install locations of `vault(1)`; `network = true` |
 
-Both are also worked examples of the manifest and the execution contract above: read
-their `plugin.toml` and `resolve` script when writing your own. Each shows the two
-things the structural cage forces on a resolver (finding a user-mode binary, and
-restoring the host `HOME` a tool derives its paths from), and each reports a
-reference it does not hold as a clean absent, so it is safe to place ahead of
-another source in a `from` chain.
+Each is also a worked example of the manifest and the execution contract above:
+read its `plugin.toml`, its `resolve` script and its README when writing your own.
+Both show the two things the structural cage forces on a resolver (finding a
+user-mode binary, and restoring the host `HOME` a tool derives its paths from),
+and both report a reference they do not hold as a clean absent, so either is safe
+to place ahead of another source in a `from` chain.
 
 If a plugin reports `command not found`, the tool it runs is installed somewhere
 `allow_paths` does not name: add that directory (and `/nix/store` for a nix
