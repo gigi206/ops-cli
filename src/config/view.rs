@@ -1827,6 +1827,7 @@ mod tests {
             name: "app".into(),
             backend: Backend::Deb(url.into()),
             state: TrustState::Trusted,
+            libs: Vec::new(),
         };
         assert_eq!(deb.backend.locator(), url);
         assert_eq!(
@@ -1848,6 +1849,7 @@ mod tests {
             name: "pinned-tool".into(),
             backend: Backend::Flake(reference.into()),
             state: TrustState::Trusted,
+            libs: Vec::new(),
         };
         // The key the upgrade/launch path writes is the package locator, so a view that looks up by
         // locator hits it. This equality is what makes the lookup work; pin it against drift.
@@ -1863,6 +1865,7 @@ mod tests {
             name: "jq".into(),
             backend: Backend::Nix("jq".into()),
             state: TrustState::Trusted,
+            libs: Vec::new(),
         };
         assert_eq!(package_view(&nixpkg, &pins).pinned_rev, None);
 

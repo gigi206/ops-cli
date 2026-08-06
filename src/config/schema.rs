@@ -659,8 +659,20 @@ pub(crate) struct RawInlineFlake {
 pub(crate) struct RawResolve {
     /// The resolver command as an argv (`["sh", "-c", "curl -s <api> | …"]`) — never
     /// whitespace-split, like `cmd`. It prints the newest release's download URL to stdout (and
-    /// nothing else); sbx validates that URL before fetching or building it.
+    /// nothing else); sbx validates that URL before fetching or building it. Optional, so the table
+    /// can carry `libs` alone for a package declared with a fixed URL or a `github:` locator; a
+    /// `<backend>:resolve` sentinel without one is refused, as it has nothing to resolve with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) resolve: Vec<String>,
+    /// Extra nixpkgs attributes this package's ELFs are autoPatchelf'd against, unioned with the
+    /// built-in Electron/Chromium set: `libs = ["webkitgtk_4_1", "libsoup_3"]` is what makes a
+    /// GTK/WebKit app (rather than an Electron one) resolve its `NEEDED` entries. Per package
+    /// because the built-in set is shared by all three prebuilt backends, so widening it for one
+    /// app would grow every other app's closure. A nested attribute path is allowed
+    /// (`gst_all_1.gst-plugins-base`); each name passes the same charset barrier as a `nix:`
+    /// attribute, since it is interpolated into the generated derivation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) libs: Vec<String>,
 }
 
 /// The `[secret]` section: a reserved `defaults` table plus one entry per destination host.

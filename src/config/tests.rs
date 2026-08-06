@@ -14,21 +14,25 @@ fn a_mise_nix_package_warns_to_use_the_plain_nix_backend() {
             name: "jq".into(),
             backend: Backend::Mise("nix:jq".into()),
             state: TrustState::Trusted,
+            libs: Vec::new(),
         },
         Package {
             name: "rg".into(),
             backend: Backend::Mise("aqua:BurntSushi/ripgrep".into()),
             state: TrustState::Trusted,
+            libs: Vec::new(),
         },
         Package {
             name: "hello".into(),
             backend: Backend::Nix("hello".into()),
             state: TrustState::Trusted,
+            libs: Vec::new(),
         },
         Package {
             name: "fd".into(),
             backend: Backend::Mise("nix:fd".into()),
             state: TrustState::Untrusted,
+            libs: Vec::new(),
         },
     ];
     let mut warnings = Vec::new();
@@ -3720,6 +3724,7 @@ fn apply_flakes_refuses_an_untrusted_override_of_a_trusted_tool() {
         name: "guarded".into(),
         backend: Backend::Nix("jq".into()),
         state: TrustState::Trusted,
+        libs: Vec::new(),
     }];
     let mut warnings = Vec::new();
     let flakes: BTreeMap<String, RawInlineFlake> = [("guarded", FLAKE_SRC), ("fresh", FLAKE_SRC)]
@@ -3964,6 +3969,7 @@ fn raw_tarball_resolve(name: &str, command: &[&str]) -> RawConfig {
         name.to_string(),
         RawResolve {
             resolve: command.iter().map(|s| s.to_string()).collect(),
+            libs: Vec::new(),
         },
     );
     raw
@@ -3998,6 +4004,7 @@ fn an_orphan_tarball_table_is_ignored_with_a_warning() {
         "orphan".to_string(),
         RawResolve {
             resolve: CMD.iter().map(|s| s.to_string()).collect(),
+            libs: Vec::new(),
         },
     );
     let r = resolve_no_plugins(raw, None);
@@ -4051,6 +4058,7 @@ fn apply_tarball_resolvers_refuses_an_untrusted_override_of_a_trusted_tool() {
         name: "guarded".into(),
         backend: Backend::Nix("jq".into()),
         state: TrustState::Trusted,
+        libs: Vec::new(),
     }];
     let mut warnings = Vec::new();
     let tarball: BTreeMap<String, RawResolve> = ["guarded", "fresh"]
@@ -4060,6 +4068,7 @@ fn apply_tarball_resolvers_refuses_an_untrusted_override_of_a_trusted_tool() {
                 n.to_string(),
                 RawResolve {
                     resolve: CMD.iter().map(|s| s.to_string()).collect(),
+                    libs: Vec::new(),
                 },
             )
         })
@@ -4098,6 +4107,7 @@ fn raw_deb_resolve(name: &str, command: &[&str]) -> RawConfig {
         name.to_string(),
         RawResolve {
             resolve: command.iter().map(|s| s.to_string()).collect(),
+            libs: Vec::new(),
         },
     );
     raw
@@ -4127,6 +4137,7 @@ fn an_orphan_deb_table_is_ignored_with_a_warning() {
         "orphan".to_string(),
         RawResolve {
             resolve: CMD.iter().map(|s| s.to_string()).collect(),
+            libs: Vec::new(),
         },
     );
     let r = resolve_no_plugins(raw, None);
@@ -4135,6 +4146,189 @@ fn an_orphan_deb_table_is_ignored_with_a_warning() {
         .warnings
         .iter()
         .any(|w| w.contains("orphan") && w.contains("[packages]")));
+}
+
+/// A `[deb.<name>]` table carrying only `libs` — no `resolve`, so it decorates a package declared
+/// with a fixed URL or a `github:` locator rather than declaring one.
+fn raw_deb_libs(name: &str, locator: &str, libs: &[&str]) -> RawConfig {
+    let mut raw = raw_packages(&[(name, locator)]);
+    raw.deb.insert(
+        name.to_string(),
+        RawResolve {
+            resolve: Vec::new(),
+            libs: libs.iter().map(|s| s.to_string()).collect(),
+        },
+    );
+    raw
+}
+
+#[test]
+fn a_deb_table_carrying_only_libs_decorates_the_package_without_a_sentinel() {
+    // The shape a GTK/WebKit app needs: the package is declared the ordinary way, and its table
+    // only names the extra attributes its ELFs must be patched against. That is NOT an orphan
+    // table — the "no matching sentinel" warning would be noise here, and the libs must land.
+    let r = resolve_no_plugins(
+        raw_deb_libs(
+            "app",
+            "deb:https://example.com/app.deb",
+            &["webkitgtk_4_1", "gst_all_1.gst-plugins-base"],
+        ),
+        None,
+    );
+    let p = pkg(&r.packages, "app").unwrap();
+    assert_eq!(p.libs, vec!["webkitgtk_4_1", "gst_all_1.gst-plugins-base"]);
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("no matching")),
+        "a libs-only table is not an orphan: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn an_apps_libs_survive_the_merge_onto_the_baseline() {
+    // The launch reads the app through `merge_app`, not through `apps[…]`: a `libs` list that
+    // resolves correctly but is dropped by the merge reaches the builder empty, and the package is
+    // patched against the built-in set alone — the build then fails on the very NEEDED entries the
+    // list was there to satisfy.
+    let mut app = raw_app(
+        &["demo-desktop"],
+        &[],
+        &[],
+        &[("demo-desktop", "deb:https://example.com/app.deb")],
+        None,
+    );
+    app.deb = std::iter::once((
+        "demo-desktop".to_string(),
+        RawResolve {
+            resolve: Vec::new(),
+            libs: vec!["webkitgtk_4_1".to_string()],
+        },
+    ))
+    .collect();
+    let r = resolve_no_plugins(raw_with_app("demo-app", app), None);
+    let mut merged = r.clone();
+    merged.merge_app(r.apps["demo-app"].clone());
+    assert_eq!(
+        pkg(&merged.packages, "demo-desktop").unwrap().libs,
+        vec!["webkitgtk_4_1"]
+    );
+}
+
+#[test]
+fn a_resolve_sentinel_can_carry_libs_alongside_its_command() {
+    // The two fields coexist: the command still declares the package, the libs still decorate it.
+    let mut raw = raw_deb_resolve("app", CMD);
+    raw.deb.get_mut("app").unwrap().libs = vec!["webkitgtk_4_1".to_string()];
+    let r = resolve_no_plugins(raw, None);
+    let p = pkg(&r.packages, "app").unwrap();
+    assert_eq!(
+        p.backend,
+        Backend::DebResolve {
+            command: CMD.iter().map(|s| s.to_string()).collect(),
+        }
+    );
+    assert_eq!(p.libs, vec!["webkitgtk_4_1"]);
+}
+
+#[test]
+fn an_invalid_library_attribute_is_dropped_on_its_own() {
+    // Each name is interpolated into the generated derivation, so it passes the same charset
+    // barrier as a `nix:` attribute. One bad entry drops itself, not the whole list.
+    let r = resolve_no_plugins(
+        raw_deb_libs(
+            "app",
+            "deb:https://example.com/app.deb",
+            &["webkitgtk_4_1", "evil; rm -rf /", "libsoup_3"],
+        ),
+        None,
+    );
+    assert_eq!(
+        pkg(&r.packages, "app").unwrap().libs,
+        vec!["webkitgtk_4_1", "libsoup_3"]
+    );
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("invalid library attribute")));
+}
+
+#[test]
+fn libs_on_a_non_prebuilt_package_are_ignored_with_a_warning() {
+    // `libs` feeds an autoPatchelf that only the prebuilt backends run. Naming a `nix:` package
+    // silently would leave the user believing a library set was applied somewhere.
+    let r = resolve_no_plugins(raw_deb_libs("app", "nix:hello", &["webkitgtk_4_1"]), None);
+    assert!(pkg(&r.packages, "app").unwrap().libs.is_empty());
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("libs") && w.contains("prebuilt")));
+}
+
+#[test]
+fn an_untrusted_project_cannot_repatch_a_trusted_apps_package() {
+    // The `libs` half of the integrity-of-intent guard: an untrusted repo may not choose what a
+    // trusted app's prebuilt package is patched against — that decides which store paths enter the
+    // app's closure, so it is the same class of substitution as replacing the tool outright.
+    let deb_table = |libs: &[&str]| {
+        std::iter::once((
+            "demo-desktop".to_string(),
+            RawResolve {
+                resolve: Vec::new(),
+                libs: libs.iter().map(|s| s.to_string()).collect(),
+            },
+        ))
+        .collect::<BTreeMap<_, _>>()
+    };
+    let mut global_app = raw_app(
+        &["demo-desktop"],
+        &[],
+        &[],
+        &[("demo-desktop", "deb:https://example.com/app.deb")],
+        None,
+    );
+    global_app.deb = deb_table(&["gtk3"]);
+    let mut project_app = raw_app(
+        &["demo-desktop"],
+        &[],
+        &[],
+        &[("demo-desktop", "deb:https://example.com/app.deb")],
+        None,
+    );
+    project_app.deb = deb_table(&["attacker_lib"]);
+
+    let r = resolve_no_plugins(
+        raw_with_app("demo-app", global_app),
+        Some((raw_with_app("demo-app", project_app), TrustState::Untrusted)),
+    );
+    let app = &r.apps["demo-app"];
+    let p = app
+        .packages
+        .iter()
+        .find(|p| p.name == "demo-desktop")
+        .expect("the app's package survives");
+    assert_eq!(p.libs, vec!["gtk3"], "the trusted library set must stand");
+    assert!(app
+        .warnings
+        .iter()
+        .any(|w| w.contains("libs") && w.contains("trusted")));
+}
+
+#[test]
+fn libs_naming_no_package_at_all_are_ignored_with_a_warning() {
+    let mut raw = RawConfig::default();
+    raw.deb.insert(
+        "ghost".to_string(),
+        RawResolve {
+            resolve: Vec::new(),
+            libs: vec!["webkitgtk_4_1".to_string()],
+        },
+    );
+    let r = resolve_no_plugins(raw, None);
+    assert!(pkg(&r.packages, "ghost").is_none());
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("ghost") && w.contains("[packages]")));
 }
 
 #[test]
@@ -4179,6 +4373,7 @@ fn raw_appimage_resolve(name: &str, command: &[&str]) -> RawConfig {
         name.to_string(),
         RawResolve {
             resolve: command.iter().map(|s| s.to_string()).collect(),
+            libs: Vec::new(),
         },
     );
     raw
@@ -4207,6 +4402,7 @@ fn an_orphan_appimage_table_is_ignored_with_a_warning() {
         "orphan".to_string(),
         RawResolve {
             resolve: CMD.iter().map(|s| s.to_string()).collect(),
+            libs: Vec::new(),
         },
     );
     let r = resolve_no_plugins(raw, None);
@@ -4255,6 +4451,7 @@ fn the_three_resolve_forms_coexist_as_distinct_backends() {
     ]);
     let cmd = || RawResolve {
         resolve: CMD.iter().map(|s| s.to_string()).collect(),
+        libs: Vec::new(),
     };
     raw.tarball.insert("web".to_string(), cmd());
     raw.deb.insert("app".to_string(), cmd());

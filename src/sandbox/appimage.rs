@@ -23,7 +23,7 @@
 //!
 //! Update model: pin-on-first-use (see [`prebuilt::provision`]) — identical to `deb:`.
 
-use super::prebuilt::{self, ELECTRON_LIBS};
+use super::prebuilt;
 use crate::store::Layout;
 use std::collections::BTreeMap;
 use std::io;
@@ -177,7 +177,14 @@ fn select_appimage_asset(json: &serde_json::Value, system: &str) -> Option<Strin
 /// binary is wrapped). Every interpolated value is sbx-controlled and charset-validated (`name`,
 /// `url`, `hash`, the pinned `nixpkgs`, `system`), so the expression carries nothing to escape;
 /// placeholders keep nix's `${…}`/`{…}` out of Rust's formatter.
-fn derivation_expr(nixpkgs: &str, system: &str, name: &str, url: &str, hash: &str) -> String {
+fn derivation_expr(
+    nixpkgs: &str,
+    system: &str,
+    name: &str,
+    url: &str,
+    hash: &str,
+    libs: &[String],
+) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
     extracted = pkgs.appimageTools.extractType2 {
       pname = "@NAME@";
@@ -217,7 +224,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
         .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
-        .replace("@LIBS@", &ELECTRON_LIBS.join(" "))
+        .replace("@LIBS@", &prebuilt::lib_set(libs))
         .replace("@IGNORE@", &ignore)
         .replace("@URL@", url)
         .replace("@HASH@", hash)
@@ -259,8 +266,9 @@ impl prebuilt::Kind for AppImage {
         name: &str,
         url: &str,
         hash: &str,
+        libs: &[String],
     ) -> String {
-        derivation_expr(nixpkgs, system, name, url, hash)
+        derivation_expr(nixpkgs, system, name, url, hash, libs)
     }
 
     fn form(&self, package: &crate::config::Package) -> Option<prebuilt::Form> {
@@ -318,6 +326,7 @@ mod tests {
             "demo-app",
             "https://example.com/x/demo-app-0.0.28-x86_64.AppImage",
             HASH,
+            &[],
         );
         // pinned source (url + resolved hash) against the pinned nixpkgs, extracted (not run) via
         // extractType2 — the build-time squashfs unpack the seccomp cage requires.
@@ -472,6 +481,7 @@ mod tests {
             } else {
                 crate::trust::TrustState::Untrusted
             },
+            libs: Vec::new(),
         }
     }
 

@@ -164,6 +164,17 @@ pub(crate) struct Package {
     /// never-trusted one — they call for different action (re-approval vs first
     /// approval), and the build-vs-fetch relaxation still needs the distinction.
     pub(crate) state: TrustState,
+    /// Extra nixpkgs attributes to autoPatchelf this package against, declared as `libs` in its
+    /// `[deb.<name>]` / `[appimage.<name>]` / `[tarball.<name>]` table and unioned with the built-in
+    /// Electron/Chromium set. Empty for every other backend and for a prebuilt package that needs
+    /// nothing beyond the built-in set.
+    ///
+    /// It exists because that built-in set is one list shared by all three prebuilt backends: adding
+    /// (say) WebKitGTK to it so ONE GTK app resolves its `NEEDED` entries would put an 825 MiB
+    /// closure into every Electron app that never asks for it. Per package, the cost lands only on
+    /// the package that declared it. Each name is interpolated into the generated derivation, so it
+    /// passes the same charset barrier a `nix:` attribute does.
+    pub(crate) libs: Vec<String>,
 }
 
 /// A project's mise file as the resolved configuration sees it: the discovered

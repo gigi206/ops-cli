@@ -484,7 +484,13 @@ impl Resolved {
             upsert(&mut self.env, key, val);
         }
         for pkg in app.packages {
-            upsert_package(&mut self.packages, pkg.name, pkg.backend, pkg.state);
+            upsert_package(
+                &mut self.packages,
+                pkg.name,
+                pkg.backend,
+                pkg.state,
+                pkg.libs,
+            );
         }
         // Merge by *path*: an app bind whose path the baseline already exposes overrides it in
         // place (so a dest is never mounted twice, and the app's mode wins), consistent with how
@@ -3120,7 +3126,7 @@ fn apply_packages(
                 continue;
             }
         };
-        upsert_package(out, name, backend, state);
+        upsert_package(out, name, backend, state, Vec::new());
     }
 }
 
@@ -3180,7 +3186,7 @@ fn apply_tools(
         out,
         warnings,
         source,
-        tarball,
+        tarball.clone(),
         &tarball_names,
         state,
         protect_trusted,
@@ -3192,7 +3198,7 @@ fn apply_tools(
         out,
         warnings,
         source,
-        deb,
+        deb.clone(),
         &deb_names,
         state,
         protect_trusted,
@@ -3204,7 +3210,7 @@ fn apply_tools(
         out,
         warnings,
         source,
-        appimage,
+        appimage.clone(),
         &appimage_names,
         state,
         protect_trusted,
@@ -3212,6 +3218,70 @@ fn apply_tools(
         "appimage",
         |command| Backend::AppImageResolve { command },
     );
+    // After the packages exist, since `libs` decorates a package rather than declaring one: the
+    // table it comes from may pair with either declaration form, so both must already be in `out`.
+    apply_prebuilt_libs(out, warnings, source, &tarball, "tarball", protect_trusted);
+    apply_prebuilt_libs(out, warnings, source, &deb, "deb", protect_trusted);
+    apply_prebuilt_libs(out, warnings, source, &appimage, "appimage", protect_trusted);
+}
+
+/// Attach a `[<label>.<name>]` table's `libs` to the package it names — the extra nixpkgs attributes
+/// that package's ELFs are autoPatchelf'd against, on top of the built-in Electron/Chromium set.
+///
+/// Separate from [`apply_resolvers`] because `libs` decorates a package instead of declaring one: it
+/// applies to both declaration forms (a fixed URL, a `github:` locator, or the `resolve` sentinel),
+/// so it runs once every package of this layer is in `out`. Each name is interpolated into the
+/// generated derivation, so it passes the same charset barrier as a `nix:` attribute; an invalid one
+/// is dropped on its own rather than voiding the list. A table naming a package this layer never
+/// declared, or one whose backend is not this prebuilt backend, is warned about — both are config
+/// mistakes whose silent form would be a package built against the wrong library set.
+fn apply_prebuilt_libs(
+    out: &mut [Package],
+    warnings: &mut Vec<String>,
+    source: &str,
+    tables: &BTreeMap<String, RawResolve>,
+    label: &str,
+    protect_trusted: bool,
+) {
+    for (name, raw) in tables {
+        if raw.libs.is_empty() {
+            continue;
+        }
+        let Some(slot) = out.iter_mut().find(|p| &p.name == name) else {
+            warnings.push(format!(
+                "{source}: ignoring `libs` in [{label}.{name}] — no `{name}` in [packages]"
+            ));
+            continue;
+        };
+        if slot.backend.label() != label {
+            warnings.push(format!(
+                "{source}: ignoring `libs` in [{label}.{name}] — `{name}` is a `{}` package, and \
+                 `libs` only applies to a prebuilt one",
+                slot.backend.label()
+            ));
+            continue;
+        }
+        // An untrusted layer may not re-patch a trusted app's tool against a library set of its
+        // choosing, exactly as it may not replace the tool itself.
+        if protect_trusted && slot.state == TrustState::Trusted {
+            warnings.push(format!(
+                "{source}: ignoring `libs` in [{label}.{name}] — it would override a trusted app's \
+                 package"
+            ));
+            continue;
+        }
+        let (valid, invalid): (Vec<String>, Vec<String>) = raw
+            .libs
+            .iter()
+            .cloned()
+            .partition(|attr| is_valid_attr(attr));
+        for attr in invalid {
+            warnings.push(format!(
+                "{source}: ignoring invalid library attribute `{attr}` in [{label}.{name}]"
+            ));
+        }
+        slot.libs = valid;
+    }
 }
 
 /// Bind each `<name> = "<label>:resolve"` sentinel to its `[<label>.<name>]` table, folding it into
@@ -3242,10 +3312,15 @@ fn apply_resolvers(
     let table_names: BTreeSet<String> = tables.keys().cloned().collect();
     for (name, raw) in tables {
         if !resolve_names.contains(&name) {
-            warnings.push(format!(
-                "{source}: ignoring [{label}.{name}] — no matching `{name} = \
-                 \"{sentinel}\"` in [packages]"
-            ));
+            // A table carrying only `libs` is not a resolver declaration at all: it decorates a
+            // package declared with a fixed URL or a `github:` locator, and `apply_prebuilt_libs`
+            // is what reads it. Only a table that meant to resolve is a mistake here.
+            if !raw.resolve.is_empty() || raw.libs.is_empty() {
+                warnings.push(format!(
+                    "{source}: ignoring [{label}.{name}] — no matching `{name} = \
+                     \"{sentinel}\"` in [packages]"
+                ));
+            }
             continue;
         }
         if !is_valid_package_name(&name) {
@@ -3271,7 +3346,7 @@ fn apply_resolvers(
             ));
             continue;
         }
-        upsert_package(out, name, make_backend(raw.resolve), state);
+        upsert_package(out, name, make_backend(raw.resolve), state, Vec::new());
     }
     // A sentinel with no `[<label>.<name>]` table at all can never resolve — warn rather than
     // silently drop the package (a sentinel whose table was present but invalid was already warned).
@@ -3330,7 +3405,13 @@ fn apply_flakes(
             ));
             continue;
         }
-        upsert_package(out, name, Backend::FlakeInline { content, attr }, state);
+        upsert_package(
+            out,
+            name,
+            Backend::FlakeInline { content, attr },
+            state,
+            Vec::new(),
+        );
     }
 }
 
@@ -3538,16 +3619,27 @@ pub(crate) fn is_valid_deb_apt_locator(s: &str) -> bool {
 /// Set the package named `name` to `backend` with the supplying layer's trust,
 /// overriding an existing entry so a later layer wins while preserving declaration
 /// order.
-fn upsert_package(out: &mut Vec<Package>, name: String, backend: Backend, state: TrustState) {
+fn upsert_package(
+    out: &mut Vec<Package>,
+    name: String,
+    backend: Backend,
+    state: TrustState,
+    libs: Vec<String>,
+) {
     match out.iter_mut().find(|p| p.name == name) {
         Some(slot) => {
             slot.backend = backend;
             slot.state = state;
+            // A layer that re-declares a package re-declares what it is patched against too: the
+            // decoration belongs to the declaration, so it never outlives it. `apply_prebuilt_libs`
+            // fills the new one in from this layer's own table, right after.
+            slot.libs = libs;
         }
         None => out.push(Package {
             name,
             backend,
             state,
+            libs,
         }),
     }
 }

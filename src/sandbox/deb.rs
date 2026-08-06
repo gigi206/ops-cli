@@ -27,7 +27,7 @@
 //! declared source forward (re-querying GitHub for the `github:` form, the apt index for the `apt:`
 //! form) and rewrites the lock.
 
-use super::prebuilt::{self, ELECTRON_LIBS};
+use super::prebuilt;
 use crate::store::Layout;
 use std::collections::BTreeMap;
 use std::io;
@@ -302,7 +302,14 @@ fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
 /// so no per-app path is hardcoded. Every interpolated value is sbx-controlled and charset-validated
 /// (`name`, `url`, `hash`, the pinned `nixpkgs`, the `system`), so the expression carries nothing to
 /// escape; placeholders keep nix's `${…}`/`{…}` out of Rust's formatter.
-fn derivation_expr(nixpkgs: &str, system: &str, name: &str, url: &str, hash: &str) -> String {
+fn derivation_expr(
+    nixpkgs: &str,
+    system: &str,
+    name: &str,
+    url: &str,
+    hash: &str,
+    libs: &[String],
+) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   name = "@NAME@";
@@ -339,7 +346,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
         .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
-        .replace("@LIBS@", &ELECTRON_LIBS.join(" "))
+        .replace("@LIBS@", &prebuilt::lib_set(libs))
         .replace("@URL@", url)
         .replace("@HASH@", hash)
         .replace("@NAME@", name)
@@ -380,8 +387,9 @@ impl prebuilt::Kind for Deb {
         name: &str,
         url: &str,
         hash: &str,
+        libs: &[String],
     ) -> String {
-        derivation_expr(nixpkgs, system, name, url, hash)
+        derivation_expr(nixpkgs, system, name, url, hash, libs)
     }
 
     fn form(&self, package: &crate::config::Package) -> Option<prebuilt::Form> {
@@ -437,6 +445,7 @@ mod tests {
             "demo-app",
             "https://example.com/x/demo-app-linux-amd64.deb",
             HASH,
+            &[],
         );
         // pinned source (url + resolved hash), against the pinned nixpkgs for this system
         assert!(expr.contains(
@@ -457,6 +466,35 @@ mod tests {
         assert!(expr.contains("meta.mainProgram = \"demo-app\";"));
         // no leftover placeholder
         assert!(!expr.contains('@'), "unreplaced placeholder in:\n{expr}");
+    }
+
+    #[test]
+    fn a_packages_own_libs_join_the_build_inputs_of_its_derivation() {
+        // What lets a GTK/WebKit `.deb` resolve its `NEEDED` entries without every Electron app
+        // paying for WebKitGTK's closure: the attributes ride the package, not the shared set.
+        let plain = derivation_expr(
+            "github:NixOS/nixpkgs/abc",
+            "x86_64-linux",
+            "demo-app",
+            "https://example.com/x/demo-app-linux-amd64.deb",
+            HASH,
+            &[],
+        );
+        assert!(!plain.contains("webkitgtk_4_1"));
+
+        let with_libs = derivation_expr(
+            "github:NixOS/nixpkgs/abc",
+            "x86_64-linux",
+            "demo-app",
+            "https://example.com/x/demo-app-linux-amd64.deb",
+            HASH,
+            &["webkitgtk_4_1".to_string(), "libsoup_3".to_string()],
+        );
+        assert!(with_libs.contains("webkitgtk_4_1") && with_libs.contains("libsoup_3"));
+        // The built-in set is unioned, never replaced — an app declaring one attribute must not
+        // lose the Electron/Chromium libraries the unpacked tree still links against.
+        assert!(with_libs.contains("gtk3") && with_libs.contains("nss"));
+        assert!(!with_libs.contains('@'), "unreplaced placeholder");
     }
 
     #[test]
@@ -618,6 +656,7 @@ mod tests {
             } else {
                 crate::trust::TrustState::Untrusted
             },
+            libs: Vec::new(),
         }
     }
 

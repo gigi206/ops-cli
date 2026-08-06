@@ -2564,7 +2564,8 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
     let ctx = prebuilt_ctx(prep);
     for kind in super::prebuilt::DIRECT_ORDER {
         for (name, url) in kind.packages(&prep.cfg.packages) {
-            match super::prebuilt::provision(kind, &ctx, &name, &url) {
+            let libs = super::prebuilt::libs_of(&prep.cfg.packages, &name);
+            match super::prebuilt::provision(kind, &ctx, &name, &url, &libs) {
                 Ok((_, root)) => packages.roots.push(root),
                 Err(e) => {
                     crate::diag::error(&format!(
@@ -2582,7 +2583,8 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
     // so it is skipped rather than resolved.
     for kind in super::prebuilt::RESOLVE_ORDER {
         for (name, _command) in kind.resolve_packages(&prep.cfg.packages) {
-            match super::prebuilt::provision_resolve_pinned(kind, &ctx, &name) {
+            let libs = super::prebuilt::libs_of(&prep.cfg.packages, &name);
+            match super::prebuilt::provision_resolve_pinned(kind, &ctx, &name, &libs) {
                 Ok(Some((_, root))) => packages.roots.push(root),
                 Ok(None) => {}
                 Err(e) => {
@@ -3522,7 +3524,8 @@ fn build(
     let ctx = prebuilt_ctx(prep);
     for kind in super::prebuilt::DIRECT_ORDER {
         for (name, url) in kind.packages(&prep.cfg.packages) {
-            match super::prebuilt::provision(kind, &ctx, &name, &url) {
+            let libs = super::prebuilt::libs_of(&prep.cfg.packages, &name);
+            match super::prebuilt::provision(kind, &ctx, &name, &url, &libs) {
                 Ok((bin, root)) => {
                     bin_paths.push(bin);
                     packages.roots.push(root);
@@ -3558,7 +3561,9 @@ fn build(
     };
     for kind in super::prebuilt::RESOLVE_ORDER {
         for (name, command) in kind.resolve_packages(&prep.cfg.packages) {
-            match super::prebuilt::provision_resolve(kind, &ctx, &name, &command, &resolve_cage) {
+            let libs = super::prebuilt::libs_of(&prep.cfg.packages, &name);
+            match super::prebuilt::provision_resolve(kind, &ctx, &name, &command, &resolve_cage, &libs)
+            {
                 Ok((bin, root)) => {
                     bin_paths.push(bin);
                     packages.roots.push(root);

@@ -366,6 +366,7 @@ mod tests {
             } else {
                 crate::trust::TrustState::Untrusted
             },
+            libs: Vec::new(),
         }
     }
 

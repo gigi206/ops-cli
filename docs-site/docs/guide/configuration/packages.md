@@ -178,6 +178,32 @@ is plain dotted-decimal (a non-numeric version is refused rather than mis-ordere
 Pairs with [`gui = "wayland"`](gui) for the display; sbx seeds its MITM CA into the cage's NSS
 store so the Chromium app trusts a filtering posture's proxy.
 
+**A non-Electron app: `libs`.** The curated library set is shared by `deb:`, `appimage:` and
+`tarball:`, and it covers the Electron/Chromium shape. An app built on something else (a Wails or
+GTK shell links `libwebkit2gtk`, `libsoup`, `libjavascriptcoregtk`) has `NEEDED` entries that set
+does not carry, and `autoPatchelfHook` fails the build naming them. Add them **per package** in its
+table, with `libs`:
+
+```toml
+[packages]
+demo-desktop = "deb:github:owner/repo"
+
+[deb.demo-desktop]
+# Unioned with the built-in set, never replacing it. A nested attribute path is allowed.
+libs = ["webkitgtk_4_1", "libsoup_3", "gst_all_1.gst-plugins-base"]
+```
+
+Per package because widening the shared set would put WebKitGTK's closure (hundreds of MiB) into
+every Electron app that never asked for it. The table needs no `resolve` for this: `libs` decorates
+a package declared any of the ways above, and the two fields can also appear together. Each name is
+interpolated into the generated derivation, so it passes the same charset check as a `nix:`
+attribute; an invalid one is dropped with a warning and the rest still apply. `libs` is a
+[trusted-only](../concepts/trust) field, like the package it decorates.
+
+The wrapper also points `GST_PLUGIN_SYSTEM_PATH_1_0` at every input's `lib/gstreamer-1.0`, so a
+WebKit app that declares the GStreamer packages above actually finds their elements (they are
+`dlopen`'d, so `LD_LIBRARY_PATH` alone never resolves them).
+
 **Auto-upgrade, `deb:resolve`.** When a vendor ships a version-stamped `.deb` URL with no
 `…/latest/…` alias and no apt index (so `deb:<url>` would freeze and neither `deb:github:` nor
 `deb:apt:` applies), pair a `deb:resolve` sentinel with a `[deb.<name>]` table carrying a `resolve`

@@ -65,8 +65,8 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
 
 /// The generic install phase (a shell snippet), embedded by each backend's generated derivation into
 /// its `installPhase` after the archive has been copied into `$out`. It finds the program to wrap in
-/// two passes, and the order matters: the **bundle** shape first, the **bare-binary** shape only when
-/// there is no bundle.
+/// three passes, and the order matters: the **bundle** shape first, then the **named binary**, and
+/// the **lone bare binary** only when neither matched.
 ///
 /// A bundle is located by its `resources/` signature — either a packed `resources/app.asar` file or,
 /// for an asar-less build (some modern VS Code forks ship the app as a loose `resources/app/`
@@ -76,12 +76,31 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
 /// `AppRun` launcher that sorts *before* the real binary) and harmless for a `.deb` (which has no
 /// `AppRun`), so one snippet serves both.
 ///
-/// The fallback covers the plainest shape a vendor ships: an archive whose root holds one executable
+/// The second pass covers the shape a non-Electron desktop package ships: an FHS tree whose program
+/// sits at `usr/bin/<name>` beside its siblings (a vendor `.deb` routinely carries a CLI and an
+/// updater there too). It matches on the *declared* name — the `[packages]` key, which the profile
+/// also writes as its `cmd` — so a tree holding several binaries is unambiguous by construction
+/// rather than by counting. More than one match anywhere in the tree is not a guess to make, so it
+/// falls through to the last pass instead. The wrapper's own destination (`$out/bin/<name>`) is
+/// excluded from that search: an archive that already unpacks to `bin/<name>` would otherwise have
+/// `makeWrapper` overwrite the very binary it wraps.
+///
+/// The last pass covers the plainest shape a vendor ships: an archive whose root holds one executable
 /// and nothing else to choose from — a self-contained CLI rather than a desktop bundle. It applies
 /// the *same* exclusions, and requires **exactly one** candidate: two would be an ambiguity, and
 /// picking the first of them is how a build silently wraps the wrong program. The search is
 /// deliberately `-maxdepth 1`, so an archive that unpacks into a versioned sub-directory fails here
 /// with a message naming what it found rather than reaching in and guessing.
+///
+/// Beyond `LD_LIBRARY_PATH`, the wrapper prefixes three runtime lookup paths from the same
+/// `buildInputs`: `GST_PLUGIN_SYSTEM_PATH_1_0` (`lib/gstreamer-1.0`), `GIO_EXTRA_MODULES`
+/// (`lib/gio/modules`) and `XDG_DATA_DIRS` (`share`). What they have in common is that the things
+/// they point at are **dlopen'd or looked up by path**, never linked, so `LD_LIBRARY_PATH` finds
+/// none of them: a WebKit app reports `GStreamer element appsink not found` on its first media
+/// page, `glib-networking`'s TLS backend is a GIO module without which HTTPS fails outright, and
+/// GSettings schemas live under `share`. All three are unconditional because they cost nothing when
+/// no such package is among the inputs — the directories simply do not exist, and each consumer
+/// skips a missing one.
 ///
 /// Two placeholders: `@NAME@` (the wrapped launcher name — the `[packages]` key, which is also the
 /// derivation's `meta.mainProgram`, so the command a profile writes is that key) and `@LDPREFIX@`
@@ -96,17 +115,43 @@ pub(crate) const LAUNCHER_WRAP: &str = r#"    app=$(find $out -type f -path '*/r
         ! -name '*.so' ! -name '*.so.*' | sort | head -1)
       [ -n "$main" ] || { echo "@NAME@: no launcher binary found in $appdir" >&2; exit 1; }
     else
-      cands=$(find $out -maxdepth 1 -type f -executable \
-        ! -name 'AppRun' ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
-        ! -name '*.so' ! -name '*.so.*' | sort)
-      [ -n "$cands" ] || { echo "@NAME@: no Electron resources/app(.asar), and no executable at the archive root" >&2; exit 1; }
-      count=$(printf '%s\n' "$cands" | wc -l)
-      [ "$count" -eq 1 ] || { echo "@NAME@: no Electron resources/app(.asar), and $count executables at the archive root (need exactly 1):" >&2; printf '%s\n' "$cands" >&2; exit 1; }
-      main=$cands
+      named=$(find $out -type f -executable -path '*/bin/@NAME@' ! -path "$out/bin/@NAME@" | sort)
+      if [ -n "$named" ] && [ "$(printf '%s\n' "$named" | wc -l)" -eq 1 ]; then
+        main=$named
+      else
+        cands=$(find $out -maxdepth 1 -type f -executable \
+          ! -name 'AppRun' ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
+          ! -name '*.so' ! -name '*.so.*' | sort)
+        [ -n "$cands" ] || { echo "@NAME@: no Electron resources/app(.asar), no */bin/@NAME@, and no executable at the archive root" >&2; exit 1; }
+        count=$(printf '%s\n' "$cands" | wc -l)
+        [ "$count" -eq 1 ] || { echo "@NAME@: no Electron resources/app(.asar), no single */bin/@NAME@, and $count executables at the archive root (need exactly 1):" >&2; printf '%s\n' "$cands" >&2; exit 1; }
+        main=$cands
+      fi
     fi
     mkdir -p $out/bin
     makeWrapper "$main" "$out/bin/@NAME@" \
-      --prefix LD_LIBRARY_PATH : "@LDPREFIX@""#;
+      --prefix LD_LIBRARY_PATH : "@LDPREFIX@" \
+      --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "@GSTPREFIX@" \
+      --prefix GIO_EXTRA_MODULES : "@GIOPREFIX@" \
+      --prefix XDG_DATA_DIRS : "@DATAPREFIX@""#;
+
+/// `@GSTPREFIX@`: the `lib/gstreamer-1.0` of every `buildInputs` entry. Named here rather than
+/// inlined so the snippet stays runnable shell once the placeholder is filled with a plain path,
+/// which is what lets a test execute it against a real directory tree. Every backend embedding the
+/// snippet builds with `mkDerivation (finalAttrs: …)` and has `pkgs` in scope.
+const GST_SEARCH_PATH: &str =
+    r#"${pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" finalAttrs.buildInputs}"#;
+
+/// `@GIOPREFIX@`: the GIO module directory of every `buildInputs` entry. `glib-networking` ships
+/// GIO's TLS backend as a module, so without this a GTK/libsoup app resolves no HTTPS at all — the
+/// same dlopen'd-not-linked shape as the GStreamer elements above.
+const GIO_SEARCH_PATH: &str =
+    r#"${pkgs.lib.makeSearchPathOutput "lib" "lib/gio/modules" finalAttrs.buildInputs}"#;
+
+/// `@DATAPREFIX@`: the `share` directory of every `buildInputs` entry — where GSettings schemas,
+/// icon themes and the rest of the XDG data a GTK application looks up at runtime live.
+const XDG_DATA_SEARCH_PATH: &str =
+    r#"${pkgs.lib.makeSearchPathOutput "out" "share" finalAttrs.buildInputs}"#;
 
 /// Fill [`LAUNCHER_WRAP`]'s two placeholders. `ld_prefix` is the `LD_LIBRARY_PATH` prefix value: a
 /// `.deb` passes just the `makeLibraryPath` of its `buildInputs`; an AppImage prepends `$out` (its
@@ -115,6 +160,35 @@ pub(crate) fn launcher_wrap(name: &str, ld_prefix: &str) -> String {
     LAUNCHER_WRAP
         .replace("@NAME@", name)
         .replace("@LDPREFIX@", ld_prefix)
+        .replace("@GSTPREFIX@", GST_SEARCH_PATH)
+        .replace("@GIOPREFIX@", GIO_SEARCH_PATH)
+        .replace("@DATAPREFIX@", XDG_DATA_SEARCH_PATH)
+}
+
+/// The extra library attributes the package called `name` declared, or none when it declared any.
+/// The collectors on [`Kind`] answer `(name, locator)` — deliberately, since the prune and count
+/// paths want exactly that — so the provisioning sites read the package's `libs` back through here
+/// rather than widening every tuple in the crate.
+pub(crate) fn libs_of(packages: &[crate::config::Package], name: &str) -> Vec<String> {
+    packages
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.libs.clone())
+        .unwrap_or_default()
+}
+
+/// The nixpkgs attributes one prebuilt package is autoPatchelf'd against: the built-in
+/// Electron/Chromium set plus whatever its own table declared, space-joined for the generated
+/// derivation's `buildInputs`. Deduplicated and order-stable so an attribute named in both lands
+/// once and the expression (and therefore the store path) does not churn on a re-declaration.
+pub(crate) fn lib_set(extra: &[String]) -> String {
+    let mut names: Vec<&str> = ELECTRON_LIBS.to_vec();
+    for attr in extra {
+        if !names.contains(&attr.as_str()) {
+            names.push(attr);
+        }
+    }
+    names.join(" ")
 }
 
 /// An SRI SHA-256 hash string as `nix store prefetch-file` emits (`sha256-<base64>`).
@@ -405,6 +479,10 @@ pub(crate) trait Kind {
     /// The generated nix expression that fetches the pinned artefact, unpacks it this backend's own
     /// way (a `dpkg-deb` data tarball, an AppImage squashfs, a plain `.tar.gz`) and autoPatchelfs the
     /// result — the one step that is genuinely a backend's own.
+    ///
+    /// `libs` are the package's own extra nixpkgs attributes (its table's `libs`), unioned with the
+    /// built-in Electron/Chromium set by [`lib_set`]: that set is shared by all three backends, so a
+    /// GTK/WebKit app names what it needs here rather than growing every other app's closure.
     fn derivation_expr(
         &self,
         nixpkgs: &str,
@@ -412,6 +490,7 @@ pub(crate) trait Kind {
         name: &str,
         url: &str,
         hash: &str,
+        libs: &[String],
     ) -> String;
 
     /// Which of this backend's two declaration forms `package` uses, or `None` when it belongs to
@@ -625,9 +704,10 @@ fn build_pinned(
     name: &str,
     url: &str,
     hash: &str,
+    libs: &[String],
 ) -> io::Result<(PathBuf, PathBuf)> {
     let system = super::current_system();
-    let expr = kind.derivation_expr(ctx.nixpkgs, &system, name, url, hash);
+    let expr = kind.derivation_expr(ctx.nixpkgs, &system, name, url, hash, libs);
     let gcroot = ctx
         .layout
         .data_dir()
@@ -648,6 +728,7 @@ pub(crate) fn provision(
     ctx: &Ctx,
     name: &str,
     locator: &str,
+    libs: &[String],
 ) -> io::Result<(PathBuf, PathBuf)> {
     let project_id = super::binds::project_runtime_id(ctx.project)?;
     let lock_file = lock_file(kind);
@@ -668,7 +749,7 @@ pub(crate) fn provision(
             (u, h)
         }
     };
-    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash)
+    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, libs)
 }
 
 /// Provision one `<backend>:resolve` package host-side — the auto-upgrade twin of [`provision`]. The
@@ -682,6 +763,7 @@ pub(crate) fn provision_resolve(
     name: &str,
     command: &[String],
     cage: &super::resolve::ResolveCage,
+    libs: &[String],
 ) -> io::Result<(PathBuf, PathBuf)> {
     let project_id = super::binds::project_runtime_id(ctx.project)?;
     let lock_file = lock_file(kind);
@@ -709,7 +791,7 @@ pub(crate) fn provision_resolve(
             (u, h)
         }
     };
-    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash)
+    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, libs)
 }
 
 /// Build a `<backend>:resolve` package from its EXISTING pin only — for the gc keep path, which must
@@ -719,6 +801,7 @@ pub(crate) fn provision_resolve_pinned(
     kind: &dyn Kind,
     ctx: &Ctx,
     name: &str,
+    libs: &[String],
 ) -> io::Result<Option<(PathBuf, PathBuf)>> {
     let project_id = super::binds::project_runtime_id(ctx.project)?;
     let Some(pin) =
@@ -726,7 +809,7 @@ pub(crate) fn provision_resolve_pinned(
     else {
         return Ok(None);
     };
-    build_pinned(kind, ctx, project_id.as_str(), name, &pin.url, &pin.hash).map(Some)
+    build_pinned(kind, ctx, project_id.as_str(), name, &pin.url, &pin.hash, libs).map(Some)
 }
 
 /// The outcome of re-resolving one declared reference during `sbx upgrade`. `url` is the lock *key*
@@ -927,6 +1010,7 @@ mod tests {
             _name: &str,
             _url: &str,
             _hash: &str,
+            _libs: &[String],
         ) -> String {
             unreachable!("upgrade never builds a derivation")
         }
@@ -949,6 +1033,7 @@ mod tests {
                 name: "demo-app".to_string(),
                 backend: crate::config::Backend::Tarball(url.to_string()),
                 state: crate::trust::TrustState::Trusted,
+                libs: Vec::new(),
             }],
             vec![],
         );
@@ -999,6 +1084,7 @@ mod tests {
                     command: vec!["sh".into(), "-c".into(), "echo https://e/a.tar.gz".into()],
                 },
                 state: crate::trust::TrustState::Trusted,
+                libs: Vec::new(),
             }],
             vec![],
         );
@@ -1062,6 +1148,7 @@ mod tests {
             } else {
                 crate::trust::TrustState::Untrusted
             },
+            libs: Vec::new(),
         }
     }
 
@@ -1286,6 +1373,160 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
     }
 
     #[test]
+    fn launcher_wrap_takes_a_named_bin_before_scanning_the_archive_root() {
+        // The shape this pass exists for: a vendor `.deb` unpacking to an FHS tree, whose program is
+        // `usr/bin/<name>` beside a CLI and an updater. Nothing sits at the archive root, and three
+        // executables sit below it, so the root scan would refuse on both counts — the declared name
+        // is what makes the choice unambiguous.
+        let wrap = launcher_wrap("demo-app", "/lib");
+        let bundle = wrap.find("resources/app.asar").expect("bundle probe");
+        let named = wrap.find("named=").expect("named-bin probe");
+        let root_scan = wrap.find("cands=").expect("root scan");
+        assert!(
+            bundle < named && named < root_scan,
+            "order must be bundle, then named bin, then root scan:\n{wrap}"
+        );
+        assert!(wrap.contains("-path '*/bin/demo-app'"));
+        // The wrapper's own destination is excluded: an archive already unpacking to `bin/<name>`
+        // would otherwise have makeWrapper overwrite the binary it is wrapping.
+        assert!(
+            wrap.contains("! -path \"$out/bin/demo-app\""),
+            "the named-bin search must exclude the wrapper's own path:\n{wrap}"
+        );
+        assert!(wrap.contains("| wc -l)\" -eq 1 ]"));
+    }
+
+    #[test]
+    fn launcher_wrap_points_every_dlopen_lookup_at_the_build_inputs() {
+        // The three paths nothing else resolves: GStreamer elements, GIO modules (glib-networking's
+        // TLS backend — no HTTPS without it) and the XDG data dirs holding GSettings schemas. All
+        // are looked up by path at runtime, so a package present in `buildInputs` is still invisible
+        // unless the wrapper says where it is.
+        let wrap = launcher_wrap("demo-app", "/lib");
+        for (var, expr) in [
+            ("GST_PLUGIN_SYSTEM_PATH_1_0", GST_SEARCH_PATH),
+            ("GIO_EXTRA_MODULES", GIO_SEARCH_PATH),
+            ("XDG_DATA_DIRS", XDG_DATA_SEARCH_PATH),
+        ] {
+            assert!(wrap.contains(&format!("--prefix {var} : ")), "{var} missing");
+            assert!(wrap.contains(expr), "{var} points nowhere");
+        }
+        assert!(!wrap.contains('@'), "unfilled placeholder in:\n{wrap}");
+    }
+
+    #[test]
+    fn the_lib_set_unions_the_builtin_one_with_the_packages_own_and_dedups() {
+        // A package's own attributes come after the built-in set, and an attribute named in both
+        // lands once: the joined string goes straight into the derivation, so a duplicate would
+        // change the expression (hence the store path) for no reason.
+        let set = lib_set(&["webkitgtk_4_1".into(), "gtk3".into(), "libsoup_3".into()]);
+        let names: Vec<&str> = set.split(' ').collect();
+        assert_eq!(names.iter().filter(|n| **n == "gtk3").count(), 1);
+        for builtin in ELECTRON_LIBS {
+            assert!(names.contains(builtin), "{builtin} missing from {set}");
+        }
+        assert!(names.ends_with(&["webkitgtk_4_1", "libsoup_3"]));
+        // No declaration is the common case, and it must leave the built-in set exactly as it was.
+        assert_eq!(lib_set(&[]), ELECTRON_LIBS.join(" "));
+    }
+
+    /// Run the launcher snippet against a real directory tree and report what it wrapped.
+    ///
+    /// The assertions above pin the snippet's *text*; this runs it. `makeWrapper` is a shell
+    /// function printing its source and destination, and the nix interpolations are filled with
+    /// plain paths — everything else (the `find` passes, the counting, the refusals) is the shipped
+    /// snippet verbatim, so a layout that breaks here breaks a real build.
+    fn wrap_on(tree: &std::path::Path, files: &[(&str, bool)]) -> Result<String, String> {
+        use std::os::unix::fs::PermissionsExt;
+        for (rel, executable) in files {
+            let path = tree.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            let mode = if *executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let snippet = launcher_wrap("demo-app", "/lib")
+            .replace(GST_SEARCH_PATH, "/gst")
+            .replace(GIO_SEARCH_PATH, "/gio")
+            .replace(XDG_DATA_SEARCH_PATH, "/share");
+        let script = format!(
+            "set -e\nout={}\nmakeWrapper() {{ echo \"WRAPPED $1\"; }}\n{snippet}\n",
+            tree.display()
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("bash runs");
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    #[test]
+    fn the_launcher_snippet_resolves_each_real_layout_and_refuses_the_ambiguous_ones() {
+        let tmp = crate::testutil::TmpDir::new();
+
+        // (a) Electron bundle: the launcher sits beside `resources/`, and the Chromium helper next
+        // to it must not be picked.
+        let electron = tmp.join("electron");
+        assert_eq!(
+            wrap_on(
+                &electron,
+                &[
+                    ("opt/demo/resources/app.asar", false),
+                    ("opt/demo/demo-app", true),
+                    ("opt/demo/chrome-sandbox", true),
+                ]
+            ),
+            Ok(format!("WRAPPED {}/opt/demo/demo-app", electron.display()))
+        );
+
+        // (b) The shape this pass was added for: a vendor `.deb` FHS tree. Nothing at the root and
+        // three executables below it, so the root scan alone would refuse — the declared name picks
+        // the shell, not the CLI beside it.
+        let fhs = tmp.join("fhs");
+        assert_eq!(
+            wrap_on(
+                &fhs,
+                &[
+                    ("usr/bin/demo-app", true),
+                    ("usr/bin/demo-app-cli", true),
+                    ("usr/lib/demo/updater", true),
+                ]
+            ),
+            Ok(format!("WRAPPED {}/usr/bin/demo-app", fhs.display()))
+        );
+
+        // (c) The plain archive: one executable at the root, which is still what gets wrapped.
+        let bare = tmp.join("bare");
+        assert_eq!(
+            wrap_on(&bare, &[("demo-app", true), ("README", false)]),
+            Ok(format!("WRAPPED {}/demo-app", bare.display()))
+        );
+
+        // (d) No bundle, no `bin/demo-app`, nothing at the root: refused, and the message names all
+        // three shapes it looked for rather than guessing at one of the binaries below.
+        let ambiguous = tmp.join("ambiguous");
+        let err = wrap_on(
+            &ambiguous,
+            &[("usr/bin/other", true), ("usr/bin/another", true)],
+        )
+        .expect_err("an unresolvable tree must fail the build");
+        assert!(err.contains("no executable at the archive root"), "{err}");
+
+        // (e) An archive that already unpacks to `bin/<name>`: the named pass excludes the wrapper's
+        // own destination, so makeWrapper never overwrites the binary it wraps. It refuses instead —
+        // the behaviour before this pass existed.
+        let collide = tmp.join("collide");
+        let err = wrap_on(&collide, &[("bin/demo-app", true)])
+            .expect_err("wrapping onto itself must never happen");
+        assert!(err.contains("no executable at the archive root"), "{err}");
+    }
+
+    #[test]
     fn the_derived_lock_and_gcroot_names_are_the_ones_already_on_disk() {
         // `Kind::name` is on-disk state: it spells the per-project lock a project's existing pins
         // live in, and the prefix of every per-package gcroot. Nothing else pins those strings --
@@ -1312,6 +1553,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             name: name.to_string(),
             backend,
             state: crate::trust::TrustState::Trusted,
+            libs: Vec::new(),
         };
         let url = "https://example.com/app".to_string();
         for (kind, backend) in [
