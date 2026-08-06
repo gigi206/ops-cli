@@ -13,6 +13,9 @@ min_version = "2024.12.0"
 
 [tools]
 rust                            = "latest"
+# The Rust language server (LSP). Pinned so every `git clone` + `mise install`
+# contributor gets a working LSP out of the box (rustup does not ship it by default).
+"github:rust-lang/rust-analyzer" = "latest"
 # The shipping binary is a static musl build; some dependencies carry C/asm, so
 # the musl target needs a musl-targeting C compiler. zig provides a self-contained
 # musl cross-cc and cargo-zigbuild wires it into cargo — no system musl-gcc package
@@ -28,7 +31,7 @@ zig                             = "latest"
 # docs-site/package.json (the lockfile source of truth); `mise run docs-install`
 # materialises them into docs-site/node_modules via `npm install`. Keep the two in
 # sync when bumping a version. `pagefind` (the search indexer) is a dev dep too.
-node                            = "24.18.0"
+node                            = "latest"
 
 # ============================================================================
 # Tasks — invoked via `mise run <name>`. `mise run ci` is the full one-liner you
