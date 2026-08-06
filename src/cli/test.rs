@@ -238,6 +238,13 @@ fn net_test(args: &[OsString]) -> ExitCode {
             {
                 print!("{}", render_private_name_note(&pal));
             }
+            // The policy permitting an inspected request is not the same as the cage being able to
+            // make it: a loopback host is exempt from the cage's proxy and gets no in-cage listener,
+            // so nothing inside takes this rule. Said here because this command is what an author
+            // checks before concluding the host's loopback is unreachable.
+            if allowed && sandbox::egress::proxy_exempt(&host) {
+                print!("{}", render_loopback_note(&host, port, &pal));
+            }
             // On an allowed request, surface any credential the proxy would inject for this exact
             // destination — by header and source locator only, never the value, and with no I/O. A
             // **cleartext** (`http://`) request never receives an injection (a bearer is not sent in
@@ -428,6 +435,25 @@ fn render_private_name_note(pal: &style::Palette) -> String {
     )
 }
 
+/// Render the dim "the policy allows it, the cage cannot take it" note for an inspected request to a
+/// loopback host — the one shape where an `ALLOWED` verdict is true of the proxy and false of every
+/// client inside the cage. Names the way through (a `tcp://` rule, which does get a listener) rather
+/// than only the obstacle. A pure presenter (its color is asserted in a test); every span is empty
+/// under a non-terminal, so a capture is plain text.
+fn render_loopback_note(host: &str, port: u16, pal: &style::Palette) -> String {
+    format!(
+        "  {}\n",
+        style::dim_prose(
+            &format!(
+                "note: the proxy would allow this, but nothing in the cage asks it — {host} is \
+                 exempt from the cage's proxy (`no_proxy`) and an inspected rule gets no in-cage \
+                 listener; declare `tcp://{host}:{port}` to reach the service on your own loopback"
+            ),
+            pal
+        )
+    )
+}
+
 /// Render the dim "+ a credential would be injected" note for a secret whose destination matches
 /// the tested request — by header name and source locator only (never the plaintext, and with no
 /// I/O), mirroring how `sbx config` describes a credential. A pure presenter (its color is asserted
@@ -590,6 +616,22 @@ mod tests {
             note,
             "  note: if this name resolves to a private or loopback address, the proxy refuses it \
              at connect time (no rule names this exact host)\n"
+        );
+    }
+
+    #[test]
+    fn loopback_note_names_the_tcp_rule_that_would_actually_carry_the_request() {
+        // An ALLOWED verdict on a loopback host is true of the proxy and false of every client in
+        // the cage. The note has to carry both halves — why nothing takes it, and the one rule shape
+        // that does — because this command is where an author checks before giving up on the
+        // filtered posture entirely.
+        let p = style::Palette::plain();
+        let note = render_loopback_note("localhost", 11434, &p);
+        assert_eq!(
+            note,
+            "  note: the proxy would allow this, but nothing in the cage asks it — localhost is \
+             exempt from the cage's proxy (`no_proxy`) and an inspected rule gets no in-cage \
+             listener; declare `tcp://localhost:11434` to reach the service on your own loopback\n"
         );
     }
 

@@ -10,27 +10,46 @@
 # >= 24) and, unlike a TUI CLI, serves a WEB dashboard: it starts a local HTTP server (default
 # 127.0.0.1:10369) and you drive it from your browser.
 #
-# WHY `network = "shared"` (AND WHAT IT COSTS). OpenFox talks to a LLM on your machine's
-# `localhost` (OPENFOX_LLM_URL default `http://localhost:8000/v1`; ollama is usually :11434,
-# llama.cpp :8080). The default sbx posture is Model-B — an EMPTY network namespace whose
-# `127.0.0.1` is the CAGE's own loopback, NOT the host's — and there is no outbound bridge to a
-# host-local service (`forward` is INBOUND only). So under the empty netns the caged openfox
-# simply cannot reach a LLM running on your host. `network = "shared"` makes the cage share the
-# host's network namespace, so `localhost:8000` in the cage IS your host's `localhost:8000` and
-# openfox reaches the LLM — and, as a bonus, the web UI it serves on the cage's `127.0.0.1:10369`
-# is then already on host loopback, so your browser reaches it directly (no `forward` needed; a
-# `forward` would be a no-op under `shared`).
+# THE TWO LOOPBACK CROSSINGS, AND WHY THE POSTURE STAYS FILTERED. OpenFox sits on both sides of
+# the boundary: it TALKS to a LLM on your machine's `localhost` (OPENFOX_LLM_URL default
+# `http://localhost:8000/v1`; ollama is usually :11434, llama.cpp :8080) and it SERVES a web UI you
+# open in your host browser. The sbx posture is Model-B — an EMPTY network namespace whose
+# `127.0.0.1` is the CAGE's own loopback, NOT the host's — so each direction needs its own crossing,
+# and each has one:
 #
-# The honest trade-off: `shared` DROPS the egress allowlist — the agent (and any code it runs in
-# its integrated terminal) can reach any network your host can. What the cage still enforces, and
-# why it is far from pointless here: HERMETIC FILESYSTEM isolation (openfox sees only this project
-# + its own isolated $HOME — never your host $HOME, SSH keys, other projects, or secrets), the
-# SECCOMP denylist (no mount/ns/ptrace kernel-LPE surface), CGROUP limits (anti fork-bomb / OOM),
-# and a dedicated persistent $HOME. For an agent that executes arbitrary commands, that FS +
-# process containment is the primary win, and the model traffic is local (no cloud exfil to
-# filter). If your LLM instead runs on a REMOTE host, prefer the full Model-B posture — replace
-# the `network` line below with a `[network] mode = "deny"` + `allow = ["<llm-host>:<port>"]`
-# allowlist, and drop `shared`; then egress is filtered too.
+#  - OUTBOUND (cage → your LLM): a `tcp://localhost:<port>` allow rule. sbx opens a listener inside
+#    the cage on that exact address:port and relays it, through the host-side proxy, to the service
+#    on YOUR loopback — so `http://localhost:8000/v1` works verbatim, with no tunnel to write. The
+#    rule is the fence: only the ports named below cross, and nothing else on your loopback is
+#    exposed to the agent.
+#  - INBOUND (your browser → the UI): `forward = [10369]`, which bridges that host loopback port
+#    into the cage. Open `http://127.0.0.1:10369` as usual.
+#
+# So egress stays FILTERED, which is what `network = "shared"` would have thrown away: under
+# `shared` the agent — and any code it runs in its integrated terminal — reaches any network your
+# host can. Here it reaches your LLM's port and the npm registry, and nothing else. Everything the
+# cage enforces either way is unchanged: HERMETIC FILESYSTEM isolation (openfox sees only this
+# project + its own isolated $HOME — never your host $HOME, SSH keys, other projects, or secrets),
+# the SECCOMP denylist (no mount/ns/ptrace kernel-LPE surface), CGROUP limits (anti fork-bomb /
+# OOM), and a dedicated persistent $HOME.
+#
+# A `tcp://` rule is a RAW SPLICE: the bytes are relayed unread, so the model traffic is not
+# inspected the way an `https://` host is (no path/verb filtering, no credential injection). That is
+# the right trade for a local backend speaking cleartext HTTP on your own machine, and the host:port
+# allowlist is still the fence. If your LLM runs on a REMOTE host instead, name it as an ordinary
+# inspected rule (`allow = ["{*} https://<llm-host>"]`) and drop the `tcp://` lines.
+#
+# ONE SPELLING TRAP, measured: the cage's `/etc/hosts` gives `localhost` both `127.0.0.1` and `::1`,
+# and the listener is IPv4. A client that retries the second address is fine (curl and Node do), but
+# one that only tries the first fails with "connection refused". Pin `127.0.0.1` in OPENFOX_LLM_URL
+# below if you hit that.
+#
+# THE ESCAPE HATCH, if the crossing ever fails you (an unusual backend, a client that will not take
+# the listener): `sbx app run openfox --net shared` gives the cage the host network for that launch
+# only, leaving the profile filtered. You keep bubblewrap + seccomp + the isolated home + the minimal
+# /dev; what you lose for that launch is egress FILTERING, so the agent and anything its terminal
+# runs can reach any network your host can. Diagnose first with `sbx net logs -a openfox`: a named
+# deny is a port to add to `allow`, not a reason to drop the allowlist.
 #
 # NATIVE ADDONS — why `cmd` is a wrapper, not a bare `openfox`. OpenFox depends on two NATIVE
 # node addons — `better-sqlite3` (its session DB) and `node-pty` (its integrated terminal). Their
@@ -41,8 +60,9 @@
 # below heals that: on first launch (and again after `sbx upgrade mise` rolls openfox to a new
 # version, whose fresh install dir has no `.node` yet) it runs `npm rebuild better-sqlite3 node-pty`
 # inside openfox's install tree, which DOWNLOADS the prebuilt binaries (no compiler needed — they
-# are published for Node 24 / this platform) and then execs openfox. The rebuild fetches from the
-# network, which `shared` provides; it is idempotent (the guard skips it once the binary exists).
+# are published for Node 24 / this platform) and then execs openfox. That fetch runs INSIDE the
+# cage, so it needs the npm registry in `allow` below (the release assets it pulls next ride the
+# built-in github allow-set); it is idempotent (the guard skips it once the binary exists).
 # Keeping openfox as a `mise:npm:` `[packages]` entry means `sbx upgrade mise` still rolls it.
 #
 # The web server auto-opens a browser by default; the hermetic cage has none, so `cmd` passes
@@ -64,9 +84,9 @@ exec openfox --no-browser "$@"
     "openfox",
 ]
 
-# Reach the host-local LLM AND expose the web UI on host loopback. See the header for the remote-LLM
-# alternative (an allowlist instead of shared).
-network = "shared"
+# The INBOUND crossing: your browser's `http://127.0.0.1:10369` is bridged into the cage, where
+# openfox serves the UI on the same port. Keep this in step with OPENFOX_PORT if you change it.
+forward = [10369]
 
 # Your host OpenFox config, mounted read-write at its real absolute path. `binds` is a security
 # field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
@@ -90,11 +110,28 @@ openfox = "mise:npm:openfox"
 # agent needs more tools (a compiler, a language runtime, ripgrep, …), declare them here per app or
 # in the project's own `.sbx.toml [packages]`.
 
+[network]
+mode = "deny"
+# The OUTBOUND crossings. Each `tcp://localhost:<port>` line opens a listener inside the cage on that
+# port and relays it to the service on YOUR loopback — one port at a time, so declaring your LLM's
+# port does not expose the rest of what listens on your machine. OpenFox probes the common ones on
+# first run (8000 vLLM, 11434 ollama, 8080 llama.cpp): a probe to a port not listed here is refused
+# by the allowlist, so uncomment the one your backend serves (or all three, if you switch between
+# them). The npm entry is the in-cage `npm rebuild` from `cmd` above; the release assets it then
+# downloads ride the built-in github allow-set.
+allow = [
+    "tcp://localhost:8000",    # vLLM — the OPENFOX_LLM_URL default
+    #"tcp://localhost:11434",  # ollama
+    #"tcp://localhost:8080",   # llama.cpp
+    "{GET,HEAD} https://registry.npmjs.org",
+]
+
 [env]
 # LLM BACKEND. On first run OpenFox auto-detects a local OpenAI-compatible backend by probing common
-# localhost ports (8000 vLLM, 11434 ollama, 8080 llama.cpp), which works under `network = "shared"`.
-# If auto-detection does not find yours, or you want to pin it, set these (uncomment + adjust):
-#OPENFOX_LLM_URL = "http://localhost:11434/v1"   # ollama; vLLM default is http://localhost:8000/v1
+# localhost ports (8000 vLLM, 11434 ollama, 8080 llama.cpp) — it finds the ones `[network] allow`
+# opens above, and no other. If auto-detection does not find yours, or you want to pin it, set these
+# (uncomment + adjust; `127.0.0.1` rather than `localhost` sidesteps the IPv6 trap in the header):
+#OPENFOX_LLM_URL = "http://127.0.0.1:11434/v1"   # ollama; vLLM default is http://127.0.0.1:8000/v1
 #OPENFOX_MODEL_NAME = "qwen2.5-coder:32b"         # the model your backend serves
 #OPENFOX_REASONING_EFFORT = "medium"              # if your model supports it
 # The web UI port (must match --port if you add one to `cmd`):
@@ -102,5 +139,6 @@ openfox = "mise:npm:openfox"
 #
 # No [secret] block: the LLM is local and needs no cloud API key. If your local backend requires a
 # token, most OpenAI-compatible servers accept any non-empty value — set it in your backend and, if
-# OpenFox needs it, provide it here (your call; it then lives in the isolated cage) rather than via
-# the egress proxy (there is no proxy under `shared`).
+# OpenFox needs it, provide it here (your call; it then lives in the isolated cage). The proxy
+# cannot inject it for you: a `tcp://` destination is spliced unread, so there is no request head to
+# add a header to.

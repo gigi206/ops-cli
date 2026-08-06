@@ -26,9 +26,10 @@
 # "bearer"), and set `provider` in the project's `vtcode.toml`.
 #
 # A LOCAL MODEL INSTEAD. VT Code also drives Ollama / LM Studio / llama.cpp. Those listen on your
-# HOST loopback, which an empty-netns cage cannot reach: swap the `[network]` table for a top-level
-# `network = "shared"` (the shape `examples/app/openfox.toml` documents and justifies) — process
-# containment stays, egress filtering does not.
+# HOST loopback, which the cage crosses by naming the port: a `tcp://localhost:<port>` allow rule
+# (:11434 ollama, :1234 LM Studio, :8080 llama.cpp) opens a listener on that exact port inside the
+# cage and relays it to your service, so the endpoint works verbatim — one port at a time, and egress
+# filtering stays on (the shape `examples/app/openfox.toml` documents).
 #
 # UNVERIFIED (like every profile until run with a real key): the live authentication and the model
 # traffic through sbx's MITM. Grounded here: the packaging (upstream's own GitHub release), the

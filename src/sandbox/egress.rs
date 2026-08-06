@@ -215,6 +215,54 @@ const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 /// on *their* loopback, reached from a cage whose own loopback is a different machine's.
 const ALREADY_LOOPBACK: &[&str] = &["localhost", "ip6-localhost", "ip6-loopback"];
 
+/// The hosts the cage's `no_proxy` exempts from the proxy — the value written into the cage
+/// environment, read back here so the two can never drift.
+///
+/// The exemption exists for the agent's *own* in-cage services (a dev server, a test harness on
+/// `127.0.0.1`), which are intra-cage and never egress. Its cost is that a rule naming one of these
+/// hosts describes a destination no client will route through the proxy, so an *inspected* rule for
+/// one is inert — see [`unreachable_loopback_rules`].
+pub(crate) const PROXY_EXEMPT_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+/// Whether the cage's `no_proxy` exempts `host`, so a client honoring it dials the host directly
+/// (the cage's own loopback) instead of asking the proxy for it.
+pub(crate) fn proxy_exempt(host: &str) -> bool {
+    let h = crate::allowlist::canonical_host(host);
+    PROXY_EXEMPT_HOSTS.contains(&h.as_str())
+}
+
+/// The **inspected** allow rules that name a host the cage's `no_proxy` exempts — rules that read as
+/// permitted everywhere sbx reports a verdict, and that nothing inside the cage can actually take.
+///
+/// Two independent facts make them inert, and each alone is enough: a client honoring `no_proxy`
+/// dials `localhost` directly, reaching the *cage's* loopback rather than the host's; and only a
+/// `tcp://` rule earns an in-cage listener ([`tcp_destinations`]), so an inspected rule has nothing
+/// there to answer either. The proxy itself is willing — a client forced onto it (`curl --noproxy ""
+/// --proxy …`) reaches the host's service and is inspected normally — which is exactly why this is
+/// worth saying out loud: the rule is not wrong, it is unreachable by default, and a silent one is
+/// how an author concludes the loopback is out of reach and reaches for `network = "shared"`.
+///
+/// Returned as rendered rules rather than warned about here, like [`TcpPlan::skipped`], so the caller
+/// decides how loudly to say it and this stays a pure function of the policy.
+pub(crate) fn unreachable_loopback_rules(policy: &crate::allowlist::EgressPolicy) -> Vec<String> {
+    use crate::allowlist::{Layer, RuleKind};
+
+    policy
+        .allow_rules()
+        .iter()
+        .filter(|rule| rule.layer != Layer::L4)
+        .filter(|rule| match &rule.kind {
+            // Only an exact host or address can be recognised: a `*.domain`/regex rule that happens
+            // to cover a loopback name is not a destination an author declared.
+            RuleKind::Host(host, _) => proxy_exempt(host),
+            RuleKind::Ip(ip, _) => proxy_exempt(&ip.to_string()),
+            RuleKind::Url { host, .. } => proxy_exempt(host),
+            RuleKind::Subdomain(..) | RuleKind::Regex { .. } => false,
+        })
+        .map(|rule| rule.to_string())
+        .collect()
+}
+
 /// The prefix of the cage's own hostname (`sbx-<slug>`), which the synthetic hosts file also maps.
 /// A destination in that space is refused rather than quietly shadowed.
 const CAGE_HOSTNAME_PREFIX: &str = "sbx-";
@@ -698,7 +746,7 @@ pub(crate) fn start(
     // harness on `127.0.0.1`) is intra-cage under the empty netns — never egress — so routing
     // it through the proxy would only get it refused (the proxy rejects an IP-literal CONNECT).
     // sbx sets `no_proxy` itself; it being reserved-for-untrusted does not stop that.
-    let no_proxy = "localhost,127.0.0.1,::1".to_string();
+    let no_proxy = PROXY_EXEMPT_HOSTS.join(",");
     let mut env = vec![
         ("http_proxy".to_string(), proxy_url.clone()),
         ("https_proxy".to_string(), proxy_url.clone()),
@@ -1438,6 +1486,68 @@ mod tests {
         assert!(
             !dest.map_name,
             "a second `localhost` line would sit after the built-in one and never be read"
+        );
+    }
+
+    /// An inspected rule for a loopback host reads as allowed on every surface that reports a
+    /// verdict, and no client inside the cage can take it: `no_proxy` sends it to the cage's own
+    /// loopback, and only a `tcp://` rule earns a listener there. Reporting it is what keeps an
+    /// author from concluding their own loopback is out of reach — which is how a profile ends up on
+    /// `network = "shared"`, dropping egress filtering wholesale.
+    #[test]
+    fn an_inspected_loopback_rule_is_reported_because_no_client_can_take_it() {
+        let reported = unreachable_loopback_rules(&tcp_policy(&[
+            "http://localhost:11434",
+            "https://127.0.0.1:8443",
+        ]));
+
+        assert_eq!(
+            reported,
+            vec![
+                "http://localhost:11434".to_string(),
+                "https://127.0.0.1:8443".to_string()
+            ],
+            "both inspected layers are inert on a loopback host, and the report names the rule"
+        );
+    }
+
+    /// The report is for rules an author can act on, so it stays off the three shapes where nothing
+    /// is wrong: a `tcp://` loopback rule (which *does* get a listener — the way through), an
+    /// inspected rule for an ordinary host (which the proxy serves normally), and a wildcard that
+    /// merely happens to cover a loopback name (never a destination anyone declared).
+    #[test]
+    fn the_loopback_report_spares_the_tcp_rule_the_public_host_and_the_wildcard() {
+        let reported = unreachable_loopback_rules(&tcp_policy(&[
+            "tcp://localhost:11434",
+            "https://api.example.com",
+            "re:.*",
+        ]));
+
+        assert!(reported.is_empty(), "{reported:?}");
+    }
+
+    /// The report and the cage's `no_proxy` must name the same hosts: the report exists *because*
+    /// that variable exempts them, so a host added to one and not the other is either a rule
+    /// reported as fine and taken by nothing, or the reverse. Read through the request-side
+    /// spellings a rule can carry (case, an absolute-FQDN trailing dot), which is what the proxy
+    /// canonicalizes away before matching.
+    #[test]
+    fn the_loopback_report_recognises_every_host_the_cage_exempts_from_its_proxy() {
+        for host in PROXY_EXEMPT_HOSTS {
+            assert!(proxy_exempt(host), "{host} is exempt but goes unrecognised");
+            assert!(
+                proxy_exempt(&host.to_ascii_uppercase()),
+                "{host} must be recognised whatever its case"
+            );
+            assert!(
+                proxy_exempt(&format!("{host}.")),
+                "{host} must be recognised in its absolute-FQDN spelling"
+            );
+        }
+        assert!(
+            !proxy_exempt("127.0.0.2"),
+            "only the exempt addresses are inert — 127.0.0.2 is where a `tcp://` destination lives, \
+             and a client does route that one through the proxy"
         );
     }
 

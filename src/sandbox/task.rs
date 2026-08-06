@@ -717,6 +717,18 @@ impl TaskEngine {
                      task's proxy, but its command will have to tunnel itself"
                 ));
             }
+            // A task cage carries the same `no_proxy` as the session's, so an inspected rule naming
+            // a loopback host is inert here for the same reason — and a task's command is fixed, so
+            // its author cannot work around it from the outside.
+            for rule in super::egress::unreachable_loopback_rules(&policy_for_cage) {
+                crate::diag::warn(&format!(
+                    "task `{name}`: `{rule}` allows a host this task's command reaches through no \
+                     client: {exempt} are exempt from the cage's proxy (`no_proxy`), and only a \
+                     `tcp://` rule gets an in-cage listener — declare `tcp://<host>:<port>` to \
+                     reach the service on YOUR loopback",
+                    exempt = super::egress::PROXY_EXEMPT_HOSTS.join(", ")
+                ));
+            }
             argv = self.cage_argv(argv, task, &tcp_plan.destinations);
             Some(guard)
         };

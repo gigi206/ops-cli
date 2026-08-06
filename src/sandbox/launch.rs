@@ -4142,6 +4142,19 @@ fn build(
                  that cannot speak an HTTP CONNECT proxy will have to tunnel itself"
             ));
         }
+        // An inspected rule naming a loopback host is permitted by the policy and taken by nothing:
+        // the cage exempts those hosts from its proxy, and only a `tcp://` rule earns a listener. A
+        // warning, not a note — the rule reads as allowed on every surface that reports a verdict,
+        // so an author who is not told concludes the host's loopback is out of reach.
+        for rule in egress::unreachable_loopback_rules(policy) {
+            crate::diag::warn(&format!(
+                "`{rule}` allows a host the cage reaches through no client: {exempt} are exempt \
+                 from the cage's proxy (`no_proxy`, so the agent's own in-cage services stay \
+                 intra-cage), and only a `tcp://` rule gets an in-cage listener — declare \
+                 `tcp://<host>:<port>` to reach the service on YOUR loopback",
+                exempt = egress::PROXY_EXEMPT_HOSTS.join(", ")
+            ));
+        }
         // A privileged port has no listener either, but ssh is wired for it — so this is a note,
         // not a warning: what an author must know is that *ssh* works as written while another
         // client on such a port still has to ask the proxy itself.
@@ -5975,6 +5988,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             } else {
                 crate::trust::TrustState::Untrusted
             },
+            libs: Vec::new(),
         }
     }
 
@@ -5983,6 +5997,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             name: name.into(),
             backend: crate::config::Backend::Nix(attr.into()),
             state: crate::trust::TrustState::Trusted,
+            libs: Vec::new(),
         }
     }
 

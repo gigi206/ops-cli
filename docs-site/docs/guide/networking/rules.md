@@ -344,6 +344,31 @@ for a service on their own machine. The cage's `localhost` is its own loopback: 
 the host's `localhost`. `-h localhost -p 5432` therefore reaches the service you meant; every other
 port on the cage's loopback is untouched, and still belongs to whatever the cage itself runs.
 
+The mirror image is worth naming, because it is the one place an allowed rule carries nothing: an
+**inspected** rule for such a host (`http://localhost:11434`, `https://127.0.0.1:8443`, or the bare
+form) is permitted by the policy and taken by no client. The cage sets
+`no_proxy=localhost,127.0.0.1,::1` so an agent's own in-cage service stays intra-cage, and only a
+`tcp://` rule earns a listener, so the request goes to the cage's own loopback and finds nothing
+there. Both surfaces say so rather than letting you conclude your loopback is out of reach:
+
+```
+sbx: warning: `http://localhost:11434` allows a host the cage reaches through no client: localhost,
+     127.0.0.1, ::1 are exempt from the cage's proxy (`no_proxy`, so the agent's own in-cage
+     services stay intra-cage), and only a `tcp://` rule gets an in-cage listener — declare
+     `tcp://<host>:<port>` to reach the service on YOUR loopback
+```
+
+```bash
+sbx test net http://localhost:11434
+# ALLOWED  http://localhost:11434
+#   by allow rule: http://localhost:11434
+#   note: the proxy would allow this, but nothing in the cage asks it …
+```
+
+Write the `tcp://` rule instead. The proxy itself is willing: a client forced onto it
+(`curl --noproxy "" --proxy http://127.0.0.1:18043 http://localhost:11434`) reaches the host's
+service and is inspected normally. Nothing routes to it by default, which is what the report says.
+
 Key properties of a raw splice:
 
 - It **must name a port** (`tcp://host:22`): a raw splice names the port it opens.
