@@ -2182,8 +2182,9 @@ mod smoke {
         tasks: Vec<TaskSpec>,
         project: &Path,
         pool: Option<&Path>,
+        slug: &str,
     ) -> Option<(TaskEngine, TmpDir)> {
-        let (engine, data) = engine_for(tasks, project)?;
+        let (engine, data) = engine_for(tasks, project, slug)?;
         Some(match pool {
             Some(p) => (
                 engine.with_pool(p.to_path_buf(), PathBuf::from("/nonexistent/mise")),
@@ -2194,7 +2195,18 @@ mod smoke {
     }
 
     /// The engine, wired to a real provisioned userland — or `None` to skip.
-    fn engine_for(tasks: Vec<TaskSpec>, project: &Path) -> Option<(TaskEngine, TmpDir)> {
+    ///
+    /// `slug` has to be this test's alone. It names the cage, and from there the systemd scope
+    /// (`sbx-<slug>-task<n>-<pid>.scope`), the cage hostname, and the tool pool. The pid in that
+    /// scope name distinguishes two cages of one project because production launches them from
+    /// separate processes; tests are threads of a single one, so every test here shares that pid
+    /// and only the slug can tell their scopes apart. Sharing it makes `systemd-run` refuse the
+    /// second launch outright on the live unit name, whichever test happens to reach it first.
+    fn engine_for(
+        tasks: Vec<TaskSpec>,
+        project: &Path,
+        slug: &str,
+    ) -> Option<(TaskEngine, TmpDir)> {
         let bwrap = crate::pathfind::find_on_path("bwrap")?;
         if !matches!(crate::probe_userns(), crate::Userns::Ok) {
             return None;
@@ -2244,7 +2256,7 @@ mod smoke {
             project,
             tasks,
             super::super::cgroup::Limits::default(),
-            "smoke",
+            slug,
             None,
             CageForwarder {
                 socat: crate::pathfind::find_on_path("socat")
@@ -2332,9 +2344,11 @@ mod smoke {
                 return;
             }
         };
-        let Some((engine, _data)) =
-            engine_for(vec![echo_task(&shell.to_string_lossy())], project.path())
-        else {
+        let Some((engine, _data)) = engine_for(
+            vec![echo_task(&shell.to_string_lossy())],
+            project.path(),
+            "smoke-declared",
+        ) else {
             eprintln!("skipping task smoke: need bwrap, userns, and nix");
             return;
         };
@@ -2429,7 +2443,7 @@ mod smoke {
         task.stdout = OutputDisposition::Hide;
         task.stderr = OutputDisposition::Show;
 
-        let Some((engine, _data)) = engine_for(vec![task], project.path()) else {
+        let Some((engine, _data)) = engine_for(vec![task], project.path(), "smoke-withheld") else {
             eprintln!("skipping count smoke: need bwrap, userns, and nix");
             return;
         };
@@ -2502,7 +2516,7 @@ mod smoke {
         // Declared and empty: stand the supervisor up, and let the command run nothing further.
         task.spawn = Some(vec![]);
 
-        let Some((engine, _data)) = engine_for(vec![task], project.path()) else {
+        let Some((engine, _data)) = engine_for(vec![task], project.path(), "smoke-refusal") else {
             eprintln!("skipping refusal smoke: need bwrap, userns, and nix");
             return;
         };
@@ -2600,7 +2614,9 @@ mod smoke {
             max_output_from: crate::config::Ceiling::Declared,
         };
 
-        let Some((engine, _data)) = engine_with(vec![spec], project.path(), Some(&pool)) else {
+        let Some((engine, _data)) =
+            engine_with(vec![spec], project.path(), Some(&pool), "smoke-pool")
+        else {
             eprintln!("skipping task pool smoke: need bwrap, userns, and nix");
             return;
         };
@@ -2672,7 +2688,8 @@ mod smoke {
         loud.secrets.clear();
         loud.max_output = 256;
 
-        let Some((engine, _data)) = engine_for(vec![hang, loud], project.path()) else {
+        let Some((engine, _data)) = engine_for(vec![hang, loud], project.path(), "smoke-timeout")
+        else {
             eprintln!("skipping task ceiling smoke: prerequisites absent");
             return;
         };
