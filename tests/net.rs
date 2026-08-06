@@ -94,6 +94,21 @@ impl Fixture {
             .output()
             .expect("spawn sbx")
     }
+
+    /// Same, with no resolvable trust store: a relative `XDG_STATE_HOME` is ignored rather than
+    /// resolved against the cwd, and with `HOME` cleared there is no absolute base left. This is
+    /// the only way to reach the trust-store branch of a `--local` write from the outside.
+    fn run_without_a_trust_store(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .current_dir(self.proj.path())
+            .env("XDG_CONFIG_HOME", self.config_home.path())
+            .env("XDG_STATE_HOME", "relative/state")
+            .env("XDG_DATA_HOME", self.data_home.path())
+            .env_remove("HOME")
+            .output()
+            .expect("spawn sbx")
+    }
 }
 
 #[test]
@@ -379,6 +394,71 @@ fn net_mute_and_unmute_round_trip_through_config() {
         String::from_utf8_lossy(&again.stdout).contains("no change"),
         "a redundant unmute is a reported no-op:\n{}",
         String::from_utf8_lossy(&again.stdout)
+    );
+}
+
+/// The removal path re-trusts only after it actually changed the file. This is the case that makes
+/// the asymmetry observable rather than merely tidy: with no project config at all there is nothing
+/// to re-trust, and re-trusting an absent path fails — which would turn an idempotent no-op into an
+/// operational error. The add path has no equivalent, since it creates the file it then trusts.
+#[test]
+fn a_removal_with_no_project_config_is_a_no_op_that_re_trusts_nothing() {
+    let fx = Fixture::new();
+    let out = fx.run(&["net", "unmute", "play.example.com"]);
+    assert!(
+        out.status.success(),
+        "`sbx net unmute` on a project with no config must not fail:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no change"),
+        "`sbx net unmute` must report the no-op:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("re-trusted"),
+        "`sbx net unmute` changed nothing, so it must not re-trust:\n{stdout}"
+    );
+    assert!(
+        !fx.proj.path().join(".sbx.toml").exists(),
+        "a removal that found nothing must not have created a config"
+    );
+}
+
+/// Every `--local` write is trust-gated, so an unresolvable trust store refuses it before anything
+/// is written -- and the add and removal paths say so in different words, deliberately: the add
+/// path explains the consequence (the rule would be written but never take effect), the removal
+/// path states the fact alone. Nothing else reaches this branch, and the two phrasings are only a
+/// field apart in the shared gate, so pin each to the path that owns it.
+#[test]
+fn an_unresolvable_trust_store_refuses_a_local_write_in_that_path_s_own_words() {
+    let fx = Fixture::new();
+
+    let add = fx.run_without_a_trust_store(&["net", "allow", "api.example.com"]);
+    assert_eq!(add.status.code(), Some(1), "a missing store is operational");
+    let stderr = String::from_utf8_lossy(&add.stderr);
+    assert!(
+        stderr.contains("cannot determine the trust store")
+            && stderr.contains("could not be trusted"),
+        "the add path must explain that the rule would not take effect:\n{stderr}"
+    );
+
+    let remove = fx.run_without_a_trust_store(&["net", "unmute", "api.example.com"]);
+    assert_eq!(
+        remove.status.code(),
+        Some(1),
+        "a missing store is operational"
+    );
+    let stderr = String::from_utf8_lossy(&remove.stderr);
+    assert!(
+        stderr.contains("cannot determine the trust store")
+            && !stderr.contains("could not be trusted"),
+        "the removal path states the fact alone:\n{stderr}"
+    );
+
+    assert!(
+        !fx.proj.path().join(".sbx.toml").exists(),
+        "a refused write must not have touched the config"
     );
 }
 
