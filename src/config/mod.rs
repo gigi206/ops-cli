@@ -1393,10 +1393,7 @@ fn resolve(
             if trusted {
                 nixpkgs_project = validate_nixpkgs(&mut warnings, PROJECT_CONFIG, value);
             } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `nixpkgs` override ({})",
-                    untrusted_reason(state)
-                ));
+                gate.refuse("`nixpkgs` override", &mut warnings);
             }
         }
         // `network` is a security field — a trusted project may change the posture;
@@ -1522,10 +1519,7 @@ fn resolve(
                 mark_limit_origins(&mut limits_origin, &project_limits, Provenance::Project);
                 overlay_limits(&mut limits, project_limits);
             } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `[limits]` ({})",
-                    untrusted_reason(state)
-                ));
+                gate.refuse("`[limits]`", &mut warnings);
             }
         }
         // `[seccomp]` is a security field — a trusted project may relax the denylist; an untrusted
@@ -1540,10 +1534,7 @@ fn resolve(
                 }
                 seccomp.union(&project_seccomp);
             } else {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `[seccomp]` ({})",
-                    untrusted_reason(state)
-                ));
+                gate.refuse("`[seccomp]`", &mut warnings);
             }
         }
         // `[devices]` is a security field — a trusted project may grant a host device; an untrusted
@@ -1614,10 +1605,7 @@ fn resolve(
             } else {
                 let n = count_host_secrets(&section.hosts);
                 if n > 0 {
-                    warnings.push(format!(
-                        "{PROJECT_CONFIG}: ignoring {n} secret(s) ({})",
-                        untrusted_reason(state)
-                    ));
+                    gate.refuse(&format!("{n} secret(s)"), &mut warnings);
                 }
             }
         }
@@ -1645,11 +1633,7 @@ fn resolve(
                     plugins,
                 );
             } else if !section.tasks.is_empty() {
-                warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring {} task(s) ({})",
-                    section.tasks.len(),
-                    untrusted_reason(state)
-                ));
+                gate.refuse(&format!("{} task(s)", section.tasks.len()), &mut warnings);
             }
         }
     }
@@ -2549,15 +2533,17 @@ fn resolve_app(
         // user, in the same place and shape as the `network` one below. Without it, the drop would
         // show only as an app mysteriously short of a tool and an egress rule.
         if !app.uses.is_empty() && !trusted {
-            warnings.push(format!(
-                "{source}: ignoring `use` of bundle(s) {} ({})",
-                app.uses
-                    .iter()
-                    .map(|b| format!("`{b}`"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                untrusted_reason(state)
-            ));
+            gate.refuse(
+                &format!(
+                    "`use` of bundle(s) {}",
+                    app.uses
+                        .iter()
+                        .map(|b| format!("`{b}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                &mut warnings,
+            );
         }
         apply_env(&mut env, None, &mut warnings, &source, app.env, !trusted);
         if !app.binds.is_empty() {
@@ -2687,10 +2673,7 @@ fn resolve_app(
                 mark_limit_origins(&mut limits_origin, &project_limits, Provenance::Project);
                 overlay_limits(&mut limits, project_limits);
             } else {
-                warnings.push(format!(
-                    "{source}: ignoring `[limits]` ({})",
-                    untrusted_reason(state)
-                ));
+                gate.refuse("`[limits]`", &mut warnings);
             }
         }
         // `[seccomp]` mirrors `[limits]`: a trusted project may relax the denylist for its own app
@@ -2705,10 +2688,7 @@ fn resolve_app(
                 }
                 seccomp.union(&project_seccomp);
             } else {
-                warnings.push(format!(
-                    "{source}: ignoring `[seccomp]` ({})",
-                    untrusted_reason(state)
-                ));
+                gate.refuse("`[seccomp]`", &mut warnings);
             }
         }
         // `[devices]` mirrors `[seccomp]`: a trusted project may grant a host device to its own app
@@ -2782,10 +2762,7 @@ fn resolve_app(
             } else {
                 let n = count_host_secrets(&section.hosts);
                 if n > 0 {
-                    warnings.push(format!(
-                        "{source}: ignoring {n} secret(s) ({})",
-                        untrusted_reason(state)
-                    ));
+                    gate.refuse(&format!("{n} secret(s)"), &mut warnings);
                 }
             }
         }
@@ -2807,11 +2784,7 @@ fn resolve_app(
                     plugins,
                 );
             } else if !section.tasks.is_empty() {
-                warnings.push(format!(
-                    "{source}: ignoring {} task(s) ({})",
-                    section.tasks.len(),
-                    untrusted_reason(state)
-                ));
+                gate.refuse(&format!("{} task(s)", section.tasks.len()), &mut warnings);
             }
         }
         if let Some(c) = app.cmd {
@@ -2819,10 +2792,7 @@ fn resolve_app(
                 cmd = c.into_argv();
                 cmd_origin = Provenance::Project;
             } else {
-                warnings.push(format!(
-                    "{source}: ignoring `cmd` override of a trusted app ({})",
-                    untrusted_reason(state)
-                ));
+                gate.refuse("`cmd` override of a trusted app", &mut warnings);
             }
         }
         if let Some(raw) = app.home_scope {
@@ -2835,10 +2805,7 @@ fn resolve_app(
                     home_scope_origin = Some(Provenance::Project);
                 }
             } else {
-                warnings.push(format!(
-                    "{source}: ignoring `home_scope` override of a trusted app ({})",
-                    untrusted_reason(state)
-                ));
+                gate.refuse("`home_scope` override of a trusted app", &mut warnings);
             }
         }
     }
@@ -3113,10 +3080,12 @@ fn apply_packages(
                 .iter()
                 .any(|p| p.name == name && p.state == TrustState::Trusted)
         {
-            warnings.push(format!(
-                "{source}: ignoring package `{name}` override of a trusted app ({})",
-                untrusted_reason(state)
-            ));
+            refuse_untrusted(
+                warnings,
+                source,
+                &format!("package `{name}` override of a trusted app"),
+                state,
+            );
             continue;
         }
         let backend = match parse_backend(&value) {
@@ -3334,10 +3303,12 @@ fn apply_resolvers(
                 .iter()
                 .any(|p| p.name == name && p.state == TrustState::Trusted)
         {
-            warnings.push(format!(
-                "{source}: ignoring {label} resolver `{name}` override of a trusted app ({})",
-                untrusted_reason(state)
-            ));
+            refuse_untrusted(
+                warnings,
+                source,
+                &format!("{label} resolver `{name}` override of a trusted app"),
+                state,
+            );
             continue;
         }
         if raw.resolve.iter().all(|a| a.trim().is_empty()) {
@@ -3385,10 +3356,12 @@ fn apply_flakes(
                 .iter()
                 .any(|p| p.name == name && p.state == TrustState::Trusted)
         {
-            warnings.push(format!(
-                "{source}: ignoring inline flake `{name}` override of a trusted app ({})",
-                untrusted_reason(state)
-            ));
+            refuse_untrusted(
+                warnings,
+                source,
+                &format!("inline flake `{name}` override of a trusted app"),
+                state,
+            );
             continue;
         }
         let content = raw.flake;
@@ -3663,18 +3636,9 @@ struct Gate<'a> {
 }
 
 impl Gate<'_> {
-    /// Refuse a field, naming it and the remedy.
-    ///
-    /// `what` is the whole phrase, passed verbatim by the caller — "`gpu` posture", "`forward`
-    /// ports", "`[devices]`". The nouns differ per field and that is deliberate: this sentence is
-    /// what a user reads, so it is the caller's to spell, never something derived from a field name
-    /// here.
+    /// Refuse a field, naming it and the remedy — [`refuse_untrusted`] for a layer that has a gate.
     fn refuse(&self, what: &str, warnings: &mut Vec<String>) {
-        warnings.push(format!(
-            "{}: ignoring {what} ({})",
-            self.source,
-            untrusted_reason(self.state)
-        ));
+        refuse_untrusted(warnings, self.source, what, self.state);
     }
 
     /// Take `value` outright when the layer is trusted, and record the layer as where it came from.
@@ -3747,6 +3711,29 @@ impl Gate<'_> {
         }
         union(acc, contributed);
     }
+}
+
+/// Refuse something for want of trust: name the layer, what was dropped, and the remedy.
+///
+/// The one place a resolution writes `<layer>: ignoring <what> (<reason>)` — the only thing that
+/// tells anyone a declared field is not in effect. [`Gate::refuse`] is the method form, for the
+/// fields a layer's gate decides. The tool-level guards in the `apply_*` helpers call this directly
+/// instead, because they answer a different question — not whether the layer may set a field, but
+/// whether it may override one a trusted layer already set — and they answer it where the
+/// accumulated set is in hand rather than at the gate.
+///
+/// `what` is the whole phrase, passed verbatim by the caller — "`gpu` posture", "`forward` ports",
+/// "`[devices]`". The nouns differ per field and that is deliberate: this sentence is what a user
+/// reads, so it is the caller's to spell, never something derived from a field name here.
+///
+/// This is not the only producer of a dropped-for-want-of-trust warning — `binds` has a sentence of
+/// its own, and the launcher withholds a package in words of its own again ([`TRUST_DROP_MARKER`]
+/// is what spans them). What is centralized is one sentence, so that changing it is one edit.
+fn refuse_untrusted(warnings: &mut Vec<String>, source: &str, what: &str, state: TrustState) {
+    warnings.push(format!(
+        "{source}: ignoring {what} ({})",
+        untrusted_reason(state)
+    ));
 }
 
 pub(crate) fn untrusted_reason(state: TrustState) -> &'static str {
