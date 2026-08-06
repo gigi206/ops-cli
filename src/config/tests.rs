@@ -7171,6 +7171,22 @@ const EVERY_GATED_FIELD: &str = "nixpkgs = \"nixos-25.05\"\n\
      from = \"env://DEMO_API_KEY\"\nheader = \"x-api-key\"\ntype = \"raw\"\n\
      [task.build]\ncmd = [\"cargo\", \"build\"]\n";
 
+/// The remedy every trust-gated refusal ends on, per trust state.
+///
+/// Spelled out here rather than read back from `untrusted_reason`, which is the code these nets
+/// exist to hold: taking the expected text from the function under test moves both sides of the
+/// comparison together, so the remedy would be pinned by nothing. Rewording it takes two edits, and
+/// that is what makes the second one deliberate. It is not decoration — `is_trust_drop` recognises
+/// a dropped security field by this text, and the launch announces dropped fields through it, so a
+/// refusal that lost it is one nobody is told about.
+const REFUSAL_REASONS: [(TrustState, &str); 2] = [
+    (TrustState::Untrusted, "untrusted — run `sbx trust`"),
+    (
+        TrustState::Changed,
+        "changed since it was trusted — re-run `sbx trust`",
+    ),
+];
+
 /// How each trust-gated field names itself when it is refused, in the order the resolver walks them.
 ///
 /// The nouns are deliberately not uniform — `gpu` has a "posture", `forward` has "ports",
@@ -7200,10 +7216,9 @@ const GATED_REFUSALS: &[&str] = &[
 /// keep every provenance assertion green, and quietly reword — or drop — what the launch says.
 #[test]
 fn every_trust_gated_project_field_names_itself_in_its_refusal() {
-    for state in [TrustState::Untrusted, TrustState::Changed] {
+    for (state, reason) in REFUSAL_REASONS {
         let project: RawConfig = toml::from_str(EVERY_GATED_FIELD).unwrap();
         let r = resolve_no_plugins(RawConfig::default(), Some((project, state)));
-        let reason = super::untrusted_reason(state);
         for what in GATED_REFUSALS {
             let expected = format!("{PROJECT_CONFIG}: ignoring {what} ({reason})");
             assert!(
@@ -7235,10 +7250,10 @@ fn every_trust_gated_app_field_names_itself_in_its_refusal() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    let (state, reason) = REFUSAL_REASONS[0];
     let project: RawConfig = toml::from_str(&toml_src).unwrap();
-    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, state)));
     let app = &r.apps["mine"];
-    let reason = super::untrusted_reason(TrustState::Untrusted);
     for what in GATED_REFUSALS.iter().filter(|w| !w.contains("nixpkgs")) {
         assert!(
             app.warnings
@@ -7296,16 +7311,7 @@ const TRUSTED_OVERRIDE_REFUSALS: &[&str] = &[
 /// a dropped security field by it, so a refusal without it is one the launch stops announcing.
 #[test]
 fn every_untrusted_override_of_a_trusted_app_names_itself_in_its_refusal() {
-    // The remedy is spelled out here rather than read from `untrusted_reason`, which is the code
-    // under test: taking it from there would move both sides of the comparison together and pin
-    // nothing. Rewording it now takes two edits, which is what makes the second one deliberate.
-    for (state, reason) in [
-        (TrustState::Untrusted, "untrusted — run `sbx trust`"),
-        (
-            TrustState::Changed,
-            "changed since it was trusted — re-run `sbx trust`",
-        ),
-    ] {
+    for (state, reason) in REFUSAL_REASONS {
         let global: RawConfig = toml::from_str(TRUSTED_APP).unwrap();
         let project: RawConfig = toml::from_str(OVERRIDING_PROJECT).unwrap();
         let r = resolve_no_plugins(global, Some((project, state)));
