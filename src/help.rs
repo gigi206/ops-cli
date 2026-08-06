@@ -11,6 +11,11 @@
 //! page. The top-level command list and each subcommand listing are both sorted
 //! alphabetically.
 //!
+//! A command a dispatcher accepts under more than one spelling has one page, under its
+//! canonical name; [`ALIASES`] maps the other spellings onto it, so `sbx plugins ls --help`
+//! resolves the same page `sbx plugins list --help` does. Alternate spellings are resolved
+//! but never *offered*: they stay out of the listings and out of completion.
+//!
 //! Option descriptions duplicate knowledge that also lives in each handler's argument
 //! parser — a deliberate, documented maintenance seam (options change rarely, and the
 //! table and the parsers all live next to each other in `main.rs`). The guard test
@@ -367,7 +372,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["proc", "ls"],
-        synopsis: "sbx proc ls [<id>] [--json]",
+        synopsis: "sbx proc ls [<id>] [--json]  (alias: sbx proc list)",
         summary: "snapshot a running session's process tree",
         options: &[
             (
@@ -408,7 +413,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["proc", "logs"],
-        synopsis: "sbx proc logs [<id>] [-f|--follow] [--json]",
+        synopsis: "sbx proc logs [<id>] [-f|--follow] [--json]  (alias: sbx proc log)",
         summary: "the exec-event feed of an observed session",
         options: &[
             (
@@ -650,7 +655,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["fs", "logs"],
-        synopsis: "sbx fs logs [<id>] [-f|--follow] [--json]",
+        synopsis: "sbx fs logs [<id>] [-f|--follow] [--json]  (alias: sbx fs log)",
         summary: "the file-write feed of an observed session",
         options: &[
             (
@@ -698,7 +703,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["ssh-agent", "logs"],
-        synopsis: "sbx ssh-agent logs [<id>] [-f|--follow] [--json]",
+        synopsis: "sbx ssh-agent logs [<id>] [-f|--follow] [--json]  (alias: sbx ssh-agent log)",
         summary: "the signature feed of a session with a granted key",
         options: &[
             (
@@ -742,7 +747,7 @@ const PAGES: &[Page] = &[
             \n\
             Two kinds appear: the wire-injected ones (`[secret.\"host\"]`, brokered into a request by\n\
             the egress proxy, so the value never enters the cage) and the ones a declared operation\n\
-            reads from its environment (`[task.<name>.secret]`).",
+            reads from its environment (`[task.<name>.secret]`). `sbx secrets` is an alias.",
     },
     Page {
         path: &["secret", "list"],
@@ -795,6 +800,8 @@ const PAGES: &[Page] = &[
             invocation *you* started. `--detach` is there too because a detached invocation is only\n\
             reachable through those verbs: a caller that could start one without being able to watch\n\
             or end it would be creating invocations nobody owns, several at once.\n\
+            \n\
+            `sbx tasks` is an alias for the whole namespace.\n\
             \n\
             A task's program must come from a tree no cage can write. Every host-side package backend\n\
             (`nix:`, a remote `flake:`, `deb:`, `appimage:`, `tarball:`) already is one.\n\
@@ -1015,7 +1022,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "logs"],
-        synopsis: "sbx task logs [<invocation>|<operation>] [--session <id>]",
+        synopsis: "sbx task logs [<invocation>|<operation>] [--session <id>]  (alias: sbx task log)",
         summary: "a session's invocation log (host-only)",
         options: &[
             (
@@ -1064,7 +1071,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["session", "ls"],
-        synopsis: "sbx session ls",
+        synopsis: "sbx session ls  (alias: sbx session list)",
         summary: "list the live sandbox sessions",
         options: &[],
         details:
@@ -1077,7 +1084,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["session", "logs"],
-        synopsis: "sbx session logs <id> [-f] [-n <N>] [--all]",
+        synopsis: "sbx session logs <id> [-f] [-n <N>] [--all]  (alias: sbx session log)",
         summary: "show a detached session's output",
         options: &[
             ("<id>", "the PID reported when the session was detached"),
@@ -1660,12 +1667,13 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "list",
-                "list every runtime tree with its state, size, and last-used date (alias: ls)",
+                "list every runtime tree with its state, size, and last-used date (alias: `sbx projects ls`)",
             ),
             ("--json", "with list, emit the trees as a JSON document"),
             (
                 "rm <id>...",
-                "remove one or more named trees; the id is what `sbx projects list` shows. Immediate —\n\
+                "remove one or more named trees (alias: `sbx projects remove`); the id is what\n\
+                 `sbx projects list` shows. Immediate —\n\
                  naming it is consent. A live-held tree is refused (run `sbx session stop` first); the\n\
                  current project is refused without --force.",
             ),
@@ -1701,7 +1709,8 @@ const PAGES: &[Page] = &[
             current project is refused without `--force`.\n\
             \n\
             Removing a tree is host-side only and leaves its store closures for `sbx gc` to\n\
-            reclaim; `--gc` runs that shared-store collection in the same command.",
+            reclaim; `--gc` runs that shared-store collection in the same command. `sbx project` is\n\
+            an alias for the whole namespace.",
     },
     Page {
         path: &["path"],
@@ -2332,7 +2341,7 @@ const PAGES: &[Page] = &[
             "A chronological, per-request record of every egress decision the proxy made this\n\
             session — the session id (the PID `sbx session ls` shows), the local `hh:mm:ss` time, host:port,\n\
             method, path, verdict, and the reason category. It is read from the same control sockets\n\
-            `sbx net pending` uses, and `log` is an accepted alias.\n\
+            `sbx net pending` uses, and `sbx net log` is an accepted alias.\n\
             \n\
             LIVE-ONLY: the log lives in the running session's memory and is NEVER written to disk;\n\
             once the session exits, nothing remains. It shows a session while it runs (watch it\n\
@@ -2682,6 +2691,48 @@ const PAGES: &[Page] = &[
     },
 ];
 
+/// Every alternate spelling a dispatcher accepts: the command path it is read under, the
+/// spelling itself, and the canonical name it stands for. Aliases stay out of [`PAGES`] —
+/// a page per spelling would double every subcommand listing, every completion candidate
+/// and every guard-test iteration — so the table below is what turns a typed alias into
+/// the path help, completion and the option lists are keyed by.
+///
+/// Only subcommand spellings belong here. A flag alias (`--optimise`/`--optimize`) or an
+/// option-value alias (`--source session`/`manual`) names no command path, so it is
+/// documented on the page that accepts it and nothing resolves it.
+const ALIASES: &[(&[&str], &str, &str)] = &[
+    (&[], "project", "projects"),
+    (&[], "secrets", "secret"),
+    (&[], "sessions", "session"),
+    (&[], "tasks", "task"),
+    (&["app"], "ls", "list"),
+    (&["fs"], "log", "logs"),
+    (&["net"], "log", "logs"),
+    (&["plugins"], "ls", "list"),
+    (&["plugins", "store"], "ls", "list"),
+    (&["proc"], "list", "ls"),
+    (&["proc"], "log", "logs"),
+    (&["projects"], "ls", "list"),
+    (&["projects"], "remove", "rm"),
+    (&["secret"], "ls", "list"),
+    (&["session"], "list", "ls"),
+    (&["session"], "log", "logs"),
+    (&["ssh-agent"], "log", "logs"),
+    (&["task"], "log", "logs"),
+    (&["task"], "ls", "list"),
+];
+
+/// The canonical name `tok` stands for under `parent`, or `tok` unchanged when it is not an
+/// alias there. `parent` is itself a canonical path, so a caller that descends a command
+/// tree must canonicalize each level before looking up the next: `sbx sessions list` reaches
+/// `["session", "ls"]` only because `sessions` was folded to `session` first.
+pub fn canonical<'a>(parent: &[&str], tok: &'a str) -> &'a str {
+    ALIASES
+        .iter()
+        .find(|(p, alias, _)| *p == parent && *alias == tok)
+        .map_or(tok, |(_, _, name)| *name)
+}
+
 /// Find the page for an exact command path.
 fn find(path: &[&str]) -> Option<&'static Page> {
     PAGES.iter().find(|p| p.path == path)
@@ -2710,10 +2761,11 @@ pub fn synopsis(name: &str) -> &'static str {
     synopsis_of(&[name])
 }
 
-/// Whether `name` is a dispatched top-level command. Used to keep the help-flag
-/// interception from swallowing an unknown command (which has its own diagnosis).
+/// Whether `name` is a dispatched top-level command, under its own name or an accepted
+/// alias. Used to keep the help-flag interception from swallowing an unknown command (which
+/// has its own diagnosis).
 pub fn is_command(name: &str) -> bool {
-    find(&[name]).is_some()
+    find(&[canonical(&[], name)]).is_some()
 }
 
 /// Whether a full command path is a known command or subcommand, e.g.
@@ -2907,17 +2959,20 @@ pub fn show(path: &[&str]) -> ExitCode {
 /// The deepest command path a help request is about: the command, then each following
 /// non-flag token that extends it to a known subcommand. `sbx plugins store add --help`
 /// resolves to `["plugins","store","add"]`; `sbx session stop --all --help` to `["session","stop"]`.
+/// Every token is read through [`canonical`], so an alias lands on the page of the name it
+/// stands for (`sbx plugins ls --help` on `plugins list`) instead of falling back to the
+/// parent's page.
 fn resolve_path<'a>(cmd: &'a str, rest: &'a [OsString]) -> Vec<&'a str> {
-    let mut path = vec![cmd];
+    let mut path = vec![canonical(&[], cmd)];
     for arg in rest {
         let Some(tok) = arg.to_str() else { break };
         if tok.starts_with('-') {
             break;
         }
         let mut candidate = path.clone();
-        candidate.push(tok);
+        candidate.push(canonical(&path, tok));
         if find(&candidate).is_some() {
-            path.push(tok);
+            path = candidate;
         } else {
             break;
         }
@@ -2942,13 +2997,19 @@ pub fn maybe_help(cmd: &str, rest: &[OsString]) -> Option<ExitCode> {
 }
 
 /// `sbx help [command [subcommand...]]` / `sbx --help` / `sbx -h`: the top-level list, or
-/// the page for the full command path given after the verb.
+/// the page for the full command path given after the verb. Each token is folded to the
+/// canonical name it stands for, against the path resolved so far; a token that names no
+/// command is kept as typed, so an unknown path is reported in the words the user used.
 pub fn dispatch(args: Vec<OsString>) -> ExitCode {
-    let path: Vec<&str> = args
+    let mut path: Vec<&str> = Vec::new();
+    for tok in args
         .iter()
         .map_while(|a| a.to_str())
         .take_while(|t| !t.starts_with('-'))
-        .collect();
+    {
+        let name = canonical(&path, tok);
+        path.push(name);
+    }
     if path.is_empty() {
         let pal = Palette::for_stream(std::io::stdout().is_terminal());
         print!("{}", top_level(&pal));
@@ -3090,22 +3151,273 @@ mod tests {
         assert!(!weird.trim_end().ends_with("\x1b["));
     }
 
+    /// Whether `text` names `phrase` as a whole command rather than as the head of a longer one:
+    /// `sbx task log` must not be considered advertised by a `sbx task logs` sitting in the prose.
+    fn names_command(text: &str, phrase: &str) -> bool {
+        text.match_indices(phrase).any(|(at, _)| {
+            text[at + phrase.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+        })
+    }
+
     #[test]
-    fn every_list_page_advertises_its_ls_alias() {
-        // Every listing verb in the CLI accepts `ls` as well as `list`. A page that does not say
-        // so leaves the alias to be discovered by trial, and — worse — reads as if that surface
-        // were the one exception. This caught exactly that: `plugins` accepted only `list`, while
-        // `secret` and `task` accepted `ls` without ever mentioning it.
-        for page in PAGES {
-            if page.path.last() != Some(&"list") {
-                continue;
-            }
-            let prefix = page.path[..page.path.len() - 1].join(" ");
-            let alias = format!("sbx {prefix} ls");
+    fn the_alias_table_is_well_formed() {
+        for &(parent, alias, name) in ALIASES {
             assert!(
-                page.synopsis.contains(&alias),
-                "{:?}: the synopsis must advertise `{alias}`",
+                is_command_path(parent),
+                "the path {alias:?} is read under, {parent:?}, is not a command"
+            );
+            let mut spelled = parent.to_vec();
+            spelled.push(alias);
+            assert!(
+                find(&spelled).is_none(),
+                "{spelled:?} has a page of its own — an alias must not shadow a command"
+            );
+            assert_ne!(alias, name, "{spelled:?} cannot stand for itself");
+            assert_eq!(
+                canonical(parent, name),
+                name,
+                "{spelled:?} stands for {name:?}, which is itself an alias — aliases must not chain"
+            );
+            assert_eq!(
+                ALIASES
+                    .iter()
+                    .filter(|(p, a, _)| *p == parent && *a == alias)
+                    .count(),
+                1,
+                "{spelled:?} is declared more than once"
+            );
+        }
+    }
+
+    #[test]
+    fn every_alias_is_advertised_on_the_page_that_owns_it() {
+        // An accepted spelling nobody documents is left to be discovered by trial, and — worse —
+        // reads as if the surface it belongs to were the one exception. This caught exactly that:
+        // `plugins` accepted only `list`, while `secret` and `task` accepted `ls` without ever
+        // mentioning it. The page that owns the canonical name carries the mention; a verb with no
+        // page of its own (`sbx projects rm`) is documented on its parent's page, so that is where
+        // its alias is looked for too.
+        for &(parent, alias, name) in ALIASES {
+            let mut canonical_path = parent.to_vec();
+            canonical_path.push(name);
+            let page = find(&canonical_path)
+                .or_else(|| find(parent))
+                .unwrap_or_else(|| panic!("{canonical_path:?} has no page and no parent page"));
+            let mut prose = format!("{}\n{}\n{}", page.synopsis, page.summary, page.details);
+            for (flag, desc) in page.options {
+                prose.push_str(&format!("\n{flag}\n{desc}"));
+            }
+            let spelled = format!(
+                "sbx {}",
+                parent
+                    .iter()
+                    .copied()
+                    .chain([alias])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert!(
+                names_command(&prose, &spelled),
+                "{:?}: the page must advertise `{spelled}`",
                 page.path
+            );
+        }
+    }
+
+    #[test]
+    fn an_alias_resolves_to_the_page_of_the_name_it_stands_for() {
+        fn v(args: &[&str]) -> Vec<OsString> {
+            args.iter().map(OsString::from).collect()
+        }
+        assert_eq!(resolve_path("plugins", &v(&["ls"])), ["plugins", "list"]);
+        assert_eq!(
+            resolve_path("plugins", &v(&["store", "ls"])),
+            ["plugins", "store", "list"]
+        );
+        assert_eq!(resolve_path("sessions", &v(&[])), ["session"]);
+        // An alias below an alias: each level is folded before the next is looked up, so the
+        // subcommand is read under `session` rather than under the `sessions` the user typed.
+        assert_eq!(resolve_path("sessions", &v(&["list"])), ["session", "ls"]);
+        assert_eq!(resolve_path("tasks", &v(&["log"])), ["task", "logs"]);
+        // A canonical name is untouched, and an unknown token still stops the descent at the
+        // deepest page that exists.
+        assert_eq!(
+            resolve_path("plugins", &v(&["store", "add"])),
+            ["plugins", "store", "add"]
+        );
+        assert_eq!(resolve_path("plugins", &v(&["bogus"])), ["plugins"]);
+        // A top-level alias is a command, so the help flag is intercepted before dispatch.
+        assert!(is_command("sessions"));
+        assert!(!is_command("bogus"));
+    }
+
+    /// The subcommand spellings one match arm accepts: the string literals left of its `=>`,
+    /// flags dropped. `Some("list") | Some("ls") =>` and `Some("list" | "ls") =>` both yield
+    /// `["list", "ls"]`; an arm that accepts one name yields one, and carries no alias.
+    fn arm_names(line: &str) -> Vec<&str> {
+        let Some((head, _)) = line.split_once("=>") else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        let mut rest = head;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { break };
+            names.push(&after[..close]);
+            rest = &after[close + 1..];
+        }
+        names.retain(|n| !n.starts_with('-'));
+        names
+    }
+
+    /// Where every dispatcher lives and what it dispatches below: the source file, the function,
+    /// and the command path its match arms are subcommands of. One file may hold two (`plugins`,
+    /// and the `store` namespace under it). A dispatcher missing from this list is not silently
+    /// unchecked — an alias arm found outside every listed function fails the scan.
+    const DISPATCHERS: &[(&str, &str, &[&str])] = &[
+        ("mod.rs", "dispatch", &[]),
+        ("app.rs", "app_cmd", &["app"]),
+        ("fs.rs", "fs_cmd", &["fs"]),
+        ("net.rs", "net_cmd", &["net"]),
+        ("plugins.rs", "plugins_cmd", &["plugins"]),
+        ("plugins.rs", "plugins_store", &["plugins", "store"]),
+        ("proc.rs", "proc_cmd", &["proc"]),
+        ("projects.rs", "projects_cmd", &["projects"]),
+        ("secret.rs", "secret_cmd", &["secret"]),
+        ("session.rs", "session_cmd", &["session"]),
+        ("sshagent.rs", "ssh_agent_cmd", &["ssh-agent"]),
+        ("task.rs", "task_cmd", &["task"]),
+    ];
+
+    /// The half-open line range a top-level `fn` occupies in `text`: its signature through the
+    /// closing brace in column 0.
+    /// A range must end at that brace, not run to the end of the file: an unterminated one would
+    /// swallow the arms of every function below it, which turns a real mismatch into a pass.
+    fn body_lines(text: &str, func: &str) -> std::ops::Range<usize> {
+        let lines: Vec<&str> = text.lines().collect();
+        let signature = format!("fn {func}(");
+        let start = lines
+            .iter()
+            .position(|l| {
+                l.starts_with(&signature) || l.starts_with(&format!("pub(crate) {signature}"))
+            })
+            .unwrap_or_else(|| panic!("no `fn {func}` in the dispatcher sources"));
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|at| start + at)
+            .unwrap_or_else(|| panic!("`fn {func}` has no closing brace in column 0"));
+        start..end
+    }
+
+    /// Every pair of spellings the dispatchers accept for one verb, read out of their sources:
+    /// `(parent path, first spelling, second spelling, where it was read)`.
+    ///
+    /// Two shapes carry a subcommand alias. A namespace dispatcher matches an `Option<&str>`, so
+    /// its arms are recognized by the `Some(` before the `=>` — which also keeps the scan off the
+    /// arms that map an *option value* (`--source session|manual`). The top-level dispatcher
+    /// matches a plain `&str`, so its arms are read without that marker, from its function alone.
+    ///
+    /// A text scan is a net, not a proof: an alias spelled some third way would slip past it. It
+    /// holds the shapes the code actually uses, and fails the moment one of them grows a spelling
+    /// the table does not know.
+    fn dispatched_alias_pairs() -> Vec<(&'static [&'static str], String, String, String)> {
+        let cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
+        let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir(&cli)
+            .expect("the dispatcher sources are readable")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        sources.sort();
+
+        let mut pairs = Vec::new();
+        for source in sources {
+            let file = source.file_name().unwrap().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&source).expect("a dispatcher source is readable");
+            let dispatchers: Vec<(&[&str], std::ops::Range<usize>)> = DISPATCHERS
+                .iter()
+                .filter(|(f, _, _)| *f == file)
+                .map(|(_, func, parent)| (*parent, body_lines(&text, func)))
+                .collect();
+            // Two dispatchers in one file must not overlap: a range that reached into the next
+            // function would read its arms under the wrong parent, and a mismatch would pass.
+            for (i, (parent, body)) in dispatchers.iter().enumerate() {
+                for (other, next) in &dispatchers[i + 1..] {
+                    assert!(
+                        body.end <= next.start || next.end <= body.start,
+                        "in {file}, the bodies read for {parent:?} and {other:?} overlap"
+                    );
+                }
+            }
+
+            for (i, line) in text.lines().enumerate() {
+                let within = dispatchers.iter().find(|(_, body)| body.contains(&i));
+                // Outside a known dispatcher only the `Some(...)` shape is read, so an arm that
+                // maps an option value to a variant is not mistaken for a subcommand alias.
+                let marked = line
+                    .split_once("=>")
+                    .is_some_and(|(head, _)| head.contains("Some("));
+                if within.is_none() && !marked {
+                    continue;
+                }
+                let names = arm_names(line);
+                let Some(first) = names.first() else { continue };
+                let parent = match within {
+                    Some((parent, _)) => *parent,
+                    None => {
+                        assert!(
+                            names.len() < 2,
+                            "src/cli/{file}:{} dispatches {names:?} from outside every function \
+                             DISPATCHERS lists — add it, so its aliases are checked too",
+                            i + 1
+                        );
+                        continue;
+                    }
+                };
+                for other in names.iter().skip(1) {
+                    pairs.push((
+                        parent,
+                        (*first).to_string(),
+                        (*other).to_string(),
+                        format!("src/cli/{file}:{}", i + 1),
+                    ));
+                }
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn every_dispatched_alias_is_declared_in_the_table() {
+        // The dispatchers own what they accept; this table owns what help, completion and the
+        // option lists resolve. A spelling in one and not the other is a verb that runs but whose
+        // `--help` lands on its parent's page — the bug this table was written for. Both
+        // directions are checked: an undeclared alias resolves to nothing, and a declared one no
+        // dispatcher accepts documents a verb that refuses to run.
+        let pairs = dispatched_alias_pairs();
+        assert!(
+            pairs.len() >= 19,
+            "the scan found only {} alias arms — its shapes no longer match the dispatchers",
+            pairs.len()
+        );
+        for (parent, a, b, at) in &pairs {
+            let declared = ALIASES.iter().any(|(p, alias, name)| {
+                p == parent && ((alias == a && name == b) || (alias == b && name == a))
+            });
+            assert!(
+                declared,
+                "{at} accepts both {a:?} and {b:?} under {parent:?}, which ALIASES does not declare"
+            );
+        }
+        for &(parent, alias, name) in ALIASES {
+            assert!(
+                pairs.iter().any(|(p, a, b, _)| *p == parent
+                    && ((a == alias && b == name) || (a == name && b == alias))),
+                "no dispatcher accepts {alias:?} for {name:?} under {parent:?}"
             );
         }
     }

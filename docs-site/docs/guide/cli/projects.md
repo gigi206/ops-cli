@@ -20,7 +20,8 @@ See also: [`sbx gc`](gc) · [`sbx path`](path) · [Garbage collection](../concep
 
 Lists every runtime tree with its id, state, on-disk size, last-used date, and
 recorded project path, richer than [`sbx path`](path)'s `projects/` section, which omits
-the size. The tree of the directory you are in is marked `*`.
+the size. The tree of the directory you are in is marked `*`. `sbx projects ls` is an
+accepted alias.
 
 Each tree's **state**:
 
@@ -52,6 +53,8 @@ Read-only (no sandbox, no nix, no network). `--json` emits the same model. For a
 than a tree, see [`sbx app show`](app).
 
 ## `rm`
+
+`sbx projects remove` is an accepted alias.
 
 | Option | Meaning |
 |---|---|

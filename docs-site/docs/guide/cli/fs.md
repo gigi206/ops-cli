@@ -23,7 +23,7 @@ sbx fs logs [<id>] [-f|--follow] [--json]
 ```
 
 The **file-write feed**, each change the agent makes in its project tree, in order, stamped with
-the time it was seen. The change kinds are:
+the time it was seen. `sbx fs log` is an accepted alias. The change kinds are:
 
 | Kind | Meaning |
 |---|---|

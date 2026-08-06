@@ -20,7 +20,8 @@ See also: [The four lenses](../concepts/observability#the-four-lenses) · [`[ssh
 sbx ssh-agent logs [<id>] [-f|--follow] [--json]
 ```
 
-One line per decision the broker made, in order, stamped with the time it was made:
+One line per decision the broker made, in order, stamped with the time it was made.
+`sbx ssh-agent log` is an accepted alias.
 
 | Kind | Meaning |
 |---|---|

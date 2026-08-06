@@ -39,6 +39,7 @@ sbx proc ls [<id>] [--json]
 Snapshot the process tree of a running session. The launcher process (or bubblewrap itself
 on the [`sbx run`](run) exec path) is the root, and every process the agent spawned is one of
 its descendants in host pid-space, so a plain `/proc` walk from that root shows the whole tree.
+`sbx proc list` is an accepted alias.
 
 | Operand / option | Meaning |
 |---|---|
@@ -101,7 +102,7 @@ with the time it was first seen. Where `ls`/`live` snapshot the *current* tree o
 `logs` reads a recorded event stream, so the session must have been launched with **observation
 on**: [`sbx run --observe`](run#observing-a-run---observe) or
 [`sbx app run <name> --observe`](app). A session without it is reported as *unobserved*, not
-shown empty.
+shown empty. `sbx proc log` is an accepted alias.
 
 | Operand / option | Meaning |
 |---|---|

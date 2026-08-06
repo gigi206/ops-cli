@@ -20,7 +20,7 @@ See also: [The four lenses](../concepts/observability#the-four-lenses) · [Netwo
 | [`mute`](#sbx-net-mute) / [`unmute`](#sbx-net-unallow-undeny-and-unmute) | add / remove a log-suppression (`dontaudit`) rule |
 | [`pending`](#sbx-net-pending) | list and answer `ask`-mode parked requests |
 | [`stats`](#sbx-net-stats) | per-host allow/deny/blocked decision counters |
-| [`logs`](#sbx-net-logs) | the live, per-request egress log of a running session |
+| [`logs`](#sbx-net-logs) (alias `log`) | the live, per-request egress log of a running session |
 | [`live`](#sbx-net-live) | a live view of the egress tunnels currently open (a `top` for connections) |
 
 ## `sbx net rules`

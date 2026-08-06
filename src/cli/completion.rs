@@ -96,7 +96,10 @@ fn candidates(words: &[String]) -> Vec<(String, &'static str)> {
     }
 
     // The deepest known command path the words name. A leading `help` is transparent, so
-    // `sbx help plugins store` offers the same subcommands as `sbx plugins store`.
+    // `sbx help plugins store` offers the same subcommands as `sbx plugins store`. A word
+    // that is an accepted alias descends through the name it stands for, so `sbx plugins ls`
+    // offers what `sbx plugins list` offers; only canonical names are ever *offered*, since
+    // a menu holding both spellings of one verb would read as two verbs.
     let mut path: Vec<&str> = Vec::new();
     let mut via_help = false;
     for word in before {
@@ -108,7 +111,7 @@ fn candidates(words: &[String]) -> Vec<(String, &'static str)> {
             continue;
         }
         let mut deeper = path.clone();
-        deeper.push(word);
+        deeper.push(help::canonical(&path, word));
         if help::is_command_path(&deeper) {
             path = deeper;
         } else {
@@ -352,6 +355,26 @@ mod tests {
         // A prefix immediately after `help` filters that list rather than falling through:
         // the skip fires on the first non-flag word, so nothing is consumed as a path token.
         assert_eq!(names(&["help", "comp"]), ["completion"]);
+    }
+
+    #[test]
+    fn an_alias_completes_what_the_name_it_stands_for_completes() {
+        // A typed alias descends through the name it stands for, so the words after it are
+        // completed from that page: `sbx session log` offers `session logs`' flags rather than
+        // the namespace's. This holds at every level, including an alias under an alias.
+        assert_eq!(names(&["session", "logs", "--al"]), ["--all"]);
+        assert_eq!(names(&["session", "log", "--al"]), ["--all"]);
+        assert_eq!(names(&["sessions", "log", "--al"]), ["--all"]);
+        assert!(names(&["task", "ls", "-"]).contains(&"--session".to_string()));
+        assert_eq!(
+            names(&["plugins", "ls", "-"]),
+            names(&["plugins", "list", "-"])
+        );
+        // Only canonical names are offered: a menu holding both spellings of one verb would
+        // read as two verbs.
+        let plugins = names(&["plugins", ""]);
+        assert!(plugins.contains(&"list".to_string()));
+        assert!(!plugins.contains(&"ls".to_string()));
     }
 
     #[test]

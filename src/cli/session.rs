@@ -13,9 +13,9 @@ use crate::{diag, format_age, help, sandbox, session, store, style, uptime_secon
 /// `sbx session <subcommand>` (alias `sbx sessions`): the namespace grouping every operation on a
 /// live sandbox session — `ls` lists them, `attach` runs a shell or a command inside one, `stop`
 /// ends them.
-/// A leading `--help` (at any depth) is intercepted by [`help::maybe_help`], which also covers the
-/// `sessions` alias that the top-level help interception does not reach. A bare `sbx session` prints
-/// the namespace page; an unknown subcommand is a usage error.
+/// A `--help` at any depth is intercepted by [`help::maybe_help`], which resolves the deepest
+/// subcommand named — under its own name or an accepted alias — and shows that page. A bare
+/// `sbx session` prints the namespace page; an unknown subcommand is a usage error.
 pub(crate) fn session_cmd(args: Vec<OsString>) -> ExitCode {
     if let Some(code) = help::maybe_help("session", &args) {
         return code;

@@ -86,7 +86,7 @@ sbx task list [<operation>] [--session <id>]
 ```
 
 One row per operation. The line above the table says which session answered and what project it runs
-in: with two sessions open, the rows alone cannot tell you.
+in: with two sessions open, the rows alone cannot tell you. `sbx task ls` is an accepted alias.
 
 ```
 $ sbx task list
@@ -474,7 +474,7 @@ sbx task logs [<invocation>|<operation>] [--session <id>]
 ```
 
 The session's invocation log, **host-only**, because the recorded party does not get to read the
-record.
+record. `sbx task log` is an accepted alias.
 
 ```
 $ sbx task logs

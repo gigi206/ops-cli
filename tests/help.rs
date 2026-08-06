@@ -168,6 +168,125 @@ fn every_command_and_verb_has_a_page() {
     }
 }
 
+/// Every alternate spelling the dispatchers accept: the words a user types, the canonical path
+/// they stand for, and the page header that must come back. Written out here rather than derived
+/// from the binary's own alias table, so a wrong entry there fails this test instead of agreeing
+/// with it.
+const ALIASES: &[(&[&str], &[&str], &str)] = &[
+    (&["project"], &["projects"], "sbx projects —"),
+    (&["secrets"], &["secret"], "sbx secret —"),
+    (&["sessions"], &["session"], "sbx session —"),
+    (&["tasks"], &["task"], "sbx task —"),
+    (&["app", "ls"], &["app", "list"], "sbx app list —"),
+    (&["fs", "log"], &["fs", "logs"], "sbx fs logs —"),
+    (&["net", "log"], &["net", "logs"], "sbx net logs —"),
+    (
+        &["plugins", "ls"],
+        &["plugins", "list"],
+        "sbx plugins list —",
+    ),
+    (
+        &["plugins", "store", "ls"],
+        &["plugins", "store", "list"],
+        "sbx plugins store list —",
+    ),
+    (&["proc", "list"], &["proc", "ls"], "sbx proc ls —"),
+    (&["proc", "log"], &["proc", "logs"], "sbx proc logs —"),
+    (&["secret", "ls"], &["secret", "list"], "sbx secret list —"),
+    (&["session", "list"], &["session", "ls"], "sbx session ls —"),
+    (
+        &["session", "log"],
+        &["session", "logs"],
+        "sbx session logs —",
+    ),
+    (
+        &["ssh-agent", "log"],
+        &["ssh-agent", "logs"],
+        "sbx ssh-agent logs —",
+    ),
+    (&["task", "ls"], &["task", "list"], "sbx task list —"),
+    (&["task", "log"], &["task", "logs"], "sbx task logs —"),
+    // An alias below an alias: the namespace is folded before its subcommand is read.
+    (
+        &["sessions", "list"],
+        &["session", "ls"],
+        "sbx session ls —",
+    ),
+    // A verb documented on its parent's page rather than one of its own: the alias must land
+    // exactly where the canonical spelling lands, which is that parent page.
+    (&["projects", "ls"], &["projects", "list"], "sbx projects —"),
+    (
+        &["projects", "remove"],
+        &["projects", "rm"],
+        "sbx projects —",
+    ),
+];
+
+#[test]
+fn an_alias_shows_the_page_of_the_verb_it_stands_for() {
+    // `sbx plugins ls -h` used to print the `plugins` namespace page: the help resolver knew only
+    // canonical names, so an alias stopped the descent and fell back to the parent. Every accepted
+    // spelling must reach the page of the verb it runs.
+    for (alias, _, header) in ALIASES {
+        for flag in ["--help", "-h"] {
+            let mut words = alias.to_vec();
+            words.push(flag);
+            let out = sbx(&words);
+            assert!(out.status.success(), "`sbx {words:?}` should exit 0");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(header),
+                "`sbx {words:?}` did not render `{header}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_alias_is_indistinguishable_from_the_name_it_stands_for() {
+    // The stronger property, and the one that covers `sbx help <path>` as well as the help flag:
+    // typing an alias produces byte-for-byte what typing the canonical name produces — including
+    // when that is a usage error (a verb with no page of its own answers the same way under both
+    // spellings).
+    // The two ways a page is asked for: a trailing help flag, and the `help` verb.
+    fn invocation(path: &[&'static str], via_help_verb: bool) -> Vec<&'static str> {
+        let mut words: Vec<&'static str> = if via_help_verb {
+            vec!["help"]
+        } else {
+            Vec::new()
+        };
+        words.extend_from_slice(path);
+        if !via_help_verb {
+            words.push("--help");
+        }
+        words
+    }
+
+    for (alias, canonical, _) in ALIASES {
+        for via_help_verb in [false, true] {
+            let (typed, meant) = (
+                invocation(alias, via_help_verb),
+                invocation(canonical, via_help_verb),
+            );
+            let (a, b) = (sbx(&typed), sbx(&meant));
+            assert_eq!(
+                a.status.code(),
+                b.status.code(),
+                "`sbx {typed:?}` and `sbx {meant:?}` disagree on the exit code"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&a.stdout),
+                String::from_utf8_lossy(&b.stdout),
+                "`sbx {typed:?}` and `sbx {meant:?}` print different pages"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&a.stderr),
+                String::from_utf8_lossy(&b.stderr),
+                "`sbx {typed:?}` and `sbx {meant:?}` print different diagnostics"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_subcommand_help_details_its_options() {
     // `sbx app import --help` must reach the import page (not the parent app page) and list its

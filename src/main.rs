@@ -55,7 +55,7 @@ fn main() -> ExitCode {
     // names (so `sbx plugins store add --help` lands on that page). `run` (which forwards
     // `--help` after a `--`) and `mise` (a passthrough) handle a leading help flag
     // themselves; an *unknown* command is left to the dispatch below, which names it.
-    if help::is_command(name) && !matches!(name, "run" | "mise") {
+    if help::is_command(name) && !matches!(help::canonical(&[], name), "run" | "mise") {
         if let Some(code) = help::maybe_help(name, &rest) {
             return code;
         }

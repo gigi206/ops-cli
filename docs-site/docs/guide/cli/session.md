@@ -24,7 +24,7 @@ sbx session ls
 List the live sandbox sessions from the on-disk registry. Reading the registry
 **re-validates and prunes dead records**, so the list is always current: a crashed or
 killed session self-heals rather than lingering. An app session shows its app name, so you
-can tell which sessions are agents.
+can tell which sessions are agents. `sbx session list` is an accepted alias.
 
 Sessions are created by [`sbx run --detach`](run), [`sbx app run --detach`](app), and
 interactive [`sbx run`](run) / [`sbx app`](app) launches. The registry is
@@ -57,7 +57,7 @@ sbx session logs <id> [-f] [-n <N>] [--all]
 Show a **detached** session's output. A session started with `--detach` has no terminal, so
 its stdout and stderr are redirected to `<data>/logs/<id>.log`; this reads that file back. A
 foreground session has no log, its output is on the terminal that started it, and the
-[`MODE` column](#ls) says which is which.
+[`MODE` column](#ls) says which is which. `sbx session log` is an accepted alias.
 
 | Operand / flag | Meaning |
 |---|---|
