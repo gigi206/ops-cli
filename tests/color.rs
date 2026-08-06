@@ -181,8 +181,24 @@ fn transactional_confirmations_are_plain_when_captured() {
     assert!(removed.status.success(), "app rm must succeed");
     assert_no_ansi(&removed, "app rm");
 
-    // plugins: install one of the repository's own plugin directories (no network), then remove it.
-    let plugin_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/vault");
+    // plugins: install a plugin directory (no network), then remove it. The directory is built
+    // here rather than taken from the repository, so this stays a color assertion and cannot be
+    // broken again by a plugin moving out of the tree.
+    let plugin_dir = cwd.path().join("demo-resolver");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(
+        plugin_dir.join("plugin.toml"),
+        "name = \"demo-resolver\"\ntype = \"resolver\"\nscheme = \"demo-resolver\"\n\
+         exec = \"resolve\"\nversion = \"0.1.0\"\ndescription = \"a test resolver\"\n",
+    )
+    .unwrap();
+    let exec = plugin_dir.join("resolve");
+    std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     let pinstall = run(
         &["plugins", "install", plugin_dir.to_str().unwrap()],
         home.path(),
@@ -193,11 +209,11 @@ fn transactional_confirmations_are_plain_when_captured() {
         "plugin install must succeed:\n{}",
         String::from_utf8_lossy(&pinstall.stderr)
     );
-    assert_no_ansi(&pinstall, "plugins install vault");
+    assert_no_ansi(&pinstall, "plugins install demo-resolver");
 
-    let prm = run(&["plugins", "rm", "vault"], home.path(), cwd.path());
+    let prm = run(&["plugins", "rm", "demo-resolver"], home.path(), cwd.path());
     assert!(prm.status.success(), "plugin rm must succeed");
-    assert_no_ansi(&prm, "plugins rm vault");
+    assert_no_ansi(&prm, "plugins rm demo-resolver");
 
     // plugins store update with nothing configured: the dimmed "no stores" message. Exit status
     // depends on whether git is on PATH (host-dependent), so only the no-ANSI invariant is pinned.

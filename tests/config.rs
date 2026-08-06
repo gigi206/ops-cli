@@ -1800,6 +1800,15 @@ fn plugins_info_explains_a_dropped_conflicting_scheme() {
 #[test]
 fn plugins_install_then_list_then_remove_through_the_binary() {
     let fx = Fixture::new();
+
+    // Nothing installed and no store configured — both stated rather than left blank, so the
+    // `(none)` this test ends on is a transition and not a binary that always says it.
+    let out = fx.run(&["plugins", "list"]);
+    assert!(out.status.success(), "list must succeed");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("installed resolver plugins: (none)"));
+    let out = fx.run(&["plugins", "store", "list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("configured plugin stores: (none)"));
+
     // a source plugin whose manifest name differs from its directory name
     let source = fx.source_plugin(
         "checkout",
@@ -1826,6 +1835,12 @@ fn plugins_install_then_list_then_remove_through_the_binary() {
     assert!(
         stdout.contains("pass://") && stdout.contains("read from the pass store"),
         "the installed plugin must be listed:\n{stdout}"
+    );
+    // Where it came from, too: an installed plugin is byte-identical whatever its source, so the
+    // recorded provenance is the only thing that can tell a reader which directory to go edit.
+    assert!(
+        stdout.contains(&format!("from: local directory {source}")),
+        "the listing must name the directory it was installed from:\n{stdout}"
     );
     assert!(
         stdout.contains("remove one with: sbx plugins rm <name>"),
@@ -1883,46 +1898,6 @@ fn plugins_install_refuses_a_colliding_scheme_through_the_binary() {
     let info = fx.run(&["plugins", "info", "vault"]);
     assert!(info.status.success(), "the original must still resolve");
     assert!(String::from_utf8_lossy(&info.stdout).contains("resolver plugin: alpha"));
-}
-
-#[test]
-fn plugins_install_from_a_directory_then_remove() {
-    let fx = Fixture::new();
-
-    // Nothing installed, and no store configured — both stated rather than left blank.
-    let out = fx.run(&["plugins", "list"]);
-    assert!(out.status.success(), "list must succeed");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("installed resolver plugins: (none)"));
-    let out = fx.run(&["plugins", "store", "list"]);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("configured plugin stores: (none)"));
-
-    // The repository's own `vault` plugin: it declares no allow_paths, so the install needs no
-    // environment beyond the redirected data dir.
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/vault");
-    let out = fx.run(&["plugins", "install", source.to_str().unwrap()]);
-    assert!(
-        out.status.success(),
-        "installing a plugin directory must succeed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("installed 'vault'"));
-
-    // It resolves, and the listing names where it came from.
-    let out = fx.run(&["plugins", "list"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("vault://"), "{stdout}");
-    assert!(
-        stdout.contains(&format!("from: local directory {}", source.display())),
-        "{stdout}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("warning"),
-        "a fresh install must load cleanly"
-    );
-
-    assert!(fx.run(&["plugins", "rm", "vault"]).status.success());
-    let out = fx.run(&["plugins", "list"]);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("installed resolver plugins: (none)"));
 }
 
 #[test]
