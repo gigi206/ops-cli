@@ -7251,6 +7251,91 @@ fn every_trust_gated_app_field_names_itself_in_its_refusal() {
     }
 }
 
+/// A trusted app, declaring one facet of every kind an untrusted layer may not override.
+const TRUSTED_APP: &str = "\
+     [bundle.demo-bundle]\n\
+     packages = { bundled-tool = \"mise:aqua:example/bundled-tool\" }\n\
+     [app.demo-app]\n\
+     cmd = \"demo-app\"\nhome_scope = \"project\"\n\
+     [app.demo-app.packages]\n\
+     demo-tool = \"mise:aqua:example/demo-tool\"\n\
+     demo-flake = \"nix:jq\"\ndemo-tar = \"nix:jq\"\n";
+
+/// An untrusted project reaching for every one of them at once, by the app's own name.
+const OVERRIDING_PROJECT: &str = "\
+     [app.demo-app]\n\
+     use = [\"demo-bundle\"]\ncmd = \"evil\"\nhome_scope = \"global\"\n\
+     [app.demo-app.packages]\n\
+     demo-tool = \"mise:aqua:attacker/x\"\ndemo-tar = \"tarball:resolve\"\n\
+     [app.demo-app.flakes.demo-flake]\n\
+     flake = \"{ outputs = _: {}; }\"\n\
+     [app.demo-app.tarball.demo-tar]\n\
+     resolve = [\"echo\", \"https://example.com/x.tar.gz\"]\n";
+
+/// How each facet of a trusted app names itself when an untrusted layer tries to override it.
+///
+/// A different gate from [`GATED_REFUSALS`]: those fields are refused because the layer declaring
+/// them is untrusted, and that alone. These are refused because the layer is untrusted **and** a
+/// trusted layer already supplied that facet — an untrusted project may still declare its own app's
+/// command, tools and home scope, so the refusal has to say it is the *override* being dropped.
+const TRUSTED_OVERRIDE_REFUSALS: &[&str] = &[
+    "`use` of bundle(s) `demo-bundle`",
+    "package `demo-tool` override of a trusted app",
+    "inline flake `demo-flake` override of a trusted app",
+    "tarball resolver `demo-tar` override of a trusted app",
+    "`cmd` override of a trusted app",
+    "`home_scope` override of a trusted app",
+];
+
+/// Every refused override of a trusted app says what it dropped and how to apply it, verbatim.
+///
+/// These refusals are the integrity guard's only user-visible output, and each one is written by
+/// hand at its own site rather than by the layer's gate — so a reworded or truncated one would
+/// compile, leave the behavioural assertions on `cmd`, `packages` and `home_scope` green, and
+/// change what the user is told. Losing the remedy costs more than wording: [`is_trust_drop`] finds
+/// a dropped security field by it, so a refusal without it is one the launch stops announcing.
+#[test]
+fn every_untrusted_override_of_a_trusted_app_names_itself_in_its_refusal() {
+    // The remedy is spelled out here rather than read from `untrusted_reason`, which is the code
+    // under test: taking it from there would move both sides of the comparison together and pin
+    // nothing. Rewording it now takes two edits, which is what makes the second one deliberate.
+    for (state, reason) in [
+        (TrustState::Untrusted, "untrusted — run `sbx trust`"),
+        (
+            TrustState::Changed,
+            "changed since it was trusted — re-run `sbx trust`",
+        ),
+    ] {
+        let global: RawConfig = toml::from_str(TRUSTED_APP).unwrap();
+        let project: RawConfig = toml::from_str(OVERRIDING_PROJECT).unwrap();
+        let r = resolve_no_plugins(global, Some((project, state)));
+        let app = &r.apps["demo-app"];
+        let source = super::app_source(PROJECT_CONFIG, "demo-app");
+        for what in TRUSTED_OVERRIDE_REFUSALS {
+            let expected = format!("{source}: ignoring {what} ({reason})");
+            assert!(
+                app.warnings.contains(&expected),
+                "{state:?}: expected exactly {expected:?}\ngot {:#?}",
+                app.warnings
+            );
+        }
+        // And nothing besides: a facet gated later has to be named above, where the whole refused
+        // surface reads at once. This is the half that catches a *new* site written its own way.
+        assert_eq!(
+            app.warnings.len(),
+            TRUSTED_OVERRIDE_REFUSALS.len(),
+            "{state:?}: an unlisted refusal appeared\n{:#?}",
+            app.warnings
+        );
+        for w in &app.warnings {
+            assert!(
+                super::is_trust_drop(w),
+                "{state:?}: the launch would not announce this drop: {w}"
+            );
+        }
+    }
+}
+
 /// Every trust-gated field lands in its own slot, stamps its own provenance, and moves nothing else.
 ///
 /// A gated field is wired by naming a value slot and a provenance slot side by side. Naming a
