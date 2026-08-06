@@ -151,6 +151,9 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
 /// The removal verb and the rule noun for one process/exec list: `sbx proc unallow` takes an `allow`
 /// rule back out, `undeny` a `deny`. One spelling, so the usage errors, the help lookup and the
 /// confirmation sentence cannot drift from the verb the user actually typed.
+///
+/// Its egress twin is `cli::net::removal_words`, deliberately a separate function: the two match
+/// over unrelated enums, and a trait to share five lines would cost more than it saves.
 fn removal_words(list: config::manage::ProcList) -> (&'static str, &'static str) {
     match list {
         config::manage::ProcList::Allow => ("unallow", "allow"),

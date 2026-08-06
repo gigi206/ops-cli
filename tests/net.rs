@@ -452,9 +452,11 @@ fn net_unallow_and_undeny_round_trip_through_config() {
     // An emptied list is dropped, not left as `allow = []`. This is the one visible difference from
     // `sbx config rm`, which keeps the empty list on purpose, so it is documented and pinned rather
     // than left to be discovered in a config file.
+    // Matched as `<key> =`, not as a bare word: `deny` alone would also match a `mode = "deny"`
+    // posture, so the assertion would pass for a reason that has nothing to do with the key.
     let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
     assert!(
-        !body.contains("allow") && !body.contains("deny ="),
+        !body.contains("allow =") && !body.contains("deny ="),
         "an emptied rule list must leave no residue behind:\n{body}"
     );
     assert!(

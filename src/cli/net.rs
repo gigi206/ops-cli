@@ -3362,6 +3362,9 @@ fn net_pending_drain_and_save(
 /// The removal verb and the rule noun for one egress list: `sbx net unallow` takes an `allow` rule
 /// back out, `undeny` a `deny`, `unmute` a `mute`. One spelling for all of it, so the usage errors,
 /// the help lookup and the confirmation sentence cannot drift from the verb the user actually typed.
+///
+/// Its `[proc]` twin is `cli::proc::removal_words`, deliberately a separate function: the two match
+/// over unrelated enums, and a trait to share five lines would cost more than it saves.
 fn removal_words(list: config::manage::EgressList) -> (&'static str, &'static str) {
     match list {
         config::manage::EgressList::Allow => ("unallow", "allow"),

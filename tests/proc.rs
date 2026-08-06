@@ -831,8 +831,10 @@ fn proc_unallow_and_undeny_round_trip_through_config() {
     // survives every rule it governed. Emptying the deny list under an enforcing posture would leave
     // enforcement on and blocking nothing, which is exactly why the mode is not touched here.
     let body = std::fs::read_to_string(proj.path().join(".sbx.toml")).unwrap();
+    // Matched as `<key> =`, not as a bare word: `deny` alone would also match a `mode = "deny"`
+    // posture, so the assertion would pass for a reason that has nothing to do with the key.
     assert!(
-        !body.contains("allow") && !body.contains("deny") && !body.contains("git"),
+        !body.contains("allow =") && !body.contains("deny =") && !body.contains("git"),
         "an emptied rule list must leave no residue behind:\n{body}"
     );
     assert!(
