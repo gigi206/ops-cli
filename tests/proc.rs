@@ -735,6 +735,38 @@ fn proc_deny_bootstraps_enforce_writes_the_config_and_retrusts() {
     );
 }
 
+/// The `--local` trust gate covers the proc plane exactly as it covers egress: a pre-existing,
+/// never-trusted project config must not be blessed by an appended rule -- the user reviews and
+/// trusts it first. Nothing exercised this on the proc side, and the gate is one shared admission
+/// now, so this also pins that `sbx proc deny` really goes through it.
+#[test]
+fn proc_deny_refuses_an_untrusted_existing_project() {
+    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    std::fs::write(
+        proj.path().join(".sbx.toml"),
+        "[proc]\nmode = \"enforce\"\ndeny = [\"ssh\"]\n",
+    )
+    .unwrap();
+    let out = sbx_config_write(
+        &["proc", "deny", "curl"],
+        proj.path(),
+        state.path(),
+        config.path(),
+        data.path(),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("not trusted") && err.contains("sbx trust"),
+        "an untrusted existing config must be refused, pointing at `sbx trust`:\n{err}"
+    );
+    let body = std::fs::read_to_string(proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        !body.contains("curl"),
+        "a refused write must not touch the file:\n{body}"
+    );
+}
+
 #[test]
 fn proc_allow_with_no_posture_is_refused_and_writes_nothing() {
     let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());

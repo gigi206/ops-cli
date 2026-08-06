@@ -550,70 +550,83 @@ fn egress_write_target<'a>(
     Ok((path, app_key, target))
 }
 
-/// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting
-/// it after — the shared writer behind `sbx net allow|deny <rule>` and the `--save` of
-/// `sbx net pending allow|deny`. Returns the success line to print, or `(exit-code, message)`: a
-/// refusal (a `-c` file scope, an untrusted project config, a posture conflict) is code `2`; an
-/// operational failure (no trust store, an unwritable path, a re-trust failure) is code `1`. A
-/// `Scope::File` is refused — the vocabulary is local/global/app, and a `-c` write would be
-/// silently dropped at launch (neither trusted-by-location nor the gated project path).
-fn persist_egress_rule(
-    list: config::manage::EgressList,
-    rule: &str,
+/// An admitted control-plane rule write: where it lands, how to name it, and whether it owes a
+/// re-trust. Produced by [`open_rule_write`], which has already refused everything a write can be
+/// refused for *before* the file is touched.
+struct RuleWrite<'a> {
+    /// The config file to edit.
+    path: PathBuf,
+    /// The in-file app key — `None` writes the top-level table, `Some(name)` an `[app.<name>]`
+    /// overlay. See [`egress_write_target`].
+    app_key: Option<&'a str>,
+    /// How to name the destination to the user; already carries the app, if any.
+    target: String,
+    /// The trust store, and by its presence the gate itself: `Some` for a `--local` project write
+    /// (which must be re-trusted after the edit), `None` for a global config or an app profile,
+    /// both trusted by location.
+    ///
+    /// The re-trust stays with each caller rather than riding along here: the two add paths always
+    /// owe one, the removal path owes one only when it actually changed the file (re-trusting a
+    /// path that no removal created would fail and turn a no-op into an error), and all three word
+    /// a failure differently.
+    store: Option<PathBuf>,
+}
+
+/// Admit a rule write to the scoped config file, refusing everything that must be refused before
+/// anything is written — the shared preamble behind `sbx net allow|deny|mute`, `sbx net unmute` and
+/// `sbx proc allow|deny`. `command` and `verb` name the invocation in a refusal (`sbx net allow`),
+/// and `no_store` is the sentence for an unresolvable trust store, which the three paths phrase
+/// differently and visibly.
+///
+/// Four refusals, in the order a write meets them:
+/// - a `Scope::File` — the vocabulary is local/global/app, and a `-c` write would be silently
+///   dropped at launch (neither trusted by location nor on the gated project path), code `2`;
+/// - an invalid or reserved app name — it keys a table `resolve_apps` drops at load, so the rule
+///   would be silently inert, and on a `--global` app scope it also reaches the filesystem, since a
+///   profile path joins the name verbatim; code `2`. The three CLI surfaces reject a bad `--app` as
+///   they parse it, so this is the net under the one that does not: `sbx net pending --save`, which
+///   passes its parsed app straight through;
+/// - no resolvable trust store for a gated write — the rule would be written but could not be
+///   trusted, so it would not take effect; operational, code `1`;
+/// - an existing-but-untrusted project config — an appended rule must not silently bless it, so the
+///   user reviews and trusts it first, code `2`. Absent or already-trusted is fine: sbx's edit is
+///   then the sole delta from the trusted bytes.
+///
+/// `base` is the directory a `--local` scope resolves against: the cwd for `sbx net allow|deny`, or
+/// the *answered session's* project for `sbx net pending --save`, so the rule lands in the project
+/// the agent runs in rather than wherever the user happens to stand. Global ignores it.
+fn open_rule_write<'a>(
+    command: &str,
+    verb: &str,
+    no_store: &str,
     scope: &config::manage::Scope,
-    app: Option<&str>,
+    app: Option<&'a str>,
     base: &Path,
-) -> Result<String, (u8, String)> {
-    use config::manage::{self, AddOutcome, Scope};
-    let verb = match list {
-        manage::EgressList::Allow => "allow",
-        manage::EgressList::Deny => "deny",
-        manage::EgressList::Mute => "mute",
-    };
+) -> Result<RuleWrite<'a>, (u8, String)> {
+    use config::manage::Scope;
     if matches!(scope, Scope::File(_)) {
         return Err((
             2,
-            format!("`sbx net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
+            format!(
+                "`sbx {command} {verb}` does not take `-c <file>` — use --local, --global, or --app"
+            ),
         ));
     }
-    // Validate the app name here, in the shared writer, so every path that persists a rule is
-    // covered — including `sbx net pending --save --app <name>`, whose by-id form does not
-    // pre-check the name. An invalid or reserved name keys a table `resolve_apps` drops at load,
-    // so the rule would be silently inert; refuse it rather than report a durable restriction.
     if let Some(name) = app {
         if !config::is_valid_app_name(name) {
             return Err((2, format!("`{name}` is not a valid app name")));
         }
     }
-    // `base` is the directory a `--local` scope resolves against: the cwd for `sbx net allow|deny`,
-    // or the *answered session's* project for `sbx net pending --save` (so the rule lands in the
-    // project the agent runs in, not wherever the user happens to stand). Global ignores it. The
-    // file, the in-file table shape (`app_key`), and the human `target` are resolved together — and
-    // shared with the drain path — so the write and the message it prints can never disagree about
-    // where the rule landed.
+    // The file, the in-file table shape, and the human target are resolved together — and shared
+    // with the drain path — so the write and the message it prints can never disagree about where
+    // the rule landed.
     let (path, app_key, target) = egress_write_target(scope, app, base)?;
 
     // A write to the project `.sbx.toml` is trust-gated; the global config and the app profiles
     // under `apps/` are trusted by location.
-    let gated = matches!(scope, Scope::Local);
-    let store =
-        if gated {
-            Some(trust::default_store_dir().ok_or((
-            1,
-            "cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule would be \
-             written but could not be trusted, so it would not take effect — use --global, or set \
-             the trust store"
-                .to_string(),
-        ))?)
-        } else {
-            None
-        };
-
-    // Pre-check: an existing-but-untrusted project config must not be silently blessed by an append
-    // — the user reviews and trusts it first. Absent or already-trusted is fine: sbx's edit is then
-    // the sole delta from the trusted bytes.
-    if let Some(store) = &store {
-        if !local_save_permitted(path.exists(), trust::state(store, &path)) {
+    let store = if matches!(scope, Scope::Local) {
+        let store = trust::default_store_dir().ok_or((1, no_store.to_string()))?;
+        if !local_save_permitted(path.exists(), trust::state(&store, &path)) {
             return Err((
                 2,
                 format!(
@@ -623,7 +636,52 @@ fn persist_egress_rule(
                 ),
             ));
         }
-    }
+        Some(store)
+    } else {
+        None
+    };
+
+    Ok(RuleWrite {
+        path,
+        app_key,
+        target,
+        store,
+    })
+}
+
+/// What an unresolvable trust store means on an *add* path, where the rule would be written but
+/// could not be trusted, so it would not take effect. The removal path states the fact alone; the
+/// difference is user-visible and deliberate.
+const NO_TRUST_STORE_ON_ADD: &str =
+    "cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule would be written but \
+     could not be trusted, so it would not take effect — use --global, or set the trust store";
+
+/// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting
+/// it after — the shared writer behind `sbx net allow|deny <rule>` and the `--save` of
+/// `sbx net pending allow|deny`. Returns the success line to print, or `(exit-code, message)`: a
+/// refusal (a `-c` file scope, an untrusted project config, a posture conflict) is code `2`; an
+/// operational failure (no trust store, an unwritable path, a re-trust failure) is code `1`. The
+/// admission itself — and every refusal before the write — is [`open_rule_write`]'s.
+fn persist_egress_rule(
+    list: config::manage::EgressList,
+    rule: &str,
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+    base: &Path,
+) -> Result<String, (u8, String)> {
+    use config::manage::{self, AddOutcome};
+    let verb = match list {
+        manage::EgressList::Allow => "allow",
+        manage::EgressList::Deny => "deny",
+        manage::EgressList::Mute => "mute",
+    };
+    let RuleWrite {
+        path,
+        app_key,
+        target,
+        store,
+    } = open_rule_write("net", verb, NO_TRUST_STORE_ON_ADD, scope, app, base)?;
+    let gated = store.is_some();
 
     let outcome =
         manage::add_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
@@ -668,8 +726,8 @@ fn persist_egress_rule(
 /// write and re-trusting it after — the proc sibling of [`persist_egress_rule`]. Returns the success
 /// line to print, or `(exit-code, message)`: a refusal (a `-c` file scope, an untrusted project
 /// config, a non-enforcing/inert posture) is code `2`; an operational failure (no trust store, an
-/// unwritable path, a re-trust failure) is code `1`. The scope/app resolution and trust interaction
-/// are shared with the egress path ([`egress_write_target`] / [`local_save_permitted`]).
+/// unwritable path, a re-trust failure) is code `1`. The admission is shared with the egress path
+/// ([`open_rule_write`]); only the list it appends to and the mode it may set differ.
 fn persist_proc_rule(
     list: config::manage::ProcList,
     rule: &str,
@@ -677,55 +735,18 @@ fn persist_proc_rule(
     app: Option<&str>,
     base: &Path,
 ) -> Result<String, (u8, String)> {
-    use config::manage::{self, AddOutcome, ProcList, Scope};
+    use config::manage::{self, AddOutcome, ProcList};
     let verb = match list {
         ProcList::Allow => "allow",
         ProcList::Deny => "deny",
     };
-    if matches!(scope, Scope::File(_)) {
-        return Err((
-            2,
-            format!(
-                "`sbx proc {verb}` does not take `-c <file>` — use --local, --global, or --app"
-            ),
-        ));
-    }
-    if let Some(name) = app {
-        if !config::is_valid_app_name(name) {
-            return Err((2, format!("`{name}` is not a valid app name")));
-        }
-    }
-    let (path, app_key, target) = egress_write_target(scope, app, base)?;
-
-    // A write to the project `.sbx.toml` is trust-gated; the global config and the app profiles under
-    // `apps/` are trusted by location.
-    let gated = matches!(scope, Scope::Local);
-    let store =
-        if gated {
-            Some(trust::default_store_dir().ok_or((
-            1,
-            "cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule would be \
-             written but could not be trusted, so it would not take effect — use --global, or set \
-             the trust store"
-                .to_string(),
-        ))?)
-        } else {
-            None
-        };
-
-    // Pre-check: an existing-but-untrusted project config must not be silently blessed by an append.
-    if let Some(store) = &store {
-        if !local_save_permitted(path.exists(), trust::state(store, &path)) {
-            return Err((
-                2,
-                format!(
-                    "{} is not trusted — review it and run `sbx trust {}`, then retry",
-                    path.display(),
-                    config::PROJECT_CONFIG
-                ),
-            ));
-        }
-    }
+    let RuleWrite {
+        path,
+        app_key,
+        target,
+        store,
+    } = open_rule_write("proc", verb, NO_TRUST_STORE_ON_ADD, scope, app, base)?;
+    let gated = store.is_some();
 
     let outcome =
         manage::add_proc_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;

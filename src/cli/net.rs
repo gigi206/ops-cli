@@ -6,8 +6,8 @@
 //! rendering layer (pending prompts, live flows, the log stream, rule/group tables,
 //! and drain/stats summaries). Cross-cutting domain and plumbing helpers — session
 //! record readers (`session_pids_*`, `pending_session_context`), the shared egress
-//! writers (`persist_egress_rule`, `egress_write_target`), the local-save trust gate
-//! (`local_save_permitted`/`precheck_local_save`), and formatting shared with other
+//! writers (`persist_egress_rule`, `egress_write_target`), the rule-write admission and its
+//! local-save trust gate (`open_rule_write`/`precheck_local_save`), and formatting shared with other
 //! families (`format_log_time`, `net_mode_word`, `short_rev`) — stay at the crate root
 //! and are reached from here via `crate::`.
 
@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use crate::{allowlist, config, diag, help, sandbox, style, trust};
 use crate::{
-    egress_data_dir, egress_write_target, fold_app_overlay, format_log_time, local_save_permitted,
-    net_mode_word, pending_session_context, persist_egress_rule, precheck_local_save,
-    session_app_of, session_pids_for_app, session_pids_for_project, split_scope,
+    egress_data_dir, egress_write_target, fold_app_overlay, format_log_time, net_mode_word,
+    open_rule_write, pending_session_context, persist_egress_rule, precheck_local_save,
+    session_app_of, session_pids_for_app, session_pids_for_project, split_scope, RuleWrite,
 };
 
 /// `sbx net <subcommand>`: the interactive-egress namespace. `rules` lists the effective egress
@@ -3357,48 +3357,29 @@ fn persist_egress_removal(
     app: Option<&str>,
     base: &Path,
 ) -> Result<String, (u8, String)> {
-    use config::manage::{self, RemoveOutcome, Scope};
+    use config::manage::{self, RemoveOutcome};
     let (verb, noun) = match list {
         manage::EgressList::Allow => ("unallow", "allow"),
         manage::EgressList::Deny => ("undeny", "deny"),
         manage::EgressList::Mute => ("unmute", "mute"),
     };
-    if matches!(scope, Scope::File(_)) {
-        return Err((
-            2,
-            format!("`sbx net {verb}` does not take `-c <file>` — use --local, --global, or --app"),
-        ));
-    }
-    if let Some(name) = app {
-        if !config::is_valid_app_name(name) {
-            return Err((2, format!("`{name}` is not a valid app name")));
-        }
-    }
-    let (path, app_key, target) = egress_write_target(scope, app, base)?;
-
     // A project `.sbx.toml` edit is trust-gated and re-trusted, exactly like the add path — removing
-    // a rule still rewrites the file, so it must not silently bless an untrusted one.
-    let gated = matches!(scope, Scope::Local);
-    let store = if gated {
-        Some(trust::default_store_dir().ok_or((
-            1,
-            "cannot determine the trust store (set XDG_STATE_HOME or HOME)".to_string(),
-        ))?)
-    } else {
-        None
-    };
-    if let Some(store) = &store {
-        if !local_save_permitted(path.exists(), trust::state(store, &path)) {
-            return Err((
-                2,
-                format!(
-                    "{} is not trusted — review it and run `sbx trust {}`, then retry",
-                    path.display(),
-                    config::PROJECT_CONFIG
-                ),
-            ));
-        }
-    }
+    // a rule still rewrites the file, so it must not silently bless an untrusted one. The missing-
+    // store sentence is shorter here than on the add path, and stays so: it is user-visible.
+    let RuleWrite {
+        path,
+        app_key,
+        target,
+        store,
+    } = open_rule_write(
+        "net",
+        verb,
+        "cannot determine the trust store (set XDG_STATE_HOME or HOME)",
+        scope,
+        app,
+        base,
+    )?;
+    let gated = store.is_some();
 
     let outcome =
         manage::remove_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
