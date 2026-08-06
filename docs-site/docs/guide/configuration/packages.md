@@ -266,8 +266,9 @@ resolve = ["sh", "-c", "curl -fsSL https://updates.example.com/api | sed -n 's/.
 sbx runs it in the same hermetic sandbox as the other `*:resolve` forms (base tools + the app's own
 `nix:` `[packages]`, host network, sbx's own CA bundle), re-validates the printed URL (`https://`,
 ending `.AppImage`, injection-free) before any fetch, and pins it in `appimage-packages.lock`. A warm
-launch reuses the pin offline; `sbx upgrade appimage` re-runs it and rolls forward. Honored **only
-from a trusted source** and **never run for an untrusted layer**.
+launch reuses the pin offline; `sbx upgrade appimage` re-runs the command and re-fetches the
+`.AppImage` only when the URL actually changed, so a command that prints a stable URL never rolls.
+Honored **only from a trusted source** and **never run for an untrusted layer**.
 
 ### `tarball:`: a prebuilt application tarball
 
