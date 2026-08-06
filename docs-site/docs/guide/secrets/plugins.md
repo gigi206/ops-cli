@@ -46,7 +46,19 @@ network     = false                # true = reach the network; false = empty net
   version.
 - `[sandbox]` declares only the resolver-specific extra; the runner supplies the
   structural environment (a minimal `PATH`, a read-only host userland, `HOME`,
-  and, under `network`, DNS/TLS files) on top of it.
+  and, under `network`, DNS/TLS files) on top of it. Two consequences a resolver
+  author has to plan for, because the structural values always win over anything
+  the manifest names:
+  - `PATH` is `/usr/bin:/bin` and only the host `/usr` is bound, so a tool
+    installed in **user mode** (a nix profile, Homebrew, `~/.local/bin`) is
+    invisible. Bind its directory through `allow_paths` (plus `/nix/store` for a
+    nix profile, whose binaries are symlinks into the store), then call it by
+    absolute path or search for it in the script. Naming `PATH` in `allow_env`
+    has no effect.
+  - `HOME` is a private tmpfs, so a tool that derives a location from it (a
+    password store, a GnuPG keyring and its agent socket, a token file) looks
+    where nothing exists. Bind the host path and point the tool at it: the
+    bundled `pass` and `vault` plugins show one way to do it.
 - `allow_env` is how a resolver receives *its own* credential (`VAULT_TOKEN`, an
   age identity), so the value never travels where another user could read it:
   see [the cage's environment is not readable by other
@@ -188,11 +200,19 @@ sbx plugins install plugins/vault   # then: from = "vault://secret/myapp#passwor
 
 | Plugin | Reference form | Resolves to | Sandbox grant |
 |---|---|---|---|
-| `pass` | `pass://<path>` | the **first line** of `~/.password-store/<path>.gpg` (the password by convention) | `allow_paths` on the store, `~/.gnupg` and the gpg-agent socket; **no network** |
-| `vault` | `vault://<path>#<field>` | one field of a HashiCorp Vault KV secret | `allow_env` for `VAULT_ADDR`/`VAULT_TOKEN`/`VAULT_NAMESPACE`; `network = true` |
+| `pass` | `pass://<path>` | the **first line** of `~/.password-store/<path>.gpg` (the password by convention) | `allow_paths` on the store, `~/.gnupg`, the gpg-agent socket, and the usual install locations of `pass(1)`; **no network** |
+| `vault` | `vault://<path>#<field>` | one field of a HashiCorp Vault KV secret | `allow_env` for `VAULT_ADDR`/`VAULT_TOKEN`/`VAULT_NAMESPACE`, `allow_paths` on `~/.vault-token` and the usual install locations of `vault(1)`; `network = true` |
 
 Both are also worked examples of the manifest and the execution contract above: read
-their `plugin.toml` and `resolve` script when writing your own.
+their `plugin.toml` and `resolve` script when writing your own. Each shows the two
+things the structural cage forces on a resolver (finding a user-mode binary, and
+restoring the host `HOME` a tool derives its paths from), and each reports a
+reference it does not hold as a clean absent, so it is safe to place ahead of
+another source in a `from` chain.
+
+If a plugin reports `command not found`, the tool it runs is installed somewhere
+`allow_paths` does not name: add that directory (and `/nix/store` for a nix
+profile) to the manifest.
 
 ## Managing plugins
 

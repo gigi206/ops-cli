@@ -2,18 +2,61 @@
 # sbx resolver plugin: HashiCorp Vault KV.
 # Contract: sbx passes the full ref as $1; print the plaintext to stdout; exit 0 on success.
 #   Ref:  vault://<path>#<field>   e.g.  vault://secret/myapp#password
-# Needs VAULT_ADDR and VAULT_TOKEN in the environment (declared in plugin.toml).
+# Needs VAULT_ADDR, and either VAULT_TOKEN or a ~/.vault-token file (both declared in
+# plugin.toml).
 set -euo pipefail
 
 ref="${1:?vault: missing secret ref}"
 rest="${ref#vault://}"
 [ "$rest" != "$ref" ] || { echo "vault: ref must start with vault:// ('$ref')" >&2; exit 1; }
-
-if [[ "$rest" == *"#"* ]]; then
-    path="${rest%%#*}"
-    field="${rest#*#}"
-    exec vault kv get -field="$field" "$path"
-else
+[[ "$rest" == *"#"* ]] || {
     echo "vault: ref must name a field: vault://<path>#<field> ('$ref')" >&2
     exit 1
+}
+path="${rest%%#*}"
+field="${rest#*#}"
+
+shopt -s nullglob
+
+# The sandbox sets HOME to a private tmpfs, so vault(1) would look for its token file there.
+# Restore the host home the manifest bound: it is the only one in the cage, so a glob
+# identifies it without needing to know the user's name (there is no /etc/passwd here). A host
+# with no token file is fine — VAULT_TOKEN then carries the credential.
+for d in /home/*/.vault-token /var/home/*/.vault-token; do
+    [ -f "$d" ] && { HOME="${d%/*}"; export HOME; break; }
+done
+
+# The cage's PATH is /usr/bin:/bin, so a user-mode install of vault(1) is not on it.
+for dir in /usr/bin /home/linuxbrew/.linuxbrew/bin /opt/homebrew/bin \
+           /home/*/.nix-profile/bin /var/home/*/.nix-profile/bin \
+           /nix/var/nix/profiles/default/bin /home/*/.local/bin /var/home/*/.local/bin; do
+    [ -x "$dir/vault" ] && { VAULT="$dir/vault"; break; }
+done
+[ -n "${VAULT:-}" ] || {
+    echo "vault: the vault(1) binary is not in the plugin sandbox — add its directory (and \
+/nix/store for a nix profile) to allow_paths in plugin.toml" >&2
+    exit 1
+}
+
+err=$(mktemp)
+trap 'rm -f "$err"' EXIT
+# The status is captured here rather than read after an `if`: a failed `if` condition leaves
+# $? at the status of the `if` itself, which is zero — that would turn every hard error into a
+# clean absent and silently downgrade the launch to a weaker source.
+rc=0
+value=$("$VAULT" kv get -field="$field" "$path" 2>"$err") || rc=$?
+if [ "$rc" -eq 0 ]; then
+    printf '%s' "$value"
+    exit 0
 fi
+
+# A path this vault does not hold, or a field the secret does not carry, is a clean absent
+# (exit 0, nothing on stdout): the caller falls through to the next source in a `from` chain.
+# Every other failure — an unreachable server, a rejected token, a denied policy — stays a
+# hard error, so a resolver problem never downgrades to a weaker source.
+detail=$(tr '\n' ' ' < "$err")
+echo "$detail" >&2
+case "$detail" in
+    *"No value found at"*|*"not present in secret"*) exit 0 ;;
+    *) exit "$rc" ;;
+esac

@@ -101,13 +101,28 @@ resolver then fails closed inside if it genuinely needed what was missing. A lea
 absolute.
 
 sbx supplies a **structural environment and filesystem** on top of the grant, so a resolver
-declares only the *extra* it needs: a minimal `PATH`, a read-only host userland (`/usr` and the
-system libraries), a private `HOME` on a tmpfs, fresh `/proc` and `/dev`, and — under
-`network = true` — the host network plus its DNS and TLS trust files
+declares only the *extra* it needs: a minimal `PATH` (`/usr/bin:/bin`), a read-only host
+userland (`/usr` and the system libraries), a private `HOME` on a tmpfs, fresh `/proc` and
+`/dev`, and — under `network = true` — the host network plus its DNS and TLS trust files
 (`/etc/resolv.conf`, `/etc/ssl`, …). Without `network = true` the resolver runs in an empty
 network namespace (no egress at all). The environment is otherwise cleared, the capabilities
 dropped, and every namespace unshared; only the variables in `allow_env` are passed through, and
 sbx's structural `HOME`/`PATH` take precedence over any the manifest names.
+
+That precedence is what a resolver author has to plan for, in two places:
+
+- **The binary.** With `PATH` at `/usr/bin:/bin` and only the host `/usr` bound, a tool
+  installed in **user mode** — a nix profile, Homebrew, `~/.local/bin` — is not found. Bind its
+  directory through `allow_paths` (plus `/nix/store` for a nix profile, whose binaries are
+  symlinks into the store) and call it by absolute path or search for it in the script. Naming
+  `PATH` in `allow_env` does nothing: the structural value is applied last and wins.
+- **The home.** `HOME` is a private tmpfs, so a tool that derives a location from it — a
+  password store, a GnuPG keyring *and the agent socket directory GnuPG computes from `HOME`*,
+  a token file — looks where nothing exists. Bind the host path and point the tool at it. The
+  `pass` and `vault` plugins here do this by locating the one host home present in the cage.
+
+Both are why a plugin that works on the command line can still fail under sbx, and neither is
+visible from the manifest alone.
 
 The built-in schemes `env`, `file`, and `sops` can never be claimed by a plugin — they always
 win. A scheme claimed by more than one installed plugin is ambiguous, so **every** plugin

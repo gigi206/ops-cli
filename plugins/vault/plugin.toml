@@ -2,9 +2,23 @@ name        = "vault"
 type        = "resolver"
 scheme      = "vault"
 exec        = "resolve"
-version     = "0.1.0"
+version     = "0.2.0"
 description  = "Fetch a field from a HashiCorp Vault KV secret: vault://<path>#<field>"
 
 [sandbox]
+# Where the vault(1) CLI is installed, plus the token file it falls back on when VAULT_TOKEN
+# is unset. The cage's PATH is `/usr/bin:/bin` and only the host `/usr` is bound, so a
+# user-mode install is otherwise invisible; a nix profile's binaries are symlinks into the
+# store, so /nix/store must come with it. Every entry is bound only if present, so one
+# manifest stays portable: add your own location here if vault(1) lives elsewhere.
+#
+# /nix/store is the widest of them, and a deliberate trade: the whole store rather than the
+# one package, because a profile's binaries are symlinks into it and their interpreters and
+# libraries live there too. It is read-only and world-readable on the host, so it holds no
+# secret of its own, but it does show this resolver every package installed through nix. Drop
+# it if vault(1) does not come from nix, and keep the list to the locations you actually use.
+allow_paths = ["~/.vault-token",
+               "/home/linuxbrew/.linuxbrew", "/opt/homebrew",
+               "~/.nix-profile/bin", "/nix/store", "~/.local/bin"]
 allow_env = ["VAULT_ADDR", "VAULT_TOKEN", "VAULT_NAMESPACE"]
 network   = true

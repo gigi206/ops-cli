@@ -156,7 +156,11 @@ before the cage exists. The plaintext lives briefly in host memory, is consumed
 by the broker, and is discarded. It is never an argument to a cage process, never
 a cage file, never a cage variable. A resolver *plugin* also runs host-side (in
 the trusted computing base, sandboxed under bubblewrap): see
-[Resolver plugins](plugins).
+[Resolver plugins](plugins). That sandbox is the one difference that shows: the
+built-in resolvers run in `sbx`'s own process and therefore see your `PATH` and
+your `HOME`, while a plugin gets the cage's minimal `PATH` and a private `HOME`,
+and reaches only what its manifest binds. A tool `sops://` finds on your `PATH`
+is not automatically within a plugin's reach.
 
 ## See also
 
