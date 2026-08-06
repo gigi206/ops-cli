@@ -258,33 +258,23 @@ fn scope_members(pid: u32) -> Vec<(u32, u64)> {
 
 /// Whether a cgroup directory name is the cage scope for `pid` — `sbx-<slug>-<pid>.scope`. The
 /// `-<pid>` segment is dash-delimited, so a longer pid ending in the same digits (or a slug ending
-/// in digits) cannot match by accident.
+/// in digits) cannot match by accident; the name is parsed by the module that builds it, so this
+/// property and the sweep's both rest on one reading of the format.
 fn is_cage_scope(name: &str, pid: u32) -> bool {
-    name.starts_with("sbx-") && name.ends_with(&format!("-{pid}.scope"))
+    crate::sandbox::cgroup::scope_launcher_pid(name) == Some(pid)
 }
 
-/// Find the cage scope's `cgroup.procs` contents. The scopes live under the user manager's cgroup;
-/// a bounded walk from the user slice locates `sbx-<slug>-<pid>.scope`. `None` if no such scope
-/// exists (a launch degraded to no scope) or the cgroup is unreadable.
+/// Find the cage scope's `cgroup.procs` contents. `None` if no such scope exists (a launch degraded
+/// to no scope) or the cgroup is unreadable.
 fn scope_cgroup_procs(pid: u32) -> Option<String> {
-    let mut stack = vec![PathBuf::from("/sys/fs/cgroup/user.slice")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if is_cage_scope(name, pid) {
-                return std::fs::read_to_string(path.join("cgroup.procs")).ok();
-            }
-            stack.push(path);
-        }
-    }
-    None
+    let dir = crate::sandbox::cgroup::cage_scope_dirs()
+        .into_iter()
+        .find(|d| {
+            d.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| is_cage_scope(n, pid))
+        })?;
+    std::fs::read_to_string(dir.join("cgroup.procs")).ok()
 }
 
 /// Open a pidfd for `pid`, or `None` if the process is already gone.

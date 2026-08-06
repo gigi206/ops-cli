@@ -60,6 +60,38 @@ limits are hardening, never the boundary. See [Enforcement stack](../concepts/en
 The memory ceiling is honestly **per-cage**, not host-global (N concurrent cages can
 sum past total RAM); the task cap is the clean host-wide anti-DoS guarantee.
 
+## Inspecting the scopes
+
+Each cage owns one transient unit named after it, so the running cages are visible from
+the host:
+
+```sh
+systemctl --user list-units --all 'sbx-*' --plain --no-pager
+```
+
+The unit is named `sbx-<slug>-<pid>.scope`, where the pid is the `sbx` process that
+launched the cage. `ps` and `systemd-cgls` show the same name, and
+[`sbx session ls`](../cli/session) is the same view from sbx's side.
+
+A scope normally disappears on its own once its cage exits: systemd watches the scope's
+cgroup and reclaims the unit when it empties. That watch is an inotify watch, and a
+session's inotify budget is shared with every other watcher on the host, so installing it
+can fail. systemd treats that failure as non-fatal, the notification then never arrives,
+and the scope stays `active running` over an empty cgroup with no path to a terminal
+state. Left alone, those units accumulate for the life of the login session.
+
+`sbx` reclaims them. Every launch stops the scopes whose launcher is gone **and** whose
+cgroup holds no process, before creating its own. Both conditions are required, and a
+cgroup that cannot be read counts as in use: the sweep leaves a leftover behind rather
+than risk touching a running cage. It never delays the launch behind it, and it says
+nothing, so a clean host looks exactly like a swept one.
+
+A leftover is recognisable by an empty cgroup under a unit systemd still calls running:
+
+```sh
+systemctl --user show <unit> -p TasksCurrent --value   # 0 on a leftover
+```
+
 ## Per-app limits
 
 An `[app.<name>.limits]` table (or a `[limits]` table in an imported profile)

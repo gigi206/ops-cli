@@ -36,7 +36,9 @@ mod packages;
 mod prebuilt;
 mod projectstore;
 mod resolve;
-mod resolver;
+/// The resolver-plugin runner. Public to the crate for one function only: `sbx plugins info`
+/// shows where a declared program resolves, and must use the very lookup a launch would.
+pub(crate) mod resolver;
 mod search;
 mod tarball;
 

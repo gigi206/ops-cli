@@ -1819,9 +1819,33 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     }
     println!("  sandbox grant:");
     println!("    network:     {}", p.sandbox.network);
+    print_grant_programs(&p.sandbox.programs, err, r);
     print_grant_paths("allow_paths", &p.sandbox.allow_paths);
     print_grant_env("allow_env", &p.sandbox.allow_env);
     ExitCode::SUCCESS
+}
+
+/// One `sbx plugins info` grant line per declared program, resolved **here and now** against the
+/// same `PATH` a launch would search, so the listing answers the question a user actually has:
+/// will this plugin find its tool on *this* machine, and which one will it get. A program that
+/// resolves to nothing is flagged rather than merely listed — it is the difference between a
+/// plugin that works and one that fails at the first secret.
+fn print_grant_programs(programs: &[String], err: &str, r: &str) {
+    if programs.is_empty() {
+        println!("    programs:    (none)");
+        return;
+    }
+    let shown = programs
+        .iter()
+        .map(
+            |name| match crate::sandbox::resolver::locate_program(name) {
+                Some(path) => format!("{name} -> {}", path.display()),
+                None => format!("{name} -> {err}not on PATH{r}"),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("    programs:    {shown}");
 }
 
 /// One `sbx plugins info` grant line listing read-only path binds, or `(none)`.

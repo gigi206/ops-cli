@@ -32,7 +32,8 @@ version     = "1.2.0"          # optional, display-only
 description = "Generic KV-store resolver"   # optional, display-only
 
 [sandbox]                      # the least-privilege grant the runner gives the plugin
-allow_paths = ["~/.vault-token"]   # extra host paths bound read-only
+programs    = ["vault"]            # host programs to locate on sbx's PATH and bind into the cage
+allow_paths = ["~/.vault-token"]   # extra host paths bound read-only (data, not binaries)
 allow_env   = ["VAULT_ADDR"]       # host env vars passed into the otherwise-cleared environment
 network     = false                # true = reach the network; false = empty network namespace
 ```
@@ -46,19 +47,30 @@ network     = false                # true = reach the network; false = empty net
   version.
 - `[sandbox]` declares only the resolver-specific extra; the runner supplies the
   structural environment (a minimal `PATH`, a read-only host userland, `HOME`,
-  and, under `network`, DNS/TLS files) on top of it. Two consequences a resolver
-  author has to plan for, because the structural values always win over anything
-  the manifest names:
-  - `PATH` is `/usr/bin:/bin` and only the host `/usr` is bound, so a tool
-    installed in **user mode** (a nix profile, Homebrew, `~/.local/bin`) is
-    invisible. Bind its directory through `allow_paths` (plus `/nix/store` for a
-    nix profile, whose binaries are symlinks into the store), then call it by
-    absolute path or search for it in the script. Naming `PATH` in `allow_env`
-    has no effect.
-  - `HOME` is a private tmpfs, so a tool that derives a location from it (a
-    password store, a GnuPG keyring and its agent socket, a token file) looks
-    where nothing exists. Bind the host path and point the tool at it: the
-    bundled `pass` and `vault` plugins show one way to do it.
+  and, under `network`, DNS/TLS files) on top of it.
+- `programs` names the host tools the plugin runs, **by name, never by path**.
+  For each one sbx searches its own `PATH` (the one your shell gives it), so a
+  tool you can run is a tool the plugin can run, whatever installed it: a
+  package manager, Homebrew, a nix profile, `~/.local/bin`. The binary is bound
+  read-only under `/run/sbx-programs/`, which leads the cage's `PATH`, so the
+  script simply calls it by name.
+  - Where a tool lives is a property of the machine, not of the plugin. Listing
+    install locations in `allow_paths` was at once too wide (a nix profile's
+    binaries are symlinks into the store, so the whole store had to be bound to
+    reach one of them) and too narrow (no list covers every package manager).
+  - The binary is `execve`d inside the resolver's cage, on the plaintext path,
+    so it is held to the check sbx applies to its own engines: a regular file,
+    owned by you or by root, not world-writable. Every match on `PATH` is
+    scanned, so a world-writable early entry is skipped with a warning rather
+    than shadowing a legitimate one further down.
+  - A declared program that resolves to nothing **fails the launch**, naming it.
+    `sbx plugins info <name>` shows where each one resolves right now, so the
+    answer comes before the first secret rather than during it.
+- `allow_paths` is for the plugin's **data** — a token file, a database, a
+  socket. `HOME` in the cage is a private tmpfs, so a tool that derives a
+  location from it (a password store, a GnuPG keyring and its agent socket, a
+  token file) looks where nothing exists: bind the host path and point the tool
+  at it. Naming `PATH` in `allow_env` has no effect; the structural value wins.
 - `allow_env` is how a resolver receives *its own* credential (`VAULT_TOKEN`, an
   age identity), so the value never travels where another user could read it:
   see [the cage's environment is not readable by other
@@ -210,9 +222,10 @@ user-mode binary, and restoring the host `HOME` a tool derives its paths from),
 and both report a reference they do not hold as a clean absent, so either is safe
 to place ahead of another source in a `from` chain.
 
-If a plugin reports `command not found`, the tool it runs is installed somewhere
-`allow_paths` does not name: add that directory (and `/nix/store` for a nix
-profile) to the manifest.
+If a launch refuses because a declared program is not on `PATH`, the tool the
+plugin runs is not installed, or not where the shell that starts sbx looks for
+it. `sbx plugins info <name>` resolves each declared program the way a launch
+would and shows the answer.
 
 ## Managing plugins
 

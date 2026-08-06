@@ -316,6 +316,115 @@ pub(crate) fn wrap(
     compose(scope_wrapper(limits, cage_slug), bwrap, bwrap_argv)
 }
 
+/// The launcher pid encoded in a cage scope's unit name, or `None` when `name` is not one.
+///
+/// [`super::naming::scope_unit`] builds the name as `sbx-<slug>-<pid>.scope`, and a slug may itself
+/// contain dashes and digits, so the pid is the segment after the **last** dash. Reading it as a
+/// suffix instead would let `sbx-probe-342.scope` answer for pid 42, which would be enough for
+/// [`sweep_stale_scopes`] to stop a live cage.
+pub(crate) fn scope_launcher_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("sbx-")?
+        .strip_suffix(".scope")?
+        .rsplit_once('-')?
+        .1
+        .parse()
+        .ok()
+}
+
+/// Every cage scope's cgroup directory under this user's slice.
+///
+/// The user manager decides where it registers a scope — under `user@<uid>.service/app.slice/` for a
+/// desktop session, elsewhere for a login session — so the walk starts at the user slice rather than
+/// assuming a path. A cage scope is a leaf here: nothing below one is another cage's scope, so the
+/// walk does not descend into it. Unreadable directories are skipped rather than aborting the walk,
+/// since every consumer is best-effort and a partial view does less than the whole, never something
+/// wrong.
+pub(crate) fn cage_scope_dirs() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![PathBuf::from("/sys/fs/cgroup/user.slice")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let is_cage_scope = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| scope_launcher_pid(n).is_some());
+            if is_cage_scope {
+                found.push(path);
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Whether a cage scope can be reclaimed: its launcher is gone **and** its cgroup holds no process.
+///
+/// Both halves are required, and which way each one fails is the whole safety argument. A live
+/// launcher means a cage is running or starting under this scope, and a starting one has a
+/// momentarily empty cgroup — between the unit's creation and bwrap being moved into it — so the pid
+/// is what covers that window. A cgroup that still lists processes means the cage outlived its
+/// launcher (it was reparented), which is a running cage whatever the pid segment says. `procs` is
+/// `None` when the file could not be read, and that reads as "not empty": an unreadable cgroup
+/// leaves an orphan behind rather than risking a live cage.
+fn is_reclaimable(launcher_alive: bool, procs: Option<&str>) -> bool {
+    !launcher_alive && procs.is_some_and(|p| p.trim().is_empty())
+}
+
+/// Stop the cage scopes left behind by launches that are over — best-effort, once per process,
+/// before this one creates a scope of its own.
+///
+/// systemd normally collects a transient scope unaided: it watches the scope's cgroup with inotify
+/// and reclaims the unit once the cgroup empties. Installing that watch can fail (the session's
+/// inotify budget is shared with every other watcher on the host), and systemd treats the failure as
+/// non-fatal. The notification then never arrives, so the scope stays `active running` over an empty
+/// cgroup with no path to a terminal state — which also means `--collect` has nothing to collect.
+/// Those units accumulate for the life of the session, and each one is walked again by every
+/// consumer of [`cage_scope_dirs`], including the teardown's member lookup. This sweep is the
+/// fallback for that case and for any other reason a scope outlives its cage.
+///
+/// [`is_reclaimable`] holds the decision and fails toward leaving an orphan. The launcher pid is
+/// checked first so a scope belonging to a live launcher is never even read. The stop is
+/// `--no-block`, so finding a large backlog does not delay the launch behind it.
+pub(crate) fn sweep_stale_scopes() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(systemctl) = crate::pathfind::find_on_path("systemctl") else {
+            return;
+        };
+        let stale: Vec<OsString> = cage_scope_dirs()
+            .into_iter()
+            .filter_map(|dir| {
+                let name = dir.file_name()?.to_str()?.to_string();
+                let alive = crate::session::pid_is_live(scope_launcher_pid(&name)?);
+                // Read the cgroup only once the launcher is known gone.
+                let procs = if alive {
+                    None
+                } else {
+                    std::fs::read_to_string(dir.join("cgroup.procs")).ok()
+                };
+                is_reclaimable(alive, procs.as_deref()).then(|| OsString::from(name))
+            })
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let _ = std::process::Command::new(systemctl)
+            .args(["--user", "stop", "--no-block"])
+            .args(&stale)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
+}
+
 /// Double every `$` in `arg`, the escape that makes systemd pass a dollar sign through literally.
 ///
 /// systemd substitutes variable references in the command line of the unit it runs, resolving them
@@ -777,6 +886,58 @@ mod tests {
             unit.contains(&std::process::id().to_string()),
             "the unit carries the launcher pid: {unit}"
         );
+    }
+
+    #[test]
+    fn a_scope_name_yields_the_launcher_pid_at_the_last_dash() {
+        assert_eq!(scope_launcher_pid("sbx-probe-42.scope"), Some(42));
+        // A slug carrying its own dashes and digits does not shift the pid segment.
+        assert_eq!(scope_launcher_pid("sbx-my-app-2-42.scope"), Some(42));
+        // The segment is read whole, so a longer pid ending in the same digits is a different pid.
+        // This is what keeps the sweep from mistaking one cage's scope for another's.
+        assert_eq!(scope_launcher_pid("sbx-probe-342.scope"), Some(342));
+        // Not a cage scope: another unit's name, another unit type, no pid segment at all.
+        assert_eq!(scope_launcher_pid("user-1000.slice"), None);
+        assert_eq!(scope_launcher_pid("other-probe-42.scope"), None);
+        assert_eq!(scope_launcher_pid("sbx-probe-42.service"), None);
+        assert_eq!(scope_launcher_pid("sbx-probe-none.scope"), None);
+    }
+
+    #[test]
+    fn only_a_dead_launcher_over_an_empty_cgroup_is_reclaimable() {
+        // The one reclaimable shape: the launcher is gone and the cgroup holds nothing.
+        assert!(is_reclaimable(false, Some("")));
+        assert!(is_reclaimable(false, Some("\n")));
+        // A live launcher holds its scope even while the cgroup is momentarily empty — the window
+        // between the unit's creation and bwrap being moved into it.
+        assert!(!is_reclaimable(true, Some("")));
+        // A cage reparented off its launcher still lists processes, so the scope is in use.
+        assert!(!is_reclaimable(false, Some("4711\n")));
+        assert!(!is_reclaimable(true, Some("4711\n")));
+        // An unreadable cgroup reads as in-use: leave an orphan rather than risk a running cage.
+        assert!(!is_reclaimable(false, None));
+    }
+
+    #[test]
+    fn the_cgroup_walk_yields_only_cage_scopes() {
+        // Exercises the real walk against this host's cgroup tree. Finding nothing is a legitimate
+        // outcome (no cage is running); what is asserted is that whatever it does find is a cage
+        // scope, since the sweep acts on the result.
+        for dir in cage_scope_dirs() {
+            let name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("a cage scope directory has a utf-8 name");
+            assert!(
+                scope_launcher_pid(name).is_some(),
+                "the walk yielded a directory that is not a cage scope: {name}"
+            );
+            assert!(
+                dir.join("cgroup.procs").exists(),
+                "a cage scope carries a cgroup.procs: {}",
+                dir.display()
+            );
+        }
     }
 
     /// The profile properties must produce the intended kernel limits, not merely

@@ -516,9 +516,10 @@ enum EngineProbe {
     Trusted,
 }
 
-/// Pure ownership/permission verdict for an engine binary about to be `execve`d.
+/// Pure ownership/permission verdict for a **host binary sbx is about to `execve`**: an engine
+/// (`nix`, `bwrap`) picked off `PATH`, or a program a resolver plugin's manifest declares.
 ///
-/// Mirrors the config-file safety gate, with one deliberate difference: an engine may
+/// Mirrors the config-file safety gate, with one deliberate difference: such a binary may
 /// legitimately be owned by **root** (the host `/usr/bin/bwrap` is `root:root`, and an
 /// override may point at a system binary), so ownership by uid 0 is accepted alongside our
 /// own euid — neither is writable by an unprivileged attacker. A non-regular file
@@ -526,7 +527,10 @@ enum EngineProbe {
 /// world-writable one (anyone could swap it) is refused; group-writable is tolerated, as for
 /// config files — the owner-only engine directory is the real boundary for the owned tier.
 /// `mode` is the full `st_mode`, type bits included.
-fn engine_verdict(file_uid: u32, mode: u32, euid: u32) -> Result<(), String> {
+///
+/// Shared rather than re-derived: a second copy would be a second place for the owned-by-root
+/// branch to drift.
+pub(crate) fn host_exec_verdict(file_uid: u32, mode: u32, euid: u32) -> Result<(), String> {
     if mode & libc::S_IFMT != libc::S_IFREG {
         return Err("not a regular file".into());
     }
@@ -560,7 +564,7 @@ fn engine_probe(path: &Path) -> EngineProbe {
         Err(_) => return EngineProbe::Absent,
     };
     let euid = unsafe { libc::geteuid() };
-    match engine_verdict(meta.uid(), meta.mode(), euid) {
+    match host_exec_verdict(meta.uid(), meta.mode(), euid) {
         Ok(()) => EngineProbe::Trusted,
         Err(why) => {
             eprintln!(
@@ -2518,20 +2522,20 @@ mod tests {
     fn engine_verdict_accepts_us_or_root_and_refuses_the_rest() {
         let reg = |perm: u32| perm | libc::S_IFREG;
         // owned by us, not world-writable → trusted (group-writable is tolerated)
-        assert!(engine_verdict(1000, reg(0o755), 1000).is_ok());
-        assert!(engine_verdict(1000, reg(0o775), 1000).is_ok());
+        assert!(host_exec_verdict(1000, reg(0o755), 1000).is_ok());
+        assert!(host_exec_verdict(1000, reg(0o775), 1000).is_ok());
         // root-owned is accepted — the host /usr/bin/bwrap is root:root and an override may be a
         // system binary; neither is writable by an unprivileged attacker.
-        assert!(engine_verdict(0, reg(0o755), 1000).is_ok());
+        assert!(host_exec_verdict(0, reg(0o755), 1000).is_ok());
         // a foreign, non-root owner is refused, naming the uid
-        let e = engine_verdict(1234, reg(0o755), 1000).unwrap_err();
+        let e = host_exec_verdict(1234, reg(0o755), 1000).unwrap_err();
         assert!(e.contains("owned by uid 1234"), "got: {e}");
         // world-writable is refused even when owned by us
-        assert!(engine_verdict(1000, reg(0o757), 1000)
+        assert!(host_exec_verdict(1000, reg(0o757), 1000)
             .unwrap_err()
             .contains("world-writable"));
         // a non-regular file (here a directory) is refused
-        assert!(engine_verdict(1000, libc::S_IFDIR | 0o755, 1000)
+        assert!(host_exec_verdict(1000, libc::S_IFDIR | 0o755, 1000)
             .unwrap_err()
             .contains("not a regular file"));
     }

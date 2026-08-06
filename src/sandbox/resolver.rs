@@ -42,6 +42,12 @@ use std::process::{Command, Stdio};
 /// writes a cache or a lockfile has somewhere ephemeral to do it without any host path.
 const CAGE_HOME: &str = "/tmp";
 
+/// Where a manifest's `programs` are bound, and the first entry of the cage's `PATH`, so a plugin
+/// invokes each one by name. Deliberately not under `/opt/sbx`, which the *agent's* cage already
+/// uses for its own furniture (the proc shim, the fonts config, the egress CA): the two cages
+/// never meet, but one prefix meaning two unrelated things is a trap for a later reader.
+const CAGE_PROGRAMS: &str = "/run/sbx-programs";
+
 /// Run `plugin` to resolve `reff`, returning its raw stdout on success (the caller classifies
 /// empty-as-absent). Fails closed: a non-zero exit, a runner that cannot spawn, or non-UTF-8
 /// output is a hard error naming the resolver — never the secret, and never the resolver's stdout.
@@ -62,7 +68,8 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
     })?;
 
     let allow_env = resolve_allow_env(&plugin.sandbox.allow_env);
-    let spec = cage_spec(plugin, reff, &allow_env).map_err(|e| {
+    let programs = resolve_programs(plugin)?;
+    let spec = cage_spec(plugin, reff, &allow_env, &programs).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -188,13 +195,68 @@ fn resolve_allow_env(keys: &[String]) -> Vec<(String, String)> {
     out
 }
 
-/// Build the cage for one resolver run. Pure: a plugin grant and the already-resolved
-/// `allow_env` values in, a [`SandboxSpec`] out, so the bind/env/network shape is testable
-/// without launching bubblewrap.
+/// Locate every program the manifest declares, on **sbx's own `PATH`** — the one the user's
+/// shell hands us, so a tool found by the user is found by the resolver, whatever installed it.
+/// Returns each name with the path to bind, or fails closed naming what is missing.
+///
+/// The resolved binary enters the trusted computing base: it is `execve`d inside the resolver's
+/// cage, on the plaintext path. So each candidate is held to the verdict sbx applies to an engine
+/// it picks off `PATH` ([`crate::store::host_exec_verdict`]): a regular file, owned by us or by
+/// root, not world-writable. Every match is scanned rather than just the first, so a
+/// world-writable early entry does not shadow a legitimate binary further down `PATH` — it is
+/// skipped, with a warning, exactly as the engine lookup does.
+///
+/// The path is canonicalized because binding the *symlink* would bind a dangling name: a nix
+/// profile's `bin/x` points into `/nix/store`, which the cage does not have.
+fn resolve_programs(plugin: &ResolverPlugin) -> io::Result<Vec<(String, PathBuf)>> {
+    let mut out = Vec::with_capacity(plugin.sandbox.programs.len());
+    for name in &plugin.sandbox.programs {
+        let Some(path) = locate_program(name) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "the `{}` resolver plugin needs the program `{name}`, which is not on \
+                     sbx's PATH — install it, or add its directory to PATH before running sbx",
+                    plugin.scheme
+                ),
+            ));
+        };
+        out.push((name.clone(), path));
+    }
+    Ok(out)
+}
+
+/// The path a declared program resolves to, or `None` when nothing usable is on `PATH`. Shared
+/// with `sbx plugins info`, so what a user is shown is what a launch would bind — a second
+/// lookup would be a second chance to disagree.
+pub(crate) fn locate_program(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let euid = unsafe { libc::geteuid() };
+    for cand in crate::pathfind::find_all_on_path(name) {
+        let Ok(meta) = std::fs::metadata(&cand) else {
+            continue;
+        };
+        match crate::store::host_exec_verdict(meta.uid(), meta.mode(), euid) {
+            // Canonicalized: binding the *symlink* would bind a dangling name, since a nix
+            // profile's `bin/x` points into `/nix/store`, which the cage does not have.
+            Ok(()) => return std::fs::canonicalize(&cand).ok().or(Some(cand)),
+            Err(why) => crate::diag::warn(&format!(
+                "ignoring {} for the program `{name}` ({why})",
+                cand.display()
+            )),
+        }
+    }
+    None
+}
+
+/// Build the cage for one resolver run. Pure: a plugin grant, the already-resolved `allow_env`
+/// values and the already-located `programs` in, a [`SandboxSpec`] out, so the bind/env/network
+/// shape is testable without launching bubblewrap.
 fn cage_spec(
     plugin: &ResolverPlugin,
     reff: &str,
     allow_env: &[(String, String)],
+    programs: &[(String, PathBuf)],
 ) -> Result<SandboxSpec, SpecError> {
     let ro = |p: &str| Mount::RoBind {
         src: PathBuf::from(p),
@@ -252,6 +314,18 @@ fn cage_spec(
         });
     }
 
+    // The declared programs, each bound read-only under one directory that the cage's `PATH`
+    // starts with, so the plugin calls the tool by name and never has to guess where a package
+    // manager put it. `RoBind` rather than `RoBindTry`: the path was just resolved, so a failure
+    // to bind it is a real fault and not a portability allowance. Same layering rule as the
+    // grant paths above — after the structural pseudo-filesystems, never before.
+    for (name, host) in programs {
+        mounts.push(Mount::RoBind {
+            src: host.clone(),
+            dest: PathBuf::from(CAGE_PROGRAMS).join(name),
+        });
+    }
+
     // A network grant shares the host network and binds the DNS + TLS files a resolver needs to
     // reach a remote secret store; without it the cage gets an empty network namespace (no egress
     // at all — fail-closed). The files are `try`, so a host missing one does not fail the launch.
@@ -273,7 +347,15 @@ fn cage_spec(
     // identity always wins over a manifest that happens to name them (self-harm at worst).
     let mut env: Vec<(String, String)> = allow_env.to_vec();
     env.push(("HOME".to_string(), CAGE_HOME.to_string()));
-    env.push(("PATH".to_string(), "/usr/bin:/bin".to_string()));
+    // The programs directory leads the cage's `PATH` when the manifest declares any, so a
+    // declared tool wins over a same-named one in the host userland: the plugin runs the binary
+    // sbx resolved and vetted, not whatever `/usr/bin` happens to hold.
+    let path = if programs.is_empty() {
+        "/usr/bin:/bin".to_string()
+    } else {
+        format!("{CAGE_PROGRAMS}:/usr/bin:/bin")
+    };
+    env.push(("PATH".to_string(), path));
 
     SandboxSpec::new(
         PathBuf::from(CAGE_HOME),
@@ -307,6 +389,7 @@ mod tests {
     fn cage_spec_isolates_the_network_and_passes_the_ref_as_argv1() {
         let dir = TmpDir::new();
         let grant = SandboxGrant {
+            programs: vec![],
             allow_paths: vec![PathBuf::from("/home/u/.gnupg")],
             allow_env: vec![],
             network: false,
@@ -316,6 +399,7 @@ mod tests {
             &p,
             "test://secret",
             &[("GNUPGHOME".into(), "/home/u/.gnupg".into())],
+            &[],
         )
         .expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
@@ -356,11 +440,13 @@ mod tests {
     fn cage_spec_shares_the_network_and_binds_dns_tls_under_a_network_grant() {
         let dir = TmpDir::new();
         let grant = SandboxGrant {
+            programs: vec![],
             allow_paths: vec![],
             allow_env: vec![],
             network: true,
         };
-        let spec = cage_spec(&plugin_in(dir.path(), grant), "vault://x", &[]).expect("valid spec");
+        let spec =
+            cage_spec(&plugin_in(dir.path(), grant), "vault://x", &[], &[]).expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
@@ -368,6 +454,66 @@ mod tests {
         );
         assert!(contains_pair(&argv, "--ro-bind-try", "/etc/resolv.conf"));
         assert!(contains_pair(&argv, "--ro-bind-try", "/etc/ssl"));
+    }
+
+    #[test]
+    fn cage_spec_binds_declared_programs_and_leads_the_cage_path_with_them() {
+        let dir = TmpDir::new();
+        let grant = SandboxGrant {
+            programs: vec!["vault".to_string()],
+            ..SandboxGrant::default()
+        };
+        let p = plugin_in(dir.path(), grant);
+        // The runner resolved it to a store path a nix profile would have symlinked to; the cage
+        // must see it under its own name, not under that one.
+        let resolved = PathBuf::from("/nix/store/abc-vault-1.2.3/bin/vault");
+        let spec = cage_spec(
+            &p,
+            "test://x",
+            &[],
+            &[("vault".to_string(), resolved.clone())],
+        )
+        .expect("valid spec");
+        let argv = super::super::argv::to_argv(&spec);
+        let env = super::super::argv::env_args(&spec);
+
+        assert!(
+            argv.windows(3).any(|w| w[0] == "--ro-bind"
+                && w[1] == resolved.as_os_str()
+                && w[2] == "/run/sbx-programs/vault"),
+            "the resolved binary is bound under its plain name: {argv:?}"
+        );
+        assert!(
+            contains_setenv(&env, "PATH", "/run/sbx-programs:/usr/bin:/bin"),
+            "the programs directory leads the cage PATH: {env:?}"
+        );
+        // The tmpfs must still precede it, as it does for the grant paths.
+        let tmpfs = argv.iter().position(|a| a == "--tmpfs").expect("tmpfs");
+        let bind = argv
+            .iter()
+            .position(|a| a == "/run/sbx-programs/vault")
+            .expect("program bind");
+        assert!(tmpfs < bind, "structural mounts come first: {argv:?}");
+    }
+
+    #[test]
+    fn cage_spec_leaves_the_path_alone_when_no_program_is_declared() {
+        let dir = TmpDir::new();
+        let spec = cage_spec(
+            &plugin_in(dir.path(), SandboxGrant::default()),
+            "test://x",
+            &[],
+            &[],
+        )
+        .expect("valid spec");
+        let env = super::super::argv::env_args(&spec);
+        assert!(contains_setenv(&env, "PATH", "/usr/bin:/bin"), "{env:?}");
+        assert!(
+            !super::super::argv::to_argv(&spec)
+                .iter()
+                .any(|a| a.to_string_lossy().contains("sbx-programs")),
+            "no programs directory is created for a plugin that declares none"
+        );
     }
 
     // --- helpers over the bwrap argv ------------------------------------------------
@@ -394,12 +540,59 @@ mod tests {
 
     /// Stage an executable fake resolver `resolve` in a fresh plugin directory.
     fn fake_resolver(body: &str) -> (TmpDir, ResolverPlugin) {
+        fake_resolver_with(body, SandboxGrant::default())
+    }
+
+    /// The same, under a chosen grant.
+    fn fake_resolver_with(body: &str, grant: SandboxGrant) -> (TmpDir, ResolverPlugin) {
         let dir = TmpDir::new();
         let exec = dir.join("resolve");
         std::fs::write(&exec, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let p = plugin_in(dir.path(), SandboxGrant::default());
+        let p = plugin_in(dir.path(), grant);
         (dir, p)
+    }
+
+    #[test]
+    fn run_binds_a_declared_program_so_the_plugin_calls_it_by_name() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        // `env` exists on every host this runs on, so what the test pins is not its presence but
+        // where the cage resolves it: the bound copy, not the one in the host userland. That is
+        // the whole point of the mechanism — a plugin never has to know where a tool was installed.
+        let (_dir, p) = fake_resolver_with(
+            "command -v env",
+            SandboxGrant {
+                programs: vec!["env".to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        let out = run(&bwrap, &p, "test://x").expect("the resolver should run");
+        assert_eq!(out.trim_end(), "/run/sbx-programs/env");
+    }
+
+    #[test]
+    fn run_fails_closed_when_a_declared_program_is_not_on_the_path() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let (_dir, p) = fake_resolver_with(
+            "printf x",
+            SandboxGrant {
+                programs: vec!["sbx-no-such-program".to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        let err = run(&bwrap, &p, "test://x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sbx-no-such-program") && msg.contains("PATH"),
+            "the refusal names the program and the remedy: {msg}"
+        );
     }
 
     #[test]

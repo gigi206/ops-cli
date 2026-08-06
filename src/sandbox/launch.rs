@@ -3247,6 +3247,9 @@ fn prepare_in(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared, Ex
         );
         return Err(ExitCode::FAILURE);
     }
+    // A cage is going to run, so this is where the scopes of the cages that already finished are
+    // reclaimed. Every launch path reaches this function, and the sweep runs once per process.
+    super::cgroup::sweep_stale_scopes();
     let Some(nix) = crate::store::resolve_nix(Some(&layout)) else {
         return Err(missing("nix (the store engine)"));
     };
@@ -3562,8 +3565,14 @@ fn build(
     for kind in super::prebuilt::RESOLVE_ORDER {
         for (name, command) in kind.resolve_packages(&prep.cfg.packages) {
             let libs = super::prebuilt::libs_of(&prep.cfg.packages, &name);
-            match super::prebuilt::provision_resolve(kind, &ctx, &name, &command, &resolve_cage, &libs)
-            {
+            match super::prebuilt::provision_resolve(
+                kind,
+                &ctx,
+                &name,
+                &command,
+                &resolve_cage,
+                &libs,
+            ) {
                 Ok((bin, root)) => {
                     bin_paths.push(bin);
                     packages.roots.push(root);

@@ -164,15 +164,24 @@ pub(crate) fn verdict_exec(mode: u32, file_uid: u32, euid: u32) -> Result<(), St
     Ok(())
 }
 
-/// The host-side least-privilege grant a resolver runs under: the extra read-only paths it
-/// needs, the host environment variables to pass through, and whether it may reach the
-/// network. The runner supplies a structural environment (a minimal PATH, a read-only host
-/// userland, `HOME`, and — under `network` — DNS/TLS files) on top of this; the grant
-/// declares only the resolver-specific extra.
+/// The host-side least-privilege grant a resolver runs under: the host programs it runs, the
+/// extra read-only paths it needs, the host environment variables to pass through, and whether
+/// it may reach the network. The runner supplies a structural environment (a minimal PATH, a
+/// read-only host userland, `HOME`, and — under `network` — DNS/TLS files) on top of this; the
+/// grant declares only the resolver-specific extra.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SandboxGrant {
+    /// Host programs the plugin runs, by **name**. The runner locates each on sbx's own `PATH`
+    /// and binds the resolved binary into the cage, on the cage's `PATH`, so the plugin calls it
+    /// by name. This is what a manifest declares instead of guessing install locations in
+    /// `allow_paths`: where a tool lives is a property of the machine, not of the plugin, and
+    /// enumerating candidates is at once too wide (a nix profile's binaries are symlinks into
+    /// the store, so the whole store had to be bound to reach one of them) and too narrow (no
+    /// list covers every package manager).
+    pub(crate) programs: Vec<String>,
     /// Extra host paths bound read-only, each absolute after expanding a leading `~`/`$HOME`
-    /// or `$XDG_RUNTIME_DIR`.
+    /// or `$XDG_RUNTIME_DIR`. For the plugin's **data** — a token file, a database, a socket;
+    /// a binary belongs in `programs`.
     pub(crate) allow_paths: Vec<PathBuf>,
     /// Host environment variable names passed through into the otherwise-cleared environment.
     pub(crate) allow_env: Vec<String>,
@@ -320,7 +329,13 @@ impl PluginRegistry {
 
 /// The raw `plugin.toml` manifest, before validation. Every field is optional so a missing
 /// one yields a precise "missing X" error rather than a generic parse failure.
+///
+/// Unknown fields are **refused**, here and in [`RawSandbox`]. A manifest is a security
+/// declaration read by a machine, so a key nothing reads is never a harmless extra: a
+/// misspelled `program` or `allow_path` would otherwise be accepted in silence and leave the
+/// author believing they had granted (or withheld) something they had not.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawManifest {
     name: Option<String>,
     #[serde(rename = "type")]
@@ -335,7 +350,10 @@ struct RawManifest {
 
 /// The raw `[sandbox]` table, before path expansion and key validation.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSandbox {
+    #[serde(default)]
+    programs: Vec<String>,
     #[serde(default)]
     allow_paths: Vec<String>,
     #[serde(default)]
@@ -376,6 +394,9 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
     let exec = raw.exec.ok_or("missing `exec`")?;
     let exec = resolve_exec(dir, &exec)?;
 
+    for program in &raw.sandbox.programs {
+        validate_program_name(program)?;
+    }
     let mut allow_paths = Vec::with_capacity(raw.sandbox.allow_paths.len());
     for entry in &raw.sandbox.allow_paths {
         allow_paths.push(expand_allow_path(entry, exp)?);
@@ -392,6 +413,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
         dir: dir.to_path_buf(),
         exec,
         sandbox: SandboxGrant {
+            programs: raw.sandbox.programs,
             allow_paths,
             allow_env: raw.sandbox.allow_env,
             network: raw.sandbox.network,
@@ -454,6 +476,32 @@ fn resolve_exec(dir: &Path, exec: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(dir.join(rel))
+}
+
+/// Validate a `programs` entry: a bare executable **name**, never a path. It is used twice, and
+/// both uses demand it: as the needle for a `PATH` lookup, and as the file name the resolved
+/// binary is bound under inside the cage. A separator or a `.`/`..` component would let a
+/// manifest name a binary outside the search (or a destination outside the programs directory),
+/// and a leading dot would hide it from the cage's `PATH` lookup.
+pub(crate) fn validate_program_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a `programs` entry is empty".to_string());
+    }
+    if name.starts_with('.') {
+        return Err(format!(
+            "`programs` entry `{name}` must not start with a dot"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+    {
+        return Err(format!(
+            "`programs` entry `{name}` must be a bare program name \
+             (letters, digits, `.`, `_`, `-`, `+`; no path)"
+        ));
+    }
+    Ok(())
 }
 
 /// The home and runtime directories used to expand a leading `~`/`$HOME`/`$XDG_RUNTIME_DIR` in
@@ -1152,6 +1200,74 @@ mod tests {
                 .any(|w| w.contains("unsupported plugin type")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn loads_declared_programs() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "vault",
+            r#"
+                type   = "resolver"
+                scheme = "vault"
+                exec   = "resolve"
+                [sandbox]
+                programs    = ["vault", "curl"]
+                allow_paths = ["~/.vault-token"]
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let p = reg.resolver("vault").expect("vault resolver");
+        assert_eq!(p.sandbox.programs, vec!["vault".to_string(), "curl".into()]);
+        // A binary belongs in `programs`; `allow_paths` keeps only the data.
+        assert_eq!(
+            p.sandbox.allow_paths,
+            vec![PathBuf::from("/home/u/.vault-token")]
+        );
+    }
+
+    #[test]
+    fn a_program_that_is_a_path_is_refused() {
+        // A path here would name a binary the `PATH` search never chose, and a `..` would land the
+        // bind outside the cage's programs directory.
+        for bad in ["/usr/bin/vault", "../vault", "sub/vault", ".hidden"] {
+            let root = crate::testutil::TmpDir::new();
+            write_plugin(
+                root.path(),
+                "p",
+                &format!(
+                    "type = \"resolver\"\nscheme = \"p\"\nexec = \"resolve\"\n\
+                     [sandbox]\nprograms = [\"{bad}\"]\n"
+                ),
+            );
+            let (reg, warnings) = load(root.path());
+            assert!(reg.resolver("p").is_none(), "`{bad}` must be refused");
+            assert!(
+                warnings.iter().any(|w| w.contains("programs")),
+                "the refusal names the field for `{bad}`: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_manifest_field_is_refused_rather_than_ignored() {
+        // A manifest is a security declaration: a key nothing reads must not pass in silence, or a
+        // misspelled `program`/`allow_path` leaves the author believing they granted something.
+        for manifest in [
+            "type = \"resolver\"\nscheme = \"p\"\nexec = \"resolve\"\naliases = [\"q\"]\n",
+            "type = \"resolver\"\nscheme = \"p\"\nexec = \"resolve\"\n[sandbox]\nprogram = [\"x\"]\n",
+        ] {
+            let root = crate::testutil::TmpDir::new();
+            write_plugin(root.path(), "p", manifest);
+            let (reg, warnings) = load(root.path());
+            assert!(reg.resolver("p").is_none(), "{manifest}");
+            assert!(
+                warnings.iter().any(|w| w.contains("invalid plugin.toml")),
+                "{warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -2039,5 +2155,4 @@ mod tests {
         assert!(err.contains("no plugin.toml"), "{err}");
         assert!(stray.exists(), "a non-plugin directory must be left intact");
     }
-
 }

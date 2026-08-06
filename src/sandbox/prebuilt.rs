@@ -809,7 +809,16 @@ pub(crate) fn provision_resolve_pinned(
     else {
         return Ok(None);
     };
-    build_pinned(kind, ctx, project_id.as_str(), name, &pin.url, &pin.hash, libs).map(Some)
+    build_pinned(
+        kind,
+        ctx,
+        project_id.as_str(),
+        name,
+        &pin.url,
+        &pin.hash,
+        libs,
+    )
+    .map(Some)
 }
 
 /// The outcome of re-resolving one declared reference during `sbx upgrade`. `url` is the lock *key*
@@ -1448,7 +1457,10 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             ("GIO_EXTRA_MODULES", GIO_SEARCH_PATH),
             ("XDG_DATA_DIRS", XDG_DATA_SEARCH_PATH),
         ] {
-            assert!(wrap.contains(&format!("--prefix {var} : ")), "{var} missing");
+            assert!(
+                wrap.contains(&format!("--prefix {var} : ")),
+                "{var} missing"
+            );
             assert!(wrap.contains(expr), "{var} points nowhere");
         }
         assert!(!wrap.contains('@'), "unfilled placeholder in:\n{wrap}");
