@@ -508,7 +508,8 @@ fn upgrade_deb_packages(
             return false;
         }
     };
-    for line in deb_upgrade_summary(&outcomes, sandbox::withheld_deb_packages(cfg), pal) {
+    for line in prebuilt_upgrade_summary("deb", &outcomes, sandbox::withheld_deb_packages(cfg), pal)
+    {
         println!("{line}");
     }
     !outcomes
@@ -523,11 +524,17 @@ fn short_hash(hash: &str) -> &str {
     &body[..body.len().min(8)]
 }
 
-/// The human-readable summary of a deb roll: one line per declared URL (newly pinned, rolled,
-/// unchanged, or failed) plus the entries pruned, and a note for any reference withheld for being
-/// untrusted. Pure, so every outcome is unit-tested without invoking nix.
-fn deb_upgrade_summary(
-    outcomes: &[sandbox::DebUpgrade],
+/// The human-readable summary of a prebuilt roll, shared by the three backends that pin a URL to a
+/// content hash — `deb:`, `appimage:` and `tarball:`, whose outcomes are one and the same type. One
+/// line per declared URL (newly pinned, rolled, unchanged, or failed) plus the entries pruned, and a
+/// note for any reference withheld for being untrusted (so an untrusted project does not read as
+/// "none declared"). `kind` is the backend's own word and the only thing that separates the three
+/// reports: it names the heading, the token each line carries, and both notes — the same way
+/// `channel_upgrade_summary` below is told its heading rather than being written twice. Pure, so
+/// every outcome is unit-tested without invoking nix.
+fn prebuilt_upgrade_summary(
+    kind: &str,
+    outcomes: &[sandbox::PrebuiltUpgrade],
     withheld: usize,
     pal: &style::Palette,
 ) -> Vec<String> {
@@ -535,11 +542,11 @@ fn deb_upgrade_summary(
     let (h, n, ok, warn, err, dim, r) = (
         pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
     );
-    let mut lines = vec![format!("{h}sbx upgrade — deb packages{r}")];
+    let mut lines = vec![format!("{h}sbx upgrade — {kind} packages{r}")];
     let withheld_note = || {
         style::prose(
             &format!(
-                "  {warn}{withheld} deb: package(s) withheld (untrusted){r} — not rolled; \
+                "  {warn}{withheld} {kind}: package(s) withheld (untrusted){r} — not rolled; \
                  run `sbx trust`."
             ),
             pal,
@@ -549,34 +556,30 @@ fn deb_upgrade_summary(
         lines.push(if withheld > 0 {
             withheld_note()
         } else {
-            format!("  {dim}no deb: packages to roll.{r}")
+            format!("  {dim}no {kind}: packages to roll.{r}")
         });
         return lines;
     }
     for outcome in outcomes {
         lines.push(match outcome {
-            Unchanged { url, hash } => {
-                format!(
-                    "  {n}deb:{url}{r}: {n}{}{r} — {dim}unchanged.{r}",
-                    short_hash(hash)
-                )
-            }
+            Unchanged { url, hash } => format!(
+                "  {n}{kind}:{url}{r}: {n}{}{r} — {dim}unchanged.{r}",
+                short_hash(hash)
+            ),
             Rolled { url, from, to } => format!(
-                "  {n}deb:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
+                "  {n}{kind}:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
                 short_hash(from),
                 short_hash(to)
             ),
-            Pinned { url, hash } => {
-                format!(
-                    "  {n}deb:{url}{r}: {n}{}{r} — {ok}newly pinned.{r}",
-                    short_hash(hash)
-                )
-            }
+            Pinned { url, hash } => format!(
+                "  {n}{kind}:{url}{r}: {n}{}{r} — {ok}newly pinned.{r}",
+                short_hash(hash)
+            ),
             Pruned { url } => {
-                format!("  {n}deb:{url}{r}: {dim}removed from the lock (no longer declared).{r}")
+                format!("  {n}{kind}:{url}{r}: {dim}removed from the lock (no longer declared).{r}")
             }
             Failed { url, error } => {
-                format!("  {n}deb:{url}{r}: {err}re-resolve failed{r} — {error}")
+                format!("  {n}{kind}:{url}{r}: {err}re-resolve failed{r} — {error}")
             }
         });
     }
@@ -586,6 +589,9 @@ fn deb_upgrade_summary(
     lines
 }
 
+/// Roll the project's and apps' `appimage:` `[packages]` — the `deb:` twin, re-resolving each
+/// `.AppImage` URL to its current content hash and rewriting the per-project appimage lock. Returns
+/// whether every reference re-resolved.
 fn upgrade_appimage_packages(
     nix: &Path,
     layout: &store::Layout,
@@ -600,7 +606,12 @@ fn upgrade_appimage_packages(
             return false;
         }
     };
-    for line in appimage_upgrade_summary(&outcomes, sandbox::withheld_appimage_packages(cfg), pal) {
+    for line in prebuilt_upgrade_summary(
+        "appimage",
+        &outcomes,
+        sandbox::withheld_appimage_packages(cfg),
+        pal,
+    ) {
         println!("{line}");
     }
     !outcomes
@@ -608,67 +619,9 @@ fn upgrade_appimage_packages(
         .any(|o| matches!(o, sandbox::AppImageUpgrade::Failed { .. }))
 }
 
-/// The human-readable summary of an appimage roll — the `deb:` twin (one line per declared URL:
-/// newly pinned, rolled, unchanged, or failed; plus the entries pruned and a withheld note). Pure,
-/// so every outcome is unit-tested without invoking nix.
-fn appimage_upgrade_summary(
-    outcomes: &[sandbox::AppImageUpgrade],
-    withheld: usize,
-    pal: &style::Palette,
-) -> Vec<String> {
-    use sandbox::PrebuiltUpgrade::*;
-    let (h, n, ok, warn, err, dim, r) = (
-        pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
-    );
-    let mut lines = vec![format!("{h}sbx upgrade — appimage packages{r}")];
-    let withheld_note = || {
-        style::prose(
-            &format!(
-                "  {warn}{withheld} appimage: package(s) withheld (untrusted){r} — not rolled; \
-                 run `sbx trust`."
-            ),
-            pal,
-        )
-    };
-    if outcomes.is_empty() {
-        lines.push(if withheld > 0 {
-            withheld_note()
-        } else {
-            format!("  {dim}no appimage: packages to roll.{r}")
-        });
-        return lines;
-    }
-    for outcome in outcomes {
-        lines.push(match outcome {
-            Unchanged { url, hash } => format!(
-                "  {n}appimage:{url}{r}: {n}{}{r} — {dim}unchanged.{r}",
-                short_hash(hash)
-            ),
-            Rolled { url, from, to } => format!(
-                "  {n}appimage:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
-                short_hash(from),
-                short_hash(to)
-            ),
-            Pinned { url, hash } => format!(
-                "  {n}appimage:{url}{r}: {n}{}{r} — {ok}newly pinned.{r}",
-                short_hash(hash)
-            ),
-            Pruned { url } => {
-                format!(
-                    "  {n}appimage:{url}{r}: {dim}removed from the lock (no longer declared).{r}"
-                )
-            }
-            Failed { url, error } => {
-                format!("  {n}appimage:{url}{r}: {err}re-resolve failed{r} — {error}")
-            }
-        });
-    }
-    if withheld > 0 {
-        lines.push(withheld_note());
-    }
-    lines
-}
-
+/// Roll the project's and apps' `tarball:` `[packages]` — the `deb:` twin, re-resolving each archive
+/// URL to its current content hash and rewriting the per-project tarball lock. Returns whether every
+/// reference re-resolved.
 fn upgrade_tarball_packages(
     nix: &Path,
     layout: &store::Layout,
@@ -683,73 +636,17 @@ fn upgrade_tarball_packages(
             return false;
         }
     };
-    for line in tarball_upgrade_summary(&outcomes, sandbox::withheld_tarball_packages(cfg), pal) {
+    for line in prebuilt_upgrade_summary(
+        "tarball",
+        &outcomes,
+        sandbox::withheld_tarball_packages(cfg),
+        pal,
+    ) {
         println!("{line}");
     }
     !outcomes
         .iter()
         .any(|o| matches!(o, sandbox::TarballUpgrade::Failed { .. }))
-}
-
-/// The human-readable summary of a tarball roll — the `deb:`/`appimage:` twin (one line per declared
-/// URL: newly pinned, rolled, unchanged, or failed; plus the entries pruned and a withheld note).
-/// Pure, so every outcome is unit-tested without invoking nix.
-fn tarball_upgrade_summary(
-    outcomes: &[sandbox::TarballUpgrade],
-    withheld: usize,
-    pal: &style::Palette,
-) -> Vec<String> {
-    use sandbox::PrebuiltUpgrade::*;
-    let (h, n, ok, warn, err, dim, r) = (
-        pal.head, pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset,
-    );
-    let mut lines = vec![format!("{h}sbx upgrade — tarball packages{r}")];
-    let withheld_note = || {
-        style::prose(
-            &format!(
-                "  {warn}{withheld} tarball: package(s) withheld (untrusted){r} — not rolled; \
-                 run `sbx trust`."
-            ),
-            pal,
-        )
-    };
-    if outcomes.is_empty() {
-        lines.push(if withheld > 0 {
-            withheld_note()
-        } else {
-            format!("  {dim}no tarball: packages to roll.{r}")
-        });
-        return lines;
-    }
-    for outcome in outcomes {
-        lines.push(match outcome {
-            Unchanged { url, hash } => format!(
-                "  {n}tarball:{url}{r}: {n}{}{r} — {dim}unchanged.{r}",
-                short_hash(hash)
-            ),
-            Rolled { url, from, to } => format!(
-                "  {n}tarball:{url}{r}: {n}{}{r} → {n}{}{r} — {ok}rolled forward.{r}",
-                short_hash(from),
-                short_hash(to)
-            ),
-            Pinned { url, hash } => format!(
-                "  {n}tarball:{url}{r}: {n}{}{r} — {ok}newly pinned.{r}",
-                short_hash(hash)
-            ),
-            Pruned { url } => {
-                format!(
-                    "  {n}tarball:{url}{r}: {dim}removed from the lock (no longer declared).{r}"
-                )
-            }
-            Failed { url, error } => {
-                format!("  {n}tarball:{url}{r}: {err}re-resolve failed{r} — {error}")
-            }
-        });
-    }
-    if withheld > 0 {
-        lines.push(withheld_note());
-    }
-    lines
 }
 
 /// The human-readable summary of a channel-style roll (the nix channel or the mise
@@ -1189,6 +1086,7 @@ mod tests {
 
         // an empty roll (no flake: packages) says so plainly
         let empty = flake_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
+        assert!(empty.starts_with("sbx upgrade — flake packages"));
         assert!(empty.contains("no flake: packages"));
 
         // an empty roll on an untrusted project names the withheld package instead of "none"
@@ -1271,19 +1169,21 @@ mod tests {
     }
 
     #[test]
-    fn deb_upgrade_summary_distinguishes_the_outcomes() {
+    fn prebuilt_upgrade_summary_distinguishes_the_outcomes_for_deb() {
         use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no deb: packages) says so plainly; an untrusted one names the withheld
-        let empty = deb_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
+        let empty = prebuilt_upgrade_summary("deb", &[], 0, &style::Palette::plain()).join("\n");
+        assert!(empty.starts_with("sbx upgrade — deb packages"));
         assert!(empty.contains("no deb: packages"));
-        let withheld = deb_upgrade_summary(&[], 1, &style::Palette::plain()).join("\n");
+        let withheld = prebuilt_upgrade_summary("deb", &[], 1, &style::Palette::plain()).join("\n");
         assert!(withheld.contains("1 deb: package(s) withheld (untrusted)"));
         assert!(!withheld.contains("no deb: packages"));
 
         let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
         let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
-        let text = deb_upgrade_summary(
+        let text = prebuilt_upgrade_summary(
+            "deb",
             &[
                 Unchanged {
                     url: "https://e/a.deb".into(),
@@ -1315,22 +1215,46 @@ mod tests {
         assert!(text.contains("deb:https://e/c.deb: XH0ykkcZ — newly pinned"));
         assert!(text.contains("deb:https://e/old.deb: removed from the lock"));
         assert!(text.contains("deb:https://e/d.deb: re-resolve failed — prefetch unreachable"));
+
+        // The withheld note also rides *after* a roll that did happen, not only in place of the
+        // "none declared" line. Colored: the URL rides the name span, the note rides warn.
+        let p = style::Palette::colored();
+        let colored = prebuilt_upgrade_summary(
+            "deb",
+            &[Pinned {
+                url: "https://e/c.deb".into(),
+                hash: h_b.into(),
+            }],
+            2,
+            &p,
+        )
+        .join("\n");
+        assert!(colored.contains(&format!("{}deb:https://e/c.deb{}", p.name, p.reset)));
+        assert!(colored.contains(&format!("{}newly pinned.{}", p.ok, p.reset)));
+        assert!(colored.contains(&format!(
+            "{}2 deb: package(s) withheld (untrusted){}",
+            p.warn, p.reset
+        )));
     }
 
     #[test]
-    fn appimage_upgrade_summary_distinguishes_the_outcomes() {
+    fn prebuilt_upgrade_summary_distinguishes_the_outcomes_for_appimage() {
         use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no appimage: packages) says so plainly; an untrusted one names the withheld
-        let empty = appimage_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
+        let empty =
+            prebuilt_upgrade_summary("appimage", &[], 0, &style::Palette::plain()).join("\n");
+        assert!(empty.starts_with("sbx upgrade — appimage packages"));
         assert!(empty.contains("no appimage: packages"));
-        let withheld = appimage_upgrade_summary(&[], 1, &style::Palette::plain()).join("\n");
+        let withheld =
+            prebuilt_upgrade_summary("appimage", &[], 1, &style::Palette::plain()).join("\n");
         assert!(withheld.contains("1 appimage: package(s) withheld (untrusted)"));
         assert!(!withheld.contains("no appimage: packages"));
 
         let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
         let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
-        let text = appimage_upgrade_summary(
+        let text = prebuilt_upgrade_summary(
+            "appimage",
             &[
                 Unchanged {
                     url: "https://e/a.AppImage".into(),
@@ -1365,22 +1289,41 @@ mod tests {
         assert!(text.contains("appimage:https://e/old.AppImage: removed from the lock"));
         assert!(text
             .contains("appimage:https://e/d.AppImage: re-resolve failed — prefetch unreachable"));
+
+        // The withheld note also rides *after* a roll that did happen, not only in place of the
+        // "none declared" line.
+        let trailing = prebuilt_upgrade_summary(
+            "appimage",
+            &[Pinned {
+                url: "https://e/c.AppImage".into(),
+                hash: h_b.into(),
+            }],
+            2,
+            &style::Palette::plain(),
+        )
+        .join("\n");
+        assert!(trailing.contains("appimage:https://e/c.AppImage: XH0ykkcZ — newly pinned"));
+        assert!(trailing.contains("2 appimage: package(s) withheld (untrusted)"));
     }
 
     #[test]
-    fn tarball_upgrade_summary_distinguishes_the_outcomes() {
+    fn prebuilt_upgrade_summary_distinguishes_the_outcomes_for_tarball() {
         use sandbox::PrebuiltUpgrade::*;
 
         // an empty roll (no tarball: packages) says so plainly; an untrusted one names the withheld
-        let empty = tarball_upgrade_summary(&[], 0, &style::Palette::plain()).join("\n");
+        let empty =
+            prebuilt_upgrade_summary("tarball", &[], 0, &style::Palette::plain()).join("\n");
+        assert!(empty.starts_with("sbx upgrade — tarball packages"));
         assert!(empty.contains("no tarball: packages"));
-        let withheld = tarball_upgrade_summary(&[], 1, &style::Palette::plain()).join("\n");
+        let withheld =
+            prebuilt_upgrade_summary("tarball", &[], 1, &style::Palette::plain()).join("\n");
         assert!(withheld.contains("1 tarball: package(s) withheld (untrusted)"));
         assert!(!withheld.contains("no tarball: packages"));
 
         let h_a = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
         let h_b = "sha256-XH0ykkcZdoyYdI7tQAS55CsvPwv96Tlr2lYF30qltkE=";
-        let text = tarball_upgrade_summary(
+        let text = prebuilt_upgrade_summary(
+            "tarball",
             &[
                 Unchanged {
                     url: "https://e/a.tar.gz".into(),
@@ -1414,5 +1357,20 @@ mod tests {
         assert!(
             text.contains("tarball:https://e/d.tar.gz: re-resolve failed — prefetch unreachable")
         );
+
+        // The withheld note also rides *after* a roll that did happen, not only in place of the
+        // "none declared" line.
+        let trailing = prebuilt_upgrade_summary(
+            "tarball",
+            &[Pinned {
+                url: "https://e/c.tar.gz".into(),
+                hash: h_b.into(),
+            }],
+            2,
+            &style::Palette::plain(),
+        )
+        .join("\n");
+        assert!(trailing.contains("tarball:https://e/c.tar.gz: XH0ykkcZ — newly pinned"));
+        assert!(trailing.contains("2 tarball: package(s) withheld (untrusted)"));
     }
 }
