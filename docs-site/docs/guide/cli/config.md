@@ -165,7 +165,7 @@ Every field of the schema, and the verb that edits it. `<name>` is yours to choo
 |---|---|---|
 | `network.allow`, `network.deny` | [`sbx net allow` / `deny`](net) | [`sbx net unallow` / `undeny`](net) or `sbx config rm` |
 | `network.mute` | [`sbx net mute`](net) | [`sbx net unmute`](net) or `sbx config rm` |
-| `proc.allow`, `proc.deny` | [`sbx proc allow` / `deny`](proc) | `sbx config rm` (there is no `sbx proc` removal verb) |
+| `proc.allow`, `proc.deny` | [`sbx proc allow` / `deny`](proc) | [`sbx proc unallow` / `undeny`](proc) or `sbx config rm` |
 
 `[network]` and `[proc]` gate their rules behind a posture, and those verbs carry the
 matrix: they bootstrap the restrictive posture when there is none, refuse a rule that

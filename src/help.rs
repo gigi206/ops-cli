@@ -357,7 +357,8 @@ const PAGES: &[Page] = &[
             order, each with its enforcement verdict when the session is enforcing. `sbx proc pending`\n\
             lists — and decides — the execs an `ask`-mode session has parked. `sbx proc allow`/`deny`\n\
             persist an exec rule to a config file's `[proc]` list — or, with `--session`, load it into a\n\
-            running session live; `sbx proc rules` lists those live rules (the sibling of `sbx net`).\n\
+            running session live — and `sbx proc unallow`/`undeny` take a persisted one back out;\n\
+            `sbx proc rules` lists those live rules (the sibling of `sbx net`).\n\
             \n\
             Enforcement is configured by `[proc]` (a trusted-only security field): `enforce` blocks a\n\
             denied exec target before the syscall runs, `ask` parks an unmatched one for a decision.\n\
@@ -503,6 +504,35 @@ const PAGES: &[Page] = &[
             already waiting (decide that with `sbx proc pending`); it governs future execs.",
     },
     Page {
+        path: &["proc", "unallow"],
+        synopsis: "sbx proc unallow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "remove an allow rule from a config file's [proc] list (the inverse of `sbx proc allow`)",
+        options: &[
+            ("<rule>", "the allow rule to remove — an exact-string match of what was written, as `sbx config show` lists it"),
+            ("-l, --local", "edit the project .sbx.toml (the default)"),
+            ("-g, --global", "edit the global sbx.toml"),
+            ("-a, --app <name>", "edit that app's `[app.<name>.proc]`"),
+        ],
+        details:
+            "Removes an `allow` rule added by `sbx proc allow`. Idempotent: removing a rule that is\n\
+            not there is a reported no-op, not an error. Editing the project config re-trusts it\n\
+            (only when something actually changed); the global config and app profiles are trusted\n\
+            by location.\n\
+            \n\
+            This one **tightens**: an `allow` exempts a target from parking under `mode = \"ask\"`, so\n\
+            taking it out means that target parks again and waits for a decision. The mode itself is\n\
+            left alone. The add path refuses a rule that would sit inert under the current mode,\n\
+            because writing one would silently decide nothing; taking a rule out cannot create that\n\
+            state, so there is nothing to guard here.\n\
+            \n\
+            An emptied list is dropped rather than left as `allow = []`. Read the result back with\n\
+            `sbx config show`, not `sbx proc rules` — that lists the live `--session` overlay, never\n\
+            the config layer this verb edits.\n\
+            \n\
+            Config only: a rule loaded with `--session` cannot be un-loaded (the overlay takes rules\n\
+            and has no retraction), so it ends with the session rather than with this verb.",
+    },
+    Page {
         path: &["proc", "deny"],
         synopsis:
             "sbx proc deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
@@ -540,6 +570,36 @@ const PAGES: &[Page] = &[
             writes no file (no re-trust) and dies with the session; the config-scope flags do not\n\
             apply. It does not retroactively deny an `execve` already parked (decide that with\n\
             `sbx proc pending`); it governs future execs.",
+    },
+    Page {
+        path: &["proc", "undeny"],
+        synopsis: "sbx proc undeny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "remove a deny rule from a config file's [proc] list (the inverse of `sbx proc deny`)",
+        options: &[
+            ("<rule>", "the deny rule to remove — an exact-string match of what was written, as `sbx config show` lists it"),
+            ("-l, --local", "edit the project .sbx.toml (the default)"),
+            ("-g, --global", "edit the global sbx.toml"),
+            ("-a, --app <name>", "edit that app's `[app.<name>.proc]`"),
+        ],
+        details:
+            "Removes a `deny` rule added by `sbx proc deny`. Idempotent: removing a rule that is not\n\
+            there is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
+            when something actually changed); the global config and app profiles are trusted by\n\
+            location.\n\
+            \n\
+            This is the removal that **widens what may exec**, and it widens further here than its\n\
+            egress namesake does. Under `mode = \"enforce\"` the deny list is the whole blocklist:\n\
+            anything unmatched already runs, so removing the last deny leaves enforcement switched\n\
+            on and blocking nothing. There is no allowlist behind it to keep constraining, the way an\n\
+            egress policy still has one. The mode is left as it was, so this does not turn\n\
+            enforcement off; it empties what enforcement acts on.\n\
+            \n\
+            An emptied list is dropped rather than left as `deny = []`. Read the result back with\n\
+            `sbx config show`, not `sbx proc rules` — that lists the live `--session` overlay, never\n\
+            the config layer this verb edits.\n\
+            \n\
+            Config only: a rule loaded with `--session` cannot be un-loaded (the overlay takes rules\n\
+            and has no retraction), so it ends with the session rather than with this verb.",
     },
     Page {
         path: &["proc", "rules"],
@@ -1273,9 +1333,10 @@ const PAGES: &[Page] = &[
             \n\
             Unlike `add`, this works on `[network]` and `[proc]` rule lists: taking a rule out\n\
             cannot leave an inert one behind, which is the hazard `add` is redirected to avoid.\n\
-            For egress, `sbx net unallow|undeny|unmute <rule>` do the same removal in the vocabulary\n\
-            the rule was written in, and this is the lower-level route to it. For `[proc]` rule\n\
-            lists it is the only route — `sbx proc` has no removal verb.",
+            `sbx net unallow|undeny|unmute` and `sbx proc unallow|undeny` do the same removal in the\n\
+            vocabulary the rule was written in; this is the lower-level route to it. The one visible\n\
+            difference: those verbs drop a list they empty, while this keeps `deny = []` to state\n\
+            that the layer closes nothing.",
     },
     Page {
         path: &["config", "unset"],

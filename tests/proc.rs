@@ -767,6 +767,136 @@ fn proc_deny_refuses_an_untrusted_existing_project() {
     );
 }
 
+/// A `[proc]` rule is taken back out with the vocabulary it was written in. Verified by reading the
+/// file, not by `sbx proc rules` — that lists the live `--session` overlay and never the config
+/// layer these verbs edit, so it could not see the change either way.
+#[test]
+fn proc_unallow_and_undeny_round_trip_through_config() {
+    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    // `ask` is the one posture that carries both lists: an `allow` is inert (and refused) under
+    // `enforce`. Trusted up front, because a pre-existing untrusted config is refused by design.
+    std::fs::write(
+        proj.path().join(".sbx.toml"),
+        "[proc]\nmode = \"ask\"\nallow = [\"git\", \"curl\"]\ndeny = [\"ssh\"]\n",
+    )
+    .unwrap();
+    let trusted = sbx_config_write(
+        &["trust", ".sbx.toml"],
+        proj.path(),
+        state.path(),
+        config.path(),
+        data.path(),
+    );
+    assert!(
+        trusted.status.success(),
+        "the fixture must start trusted: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    for (verb, rule) in [("unallow", "git"), ("undeny", "ssh"), ("unallow", "curl")] {
+        let out = sbx_config_write(
+            &["proc", verb, rule],
+            proj.path(),
+            state.path(),
+            config.path(),
+            data.path(),
+        );
+        assert!(
+            out.status.success(),
+            "`proc {verb} {rule}` failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("removed") && stdout.contains("re-trusted"),
+            "`proc {verb}` must report the removal and the re-trust:\n{stdout}"
+        );
+        // Idempotent: a rule that is not there is a reported no-op, and the missing re-trust line is
+        // the visible half of "nothing was written".
+        let again = sbx_config_write(
+            &["proc", verb, rule],
+            proj.path(),
+            state.path(),
+            config.path(),
+            data.path(),
+        );
+        let stdout = String::from_utf8_lossy(&again.stdout);
+        assert!(
+            stdout.contains("no change") && !stdout.contains("re-trusted"),
+            "a redundant `proc {verb}` must change nothing:\n{stdout}"
+        );
+    }
+
+    // Both lists emptied: their keys are dropped rather than left as `allow = []`, and the posture
+    // survives every rule it governed. Emptying the deny list under an enforcing posture would leave
+    // enforcement on and blocking nothing, which is exactly why the mode is not touched here.
+    let body = std::fs::read_to_string(proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        !body.contains("allow") && !body.contains("deny") && !body.contains("git"),
+        "an emptied rule list must leave no residue behind:\n{body}"
+    );
+    assert!(
+        body.contains("mode = \"ask\""),
+        "the posture survives the removal of every rule it governed:\n{body}"
+    );
+}
+
+/// The removal path goes through the same admission as every other rule write: an existing project
+/// config nobody has trusted is refused, and nothing is written.
+#[test]
+fn proc_unallow_refuses_an_untrusted_existing_project() {
+    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    std::fs::write(
+        proj.path().join(".sbx.toml"),
+        "[proc]\nmode = \"ask\"\nallow = [\"git\"]\n",
+    )
+    .unwrap();
+    let out = sbx_config_write(
+        &["proc", "unallow", "git"],
+        proj.path(),
+        state.path(),
+        config.path(),
+        data.path(),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("not trusted") && err.contains("sbx trust"),
+        "an untrusted existing config must be refused, pointing at `sbx trust`:\n{err}"
+    );
+    let body = std::fs::read_to_string(proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        body.contains("git"),
+        "a refused removal must leave the rule in place:\n{body}"
+    );
+}
+
+/// Each removal verb names ITSELF when it refuses a session flag, rather than reporting a command
+/// the user never ran.
+#[test]
+fn a_proc_removal_verb_names_itself_when_it_refuses_a_session_flag() {
+    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    for verb in ["unallow", "undeny"] {
+        let out = sbx_config_write(
+            &["proc", verb, "curl", "--session"],
+            proj.path(),
+            state.path(),
+            config.path(),
+            data.path(),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`proc {verb} --session` must fail"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains(&format!("proc {verb}:")),
+            "the refusal must name `{verb}`, not another verb:\n{err}"
+        );
+    }
+}
+
 #[test]
 fn proc_allow_with_no_posture_is_refused_and_writes_nothing() {
     let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());

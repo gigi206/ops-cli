@@ -7,6 +7,8 @@ sbx proc logs    [<id>] [-f|--follow] [--json]
 sbx proc pending [allow|deny <id>]
 sbx proc allow   <rule> [-l|-g] [-a <app>] [--session [--all]]
 sbx proc deny    <rule> [-l|-g] [-a <app>] [--session [--all]]
+sbx proc unallow <rule> [-l|-g] [-a <app>]
+sbx proc undeny  <rule> [-l|-g] [-a <app>]
 sbx proc rules   [-a <app>] [--all]
 ```
 
@@ -18,7 +20,8 @@ cooperation from the cage, launching nothing. `sbx proc logs` is the **exec-even
 processes the agent spawns, in order, each with its enforcement verdict when the session is
 enforcing. `sbx proc pending` lists, and decides, the `execve`s an `ask`-mode session has parked.
 `sbx proc allow`/`deny` persist an exec rule to a config file's [`[proc]`](../configuration/proc)
-list: the sibling of [`sbx net allow`/`deny`](net).
+list, and `sbx proc unallow`/`undeny` take a persisted one back out: the sibling of
+[`sbx net allow`/`deny`](net).
 
 To set the posture for a **single launch** without editing a config, use the one-shot
 [`--proc <mode>` / `SBX_PROC`](../configuration/overrides) override: e.g. `sbx run --proc off`
@@ -223,6 +226,52 @@ current project by default; `-a <app>` / `--all` widen it, and the config-scope 
 not apply. A `--session allow` only loads into an `ask` session (it is inert under `enforce`, and is
 reported as such). It governs **future** execs: it does not un-park (`allow`) or retroactively
 refuse (`deny`) an `execve` already parked; decide those with [`pending`](#pending).
+
+## `unallow` / `undeny`
+
+```
+sbx proc unallow <rule> [-l|--local|-g|--global] [-a|--app <name>]
+sbx proc undeny  <rule> [-l|--local|-g|--global] [-a|--app <name>]
+```
+
+Take one rule back out of the config file it was written to, in the vocabulary it was
+written in. The `<rule>` is an exact-string match of what was written. Same scope
+vocabulary and the same trust gate as the add verbs: editing the project `.sbx.toml`
+re-trusts it, and only when something actually changed, while the global config and an
+`-a <name>` app profile are trusted by location. Removing a rule that is not there is a
+reported no-op rather than an error.
+
+The **posture is left alone**. The add verbs refuse a rule that would sit inert under the
+current mode, because writing one would silently decide nothing; taking a rule out cannot
+create that state, so `mode` is untouched.
+
+The two directions are not symmetric:
+
+| Verb | Effect |
+|---|---|
+| `unallow` | **tightens**: an `allow` exempts a target from parking under `ask`, so removing it makes that target park again |
+| `undeny` | **widens what may exec**, and further here than its egress namesake |
+
+Under `mode = "enforce"` the deny list is the whole blocklist: anything unmatched already
+runs, so removing the last deny leaves enforcement switched on and blocking nothing. There
+is no allowlist behind it to keep constraining, the way an egress policy still has one. The
+mode is left as it was, so this does not turn enforcement off; it empties what enforcement
+acts on.
+
+An emptied list is **dropped** rather than left as `deny = []`, which is the one visible
+difference from `sbx config rm proc.deny <rule>`, whose empty list is a deliberate statement
+that the layer closes nothing.
+
+Read the result back with [`sbx config show`](config), **not** with [`rules`](#rules): that
+lists the live `--session` overlay and never the config layer these verbs edit. There is no
+`--session` form either, because the overlay takes rules and has no retraction, so a live
+rule ends with its session.
+
+```sh
+sbx proc unallow git                 # `git` parks again under an `ask` posture
+sbx proc undeny  curl                # stop blocking `curl`
+sbx proc undeny  ssh -a claude-code  # from that app's own [proc] list
+```
 
 ## `rules`
 

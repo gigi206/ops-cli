@@ -865,23 +865,51 @@ pub(crate) enum RemoveOutcome {
 }
 
 /// Remove an egress `rule` from the `list` of the target's `[network]` table — the inverse of
-/// [`add_egress_rule`]. An absent file, an absent `[network]`, a bare-string posture (which carries
-/// no lists), or a rule simply not in the list are all a clean [`RemoveOutcome::NotPresent`], never
-/// an error, so `sbx net unmute` of something already gone is idempotent. Unlike the add path it
-/// **never creates** the app/network scaffolding — there is nothing to remove from a table that does
-/// not exist. Preserves comments/formatting and writes atomically only when it actually removed
-/// something.
+/// [`add_egress_rule`]. See [`remove_rule_from`] for what counts as a no-op.
 pub(crate) fn remove_egress_rule(
     path: &Path,
     app: Option<&str>,
     list: EgressList,
     rule: &str,
 ) -> Result<RemoveOutcome, ManageError> {
+    remove_rule_from(path, app, "network", list.key(), rule)
+}
+
+/// Remove a process/exec `rule` from the `list` of the target's `[proc]` table — the inverse of
+/// [`add_proc_rule`]. See [`remove_rule_from`] for what counts as a no-op.
+///
+/// There is no posture guard here, which is the whole asymmetry with the add path: `add_proc_rule`
+/// refuses a rule that would sit inert under the current mode (an `allow` outside `ask`, a `deny`
+/// under `off`/`observe`), because writing one would silently decide nothing. Taking a rule back out
+/// cannot create that state, so the mode is left exactly as it was.
+pub(crate) fn remove_proc_rule(
+    path: &Path,
+    app: Option<&str>,
+    list: ProcList,
+    rule: &str,
+) -> Result<RemoveOutcome, ManageError> {
+    remove_rule_from(path, app, "proc", list.key(), rule)
+}
+
+/// Take one `rule` out of the array at `key` inside the target's `table` (`network` or `proc`),
+/// under `[app.<name>]` when an app is named. An absent file, an absent table, a bare-string posture
+/// (which carries no lists), or a rule simply not in the array are all a clean
+/// [`RemoveOutcome::NotPresent`], never an error, so removing something already gone is idempotent.
+/// Unlike the add paths it **never creates** the app/table scaffolding — there is nothing to remove
+/// from a table that does not exist. Preserves comments/formatting and writes atomically only when
+/// it actually removed something.
+fn remove_rule_from(
+    path: &Path,
+    app: Option<&str>,
+    table: &str,
+    key: &str,
+    rule: &str,
+) -> Result<RemoveOutcome, ManageError> {
     if !path.exists() {
         return Ok(RemoveOutcome::NotPresent);
     }
     let mut doc = read_or_empty(path)?;
-    // Navigate to the table holding `network` WITHOUT creating anything (the add path creates the
+    // Navigate to the table's parent WITHOUT creating anything (the add paths create the
     // `[app.<name>]` scaffolding; removal must not).
     let parent = match app {
         None => Some(doc.as_table_mut()),
@@ -895,19 +923,19 @@ pub(crate) fn remove_egress_rule(
     let Some(parent) = parent else {
         return Ok(RemoveOutcome::NotPresent);
     };
-    let removed = match parent.get_mut("network") {
+    let removed = match parent.get_mut(table) {
         Some(Item::Table(t)) => {
             let hit = t
-                .get_mut(list.key())
+                .get_mut(key)
                 .and_then(Item::as_array_mut)
                 .is_some_and(|arr| remove_from_array(arr, rule));
             // Drop a now-empty list so no `mute = []` residue is left behind.
             if hit
-                && t.get(list.key())
+                && t.get(key)
                     .and_then(Item::as_array)
                     .is_some_and(Array::is_empty)
             {
-                t.remove(list.key());
+                t.remove(key);
             }
             hit
         }
@@ -916,16 +944,16 @@ pub(crate) fn remove_egress_rule(
                 .as_inline_table_mut()
                 .expect("inspected as an inline table");
             let hit = it
-                .get_mut(list.key())
+                .get_mut(key)
                 .and_then(Value::as_array_mut)
                 .is_some_and(|arr| remove_from_array(arr, rule));
             if hit
                 && it
-                    .get(list.key())
+                    .get(key)
                     .and_then(Value::as_array)
                     .is_some_and(Array::is_empty)
             {
-                it.remove(list.key());
+                it.remove(key);
             }
             hit
         }

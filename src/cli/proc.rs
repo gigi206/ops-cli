@@ -29,8 +29,14 @@ pub(crate) fn proc_cmd(args: Vec<OsString>) -> ExitCode {
         Some("logs") | Some("log") => proc_logs(&args[1..]),
         Some("pending") => proc_pending(&args[1..]),
         Some("rules") => proc_rules(&args[1..]),
+        // Each list is added to and taken back out with one vocabulary, so undoing a rule never
+        // means dropping to the schema key it was written under. The removal verbs are config-only:
+        // a `--session` overlay rule cannot be un-loaded (the control plane injects, it does not
+        // retract), so it dies with the session instead.
         Some("allow") => proc_add_rule(config::manage::ProcList::Allow, &args[1..]),
+        Some("unallow") => proc_remove_rule(config::manage::ProcList::Allow, &args[1..]),
         Some("deny") => proc_add_rule(config::manage::ProcList::Deny, &args[1..]),
+        Some("undeny") => proc_remove_rule(config::manage::ProcList::Deny, &args[1..]),
         None => {
             eprint!("{}", help::page_usage(&["proc"]).unwrap_or_default());
             ExitCode::from(2)
@@ -138,6 +144,155 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
         Err((code, message)) => {
             diag::error(&format!("sbx: {message}"));
             ExitCode::from(code)
+        }
+    }
+}
+
+/// The removal verb and the rule noun for one process/exec list: `sbx proc unallow` takes an `allow`
+/// rule back out, `undeny` a `deny`. One spelling, so the usage errors, the help lookup and the
+/// confirmation sentence cannot drift from the verb the user actually typed.
+fn removal_words(list: config::manage::ProcList) -> (&'static str, &'static str) {
+    match list {
+        config::manage::ProcList::Allow => ("unallow", "allow"),
+        config::manage::ProcList::Deny => ("undeny", "deny"),
+    }
+}
+
+/// `sbx proc unallow|undeny <rule> [--local|--global|-c <file>] [-a <app>]`: remove one exec rule
+/// from a config file — the inverse of `sbx proc allow|deny`, so a rule is undone with the
+/// vocabulary it was written in. Idempotent (removing a rule that is not there is a reported no-op,
+/// not an error); a project `.sbx.toml` write is trust-gated and re-trusted exactly like the add
+/// path. There is no `--session` form: the live overlay only takes rules
+/// ([`sandbox::proc_control::inject_proc_rule`] has no retraction), so an overlay rule dies with the
+/// session rather than being un-loaded.
+///
+/// The posture is deliberately left alone. The add path refuses a rule that would sit inert under
+/// the current mode; taking one back out cannot create that state, so `mode` is untouched.
+fn proc_remove_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode {
+    let (verb, _) = removal_words(list);
+    if args
+        .iter()
+        .any(|a| matches!(a.to_str(), Some("--session") | Some("--all")))
+    {
+        diag::error(&format!(
+            "sbx: proc {verb}: --session/--all do not apply — this removes a rule from a config file"
+        ));
+        return ExitCode::from(2);
+    }
+    let parsed = match split_scope(args) {
+        Ok(p) => p,
+        Err(e) => {
+            diag::error(&format!("sbx: {e}"));
+            return ExitCode::from(2);
+        }
+    };
+    let rule = match parsed.positionals.as_slice() {
+        [r] => r.trim().to_string(),
+        [] => {
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["proc", verb])
+            ));
+            return ExitCode::from(2);
+        }
+        _ => {
+            diag::error(&format!("sbx: proc {verb}: expected exactly one rule"));
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(name) = &parsed.app {
+        if !config::is_valid_app_name(name) {
+            diag::error(&format!("sbx: invalid app name '{name}'"));
+            return ExitCode::from(2);
+        }
+    }
+    // The rule is NOT validated here, unlike the add path. A config file may already hold a rule a
+    // later grammar would refuse, and refusing to remove it would leave the user no way out but a
+    // hand edit; matching is an exact string compare, so an invalid rule simply matches nothing.
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            diag::error(&format!("sbx: cannot read the current directory: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    match persist_proc_removal(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
+        Ok(message) => {
+            println!(
+                "{}",
+                style::prose(
+                    &message,
+                    &style::Palette::for_stream(std::io::stdout().is_terminal())
+                )
+            );
+            ExitCode::SUCCESS
+        }
+        Err((code, message)) => {
+            diag::error(&format!("sbx: {message}"));
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// Remove a process/exec `rule` from the scoped config file — the removal sibling of
+/// [`crate::persist_proc_rule`]. A rule that is not present is a reported no-op (no write, no
+/// re-trust). Same scope vocabulary, trust gate, and error codes as the add path: a `-c <file>`
+/// scope or an untrusted project config is code `2`; a trust-store/write/re-trust failure is code
+/// `1`.
+fn persist_proc_removal(
+    list: config::manage::ProcList,
+    rule: &str,
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+    base: &Path,
+) -> Result<String, (u8, String)> {
+    use config::manage::{self, RemoveOutcome};
+    let (verb, noun) = removal_words(list);
+    // The missing-store sentence is shorter than the add path's, which explains a consequence a
+    // removal does not have: a rule that is written but cannot be trusted takes no effect, while a
+    // rule that is removed is gone from the file either way.
+    let crate::RuleWrite {
+        path,
+        app_key,
+        target,
+        store,
+    } = crate::open_rule_write(
+        "proc",
+        verb,
+        "cannot determine the trust store (set XDG_STATE_HOME or HOME)",
+        scope,
+        app,
+        base,
+    )?;
+    let gated = store.is_some();
+
+    let outcome =
+        manage::remove_proc_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
+
+    match outcome {
+        RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
+        RemoveOutcome::Removed => {
+            // Re-trust only after an actual change. Fail-safe ordering: a crash between the write
+            // and the trust leaves a correct-but-untrusted file the next launch drops.
+            if let Some(store) = &store {
+                // Fully qualified: inside `cli`, a bare `trust` would bind the sibling `cli::trust`
+                // command module, not the crate-root trust store.
+                crate::trust::trust(store, &path).map_err(|e| {
+                    (
+                        1,
+                        format!(
+                            "removed the rule but could not re-trust {}: {e} — run `sbx trust {}`",
+                            path.display(),
+                            config::PROJECT_CONFIG
+                        ),
+                    )
+                })?;
+            }
+            let mut msg = format!("removed {noun} {rule} from {target}");
+            if gated {
+                msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
+            }
+            Ok(msg)
         }
     }
 }
