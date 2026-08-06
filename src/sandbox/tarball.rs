@@ -96,13 +96,13 @@ pub(crate) fn resolve_source(
 }
 
 /// The generated nix expression building one `tarball:` package: fetch the pinned `.tar.gz`, extract
-/// it, and autoPatchelf it against [`ELECTRON_LIBS`] from the pinned `nixpkgs`. The install phase is
-/// generic for an Electron layout — [`prebuilt::launcher_wrap`] locates the app directory by its
-/// `resources/` signature (a packed `resources/app.asar` or, for an asar-less VS Code fork, the
-/// `resources/app/` directory) and wraps the app's own launcher, so no
-/// per-app path is hardcoded. Every interpolated value is sbx-controlled and charset-validated
-/// (`name`, `url`, `hash`, the pinned `nixpkgs`, the `system`), so the expression carries nothing to
-/// escape; placeholders keep nix's `${…}`/`{…}` out of Rust's formatter.
+/// it, and autoPatchelf it against [`prebuilt::ELECTRON_LIBS`] from the pinned `nixpkgs`. The
+/// install phase is generic for an Electron layout — [`prebuilt::launcher_wrap`] locates the app
+/// directory by its `resources/` signature (a packed `resources/app.asar` or, for an asar-less VS
+/// Code fork, the `resources/app/` directory) and wraps the app's own launcher, so no per-app path
+/// is hardcoded. Every interpolated value is sbx-controlled and charset-validated (`name`, `url`,
+/// `hash`, the pinned `nixpkgs`, the `system`), so the expression carries nothing to escape;
+/// placeholders keep nix's `${…}`/`{…}` out of Rust's formatter.
 fn derivation_expr(
     nixpkgs: &str,
     system: &str,
