@@ -130,8 +130,21 @@ pub(crate) fn provision(
                 })?
             }
             // `mise:` is equipped in-cage by `mise use -g`; an inline `[flakes.<name>]` is built
-            // in-cage (local content); the prebuilt trio is provisioned by their own modules.
-            _ => continue,
+            // in-cage (local content); the prebuilt trio and its resolver forms are provisioned
+            // host-side by their own walk over `prebuilt::Kind`.
+            //
+            // Spelled out rather than swept by `_`: this loop is where a declared package becomes a
+            // realised one, so a new `Backend` variant landing in a catch-all would compile clean,
+            // run clean, and simply never be provisioned — the same silent-fallthrough failure the
+            // prebuilt prune universe already had to be closed against.
+            Backend::Mise(_)
+            | Backend::FlakeInline { .. }
+            | Backend::Deb(_)
+            | Backend::DebResolve { .. }
+            | Backend::AppImage(_)
+            | Backend::AppImageResolve { .. }
+            | Backend::Tarball(_)
+            | Backend::TarballResolve { .. } => continue,
         };
         bins.push(logical.join(BIN));
         roots.push(logical);
