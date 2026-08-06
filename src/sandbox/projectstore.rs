@@ -1094,7 +1094,7 @@ mod tests {
 mod smoke {
     use super::*;
     use crate::store::{self, Layout, LockTarget};
-    use crate::testutil::TmpDir;
+    use crate::testutil::{fingerprint, TmpDir};
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
 
@@ -1106,34 +1106,6 @@ mod smoke {
     fn ino(path: &Path) -> (u64, u64) {
         let m = std::fs::symlink_metadata(path).unwrap();
         (m.dev(), m.ino())
-    }
-
-    /// A sorted `(relative path, size)` fingerprint of a tree — sensitive to any
-    /// addition, removal, or size change, enough to assert the shared store never
-    /// moved under the seed.
-    fn fingerprint(root: &Path) -> Vec<(PathBuf, u64)> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(meta) = path.symlink_metadata() else {
-                    continue;
-                };
-                let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-                if meta.is_dir() {
-                    out.push((rel, 0));
-                    stack.push(path);
-                } else {
-                    out.push((rel, meta.len()));
-                }
-            }
-        }
-        out.sort();
-        out
     }
 
     /// Whether a store path named like `<hash>-<name>` is present in the project

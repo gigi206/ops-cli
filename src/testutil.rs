@@ -63,6 +63,33 @@ pub(crate) fn force_remove(path: &Path) {
     }
 }
 
+/// A sorted `(relative path, size)` fingerprint of a tree — sensitive to any
+/// addition, removal, or size change, enough to assert a store never moved.
+pub(crate) fn fingerprint(root: &Path) -> Vec<(PathBuf, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            if meta.is_dir() {
+                out.push((rel, 0));
+                stack.push(path);
+            } else {
+                out.push((rel, meta.len()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// A baseline [`crate::config::Resolved`] carrying nothing but the packages and apps a test cares
 /// about, every other field at its quietest value. Config resolution has a wide struct and a test
 /// that spells all of it out says nothing about what it is testing; this keeps each test's fixture

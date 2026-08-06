@@ -2703,7 +2703,7 @@ mod tests {
 #[cfg(test)]
 mod smoke {
     use super::*;
-    use crate::testutil::TmpDir;
+    use crate::testutil::{fingerprint, TmpDir};
     use std::process::Command;
 
     /// `(bwrap, nix)` when bwrap, a capability-bearing userns, and nix are all
@@ -2715,33 +2715,6 @@ mod smoke {
         }
         let nix = crate::store::resolve_nix(None)?;
         Some((bwrap, nix))
-    }
-
-    /// A sorted `(relative path, size)` fingerprint of a tree — sensitive to any
-    /// addition, removal, or size change, enough to assert a store never moved.
-    fn fingerprint(root: &Path) -> Vec<(PathBuf, u64)> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(meta) = path.symlink_metadata() else {
-                    continue;
-                };
-                let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-                if meta.is_dir() {
-                    out.push((rel, 0));
-                    stack.push(path);
-                } else {
-                    out.push((rel, meta.len()));
-                }
-            }
-        }
-        out.sort();
-        out
     }
 
     #[test]
