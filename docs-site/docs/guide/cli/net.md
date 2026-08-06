@@ -16,7 +16,8 @@ See also: [The four lenses](../concepts/observability#the-four-lenses) · [Netwo
 | [`rules`](#sbx-net-rules) | list the effective allow/deny rules by source |
 | [`groups`](#sbx-net-groups) | list reusable `[net.groups]`, or resolve one |
 | [`allow`](#sbx-net-allow-and-deny) / [`deny`](#sbx-net-allow-and-deny) | persist a rule to config |
-| [`mute`](#sbx-net-mute-and-unmute) / [`unmute`](#sbx-net-mute-and-unmute) | add / remove a log-suppression (`dontaudit`) rule |
+| [`unallow`](#sbx-net-unallow-undeny-and-unmute) / [`undeny`](#sbx-net-unallow-undeny-and-unmute) | take a persisted rule back out |
+| [`mute`](#sbx-net-mute) / [`unmute`](#sbx-net-unallow-undeny-and-unmute) | add / remove a log-suppression (`dontaudit`) rule |
 | [`pending`](#sbx-net-pending) | list and answer `ask`-mode parked requests |
 | [`stats`](#sbx-net-stats) | per-host allow/deny/blocked decision counters |
 | [`logs`](#sbx-net-logs) | the live, per-request egress log of a running session |
@@ -89,20 +90,73 @@ sbx net allow api.example.com --session -a bot   # only app `bot`'s session(s)
 sbx net deny  ads.example.com --session --all    # every reachable session, this run only
 ```
 
-## sbx net mute and unmute
+## sbx net unallow, undeny and unmute
 
 ```
-sbx net mute   <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
-sbx net unmute <rule> [-l|--local|-g|--global] [-a|--app <name>]
+sbx net unallow <rule> [-l|--local|-g|--global] [-a|--app <name>]
+sbx net undeny  <rule> [-l|--local|-g|--global] [-a|--app <name>]
+sbx net unmute  <rule> [-l|--local|-g|--global] [-a|--app <name>]
+```
+
+Each takes one rule back out of the config file it was written to, in the vocabulary it was
+written in: `unallow` undoes [`allow`](#sbx-net-allow-and-deny), `undeny` undoes `deny`, and
+`unmute` undoes [`mute`](#sbx-net-mute). The `<rule>` is an exact-string match of what was
+written, as [`rules`](#sbx-net-rules) lists it.
+
+Same scope vocabulary and the same trust gate as the add verbs: editing the project
+`.sbx.toml` re-trusts it, and only when something actually changed, while the global config
+and an `-a <name>` app profile are trusted by location. Removing a rule that is not there is
+a reported no-op rather than an error, so re-running a removal is safe.
+
+The **posture is left alone**. `allow` sets one because a rule written without a posture
+decides nothing, while taking a rule out cannot leave that inert state behind. Removing the
+last `allow` therefore leaves a closed posture with nothing allowed: the cage reaches nothing
+beyond the built-in self-equip set, which is stricter than before, never looser.
+
+An emptied list is **dropped** rather than left as `allow = []`, so no residue is written
+back:
+
+```toml
+# after `sbx net unallow api.example.com`, its only allow rule
+[network]
+mode = "deny"
+```
+
+That is the one visible difference from `sbx config rm network.allow <rule>`, which keeps the
+empty list on purpose, to state that this layer closes nothing.
+
+**`undeny` is the one removal that widens what the cage can reach.** `unallow` can only take
+a permission away; taking a deny out lets through whatever the rest of the policy already
+said, which on a denylist posture is everything that host answers. Read the result back with
+[`rules`](#sbx-net-rules) rather than assuming the host stayed closed.
+
+There is no `--session` form on any of the three. A rule loaded into a running session's live
+overlay cannot be un-loaded (the overlay takes rules and has no retraction), so it ends with
+the session; a session flag here is refused rather than silently ignored.
+
+`sbx config rm network.allow <rule>` is the same removal through the generic
+[config surface](config), and stays the only route for `[proc]` rule lists.
+
+```sh
+sbx net unallow api.example.com              # take a persisted allow back out
+sbx net undeny  tracker.example.com          # reopen what a deny rule closed
+sbx net unmute  play.googleapis.com -a agy   # stop suppressing that refusal's log line
+```
+
+## sbx net mute
+
+```
+sbx net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
 ```
 
 `mute` adds a [`[network] mute`](../networking/observability#muting-noisy-refusals-network-mute-selinux-dontaudit)
 rule (SELinux `dontaudit`): a **denied** request matching it is still refused and still
 counted in [`stats`](#sbx-net-stats), but its line is kept out of the default
-[`sbx net log`](#sbx-net-logs) (see it with `--all`). It is a log filter, never a verdict, it cannot open egress. `unmute` removes such a rule (idempotent: removing an absent rule is a
-reported no-op). Same scope vocabulary as `allow`/`deny`: a config write needs an existing
+[`sbx net log`](#sbx-net-logs) (see it with `--all`). It is a log filter, never a verdict, it
+cannot open egress. Same scope vocabulary as `allow`/`deny`: a config write needs an existing
 filtering posture (nothing to suppress under `shared`/`none`) and re-trusts the project
-config; the global config and `-a <name>` app profile are trusted by location.
+config; the global config and `-a <name>` app profile are trusted by location. Take one back
+out with [`unmute`](#sbx-net-unallow-undeny-and-unmute).
 
 `--session` instead loads the mute into a **running** session's live overlay: it takes
 effect immediately and dies with the session, exactly like `sbx net allow|deny --session`
@@ -110,9 +164,8 @@ effect immediately and dies with the session, exactly like `sbx net allow|deny -
 counter-verdict); it ends with the session.
 
 ```sh
-sbx net mute   play.googleapis.com -a agy             # persist to the profile
-sbx net unmute play.googleapis.com -a agy             # undo it
-sbx net mute   play.googleapis.com --session -a agy   # quiet a running agy session now
+sbx net mute play.googleapis.com -a agy             # persist to the profile
+sbx net mute play.googleapis.com --session -a agy   # quiet a running agy session now
 ```
 
 ## `sbx net pending`

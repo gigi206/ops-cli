@@ -335,8 +335,9 @@ const PAGES: &[Page] = &[
         details:
             "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
             `groups` lists the reusable `[net.groups]` egress groups (referenced by `@<name>`) and\n\
-            resolves one to its entries; `allow`/`deny <rule>` persist a rule to config, and\n\
-            `mute`/`unmute <rule>` add/remove a log-suppression (`dontaudit`) rule; `pending`\n\
+            resolves one to its entries; `allow`/`deny <rule>` persist a rule to config and\n\
+            `unallow`/`undeny` take one back out; `mute`/`unmute <rule>` add/remove a\n\
+            log-suppression (`dontaudit`) rule; `pending`\n\
             lists and answers requests parked by the `ask` posture; `stats` reports the per-host\n\
             allow/deny/blocked decision counters launches recorded; `logs` is the live, per-request\n\
             egress log of a running session; and `live` is a `top`-style view of the egress tunnels\n\
@@ -1224,7 +1225,8 @@ const PAGES: &[Page] = &[
             "Appends one entry to the list at <key>, creating the list (and its table) if absent.\n\
             The rest of the list, the file's other keys, and its comments are untouched — which is\n\
             what separates this from `sbx config set <key> '[…]'`, where you restate the whole list\n\
-            and can drop an entry by omission.\n\
+            and can drop an entry by omission. So `config add fs.deny .env` adds one path where\n\
+            `config set fs.deny '[\".env\", \"secrets/\"]'` replaces the whole list.\n\
             \n\
             An entry already in the list changes nothing and says so. That is worth knowing rather\n\
             than assuming: an unchanged file keeps its trust marker, so repeating the command cannot\n\
@@ -1269,9 +1271,11 @@ const PAGES: &[Page] = &[
             absent and a parent layer's entries standing alone. Use `sbx config unset <key>` for\n\
             that.\n\
             \n\
-            Unlike `add`, this works on `[network]` and `[proc]` rule lists — taking a rule out\n\
-            cannot leave an inert one behind, and it is the only way to remove an `allow`/`deny`\n\
-            rule from a config file (`sbx net` removes only a mute, with `unmute`).",
+            Unlike `add`, this works on `[network]` and `[proc]` rule lists: taking a rule out\n\
+            cannot leave an inert one behind, which is the hazard `add` is redirected to avoid.\n\
+            For egress, `sbx net unallow|undeny|unmute <rule>` do the same removal in the vocabulary\n\
+            the rule was written in, and this is the lower-level route to it. For `[proc]` rule\n\
+            lists it is the only route — `sbx proc` has no removal verb.",
     },
     Page {
         path: &["config", "unset"],
@@ -2003,6 +2007,34 @@ const PAGES: &[Page] = &[
             session has nothing to load into.",
     },
     Page {
+        path: &["net", "unallow"],
+        synopsis: "sbx net unallow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "remove an allow rule from a config file (the inverse of `sbx net allow`)",
+        options: &[
+            ("<rule>", "the allow rule to remove — an exact-string match of what was written, as `sbx net rules` lists it"),
+            ("-l, --local", "edit the project .sbx.toml (the default)"),
+            ("-g, --global", "edit the global sbx.toml"),
+            ("-a, --app <name>", "edit that app's `[app.<name>.network]`"),
+        ],
+        details:
+            "Removes an `allow` rule added by `sbx net allow`. Idempotent: removing a rule that is not\n\
+            present is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
+            when something actually changed); the global config and app profiles are trusted by\n\
+            location.\n\
+            \n\
+            The posture is left in place. `allow` sets one because a rule written without one decides\n\
+            nothing, while taking a rule back out cannot leave that inert state behind — so removing\n\
+            the last allow leaves a closed posture with nothing allowed, reaching only the built-in\n\
+            self-equip set. That is stricter than before, never looser.\n\
+            \n\
+            An emptied list is dropped rather than left as `allow = []`, so no residue is written\n\
+            back. This is the one visible difference from `sbx config rm network.allow <rule>`,\n\
+            which keeps the empty list to state that this layer closes nothing.\n\
+            \n\
+            Config only: a rule loaded with `--session` cannot be un-loaded (the live overlay takes\n\
+            rules and has no retraction), so it ends with the session rather than with this verb.",
+    },
+    Page {
         path: &["net", "deny"],
         synopsis: "sbx net deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist a deny rule to a config file (or load it live with --session)",
@@ -2024,6 +2056,36 @@ const PAGES: &[Page] = &[
             an allowlist or denylist session as well as `ask` (deny wins over any allow). It writes no\n\
             file and dies with the session. The config-scope flags (`-l`/`-g`/`-c`) do not apply with\n\
             `--session`; scope the sessions with `-a <app>`/`--all`.",
+    },
+    Page {
+        path: &["net", "undeny"],
+        synopsis: "sbx net undeny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "remove a deny rule from a config file (the inverse of `sbx net deny`)",
+        options: &[
+            ("<rule>", "the deny rule to remove — an exact-string match of what was written, as `sbx net rules` lists it"),
+            ("-l, --local", "edit the project .sbx.toml (the default)"),
+            ("-g, --global", "edit the global sbx.toml"),
+            ("-a, --app <name>", "edit that app's `[app.<name>.network]`"),
+        ],
+        details:
+            "Removes a `deny` rule added by `sbx net deny`. Idempotent: removing a rule that is not\n\
+            present is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
+            when something actually changed); the global config and app profiles are trusted by\n\
+            location.\n\
+            \n\
+            This is the one removal that **widens** what the cage can reach. `unallow` can only take a\n\
+            permission away; taking a deny out lets through whatever the rest of the policy already\n\
+            said — which on a denylist posture is everything that host answers. It passes the same\n\
+            trust gate as any other rule write (an untrusted project config is refused, and a real\n\
+            change re-trusts it), but read the result back with `sbx net rules` rather than assuming\n\
+            the host stayed closed.\n\
+            \n\
+            An emptied list is dropped rather than left as `deny = []`, so no residue is written\n\
+            back. This is the one visible difference from `sbx config rm network.deny <rule>`, which\n\
+            keeps the empty list to state that this layer closes nothing.\n\
+            \n\
+            Config only: a rule loaded with `--session` cannot be un-loaded (the live overlay takes\n\
+            rules and has no retraction), so it ends with the session rather than with this verb.",
     },
     Page {
         path: &["net", "mute"],

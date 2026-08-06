@@ -33,8 +33,14 @@ pub(crate) fn net_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("rules") => net_rules(&args[1..]),
         Some("groups") => net_groups(&args[1..]),
+        // Each rule list is added to and taken back out with one vocabulary, so undoing a rule never
+        // means dropping to the schema key it was written under. The removal verbs are config-only:
+        // an `--session` overlay rule cannot be un-loaded (the control plane injects, it does not
+        // retract), so it dies with the session instead.
         Some("allow") => net_add_rule(config::manage::EgressList::Allow, &args[1..]),
+        Some("unallow") => net_remove_rule(config::manage::EgressList::Allow, &args[1..]),
         Some("deny") => net_add_rule(config::manage::EgressList::Deny, &args[1..]),
+        Some("undeny") => net_remove_rule(config::manage::EgressList::Deny, &args[1..]),
         // `mute` adds a `dontaudit` log-suppression rule; `unmute` removes one. Both are
         // config-level (the same scopes as allow/deny) — a live `--session` mute is not yet wired.
         Some("mute") => net_add_rule(config::manage::EgressList::Mute, &args[1..]),
@@ -2923,19 +2929,27 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     }
 }
 
-/// `sbx net unmute <rule> [--local|--global|-c <file>] [-a <app>]`: remove a `mute` rule from a
-/// config file — the inverse of `sbx net mute`. Idempotent (removing a rule that is not there is a
-/// reported no-op, not an error); a project `.sbx.toml` write is trust-gated and re-trusted exactly
-/// like `sbx net mute`. There is no `--session` form — a live mute overlay is not yet wired, so a
-/// session-scope flag is refused rather than silently ignored.
+/// `sbx net unallow|undeny|unmute <rule> [--local|--global|-c <file>] [-a <app>]`: remove one egress
+/// rule from a config file — the inverse of `sbx net allow|deny|mute`, so a rule is undone with the
+/// vocabulary it was written in. Idempotent (removing a rule that is not there is a reported no-op,
+/// not an error); a project `.sbx.toml` write is trust-gated and re-trusted exactly like the add
+/// path. There is no `--session` form on any of the three: the live overlay only takes rules
+/// (`inject_rule` has no retraction), so an overlay rule dies with the session rather than being
+/// un-loaded, and a session-scope flag is refused rather than silently ignored.
+///
+/// The posture is deliberately left alone. `sbx net allow` sets one because a rule without it
+/// decides nothing; taking the rule back out cannot leave that inert state behind, so removing the
+/// last `allow` leaves the closed posture in place — an empty allowlist under `deny`, which is
+/// stricter than what was there before, never looser.
 fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode {
+    let (verb, _) = removal_words(list);
     if args
         .iter()
         .any(|a| matches!(a.to_str(), Some("--session") | Some("--all")))
     {
-        diag::error(
-            "sbx: net unmute: --session/--all do not apply — this removes a rule from a config file"
-        );
+        diag::error(&format!(
+            "sbx: net {verb}: --session/--all do not apply — this removes a rule from a config file"
+        ));
         return ExitCode::from(2);
     }
     let parsed = match split_scope(args) {
@@ -2950,12 +2964,12 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
         [] => {
             diag::error(&format!(
                 "sbx: usage: {}",
-                help::synopsis_of(&["net", "unmute"])
+                help::synopsis_of(&["net", verb])
             ));
             return ExitCode::from(2);
         }
         _ => {
-            diag::error("sbx: net unmute: expected exactly one rule");
+            diag::error(&format!("sbx: net {verb}: expected exactly one rule"));
             return ExitCode::from(2);
         }
     };
@@ -3345,11 +3359,22 @@ fn net_pending_drain_and_save(
     }
 }
 
+/// The removal verb and the rule noun for one egress list: `sbx net unallow` takes an `allow` rule
+/// back out, `undeny` a `deny`, `unmute` a `mute`. One spelling for all of it, so the usage errors,
+/// the help lookup and the confirmation sentence cannot drift from the verb the user actually typed.
+fn removal_words(list: config::manage::EgressList) -> (&'static str, &'static str) {
+    match list {
+        config::manage::EgressList::Allow => ("unallow", "allow"),
+        config::manage::EgressList::Deny => ("undeny", "deny"),
+        config::manage::EgressList::Mute => ("unmute", "mute"),
+    }
+}
+
 /// Remove an egress `rule` from the scoped config file — the removal sibling of
-/// [`persist_egress_rule`], behind `sbx net unmute`. A rule that is not present is a reported no-op
-/// (no write, no re-trust). Same scope vocabulary, trust-gate, and error codes as the add path: a
-/// `-c <file>` scope or an untrusted project config is code `2`; a trust-store/write/re-trust
-/// failure is code `1`.
+/// [`persist_egress_rule`], behind `sbx net unallow|undeny|unmute`. A rule that is not present is a
+/// reported no-op (no write, no re-trust). Same scope vocabulary, trust-gate, and error codes as the
+/// add path: a `-c <file>` scope or an untrusted project config is code `2`; a trust-store/write/
+/// re-trust failure is code `1`.
 fn persist_egress_removal(
     list: config::manage::EgressList,
     rule: &str,
@@ -3358,11 +3383,7 @@ fn persist_egress_removal(
     base: &Path,
 ) -> Result<String, (u8, String)> {
     use config::manage::{self, RemoveOutcome};
-    let (verb, noun) = match list {
-        manage::EgressList::Allow => ("unallow", "allow"),
-        manage::EgressList::Deny => ("undeny", "deny"),
-        manage::EgressList::Mute => ("unmute", "mute"),
-    };
+    let (verb, noun) = removal_words(list);
     // A project `.sbx.toml` edit is trust-gated and re-trusted, exactly like the add path — removing
     // a rule still rewrites the file, so it must not silently bless an untrusted one. The missing-
     // store sentence is shorter here than on the add path, and stays so: it is user-visible.

@@ -397,6 +397,115 @@ fn net_mute_and_unmute_round_trip_through_config() {
     );
 }
 
+/// A rule is taken back out with the vocabulary it was written in: `unallow` undoes `allow`,
+/// `undeny` undoes `deny`. Both arms of the removal path were unreachable before these verbs were
+/// routed, so this is the first thing that exercises them at all.
+#[test]
+fn net_unallow_and_undeny_round_trip_through_config() {
+    let fx = Fixture::new();
+    // `allow` bootstraps the filtering posture a `deny` then needs.
+    assert!(fx
+        .run(&["net", "allow", "api.example.com"])
+        .status
+        .success());
+    assert!(fx
+        .run(&["net", "deny", "tracker.example.com"])
+        .status
+        .success());
+    let rules = String::from_utf8_lossy(&fx.run(&["net", "rules"]).stdout).into_owned();
+    assert!(
+        rules.contains("api.example.com") && rules.contains("tracker.example.com"),
+        "both rules must be in effect before they are removed:\n{rules}"
+    );
+
+    for (verb, rule) in [
+        ("unallow", "api.example.com"),
+        ("undeny", "tracker.example.com"),
+    ] {
+        let out = fx.run(&["net", verb, rule]);
+        assert!(
+            out.status.success(),
+            "`net {verb}` failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("removed") && stdout.contains("re-trusted"),
+            "`net {verb}` must report the removal and the re-trust:\n{stdout}"
+        );
+        // Idempotent, exactly like `unmute`: a rule that is not there is a reported no-op, and the
+        // absence of a re-trust line is the visible half of "nothing was written".
+        let again = fx.run(&["net", verb, rule]);
+        let stdout = String::from_utf8_lossy(&again.stdout);
+        assert!(
+            stdout.contains("no change") && !stdout.contains("re-trusted"),
+            "a redundant `net {verb}` must change nothing:\n{stdout}"
+        );
+    }
+
+    let rules = String::from_utf8_lossy(&fx.run(&["net", "rules"]).stdout).into_owned();
+    assert!(
+        !rules.contains("api.example.com") && !rules.contains("tracker.example.com"),
+        "neither rule may survive its removal:\n{rules}"
+    );
+
+    // An emptied list is dropped, not left as `allow = []`. This is the one visible difference from
+    // `sbx config rm`, which keeps the empty list on purpose, so it is documented and pinned rather
+    // than left to be discovered in a config file.
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        !body.contains("allow") && !body.contains("deny ="),
+        "an emptied rule list must leave no residue behind:\n{body}"
+    );
+    assert!(
+        body.contains("mode = \"deny\""),
+        "the posture survives the removal of every rule it governed:\n{body}"
+    );
+}
+
+/// The removal verbs go through the same admission as every other rule write: an existing project
+/// config nobody has trusted is refused, and nothing is written. Worth pinning on `unallow`
+/// specifically — the add path had this test, the removal path reached it only through `unmute`.
+#[test]
+fn net_unallow_refuses_an_untrusted_existing_project() {
+    let fx = Fixture::new();
+    fx.write_project("[network]\nmode = \"deny\"\nallow = [\"a.com\", \"b.com\"]\n");
+    let out = fx.run(&["net", "unallow", "b.com"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not trusted")
+            && String::from_utf8_lossy(&out.stderr).contains("sbx trust"),
+        "an untrusted existing config must be refused, pointing at `sbx trust`:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        body.contains("b.com"),
+        "a refused removal must leave the rule in place:\n{body}"
+    );
+}
+
+/// Each removal verb names ITSELF when it refuses a session flag. The message used to be a fixed
+/// `unmute` string, which was invisible while `unmute` was the only routed removal and would have
+/// told an `undeny` user about a command they had not run.
+#[test]
+fn a_removal_verb_names_itself_when_it_refuses_a_session_flag() {
+    let fx = Fixture::new();
+    for verb in ["unallow", "undeny", "unmute"] {
+        let out = fx.run(&["net", verb, "api.example.com", "--session"]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`net {verb} --session` must fail"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("net {verb}:")),
+            "the refusal must name `{verb}`, not another verb:\n{stderr}"
+        );
+    }
+}
+
 /// The removal path re-trusts only after it actually changed the file. This is the case that makes
 /// the asymmetry observable rather than merely tidy: with no project config at all there is nothing
 /// to re-trust, and re-trusting an absent path fails — which would turn an idempotent no-op into an

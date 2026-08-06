@@ -90,6 +90,18 @@ sbx config add fs.deny .env                    # one entry, rest untouched
 sbx config rm  fs.deny .env
 ```
 
+The difference is what survives. On a file that already reads `fs.deny = [".env"]`:
+
+```sh
+sbx config set  fs.deny '["secrets/"]'   # → fs.deny = ["secrets/"]          ".env" is gone
+sbx config add  fs.deny .env             # → fs.deny = ["secrets/", ".env"]  both kept
+sbx config set  fs.deny .env             # → refused: a single value for a list
+sbx config add  fs.deny .env             # → already there: no change, no trust lost
+```
+
+`set` is a statement: "this is the whole value now". `add` is a suggestion:
+"one more entry", and it never touches the rest.
+
 `set` writes the value in the type the schema expects: `true`/`false` become booleans
 and a bare number an integer, so `set network.stats false` writes a real boolean rather
 than a string that would make the loader drop the whole layer. Handing a list a single
@@ -151,9 +163,9 @@ Every field of the schema, and the verb that edits it. `<name>` is yours to choo
 
 | Key | Add with | Remove with |
 |---|---|---|
-| `network.allow`, `network.deny` | [`sbx net allow` / `deny`](net) | `sbx config rm` |
+| `network.allow`, `network.deny` | [`sbx net allow` / `deny`](net) | [`sbx net unallow` / `undeny`](net) or `sbx config rm` |
 | `network.mute` | [`sbx net mute`](net) | [`sbx net unmute`](net) or `sbx config rm` |
-| `proc.allow`, `proc.deny` | [`sbx proc allow` / `deny`](proc) | `sbx config rm` |
+| `proc.allow`, `proc.deny` | [`sbx proc allow` / `deny`](proc) | `sbx config rm` (there is no `sbx proc` removal verb) |
 
 `[network]` and `[proc]` gate their rules behind a posture, and those verbs carry the
 matrix: they bootstrap the restrictive posture when there is none, refuse a rule that
