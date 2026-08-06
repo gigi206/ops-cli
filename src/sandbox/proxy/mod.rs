@@ -587,7 +587,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // 5. The verdict — the shared `https` decision ([`decide_https`]), which an absolute-form forward
     //    to the same host reaches identically. A refusal is answered *inside* the terminated TLS, so
     //    the client reads a real HTTP response rather than a tunnel that dies without explanation.
-    let deciding: Option<Rule> = match decide_https(ctx, &connect_host, port, &itarget, &imethod) {
+    let deciding: Option<Rule> = match decide_https(
+        ctx,
+        &connect_host,
+        port,
+        &itarget,
+        &imethod,
+        AskPosture::Park,
+    ) {
         Ok(rule) => rule,
         Err(refusal) => {
             return respond_refusal_tls(
@@ -1784,17 +1791,18 @@ fn handle_https_forward(
     // 5. The verdict — the SAME `https` decision a `CONNECT` to this host gets ([`decide_https`]):
     //    same rules, same denial shapes, same parking for an undecided host. Only the answer differs,
     //    written on the plaintext client socket this form arrived on.
-    let deciding: Option<Rule> = match decide_https(ctx, &host, port, &path, method) {
-        Ok(rule) => rule,
-        Err(refusal) => {
-            return write_refusal(
-                &mut client,
-                refusal.status_line(),
-                refusal.tag(),
-                &refusal.message(ctx, &host, port, method),
-            )
-        }
-    };
+    let deciding: Option<Rule> =
+        match decide_https(ctx, &host, port, &path, method, AskPosture::Park) {
+            Ok(rule) => rule,
+            Err(refusal) => {
+                return write_refusal(
+                    &mut client,
+                    refusal.status_line(),
+                    refusal.tag(),
+                    &refusal.message(ctx, &host, port, method),
+                )
+            }
+        };
 
     // 6. Resolve host-side, then the SSRF guard against the deciding rule. A resolution failure for an
     //    allowed host is a clean 502, distinct from a refusal.
@@ -2106,13 +2114,37 @@ enum PolicyRefusal {
     DeniedDefault,
     /// An `ask`-undecided host a live decision refused, or whose ask timeout elapsed.
     AskedDenied,
+    /// An `ask`-undecided host on a transport that cannot park one. Only the HTTP/2 path produces
+    /// it, and it names that transport in its reason token so the refusal reads as the documented
+    /// limitation it is rather than as an ordinary deny. See [`AskPosture::RefuseUnsupported`].
+    Http2AskUnsupported,
+}
+
+/// Whether the transport asking for a verdict can park a request while a person decides it.
+///
+/// This is a property of how the path runs, not a preference. The synchronous HTTP/1.1 paths serve
+/// one connection per thread, so blocking one to wait for `sbx net pending` costs that request and
+/// nothing else. Every stream of an HTTP/2 connection is multiplexed onto ONE current-thread tokio
+/// runtime, so parking a single stream there would stall its siblings — it fails closed instead.
+#[derive(Clone, Copy)]
+enum AskPosture {
+    /// Block until a host-side `sbx net pending` answers, or the ask timeout elapses (deny).
+    Park,
+    /// Refuse an undecided host outright, under [`PolicyRefusal::Http2AskUnsupported`].
+    RefuseUnsupported,
 }
 
 impl PolicyRefusal {
-    /// The status line both paths write. Every policy refusal is a `403`: the request was understood
-    /// and reached a verdict, which is what separates these from the `502`s a connect failure gets.
+    /// The status line the HTTP/1.1 paths write. Every policy refusal is a `403`: the request was
+    /// understood and reached a verdict, which is what separates these from the `502`s a connect
+    /// failure gets.
     fn status_line(&self) -> &'static str {
         "403 Forbidden"
+    }
+
+    /// The same status for the HTTP/2 path, which frames a refusal rather than writing it.
+    fn status(&self) -> http::StatusCode {
+        http::StatusCode::FORBIDDEN
     }
 
     /// The stable reason token: the `x-sbx-egress-reason` header, and the reason in the log.
@@ -2122,6 +2154,7 @@ impl PolicyRefusal {
             Self::DeniedMethod => "denied-method",
             Self::DeniedDefault => "denied-default",
             Self::AskedDenied => "asked-denied",
+            Self::Http2AskUnsupported => "http2-ask-unsupported",
         }
     }
 
@@ -2146,6 +2179,14 @@ impl PolicyRefusal {
             Self::AskedDenied => {
                 "this request was denied by a live decision or the ask timeout elapsed".to_string()
             }
+            // Reached only by the HTTP/2 path, which frames a status and a reason token and sends no
+            // body — so this sentence has no writer today. It is spelled anyway: the enum's contract
+            // is that every refusal can say what it is, and a variant that cannot would be a trap
+            // for whoever gives that path a body later.
+            Self::Http2AskUnsupported => format!(
+                "`{host}:{port}` is undecided under the `ask` posture, and this HTTP/2 stream \
+                 cannot wait for a decision — allow the host explicitly to reach it"
+            ),
         }
     }
 }
@@ -2162,24 +2203,20 @@ impl PolicyRefusal {
 /// host:port as the deciding rule, so the SSRF guard admits a deliberately-approved internal target.
 ///
 /// Every refusal records its own outcome before returning, so a caller cannot answer one without
-/// counting it.
+/// counting it. `ask` is the one arm the callers do not all share, which is what [`AskPosture`]
+/// carries: the two HTTP/1.1 paths park, the HTTP/2 path cannot and refuses.
 ///
-/// Two other paths reach the same policy and do NOT come here, for opposite reasons:
-///
-/// - The cleartext `http://` path is a **deliberate** exclusion. It is strictly opt-in, its
-///   `explain_clear` consults neither the default action nor the ask queue, and routing it through
-///   this verdict would widen it into a posture it was written to refuse.
-/// - The HTTP/2 path ([`h2mitm::handle`]) is **not yet folded**. Three of its four arms are this
-///   function's verbatim; the fourth is not, because it cannot park — every stream of an h2
-///   connection is multiplexed on one current-thread runtime, so blocking for a live decision would
-///   stall its siblings, and it refuses `ask` under its own reason instead. Folding it means giving
-///   this function an explicit posture for that, not pretending the difference away.
+/// The cleartext `http://` path is the one consumer of the `https` policy that deliberately does NOT
+/// come here. It is strictly opt-in, its `explain_clear` consults neither the default action nor the
+/// ask queue, and routing it through this verdict would widen it into a posture it was written to
+/// refuse.
 fn decide_https(
     ctx: &ProxyCtx,
     host: &str,
     port: u16,
     path: &str,
     method: &str,
+    ask: AskPosture,
 ) -> Result<Option<Rule>, PolicyRefusal> {
     let refuse = |refusal: PolicyRefusal| {
         ctx.outcome(
@@ -2206,6 +2243,12 @@ fn decide_https(
             } else {
                 refuse(PolicyRefusal::DeniedDefault)
             }
+        }
+        // Undecided. Parking blocks the calling thread until a person answers, which only a
+        // transport that owns its thread may do — the other fails closed rather than stalling every
+        // stream sharing its runtime.
+        Decision::Ask if matches!(ask, AskPosture::RefuseUnsupported) => {
+            refuse(PolicyRefusal::Http2AskUnsupported)
         }
         Decision::Ask => {
             let verdict = ctx.pending.park(

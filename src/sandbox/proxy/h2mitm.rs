@@ -5,8 +5,12 @@
 //! **per-connection current-thread tokio runtime** built and dropped inside [`handle`], so tokio
 //! never leaks into sbx's std-thread world.
 //!
-//! Security parity with the HTTP/1.1 path is the invariant: every stream is checked against the same
-//! [`effective_policy`]/[`EgressPolicy::explain`](crate::allowlist::EgressPolicy::explain) chokepoint (host/`:path`/method), the `:authority`
+//! Security parity with the HTTP/1.1 path is the invariant, and since the verdict was folded it is
+//! no longer a parity that has to be maintained by hand: every stream goes through
+//! [`decide_https`](super::decide_https), the same function the tunnel and the absolute-form forward
+//! call, so there is one policy decision rather than three that must be kept in step. This path
+//! passes [`AskPosture::RefuseUnsupported`](super::AskPosture), which is the single way it diverges —
+//! see the call site for why it cannot park. The `:authority`
 //! is re-verified against the CONNECT host **per stream** (h2 lets a client vary it), the SSRF guard
 //! resolves and validates the address exactly as [`connect_upstream`](super::connect_upstream) does (connect the checked IP,
 //! no re-resolve, validate the upstream cert), and gRPC is HTTP/2 end-to-end (no downgrade). The
@@ -17,10 +21,10 @@
 
 use super::capture::CapBuf;
 use super::{
-    carries_secret, effective_policy, matching_injections, redact_in_place, resolve_checked,
-    upstream_server_name, ProxyCtx, SecretNeedle, StatKind,
+    carries_secret, decide_https, matching_injections, redact_in_place, resolve_checked,
+    upstream_server_name, AskPosture, ProxyCtx, SecretNeedle, StatKind,
 };
-use crate::allowlist::{self, Decision, Rule};
+use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
 use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -241,58 +245,25 @@ async fn stream(
         return;
     }
 
-    // The verdict — the same chokepoint as the HTTP/1.1 path (config policy ∪ any `--session`
-    // overlay), deny-wins, method/path aware.
-    let policy = effective_policy(ctx);
-    let deciding: Option<Rule> = match policy.explain(connect_host, port, &path, method.as_str()) {
-        Decision::AllowedBy(rule) => Some(rule.clone()),
-        Decision::AllowedDefault => None,
-        Decision::DeniedBy(_) => {
-            ctx.outcome(
-                Proto::Https,
-                connect_host,
-                port,
-                Some(method.as_str()),
-                Some(&path),
-                StatKind::Deny,
-                "denied-by-rule",
-            );
-            let _ = refuse(respond, StatusCode::FORBIDDEN, "denied-by-rule");
-            return;
-        }
-        Decision::DeniedDefault => {
-            let reason = if policy.method_denied(connect_host, port, &path, method.as_str()) {
-                "denied-method"
-            } else {
-                "denied-default"
-            };
-            ctx.outcome(
-                Proto::Https,
-                connect_host,
-                port,
-                Some(method.as_str()),
-                Some(&path),
-                StatKind::Deny,
-                reason,
-            );
-            let _ = refuse(respond, StatusCode::FORBIDDEN, reason);
-            return;
-        }
-        Decision::Ask => {
-            // `ask`-mode parking (a blocking live per-request decision) is not supported on the
-            // async h2 path yet — an unmatched stream to a designated http2 host under `ask` mode
-            // is denied, not parked (fail-closed). An explicit `allow` rule for the gRPC endpoint
-            // is the intended posture; parking on h2 is a later increment.
-            ctx.outcome(
-                Proto::Https,
-                connect_host,
-                port,
-                Some(method.as_str()),
-                Some(&path),
-                StatKind::Deny,
-                "http2-ask-unsupported",
-            );
-            let _ = refuse(respond, StatusCode::FORBIDDEN, "http2-ask-unsupported");
+    // The verdict — literally the same decision the HTTP/1.1 paths reach, through the shared
+    // [`decide_https`]: config policy ∪ any `--session` overlay, deny-wins, method/path aware. Only
+    // the answer differs, framed here as a status plus the reason token rather than written.
+    //
+    // [`AskPosture::RefuseUnsupported`] is where this path genuinely diverges. Parking blocks the
+    // caller until a person answers, and every stream of this connection shares one current-thread
+    // runtime, so parking one would stall its siblings. An undecided host fails closed under its own
+    // reason instead; an explicit `allow` rule for the gRPC endpoint is the intended posture.
+    let deciding: Option<Rule> = match decide_https(
+        ctx,
+        connect_host,
+        port,
+        &path,
+        method.as_str(),
+        AskPosture::RefuseUnsupported,
+    ) {
+        Ok(rule) => rule,
+        Err(refusal) => {
+            let _ = refuse(respond, refusal.status(), refusal.tag());
             return;
         }
     };
