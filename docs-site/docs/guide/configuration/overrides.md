@@ -129,14 +129,41 @@ blob's `[notify]` table wholesale, period included. So do **not** split one inte
 
 #### The `--net` posture
 
-`--net` takes `none | shared | ask | allow=h1,h2 | deny=h1,h2`. The `allow=`/`deny=`
-DSL builds the common one-shot egress shapes:
+`--net` takes two kinds of value. A **bare posture** is one of the five words the
+config's `network = "…"` string takes, meaning exactly what it means there:
 
-- `allow=h1,h2` → a default-**deny** allowlist (only `h1,h2` reach).
-- `deny=h1,h2` → a default-**allow** denylist (everything except `h1,h2`).
+```sh
+sbx run --net none    # empty network namespace
+sbx run --net shared  # the host network, no proxy
+sbx run --net deny    # deny-by-default, no rules of its own
+sbx run --net allow   # allow-by-default, an empty deny list
+sbx run --net ask     # park every undecided request, with no timeout
+```
 
-A bare `allow`/`deny` (no `=`) is **refused as ambiguous**: it reads like the list
-forms but would mean the opposite wide-open posture.
+A bare posture **replaces the whole `network` field**, its lists included, exactly as
+`--proc <mode>` replaces the whole `[proc]` policy. So `--net deny` does not tighten a
+project's curated allowlist for the run: it discards it and leaves the filtering
+default, which reaches only the [built-in self-equip
+set](../networking/modes#the-built-in-self-equip-set). Bare `ask` likewise carries no
+`ask_timeout`, so a parked request waits **indefinitely**. To keep or add rules, and to
+bound `ask`, put the mode and its table together in one `--config` blob.
+
+The `allow=`/`deny=` **list shorthands** build the common one-shot egress shapes:
+
+- `allow=host1,host2` → a default-**deny** allowlist (only `host1,host2` reach).
+- `deny=host1,host2` → a default-**allow** denylist (everything except `host1,host2`).
+
+The bare word and the list form of the same word therefore mean the **opposite** of
+each other: `--net allow` opens by default, `--net allow=host1` restricts egress to `host1`.
+This is the config's own collision (`mode = "allow"` versus `allow = […]` in a
+`[network]` table), kept rather than respelled so one vocabulary covers both surfaces.
+
+Because the posture exists on the flag, a catch-all is never needed to open a run:
+`--net allow` reaches what `--net 'allow=re:.*'` reaches
+([the difference](../networking/modes#which-of-the-two-filtering-forms-to-prefer) is
+what `sbx net logs` records). An `allow=` naming **no** host stays a hard error rather
+than a silent all-deny. Carve-out lists on top of a posture need a `--config` blob's
+`[network]` table.
 
 #### The `--bind` mode
 

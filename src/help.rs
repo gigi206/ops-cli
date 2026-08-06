@@ -102,7 +102,8 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--net <posture>",
-                "one-shot network posture: none | shared | ask | allow=h1,h2 | deny=h1,h2",
+                "one-shot network posture: none | shared | ask | allow | deny; the list forms \
+                 allow=host1,host2 | deny=host1,host2 mean the opposite of the bare word (below)",
             ),
             ("--gui <none|offscreen|wayland>", "one-shot display posture"),
             (
@@ -173,7 +174,19 @@ const PAGES: &[Page] = &[
             each. The\n\
             booleans `--gpu`/`--audio`/`--dbus` are optional-value (bare means `true`, or\n\
             `=true`/`=false`); the rest take a\n\
-            value. `--proc` sets only the exec *mode* — the one-shot allow/deny lists live in a\n\
+            value. `--net` takes the five bare postures the config's `network = \"…\"` string\n\
+            takes (`none`, `shared`, `ask`, `allow`, `deny`), plus two list shorthands that read\n\
+            like two of them and mean the reverse: `allow=host1,host2` restricts egress to those\n\
+            hosts (a deny-by-default allowlist) where bare `allow` opens by default with an empty\n\
+            deny list, and `deny=host1,host2` mirrors it. So `--net allow` is the posture to reach\n\
+            for — the catch-all `--net 'allow=re:.*'` opens the same doors the long way round, and\n\
+            differs only in that each request then carries a visible deciding rule in\n\
+            `sbx net logs` instead of an `allowed-by-default` verdict. A bare posture replaces the\n\
+            whole `network` field, lists included (so `--net deny` discards a project's allowlist\n\
+            rather than tightening it, and bare `ask` waits indefinitely, carrying no\n\
+            `ask_timeout`): keep a mode and its rules together in a `--config` blob's `[network]`\n\
+            table.\n\
+            `--proc` sets only the exec *mode* — the one-shot allow/deny lists live in a\n\
             `--config` blob's `[proc]` table (or `sbx proc allow/deny --session` after launch);\n\
             `--notify` likewise sets one mode for every event, and the per-event table and\n\
             `repeat_after` live in a `--config` blob's `[notify]` table. Every\n\

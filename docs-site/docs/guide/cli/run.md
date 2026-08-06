@@ -18,7 +18,7 @@ See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [O
 | `--observe` | record what the command does, its processes ([`sbx proc logs`](proc#logs)) and file writes ([`sbx fs logs`](fs#logs)); see [Observing a run](#observing-a-run---observe) |
 | `--config <toml\|@file>` | one-shot config override (any field); repeatable, later wins |
 | `--env KEY=VALUE` | one-shot override of a single cage environment variable; repeatable |
-| `--net <posture>` | one-shot network posture: `none` \| `shared` \| `ask` \| `allow=h1,h2` \| `deny=h1,h2`; to open everything see [Opening the network wide](../networking/modes#opening-the-network-wide) |
+| `--net <posture>` | one-shot network posture: `none` \| `shared` \| `ask` \| `allow` \| `deny`, or the list forms `allow=host1,host2` \| `deny=host1,host2`, which mean the [opposite of the bare word](../configuration/overrides#the---net-posture); to open everything see [Opening the network wide](../networking/modes#opening-the-network-wide) |
 | `--gui <none\|offscreen\|wayland>` | one-shot display posture |
 | `--nixpkgs <ref>` | one-shot nixpkgs channel or revision |
 | `--bind <path[:ro\|:rw]>` | one-shot host bind (read-only by default); repeatable |
@@ -111,6 +111,7 @@ sbx run -- cargo test
 echo 'rg --version' | sbx run          # a non-interactive shell reading stdin
 sbx run --net none -- ./offline-build.sh
 sbx run --net shared -- ./x.sh         # open everything: no proxy at all
+sbx run --net allow -- ./x.sh          # open everything, still through the proxy
 sbx run --bind /opt/data:rw -- ./process.sh
 sbx run --observe -- ./build.sh        # stream a [sbx:exec] feed of what it spawns
 sbx run --detach -- ./long-task.sh     # background; see `sbx session ls`

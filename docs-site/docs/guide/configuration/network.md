@@ -306,16 +306,18 @@ To set the posture for a single launch without editing the file, use `--net` or
 
 ```sh
 sbx run --net none -- ./build.sh                # cut the network for one run
+sbx run --net allow -- ./ci.sh                  # allow-by-default for one run
 sbx run --net allow=api.github.com -- ./ci.sh   # a one-shot allowlist
 SBX_NET=shared sbx run
 ```
 
-`--net` takes `none | shared | ask | allow=h1,h2 | deny=h1,h2` (a bare `allow`/`deny`
-is refused as ambiguous). The command line beats the environment, and both beat the
-config file. For the full grammar and the four-tier precedence, see
+`--net` takes the five bare postures the `network` string takes — `none | shared | ask
+| allow | deny` — plus the `allow=host1,host2 | deny=host1,host2` list shorthands. The command line
+beats the environment, and both beat the config file. For the full grammar, the two
+meanings of `allow`, and the four-tier precedence, see
 [One-shot overrides](overrides).
 
-To open the network wide for one launch (`--net shared`, `--net 'allow=re:.*'`, or
-`--config 'network = "allow"'`), and for what each of the three actually opens (only
-`shared` drops the proxy), see
+To open the network wide for one launch (`--net shared`, `--net allow`, or
+`--net 'allow=re:.*'`), and for what each of the three actually opens (only `shared`
+drops the proxy), see
 [Opening the network wide](../networking/modes#opening-the-network-wide).

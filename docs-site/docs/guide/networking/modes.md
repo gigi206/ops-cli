@@ -29,6 +29,10 @@ deny  = ["telemetry.example.com"]
 The string and table forms are the same field: a bare string is just a table with
 no `allow`/`deny` lists. See [rules](rules) for what goes in the lists.
 
+Those same five words are what `--net` and `SBX_NET` take for a single launch
+(`sbx run --net allow -- ./x.sh`), carve-out lists excepted: see
+[One-shot override](../configuration/network#one-shot-override).
+
 ---
 
 ## `none`
@@ -151,12 +155,12 @@ through it and merely widen what the policy permits. (A fourth spelling, `allow 
 say in the posture what they do.)
 
 ```bash
-sbx run --net shared -- ./x.sh                   # no proxy at all: the host's network
-sbx run --net 'allow=re:.*' -- ./x.sh            # deny mode, one catch-all rule
-sbx run --config 'network = "allow"' -- ./x.sh   # allow-by-default, an empty denylist
+sbx run --net shared -- ./x.sh          # no proxy at all: the host's network
+sbx run --net 'allow=re:.*' -- ./x.sh   # deny mode, one catch-all rule
+sbx run --net allow -- ./x.sh           # allow-by-default, an empty denylist
 ```
 
-|  | `--net shared` | `--net 'allow=re:.*'` | `--config 'network = "allow"'` |
+|  | `--net shared` | `--net 'allow=re:.*'` | `--net allow` |
 |---|---|---|---|
 | the proxy | **none**: no `http_proxy` in the cage | MITM proxy | MITM proxy |
 | the network namespace | the host's own | empty | empty |
@@ -218,11 +222,15 @@ waiting for.
 
 ### Which of the two filtering forms to prefer
 
-`network = "allow"` is the readable one: it is a posture, it reads as "everything
-except my `deny` list", and a `deny` entry keeps working on top of it. The catch-all
-`re:.*` is a `deny` posture wearing a disguise; prefer it only when you want each
-allowed request to carry a *visible deciding rule* in [`sbx net logs`](observability)
-rather than an `allowed-by-default` verdict.
+The posture is the readable one: `network = "allow"` in a file, `--net allow` for one
+launch. It reads as "everything except my `deny` list", and a `deny` entry keeps working
+on top of it. The catch-all `re:.*` is a `deny` posture wearing a disguise; prefer it
+only when you want each allowed request to carry a *visible deciding rule* in
+[`sbx net logs`](observability) rather than an `allowed-by-default` verdict.
+
+So there is no reason to write `--net 'allow=re:.*'` (or `--net 'allow=re:'`) just to
+open the network for a run: `--net allow` reaches the same hosts, spelled as the posture
+it is. The catch-all remains available for the logging difference above.
 
 Two practical notes on the catch-all form:
 

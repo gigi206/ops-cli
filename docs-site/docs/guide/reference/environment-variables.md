@@ -13,7 +13,7 @@ beats the environment; a security field set from the environment prints a stderr
 |---|---|---|
 | `SBX_CONFIG` | `--config` | a whole-schema TOML overlay |
 | `SBX_ENV_<KEY>` | `--env KEY=…` | one cage environment variable |
-| `SBX_NET` | `--net` | the network posture (`none`/`shared`/`ask`/`allow=…`/`deny=…`) |
+| `SBX_NET` | `--net` | the network posture (`none`/`shared`/`ask`/`allow`/`deny`, or the `allow=…`/`deny=…` list forms) |
 | `SBX_GUI` | `--gui` | the display posture (`none`/`offscreen`/`wayland`) |
 | `SBX_PROC` | `--proc` | the [process/exec](../configuration/proc) posture (`off`/`observe`/`enforce`/`ask`) |
 | `SBX_NOTIFY` | `--notify` | how loudly a refusal is [announced](../configuration/notify) (`off`/`once`/`always`) |
@@ -42,6 +42,7 @@ One field at a time, for one launch:
 
 ```sh
 SBX_NET=none sbx run -- ./build.sh                    # cut egress
+SBX_NET=allow sbx run -- ./deploy.sh                  # allow-by-default for one run
 SBX_NET=allow=api.example.com sbx run -- ./deploy.sh  # a one-shot allowlist
 SBX_GUI=wayland sbx app run some-editor               # a display for one run
 SBX_PROC=enforce sbx run -- ./untrusted.sh            # stand exec enforcement up

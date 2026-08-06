@@ -771,11 +771,17 @@ fn parse_bool(value: &str, label: &str) -> Result<bool, String> {
     }
 }
 
-/// Parse a `--net` value into a `network` field. The postures `none`/`shared`/`ask` pass through
-/// verbatim (validated downstream); `allow=h1,h2` becomes a default-deny allowlist and `deny=h1,h2`
-/// a default-allow denylist — the common one-shot egress shapes. A bare `allow`/`deny` is refused as
-/// ambiguous (it reads like the list forms but means the opposite, a wide-open posture); an unknown
-/// keyword passes through and is caught by the downstream posture validation.
+/// Parse a `--net` value into a `network` field. A bare posture (`none`/`shared`/`ask`/`allow`/
+/// `deny`) passes through verbatim — the same five words the config's bare-string `network = "…"`
+/// form takes, validated downstream — while `allow=host1,host2` becomes a default-deny allowlist
+/// and `deny=host1,host2` a default-allow denylist, the common one-shot egress shapes. An unknown
+/// keyword passes through too and is caught by the downstream posture validation.
+///
+/// The two forms of the same word mean opposite things: bare `allow` is the allow-by-default
+/// posture (an empty denylist, so everything reaches), whereas `allow=host1` restricts egress to
+/// `host1`. That collision is the config's own — `mode = "allow"` versus `allow = […]` in a
+/// `[network]` table reads exactly the same way — so the CLI keeps the config's vocabulary rather
+/// than inventing a third spelling for a posture, and the help text carries the distinction.
 fn parse_net(value: &str, label: &str) -> Result<NetworkField, String> {
     if let Some(hosts) = value.strip_prefix("allow=") {
         return Ok(net_table(
@@ -789,12 +795,6 @@ fn parse_net(value: &str, label: &str) -> Result<NetworkField, String> {
             "allow",
             Vec::new(),
             split_hosts(hosts, label, "deny")?,
-        ));
-    }
-    if value == "allow" || value == "deny" {
-        return Err(format!(
-            "{label}: bare `{value}` is ambiguous — use `{label} allow=host,…` to restrict egress \
-             to those hosts, or `--config` for a raw posture"
         ));
     }
     Ok(NetworkField::Posture(value.to_string()))
@@ -1498,20 +1498,27 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_net_allow_or_deny_is_refused_as_ambiguous() {
-        let err = collect_cli(Cli {
-            net: &["allow"],
-            ..Default::default()
-        })
-        .unwrap_err();
-        assert!(err.contains("ambiguous"), "{err}");
-        let err = collect_cli(Cli {
-            net: &["deny"],
-            ..Default::default()
-        })
-        .unwrap_err();
-        assert!(err.contains("ambiguous"), "{err}");
-        // an empty host list is structural too
+    fn every_bare_config_posture_is_typeable_on_the_flag() {
+        // The flag's vocabulary is the config's: the five words `network = "…"` takes are the five
+        // the flag takes, each reaching the same downstream validation. `allow`/`deny` are the two
+        // that also head a list form (`allow=host1`), and they mean the *opposite* of it — the bare
+        // word is the posture, so `--net allow` opens by default where `--net allow=host1` restricts
+        // egress to `host1`.
+        for name in ["none", "shared", "ask", "allow", "deny"] {
+            assert_eq!(
+                collect_cli(Cli {
+                    net: &[name],
+                    ..Default::default()
+                })
+                .unwrap()
+                .raw
+                .network,
+                Some(posture(name)),
+                "`--net {name}` must reach the posture validation as itself"
+            );
+        }
+        // The list form keeps its own meaning, and an empty list stays structural: `allow=` names
+        // no host, which is a value the user mistyped, never a silent all-deny.
         let err = collect_cli(Cli {
             net: &["allow="],
             ..Default::default()
