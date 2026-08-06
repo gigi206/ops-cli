@@ -111,7 +111,7 @@ step is skipped for its `@vscode/ripgrep` dependency, yet it needs no wrapper �
 | `crush`           | `mise:github:charmbracelet/crush` — Charm's "glamourous agentic coding" TUI (Go, static-pie, 27 MiB binary + man pages + shell completions) | `hyper.charm.land` (Hyper account, ZDR + GDPR) or multi-provider BYOK (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` / `AWS_BEARER_TOKEN_BEDROCK` / etc. — 24+ providers) |
 | `cursor-agent`    | bootstrap `curl cursor.com/install` (CLI tarball — no clean backend; **not** the npm `cursor-agent`) | `*.cursor.sh` (Cursor account) |
 | `cursor`          | `deb:` prebuilt `.deb` (Electron GUI editor, `gui`/`gpu`/`dbus`) | `*.cursor.sh` (Cursor account) |
-| `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | **`network = "shared"`** (see note ‡) |
+| `t3code`          | `appimage:` prebuilt `.AppImage` (Electron GUI, `gui`/`gpu`/`dbus`) — a control plane driving other agents | none of its own: each sub-agent uses ITS credentials; filtered egress needs `NODE_USE_ENV_PROXY` (note ‡) |
 | `openfox`         | `mise:npm:openfox` (+ `nix:nodejs`) — a local-LLM web coding agent (browser UI) | none: a local LLM, reached under the allowlist by `tcp://localhost:<port>` (its UI comes back through `forward`) |
 | `goose`           | `mise:aqua:block/goose` (Rust release binary, no runtime deps) | provider-dependent (BYOK: OpenRouter / Anthropic / OpenAI — examples in profile) |
 | `goose-desktop`   | `deb:` prebuilt `.deb` (Electron GUI, `gui`/`gpu`/`dbus`) — the same agent with a desktop UI | provider-dependent (GUI login or BYOK — examples in profile) |
@@ -238,8 +238,8 @@ in [the worked example](../docs-site/docs/guide/configuration/secret.md#worked-e
 > failing it), and the dual-stack agent hosts fall back to HTTP/1.1 SSE — but this rides sbx's own
 > brand-new h2/gRPC MITM, itself unproven for Cursor, and Cursor recommends against SSL inspection on
 > its domains, so it is a live-pending claim, not a proven one. If the agent misbehaves under the
-> allowlist, the profile header documents the `network = "shared"` fallback (like `t3code`) and the
-> exact failure signatures to read from `sbx net logs -a cursor-agent`.
+> allowlist, the profile header documents the one-launch `--net shared` fallback and the exact
+> failure signatures to read from `sbx net logs -a cursor-agent`.
 >
 > `cursor` (the Cursor desktop **editor** — the GUI sibling of `cursor-agent`) is an Electron
 > profile in the `opencode-desktop` / `claude-desktop` mould: packaged from Cursor's prebuilt `.deb`
@@ -561,20 +561,20 @@ profile's header.)*
   filtering posture (Chromium ignores the CA-file env vars other tools honour). **`t3code`** — a
   control plane driving *other* agents (`codex`/`claude`/`opencode`, already profiled as CLIs) — is
   the AppImage-backend flagship: it packages, imports, resolves, renders + logs in, and its build seam
-  is proven through `sbx run` (the launcher lands on the cage PATH). **‡ It is the ONLY shipped
-  profile that ships `network = "shared"` and cannot filter egress.** (`openfox` used to be the
-  second, for an unrelated reason — a LLM on the host's `localhost`. It no longer needs it: a
-  `tcp://localhost:<port>` allow rule gets a listener on that port inside the cage and relays it to
-  the host's service, so openfox now runs under the allowlist, verified end to end. That way out
-  does not exist for t3code, whose problem is not the loopback.) t3code's model traffic is made by a
-  SEPARATE,
-  proxy-blind Node backend (`ELECTRON_RUN_AS_NODE`, Effect's undici with its own Agent) that no
-  profile-level mechanism can route through the egress proxy: proxychains' `LD_PRELOAD` breaks
-  Chromium's renderer (spiked 1-vs-0 rendered docs), Electron strips `NODE_OPTIONS` so a preload never
-  reaches the backend, and a transparent redirect is an sbx-sized feature (a Chromium-safe LD_PRELOAD
-  connect-shim, or a cap-free loopback-DNS + SNI-relay interceptor), not a profile knob. So t3code keeps
-  bwrap + seccomp + the isolated home + the minimal `/dev`, but reaches the host network unfiltered —
-  the honest posture for an Electron app whose backend is proxy-blind. The Antigravity *IDE* (distinct
+  is proven through `sbx run` (the launcher lands on the cage PATH). **‡ NO shipped profile ships
+  `network = "shared"` any more.** The last two both fell to a measurement. `openfox` needed the host's
+  `localhost` for a local LLM: a `tcp://localhost:<port>` allow rule gets a listener on that port
+  inside the cage and relays it to the host's service, so it runs under the allowlist, verified end to
+  end. `t3code` needed something else entirely, and the reason it looked impossible was that its
+  network is split across THREE processes. Measured against the shipped binary (Electron 41.5.0 /
+  Node 24.15.0): the Chromium **renderer** honours the proxy natively; the Node **backend** — the
+  separate `ELECTRON_RUN_AS_NODE` child that serves the model list — builds its client from Effect's
+  `FetchHttpClient`, i.e. `globalThis.fetch`, i.e. undici's PROCESS-GLOBAL dispatcher, so
+  `NODE_USE_ENV_PROXY = "1"` routes it and the profile filters; only the Electron **main** process is
+  genuinely unreachable (it constructs its own `new Agent()` via `NodeHttpClient.layerUndici`, and the
+  one way to run code before it, `NODE_OPTIONS=--import`, is stripped by Electron in a PACKAGED app —
+  both halves measured, the substitution works and the delivery does not). That hole is the account /
+  sign-in side, and what it cannot reach is REFUSED, not leaked. The Antigravity *IDE* (distinct
   from the `agy` CLI, profiled above) now **ships** as `antigravity-ide` — packaged from Google's
   official `.tar.gz` via the `tarball:resolve` backend (auto-upgraded through a sandboxed resolve command),
   with the `gui`/`gpu`/`dbus` holes and the Google Sign-In in-cage-browser flow; its real build + login

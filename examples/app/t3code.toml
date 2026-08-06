@@ -118,18 +118,36 @@ gui = "wayland"
 gpu = true
 dbus = true
 
-# NETWORK = SHARED (the host network), deliberately — and this is the ONE shipped profile that does not
-# filter egress. `network = "none"`/`"deny"`/an allowlist do NOT work for t3code: its model/provider
-# calls are made by a SEPARATE Node backend process (Effect's undici HTTP client, `ELECTRON_RUN_AS_NODE`)
-# that is blind to the egress proxy, so under a filtering posture (Model-B empty netns) those calls die
-# at DNS → an empty model list + an Offline environment. Only the Chromium UI honours the proxy, and
-# every clean way to route the backend hits a hard wall (proxychains breaks Chromium's renderer; Electron
-# strips NODE_OPTIONS so a preload can't reach the backend; a cap-free transparent interceptor is an
-# sbx-sized feature, not a profile knob — full reasoning in the commented "aspirational allowlist" below
-# and in `examples/README.md`). So t3code ships `shared` so `sbx app run t3code` just works. What you KEEP
-# under shared: bubblewrap + seccomp + the isolated home + the minimal /dev — only egress FILTERING is
-# off (the app reaches any host, but still cannot see your real $HOME or other processes).
-network = "shared"
+# EGRESS IS FILTERED — and one env var is what makes that possible. T3 splits its network across THREE
+# processes, and each reaches the proxy by a different route. All three were measured against the
+# shipped binary (Electron 41.5.0 / Node 24.15.0), because the split is not something you can guess:
+#
+#  - The Chromium RENDERER (the UI) honours the proxy variables sbx sets, natively and with no help.
+#  - The Node BACKEND — `apps/server`, spawned as a SEPARATE `ELECTRON_RUN_AS_NODE` child, and the
+#    process that actually serves the model list and drives the agents — builds its HTTP client from
+#    Effect's `FetchHttpClient`, which is `globalThis.fetch`, which is undici's PROCESS-GLOBAL
+#    dispatcher. That dispatcher ignores `http_proxy` by default, which is why this profile used to
+#    ship `network = "shared"`. `NODE_USE_ENV_PROXY = "1"` in [env] below replaces it with a
+#    proxy-aware one (Node >= 24.15 — the runtime Electron 41 embeds), and the backend's traffic then
+#    crosses the allowlist like everything else. WITHOUT that variable its calls die at DNS in the
+#    empty netns and you get an empty model list and an "Offline" environment: it is load-bearing
+#    here, not a tuning knob.
+#  - The Electron MAIN process is the one hole left. It builds `NodeHttpClient.layerUndici`, which
+#    constructs its OWN `new Agent()` — a dispatcher NO environment variable reaches, `NODE_USE_ENV_PROXY`
+#    included (that variable only swaps the global one). Substituting the class it constructs does
+#    work, but the only way to run code before it — `NODE_OPTIONS=--import …` — is stripped by Electron
+#    itself in a PACKAGED app before any app code runs, so there is nothing to hook. Its outbound
+#    surface is small and is the ACCOUNT side (`t3.codes`, `t3.chat`, `challenges.cloudflare.com`) —
+#    and on a real launch the sign-in flow still came up, because Clerk's UI and its `/v1/*` calls are
+#    made by the RENDERER, which is routed. So the hole is bounded and, signed out, was not visible.
+#    Everything it does reach on its own is REFUSED, never leaked: a proxy-blind client in an empty
+#    netns simply fails to resolve.
+#
+# The posture itself is the `[network]` table at the END of this file (a `[network]` table written
+# here would swallow the top-level keys that follow it). If a launch misbehaves, read
+# `sbx net logs -a t3code` first: a named deny is a host to add to `allow`, not a reason to drop the
+# allowlist. `sbx app run t3code --net shared` remains the one-launch escape hatch, and it leaves the
+# profile filtered.
 
 # --- The coding agents T3 drives ------------------------------------------------------------------
 # T3 spawns its agents as subprocesses (it depends on node-pty). It is EXPECTED to find each one on
@@ -143,9 +161,10 @@ network = "shared"
 #     sbx bundle import examples/bundle/claude-code.toml
 # Without it the app resolves with a note saying the bundle is undeclared, and T3 finds no agent.
 #
-# Note for this profile specifically: `network = "shared"` above means the bundles' egress rules are
-# REDUNDANT here (nothing filters, so nothing needs allowing) and are dropped silently — no rule is
-# lost. What `use` buys T3 is the package and its environment, kept in step with the agent.
+# Note for this profile specifically: now that egress is filtered, a bundle's egress rules LAND in
+# the `[network]` table below rather than being dropped as redundant — so naming `claude-code` here
+# also opens the hosts that agent needs, kept in step with its own profile. That is why the allowlist
+# below carries T3's OWN hosts only.
 #
 # claude-code is named by default so T3 is not inert; add more as you need. To actually USE one you
 # still need its own login (OAuth via the in-cage browser, or an API key in its config in the
@@ -175,22 +194,59 @@ chromium = "nix:chromium"
 
 # The agents T3 drives come from their BUNDLES — see `use` above, not this table.
 
-# ── ASPIRATIONAL ALLOWLIST (inert — `network = "shared"` is set above; there is NO `[network]` table).
-# Kept as documentation for the day t3code CAN be filtered — i.e. when sbx grows a Chromium-safe
-# interceptor for the proxy-blind Node backend (a self-disabling LD_PRELOAD connect-shim, or a cap-free
-# loopback DNS responder + SNI-reading TLS relay tunnelling to the forwarder). Until then these lines do
-# nothing; do not uncomment them into a `[network] mode = "deny"` table expecting it to work — it won't
-# (the model list will be empty). The hosts, grounded live, would be:
-#   allow:
-#     "{*} https://api.anthropic.com"                          # Anthropic (claude-agent-sdk + Claude Code)
-#     "{*} https://clerk.t3.codes"                             # t3's own Clerk login UI
-#     "{GET} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*"
-#     "{GET} https://registry.npmjs.org"                       # mise npm/aqua fetches
-#     "{GET} https://models.dev"                               # the model catalogue
-#     "{*} https://api.openai.com" / "{*} https://openrouter.ai" / provider login hosts (per sub-agent)
-#     're:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/'  # Chromium spellcheck dictionary
-#   mute (telemetry): "*.sentry.io", "*.posthog.com", "api.axiom.co"
+[env]
+# THE ONE LOAD-BEARING VARIABLE (see the egress block near the top of this file). T3's Node backend
+# gets its HTTP client from Effect's `FetchHttpClient` — `globalThis.fetch`, i.e. undici's
+# process-global dispatcher, which ignores `http_proxy` unless this is set. With it, the backend's
+# requests reach the proxy and are subject to the allowlist below; without it they never leave the
+# empty netns and the app shows no models and an "Offline" environment. Node >= 24.15 honours it,
+# and Electron 41 embeds exactly 24.15. Harmless under `--net shared`: with no proxy variables in the
+# environment the proxy-aware dispatcher behaves as the ordinary one.
 #
+# IT FAILS SILENTLY IF YOU TURN IT OFF. Losing it (a `--env NODE_USE_ENV_PROXY=0` while debugging
+# something else, say) gives you the original symptom — no models, "Offline" — and the app logs
+# NOTHING: its backend swallows the failure. The check is `sbx net logs -a t3code`. With the variable
+# in effect the backend's own hosts appear there (its telemetry POSTs to `us.i.posthog.com`, refused
+# and muted, are the easiest tell, and they carry no CORS preflight because they come from Node, not
+# the browser). If NOTHING from the backend appears at all, the variable is not reaching it.
+NODE_USE_ENV_PROXY = "1"
+
+[network]
+mode = "deny"
+# T3's OWN hosts only — the coding agents bring theirs through their bundle (`use` above). Read
+# `sbx net logs -a t3code` after a launch: what you see refused there is what to add here.
+allow = [
+    # T3's first-party API + account/sign-in. Only `clerk.t3.codes` was OBSERVED on the wire (the
+    # sign-in UI and its `/v1/*` calls, on a signed-out launch). `app.t3.codes`, `relay.t3.codes` and
+    # `t3.chat` are read out of the shipped backend bundle and are opened ahead of need, not measured
+    # — a signed-in session would confirm them. All-verbs: the app POSTs to them.
+    "{*} https://app.t3.codes",
+    "{*} https://relay.t3.codes",
+    "{*} https://clerk.t3.codes",
+    "{*} https://t3.chat",
+    # The model catalogue. Named in the shipped backend bundle; not seen on the wire on a
+    # signed-out launch, so treat it as opened ahead of need rather than confirmed.
+    "{GET} https://models.dev",
+    # mise's npm/aqua fetches for the agents provisioned into the cage.
+    "{GET} https://registry.npmjs.org",
+    # Git-forge integrations (opening a repo, generating a PR). Keep only the forge you use.
+    "{*} https://github.com",
+    #"{*} https://gitlab.com",
+    #"{*} https://api.bitbucket.org",
+    # Chromium's spellcheck dictionary, fetched by the in-cage browser on first use.
+    're:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+    # Extra providers, if you point a sub-agent at one its own bundle does not cover.
+    #"{*} https://api.openai.com",
+    #"{*} https://openrouter.ai",
+]
+# Denied by construction; muted so their refusals do not drown the actionable ones in
+# `sbx net logs` (they are still counted in `sbx net stats`, and shown with `--all`).
+mute = [
+    "us.i.posthog.com",
+    "api.axiom.co",
+    "*.sentry.io",
+]
+
 # AUTHENTICATION — no [secret] block. T3 does not hold model credentials itself: each sub-agent
 # authenticates with ITS OWN account/key, stored by that CLI in the app's PERSISTENT ISOLATED HOME
 # (OAuth session via the in-cage browser, or an API key you place in the CLI's own config). So there is
