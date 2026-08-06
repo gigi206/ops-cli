@@ -108,8 +108,9 @@ fn write_pins(
 /// resolves to itself; a `github:<owner>/<repo>` locator queries the repo's latest release, selects
 /// its linux `.deb` asset, and **re-validates that GitHub-supplied URL** through the same
 /// injection-free barrier a hand-written `deb:` URL passes before it is fetched or interpolated into
-/// the generated derivation. `fresh` bypasses the fetch cache (set on `sbx upgrade`, so it sees a
-/// new release). Fail-closed: an unvalidated or unselectable asset returns an error and no pin.
+/// the generated derivation. `fresh` marks an `sbx upgrade` re-resolve: the release or index query
+/// bypasses nix's metadata cache so it sees a new entry, and the artefact fetch stays quiet for the
+/// summary. Fail-closed: an unvalidated or unselectable asset returns an error and no pin.
 pub(crate) fn resolve_source(
     nix: &Path,
     layout: &Layout,

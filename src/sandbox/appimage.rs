@@ -109,8 +109,9 @@ fn write_pins(
 /// URL resolves to itself; a `github:<owner>/<repo>` locator queries the repo's latest release,
 /// selects its linux `.AppImage` asset, and **re-validates that GitHub-supplied URL** through the
 /// same injection-free barrier a hand-written `appimage:` URL passes before it is fetched or
-/// interpolated into the generated derivation. `fresh` bypasses the fetch cache (set on `sbx upgrade`,
-/// so it sees a new release). Fail-closed: an unvalidated or unselectable asset returns an error.
+/// interpolated into the generated derivation. `fresh` marks an `sbx upgrade` re-resolve: the release
+/// query bypasses nix's metadata cache so it sees a new release, and the artefact fetch stays quiet
+/// for the summary. Fail-closed: an unvalidated or unselectable asset returns an error.
 pub(crate) fn resolve_source(
     nix: &Path,
     layout: &Layout,

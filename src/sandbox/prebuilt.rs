@@ -372,19 +372,18 @@ pub(crate) fn prefetch_hash(
         });
     let out = cmd.spawn()?.wait_with_output()?;
     if !out.status.success() {
-        // On the quiet path (an `sbx upgrade` re-resolve) stderr was captured and the summary
-        // already frames the line with `re-resolve failed — `, so the returned error is the folded
-        // cause alone. On the live path stderr has streamed to the terminal, so the bare step name
-        // is the right context for the launch failure that bubbles up.
-        if quiet {
-            let cause = fold_prefetch_cause(&String::from_utf8_lossy(&out.stderr));
-            return Err(io::Error::other(if cause.is_empty() {
-                "nix store prefetch-file failed".to_string()
-            } else {
-                cause
-            }));
-        }
-        return Err(io::Error::other("nix store prefetch-file failed"));
+        // `quiet` decides this on its own, through what it captured. On the quiet path (an
+        // `sbx upgrade` re-resolve) stderr is in hand and the summary already frames the line with
+        // `re-resolve failed — `, so the returned error is the folded cause alone. On the live path
+        // nothing was captured — it streamed to the terminal as it happened — so the fold finds
+        // nothing and the bare step name is what bubbles up, which is the right context for a
+        // failure the user has just watched scroll past.
+        let cause = fold_prefetch_cause(&String::from_utf8_lossy(&out.stderr));
+        return Err(io::Error::other(if cause.is_empty() {
+            "nix store prefetch-file failed".to_string()
+        } else {
+            cause
+        }));
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| io::Error::other(format!("prefetch-file returned invalid JSON: {e}")))?;
@@ -464,9 +463,10 @@ pub(crate) trait Kind {
 
     /// Resolve a declared locator to `(concrete artefact url, SRI content hash)`. A direct URL
     /// resolves to itself; a `github:`/`apt:` locator queries its source and re-validates what comes
-    /// back. `fresh` bypasses the fetch cache (set on `sbx upgrade`, so a new release is seen).
-    /// `system` selects the release asset for this host — a backend with a single asset form ignores
-    /// it.
+    /// back. `fresh` marks an `sbx upgrade` re-resolve: a backend that queries a source bypasses
+    /// nix's metadata cache so a new release or index entry is seen, and every backend keeps the
+    /// artefact fetch quiet so the upgrade summary frames its own failures. `system` selects the
+    /// release asset for this host — a backend with a single asset form ignores it.
     fn resolve_source(
         &self,
         nix: &Path,
@@ -844,9 +844,11 @@ pub(crate) enum Upgrade {
 /// a failure keeps the prior pin and is reported, and the lock is rewritten once at the end.
 ///
 /// Every resolution here runs with `fresh` set, which is what makes this an *upgrade* rather than a
-/// re-read: it bypasses the fetch cache so a new GitHub release, a new apt index entry, or new
-/// content behind a stable URL is actually seen. The provisioning path deliberately does the
-/// opposite.
+/// re-read: it bypasses nix's metadata cache, so a locator's source query sees a new GitHub release
+/// or a new apt index entry instead of the copy the last hour's query left behind. The provisioning
+/// path deliberately does the opposite. A `<backend>:resolve` whose command prints the URL already
+/// pinned keeps that pin's hash rather than fetching the artefact again, so a change of URL is what
+/// makes it look at the bytes at all: content that moves behind an unchanged URL is never seen.
 ///
 /// `cage` is the sandbox resolve commands run in. When it is `None` (the host cannot sandbox), a
 /// resolver reference is reported as failed rather than silently frozen at its current pin.
@@ -1048,9 +1050,9 @@ mod tests {
         )
         .expect("the roll writes its lock");
 
-        // `fresh` is what separates an upgrade from a re-read: without it a no-op `sbx upgrade`
-        // answers from the fetch cache and silently stops seeing new releases. Nothing else fails
-        // when it flips, which is why it is asserted here rather than trusted.
+        // `fresh` is what separates an upgrade from a re-read: without it a backend's source query
+        // answers from nix's metadata cache and a no-op `sbx upgrade` stops seeing new releases.
+        // Nothing else fails when it flips, which is why it is asserted here rather than trusted.
         assert_eq!(
             kind.fresh.get(),
             Some(true),
@@ -1318,6 +1320,44 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         );
         // Nothing captured at all → empty, so the caller omits the `: <cause>` suffix.
         assert_eq!(fold_prefetch_cause("   \n  \n"), "");
+    }
+
+    #[test]
+    fn prefetch_hash_folds_the_cause_when_quiet_and_names_the_step_when_loud() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        // A stand-in for the engine, failing the way nix does: a retry `warning:` ahead of the one
+        // `error:` line carrying the cause. Both arms run it, so the framing is the only variable.
+        // The loud arm inherits its `stderr`, so these two lines reach the terminal during a run.
+        let nix = data.path().join("fake-nix");
+        std::fs::write(
+            &nix,
+            "#!/bin/sh\n\
+             echo \"warning: unable to download 'https://example.com/demo-app.tar.gz': \
+             retrying (attempt 1/5)\" >&2\n\
+             echo \"error: unable to download 'https://example.com/demo-app.tar.gz': \
+             HTTP error 404\" >&2\n\
+             exit 1\n",
+        )
+        .expect("the stand-in engine is written");
+        std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in engine is made executable");
+        let url = "https://example.com/demo-app.tar.gz";
+
+        // An `sbx upgrade` re-resolve captures stderr, so its summary prints the cause in place of
+        // the fetch's own multi-line output.
+        let quiet = prefetch_hash(&nix, &layout, url, true).expect_err("the stand-in engine fails");
+        assert_eq!(
+            quiet.to_string(),
+            "unable to download 'https://example.com/demo-app.tar.gz': HTTP error 404"
+        );
+
+        // A first launch has already streamed that output to the terminal, so its error names the
+        // step alone rather than repeating what the user just read.
+        let loud = prefetch_hash(&nix, &layout, url, false).expect_err("the stand-in engine fails");
+        assert_eq!(loud.to_string(), "nix store prefetch-file failed");
     }
 
     #[test]
