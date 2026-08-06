@@ -177,11 +177,11 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
 }
 
 /// The cage environment pointing a D-Bus/portal client at the private bus and the GTK backend:
-/// the bus address, the keyfile GSettings backend (no dconf daemon in the cage), the portal
-/// directory carrying the GTK backend's `gtk.portal`, and the config directory carrying the
-/// generated `portals.conf`. `XDG_*` are data paths, not code-load paths, so an untrusted `[env]`
-/// that re-points them only sabotages the cage's own portal lookup (self-DoS), never an escape —
-/// like `WAYLAND_DISPLAY`, they need no denylist entry.
+/// the bus address, the keyfile GSettings backend (no dconf daemon in the cage), the settings
+/// portal opt-in, the portal directory carrying the GTK backend's `gtk.portal`, and the config
+/// directory carrying the generated `portals.conf`. `XDG_*` are data paths, not code-load paths,
+/// so an untrusted `[env]` that re-points them only sabotages the cage's own portal lookup
+/// (self-DoS), never an escape — like `WAYLAND_DISPLAY`, they need no denylist entry.
 pub(crate) fn env(gtk_root: &Path) -> Vec<(String, String)> {
     vec![
         (
@@ -189,6 +189,16 @@ pub(crate) fn env(gtk_root: &Path) -> Vec<(String, String)> {
             format!("unix:path={CAGE_SOCK}"),
         ),
         ("GSETTINGS_BACKEND".to_string(), "keyfile".to_string()),
+        // Make GDK read its settings from the portal. A Chromium/Electron app is its own portal
+        // client and picks the theme up unaided, but GDK only consults the settings portal when it
+        // believes it is sandboxed — which it detects from this variable or from a Flatpak marker
+        // the cage does not carry. Without it a GTK app ignores the light/dark preference the
+        // portal is already serving it: the seed lands in the keyfile, the relay rewrites it on
+        // every host switch, the in-cage portal re-emits `SettingChanged`, and the window stays on
+        // its default theme regardless. With it, a GTK app opens in the host scheme and follows a
+        // switch live, like an Electron one. It also routes GTK's own dialogs (file chooser, print)
+        // through the portal, which is where the cage renders them anyway.
+        ("GTK_USE_PORTAL".to_string(), "1".to_string()),
         (
             "XDG_DESKTOP_PORTAL_DIR".to_string(),
             gtk_root
@@ -370,6 +380,9 @@ mod tests {
             Some("unix:path=/run/sbx-portal/bus")
         );
         assert_eq!(get("GSETTINGS_BACKEND").as_deref(), Some("keyfile"));
+        // Without this opt-in GDK never asks the portal for the light/dark preference, so a GTK
+        // app stays on its default theme while an Electron one in the same cage follows the host.
+        assert_eq!(get("GTK_USE_PORTAL").as_deref(), Some("1"));
         assert_eq!(
             get("XDG_DESKTOP_PORTAL_DIR").as_deref(),
             Some("/nix/store/bbb-xdg-desktop-portal-gtk/share/xdg-desktop-portal/portals")

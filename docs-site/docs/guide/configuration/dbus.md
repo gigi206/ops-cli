@@ -40,6 +40,15 @@ The app probes *that* portal and gets three things:
   app window **and the file chooser** open in the right theme, and a host-side relay mirrors later
   host theme switches into the cage, so both surfaces **follow the theme live** (the file dialog
   re-themes even while it is open).
+
+  One file carries it: the GSettings **keyfile** the in-cage portal serves from. A Chromium/Electron
+  app is its own portal client and reads the scheme straight off it. A **GTK app** reaches the same
+  values, but only because sbx sets `GTK_USE_PORTAL=1` in the cage: GDK consults the settings portal
+  only when it believes it is sandboxed, which it decides from that variable or from a Flatpak
+  marker the cage does not carry. Without it a GTK window ignores a preference the portal is already
+  serving it — the seed lands, the relay rewrites, the portal re-emits, and the window stays on its
+  default theme. This is also why sbx sets no `GTK_THEME`: GTK reads that once at start and could
+  never follow a switch, whereas the portal channel re-themes a running app.
 - **Notifications**, a host-side relay bridges `org.freedesktop.Notifications` on the private bus to
   the host notifications daemon, so the app's desktop notifications work end to end (including
   click-to-focus and dismiss).
