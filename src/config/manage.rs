@@ -386,7 +386,7 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<bool, ManageErr
     // a list of *ports*, so a string entry there would fail validation and leave the field with no
     // way in at all. The guess is validated below and retried as a string, so an over-eager one
     // (a host that looks like a number) is never committed.
-    list.push_formatted(scalar_value(entry).into());
+    list.push_formatted(scalar_value(entry));
     // Keep the rendering readable: `toml_edit` leaves an appended entry flush against the previous
     // one, so a list built by repeated `add` would read `["a","b"]`.
     space_entries(list);
@@ -394,7 +394,7 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<bool, ManageErr
         let list = list_at(&mut doc, key)?;
         let last = list.len() - 1;
         list.remove(last);
-        list.push_formatted(Value::from(entry).into());
+        list.push_formatted(Value::from(entry));
         space_entries(list);
         if let Err(detail) = validate_layer(&doc) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));

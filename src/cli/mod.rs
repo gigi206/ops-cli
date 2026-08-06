@@ -60,18 +60,6 @@ pub(crate) fn dedupe_names(names: &mut Vec<&str>) {
     names.retain(|name| seen.insert(*name));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::dedupe_names;
-
-    #[test]
-    fn dedupe_names_keeps_the_first_of_each_in_order() {
-        let mut names = vec!["demo-tool", "demo-app", "demo-tool", "demo-app", "demo-svc"];
-        dedupe_names(&mut names);
-        assert_eq!(names, vec!["demo-tool", "demo-app", "demo-svc"]);
-    }
-}
-
 /// Route a resolved command name to its handler. `main` has already peeled off the help paths
 /// (`sbx --help`, `sbx <cmd> --help`) and the no-command usage error, so every name that reaches
 /// here is a concrete command plus its remaining arguments; each family owns its parsing from this
@@ -173,5 +161,17 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
             diag::hint("Run `sbx --help` for the list of commands.");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_names;
+
+    #[test]
+    fn dedupe_names_keeps_the_first_of_each_in_order() {
+        let mut names = vec!["demo-tool", "demo-app", "demo-tool", "demo-app", "demo-svc"];
+        dedupe_names(&mut names);
+        assert_eq!(names, vec!["demo-tool", "demo-app", "demo-svc"]);
     }
 }
