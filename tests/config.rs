@@ -3485,6 +3485,56 @@ fn sbx_app_rm_of_an_absent_profile_points_at_sbx_toml() {
 }
 
 #[test]
+fn sbx_app_rm_takes_several_names_and_one_failure_spares_the_rest() {
+    let fx = Fixture::new();
+    fx.write_profile("demo-one", "cmd = \"demo-app\"\n");
+    fx.write_profile("demo-two", "cmd = \"demo-app\"\n");
+
+    // Three names with an absent one in the middle: the two profiles that exist are removed, the
+    // absent one is reported, and the call carries a non-zero exit without stopping at it.
+    let out = fx.run(&["app", "rm", "demo-one", "demo-absent", "demo-two"]);
+    assert!(
+        !out.status.success(),
+        "an absent profile must colour the exit code: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no imported profile 'demo-absent'"),
+        "the failing name is not the one reported: {out:?}"
+    );
+    let profiles = fx.config_home.path().join("sbx/apps");
+    assert!(
+        !profiles.join("demo-one.toml").exists(),
+        "the profile named before the failing one was not removed"
+    );
+    assert!(
+        !profiles.join("demo-two.toml").exists(),
+        "the failing name stopped the batch — the name after it was skipped"
+    );
+}
+
+#[test]
+fn sbx_app_rm_rejects_an_invalid_name_before_removing_anything() {
+    let fx = Fixture::new();
+    fx.write_profile("demo-one", "cmd = \"demo-app\"\n");
+
+    // A path-shaped name is a usage error, and it is caught before the valid name ahead of it is
+    // acted on: a removal is destructive, so a typo at the end must not cost the names before it.
+    let out = fx.run(&["app", "rm", "demo-one", "../escape"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an invalid app name is a usage error: {out:?}"
+    );
+    assert!(
+        fx.config_home
+            .path()
+            .join("sbx/apps/demo-one.toml")
+            .exists(),
+        "a profile was removed before the invalid name was rejected"
+    );
+}
+
+#[test]
 fn config_get_set_unset_round_trip() {
     let fx = Fixture::new();
     // set creates the file; get reads it back; unset removes it; get then exits 1.

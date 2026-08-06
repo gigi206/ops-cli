@@ -202,7 +202,7 @@ sbx plugins list              # built-in schemes + every installed plugin
 sbx plugins info <scheme>     # a plugin's manifest, sandbox grant, and origin
                               #   (a built-in scheme is reported as such)
 sbx plugins install <name|dir>  # install a bundled plugin by name, or copy a local ./dir
-sbx plugins rm <name>         # remove an installed plugin
+sbx plugins rm <name>...      # remove installed plugins (several names in one call)
 sbx plugins verify [name]     # re-hash installed plugins against the digest recorded at install
 sbx plugins upgrade [name] [--dry-run]   # replace with what the store lists now (digest-decided)
 ```

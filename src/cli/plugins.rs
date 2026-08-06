@@ -41,12 +41,7 @@ pub(crate) fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
                 Ok(()) => plugins_install(args.get(1)),
             }
         }
-        Some("rm") => {
-            match crate::cli::reject_extra(&["plugins", "rm"], args.get(2..).unwrap_or(&[])) {
-                Err(code) => code,
-                Ok(()) => plugins_remove(args.get(1).and_then(|a| a.to_str())),
-            }
-        }
+        Some("rm") => plugins_remove(&args[1..]),
         Some("upgrade") => plugins_upgrade(&args[1..]),
         Some("verify") => {
             match crate::cli::reject_extra(&["plugins", "verify"], args.get(2..).unwrap_or(&[])) {
@@ -1408,32 +1403,68 @@ fn plugins_store_list(only_installed: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `sbx plugins rm <name>`: remove an installed resolver plugin by its name (the token `list`
-/// shows). Host-level, like `install`; refuses an unsafe name or a directory that is not a plugin.
-fn plugins_remove(name: Option<&str>) -> ExitCode {
-    let Some(name) = name else {
+/// `sbx plugins rm <name>...`: remove installed resolver plugins by name (the token `list` shows).
+/// Host-level, like `install`; refuses an unsafe name or a directory that is not a plugin.
+///
+/// Several names may be given in one call, like `sbx app rm`. Each is removed independently, so one
+/// name failing (not installed, or a directory carrying no `plugin.toml`) leaves the others removed
+/// and only colours the exit code. Every name is validated *before* the first removal — a removal is
+/// destructive, so a typo at the end of the list must not cost the plugins before it — which is also
+/// what keeps an unsafe name away from the data directory it would be joined to.
+fn plugins_remove(args: &[OsString]) -> ExitCode {
+    let mut names: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.to_str() {
+            Some(tok) if tok.starts_with('-') => {
+                diag::error(&format!("sbx: plugins rm: unknown option `{tok}`"));
+                diag::error(&format!(
+                    "sbx: usage: {}",
+                    help::synopsis_of(&["plugins", "rm"])
+                ));
+                return ExitCode::from(2);
+            }
+            Some(tok) => names.push(tok),
+            None => {
+                diag::error("sbx: plugins rm: argument is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if names.is_empty() {
         diag::error(&format!(
             "sbx: usage: {}",
             help::synopsis_of(&["plugins", "rm"])
         ));
         return ExitCode::from(2);
-    };
+    }
+    for name in &names {
+        if let Err(why) = plugins::validate_install_name(name) {
+            diag::error(&format!("sbx: cannot remove plugin: {why}"));
+            return ExitCode::FAILURE;
+        }
+    }
+    crate::cli::dedupe_names(&mut names);
     let Some(layout) = store::Layout::from_env() else {
         diag::error(
             "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
         );
         return ExitCode::FAILURE;
     };
-    match plugins::remove(&layout, name) {
-        Ok(()) => {
-            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_removed(None, name, &pal));
-            ExitCode::SUCCESS
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let mut had_error = false;
+    for name in &names {
+        match plugins::remove(&layout, name) {
+            Ok(()) => println!("{}", render_removed(None, name, &pal)),
+            Err(why) => {
+                diag::error(&format!("sbx: cannot remove plugin: {why}"));
+                had_error = true;
+            }
         }
-        Err(why) => {
-            diag::error(&format!("sbx: cannot remove plugin: {why}"));
-            ExitCode::FAILURE
-        }
+    }
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

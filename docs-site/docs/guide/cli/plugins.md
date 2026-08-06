@@ -18,7 +18,7 @@ See also: [Resolver plugins](../secrets/plugins) · [Signed plugin stores](../se
 | `list` (alias `ls`) | list installed resolver plugins (with their origin) and the built-in schemes |
 | `info <scheme>` | show a plugin's manifest, sandbox grant, and origin |
 | `install <dir>` | install a local plugin directory (`<data>/plugins/<name>`); the built-in schemes are always present, not installed |
-| `rm <name>` | remove an installed resolver plugin |
+| `rm <name>...` | remove installed resolver plugins; several names may be given, each removed on its own |
 | `verify [name]` | check installed plugins against the digest recorded at install |
 | `upgrade [name] [--dry-run]` | replace installed plugins with what their store lists now |
 
@@ -162,12 +162,18 @@ verifies, so a failed upgrade leaves what you had.
 sbx plugins verify                     # every plugin, against the digest recorded at install
 sbx plugins verify kp                  # one; exit 1 means its tree changed
 sbx plugins rm kp                      # remove the plugin
+sbx plugins rm kp pass-old             # several in one call, each removed on its own
 sbx plugins store rm mine              # remove the store (installed plugins stay)
 ```
 
 A `verify` failure is **drift**, not an attack signal: the digest record lives in the
 same owner-only directory as the plugin, so whatever can rewrite one can rewrite the
 other. It catches a plugin edited in place and forgotten.
+
+`rm` takes several names. Each plugin is removed independently: a name that fails (not
+installed, or a directory carrying no `plugin.toml`) leaves the others removed and only
+makes the exit code non-zero, while an unsafe name is rejected before anything is
+removed at all.
 
 ### Resolve a scheme conflict
 

@@ -4,7 +4,7 @@
 sbx app run <name> [--detach] [--observe] [--net-learn[=level] [--global|--local] [--dry-run]] [override flags] [-- <args>...]
 sbx app import <file> [--as <name>] [--force]
 sbx app export <name> [--out <file>]
-sbx app rm <name> [--purge] [--gc]
+sbx app rm <name>... [--purge] [--gc]
 sbx app list
 sbx app show <name> [--json]
 sbx app prune <name> [--yes]
@@ -114,6 +114,13 @@ there, reclaiming the app's now-unreferenced `nix:`/`flake:` closures. For a glo
 used in several projects, run the sweep in each of them (one command covers the current
 project only). Use `sbx app list` to see which apps have an installed home to purge.
 
+Several names may be given in one call, like [`sbx projects rm`](projects). Each app is
+removed on its own: a name that fails (no profile to remove, a live session holding its
+home) leaves the others removed and only makes the exit code non-zero, while an invalid
+name is rejected before anything is removed at all. A name repeated in one call counts
+once, and the `--gc` sweep runs once for the whole call, since the store it collects is
+shared by every app in the project.
+
 ## Inspecting an app
 
 `sbx app show <name>` reports one app's **realized-on-disk** detail: the counterpart to
@@ -172,4 +179,5 @@ sbx app prune hermes --yes              # …and remove them
 sbx app export claude-code > my-claude.toml
 sbx app rm claude-code --purge         # remove the profile, home, and tools
 sbx app rm claude-code --purge --gc    # …and sweep this project's nix store too
+sbx app rm claude-code hermes --purge  # several apps in one call, each on its own
 ```

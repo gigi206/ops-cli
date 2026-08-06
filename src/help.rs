@@ -1696,10 +1696,13 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "rm"],
-        synopsis: "sbx app rm <name> [--purge] [--gc]",
-        summary: "remove an imported profile (and, with --purge, the app's home + tools)",
+        synopsis: "sbx app rm <name>... [--purge] [--gc]",
+        summary: "remove imported profiles (and, with --purge, the apps' homes + tools)",
         options: &[
-            ("<name>", "the app to remove"),
+            (
+                "<name>...",
+                "the app(s) to remove; name several and each is removed on its own",
+            ),
             (
                 "--purge",
                 "also remove the app's isolated home(s): its mise tools, config, and login state",
@@ -1718,7 +1721,12 @@ const PAGES: &[Page] = &[
             nix store is not touched by --purge alone: add --gc to sweep the current project's\n\
             store in the same command (equivalent to `sbx gc --prune` there), or run that yourself\n\
             in each project the app used to reclaim its nix:/flake: closures. A purge refuses while\n\
-            a session of the app is still running.",
+            a session of the app is still running.\n\
+            \n\
+            Several names may be given in one call. Each app is removed independently — one name\n\
+            failing (no profile, a live session) leaves the others removed and only makes the exit\n\
+            code non-zero — while an invalid name is rejected before anything is removed. The --gc\n\
+            sweep runs once for the whole call, since the store it collects is shared.",
     },
     Page {
         path: &["app", "list"],
@@ -2357,13 +2365,16 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "rm"],
-        synopsis: "sbx plugins rm <name>",
-        summary: "remove an installed resolver plugin",
+        synopsis: "sbx plugins rm <name>...",
+        summary: "remove installed resolver plugins",
         options: &[(
-            "<name>",
-            "the installed plugin to remove (the token `list` shows)",
+            "<name>...",
+            "the installed plugin(s) to remove (the token `list` shows)",
         )],
-        details: "",
+        details: "Several names may be given in one call. Each plugin is removed independently —\n\
+            one name failing (not installed, or a directory carrying no plugin.toml) leaves the\n\
+            others removed and only makes the exit code non-zero — while an unsafe name is\n\
+            rejected before anything is removed.",
     },
     Page {
         path: &["plugins", "upgrade"],

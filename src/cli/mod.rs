@@ -52,6 +52,26 @@ pub(crate) fn reject_extra(path: &[&str], extra: &[OsString]) -> Result<(), Exit
     Err(ExitCode::from(2))
 }
 
+/// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single
+/// removal, keeping the order the user typed. Without this the second pass over a name finds
+/// nothing left to remove and reports a phantom failure over work that in fact succeeded.
+pub(crate) fn dedupe_names(names: &mut Vec<&str>) {
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|name| seen.insert(*name));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_names;
+
+    #[test]
+    fn dedupe_names_keeps_the_first_of_each_in_order() {
+        let mut names = vec!["demo-tool", "demo-app", "demo-tool", "demo-app", "demo-svc"];
+        dedupe_names(&mut names);
+        assert_eq!(names, vec!["demo-tool", "demo-app", "demo-svc"]);
+    }
+}
+
 /// Route a resolved command name to its handler. `main` has already peeled off the help paths
 /// (`sbx --help`, `sbx <cmd> --help`) and the no-command usage error, so every name that reaches
 /// here is a concrete command plus its remaining arguments; each family owns its parsing from this

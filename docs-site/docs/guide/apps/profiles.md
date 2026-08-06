@@ -71,11 +71,13 @@ sbx app export claude-code > my-claude.toml
 
 ```sh
 sbx app list          # the imported profiles, by name
-sbx app rm <name>     # remove an imported profile (not an inline [app.<name>])
+sbx app rm <name>...  # remove imported profiles (not an inline [app.<name>])
 ```
 
 `sbx app rm` manages only **imported** profiles (files in the profiles directory). A
 project `[app.<name>]` overlay lives in that project's `.sbx.toml` and is edited there.
+Several names may be given in one call, each removed on its own (see
+[Removing an app](../cli/app#removing-an-app)).
 For the full resolved app set (inline, project, and profile apps with their gating), use
 [`sbx config show`](../cli/config).
 

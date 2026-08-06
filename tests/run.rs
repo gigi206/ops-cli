@@ -7334,6 +7334,119 @@ fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
 }
 
 #[test]
+fn sbx_app_rm_purges_several_apps_in_one_call() {
+    let data = TmpDir::new("purge-many-data");
+    let sbx_dir = data.path().join("sbx");
+    // Two target apps, one with a global home and one with a per-project home, plus a third that
+    // is not named and must survive.
+    touch_under(&sbx_dir.join("apps/agent-one/home/state"));
+    touch_under(&sbx_dir.join("projects/testproj/apps/agent-two/home/state"));
+    touch_under(&sbx_dir.join("apps/agent-three/home/state"));
+
+    // Three names with an absent one in the middle: each app is purged on its own, so the failing
+    // name is reported without stopping the one after it, and the call exits non-zero.
+    let out = sbx_data(
+        data.path(),
+        &[
+            "app",
+            "rm",
+            "agent-one",
+            "absent-app",
+            "agent-two",
+            "--purge",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "an app with nothing to purge must colour the exit code: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nothing to purge for 'absent-app'"),
+        "the failing name is not the one reported: {out:?}"
+    );
+    assert!(
+        !sbx_dir.join("apps/agent-one").exists(),
+        "the app named before the failing one was not purged"
+    );
+    assert!(
+        !sbx_dir.join("projects/testproj/apps/agent-two").exists(),
+        "the failing name stopped the batch — the name after it was skipped"
+    );
+    assert!(
+        sbx_dir.join("apps/agent-three/home/state").exists(),
+        "an app that was not named was collateral"
+    );
+    // Each purged app reports its own summary…
+    assert_eq!(
+        stdout.matches("purged app").count(),
+        2,
+        "one summary line per purged app expected:\n{stdout}"
+    );
+    // …while the closing store note is batch-level: the store it points at is shared by every app
+    // in the project, so one call prints it once however many apps it purged.
+    assert_eq!(
+        stdout.matches("nix:/flake: tool closures").count(),
+        1,
+        "the shared-store note must be printed once per call:\n{stdout}"
+    );
+}
+
+#[test]
+fn sbx_app_rm_counts_a_repeated_name_once() {
+    let data = TmpDir::new("purge-dup-data");
+    let sbx_dir = data.path().join("sbx");
+    touch_under(&sbx_dir.join("apps/agent-one/home/state"));
+
+    // The same app named twice is one removal: a second pass would find nothing left and report a
+    // phantom "nothing to purge" over work that in fact succeeded.
+    let out = sbx_data(
+        data.path(),
+        &["app", "rm", "agent-one", "agent-one", "--purge"],
+    );
+    assert!(
+        out.status.success(),
+        "a repeated name reported a failure: {out:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("nothing to purge"),
+        "the repeat was purged twice: {out:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .matches("purged app")
+            .count(),
+        1,
+        "the repeat produced a second summary line: {out:?}"
+    );
+    assert!(
+        !sbx_dir.join("apps/agent-one").exists(),
+        "the home survived the purge"
+    );
+}
+
+#[test]
+fn sbx_app_rm_gc_is_skipped_when_the_call_purged_nothing() {
+    // Nothing on disk for any name: the sweep has no reclamation to make, so it must not run —
+    // which is also what keeps this test free of nix and of a capable host.
+    let data = TmpDir::new("gc-nothing-data");
+    let out = sbx_data(data.path(), &["app", "rm", "absent-app", "--purge", "--gc"]);
+    assert!(
+        !out.status.success(),
+        "a call that purged nothing must not report success: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("swept this project's store"),
+        "the sweep ran for a call that purged nothing:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("nix:/flake: tool closures"),
+        "a store note was printed with no purge to point it at:\n{stdout}"
+    );
+}
+
+#[test]
 fn sbx_app_rm_gc_requires_purge() {
     // `--gc` sweeps the store a purged home referenced, so it is meaningless without `--purge`.
     // This errors before any work, so it needs no capable host and no data setup.

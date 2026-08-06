@@ -728,6 +728,60 @@ fn a_verb_given_without_its_argument_prints_usage_instead_of_crashing() {
 }
 
 #[test]
+fn plugins_rm_takes_several_names_and_one_failure_spares_the_rest() {
+    let home = TmpDir::new();
+    let src = TmpDir::new();
+    // Two installed plugins on distinct schemes (a scheme claimed twice would disable both).
+    let one = local_plugin(src.path(), "demo-one", "one");
+    let two = local_plugin(src.path(), "demo-two", "two");
+    run(&["plugins", "install", one.to_str().unwrap()], home.path());
+    run(&["plugins", "install", two.to_str().unwrap()], home.path());
+
+    // Three names with an absent one in the middle: each plugin is removed on its own, so the
+    // failing name is reported without stopping the one after it, and the call exits non-zero.
+    let (code, out, err) = run_both(
+        &["plugins", "rm", "demo-one", "demo-absent", "demo-two"],
+        home.path(),
+    );
+    assert_eq!(code, 1, "an absent plugin must colour the exit code: {err}");
+    assert!(
+        err.contains("no installed plugin named `demo-absent`"),
+        "the failing name is not the one reported: {err}"
+    );
+    assert!(
+        out.contains("demo-one") && out.contains("demo-two"),
+        "both removals must be reported:\n{out}"
+    );
+    let listing = run(&["plugins", "list"], home.path());
+    assert!(
+        listing.contains("installed resolver plugins: (none)"),
+        "the failing name stopped the batch — the name after it was skipped:\n{listing}"
+    );
+}
+
+#[test]
+fn plugins_rm_rejects_an_unsafe_name_before_removing_anything() {
+    let home = TmpDir::new();
+    let src = TmpDir::new();
+    let one = local_plugin(src.path(), "demo-one", "one");
+    run(&["plugins", "install", one.to_str().unwrap()], home.path());
+
+    // A path-shaped name is refused, and the valid name ahead of it is left installed: a removal is
+    // destructive, so a typo at the end must not cost the names before it.
+    let (code, err) = run_failing(&["plugins", "rm", "demo-one", "../escape"], home.path());
+    assert_eq!(code, 1, "an unsafe plugin name must be refused: {err}");
+    assert!(
+        err.contains("must not start with a dot"),
+        "the refusal must be the name check, not a removal that failed at the sink: {err}"
+    );
+    let listing = run(&["plugins", "list"], home.path());
+    assert!(
+        listing.contains("demo-one"),
+        "a plugin was removed before the unsafe name was rejected:\n{listing}"
+    );
+}
+
+#[test]
 fn a_plugin_edited_after_install_is_reported_by_every_inspection_path() {
     let home = TmpDir::new();
     let src = TmpDir::new();

@@ -560,19 +560,24 @@ fn app_export(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `sbx app rm <name> [--purge] [--gc]`: remove an app.
+/// `sbx app rm <name>... [--purge] [--gc]`: remove one or more apps.
 ///
 /// By default this removes only the imported **profile** (a file in the profiles directory) — a
 /// project `[app.<name>]` overlay lives in that project's `.sbx.toml` and is the user's to edit
 /// there. With `--purge` it also removes the app's isolated **runtime state**: its per-app home(s)
 /// (the mise tools its `mise:` backends installed, its config, and its login/session state), which
 /// is freed immediately. `--gc` (which requires `--purge`) then sweeps the **current project's**
-/// nix store — reclaiming the app's now-unreferenced `nix:`/`flake:` closures in one command for the
-/// common single-project case (see [`app_rm_purge`]). The name is validated before it is joined to
-/// any path (anti-traversal).
+/// nix store — reclaiming the apps' now-unreferenced `nix:`/`flake:` closures in one command for the
+/// common single-project case (see [`app_rm_purge`]).
+///
+/// Several names may be named in one call, like `sbx projects rm`. Each is removed independently:
+/// one name failing (no profile, a live session, a home that will not delete) never stops the ones
+/// after it, and the exit code reports the batch. Every name is validated *before* the first removal
+/// — the removal is destructive, so a typo at the end of the list must not cost the names before it
+/// — and only a validated name is ever joined to a path (anti-traversal).
 fn app_rm(args: &[OsString]) -> ExitCode {
-    let (purge, gc, name) = match parse_app_rm(args) {
-        AppRmArgs::Ok { purge, gc, name } => (purge, gc, name),
+    let (purge, gc, mut names) = match parse_app_rm(args) {
+        AppRmArgs::Ok { purge, gc, names } => (purge, gc, names),
         AppRmArgs::MissingName => {
             diag::error(&format!(
                 "sbx: usage: {}",
@@ -588,20 +593,16 @@ fn app_rm(args: &[OsString]) -> ExitCode {
             ));
             return ExitCode::from(2);
         }
-        AppRmArgs::Extra(tok) => {
-            diag::error(&format!(
-                "sbx: app rm: unexpected argument `{tok}` (one app name only)"
-            ));
-            return ExitCode::from(2);
-        }
         AppRmArgs::NonUtf8 => {
             diag::error("sbx: app rm: argument is not valid UTF-8");
             return ExitCode::from(2);
         }
     };
-    if !config::is_valid_app_name(name) {
-        diag::error(&format!("sbx: '{name}' is not a valid app name"));
-        return ExitCode::from(2);
+    for name in &names {
+        if !config::is_valid_app_name(name) {
+            diag::error(&format!("sbx: '{name}' is not a valid app name"));
+            return ExitCode::from(2);
+        }
     }
     // `--gc` reclaims the store an app's homes referenced, so it only makes sense alongside the
     // home removal `--purge` performs — never on a bare profile removal.
@@ -611,79 +612,86 @@ fn app_rm(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    crate::cli::dedupe_names(&mut names);
     if purge {
-        app_rm_purge(name, gc)
+        app_rm_purge(&names, gc)
     } else {
-        app_rm_profile(name)
+        app_rm_profiles(&names)
     }
 }
 
 /// The structural parse of `sbx app rm` arguments (before name validation). Kept pure so the flag/
-/// positional handling — `--purge`, `--gc`, and the single app name in any order — is unit-tested.
-/// The name's charset validation and the `--gc`-requires-`--purge` rule are the caller's next steps.
+/// positional handling — `--purge`, `--gc`, and one or more app names in any order — is unit-tested.
+/// The names' charset validation, deduplication, and the `--gc`-requires-`--purge` rule are the
+/// caller's next steps.
 enum AppRmArgs<'a> {
     Ok {
         purge: bool,
         gc: bool,
-        name: &'a str,
+        names: Vec<&'a str>,
     },
     MissingName,
     UnknownOption(&'a str),
-    Extra(&'a str),
     NonUtf8,
 }
 
 fn parse_app_rm(args: &[OsString]) -> AppRmArgs<'_> {
     let mut purge = false;
     let mut gc = false;
-    let mut name: Option<&str> = None;
+    let mut names: Vec<&str> = Vec::new();
     for arg in args {
         match arg.to_str() {
             Some("--purge") => purge = true,
             Some("--gc") => gc = true,
             Some(tok) if tok.starts_with('-') => return AppRmArgs::UnknownOption(tok),
-            Some(tok) if name.is_none() => name = Some(tok),
-            Some(tok) => return AppRmArgs::Extra(tok),
+            Some(tok) => names.push(tok),
             None => return AppRmArgs::NonUtf8,
         }
     }
-    match name {
-        Some(name) => AppRmArgs::Ok { purge, gc, name },
-        None => AppRmArgs::MissingName,
+    if names.is_empty() {
+        AppRmArgs::MissingName
+    } else {
+        AppRmArgs::Ok { purge, gc, names }
     }
 }
 
-/// Remove app `name`'s imported profile only (the default `sbx app rm`). A missing profile is an
-/// error here — the user asked to remove a profile and there is none to remove (with `--purge` a
-/// missing profile is tolerated, since the homes may still exist).
-fn app_rm_profile(name: &str) -> ExitCode {
+/// Remove the imported profiles of `names` only (the default `sbx app rm`, without `--purge`). A
+/// missing profile is an error here — the user asked to remove a profile and there is none to remove
+/// (with `--purge` a missing profile is tolerated, since the homes may still exist). Each name is
+/// independent: a failing one leaves the others removed and only colours the exit code.
+fn app_rm_profiles(names: &[&str]) -> ExitCode {
     let Some(dir) = config::profiles_dir() else {
         diag::error("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
         return ExitCode::FAILURE;
     };
-    let path = dir.join(format!("{name}.toml"));
-    match std::fs::remove_file(&path) {
-        Ok(()) => {
-            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_removed(Some("app profile"), name, &pal));
-            ExitCode::SUCCESS
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let mut had_error = false;
+    for name in names {
+        let path = dir.join(format!("{name}.toml"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("{}", render_removed(Some("app profile"), name, &pal)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                diag::error(&format!(
+                    "sbx: no imported profile '{name}' (a project [app.{name}] overlay lives in a \
+                     project's .sbx.toml — edit it there). To also remove an app's home/tools, use \
+                     `sbx app rm {name} --purge`."
+                ));
+                had_error = true;
+            }
+            Err(e) => {
+                diag::error(&format!("sbx: cannot remove {}: {e}", path.display()));
+                had_error = true;
+            }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            diag::error(&format!(
-                "sbx: no imported profile '{name}' (a project [app.{name}] overlay lives in a \
-                 project's .sbx.toml — edit it there). To also remove an app's home/tools, use \
-                 `sbx app rm {name} --purge`."
-            ));
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            diag::error(&format!("sbx: cannot remove {}: {e}", path.display()));
-            ExitCode::FAILURE
-        }
+    }
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
-/// `sbx app rm <name> --purge`: remove the profile **and** the app's isolated runtime state.
+/// `sbx app rm <name>... --purge`: remove the profiles **and** the apps' isolated runtime state.
 ///
 /// The runtime state is the per-app home(s): the global `<data>/apps/<name>/` and each per-project
 /// `<data>/projects/<id>/apps/<name>/`. They hold the tools the app's `mise:` backends installed
@@ -692,18 +700,18 @@ fn app_rm_profile(name: &str) -> ExitCode {
 /// is the shared per-project nix store: it backs every app in a project, so a purged app's
 /// `nix:`/`flake:` closures are reclaimed by `sbx gc`, which the closing note points at.
 ///
-/// A running session of the app is a hard stop — deleting its home mid-run would corrupt it — so
-/// this refuses until the session is stopped (the same live guard `sbx gc` applies). Under `--purge`
-/// a missing profile is tolerated (the homes may still exist), but finding *nothing at all* — no
-/// profile and no home — is reported as a no-op so a typo never silently "succeeds".
+/// The session registry is read **once** for the whole call: it decides the live-app guard for every
+/// name, and a registry that cannot be read fails the batch closed (a purge must not run unproven).
+/// Each name is then purged on its own by [`app_rm_purge_one`], so one refusal leaves the rest of
+/// the batch to run and only colours the exit code.
 ///
 /// When `gc` is set (the `--gc` flag), it then sweeps the **current project's** store via the same
-/// path as `sbx gc --prune`, reclaiming the app's now-unreferenced closures there in one command.
-/// The sweep is a distinct step with its own prerequisites (a capable host, nix); its failure is
-/// reflected in the exit code but never undoes the purge that already happened.
-fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
+/// path as `sbx gc --prune`, reclaiming the apps' now-unreferenced closures there in one command.
+/// The sweep and its closing note are batch-level — the store is shared, so one sweep covers every
+/// name. The sweep is a distinct step with its own prerequisites (a capable host, nix); its failure
+/// is reflected in the exit code but never undoes the purge that already happened.
+fn app_rm_purge(names: &[&str], gc: bool) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    let (ok, n, warn, dim, r) = (pal.ok, pal.name, pal.warn, pal.dim, pal.reset);
 
     let Some(layout) = store::Layout::from_env() else {
         diag::error(
@@ -712,31 +720,115 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // Live-session guard: a session running as this app holds its home open. Refuse until it is
-    // stopped, and fail closed if the registry cannot be read (a purge must not run unproven).
-    match session::Registry::at(layout.data_dir()).list() {
-        Ok(sessions) => {
-            let pids: Vec<String> = sessions
-                .iter()
-                .filter(|s| s.app() == Some(name))
-                .map(|s| s.pid.to_string())
-                .collect();
-            if !pids.is_empty() {
-                diag::error(&format!(
-                    "sbx: app '{name}' has a running session (pid {}); stop it first \
-                     (see `sbx session ls`; then `sbx session stop {}`).",
-                    pids.join(", "),
-                    pids.join(" ")
-                ));
-                return ExitCode::FAILURE;
-            }
-        }
+    // Read once for the batch, and fail closed for all of it: without the registry no name can be
+    // proven idle, so none of them may be purged.
+    let sessions = match session::Registry::at(layout.data_dir()).list() {
+        Ok(sessions) => sessions,
         Err(e) => {
+            let listed: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
             diag::error(&format!(
-                "sbx: cannot read the session registry ({e}); not purging '{name}'."
+                "sbx: cannot read the session registry ({e}); not purging {}.",
+                listed.join(", ")
             ));
             return ExitCode::FAILURE;
         }
+    };
+
+    let mut had_error = false;
+    let mut purged_any = false;
+    for name in names {
+        let outcome = app_rm_purge_one(name, &sessions, &layout, &pal);
+        had_error |= !outcome.ok;
+        purged_any |= outcome.acted;
+    }
+
+    // Nothing came off disk for any name (a typo, or every name refused): the per-app errors above
+    // already said why, and there is no reclamation to point at — neither the sweep nor its note.
+    if !purged_any {
+        return ExitCode::FAILURE;
+    }
+
+    // Any `nix:`/`flake:` tool closures the apps built live in the shared per-project store, which
+    // backs every app in a project. `--gc` sweeps the *current* project's store now; without it, the
+    // reclamation is a separate manual step, and either way other projects need their own sweep.
+    if gc {
+        println!();
+        let gc_code = sandbox::gc(true, false, false, &pal);
+        println!(
+            "{}",
+            style::dim_prose(
+                "note: `--gc` swept this project's store; run `sbx gc --prune` in the apps' other \
+                 projects to reclaim their copies too.",
+                &pal
+            )
+        );
+        // The purge succeeded independently of the sweep; when it did, defer to the sweep's own exit
+        // code so a sweep that could not run (no capable host, nix missing) is not hidden — but never
+        // undo the purge's failure signal.
+        return if had_error {
+            ExitCode::FAILURE
+        } else {
+            gc_code
+        };
+    }
+
+    println!(
+        "{}",
+        style::dim_prose(
+            "note: an app's nix:/flake: tool closures live in the shared per-project store; \
+             run `sbx gc --prune` in a project to reclaim any no longer referenced there \
+             (or re-run with --gc for the current project).",
+            &pal
+        )
+    );
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// What purging a single app under `--purge` did, as the batch in [`app_rm_purge`] needs to see it.
+struct AppPurgeOutcome {
+    /// The purge was clean: nothing refused it, and every home it found went away.
+    ok: bool,
+    /// Something was actually there to act on (a profile, or at least one home). It gates the
+    /// batch's store sweep — a call that removed nothing has earned no reclamation.
+    acted: bool,
+}
+
+/// Purge one app: its profile (if any) and its isolated home(s). `sessions` is the batch's single
+/// read of the registry, so the live-app guard costs one listing no matter how many names are given.
+///
+/// A running session of the app is a hard stop — deleting its home mid-run would corrupt it — so
+/// this refuses until the session is stopped (the same live guard `sbx gc` applies). Under `--purge`
+/// a missing profile is tolerated (the homes may still exist), but finding *nothing at all* — no
+/// profile and no home — is reported as a no-op so a typo never silently "succeeds".
+fn app_rm_purge_one(
+    name: &str,
+    sessions: &[session::Session],
+    layout: &store::Layout,
+    pal: &style::Palette,
+) -> AppPurgeOutcome {
+    let (ok, n, warn, dim, r) = (pal.ok, pal.name, pal.warn, pal.dim, pal.reset);
+
+    // Live-session guard: a session running as this app holds its home open.
+    let pids: Vec<String> = sessions
+        .iter()
+        .filter(|s| s.app() == Some(name))
+        .map(|s| s.pid.to_string())
+        .collect();
+    if !pids.is_empty() {
+        diag::error(&format!(
+            "sbx: app '{name}' has a running session (pid {}); stop it first \
+             (see `sbx session ls`; then `sbx session stop {}`).",
+            pids.join(", "),
+            pids.join(" ")
+        ));
+        return AppPurgeOutcome {
+            ok: false,
+            acted: false,
+        };
     }
 
     // 1. The profile (if any). Under --purge a missing profile is not fatal — the homes may still
@@ -744,7 +836,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
     let profile_removed = match config::profile_path(name) {
         Some(path) => match std::fs::remove_file(&path) {
             Ok(()) => {
-                println!("{}", render_removed(Some("app profile"), name, &pal));
+                println!("{}", render_removed(Some("app profile"), name, pal));
                 true
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -777,7 +869,10 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
         diag::error(&format!(
             "sbx: nothing to purge for '{name}' (no profile and no home)"
         ));
-        return ExitCode::FAILURE;
+        return AppPurgeOutcome {
+            ok: false,
+            acted: false,
+        };
     }
 
     // Name only what was actually removed: a purge with no profile present must not claim one.
@@ -787,7 +882,7 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
         "mise tools + login state"
     };
     // A partial failure (a home that would not delete) is not a clean purge — say so, so the green
-    // summary never contradicts the non-zero exit below.
+    // summary never contradicts the non-zero exit the batch will carry.
     let verb = if report.failed.is_empty() {
         format!("{ok}purged{r}")
     } else {
@@ -798,41 +893,9 @@ fn app_rm_purge(name: &str, gc: bool) -> ExitCode {
         sandbox::human_bytes(report.freed())
     );
     // The purge itself left state behind if a home would not delete — surface it in the exit code.
-    let purge_ok = report.failed.is_empty();
-
-    // Any `nix:`/`flake:` tool closures the app built live in the shared per-project store, which
-    // backs every app in a project. `--gc` sweeps the *current* project's store now; without it, the
-    // reclamation is a separate manual step, and either way other projects need their own sweep.
-    if gc {
-        println!();
-        let gc_code = sandbox::gc(true, false, false, &pal);
-        println!(
-            "{}",
-            style::dim_prose(
-                "note: `--gc` swept this project's store; run `sbx gc --prune` in the app's other \
-                 projects to reclaim their copies too.",
-                &pal
-            )
-        );
-        // The purge succeeded independently of the sweep; when it did, defer to the sweep's own exit
-        // code so a sweep that could not run (no capable host, nix missing) is not hidden — but never
-        // undo the purge's failure signal.
-        return if purge_ok { gc_code } else { ExitCode::FAILURE };
-    }
-
-    println!(
-        "{}",
-        style::dim_prose(
-            "note: an app's nix:/flake: tool closures live in the shared per-project store; \
-             run `sbx gc --prune` in a project to reclaim any no longer referenced there \
-             (or re-run with --gc for the current project).",
-            &pal
-        )
-    );
-    if purge_ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    AppPurgeOutcome {
+        ok: report.failed.is_empty(),
+        acted: true,
     }
 }
 
@@ -1593,69 +1656,78 @@ fn describe_home_locations(app: &sandbox::InstalledApp) -> String {
 mod tests {
     use super::*;
 
+    /// A successful `sbx app rm` parse as a comparable tuple; any error arm panics, so a regression
+    /// reads as the arm that was actually taken rather than as a silent non-match.
+    fn parse_rm_ok(args: &[OsString]) -> (bool, bool, Vec<String>) {
+        match parse_app_rm(args) {
+            AppRmArgs::Ok { purge, gc, names } => {
+                (purge, gc, names.into_iter().map(str::to_string).collect())
+            }
+            _ => panic!("expected a successful parse"),
+        }
+    }
+
     #[test]
     fn parse_app_rm_handles_flag_and_name_in_either_order() {
         let os = |s: &str| OsString::from(s);
+        let one = |name: &str| vec![name.to_string()];
         // name only
-        assert!(matches!(
-            parse_app_rm(&[os("demo-app")]),
-            AppRmArgs::Ok {
-                purge: false,
-                gc: false,
-                name: "demo-app"
-            }
-        ));
+        assert_eq!(
+            parse_rm_ok(&[os("demo-app")]),
+            (false, false, one("demo-app"))
+        );
         // --purge before the name
-        assert!(matches!(
-            parse_app_rm(&[os("--purge"), os("demo-app")]),
-            AppRmArgs::Ok {
-                purge: true,
-                gc: false,
-                name: "demo-app"
-            }
-        ));
+        assert_eq!(
+            parse_rm_ok(&[os("--purge"), os("demo-app")]),
+            (true, false, one("demo-app"))
+        );
         // --purge after the name (either order)
-        assert!(matches!(
-            parse_app_rm(&[os("demo-app"), os("--purge")]),
-            AppRmArgs::Ok {
-                purge: true,
-                gc: false,
-                name: "demo-app"
-            }
-        ));
+        assert_eq!(
+            parse_rm_ok(&[os("demo-app"), os("--purge")]),
+            (true, false, one("demo-app"))
+        );
         // --purge and --gc together, name interleaved between the flags
-        assert!(matches!(
-            parse_app_rm(&[os("--gc"), os("demo-app"), os("--purge")]),
-            AppRmArgs::Ok {
-                purge: true,
-                gc: true,
-                name: "demo-app"
-            }
-        ));
+        assert_eq!(
+            parse_rm_ok(&[os("--gc"), os("demo-app"), os("--purge")]),
+            (true, true, one("demo-app"))
+        );
         // --gc alone parses; the --gc-requires---purge rule is the caller's, not the parser's
-        assert!(matches!(
-            parse_app_rm(&[os("--gc"), os("demo-app")]),
-            AppRmArgs::Ok {
-                purge: false,
-                gc: true,
-                name: "demo-app"
-            }
-        ));
+        assert_eq!(
+            parse_rm_ok(&[os("--gc"), os("demo-app")]),
+            (false, true, one("demo-app"))
+        );
         // no name — even with the flag, --purge alone must never mean "purge everything"
         assert!(matches!(parse_app_rm(&[]), AppRmArgs::MissingName));
         assert!(matches!(
             parse_app_rm(&[os("--purge")]),
             AppRmArgs::MissingName
         ));
-        // unknown option and a second positional are distinct errors
+        // a leading dash is an option, never a name
         assert!(matches!(
             parse_app_rm(&[os("--nope"), os("demo-app")]),
             AppRmArgs::UnknownOption("--nope")
         ));
-        assert!(matches!(
-            parse_app_rm(&[os("demo-app"), os("demo-tool")]),
-            AppRmArgs::Extra("demo-tool")
-        ));
+    }
+
+    #[test]
+    fn parse_app_rm_takes_several_names_in_the_order_given() {
+        let os = |s: &str| OsString::from(s);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Several positionals are several apps, kept in the order the user typed them.
+        assert_eq!(
+            parse_rm_ok(&[os("demo-app"), os("demo-tool")]),
+            (false, false, names(&["demo-app", "demo-tool"]))
+        );
+        // Flags may sit anywhere among the names; they apply to the whole call.
+        assert_eq!(
+            parse_rm_ok(&[os("--purge"), os("demo-app"), os("--gc"), os("demo-tool")]),
+            (true, true, names(&["demo-app", "demo-tool"]))
+        );
+        // A repeat is preserved by the parser — deduplication is the caller's step.
+        assert_eq!(
+            parse_rm_ok(&[os("demo-app"), os("demo-app")]),
+            (false, false, names(&["demo-app", "demo-app"]))
+        );
     }
 
     #[test]
