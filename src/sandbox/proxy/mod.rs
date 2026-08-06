@@ -4590,6 +4590,59 @@ mod tests {
         );
     }
 
+    /// The other denial shape on the https-forward path: a deny rule refuses with `denied-by-rule`,
+    /// not the `denied-default` above. The policy is allow-by-default, so nothing but the rule itself
+    /// can produce the refusal — which is what makes this the arm and not the fallback. The resolver
+    /// panics if reached: a deny is decided before any name is looked up.
+    #[test]
+    fn an_absolute_form_https_forward_is_refused_by_a_deny_rule() {
+        use crate::allowlist::DefaultAction;
+        let denylist = EgressPolicy::new(vec![], vec![classify("evil.test:*").unwrap()])
+            .with_default(DefaultAction::Allow);
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), denylist)
+                .unwrap()
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run for a deny-rule host")
+                })),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"POST https://evil.test/oauth/token HTTP/1.1\r\nHost: evil.test\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains(" 403 ") && resp.contains("denied-by-rule"),
+            "a deny rule must refuse the forward as denied-by-rule: {resp:?}"
+        );
+    }
+
+    /// A host the policy opens for reading only refuses a write on the https-forward path with
+    /// `denied-method`, the same method-scoped reason a `CONNECT` to that host produces — so the
+    /// agent can tell "not for this verb" from "not this host at all" whichever form it sent.
+    #[test]
+    fn a_method_outside_the_allow_set_is_refused_on_the_https_forward_path() {
+        let policy = EgressPolicy::new(vec![classify("{GET,HEAD} host.test:*").unwrap()], vec![]);
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy)
+                .unwrap()
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run for a method-denied request")
+                })),
+        );
+        let resp = through_cleartext(
+            ctx,
+            b"POST https://host.test/submit HTTP/1.1\r\nHost: host.test\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains(" 403 ") && resp.contains("denied-method"),
+            "a POST to a GET/HEAD-only host must be refused as denied-method: {resp:?}"
+        );
+    }
+
     /// On the https-forward path, a forged/untrusted upstream certificate is refused `502
     /// upstream-cert-rejected` — never downgraded, the same upstream validation the MITM path applies.
     #[test]
