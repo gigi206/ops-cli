@@ -794,6 +794,10 @@ fn forbidden_response_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Named here rather than per-test because the shared verdict harness carries them in its
+    // signature; the tests below still spell their own policy imports where they build one.
+    use crate::allowlist::EgressPolicy;
+    use crate::sandbox::egress_stats::Counts;
 
     /// An SSRF refusal on the HTTP/2 path must be *accounted for* the way the HTTP/1.1 one is, not
     /// merely written into the log: the `blocked` bucket `sbx net stats` reports, and — because
@@ -892,6 +896,186 @@ mod tests {
             ),
             ("grpc.test", LogVerdict::Blocked, "ssrf-blocked")
         );
+    }
+
+    /// Drive ONE h2 stream through the real handler over an in-memory duplex and read back BOTH
+    /// halves of the decision: what the client was told (the status and the `x-sbx-egress-reason`
+    /// token) and what the proxy recorded (the host's stats bucket, and the log events). The
+    /// resolver PANICS on purpose — a verdict is settled from the policy alone, so a refusal that
+    /// reaches a name lookup is a refusal that ran too late.
+    fn h2_verdict(
+        policy: EgressPolicy,
+        method: Method,
+        uri: &str,
+    ) -> (
+        StatusCode,
+        String,
+        Counts,
+        Vec<(String, LogVerdict, String)>,
+    ) {
+        use crate::sandbox::control::{LogRing, LOG_RING_CAP};
+        use crate::sandbox::egress_stats::EgressStats;
+        use crate::testutil::TmpDir;
+        use std::time::Duration;
+
+        let dir = TmpDir::new();
+        let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = ProxyCtx::new(Arc::new(super::super::Ca::ephemeral().unwrap()), policy)
+            .unwrap()
+            .with_stats(Arc::clone(&stats))
+            .with_log(Arc::clone(&log))
+            .with_resolver(Box::new(|_| {
+                panic!("a verdict refusal must be decided before any name is resolved")
+            }));
+
+        let (status, reason) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+                let client = async {
+                    let (mut send, conn) = h2::client::handshake(client_io).await.unwrap();
+                    let driver = tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    let req = Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let (resp, _body) = send.send_request(req, true).unwrap();
+                    let resp = resp.await.unwrap();
+                    let reason = resp
+                        .headers()
+                        .get("x-sbx-egress-reason")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let status = resp.status();
+                    driver.abort();
+                    (status, reason)
+                };
+                let proxy = async {
+                    let mut conn = h2::server::handshake(server_io).await.unwrap();
+                    let (req, respond) = conn.accept().await.unwrap().unwrap();
+                    stream(req, respond, "grpc.test", 443, &ctx).await;
+                    while conn.accept().await.is_some() {}
+                };
+                // The bound is also the assertion for the `ask` case: a verdict that parked would
+                // block this leg forever, so a regression that starts parking fails here instead of
+                // hanging the suite. The real exchange is in-memory and takes microseconds.
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    tokio::select! {
+                        answer = client => answer,
+                        () = proxy => panic!("the proxy leg ended before the client had its answer"),
+                    }
+                })
+                .await
+                .expect("the in-memory h2 exchange must not stall")
+            });
+
+        let counts = stats
+            .snapshot()
+            .get("grpc.test")
+            .copied()
+            .unwrap_or_default();
+        let events = log
+            .snapshot(None, None, false)
+            .events
+            .into_iter()
+            .map(|e| (e.host, e.verdict, e.reason))
+            .collect();
+        (status, reason, counts, events)
+    }
+
+    /// The `deny` bucket every verdict refusal on this path must land in, and the one log event it
+    /// must emit. Shared by the three denial shapes below, which differ only in their reason.
+    fn one_denial(reason: &str) -> (Counts, Vec<(String, LogVerdict, String)>) {
+        (
+            Counts {
+                deny: 1,
+                ..Default::default()
+            },
+            vec![(
+                "grpc.test".to_string(),
+                LogVerdict::Deny,
+                reason.to_string(),
+            )],
+        )
+    }
+
+    /// A deny rule refuses an h2 stream as `denied-by-rule`. The policy allows by default, so
+    /// nothing but the rule itself can produce this — which is what makes it the arm rather than
+    /// the fallback below.
+    #[test]
+    fn an_h2_stream_a_deny_rule_blocks_is_told_denied_by_rule() {
+        use crate::allowlist::{classify, DefaultAction, EgressPolicy};
+
+        let (status, reason, counts, events) = h2_verdict(
+            EgressPolicy::new(vec![], vec![classify("grpc.test:*").unwrap()])
+                .with_default(DefaultAction::Allow),
+            Method::POST,
+            "https://grpc.test/pkg.Svc/Method",
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(reason, "denied-by-rule");
+        assert_eq!((counts, events), one_denial("denied-by-rule"));
+    }
+
+    /// A host the policy opens for reading only refuses a gRPC call — which is always a `POST` — as
+    /// `denied-method`, not as a closed host. The distinction is the whole point: the agent can tell
+    /// "this host, but not this verb" from "not this host at all", whichever protocol it spoke.
+    #[test]
+    fn an_h2_stream_outside_the_allow_set_is_told_denied_method() {
+        use crate::allowlist::{classify, EgressPolicy};
+
+        let (status, reason, counts, events) = h2_verdict(
+            EgressPolicy::new(vec![classify("{GET} grpc.test:*").unwrap()], vec![]),
+            Method::POST,
+            "https://grpc.test/pkg.Svc/Method",
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(reason, "denied-method");
+        assert_eq!((counts, events), one_denial("denied-method"));
+    }
+
+    /// No rule names the host: `denied-default`, the shape `sbx net learn` reads back to synthesize
+    /// a rule.
+    #[test]
+    fn an_h2_stream_to_an_unnamed_host_is_told_denied_default() {
+        use crate::allowlist::{classify, EgressPolicy};
+
+        let (status, reason, counts, events) = h2_verdict(
+            EgressPolicy::new(vec![classify("other.test:*").unwrap()], vec![]),
+            Method::POST,
+            "https://grpc.test/pkg.Svc/Method",
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(reason, "denied-default");
+        assert_eq!((counts, events), one_denial("denied-default"));
+    }
+
+    /// The one arm this path does NOT share with the HTTP/1.1 verdict: under an `ask` posture an
+    /// undecided host is refused, never parked. Every stream of an h2 connection is multiplexed on
+    /// one current-thread runtime, so blocking this one for a live decision would stall its
+    /// siblings. It fails closed under its own reason, so the refusal reads as the documented
+    /// limitation it is rather than as an ordinary deny — and the exchange still completes, which
+    /// the harness's timeout is what proves.
+    #[test]
+    fn an_h2_stream_under_an_ask_posture_is_refused_rather_than_parked() {
+        use crate::allowlist::{DefaultAction, EgressPolicy};
+
+        let (status, reason, counts, events) = h2_verdict(
+            EgressPolicy::default().with_default(DefaultAction::Ask),
+            Method::POST,
+            "https://grpc.test/pkg.Svc/Method",
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(reason, "http2-ask-unsupported");
+        assert_eq!((counts, events), one_denial("http2-ask-unsupported"));
     }
 
     #[test]
