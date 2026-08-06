@@ -66,7 +66,7 @@ network     = false                # true = reach the network; false = empty net
   - A declared program that resolves to nothing **fails the launch**, naming it.
     `sbx plugins info <name>` shows where each one resolves right now, so the
     answer comes before the first secret rather than during it.
-- `allow_paths` is for the plugin's **data** — a token file, a database, a
+- `allow_paths` is for the plugin's **data**: a token file, a database, a
   socket. `HOME` in the cage is a private tmpfs, so a tool that derives a
   location from it (a password store, a GnuPG keyring and its agent socket, a
   token file) looks where nothing exists: bind the host path and point the tool
@@ -212,15 +212,27 @@ sbx plugins store install sbx-plugins vault   # then: from = "vault://secret/mya
 
 | Plugin | Reference form | Resolves to | Sandbox grant |
 |---|---|---|---|
-| `pass` | `pass://<path>` | the **first line** of `~/.password-store/<path>.gpg` (the password by convention) | `allow_paths` on the store, `~/.gnupg`, the gpg-agent socket, and the usual install locations of `pass(1)`; **no network** |
-| `vault` | `vault://<path>#<field>` | one field of a HashiCorp Vault KV secret | `allow_env` for `VAULT_ADDR`/`VAULT_TOKEN`/`VAULT_NAMESPACE`, `allow_paths` on `~/.vault-token` and the usual install locations of `vault(1)`; `network = true` |
+| `pass` | `pass://<path>[#<field>]` | the **first line** of `~/.password-store/<path>.gpg` (the password by convention), or a named `key: value` field below it | `programs = ["pass"]`; `allow_paths` on the store, `~/.gnupg` and the gpg-agent socket; **no network** |
+| `vault` | `vault://<mount>/<path>[?version=<n>]#<field>` | one field of a HashiCorp Vault KV secret, optionally at a past version | `programs = ["vault"]`; `allow_env` for `VAULT_ADDR`/`VAULT_TOKEN`/`VAULT_NAMESPACE`; `allow_paths` on `~/.vault-token`; `network = true` |
+| `openbao` | `openbao://<mount>/<path>[?version=<n>]#<field>` | the same, against an OpenBao server (`bao`) | `programs = ["bao"]`; the `BAO_*` equivalents; `network = true` |
+| `infisical` | `infisical://<project>/<env>[/<folder>][?<opts>]#<secret>` | one secret of an Infisical project | `programs = ["infisical"]`; `allow_env` for the `INFISICAL_*` credentials; `network = true` |
+| `keepassxc` | `keepassxc://<database>/<entry>[#<attribute>]` | one attribute of an entry in a `.kdbx` on disk, unlocked by a key file or password file beside it | `programs = ["keepassxc-cli"]`; `allow_paths` on the vault directories; **no network** |
+| `keepassxc-browser` | `keepassxc-browser://<url>[#<login>]` | a credential out of the database KeePassXC currently holds **unlocked**, over its browser-integration socket | `allow_paths` on that socket and the association; **no network** |
 
 Each is also a worked example of the manifest and the execution contract above:
 read its `plugin.toml`, its `resolve` script and its README when writing your own.
-Both show the two things the structural cage forces on a resolver (finding a
-user-mode binary, and restoring the host `HOME` a tool derives its paths from),
-and both report a reference they do not hold as a clean absent, so either is safe
-to place ahead of another source in a `from` chain.
+They show what the structural cage forces on a resolver (declaring the host tools
+it runs, and restoring the host `HOME` a tool derives its paths from), and each
+reports a reference it does not hold as a clean absent, so any of them is safe to
+place ahead of another source in a `from` chain.
+
+Two conventions are worth copying. A reference is read as a URI, so the container
+is the authority, the item is the path, options are the query and the selector is
+the fragment. And where a `#` could belong to either side, the split follows the
+side the source constrains: `sops://` and `vault://` split at the **last** `#`
+because a path may hold one, while `infisical://` splits at the **first**, since
+an Infisical secret name may hold a `#` and the project, environment and folder
+before it cannot.
 
 If a launch refuses because a declared program is not on `PATH`, the tool the
 plugin runs is not installed, or not where the shell that starts sbx looks for
