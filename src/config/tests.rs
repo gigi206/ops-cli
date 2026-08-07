@@ -6236,7 +6236,11 @@ fn vhs_with(secret: RawHostSecret, plugins: &PluginRegistry) -> Result<HeaderSec
 
 /// A plugin declaring the variables it reads, so the `[plugin.<name>]` validation has something
 /// to check a config against.
-fn plugin_reading(scheme: &str, env: &[&str], env_paths: &[&str]) -> crate::plugins::ResolverPlugin {
+fn plugin_reading(
+    scheme: &str,
+    env: &[&str],
+    env_paths: &[&str],
+) -> crate::plugins::ResolverPlugin {
     let mut p = plugin(scheme);
     p.sandbox.allow_env = env.iter().map(|s| s.to_string()).collect();
     p.sandbox.allow_env_paths = env_paths.iter().map(|s| s.to_string()).collect();
@@ -6245,11 +6249,20 @@ fn plugin_reading(scheme: &str, env: &[&str], env_paths: &[&str]) -> crate::plug
 
 /// A config whose only content is one `[plugin.<name>]` table.
 fn raw_plugin_table(name: &str, env: &[(&str, &str)]) -> RawConfig {
+    raw_plugin_table_with(name, env, &[])
+}
+
+/// The same, with `programs` entries as well.
+fn raw_plugin_table_with(name: &str, env: &[(&str, &str)], programs: &[(&str, &str)]) -> RawConfig {
     let mut cfg = raw(&[], &[]);
     cfg.plugin.insert(
         name.to_string(),
         crate::config::schema::RawPluginConfig {
             env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            programs: programs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
@@ -6263,23 +6276,25 @@ fn secret_using(scheme: &str) -> RawConfig {
     let mut cfg = raw(&[], &[]);
     let reff = format!("{scheme}://x");
     let sec = raw_secret_from(vec![reff.as_str()]);
-    cfg.secret = Some(raw_secret_section(vec![("api.example.com".to_string(), sec)]));
+    cfg.secret = Some(raw_secret_section(vec![(
+        "api.example.com".to_string(),
+        sec,
+    )]));
     cfg
 }
 
 #[test]
 fn a_plugin_table_supplies_only_the_variables_the_manifest_reads() {
-    let reg = PluginRegistry::with([plugin_reading(
-        "vault",
-        &["VAULT_ADDR"],
-        &["VAULT_CACERT"],
-    )]);
+    let reg = PluginRegistry::with([plugin_reading("vault", &["VAULT_ADDR"], &["VAULT_CACERT"])]);
     let mut global = secret_using("vault");
-    global.plugin = raw_plugin_table("vault", &[
+    global.plugin = raw_plugin_table(
+        "vault",
+        &[
             ("VAULT_ADDR", "https://vault.example.com"),
             ("VAULT_CACERT", "/etc/ca/vault.pem"),
             ("VAULT_TOKEN_HELPER", "/usr/local/bin/helper"),
-        ])
+        ],
+    )
     .plugin;
     let r = super::resolve(global, None, &reg);
     let host = match &r.secrets[0].sources[0] {
@@ -6290,7 +6305,10 @@ fn a_plugin_table_supplies_only_the_variables_the_manifest_reads() {
     assert_eq!(
         host.env,
         vec![
-            ("VAULT_ADDR".to_string(), "https://vault.example.com".to_string()),
+            (
+                "VAULT_ADDR".to_string(),
+                "https://vault.example.com".to_string()
+            ),
             ("VAULT_CACERT".to_string(), "/etc/ca/vault.pem".to_string()),
         ]
     );
@@ -6301,6 +6319,110 @@ fn a_plugin_table_supplies_only_the_variables_the_manifest_reads() {
             .iter()
             .any(|w| w.contains("VAULT_TOKEN_HELPER") && w.contains("does not read")),
         "the refusal names the variable: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_plugin_reached_only_from_a_task_still_gets_its_host_table() {
+    let reg = PluginRegistry::with([plugin_reading("vault", &["VAULT_ADDR"], &[])]);
+    // No `[secret]` at all: the only user of the plugin is a declared operation, which resolves
+    // its credential host-side through the very same chain.
+    let global: RawConfig = toml::from_str(
+        r#"
+        [plugin.vault]
+        env = { VAULT_ADDR = "https://vault.example.com" }
+
+        [task.q]
+        description = "one"
+        cmd = ["true"]
+
+        [task.q.secret]
+        TOKEN = "vault://x"
+        "#,
+    )
+    .unwrap();
+    let r = super::resolve(global, None, &reg);
+    let host = match &r.tasks[0].secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => &plugin.host,
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    assert_eq!(
+        host.env,
+        vec![(
+            "VAULT_ADDR".to_string(),
+            "https://vault.example.com".to_string()
+        )]
+    );
+    // And the table is not reported as naming nothing, which is the visible half of the same bug:
+    // the name was correct, so a "check the spelling" warning would send the user looking for a
+    // typo that is not there.
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("no secret uses")),
+        "the table matched a task, so nothing is unmatched: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_plugin_table_supplies_a_package_only_for_a_program_the_manifest_runs() {
+    let mut p = plugin_reading("vault", &[], &[]);
+    p.sandbox.programs = vec!["vault".to_string()];
+    let reg = PluginRegistry::with([p]);
+    let mut global = secret_using("vault");
+    global.plugin = raw_plugin_table_with(
+        "vault",
+        &[],
+        &[("vault", "nix:vault"), ("curl", "nix:curl")],
+    )
+    .plugin;
+    let r = super::resolve(global, None, &reg);
+    let host = match &r.secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => &plugin.host,
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    // The declared one is kept, with the `nix:` prefix stripped: what is stored is the attribute.
+    assert_eq!(
+        host.programs,
+        vec![("vault".to_string(), "vault".to_string())]
+    );
+    // `curl` is refused. The manifest is the list of tools this resolver runs, and a launch binds
+    // exactly those, so building anything else would be a package no plugin could ever invoke.
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("curl") && w.contains("does not run it")),
+        "the refusal names the program: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_plugin_table_refuses_every_backend_but_nix() {
+    let mut p = plugin_reading("vault", &[], &[]);
+    p.sandbox.programs = vec!["vault".to_string()];
+    let reg = PluginRegistry::with([p]);
+    let mut global = secret_using("vault");
+    global.plugin =
+        raw_plugin_table_with("vault", &[], &[("vault", "mise:aqua:hashicorp/vault")]).plugin;
+    let r = super::resolve(global, None, &reg);
+    let host = match &r.secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => &plugin.host,
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    // `nix:` is the only backend that can be built host-side and project-independently at the
+    // moment a plugin is installed; a `mise:` tool is equipped inside a cage that does not exist
+    // here. Refusing by name is what keeps the field from reading as a general backend selector.
+    assert!(
+        host.programs.is_empty(),
+        "nothing is supplied: {:?}",
+        host.programs
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("mise:aqua:hashicorp/vault") && w.contains("nix:<attribute>")),
+        "the refusal quotes the value and names the only accepted form: {:?}",
         r.warnings
     );
 }
@@ -6324,7 +6446,9 @@ fn an_untrusted_projects_plugin_table_is_dropped_and_named() {
         host.env
     );
     assert!(
-        r.warnings.iter().any(|w| w.contains("[plugin.*]") && w.contains("vault")),
+        r.warnings
+            .iter()
+            .any(|w| w.contains("[plugin.*]") && w.contains("vault")),
         "the drop is named: {:?}",
         r.warnings
     );
@@ -6344,7 +6468,10 @@ fn a_trusted_projects_plugin_table_layers_over_the_global_one() {
     // A hard-coded literal, not a value recomputed from the input: the project layer wins.
     assert_eq!(
         host.env,
-        vec![("VAULT_ADDR".to_string(), "https://project.example".to_string())]
+        vec![(
+            "VAULT_ADDR".to_string(),
+            "https://project.example".to_string()
+        )]
     );
 }
 
@@ -6355,7 +6482,9 @@ fn a_plugin_table_naming_no_installed_plugin_is_reported() {
     global.plugin = raw_plugin_table("valut", &[("VAULT_ADDR", "https://x.example")]).plugin;
     let r = super::resolve(global, None, &reg);
     assert!(
-        r.warnings.iter().any(|w| w.contains("valut") && w.contains("no secret uses")),
+        r.warnings
+            .iter()
+            .any(|w| w.contains("valut") && w.contains("no secret uses")),
         "a typo is named rather than left inert in silence: {:?}",
         r.warnings
     );

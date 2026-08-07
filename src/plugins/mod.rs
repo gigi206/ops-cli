@@ -29,6 +29,7 @@
 /// (identical whatever the source) cannot say.
 pub(crate) mod catalogue;
 pub(crate) mod origin;
+pub(crate) mod programs;
 pub(crate) mod stores;
 
 use serde::Deserialize;
@@ -90,7 +91,8 @@ pub(crate) struct ResolverPlugin {
     pub(crate) host: HostConfig,
 }
 
-/// The host's answer to what a plugin's manifest declares: values for the variables it reads.
+/// The host's answer to what a plugin's manifest declares: values for the variables it reads, and
+/// where to get the programs it runs when this machine does not already have them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct HostConfig {
     /// Values for variables the manifest declares in `allow_env`/`allow_env_paths`, validated
@@ -98,6 +100,14 @@ pub(crate) struct HostConfig {
     /// precedence over the same name in sbx's own environment — a config that names a value is
     /// more deliberate than whatever the invoking shell happened to export.
     pub(crate) env: Vec<(String, String)>,
+    /// Nixpkgs attributes for programs the manifest declares, as `(program, attribute)`, validated
+    /// against it: a program the plugin does not run is refused, and so is any prefix but `nix:`
+    /// (the attribute is stored with the prefix removed).
+    ///
+    /// A *fallback*, consulted only where `PATH` has no answer. What is recorded here is the
+    /// intent; the build happens at `sbx plugins install`, which is where a user expects one, and
+    /// a launch only ever reads the resulting out-link.
+    pub(crate) programs: Vec<(String, String)>,
 }
 
 impl ResolverPlugin {
@@ -1071,6 +1081,11 @@ pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), St
     // so drop it here — otherwise a later install of that name would start with a stale origin
     // until it writes its own.
     origin::forget(layout, name);
+    // The out-links for any program provisioned for this plugin are outside the tree for the same
+    // reason, and outlive it the same way. An out-link left behind keeps a whole closure live in
+    // the store, invisibly: nix's own root is indirect, so it stays valid exactly as long as the
+    // link does, and nothing else would ever name the plugin it was built for.
+    programs::forget(layout, name);
     Ok(())
 }
 

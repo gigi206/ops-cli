@@ -2499,7 +2499,12 @@ const PAGES: &[Page] = &[
         details: "A deliberate user act (an agent in the cage cannot run it). The staged copy is\n\
             validated exactly as the launcher will and refused, fail-closed, on any flaw. The\n\
             other way in is `sbx plugins store install`, which adds a signature and a content\n\
-            hash to the same placement.",
+            hash to the same placement.\n\
+            \n\
+            This is also where a program the plugin needs gets built, when the host has none and\n\
+            `[plugin.<name>] programs` names a `nix:` attribute for it — here rather than at\n\
+            launch, since a plugin's program belongs to the plugin and not to any one project.\n\
+            Run it again to pick up a `programs` entry added after installing.",
     },
     Page {
         path: &["plugins", "rm"],

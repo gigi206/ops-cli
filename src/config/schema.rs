@@ -502,6 +502,21 @@ pub(crate) struct RawPluginConfig {
     /// `[secret]`, whose sources are resolved at launch and never written down.
     #[serde(default)]
     pub(crate) env: BTreeMap<String, String>,
+    /// Where to get a program the plugin needs, as `<program> = "nix:<attribute>"`.
+    ///
+    /// A manifest names the *tools* a resolver runs and sbx finds each on its own `PATH`, which is
+    /// what makes a published plugin portable. This is the answer for a machine where one of them
+    /// is simply not installed: rather than requiring a global install to satisfy one plugin, sbx
+    /// provisions the attribute into its own store and binds that.
+    ///
+    /// Only a program the manifest declares may appear, and only the `nix:` prefix is accepted;
+    /// anything else is dropped with a warning naming it. `PATH` always wins, so this is a fallback
+    /// and never a way to point a plugin at a different binary than the one the user already has.
+    ///
+    /// A security field like the rest of this table, and the one that makes sbx **build**: honored
+    /// from the global config or a trusted project only.
+    #[serde(default)]
+    pub(crate) programs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

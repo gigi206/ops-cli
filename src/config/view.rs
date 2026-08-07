@@ -34,6 +34,10 @@ pub(crate) struct PluginView {
     pub(crate) name: String,
     /// The variables it sets, as `KEY=value`, in the order the table lists them.
     pub(crate) env: Vec<String>,
+    /// The packages it names for the plugin's programs, as `<program>=<locator>`. Shown as
+    /// written, not as resolved: whether one was built, was already on `PATH`, or is still waiting
+    /// for an install is a question about this machine, which `sbx plugins info` answers.
+    pub(crate) programs: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -886,10 +890,15 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     let plugins: Vec<PluginView> = resolved
         .plugin
         .iter()
-        .filter(|(_, raw)| !raw.env.is_empty())
+        .filter(|(_, raw)| !raw.env.is_empty() || !raw.programs.is_empty())
         .map(|(name, raw)| PluginView {
             name: name.clone(),
             env: raw.env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+            programs: raw
+                .programs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect(),
         })
         .collect();
 

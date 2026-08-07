@@ -463,10 +463,91 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
                 "{}",
                 render_plugin_installed(&installed.name, &installed.scheme, None, &pal)
             );
-            ExitCode::SUCCESS
+            provision_configured_programs(&layout, &installed.scheme)
         }
         Err(why) => {
             diag::error(&format!("sbx: cannot install plugin: {why}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Build whatever `[plugin.<name>] programs` names for the plugin that just claimed `scheme`, and
+/// report it.
+///
+/// Runs here rather than at launch because a plugin's program is **project-independent**: it is
+/// installed once and any project's secret may route through it, so provisioning it during a launch
+/// would run a project-scoped path to produce a project-independent artifact and re-ask the question
+/// every time. This is also the moment a user expects a build, having just asked for a plugin.
+///
+/// Re-running the install is therefore how a `programs` entry added *after* installing takes
+/// effect, which is what the launch-time refusal for a missing program tells the user to do.
+///
+/// A build failure fails the command. The install itself already succeeded and is not undone: the
+/// plugin is there, and what could not be built is named so the user can fix the attribute and run
+/// the install again. Reporting success over a program the plugin cannot start would only move the
+/// failure to the first secret.
+fn provision_configured_programs(layout: &store::Layout, scheme: &str) -> ExitCode {
+    let mut load_warnings = Vec::new();
+    let registry = plugins::PluginRegistry::load_quiet(&layout.plugins_dir(), &mut load_warnings);
+    let Some(plugin) = registry.resolver(scheme) else {
+        return ExitCode::SUCCESS;
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return ExitCode::SUCCESS;
+    };
+    let resolved = crate::config::load(&cwd);
+    let Some(raw) = resolved.plugin.get(&plugin.name) else {
+        return ExitCode::SUCCESS;
+    };
+    let mut warnings = Vec::new();
+    let wanted = crate::config::validated_programs(plugin, &raw.programs, &mut warnings);
+    for w in &warnings {
+        diag::warn(w);
+    }
+    if wanted.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    let Some(nix) = store::resolve_nix(Some(layout)) else {
+        diag::error(&format!(
+            "sbx: `[plugin.{}] programs` names a package to provision, but there is no nix to \
+             build it with",
+            plugin.name
+        ));
+        return ExitCode::FAILURE;
+    };
+    // The **global** channel pin, never a project's: this artifact outlives the directory the
+    // install happened to be run from, so pinning it to that project's nixpkgs would make one
+    // plugin's tool differ per project while a single out-link claims to hold all of them.
+    let nixpkgs = match store::LockTarget::global(layout, resolved.nixpkgs_global.as_deref())
+        .resolve(&nix, layout)
+    {
+        Ok(n) => n,
+        Err(e) => {
+            diag::error(&format!("sbx: cannot resolve the nixpkgs channel: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    match plugins::programs::provision(layout, &nix, &nixpkgs, plugin.dir_name(), &wanted) {
+        Ok(done) => {
+            for one in &done {
+                match one {
+                    plugins::programs::Provisioned::OnPath { path } => println!(
+                        "  {}: already on PATH at {} (the configured package is unused)",
+                        plugin.name,
+                        path.display()
+                    ),
+                    plugins::programs::Provisioned::Built { program, path } => println!(
+                        "  {}: provisioned `{program}` at {}",
+                        plugin.name,
+                        path.display()
+                    ),
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            diag::error(&format!("sbx: {why}"));
             ExitCode::FAILURE
         }
     }
@@ -905,7 +986,7 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
                 "{}",
                 render_plugin_installed(&installed.name, &installed.scheme, Some(store_name), &pal)
             );
-            ExitCode::SUCCESS
+            provision_configured_programs(&layout, &installed.scheme)
         }
         Err(why) => {
             diag::error(&format!("sbx: cannot install plugin: {why}"));
@@ -1847,7 +1928,7 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     }
     println!("  sandbox grant:");
     println!("    network:     {}", p.sandbox.network);
-    print_grant_programs(&p.sandbox.programs, err, r);
+    print_grant_programs(&layout, p, err, r);
     print_grant_paths("allow_paths", &p.sandbox.allow_paths);
     print_grant_masks(&p.sandbox.mask_paths);
     print_grant_env("allow_env", &p.sandbox.allow_env);
@@ -1907,19 +1988,57 @@ fn print_host_config(p: &crate::plugins::ResolverPlugin, err: &str, r: &str) {
 /// will this plugin find its tool on *this* machine, and which one will it get. A program that
 /// resolves to nothing is flagged rather than merely listed — it is the difference between a
 /// plugin that works and one that fails at the first secret.
-fn print_grant_programs(programs: &[String], err: &str, r: &str) {
-    if programs.is_empty() {
+/// Four states are possible and each has a different remedy, so each is said rather than collapsed
+/// into "found" and "missing": on `PATH` (any configured package is inert); not on `PATH` but
+/// already provisioned; not on `PATH`, configured, and **not yet built** — the state a user reaches
+/// by adding `programs` after installing, whose remedy is to re-run the install; and neither, which
+/// is what fails a launch. Nothing here builds: the answer must be free to ask.
+fn print_grant_programs(
+    layout: &store::Layout,
+    plugin: &crate::plugins::ResolverPlugin,
+    err: &str,
+    r: &str,
+) {
+    if plugin.sandbox.programs.is_empty() {
         println!("    programs:    (none)");
         return;
     }
-    let shown = programs
+    let configured: std::collections::BTreeMap<String, String> = std::env::current_dir()
+        .ok()
+        .map(|cwd| crate::config::load(&cwd))
+        .and_then(|c| c.plugin.get(&plugin.name).cloned())
+        .map(|raw| {
+            let mut ignored = Vec::new();
+            crate::config::validated_programs(plugin, &raw.programs, &mut ignored)
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let shown = plugin
+        .sandbox
+        .programs
         .iter()
-        .map(
-            |name| match crate::sandbox::resolver::locate_program(name) {
-                Some(path) => format!("{name} -> {}", path.display()),
+        .map(|name| {
+            if let Some(path) = crate::sandbox::resolver::locate_program(name) {
+                let mut line = format!("{name} -> {}", path.display());
+                if configured.contains_key(name) {
+                    line.push_str(" (on PATH, so the configured package is unused)");
+                }
+                return line;
+            }
+            if let Some(path) = plugins::programs::provisioned(layout, plugin.dir_name(), name) {
+                return format!("{name} -> {} (provisioned)", path.display());
+            }
+            match configured.get(name) {
+                Some(attr) => format!(
+                    "{name} -> {err}nix:{attr} configured but not built{r} (run: sbx plugins \
+                     install {})",
+                    plugin.dir_name()
+                ),
                 None => format!("{name} -> {err}not on PATH{r}"),
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     println!("    programs:    {shown}");

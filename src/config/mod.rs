@@ -1060,6 +1060,7 @@ fn override_fatal_error(fatal: Vec<String>, notes: Vec<String>) -> Vec<String> {
 /// silent would leave the user waiting for settings that never applied.
 fn apply_plugin_host_config(
     secrets: &mut [HeaderSecret],
+    tasks: &mut [TaskSpec],
     apps: &mut BTreeMap<String, ResolvedApp>,
     cfg: &BTreeMap<String, crate::config::schema::RawPluginConfig>,
     warnings: &mut Vec<String>,
@@ -1071,10 +1072,16 @@ fn apply_plugin_host_config(
     for secret in secrets.iter_mut() {
         apply_to_sources(&mut secret.sources, cfg, &mut matched, warnings);
     }
+    // A declared operation resolves its own credentials, through the same resolver chain, so a
+    // plugin reached only from a `[task.<name>.secret]` needs the table just as much. Missing these
+    // left such a plugin running with none of it *and* reported the table as matching no secret,
+    // which reads as a typo in a name that was in fact correct.
+    apply_to_tasks(tasks, cfg, &mut matched, warnings);
     for app in apps.values_mut() {
         for secret in app.secrets.iter_mut() {
             apply_to_sources(&mut secret.sources, cfg, &mut matched, warnings);
         }
+        apply_to_tasks(&mut app.tasks, cfg, &mut matched, warnings);
     }
     for name in cfg.keys() {
         if !matched.contains(name) {
@@ -1086,6 +1093,24 @@ fn apply_plugin_host_config(
     }
 }
 
+/// Attach the table to every plugin a declared operation reaches: the credentials its command reads
+/// from its environment, and the ones its own proxy injects on the wire. Both resolve host-side
+/// through the same chain, so both see the same host answer.
+fn apply_to_tasks(
+    tasks: &mut [TaskSpec],
+    cfg: &BTreeMap<String, crate::config::schema::RawPluginConfig>,
+    matched: &mut BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    for task in tasks.iter_mut() {
+        for secret in task.secrets.iter_mut() {
+            apply_to_sources(&mut secret.sources, cfg, matched, warnings);
+        }
+        for injection in task.injections.iter_mut() {
+            apply_to_sources(&mut injection.sources, cfg, matched, warnings);
+        }
+    }
+}
 
 /// Attach the table to every plugin instance in one source chain. Split out of
 /// [`apply_plugin_host_config`] so the `matched` set can outlive each call without a closure
@@ -1119,8 +1144,54 @@ fn apply_to_sources(
                 ));
             }
         }
-        plugin.host = crate::plugins::HostConfig { env };
+        let programs = validated_programs(plugin, &raw.programs, warnings);
+        plugin.host = crate::plugins::HostConfig { env, programs };
     }
+}
+
+/// The `programs` entries of one `[plugin.<name>]` table, keeping those the manifest can actually
+/// use and naming every one it drops.
+///
+/// Two rules, both fail-closed, and neither is a formality:
+///
+/// - the key must be a program the **manifest declares**. `programs` in a manifest is the list of
+///   host tools that plugin runs, and a launch binds exactly those under one directory; naming
+///   anything else here would ask sbx to build a package no plugin would ever invoke.
+/// - the value must carry the `nix:` prefix. It is the only backend that can be built host-side,
+///   project-independently, at the moment a plugin is installed: `mise:` is equipped *inside* a
+///   cage and the prebuilt backends are pinned per project. Refusing the others by name is what
+///   keeps this from reading as a general backend selector that happens to support one backend.
+pub(crate) fn validated_programs(
+    plugin: &crate::plugins::ResolverPlugin,
+    raw: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (program, locator) in raw {
+        if !plugin.sandbox.programs.iter().any(|p| p == program) {
+            let declared = if plugin.sandbox.programs.is_empty() {
+                "none".to_string()
+            } else {
+                plugin.sandbox.programs.join(", ")
+            };
+            warnings.push(format!(
+                "`[plugin.{}] programs`: ignoring `{program}` — the plugin's manifest does not run \
+                 it (it declares: {declared})",
+                plugin.name
+            ));
+            continue;
+        }
+        let Some(attr) = locator.strip_prefix("nix:").filter(|a| !a.is_empty()) else {
+            warnings.push(format!(
+                "`[plugin.{}] programs`: ignoring `{program} = \"{locator}\"` — only a \
+                 `nix:<attribute>` value can be provisioned for a plugin",
+                plugin.name
+            ));
+            continue;
+        };
+        out.push((program.clone(), attr.to_string()));
+    }
+    out
 }
 
 /// The variables a plugin's manifest says it reads, for a diagnostic that names the alternatives
@@ -1794,7 +1865,13 @@ fn resolve(
     // Answer each plugin the config configures, now that `[plugin.*]` has been layered and gated.
     // Done here rather than where a `SecretSource::Plugin` is parsed, because the answer must see
     // the FINAL table: a project layer that is read after the secrets would otherwise be missed.
-    apply_plugin_host_config(&mut secrets, &mut apps, &plugin_cfg, &mut warnings);
+    apply_plugin_host_config(
+        &mut secrets,
+        &mut tasks,
+        &mut apps,
+        &plugin_cfg,
+        &mut warnings,
+    );
 
     Resolved {
         env,
@@ -3320,7 +3397,14 @@ fn apply_tools(
     // table it comes from may pair with either declaration form, so both must already be in `out`.
     apply_prebuilt_libs(out, warnings, source, &tarball, "tarball", protect_trusted);
     apply_prebuilt_libs(out, warnings, source, &deb, "deb", protect_trusted);
-    apply_prebuilt_libs(out, warnings, source, &appimage, "appimage", protect_trusted);
+    apply_prebuilt_libs(
+        out,
+        warnings,
+        source,
+        &appimage,
+        "appimage",
+        protect_trusted,
+    );
 }
 
 /// Attach a `[<label>.<name>]` table's `libs` to the package it names — the extra nixpkgs attributes

@@ -902,9 +902,25 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     // carries configuration, never a credential — a secret is declared in `[secret]`, which the
     // block above prints by locator and never by value.
     if !view.plugins.is_empty() {
-        let _ = writeln!(o, "  {h}plugins (what this host supplies to a resolver):{r}");
+        let _ = writeln!(
+            o,
+            "  {h}plugins (what this host supplies to a resolver):{r}"
+        );
         for p in &view.plugins {
-            let _ = writeln!(o, "    {n}{}{r}  {}", p.name, p.env.join(", "));
+            // Two different kinds of answer, kept on their own lines: `env` configures a tool the
+            // machine already has, `programs` says where to get one it has not. Running them
+            // together would read as one list whose entries mean different things.
+            if !p.env.is_empty() {
+                let _ = writeln!(o, "    {n}{}{r}  env: {}", p.name, p.env.join(", "));
+            }
+            if !p.programs.is_empty() {
+                let _ = writeln!(
+                    o,
+                    "    {n}{}{r}  programs: {} (a fallback; PATH wins)",
+                    p.name,
+                    p.programs.join(", ")
+                );
+            }
         }
     }
 

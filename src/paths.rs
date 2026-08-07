@@ -91,7 +91,7 @@ const DATA_ENTRIES: &[Entry] = &[
     Entry {
         label: "gcroots/",
         rel: "gcroots",
-        desc: "nix gcroots (base, mise, gui, projects)",
+        desc: "nix gcroots (base, mise, gui, audio, gpu, storage, plugins, projects)",
         enumerate: Enumerate::None,
     },
     Entry {

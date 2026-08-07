@@ -100,16 +100,19 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
     let programs = resolve_programs(plugin)?;
     // A nix-installed program is not a self-contained file, so the paths it needs come with it.
     let closure = nix_closures(&programs)?;
-    let spec =
-        cage_spec(plugin, reff, &allow_env, &env_paths, &programs, &closure).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "cannot build the resolver sandbox for `{}`: {e:?}",
-                    plugin.scheme
-                ),
-            )
-        })?;
+    let mut binds = Vec::with_capacity(programs.len());
+    for program in &programs {
+        binds.push((program.name.clone(), program.bind_src()?));
+    }
+    let spec = cage_spec(plugin, reff, &allow_env, &env_paths, &binds, &closure).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot build the resolver sandbox for `{}`: {e:?}",
+                plugin.scheme
+            ),
+        )
+    })?;
 
     // `_env` holds the descriptor the cage's environment is read from open until bwrap has run —
     // and the reason it is a descriptor is this cage in particular: a plugin's `allow_env` is how a
@@ -268,22 +271,90 @@ fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
 ///
 /// The path is canonicalized because binding the *symlink* would bind a dangling name: a nix
 /// profile's `bin/x` points into `/nix/store`, which the cage does not have.
-fn resolve_programs(plugin: &ResolverPlugin) -> io::Result<Vec<(String, PathBuf)>> {
+/// Where `PATH` has no answer, a program the host configured under `[plugin.<name>] programs` and
+/// `sbx plugins install` already built is used instead. Only the out-link is read here — a launch
+/// never builds — so the fallback costs one `readlink` and never stalls a secret on a nix build.
+fn resolve_programs(plugin: &ResolverPlugin) -> io::Result<Vec<Program>> {
     let mut out = Vec::with_capacity(plugin.sandbox.programs.len());
     for name in &plugin.sandbox.programs {
-        let Some(path) = locate_program(name) else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "the `{}` resolver plugin needs the program `{name}`, which is not on \
-                     sbx's PATH — install it, or add its directory to PATH before running sbx",
-                    plugin.scheme
-                ),
-            ));
-        };
-        out.push((name.clone(), path));
+        if let Some(path) = locate_program(name) {
+            out.push(Program {
+                name: name.clone(),
+                path,
+                origin: Origin::Host,
+            });
+            continue;
+        }
+        if let Some(path) = crate::store::Layout::from_env()
+            .and_then(|l| crate::plugins::programs::provisioned(&l, plugin.dir_name(), name))
+        {
+            out.push(Program {
+                name: name.clone(),
+                path,
+                origin: Origin::Provisioned,
+            });
+            continue;
+        }
+        // Both answers are exhausted, so this is the terminal state: name the two remedies, since
+        // which one applies is the user's to know. The configured-but-unbuilt case reads as the
+        // second one, and re-running the install is what turns a `programs` entry added after the
+        // fact into a built program.
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "the `{}` resolver plugin needs the program `{name}`, which is not on sbx's PATH \
+                 and has not been provisioned — install it (or add its directory to PATH), or name \
+                 it in `[plugin.{}] programs` as `{name} = \"nix:<attribute>\"` and re-run \
+                 `sbx plugins install`",
+                plugin.scheme, plugin.name
+            ),
+        ));
     }
     Ok(out)
+}
+
+/// A declared program, resolved, with **how** it was found.
+///
+/// The distinction is load-bearing rather than descriptive: a host tool's path is also what its own
+/// interpreter line and library references name, whereas a provisioned one's content lives at a
+/// physical path under sbx's store while every reference inside it names the *logical* path. Both
+/// live under `/nix/store` often enough that inspecting the path cannot tell them apart, so the
+/// origin is recorded when the program is found and never re-derived.
+struct Program {
+    name: String,
+    /// The host path for [`Origin::Host`]; the **logical** store path for [`Origin::Provisioned`].
+    path: PathBuf,
+    origin: Origin,
+}
+
+/// How a declared program was found. See [`Program`].
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Origin {
+    /// On sbx's own `PATH`.
+    Host,
+    /// Built into sbx's store for this plugin by `sbx plugins install`.
+    Provisioned,
+}
+
+impl Program {
+    /// The host path a launch binds this program **from**.
+    ///
+    /// Equal to [`Self::path`] for a host tool. For a provisioned one it is not: `path` is the
+    /// logical store path, which nothing outside a cage can open, so the source has to be the
+    /// physical location of the same content under sbx's store root.
+    fn bind_src(&self) -> io::Result<PathBuf> {
+        match self.origin {
+            Origin::Host => Ok(self.path.clone()),
+            Origin::Provisioned => crate::store::Layout::from_env()
+                .map(|l| crate::store::physical_path(&l, &self.path))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "cannot locate sbx's data directory to bind a provisioned program",
+                    )
+                }),
+        }
+    }
 }
 
 /// How many store paths a launch would bind for these declared programs, or `None` when none of
@@ -295,31 +366,62 @@ fn resolve_programs(plugin: &ResolverPlugin) -> io::Result<Vec<(String, PathBuf)
 /// reported as no closure rather than failing the inspection: `info` describes a grant, and a
 /// launch is where an unreadable closure has to be fatal.
 pub(crate) fn nix_closure_paths(programs: &[String]) -> Option<usize> {
-    let resolved: Vec<(String, PathBuf)> = programs
+    let resolved: Vec<Program> = programs
         .iter()
-        .filter_map(|n| locate_program(n).map(|p| (n.clone(), p)))
+        .filter_map(|n| {
+            locate_program(n).map(|p| Program {
+                name: n.clone(),
+                path: p,
+                origin: Origin::Host,
+            })
+        })
         .collect();
-    if !resolved.iter().any(|(_, p)| p.starts_with(NIX_STORE)) {
+    if !resolved.iter().any(|p| p.path.starts_with(NIX_STORE)) {
         return None;
     }
     nix_closures(&resolved).ok().map(|c| c.len())
 }
 
-/// The store paths every nix-resolved program among `programs` needs, deduplicated.
+/// The store paths every nix-resolved program among `programs` needs, deduplicated, each as the
+/// `(source, destination)` pair a launch binds it with.
+///
+/// The pair is what makes a provisioned program work at all. A host tool's closure entries are
+/// bound at their own location, source and destination alike. A provisioned one's are not: the
+/// content sits under sbx's own store root while the program's interpreter line and library
+/// references name the *logical* `/nix/store/…` path, so each entry must be bound with the physical
+/// path as source and the logical one as destination. Bound at the physical path instead, a wrapper
+/// script fails at `execve` with nothing pointing at why.
 ///
 /// Only programs that actually resolved under `/nix/store` are queried, so a host with no nix
 /// package pays nothing — no subprocess, no requirement that `nix-store` exist. Deduplicated
 /// because two programs from one profile share most of their closure, and each entry becomes a
 /// bind argument.
-fn nix_closures(programs: &[(String, PathBuf)]) -> io::Result<Vec<PathBuf>> {
-    let mut seen = std::collections::BTreeSet::new();
-    for (_, path) in programs {
-        if !path.starts_with(NIX_STORE) {
+fn nix_closures(programs: &[Program]) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut seen = std::collections::BTreeMap::new();
+    for program in programs {
+        if !program.path.starts_with(NIX_STORE) {
             continue;
         }
-        seen.extend(nix_closure(path)?);
+        // A provisioned path is only known to sbx's own store database, so the query has to name
+        // that store; the host's database does not hold it and reports it invalid.
+        let layout = match program.origin {
+            Origin::Host => None,
+            Origin::Provisioned => Some(crate::store::Layout::from_env().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cannot locate sbx's data directory to read a provisioned program's store paths",
+                )
+            })?),
+        };
+        for logical in nix_closure(&program.path, layout.as_ref())? {
+            let src = match &layout {
+                None => logical.clone(),
+                Some(l) => crate::store::physical_path(l, &logical),
+            };
+            seen.insert(logical, src);
+        }
     }
-    Ok(seen.into_iter().collect())
+    Ok(seen.into_iter().map(|(dest, src)| (src, dest)).collect())
 }
 
 /// The nix store prefix. A program resolving under it is not a self-contained file: its
@@ -338,7 +440,7 @@ const NIX_STORE: &str = "/nix/store/";
 /// Fails rather than falling back to binding nothing. A silent fallback would reproduce the trap
 /// this repository already paid for once: a binary that is present and executable and still dies
 /// at `execve`, surfacing as a bare exit 127 with nothing pointing at the cause.
-fn nix_closure(program: &Path) -> io::Result<Vec<PathBuf>> {
+fn nix_closure(program: &Path, layout: Option<&crate::store::Layout>) -> io::Result<Vec<PathBuf>> {
     let nix_store = crate::store::resolve_nix_store(None).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -350,7 +452,13 @@ fn nix_closure(program: &Path) -> io::Result<Vec<PathBuf>> {
             ),
         )
     })?;
-    let out = Command::new(&nix_store)
+    let mut cmd = Command::new(&nix_store);
+    // A path sbx provisioned lives in sbx's own store, which is a different database: without this
+    // the query reports the path invalid, since the host's nix knows nothing of it.
+    if let Some(layout) = layout {
+        cmd.arg("--store").arg(layout.store_dir());
+    }
+    let out = cmd
         .arg("--query")
         .arg("--requisites")
         .arg(program)
@@ -401,7 +509,7 @@ fn cage_spec(
     allow_env: &[(String, String)],
     env_paths: &[(String, String)],
     programs: &[(String, PathBuf)],
-    closure: &[PathBuf],
+    closure: &[(PathBuf, PathBuf)],
 ) -> Result<SandboxSpec, SpecError> {
     let ro = |p: &str| Mount::RoBind {
         src: PathBuf::from(p),
@@ -482,14 +590,16 @@ fn cage_spec(
         });
     }
 
-    // The store paths a nix-installed program needs, each at its own location because that is the
-    // only place its own interpreter line and library references can find it. This is what a
+    // The store paths a nix-installed program needs, each at the location its own interpreter line
+    // and library references name, which is the only place they can be found. This is what a
     // manifest used to buy by granting the entire store: the closure is what the program actually
-    // reads, and nothing else in the store comes with it.
-    for path in closure {
+    // reads, and nothing else in the store comes with it. Source and destination differ for a
+    // program sbx provisioned, whose content lives under sbx's own store root while every reference
+    // inside it names `/nix/store` — see [`nix_closures`].
+    for (src, dest) in closure {
         mounts.push(Mount::RoBindTry {
-            src: path.clone(),
-            dest: path.clone(),
+            src: src.clone(),
+            dest: dest.clone(),
         });
     }
 
@@ -765,8 +875,14 @@ mod tests {
         // Store paths must be bound where they say they are: a nix wrapper's interpreter line and
         // its library references are absolute store paths, so anywhere else is unreachable.
         let closure = [
-            PathBuf::from("/nix/store/aaa-bash-5.3/bin/bash"),
-            PathBuf::from("/nix/store/bbb-pass-1.7.4"),
+            (
+                PathBuf::from("/nix/store/aaa-bash-5.3/bin/bash"),
+                PathBuf::from("/nix/store/aaa-bash-5.3/bin/bash"),
+            ),
+            (
+                PathBuf::from("/nix/store/bbb-pass-1.7.4"),
+                PathBuf::from("/nix/store/bbb-pass-1.7.4"),
+            ),
         ];
         let spec = cage_spec(
             &plugin_in(dir.path(), SandboxGrant::default()),
@@ -778,14 +894,41 @@ mod tests {
         )
         .expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
-        for p in &closure {
-            let p = p.to_string_lossy().to_string();
+        for (_, dest) in &closure {
+            let p = dest.to_string_lossy().to_string();
             assert!(
                 argv.windows(3)
                     .any(|w| w[0] == "--ro-bind-try" && w[1] == p.as_str() && w[2] == p.as_str()),
                 "closure path {p} bound at its own location: {argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_provisioned_closure_binds_the_physical_source_at_the_logical_destination() {
+        let dir = TmpDir::new();
+        // The whole reason the closure carries a pair. A program sbx provisioned has its content
+        // under sbx's own store root, while its interpreter line and library references name
+        // `/nix/store/…`; binding such an entry at the physical path leaves the wrapper unable to
+        // start, with nothing in the failure pointing at why.
+        let physical = PathBuf::from("/data/sbx/store/nix/store/aaa-bash-5.3");
+        let logical = PathBuf::from("/nix/store/aaa-bash-5.3");
+        let spec = cage_spec(
+            &plugin_in(dir.path(), SandboxGrant::default()),
+            "test://x",
+            &[],
+            &[],
+            &[],
+            &[(physical.clone(), logical.clone())],
+        )
+        .expect("valid spec");
+        let argv = super::super::argv::to_argv(&spec);
+        assert!(
+            argv.windows(3).any(|w| w[0] == "--ro-bind-try"
+                && w[1] == *physical.to_string_lossy()
+                && w[2] == *logical.to_string_lossy()),
+            "the source must be the physical path and the destination the logical one: {argv:?}"
+        );
     }
 
     #[test]
@@ -822,10 +965,14 @@ mod tests {
         // The guard that keeps a host without nix from paying anything: no subprocess, and no
         // requirement that `nix-store` exist. A regression here would fail closed on every
         // non-nix host, so it is pinned rather than left to the happy path.
-        let programs = [("env".to_string(), PathBuf::from("/usr/bin/env"))];
+        let programs = [Program {
+            name: "env".to_string(),
+            path: PathBuf::from("/usr/bin/env"),
+            origin: Origin::Host,
+        }];
         assert_eq!(
             nix_closures(&programs).expect("no query, no error"),
-            Vec::<PathBuf>::new()
+            Vec::<(PathBuf, PathBuf)>::new()
         );
     }
 
@@ -973,9 +1120,25 @@ mod tests {
         let err = run(&bwrap, &p, "test://x").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         let msg = err.to_string();
+        // The terminal state is now BOTH answers exhausted, not just the `PATH` one: a program can
+        // also come from `[plugin.<name>] programs`, provisioned at install. Asserting only the
+        // `PATH` half would keep this green while saying nothing about the branch it is named for,
+        // since the fixture has no config entry either way.
         assert!(
-            msg.contains("sbx-no-such-program") && msg.contains("PATH"),
-            "the refusal names the program and the remedy: {msg}"
+            msg.contains("sbx-no-such-program"),
+            "the refusal names the program: {msg}"
+        );
+        assert!(
+            msg.contains("PATH"),
+            "the refusal names the first place a program is looked for: {msg}"
+        );
+        assert!(
+            msg.contains("has not been provisioned") && msg.contains("programs"),
+            "the refusal names the second answer, and the config field that supplies it: {msg}"
+        );
+        assert!(
+            msg.contains("sbx plugins install"),
+            "the refusal names the command that turns a configured program into a built one: {msg}"
         );
     }
 
