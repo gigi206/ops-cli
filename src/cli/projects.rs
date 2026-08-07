@@ -61,37 +61,11 @@ fn projects_list_cmd(args: &[OsString]) -> ExitCode {
 
 /// `sbx projects show <id>`: the realized-on-disk detail for one runtime tree.
 fn projects_show_cmd(args: &[OsString]) -> ExitCode {
-    let mut id: Option<&str> = None;
-    let mut json = false;
-    for a in args {
-        match a.to_str() {
-            Some("--json") => json = true,
-            Some("--help") | Some("-h") => return help::show(&["projects", "show"]),
-            Some(flag) if flag.starts_with('-') => {
-                diag::error(&format!("sbx: projects show: unknown flag `{flag}`"));
-                diag::hint("       run `sbx help projects show` for usage.");
-                return ExitCode::from(2);
-            }
-            Some(other) if id.is_none() => id = Some(other),
-            Some(extra) => {
-                diag::error(&format!(
-                    "sbx: projects show: unexpected extra argument `{extra}`"
-                ));
-                return ExitCode::from(2);
-            }
-            None => {
-                diag::error("sbx: projects show: argument is not valid UTF-8");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    let Some(id) = id else {
-        diag::error(&format!(
-            "sbx: projects show: name a tree id — usage: {}",
-            help::synopsis_of(&["projects", "show"])
-        ));
-        return ExitCode::from(2);
-    };
+    let (id, json) =
+        match crate::cli::one_name(args, &["projects", "show"], &["--json"], "name a tree id") {
+            Ok(parsed) => parsed,
+            Err(code) => return code,
+        };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     sandbox::projects_show(id, json, &pal)
 }

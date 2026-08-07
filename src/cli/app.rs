@@ -1018,37 +1018,11 @@ fn app_list() -> ExitCode {
 /// it is not mistaken for a failed provision. Read-only: no trust gate, no launch, no network.
 /// `--json` emits the same model.
 fn app_show(args: &[OsString]) -> ExitCode {
-    let mut name: Option<&str> = None;
-    let mut json = false;
-    for a in args {
-        match a.to_str() {
-            Some("--json") => json = true,
-            Some("--help") | Some("-h") => return help::show(&["app", "show"]),
-            Some(flag) if flag.starts_with('-') => {
-                diag::error(&format!("sbx: app show: unknown flag `{flag}`"));
-                diag::hint("       run `sbx help app show` for usage.");
-                return ExitCode::from(2);
-            }
-            Some(other) if name.is_none() => name = Some(other),
-            Some(extra) => {
-                diag::error(&format!(
-                    "sbx: app show: unexpected extra argument `{extra}`"
-                ));
-                return ExitCode::from(2);
-            }
-            None => {
-                diag::error("sbx: app show: argument is not valid UTF-8");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    let Some(name) = name else {
-        diag::error(&format!(
-            "sbx: app show: name an app — usage: {}",
-            help::synopsis_of(&["app", "show"])
-        ));
-        return ExitCode::from(2);
-    };
+    let (name, json) =
+        match crate::cli::one_name(args, &["app", "show"], &["--json"], "name an app") {
+            Ok(parsed) => parsed,
+            Err(code) => return code,
+        };
     let cwd = match config_cwd() {
         Ok(c) => c,
         Err(code) => return code,
@@ -1512,37 +1486,11 @@ fn render_app_show(v: &AppShow, pal: &style::Palette) -> String {
 /// and dropped from its `config.toml` `[tools]` so it does not re-equip. Previews by default; `--yes`
 /// applies. Declared tools, login/session state, and any `nix:`/`deb:`/`flake:` build are untouched.
 fn app_prune(args: &[OsString]) -> ExitCode {
-    let mut name: Option<&str> = None;
-    let mut apply = false;
-    for a in args {
-        match a.to_str() {
-            Some("-y") | Some("--yes") => apply = true,
-            Some("--help") | Some("-h") => return help::show(&["app", "prune"]),
-            Some(flag) if flag.starts_with('-') => {
-                diag::error(&format!("sbx: app prune: unknown flag `{flag}`"));
-                diag::hint("       run `sbx help app prune` for usage.");
-                return ExitCode::from(2);
-            }
-            Some(other) if name.is_none() => name = Some(other),
-            Some(extra) => {
-                diag::error(&format!(
-                    "sbx: app prune: unexpected extra argument `{extra}`"
-                ));
-                return ExitCode::from(2);
-            }
-            None => {
-                diag::error("sbx: app prune: argument is not valid UTF-8");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    let Some(name) = name else {
-        diag::error(&format!(
-            "sbx: app prune: name an app — usage: {}",
-            help::synopsis_of(&["app", "prune"])
-        ));
-        return ExitCode::from(2);
-    };
+    let (name, apply) =
+        match crate::cli::one_name(args, &["app", "prune"], &["-y", "--yes"], "name an app") {
+            Ok(parsed) => parsed,
+            Err(code) => return code,
+        };
     let cwd = match config_cwd() {
         Ok(c) => c,
         Err(code) => return code,

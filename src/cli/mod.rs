@@ -52,6 +52,110 @@ pub(crate) fn reject_extra(path: &[&str], extra: &[OsString]) -> Result<(), Exit
     Err(ExitCode::from(2))
 }
 
+/// What parsing a `<verb> <name> [switch]` command line yielded: show the verb's page, run with the
+/// name and the switch's state, or report a usage error. `Error` carries the message already
+/// formatted, and a hint only where the verb offers one, so the caller reports without deciding
+/// anything.
+#[derive(Debug, PartialEq)]
+pub(crate) enum OneName<'a> {
+    Help,
+    Run {
+        name: &'a str,
+        switch: bool,
+    },
+    Error {
+        message: String,
+        hint: Option<String>,
+    },
+}
+
+/// Parse the grammar shared by the verbs that inspect or act on a single named thing
+/// (`sbx app show`, `sbx app prune`, `sbx projects show`): one required name, one optional boolean
+/// switch under any of its spellings, and the usual help flags. Pure — it reads no config and
+/// prints nothing — so the grammar is unit-tested, which a loop returning an `ExitCode` around
+/// `println!` is not.
+///
+/// A second positional is an error rather than being swallowed: `sbx app show one two` silently
+/// inspecting `one` would answer a different question than the one asked, and a mistyped name would
+/// look like it worked. The same reasoning as [`reject_extra`], applied to a verb that does take one
+/// argument. An argument that is not valid UTF-8 cannot be a name sbx knows, so it is refused by the
+/// same rule instead of being lossily converted.
+///
+/// Only an unknown flag carries a hint: it is the one mistake whose fix is to read the verb's
+/// options, whereas an extra argument, a bad encoding and a missing name each say what to do in the
+/// message itself.
+pub(crate) fn parse_one_name<'a>(
+    args: &'a [OsString],
+    path: &[&str],
+    switches: &[&str],
+    missing: &str,
+) -> OneName<'a> {
+    let verb = path.join(" ");
+    let mut name: Option<&str> = None;
+    let mut switch = false;
+    for a in args {
+        match a.to_str() {
+            Some(s) if switches.contains(&s) => switch = true,
+            Some("--help") | Some("-h") => return OneName::Help,
+            Some(flag) if flag.starts_with('-') => {
+                return OneName::Error {
+                    message: format!("sbx: {verb}: unknown flag `{flag}`"),
+                    hint: Some(format!("       run `sbx help {verb}` for usage.")),
+                };
+            }
+            Some(other) if name.is_none() => name = Some(other),
+            Some(extra) => {
+                return OneName::Error {
+                    message: format!("sbx: {verb}: unexpected extra argument `{extra}`"),
+                    hint: None,
+                };
+            }
+            None => {
+                return OneName::Error {
+                    message: format!("sbx: {verb}: argument is not valid UTF-8"),
+                    hint: None,
+                };
+            }
+        }
+    }
+    match name {
+        Some(name) => OneName::Run { name, switch },
+        // The synopsis rather than a hint: the name is positional, so seeing where it goes is the
+        // answer.
+        None => OneName::Error {
+            message: format!(
+                "sbx: {verb}: {missing} — usage: {}",
+                crate::help::synopsis_of(path)
+            ),
+            hint: None,
+        },
+    }
+}
+
+/// [`parse_one_name`] plus the reporting each call site would otherwise repeat: the verb's page for
+/// a help flag, the usage error with its hint otherwise, and the name and switch when the line
+/// parses. `Err` carries the code the handler must return, which for a help flag is a success.
+/// Kept apart from the parsing so the grammar is tested on its values rather than through captured
+/// output.
+pub(crate) fn one_name<'a>(
+    args: &'a [OsString],
+    path: &[&str],
+    switches: &[&str],
+    missing: &str,
+) -> Result<(&'a str, bool), ExitCode> {
+    match parse_one_name(args, path, switches, missing) {
+        OneName::Run { name, switch } => Ok((name, switch)),
+        OneName::Help => Err(crate::help::show(path)),
+        OneName::Error { message, hint } => {
+            diag::error(&message);
+            if let Some(hint) = hint {
+                diag::hint(&hint);
+            }
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
 /// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single
 /// removal, keeping the order the user typed. Without this the second pass over a name finds
 /// nothing left to remove and reports a phantom failure over work that in fact succeeded.
@@ -166,12 +270,190 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::dedupe_names;
+    use super::{dedupe_names, one_name, parse_one_name, OneName};
+    use std::ffi::OsString;
 
     #[test]
     fn dedupe_names_keeps_the_first_of_each_in_order() {
         let mut names = vec!["demo-tool", "demo-app", "demo-tool", "demo-app", "demo-svc"];
         dedupe_names(&mut names);
         assert_eq!(names, vec!["demo-tool", "demo-app", "demo-svc"]);
+    }
+
+    fn os(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    /// `sbx app show`'s grammar, which every assertion below spells out literally rather than
+    /// rebuilding it from `path` the way the function does.
+    fn show(args: &[OsString]) -> OneName<'_> {
+        parse_one_name(args, &["app", "show"], &["--json"], "name an app")
+    }
+
+    #[test]
+    fn a_name_parses_with_the_switch_on_either_side_of_it() {
+        assert_eq!(
+            show(&os(&["demo-app"])),
+            OneName::Run {
+                name: "demo-app",
+                switch: false
+            }
+        );
+        for line in [["demo-app", "--json"], ["--json", "demo-app"]] {
+            assert_eq!(
+                show(&os(&line)),
+                OneName::Run {
+                    name: "demo-app",
+                    switch: true
+                },
+                "{line:?}"
+            );
+        }
+        // The switch repeated is not a second positional.
+        assert_eq!(
+            show(&os(&["--json", "demo-app", "--json"])),
+            OneName::Run {
+                name: "demo-app",
+                switch: true
+            }
+        );
+    }
+
+    #[test]
+    fn each_spelling_of_a_switch_turns_it_on() {
+        for spelling in ["-y", "--yes"] {
+            assert_eq!(
+                parse_one_name(
+                    &os(&["demo-app", spelling]),
+                    &["app", "prune"],
+                    &["-y", "--yes"],
+                    "name an app",
+                ),
+                OneName::Run {
+                    name: "demo-app",
+                    switch: true
+                },
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_help_flag_wins_over_everything_else_on_the_line() {
+        for line in [
+            vec!["--help"],
+            vec!["-h"],
+            vec!["demo-app", "--help"],
+            vec!["--json", "-h"],
+        ] {
+            assert_eq!(show(&os(&line)), OneName::Help, "{line:?}");
+        }
+        // Only over the arguments it reaches: the line is scanned left to right and returns at the
+        // first refusal, so a help flag behind an already-refused argument does not rescue it.
+        assert!(matches!(
+            show(&os(&["a", "b", "--help"])),
+            OneName::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_flag_is_named_and_points_at_the_verbs_page() {
+        let OneName::Error { message, hint } = show(&os(&["--bogus"])) else {
+            panic!("an unknown flag must not parse");
+        };
+        assert_eq!(message, "sbx: app show: unknown flag `--bogus`");
+        assert_eq!(
+            hint.as_deref(),
+            Some("       run `sbx help app show` for usage.")
+        );
+        // A flag typed after the name is still a flag, not the extra argument.
+        let OneName::Error { message, .. } = show(&os(&["demo-app", "--bogus"])) else {
+            panic!("an unknown flag after the name must not parse");
+        };
+        assert_eq!(message, "sbx: app show: unknown flag `--bogus`");
+    }
+
+    #[test]
+    fn a_second_name_is_refused_rather_than_swallowed() {
+        let OneName::Error { message, hint } = show(&os(&["demo-app", "other-app"])) else {
+            panic!("two names must not parse");
+        };
+        assert_eq!(
+            message,
+            "sbx: app show: unexpected extra argument `other-app`"
+        );
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStringExt;
+        let args = vec![OsString::from_vec(vec![0x64, 0xff, 0x6d])];
+        let OneName::Error { message, hint } = show(&args) else {
+            panic!("a non-UTF-8 name must not parse");
+        };
+        assert_eq!(message, "sbx: app show: argument is not valid UTF-8");
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn a_missing_name_answers_with_the_verbs_synopsis() {
+        for line in [vec![], vec!["--json"]] {
+            let OneName::Error { message, hint } = show(&os(&line)) else {
+                panic!("a line with no name must not parse: {line:?}");
+            };
+            assert_eq!(
+                message,
+                "sbx: app show: name an app — usage: sbx app show <name> [--json]"
+            );
+            assert_eq!(hint, None);
+        }
+    }
+
+    /// The pair a caller destructures, which is the one thing a command-line comparison cannot
+    /// check: a verb that acts on its switch (`sbx app prune`) previews when it is off and applies
+    /// when it is on, so a switch read as anything but the second element would act on a line that
+    /// asked for a preview.
+    #[test]
+    fn the_reported_pair_is_the_name_then_the_switch() {
+        for (line, want) in [
+            (vec!["demo-app"], ("demo-app", false)),
+            (vec!["demo-app", "-y"], ("demo-app", true)),
+            (vec!["demo-app", "--yes"], ("demo-app", true)),
+        ] {
+            let args = os(&line);
+            assert_eq!(
+                one_name(&args, &["app", "prune"], &["-y", "--yes"], "name an app").ok(),
+                Some(want),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// The messages interpolate the verb and its own wording, so a second `path` is asserted whole:
+    /// a helper that hardcoded `app show` would pass every test above and still mislabel this one.
+    #[test]
+    fn the_messages_name_the_verb_that_was_run() {
+        let path = ["projects", "show"];
+        let missing = "name a tree id";
+        let OneName::Error { message, hint } =
+            parse_one_name(&os(&["--bogus"]), &path, &["--json"], missing)
+        else {
+            panic!("an unknown flag must not parse");
+        };
+        assert_eq!(message, "sbx: projects show: unknown flag `--bogus`");
+        assert_eq!(
+            hint.as_deref(),
+            Some("       run `sbx help projects show` for usage.")
+        );
+
+        let OneName::Error { message, .. } = parse_one_name(&os(&[]), &path, &["--json"], missing)
+        else {
+            panic!("a line with no id must not parse");
+        };
+        assert_eq!(
+            message,
+            "sbx: projects show: name a tree id — usage: sbx projects show <id> [--json]"
+        );
     }
 }
