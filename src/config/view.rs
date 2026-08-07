@@ -25,6 +25,17 @@ use crate::{sandbox, store};
 /// A serializable projection of the resolved configuration for a directory — the model both the
 /// `sbx config` CLI and a future management front-end render. Field order mirrors the CLI's
 /// long-standing display order so a presenter can walk it top to bottom.
+/// One `[plugin.<name>]` table as the layers resolved it, for `sbx config show`. Values are
+/// shown: they are configuration (an address, a namespace, a path), never a credential — a
+/// secret belongs in `[secret]`, which this view prints by locator and never by value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PluginView {
+    /// The plugin the table configures.
+    pub(crate) name: String,
+    /// The variables it sets, as `KEY=value`, in the order the table lists them.
+    pub(crate) env: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub(crate) struct ConfigView {
     /// The directory this configuration was resolved for.
@@ -111,6 +122,11 @@ pub(crate) struct ConfigView {
     pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
     pub(crate) secrets: Vec<SecretView>,
+    /// What the host answers to each configured resolver plugin: the plugin name and the
+    /// variables set for it. Shown because a `[plugin.<name>]` table is otherwise invisible —
+    /// `sbx plugins info` needs a plugin to be installed and named, while this is the view that
+    /// says what the layers produced.
+    pub(crate) plugins: Vec<PluginView>,
     /// Named application profiles, each a gated overlay over the baseline.
     pub(crate) apps: Vec<AppView>,
     /// Notes about what was dropped or ignored and why — rendered out of band (the CLI's stderr).
@@ -865,11 +881,24 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         })
         .collect();
 
+    // The `[plugin.<name>]` tables as the layers left them: an untrusted project's is already
+    // gone by here, so this is what a launch would answer.
+    let plugins: Vec<PluginView> = resolved
+        .plugin
+        .iter()
+        .filter(|(_, raw)| !raw.env.is_empty())
+        .map(|(name, raw)| PluginView {
+            name: name.clone(),
+            env: raw.env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        })
+        .collect();
+
     ConfigView {
         cwd: cwd.display().to_string(),
         env,
         binds,
         packages,
+        plugins,
         mise,
         tools,
         nixpkgs,
@@ -1603,6 +1632,7 @@ mod tests {
     #[test]
     fn the_view_model_serializes_to_a_json_object() {
         let view = ConfigView {
+            plugins: vec![],
             tasks: Vec::new(),
             fs_deny: Vec::new(),
             fs_origin: Default::default(),

@@ -898,6 +898,16 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         }
     }
 
+    // What the host answers to a resolver plugin. Values are shown: a `[plugin.<name>]` table
+    // carries configuration, never a credential — a secret is declared in `[secret]`, which the
+    // block above prints by locator and never by value.
+    if !view.plugins.is_empty() {
+        let _ = writeln!(o, "  {h}plugins (what this host supplies to a resolver):{r}");
+        for p in &view.plugins {
+            let _ = writeln!(o, "    {n}{}{r}  {}", p.name, p.env.join(", "));
+        }
+    }
+
     // Declared operations, the static counterpart to `sbx task ls` (which reads a running session).
     // Name, what it says it does, and which layer declared it — not the command, which is the whole
     // contract `sbx task show` prints. Without this there was no way to confirm a `[task]` block
@@ -2383,6 +2393,7 @@ mod tests {
     fn sample_config_view() -> config::view::ConfigView {
         use config::view::*;
         ConfigView {
+            plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
             fs_origin: Default::default(),
@@ -2999,6 +3010,7 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
             fs_origin: Default::default(),
@@ -3125,6 +3137,7 @@ mod tests {
         // a profile's app-overlay allowlist surfaces what `sbx app <name>` can actually reach.
         use config::view::*;
         let view = ConfigView {
+            plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
             fs_origin: Default::default(),
@@ -3269,6 +3282,7 @@ mod tests {
             notes: vec![],
         };
         let view = ConfigView {
+            plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
             fs_origin: Default::default(),
@@ -3348,6 +3362,7 @@ mod tests {
         // profile's credential surfaces in `sbx config` (the baseline `secrets` section is empty).
         use config::view::*;
         let view = ConfigView {
+            plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
             fs_origin: Default::default(),
@@ -3466,6 +3481,7 @@ mod tests {
         // profile's overlay env/binds surface, mirroring the baseline `env`/`binds` sections.
         use config::view::*;
         let view = ConfigView {
+            plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
             fs_origin: Default::default(),
@@ -3584,6 +3600,7 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
             fs_origin: Default::default(),
