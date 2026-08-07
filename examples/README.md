@@ -119,6 +119,7 @@ step is skipped for its `@vscode/ripgrep` dependency, yet it needs no wrapper �
 | `pool`            | bootstrap `curl downloads.poolside.ai/pool/install.sh` (CLI tarball — no clean backend) | `*.poolside.ai` (Poolside API token, see note) |
 | `open-design`     | in-cage source checkout (`nexu-io/open-design`, pnpm workspace) — a design studio served to your host browser, driving OpenCode as its engine | `registry.npmjs.org` + your OpenCode provider |
 | `odysseus`        | in-cage source checkout (`odysseus-dev/odysseus`, Python/uvicorn) — a self-hosted AI workspace served to your host browser | `pypi.org` + `*.huggingface.co` + your provider (BYOK, in Settings) |
+| `prime-agent`     | bootstrap `curl app.primeintellect.ai/prime-agent/install.sh` (npm tarball release — no clean backend: absent from the public npm registry, no nixpkgs attribute, no native binary) + `nix:nodejs`, `nix:uv`, `nix:git`, `nix:ripgrep`, `nix:fd` — Prime Intellect's self-improving RLM agent: one built-in tool (a persistent IPython kernel `uv` provisions), `rlm()` child agents, and a continual harness the agent refines itself; upstream says its worker and kernel are **not** a security sandbox | provider-dependent (BYOK: `ANTHROPIC_API_KEY` in the profile, or OpenAI / Prime Inference / OpenRouter / DeepSeek / Mistral / …) **or** a `/login` subscription (Claude Pro/Max, Codex, Copilot — cage completion unverified, see the profile header) |
 
 Each gets its own persistent, isolated `$HOME` (config, login, history), shared
 across projects by default (`home_scope`).
@@ -352,6 +353,21 @@ in [the worked example](../docs-site/docs/guide/configuration/secret.md#worked-e
 > the Sentry telemetry denied — egress filtered as intended. `sbx upgrade deb` rolls it forward
 > (re-resolving the `…/releases/latest/…` URL). The remaining flagship step, as for every profile,
 > is the live credential/auth with your own provider key.
+>
+> `prime-agent` (Prime Intellect's Prime Agent) is a **bootstrap** profile in the `pool` / `muse`
+> mould, and the first whose bootstrap is an `npm install -g`: the tool is absent from the public npm
+> registry — its release assets are npm tarballs on Prime Intellect's own bucket, with the internal
+> dependencies rewritten to absolute URLs there — so the `cmd` runs the vendor's installer in-cage
+> with `NPM_CONFIG_PREFIX` pinned into the isolated home, because the nix node's own global prefix
+> lives in the read-only store. Its second half is a Python one: the agent's single built-in tool is
+> an IPython kernel that `uv` provisions into `~/.prime/agent/kernel-venv`, which is why `nix:uv` is
+> declared (uv would otherwise offer to fetch itself from `astral.sh`) and why `pypi.org` +
+> `files.pythonhosted.org` are in the allowlist; `nix:ripgrep` + `nix:fd` are there for the same
+> reason, as the agent looks both up on PATH before downloading them from GitHub releases. What the
+> cage buys is stated by upstream itself: the worker and kernel processes are **not** a security
+> sandbox, and model-written Python is what runs in them. It imports and resolves (test-covered); the
+> in-cage install, the kernel bootstrap (a downloaded interpreter and compiled wheels under the
+> cage's `nix-ld`), the login and a first model call are all still to be proven live.
 
 ## Tool freshness
 

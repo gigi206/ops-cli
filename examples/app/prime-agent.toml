@@ -1,0 +1,180 @@
+# prime-agent — Prime Agent, Prime Intellect's self-improving RLM coding and research agent
+# (PrimeIntellect-ai/prime-agent), sandboxed by sbx.
+#
+#   sbx app import examples/app/prime-agent.toml
+#   sbx app run prime-agent                      # interactive TUI, working on the current project
+#   sbx app run prime-agent -- -p "<task>"       # one-shot, non-interactive
+#   sbx app run prime-agent -- agents            # browse running, idle and saved sessions
+#
+# WHY A CAGE. Prime Agent hands the model ONE built-in tool: a long-lived IPython kernel. File
+# edits, project commands, tool use and context management all happen as model-written Python
+# executed in that kernel, and `await rlm("subtask")` spawns real child agents that use the same
+# runtime, providers and tools as the parent. Upstream states that the worker and kernel processes
+# improve lifecycle isolation and recovery but are NOT a security sandbox, and recommends running
+# untrusted code or instructions in an external sandbox. That is the boundary this profile draws:
+# model-written Python reaches the project you launched in, the app's own home, and the hosts in
+# `allow` — nothing else on the machine.
+#
+# The agent's durable side is the CONTINUAL HARNESS: `/refine` reviews the trajectory and persists
+# supplemental prompts, memories, skill descriptions and subagent specifications as state the agent
+# can revise, with recorded snapshots for rollback. That state lives in the app home below, so it
+# survives across launches without ever touching your own shell or another app's home.
+#
+# PACKAGING — a bootstrap install, NOT a clean sbx backend. There is no `prime-agent` on the public
+# npm registry (the `@earendil-works/pi-*` workspace names in the source tree are pi's, which Prime
+# Agent is built on, and upstream says they are not the install path), no nixpkgs attribute, and no
+# native release binary: the release assets are npm `.tgz` archives. The official path is Prime
+# Intellect's installer, which reads the `stable` channel file, downloads the release tarball,
+# verifies it against the release `SHA256SUMS` and runs `npm install -g`. So the `cmd` below runs
+# THAT installer inside the cage on the first launch — contained by bubblewrap + seccomp + the empty
+# netns + the egress allowlist — into the app's isolated home. The tarball's internal dependencies
+# are rewritten at packaging time into absolute tarball URLs on Prime Intellect's release bucket,
+# and its third-party dependencies resolve from npm: both hosts are in `allow` for that reason.
+#
+# THE PYTHON KERNEL is bootstrapped by `uv` into `~/.prime/agent/kernel-venv` (Python 3.11,
+# `ipykernel`, `prime-agent-runtime`, `dill`, and a default working set: requests, httpx, pyyaml,
+# tomli, python-dotenv, pandas, numpy, scipy, beautifulsoup4, lxml, pydantic, tyro). The installer
+# asks the package to do it at install time; otherwise it happens on the first use of the tool.
+# `nix:uv` puts uv on PATH so the agent never offers to fetch it from astral.sh, and `nix:ripgrep` +
+# `nix:fd` do the same for the two search tools it downloads from GitHub releases when they are
+# absent (it checks PATH first). uv's own interpreter and the wheels for the compiled packages are
+# foreign binaries; the cage's base userland supplies the glibc loader and the `nix-ld` shim for
+# exactly that. If one fails to start for a missing shared library, the network gating is fine and
+# you add that library as a `nix:` package (the pattern `cursor-agent.toml` uses). To skip the
+# managed environment entirely, point `PRIME_AGENT_KERNEL_PYTHON` at a Python that already has
+# `ipykernel` and a current `prime-agent-runtime`.
+#
+# CONFIG + STATE — `~/.prime/agent/` in the app's isolated home: `auth.json` (API keys and the
+# OAuth credentials `/login` stores), `sessions/`, the kernel venv, and the global `AGENTS.md`. So a
+# login persists across projects and never reaches your host `~`. Project instructions are READ from
+# the project bind (`AGENTS.md` or `CLAUDE.md`, current directory and parents), not written.
+#
+# SESSIONS run in worker processes behind a daemon: closing the TUI DETACHES from the agent rather
+# than necessarily stopping it, and `prime-agent agents` / `attach` / `status` / `shutdown` manage
+# them from inside. They are still the cage's processes: `sbx session ls` shows the launch,
+# `sbx session stop <name>` tears the whole subtree down. The kernel talks to its Python process
+# over loopback TCP (the Jupyter/ZeroMQ channels), which is intra-cage under the empty netns and
+# never egress, so it needs no `allow` entry.
+#
+# CREDENTIALS — Prime Agent is multi-provider. Two paths:
+#
+#   1. BYOK (set up below, for Anthropic). The real key is read on the HOST and injected by the
+#      egress proxy on the wire; the in-cage placeholder only lets the agent start and issue the
+#      request. Uncomment the `[env]` line and the `[secret]` block. For another provider, change
+#      the host, the allowlist entry and the env var: OpenAI (`OPENAI_API_KEY`, `Authorization`,
+#      `bearer`), Prime Inference (`PRIME_API_KEY`, api.pinference.ai), OpenRouter, DeepSeek,
+#      Mistral, Groq, xAI and more all take a header the broker can strip and replace. Google
+#      Gemini's key rides a query parameter, which header injection cannot broker.
+#   2. SUBSCRIPTION LOGIN — `/login` inside the TUI, for Claude Pro/Max, ChatGPT Plus/Pro (Codex) or
+#      GitHub Copilot, storing OAuth credentials in `auth.json`. Whether each provider's flow
+#      completes in a cage is UNVERIFIED: a server-side poll works, while a `localhost` OAuth
+#      callback binds the CAGE's loopback and is unreachable from your host browser. Prefer path 1,
+#      and note that a `[secret]` block for a host is strip-and-replace, so it would overwrite the
+#      OAuth Authorization header on that same host.
+#
+# EGRESS — a request that is refused is NAMED by the proxy: add the host to `allow`, or check ahead
+# with `sbx test net <url>`. GitHub is not listed below because sbx's built-in self-equip lane
+# already permits `github.com` / `api.github.com` / `*.githubusercontent.com` at `{GET,HEAD}`, which
+# is what uv's interpreter download and the ripgrep/fd fallback use.
+#
+# UNVERIFIED (like every profile until run with a real key): the in-cage install, the kernel
+# bootstrap, the login, and a first model call under the allowlist. Grounded here: the release
+# channel and artifact layout (read from the PUBLISHED installer and fetched), the tarball's
+# rewritten dependency URLs and `bin` name, the kernel bootstrap commands and package set
+# (src/core/kernel/bootstrap.ts), the PATH-first tool lookup (src/utils/tools-manager.ts), the
+# `git --no-optional-locks` invocation (src/utils/git.ts), the config directory (`piConfig`), and
+# the provider env vars (docs/providers.md).
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+# `npm install -g` needs a writable prefix, and the nix node's own prefix lives in the read-only
+# store, so the global install is pinned into the app's isolated home.
+export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+
+# First launch only: run Prime Intellect's official installer inside the cage. `pipefail` surfaces a
+# failed `curl … | bash` as a clean install error rather than later as `prime-agent: not found`.
+# Node and uv are already on PATH from [packages], so the installer's interactive offers to install
+# them are never reached. It still asks once, on a terminal, before it installs ("Install? [Y/n]"):
+# there is no variable that answers that one, and with no terminal it proceeds without asking. The
+# variable below answers its SECOND question, so the Python kernel is prepared during the install
+# rather than on the first use of the tool. It is `export`ed rather than written as a `VAR=1 curl …`
+# prefix, which would bind to `curl` and never reach the shell reading the script.
+#
+# UPGRADE. A bootstrap install rides no sbx `[packages]` backend, so `sbx upgrade` has nothing to
+# roll and the agent would stay at whatever release the first launch fetched. Re-run the installer,
+# which always resolves the current release, for ONE launch:
+#     sbx app run prime-agent --env PRIME_AGENT_SBX_UPDATE=1
+# `--env` is an authoritative one-shot override read on the HOST, so the version moves only when you
+# ask. Your auth, sessions and harness state live elsewhere in the app home and are untouched. An
+# already-installed command on PATH only changes what the installer PRINTS ("Existing prime-agent
+# command found on PATH"), not whether it installs: its preflight fails the run for a missing or too
+# old node/npm, nothing else.
+if [ ! -x "$NPM_CONFIG_PREFIX/bin/prime-agent" ] || [ -n "$PRIME_AGENT_SBX_UPDATE" ]; then
+  export PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1
+  curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | bash
+fi
+exec prime-agent "$@"
+    ''',
+    # `$0` placeholder: `sbx app run prime-agent -- <args>` appends <args> to this cmd array, so they
+    # arrive as `$1 $2 …` and reach the agent verbatim via `exec … "$@"`.
+    "prime-agent",
+]
+
+# Your host Prime Agent setup, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged agent read and write these host files (auth, sessions, harness state). Uncomment to share
+# your host setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.prime/agent", mode = "rw" },
+#]
+
+[packages]
+# The node runtime the installer and the agent need, and uv for the Python kernel. `git` is called
+# directly by the agent for repository state, and ripgrep + fd are the two tools it looks up on PATH
+# before falling back to a GitHub download.
+nodejs   = "nix:nodejs"
+uv       = "nix:uv"
+git      = "nix:git"
+ripgrep  = "nix:ripgrep"
+fd       = "nix:fd"
+
+# An app is read-by-default ({GET,HEAD}); the model provider the agent POSTs to is opened with `{*}`.
+[network]
+mode = "deny"
+allow = [
+    # Bootstrap, first launch (and an explicit PRIME_AGENT_SBX_UPDATE re-run): the installer script.
+    # The same host serves the Prime Inference dashboard the CLI points at for keys.
+    "{GET} https://app.primeintellect.ai",
+    # The release bucket the installer resolves the channel, tarball and SHA256SUMS from, which the
+    # tarball's own internal dependency URLs also point at. The agent's startup notice reads its
+    # release manifest (`latest.json`) from the same host.
+    "{GET} https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev",
+    # The third-party npm dependencies of that tarball.
+    "{GET} https://registry.npmjs.org",
+    # The Python kernel: ipykernel, prime-agent-runtime and the default working set.
+    "{GET} https://pypi.org",
+    "{GET} https://files.pythonhosted.org",
+    # The model provider. Anthropic here; swap the host for the provider you key it to, and keep the
+    # `[secret]` block on the same host.
+    "{*} https://api.anthropic.com",
+]
+
+[env]
+# REQUIRED. Prime Agent is a Node CLI that reaches its provider through fetch (undici), which does
+# not honour the http_proxy/https_proxy variables sbx injects. In the cage's empty network namespace
+# a fetch that bypasses the proxy resolves the host itself and dies with `EAI_AGAIN`, never reaching
+# the proxy at all. This makes it route through the proxy, so every request is subject to the
+# allowlist above.
+NODE_USE_ENV_PROXY = "1"
+
+# BYOK: the real key is read on the HOST and injected by the egress proxy — never in the cage.
+# Uncomment the placeholder and the block together.
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"

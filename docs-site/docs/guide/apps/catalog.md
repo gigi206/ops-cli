@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/) directory ships **64 importable
+The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/) directory ships **65 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -15,7 +15,7 @@ terminal agent, a desktop window, or a UI served in your host browser. The per-p
 packaging notes and the "not here yet, and why" triage live in
 [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/).
 
-## Terminal agents (45)
+## Terminal agents (46)
 
 The common case: a CLI or TUI that runs in the terminal you launched it from.
 
@@ -57,6 +57,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `openfox` | `nix:nodejs` (+ `mise:npm:openfox`) | **none**: a local LLM you point it at |
 | `pi` | `mise:aqua:earendil-works/pi` | provider-dependent (BYOK) |
 | `pool` | `nix:gnutar` (+ `nix:gzip`) | `*.poolside.ai` (Poolside account) |
+| `prime-agent` | bootstrap `curl app.primeintellect.ai/prime-agent/install.sh` (+ `nix:nodejs`, `nix:uv`, `nix:git`, `nix:ripgrep`, `nix:fd`) | provider-dependent (BYOK: `ANTHROPIC_API_KEY` in the profile, or a `/login` subscription): Prime Intellect's self-improving RLM agent, whose one built-in tool is a persistent IPython kernel |
 | `qoder` | `nix:nodejs` (+ `mise:npm:@qoder-ai/qodercli`, `nix:ripgrep`) | `*.qoder.sh` (Qoder account / `QODER_PERSONAL_ACCESS_TOKEN`) |
 | `qwen-code` | `nix:nodejs` (+ `mise:npm:@qwen-code/qwen-code`) | `dashscope.aliyuncs.com` (`DASHSCOPE_API_KEY`) |
 | `reasonix` | `nix:nodejs` (+ `mise:npm:reasonix`) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
