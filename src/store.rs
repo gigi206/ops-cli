@@ -1271,6 +1271,11 @@ pub(crate) fn physical_path(layout: &Layout, logical: &Path) -> PathBuf {
 /// outputs (e.g. a `-man` beside the binary), so the output is selected by which
 /// one actually contains `marker` — by content, not by order. nix's progress (the
 /// first-run cache fetch) streams to the user; only the out-paths are captured.
+///
+/// This is the path for sbx's **own furniture** — the portal, the font layer, the storage
+/// helpers — where the attribute is one sbx names itself and is free by construction. What the
+/// *user* declares goes through [`provision_unfree`] instead; the split is by who chose the
+/// attribute, not by what the licence turned out to be.
 pub(crate) fn provision(
     nix: &Path,
     layout: &Layout,
@@ -1282,9 +1287,21 @@ pub(crate) fn provision(
     provision_licensed(nix, layout, gcroot, flake_ref, attr, marker, false)
 }
 
-/// Like [`provision`], but permits an **unfree**-licensed attribute (a proprietary vendor
-/// binary packaged in nixpkgs — e.g. an agent CLI whose upstream ships closed-source
-/// releases). nixpkgs refuses to evaluate such a package unless allowed, so this builds it
+/// Provision a **user-declared** attribute, permitting an **unfree** licence.
+///
+/// Despite the name this is not a special case taken for known-proprietary packages: it is the
+/// single path every `nix:` entry in `[packages]` takes ([`crate::sandbox::packages`]), free or
+/// not. sbx cannot know a licence before evaluating, and an attribute is not asked twice, so the
+/// allowance is decided by *who named the attribute* rather than by what its licence turns out to
+/// be. A free package builds through here byte for byte as it would through [`provision`]; the
+/// difference shows only on an attribute nixpkgs would otherwise refuse.
+///
+/// The consequence to be honest about: declaring `nix:<attr>` accepts that attribute's licence
+/// terms on the user's behalf, and some are proprietary (a vendor agent CLI whose upstream ships
+/// closed-source releases; a BUSL-licensed server tool). sbx neither asks nor reports which of a
+/// project's packages were unfree, so the guide shows how to ask nixpkgs directly.
+///
+/// nixpkgs refuses to evaluate an unfree package unless allowed, so this builds it
 /// through a **pure** expression that re-imports the pinned nixpkgs with a scoped
 /// `config.allowUnfree = true` (see [`provision_command`]) — *not* `--impure`. Evaluation
 /// therefore stays pure (`builtins.getEnv` reads nothing, no impure paths are touched) and the

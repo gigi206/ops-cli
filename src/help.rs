@@ -321,7 +321,13 @@ const PAGES: &[Page] = &[
         details: "Queries nixhub for tools to declare. A fuzzy query lists matches; a query that\n\
             names a package exactly leads with that package's versions and the lines to\n\
             declare it in `[tools]` or `[packages]`. Host-side and read-only — it resolves\n\
-            nothing into the sandbox and needs no trust.",
+            nothing into the sandbox and needs no trust.\n\
+            \n\
+            A `nix:` package builds even when its licence is unfree: sbx permits it for every\n\
+            entry in `[packages]`, not only for ones known to be proprietary, since a licence\n\
+            cannot be known before evaluating. Declaring an attribute therefore accepts its\n\
+            licence, and sbx neither asks nor reports which ones were unfree. To check one:\n\
+            `nix eval 'nixpkgs#<attr>.meta.unfree'`.",
     },
     Page {
         path: &["test"],

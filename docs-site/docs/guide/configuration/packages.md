@@ -43,13 +43,36 @@ Provisioned **host-side** from the pinned nixpkgs channel into `sbx`'s store, it
 per-project store). Use [`sbx search <query>`](../cli/search) to find attribute
 names. Advances with [`sbx upgrade nix`](../concepts/upgrade).
 
-**Unfree packages are allowed here.** Some tools ship a proprietary (`unfree`) nixpkgs
-derivation, e.g. a vendor agent CLI whose upstream is closed-source. Because a
-`[packages]` declaration is trusted-only (an untrusted project's `[packages]` are
-dropped before anything is built), `sbx` builds such an attribute rather than refusing
-it. This is a *licensing* allowance, not a security relaxation: `unfree` is orthogonal
-to `sbx`'s code-trust boundary, and it never reaches the in-cage `sbx mise install nix:`
-self-equip path.
+#### Unfree packages build without asking
+
+Some tools ship a proprietary (`unfree`) nixpkgs derivation: a vendor agent CLI whose
+upstream is closed-source, or a server tool under a source-available licence. nixpkgs
+refuses to evaluate those unless it is told to allow them, and `sbx` tells it to.
+
+This is not a special case reserved for packages known to be proprietary. **Every**
+`nix:` entry in `[packages]` is built with the allowance in place, because a licence
+cannot be known before evaluating and an attribute is not offered twice. A free package
+is unaffected: the derivation is identical either way, and the allowance shows only on
+an attribute that would otherwise have been refused.
+
+What that means for you: writing `nix:<attr>` accepts that attribute's licence on your
+behalf, and `sbx` will not stop to ask. The declaration is treated as the deliberate act,
+which is why it is [trusted-only](../concepts/trust): an untrusted project's `[packages]` are dropped
+before anything is built, so no project can trigger a build by being opened.
+
+**`sbx` does not report which of your packages were unfree.** To ask nixpkgs yourself:
+
+```console
+$ nix eval 'nixpkgs#vault.meta.unfree'
+true
+$ nix eval --raw 'nixpkgs#vault.meta.license.spdxId'
+BUSL-1.1
+```
+
+The allowance is confined to this one import and is evaluated purely, so nothing is
+unpinned by it: it is a *licensing* gate, orthogonal to `sbx`'s code-trust boundary. It
+never reaches the in-cage `sbx mise install nix:` self-equip path, which is a different
+builder.
 
 `mise:nix:<pkg>` routes to mise's nixhub resolver: a way to get a nix package with
 mise's own version selection, not a third nix path. **Prefer plain `nix:<pkg>` in an
@@ -353,8 +376,8 @@ never-trusted one):
 | Project config state | What `[packages]` does | The launch message |
 |---|---|---|
 | `Trusted` | the package is honoured (built / installed) | nothing: the pin was recorded |
-| `Changed` (trusted before, edited since) | **the package is dropped, with a warning** | "`package <name>` withheld because `.sbx.toml` is untrusted — run `sbx trust` and retry" |
-| `Untrusted` (never trusted) | the package is dropped, with a warning | same wording as above |
+| `Changed` (trusted before, edited since) | **the package is dropped, with a warning** | ``.sbx.toml: withholding package `<name>` (changed since it was trusted — re-run `sbx trust`)`` |
+| `Untrusted` (never trusted) | the package is dropped, with a warning | ``.sbx.toml: withholding package `<name>` (untrusted — run `sbx trust`)`` |
 
 The `Changed` row is the one that surprises operators: a previously-trusted project's security
 fields **stop applying** on the first byte-edit (the gate is the direnv model: the whole file is

@@ -126,6 +126,19 @@ applies from an untrusted project (minus a reserved-key denylist). Trust is boun
 the file's content hash on the direnv model, so any edit re-arms the gate. See
 [The trust gate](trust).
 
+### An unfree package is a licensing question, not a trust one
+
+`sbx` builds a `nix:` package whose licence is unfree, and does so for every entry in
+`[packages]` rather than only for ones known to be proprietary. That is not a hole in
+the gate above, and it is worth being explicit about why: the allowance changes whether
+nixpkgs agrees to *evaluate* an attribute, never who is allowed to *name* one.
+
+Naming one stays trusted-only, so an untrusted project cannot cause a build of any kind,
+free or unfree. The allowance is confined to a single pinned import, evaluated purely, so
+it unpins nothing and widens no path. What it does cost you is a licence accepted without
+being asked: see [unfree packages build without
+asking](../configuration/packages#unfree-packages-build-without-asking).
+
 ## The cage's environment is not readable by other users
 
 A process's argument list is world-readable: `/proc/<pid>/cmdline` is mode `444`, so
