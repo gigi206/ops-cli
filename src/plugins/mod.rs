@@ -420,7 +420,9 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
     }
     let mut allow_paths = Vec::with_capacity(raw.sandbox.allow_paths.len());
     for entry in &raw.sandbox.allow_paths {
-        allow_paths.push(expand_allow_path(entry, exp)?);
+        if let Some(p) = expand_allow_path(entry, exp)? {
+            allow_paths.push(p);
+        }
     }
     for key in &raw.sandbox.allow_env {
         if !is_valid_env_key(key) {
@@ -568,7 +570,7 @@ impl Expansion {
 /// (`config::expand_bind_path`) so the user sees one variable vocabulary, but the two differ
 /// intentionally: this resolver allowlist rejects *any* stray `$`, whereas a `binds` source keeps
 /// a literal `$` past the head (a real mount path may contain one). Keep them separate.
-fn expand_allow_path(raw: &str, exp: &Expansion) -> Result<PathBuf, String> {
+fn expand_allow_path(raw: &str, exp: &Expansion) -> Result<Option<PathBuf>, String> {
     if raw.is_empty() {
         return Err("an `allow_paths` entry is empty".to_string());
     }
@@ -577,12 +579,31 @@ fn expand_allow_path(raw: &str, exp: &Expansion) -> Result<PathBuf, String> {
         None => (raw, None),
     };
     let base = match head {
-        "~" | "$HOME" => exp.home.clone().ok_or_else(|| {
-            format!("`allow_paths` entry `{raw}` needs `$HOME`, which is not set")
-        })?,
-        "$XDG_RUNTIME_DIR" => exp.runtime.clone().ok_or_else(|| {
-            format!("`allow_paths` entry `{raw}` needs `$XDG_RUNTIME_DIR`, which is not set")
-        })?,
+        // An unset variable **drops the entry** rather than refusing the plugin, which is the
+        // same answer the mount already gives: every grant path is a `--ro-bind-try`, so a path
+        // that is not there is skipped. Refusing here made the two disagree, and disabled a whole
+        // plugin over one optional path — `$XDG_RUNTIME_DIR` is unset under cron, a session-less
+        // ssh or a container, and that is exactly where GnuPG puts its agent socket inside
+        // `$GNUPGHOME` instead, a path the same manifest already binds. Dropping is also the
+        // fail-closed direction: the cage gets less, never more.
+        "~" | "$HOME" => match exp.home.clone() {
+            Some(h) => h,
+            None => {
+                crate::diag::warn(&format!(
+                    "plugins: not binding `{raw}` — $HOME is not set"
+                ));
+                return Ok(None);
+            }
+        },
+        "$XDG_RUNTIME_DIR" => match exp.runtime.clone() {
+            Some(r) => r,
+            None => {
+                crate::diag::warn(&format!(
+                    "plugins: not binding `{raw}` — $XDG_RUNTIME_DIR is not set"
+                ));
+                return Ok(None);
+            }
+        },
         other => {
             if other.contains('$') || rest.is_some_and(|r| r.contains('$')) {
                 return Err(format!(
@@ -596,13 +617,13 @@ fn expand_allow_path(raw: &str, exp: &Expansion) -> Result<PathBuf, String> {
                     "`allow_paths` entry `{raw}` is not an absolute path"
                 ));
             }
-            return Ok(p);
+            return Ok(Some(p));
         }
     };
-    Ok(match rest {
+    Ok(Some(match rest {
         Some(r) => base.join(r),
         None => base,
-    })
+    }))
 }
 
 /// A POSIX-ish environment variable name: a non-empty run of letters, digits, and `_` not
@@ -1492,17 +1513,29 @@ mod tests {
     }
 
     #[test]
-    fn expansion_needs_the_variable_to_be_set() {
-        // `$XDG_RUNTIME_DIR` unset → the entry that needs it is an error, not a silent drop.
+    fn an_unset_variable_drops_its_entry_instead_of_refusing_the_plugin() {
+        // An entry needing an unset variable is dropped, not fatal. Refusing disabled the whole
+        // plugin over one optional path: `$XDG_RUNTIME_DIR` is unset under cron, a session-less
+        // ssh or a container, and `pass://` then vanished from the registry entirely. Dropping
+        // matches what the mount already does — every grant path is a `--ro-bind-try`, so an
+        // absent one is skipped — and it only ever gives the cage *less*. The runner warns, so
+        // the narrower grant is stated rather than silent.
         let exp = Expansion {
             home: Some(PathBuf::from("/home/u")),
             runtime: None,
         };
-        assert!(expand_allow_path("$XDG_RUNTIME_DIR/gnupg", &exp).is_err());
+        assert_eq!(
+            expand_allow_path("$XDG_RUNTIME_DIR/gnupg", &exp).unwrap(),
+            None
+        );
         assert_eq!(
             expand_allow_path("~/.ssh", &exp).unwrap(),
-            PathBuf::from("/home/u/.ssh")
+            Some(PathBuf::from("/home/u/.ssh"))
         );
+        // A malformed entry is still an error: it can never be right on any host, while an unset
+        // variable is a fact about this one.
+        assert!(expand_allow_path("relative/path", &exp).is_err());
+        assert!(expand_allow_path("$SECRET_DIR/x", &exp).is_err());
     }
 
     #[test]
@@ -1513,11 +1546,11 @@ mod tests {
         };
         assert_eq!(
             expand_allow_path("$HOME", &exp).unwrap(),
-            PathBuf::from("/home/u")
+            Some(PathBuf::from("/home/u"))
         );
         assert_eq!(
             expand_allow_path("$XDG_RUNTIME_DIR", &exp).unwrap(),
-            PathBuf::from("/run/user/1000")
+            Some(PathBuf::from("/run/user/1000"))
         );
     }
 
