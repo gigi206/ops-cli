@@ -404,6 +404,34 @@ re-validates the manifest exactly as a local install does; what a store adds is 
 the tree came from and how its authenticity is established. See
 [Signed plugin stores](stores).
 
+## Running a plugin's tests
+
+A plugin may ship its own behaviour tests, as an executable `tests/run` inside its
+directory. They are covered by the hash a store pins the plugin with, so they arrive
+with it and are checked with it: what you run is the copy you installed, not a
+checkout you would have to trust separately.
+
+```sh
+"$(sbx plugins info <name> | sed -n 's/^  exec: *//p' | xargs dirname)/tests/run"
+```
+
+sbx neither runs them nor requires them, and a plugin without a `tests/` directory
+installs and resolves exactly the same. What they are worth is evidence: a resolver
+decides whether a missing credential is *absent* (your chain falls through to a
+weaker source) or *failed* (the launch aborts), and getting that line wrong is
+silent. A suite that pins it lets you check the distinction rather than read the
+code for it.
+
+Expect a suite to exit **77** when a tool it needs is not installed, rather than
+reporting a pass it never ran, and expect it to leave the plugin's own directory
+untouched: a file written there would put the tree out of agreement with what was
+signed, and `sbx plugins list` would report the plugin as MODIFIED.
+
+If you write a plugin, keep its tests inside its directory for the same reason, and
+do not rebuild sbx's sandbox in them. A hand-written cage is a second copy of what
+sbx builds, and it stops testing what ships as soon as the two drift. Stand in for
+the service a resolver talks to, not for the tool it runs.
+
 ## An honest residual: a networked resolver reaches the host network
 
 - **A `network = true` resolver reaches the host network, not the cage's
