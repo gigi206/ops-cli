@@ -1,0 +1,67 @@
+# Docs — builds the Docusaurus docs site and publishes it to GitHub Pages.
+#
+# Triggered on every push to `main` and `ops-v2`, and on every `v*` tag, so the
+# published documentation always matches the shipping release.
+#
+# The build is the same as `mise run docs-build` (docusaurus build + pagefind),
+# so broken links, missing anchors and markdown errors fail here exactly as they
+# do locally. The static output is uploaded with `actions/upload-pages-artifact`
+# and deployed with `actions/deploy-pages`.
+
+name: Docs
+
+on:
+  push:
+    branches:
+      - main
+      - ops-v2
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: docs-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Docusaurus docs
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs-site
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Install the docs-site dependencies
+        run: npm ci
+
+      - name: Build the static site (+ pagefind search index)
+        run: npm run build
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-site/build
+
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

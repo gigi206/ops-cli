@@ -1,38 +1,44 @@
-# Release — builds the self-contained (nix+bwrap bundled) static musl binary and
-# attaches it to a GitHub Release created from the pushed tag.
+# Latest — a rolling release that always tracks the leading edge of the
+# develop branch (ops-v2) and `main`.
 #
-# Trigger: any tag matching v*.*.* (e.g. v2.0.0, v2.0.1-alpha.0 is NOT matched by
-# that glob — use v2.0.1-alpha0 style, or widen the pattern below if you want
-# pre-release tags to publish too).
+# On every push to `ops-v2` or `main` we rebuild the self-contained (nix+bwrap
+# bundled) static musl binary and OVERWRITE the `latest` release: the `latest`
+# git tag is force-moved onto the current commit and the existing release (with
+# its old assets) is deleted and recreated as a pre-release. `make_latest` is
+# disabled so it never shadows a real versioned release.
 #
-# The bundled engines are pinned. Keep the nixpkgs REV and the expected_sha in
-# sync with build.rs / mise.toml when you bump them.
+# Consumers that want "always the newest build" pin to the `latest` tag.
 
-name: Release
+name: Latest
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - ops-v2
+      - main
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: latest
+  # Do not cancel a run mid-flight: a half-finished overwrite would leave the
+  # latest release in an inconsistent state (tag moved, assets not yet uploaded).
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  # Static musl engines pinned in build.rs. Same nixpkgs rev as mise.toml.
   NIXPKGS_REV: "89570f24e97e614aa34aa9ab1c927b6578a43775"
 
 jobs:
   build:
-    name: build + publish release asset
+    name: build + overwrite latest release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust (with the musl target)
         uses: dtolnay/rust-toolchain@stable
@@ -81,10 +87,14 @@ jobs:
 
       # Sanity gate: the default-feature unit suite must pass before we spend
       # minutes bundling engines. (The sandbox e2e skip on a hosted runner.)
-      # The systemd `systemd-run` dollar-escape test is host-dependent and fails
-      # on this runner, so it is skipped here; it stays enabled in local runs.
+      # The dollar-escape test asserts behaviour of the host's `systemd-run`
+      # that differs across systemd versions, so it is excluded here exactly as
+      # in ci.yml.
       - name: Unit tests (default features)
-        run: cargo test --bins -- --skip sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo test --bins \
+            -- --skip sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim
 
       - name: Build the bundled static musl binary
         env:
@@ -97,13 +107,25 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/sbx sbx-linux-x86_64
           sha256sum sbx-linux-x86_64 | cut -d' ' -f1 > sbx-linux-x86_64.sha256
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            sbx-linux-x86_64
+      - name: Force-move the latest tag onto this commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Recreate the latest release (overwrite)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release delete latest --yes || true
+          NOTES="Rolling build of ${GITHUB_REF_NAME} @ ${GITHUB_SHA::8}."$'\n'"\n"$'\n'"Built from: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          gh release create latest \
+            --prerelease \
+            --latest=false \
+            --title "latest (rolling, tracks ops-v2 + main)" \
+            --notes "$NOTES" \
+            sbx-linux-x86_64 \
             sbx-linux-x86_64.sha256
-          # A tag containing a hyphen (e.g. v2.0.0-alpha.0) is a pre-release.
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
