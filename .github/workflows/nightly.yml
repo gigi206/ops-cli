@@ -44,7 +44,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Install zig (linker for the musl target)
-        uses: mlugg/setup-zig@v4
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.13.0
 
