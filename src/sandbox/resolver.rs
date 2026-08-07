@@ -75,7 +75,9 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
     let env_paths = resolve_env_paths(&plugin.sandbox.allow_env_paths);
     allow_env.extend(env_paths.iter().cloned());
     let programs = resolve_programs(plugin)?;
-    let spec = cage_spec(plugin, reff, &allow_env, &env_paths, &programs).map_err(|e| {
+    // A nix-installed program is not a self-contained file, so the paths it needs come with it.
+    let closure = nix_closures(&programs)?;
+    let spec = cage_spec(plugin, reff, &allow_env, &env_paths, &programs, &closure).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -260,6 +262,89 @@ fn resolve_programs(plugin: &ResolverPlugin) -> io::Result<Vec<(String, PathBuf)
     Ok(out)
 }
 
+/// How many store paths a launch would bind for these declared programs, or `None` when none of
+/// them lives in the nix store and no closure is involved.
+///
+/// For `sbx plugins info`. A closure is the one part of a grant a reader cannot infer from the
+/// manifest, which names no store path at all, so leaving it off the inspection view would hide
+/// the largest thing a launch binds. Resolved exactly as a launch resolves it. An error is
+/// reported as no closure rather than failing the inspection: `info` describes a grant, and a
+/// launch is where an unreadable closure has to be fatal.
+pub(crate) fn nix_closure_paths(programs: &[String]) -> Option<usize> {
+    let resolved: Vec<(String, PathBuf)> = programs
+        .iter()
+        .filter_map(|n| locate_program(n).map(|p| (n.clone(), p)))
+        .collect();
+    if !resolved.iter().any(|(_, p)| p.starts_with(NIX_STORE)) {
+        return None;
+    }
+    nix_closures(&resolved).ok().map(|c| c.len())
+}
+
+/// The store paths every nix-resolved program among `programs` needs, deduplicated.
+///
+/// Only programs that actually resolved under `/nix/store` are queried, so a host with no nix
+/// package pays nothing — no subprocess, no requirement that `nix-store` exist. Deduplicated
+/// because two programs from one profile share most of their closure, and each entry becomes a
+/// bind argument.
+fn nix_closures(programs: &[(String, PathBuf)]) -> io::Result<Vec<PathBuf>> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, path) in programs {
+        if !path.starts_with(NIX_STORE) {
+            continue;
+        }
+        seen.extend(nix_closure(path)?);
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// The nix store prefix. A program resolving under it is not a self-contained file: its
+/// interpreter line, its libraries and the helpers it shells out to are all other store paths.
+const NIX_STORE: &str = "/nix/store/";
+
+/// Every store path a nix-installed program needs, itself included, or an error naming why the
+/// question could not be answered.
+///
+/// A `pass` from nix is a wrapper script whose shebang is a store path and whose helpers are
+/// more of them; a `keepassxc-cli` from nix links against a Qt closure. Binding the resolved
+/// file alone leaves both unable to start, which is why manifests used to grant the **whole**
+/// store to run one program. `nix-store -qR` names exactly the paths that program needs, so the
+/// grant becomes the closure rather than the store.
+///
+/// Fails rather than falling back to binding nothing. A silent fallback would reproduce the trap
+/// this repository already paid for once: a binary that is present and executable and still dies
+/// at `execve`, surfacing as a bare exit 127 with nothing pointing at the cause.
+fn nix_closure(program: &Path) -> io::Result<Vec<PathBuf>> {
+    let nix_store = crate::store::resolve_nix_store(None).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "`{}` is a nix store path, so the paths it needs must be read with `nix-store`, \
+                 which is not on sbx's PATH — install nix, or use a build of that program which \
+                 does not come from the store",
+                program.display()
+            ),
+        )
+    })?;
+    let out = Command::new(&nix_store)
+        .arg("--query")
+        .arg("--requisites")
+        .arg(program)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| io::Error::other(format!("could not run {}: {e}", nix_store.display())))?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "could not read the store paths `{}` needs: {}",
+            program.display(),
+            one_line_detail(&out.stderr)
+        )));
+    }
+    let text = String::from_utf8(out.stdout)
+        .map_err(|_| io::Error::other("`nix-store --query --requisites` produced non-UTF-8"))?;
+    Ok(text.lines().map(PathBuf::from).collect())
+}
+
 /// The path a declared program resolves to, or `None` when nothing usable is on `PATH`. Shared
 /// with `sbx plugins info`, so what a user is shown is what a launch would bind — a second
 /// lookup would be a second chance to disagree.
@@ -292,6 +377,7 @@ fn cage_spec(
     allow_env: &[(String, String)],
     env_paths: &[(String, String)],
     programs: &[(String, PathBuf)],
+    closure: &[PathBuf],
 ) -> Result<SandboxSpec, SpecError> {
     let ro = |p: &str| Mount::RoBind {
         src: PathBuf::from(p),
@@ -372,6 +458,17 @@ fn cage_spec(
         });
     }
 
+    // The store paths a nix-installed program needs, each at its own location because that is the
+    // only place its own interpreter line and library references can find it. This is what a
+    // manifest used to buy by granting the entire store: the closure is what the program actually
+    // reads, and nothing else in the store comes with it.
+    for path in closure {
+        mounts.push(Mount::RoBindTry {
+            src: path.clone(),
+            dest: path.clone(),
+        });
+    }
+
     // A network grant shares the host network and binds the DNS + TLS files a resolver needs to
     // reach a remote secret store; without it the cage gets an empty network namespace (no egress
     // at all — fail-closed). The files are `try`, so a host missing one does not fail the launch.
@@ -448,6 +545,7 @@ mod tests {
             &[("GNUPGHOME".into(), "/home/u/.gnupg".into())],
             &[],
             &[],
+            &[],
         )
         .expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
@@ -495,7 +593,7 @@ mod tests {
             network: true,
         };
         let spec =
-            cage_spec(&plugin_in(dir.path(), grant), "vault://x", &[], &[], &[]).expect("valid spec");
+            cage_spec(&plugin_in(dir.path(), grant), "vault://x", &[], &[], &[], &[]).expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
@@ -522,6 +620,7 @@ mod tests {
             &[],
             &[],
             &[("vault".to_string(), resolved.clone())],
+            &[],
         )
         .expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
@@ -555,6 +654,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("valid spec");
         let env = super::super::argv::env_args(&spec);
@@ -582,6 +682,74 @@ mod tests {
     }
 
     #[test]
+    fn cage_spec_binds_a_nix_closure_at_its_own_paths() {
+        let dir = TmpDir::new();
+        // Store paths must be bound where they say they are: a nix wrapper's interpreter line and
+        // its library references are absolute store paths, so anywhere else is unreachable.
+        let closure = [
+            PathBuf::from("/nix/store/aaa-bash-5.3/bin/bash"),
+            PathBuf::from("/nix/store/bbb-pass-1.7.4"),
+        ];
+        let spec = cage_spec(
+            &plugin_in(dir.path(), SandboxGrant::default()),
+            "test://x",
+            &[],
+            &[],
+            &[],
+            &closure,
+        )
+        .expect("valid spec");
+        let argv = super::super::argv::to_argv(&spec);
+        for p in &closure {
+            let p = p.to_string_lossy().to_string();
+            assert!(
+                argv.windows(3)
+                    .any(|w| w[0] == "--ro-bind-try" && w[1] == p.as_str() && w[2] == p.as_str()),
+                "closure path {p} bound at its own location: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_binds_a_nix_programs_closure_so_a_wrapper_script_can_start() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        // Needs a real nix-installed program to be meaningful; skip where there is none.
+        let Some(pass) = locate_program("pass") else { return };
+        if !pass.starts_with(NIX_STORE) {
+            eprintln!("skipping nix closure run: `pass` is not a store path here");
+            return;
+        }
+        // The case the closure exists for. A nix `pass` is a wrapper script whose shebang is a
+        // store path, so binding the resolved file alone leaves it unable to start — which is why
+        // the manifest used to grant the whole store. Nothing here grants /nix/store: if the
+        // closure were not bound, this exec would fail.
+        let (_dir, p) = fake_resolver_with(
+            "pass --help >/dev/null 2>&1; echo started=$?",
+            SandboxGrant {
+                programs: vec!["pass".to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        let out = run(&bwrap, &p, "test://x").expect("the resolver should run");
+        assert_eq!(out.trim_end(), "started=0");
+    }
+
+    #[test]
+    fn a_program_outside_the_nix_store_is_never_queried_for_a_closure() {
+        // The guard that keeps a host without nix from paying anything: no subprocess, and no
+        // requirement that `nix-store` exist. A regression here would fail closed on every
+        // non-nix host, so it is pinned rather than left to the happy path.
+        let programs = [("env".to_string(), PathBuf::from("/usr/bin/env"))];
+        assert_eq!(
+            nix_closures(&programs).expect("no query, no error"),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
     fn cage_spec_binds_an_env_path_at_its_own_location() {
         let dir = TmpDir::new();
         let spec = cage_spec(
@@ -589,6 +757,7 @@ mod tests {
             "test://x",
             &[("PASSWORD_STORE_DIR".into(), "/data/secrets".into())],
             &[("PASSWORD_STORE_DIR".into(), "/data/secrets".into())],
+            &[],
             &[],
         )
         .expect("valid spec");

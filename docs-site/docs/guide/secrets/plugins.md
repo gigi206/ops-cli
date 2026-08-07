@@ -67,6 +67,13 @@ network     = false                # true = reach the network; false = empty net
   - A declared program that resolves to nothing **fails the launch**, naming it.
     `sbx plugins info <name>` shows where each one resolves right now, so the
     answer comes before the first secret rather than during it.
+  - A program that resolves **under `/nix/store`** is not a self-contained file:
+    its interpreter line, its libraries and the helpers it runs are other store
+    paths. sbx reads exactly which ones it needs and binds those, so a nix build
+    works with no `/nix/store` in the manifest, and the grant is that program's
+    closure rather than the whole store. A host with no nix package is never
+    asked the question, and a store path whose closure cannot be read fails the
+    launch naming why, rather than binding nothing and dying later at `execve`.
 - `allow_paths` is for the plugin's **data**: a token file, a database, a
   socket. `HOME` in the cage is a private tmpfs, so a tool that derives a
   location from it (a password store, a GnuPG keyring and its agent socket, a

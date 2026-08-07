@@ -1823,6 +1823,12 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     print_grant_paths("allow_paths", &p.sandbox.allow_paths);
     print_grant_env("allow_env", &p.sandbox.allow_env);
     print_grant_env_paths(&p.sandbox.allow_env_paths, err, r);
+    // The closure, when a declared program lives in the nix store. Shown because it is the one
+    // part of the grant no manifest names, so it would otherwise be the largest thing a launch
+    // binds and the only one a reader cannot see coming.
+    if let Some(n) = crate::sandbox::resolver::nix_closure_paths(&p.sandbox.programs) {
+        println!("    nix closure: {n} store paths, so a store-installed program can run");
+    }
     ExitCode::SUCCESS
 }
 
