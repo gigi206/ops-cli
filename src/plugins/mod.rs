@@ -203,6 +203,30 @@ pub(crate) struct SandboxGrant {
     pub(crate) allow_paths: Vec<PathBuf>,
     /// Host environment variable names passed through into the otherwise-cleared environment.
     pub(crate) allow_env: Vec<String>,
+    /// Paths to hide **inside** a granted one, each covered by an empty tmpfs after the binds are
+    /// applied.
+    ///
+    /// A grant is sometimes wide for a reason that has nothing to do with what the plugin needs:
+    /// `~/.gnupg` has to be bound whole because the public material it holds has no single name
+    /// (`pubring.kbx`, `pubring.gpg`, `public-keys.d/` under keyboxd, plus the `.conf` files), and
+    /// binding it drags in `private-keys-v1.d` — which the resolver never needs to read, since the
+    /// host agent does the decryption. Naming that subdirectory here removes it without narrowing
+    /// the grant to a list of files that breaks on the next layout.
+    ///
+    /// What a mask buys is that the material cannot be *copied out*, not that it is beyond *use*:
+    /// the same grant binds the agent socket, so decryption stays available for the length of the
+    /// run. Copying is the capability worth removing, being the one that outlives it.
+    ///
+    /// A mask can only ever take away, so it needs no trust gate of its own: the widest thing a
+    /// manifest can do with it is hide something from itself. Applied after every bind, since a
+    /// tmpfs laid before one would simply be covered by it.
+    ///
+    /// Deliberately a **fixed path**, expanded like an `allow_paths` entry, so it cannot follow a
+    /// location that [`Self::allow_env_paths`] supplies: that value may come from the environment
+    /// *or* from the host's `[plugin.<name>]` table, and the two are known at different times. A
+    /// protection that held for one source and not the other would be worse than one whose limit
+    /// is stated, so a relocated home is bound whole and documented as unmasked.
+    pub(crate) mask_paths: Vec<PathBuf>,
     /// Environment variables whose **value is a path to bind**, read-only, when they are set.
     ///
     /// A manifest can only name paths it knows in advance (`~/.password-store`, `~/.gnupg`), yet
@@ -398,6 +422,8 @@ struct RawSandbox {
     #[serde(default)]
     allow_env_paths: Vec<String>,
     #[serde(default)]
+    mask_paths: Vec<String>,
+    #[serde(default)]
     network: bool,
 }
 
@@ -442,6 +468,12 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
             allow_paths.push(p);
         }
     }
+    let mut mask_paths = Vec::with_capacity(raw.sandbox.mask_paths.len());
+    for entry in &raw.sandbox.mask_paths {
+        if let Some(p) = expand_allow_path(entry, exp)? {
+            mask_paths.push(p);
+        }
+    }
     for key in &raw.sandbox.allow_env {
         if !is_valid_env_key(key) {
             return Err(format!("`allow_env` has an invalid variable name `{key}`"));
@@ -472,6 +504,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
         sandbox: SandboxGrant {
             programs: raw.sandbox.programs,
             allow_paths,
+            mask_paths,
             allow_env: raw.sandbox.allow_env,
             allow_env_paths: raw.sandbox.allow_env_paths,
             network: raw.sandbox.network,
@@ -610,9 +643,7 @@ fn expand_allow_path(raw: &str, exp: &Expansion) -> Result<Option<PathBuf>, Stri
         "~" | "$HOME" => match exp.home.clone() {
             Some(h) => h,
             None => {
-                crate::diag::warn(&format!(
-                    "plugins: not binding `{raw}` — $HOME is not set"
-                ));
+                crate::diag::warn(&format!("plugins: not binding `{raw}` — $HOME is not set"));
                 return Ok(None);
             }
         },
@@ -1226,6 +1257,34 @@ mod tests {
         );
         assert_eq!(p.sandbox.allow_env, vec!["GNUPGHOME".to_string()]);
         assert!(!p.sandbox.network);
+    }
+
+    #[test]
+    fn a_mask_path_is_expanded_like_a_grant_path_and_kept_separate_from_it() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "pass",
+            r#"
+                name   = "pass"
+                type   = "resolver"
+                scheme = "pass"
+                exec   = "resolve"
+                [sandbox]
+                allow_paths = ["~/.gnupg"]
+                mask_paths  = ["~/.gnupg/private-keys-v1.d"]
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let p = reg.resolver("pass").expect("pass resolver");
+        // The same `~` expansion as a grant path, so a manifest names one directory one way.
+        assert_eq!(
+            p.sandbox.mask_paths,
+            vec![PathBuf::from("/home/u/.gnupg/private-keys-v1.d")]
+        );
+        // And it stays out of `allow_paths`: a mask must never read as one more thing granted.
+        assert_eq!(p.sandbox.allow_paths, vec![PathBuf::from("/home/u/.gnupg")]);
     }
 
     #[test]

@@ -34,6 +34,7 @@ description = "Generic KV-store resolver"   # optional, display-only
 [sandbox]                      # the least-privilege grant the runner gives the plugin
 programs    = ["vault"]            # host programs to locate on sbx's PATH and bind into the cage
 allow_paths = ["~/.vault-token"]   # extra host paths bound read-only (data, not binaries)
+mask_paths  = []                   # paths inside a granted one to hide again (an empty tmpfs)
 allow_env   = ["VAULT_ADDR"]       # host env vars passed into the otherwise-cleared environment
 allow_env_paths = ["VAULT_CACERT"] # env vars whose VALUE is a path: passed through, and bound
 network     = false                # true = reach the network; false = empty network namespace
@@ -79,6 +80,32 @@ network     = false                # true = reach the network; false = empty net
   location from it (a password store, a GnuPG keyring and its agent socket, a
   token file) looks where nothing exists: bind the host path and point the tool
   at it. Naming `PATH` in `allow_env` has no effect; the structural value wins.
+- `mask_paths` takes something back out of a path `allow_paths` granted, by
+  covering it with an empty filesystem. It exists because a grant is sometimes
+  wide for a reason unrelated to what the plugin needs: the `pass` plugin binds
+  `~/.gnupg` whole, since the public material it wants has no single name (a
+  keyring is `pubring.kbx`, or `pubring.gpg`, or `public-keys.d/` under keyboxd,
+  and `gpg` reads its `.conf` files from there too), and a list of files would
+  break on the next layout. Naming `~/.gnupg/private-keys-v1.d` here removes the
+  secret keys again, and the resolver never misses them: it only ever needed the
+  host `gpg-agent` to decrypt, reached through its socket.
+  - A mask can only ever *subtract*, so unlike the other grant fields it needs no
+    trust of its own: the widest thing a manifest can do with one is hide
+    something from itself.
+  - It is applied after every bind, since a filesystem laid down first would
+    simply be covered by the bind that follows it. The masked path exists inside
+    the cage and is empty, rather than being absent, so a tool that stats it
+    before reading finds what it expects.
+  - What a mask buys is that the material cannot be **copied out**. It does not
+    put it beyond **use**: in the example above the agent socket is still bound,
+    so code in that cage can ask the agent to decrypt while it runs. Copying is
+    the capability worth removing, being the one that outlives the run.
+  - A mask is a **fixed path in a signed manifest**, so it cannot follow a path
+    that `allow_env_paths` supplies: if `GNUPGHOME` names another home, that home
+    is bound whole and nothing in it is masked. Expanding a mask against the
+    variable was considered and rejected: the value can come from the
+    environment or from `[plugin.<name>]`, and a protection that holds for one
+    source and not the other is worse than one whose limit is stated.
 - `allow_env` is how a resolver receives *its own* credential (`VAULT_TOKEN`, an
   age identity), so the value never travels where another user could read it:
   see [the cage's environment is not readable by other

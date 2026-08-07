@@ -1849,6 +1849,7 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     println!("    network:     {}", p.sandbox.network);
     print_grant_programs(&p.sandbox.programs, err, r);
     print_grant_paths("allow_paths", &p.sandbox.allow_paths);
+    print_grant_masks(&p.sandbox.mask_paths);
     print_grant_env("allow_env", &p.sandbox.allow_env);
     print_grant_env_paths(&p.sandbox.allow_env_paths, err, r);
     // The closure, when a declared program lives in the nix store. Shown because it is the one
@@ -1860,7 +1861,6 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     print_host_config(p, err, r);
     ExitCode::SUCCESS
 }
-
 
 /// What this host answers for a plugin, from `[plugin.<name>]` in the resolved config.
 ///
@@ -1937,6 +1937,25 @@ fn print_grant_paths(label: &str, paths: &[PathBuf]) {
             .join(", ");
         println!("    {label}:  {joined}");
     }
+}
+
+/// One `sbx plugins info` grant line listing the paths hidden inside the grant, or `(none)`.
+///
+/// Printed right under `allow_paths` because it only ever reads against it: a mask is a subtraction
+/// from a path the line above granted, and the two apart would leave a reader summing them by hand.
+/// Always printed, even empty — a grant block whose shape changes per plugin cannot be compared
+/// across two of them, and "nothing is hidden here" is itself the answer to a fair question.
+fn print_grant_masks(paths: &[PathBuf]) {
+    if paths.is_empty() {
+        println!("    mask_paths:   (none)");
+        return;
+    }
+    let joined = paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("    mask_paths:   {joined} (hidden inside the grant above)");
 }
 
 /// One `sbx plugins info` grant line listing passed-through environment variables, or `(none)`.

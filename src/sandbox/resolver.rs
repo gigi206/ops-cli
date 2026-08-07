@@ -100,15 +100,16 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
     let programs = resolve_programs(plugin)?;
     // A nix-installed program is not a self-contained file, so the paths it needs come with it.
     let closure = nix_closures(&programs)?;
-    let spec = cage_spec(plugin, reff, &allow_env, &env_paths, &programs, &closure).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "cannot build the resolver sandbox for `{}`: {e:?}",
-                plugin.scheme
-            ),
-        )
-    })?;
+    let spec =
+        cage_spec(plugin, reff, &allow_env, &env_paths, &programs, &closure).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot build the resolver sandbox for `{}`: {e:?}",
+                    plugin.scheme
+                ),
+            )
+        })?;
 
     // `_env` holds the descriptor the cage's environment is read from open until bwrap has run —
     // and the reason it is a descriptor is this cage in particular: a plugin's `allow_env` is how a
@@ -509,6 +510,15 @@ fn cage_spec(
         NetPolicy::Isolated
     };
 
+    // The masks, laid over everything the grant bound. After the binds, never before: a tmpfs put
+    // down first would simply be covered by the bind that follows it. `Tmpfs` rather than an
+    // unbind because bwrap has no unbind — an empty filesystem is how a path is made to hold
+    // nothing, and it is what makes a wide grant survivable (`~/.gnupg` whole, minus its private
+    // keys).
+    for p in &plugin.sandbox.mask_paths {
+        mounts.push(Mount::Tmpfs { dest: p.clone() });
+    }
+
     // The grant's pass-throughs first, then sbx's structural HOME/PATH last so the cage's own
     // identity always wins over a manifest that happens to name them (self-harm at worst).
     let mut env: Vec<(String, String)> = allow_env.to_vec();
@@ -560,6 +570,7 @@ mod tests {
             allow_paths: vec![PathBuf::from("/home/u/.gnupg")],
             allow_env: vec![],
             allow_env_paths: vec![],
+            mask_paths: vec![],
             network: false,
         };
         let p = plugin_in(dir.path(), grant);
@@ -614,10 +625,18 @@ mod tests {
             allow_paths: vec![],
             allow_env: vec![],
             allow_env_paths: vec![],
+            mask_paths: vec![],
             network: true,
         };
-        let spec =
-            cage_spec(&plugin_in(dir.path(), grant), "vault://x", &[], &[], &[], &[]).expect("valid spec");
+        let spec = cage_spec(
+            &plugin_in(dir.path(), grant),
+            "vault://x",
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
@@ -706,6 +725,41 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_covers_a_granted_path_and_comes_after_every_bind() {
+        let dir = TmpDir::new();
+        let grant = SandboxGrant {
+            allow_paths: vec![PathBuf::from("/home/u/.gnupg")],
+            mask_paths: vec![PathBuf::from("/home/u/.gnupg/private-keys-v1.d")],
+            ..SandboxGrant::default()
+        };
+        let spec = cage_spec(
+            &plugin_in(dir.path(), grant),
+            "test://x",
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("valid spec");
+        let argv = super::super::argv::to_argv(&spec);
+        let bind = argv
+            .iter()
+            .position(|a| a == "/home/u/.gnupg")
+            .expect("the grant path is bound");
+        let mask = argv
+            .iter()
+            .position(|a| a == "/home/u/.gnupg/private-keys-v1.d")
+            .expect("the mask is applied");
+        // Order is the whole mechanism: a tmpfs laid before the bind would be covered by it, so
+        // the mask must come later in the argv bwrap replays in order.
+        assert!(
+            mask > bind,
+            "the mask must follow the bind it hides part of: {argv:?}"
+        );
+        assert_eq!(argv[mask - 1], "--tmpfs", "a mask is an empty filesystem");
+    }
+
+    #[test]
     fn cage_spec_binds_a_nix_closure_at_its_own_paths() {
         let dir = TmpDir::new();
         // Store paths must be bound where they say they are: a nix wrapper's interpreter line and
@@ -741,7 +795,9 @@ mod tests {
             return;
         };
         // Needs a real nix-installed program to be meaningful; skip where there is none.
-        let Some(pass) = locate_program("pass") else { return };
+        let Some(pass) = locate_program("pass") else {
+            return;
+        };
         if !pass.starts_with(NIX_STORE) {
             eprintln!("skipping nix closure run: `pass` is not a store path here");
             return;
@@ -871,7 +927,10 @@ mod tests {
         std::env::remove_var(VAR);
         // A hard-coded literal, so the assertion cannot be met by the test recomputing whatever
         // the code produced. Dropping the bind in `cage_spec` makes `cat` fail instead.
-        assert_eq!(out.expect("the resolver should run"), "the-fixture-wrote-this");
+        assert_eq!(
+            out.expect("the resolver should run"),
+            "the-fixture-wrote-this"
+        );
     }
 
     #[test]
