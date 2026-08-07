@@ -67,9 +67,15 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
         )
     })?;
 
-    let allow_env = resolve_allow_env(&plugin.sandbox.allow_env);
+    let mut allow_env = resolve_allow_env(&plugin.sandbox.allow_env);
+    // The path-valued variables resolve the same way, and their values are additionally bound.
+    // They join `allow_env` because naming one in `allow_env_paths` *is* the pass-through: binding
+    // the path without handing the tool the variable pointing at it would leave the tool reading
+    // its default, with the grant paid for nothing.
+    let env_paths = resolve_env_paths(&plugin.sandbox.allow_env_paths);
+    allow_env.extend(env_paths.iter().cloned());
     let programs = resolve_programs(plugin)?;
-    let spec = cage_spec(plugin, reff, &allow_env, &programs).map_err(|e| {
+    let spec = cage_spec(plugin, reff, &allow_env, &env_paths, &programs).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -195,6 +201,34 @@ fn resolve_allow_env(keys: &[String]) -> Vec<(String, String)> {
     out
 }
 
+/// Read each declared `allow_env_paths` variable from sbx's environment, keeping the ones that
+/// are set to a usable path. The caller both passes these through as environment *and* binds
+/// their values, so this is the single place the two can agree.
+///
+/// A **relative** value is dropped with a warning rather than bound. It is the user's own value,
+/// not a plugin's, so it is a mistake to report rather than a grant to refuse a launch over — but
+/// it cannot be bound: `--ro-bind-try foo foo` names a path relative to a working directory the
+/// cage does not share, so it would silently mean something other than what the user wrote. This
+/// mirrors the posture `$SBX_DATA_DIR` takes on a relative override.
+///
+/// A value naming a path that does not exist is kept for the environment and simply binds
+/// nothing (the mount is a `try`): the tool then reports what it could not find, which is a
+/// better diagnostic than a bind failure the user cannot place.
+fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (key, value) in resolve_allow_env(keys) {
+        if !Path::new(&value).is_absolute() {
+            crate::diag::warn(&format!(
+                "not binding ${key} for a resolver plugin — its value `{value}` is not an \
+                 absolute path"
+            ));
+            continue;
+        }
+        out.push((key, value));
+    }
+    out
+}
+
 /// Locate every program the manifest declares, on **sbx's own `PATH`** — the one the user's
 /// shell hands us, so a tool found by the user is found by the resolver, whatever installed it.
 /// Returns each name with the path to bind, or fails closed naming what is missing.
@@ -256,6 +290,7 @@ fn cage_spec(
     plugin: &ResolverPlugin,
     reff: &str,
     allow_env: &[(String, String)],
+    env_paths: &[(String, String)],
     programs: &[(String, PathBuf)],
 ) -> Result<SandboxSpec, SpecError> {
     let ro = |p: &str| Mount::RoBind {
@@ -311,6 +346,17 @@ fn cage_spec(
         mounts.push(Mount::RoBindTry {
             src: p.clone(),
             dest: p.clone(),
+        });
+    }
+
+    // The paths named by `allow_env_paths`, bound at their own location so the variable the tool
+    // reads and the path it finds are the same string. `try`, like the grant paths above: a
+    // variable pointing at something that is not there yet is the user's problem to see reported
+    // by the tool, not a launch sbx refuses to start.
+    for (_, value) in env_paths {
+        mounts.push(Mount::RoBindTry {
+            src: PathBuf::from(value),
+            dest: PathBuf::from(value),
         });
     }
 
@@ -392,6 +438,7 @@ mod tests {
             programs: vec![],
             allow_paths: vec![PathBuf::from("/home/u/.gnupg")],
             allow_env: vec![],
+            allow_env_paths: vec![],
             network: false,
         };
         let p = plugin_in(dir.path(), grant);
@@ -399,6 +446,7 @@ mod tests {
             &p,
             "test://secret",
             &[("GNUPGHOME".into(), "/home/u/.gnupg".into())],
+            &[],
             &[],
         )
         .expect("valid spec");
@@ -443,10 +491,11 @@ mod tests {
             programs: vec![],
             allow_paths: vec![],
             allow_env: vec![],
+            allow_env_paths: vec![],
             network: true,
         };
         let spec =
-            cage_spec(&plugin_in(dir.path(), grant), "vault://x", &[], &[]).expect("valid spec");
+            cage_spec(&plugin_in(dir.path(), grant), "vault://x", &[], &[], &[]).expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
@@ -470,6 +519,7 @@ mod tests {
         let spec = cage_spec(
             &p,
             "test://x",
+            &[],
             &[],
             &[("vault".to_string(), resolved.clone())],
         )
@@ -504,6 +554,7 @@ mod tests {
             "test://x",
             &[],
             &[],
+            &[],
         )
         .expect("valid spec");
         let env = super::super::argv::env_args(&spec);
@@ -528,6 +579,34 @@ mod tests {
     fn setenv_index(argv: &[OsString], key: &str) -> Option<usize> {
         argv.windows(2)
             .position(|w| w[0] == "--setenv" && w[1] == key)
+    }
+
+    #[test]
+    fn cage_spec_binds_an_env_path_at_its_own_location() {
+        let dir = TmpDir::new();
+        let spec = cage_spec(
+            &plugin_in(dir.path(), SandboxGrant::default()),
+            "test://x",
+            &[("PASSWORD_STORE_DIR".into(), "/data/secrets".into())],
+            &[("PASSWORD_STORE_DIR".into(), "/data/secrets".into())],
+            &[],
+        )
+        .expect("valid spec");
+        let argv = super::super::argv::to_argv(&spec);
+        // Bound at its own path, so the value the tool reads and the path it finds are one string.
+        assert!(
+            argv.windows(3).any(|w| w[0] == "--ro-bind-try"
+                && w[1] == "/data/secrets"
+                && w[2] == "/data/secrets"),
+            "the env path is bound at its own location: {argv:?}"
+        );
+        // The variable itself travels on the descriptor, never in the argument list — it can name
+        // a private location, and an argv is readable by every user on the machine.
+        let env = super::super::argv::env_args(&spec);
+        assert!(
+            contains_setenv(&env, "PASSWORD_STORE_DIR", "/data/secrets"),
+            "and the variable naming it is passed through: {env:?}"
+        );
     }
 
     // --- live runs through real bwrap (skipped where the host cannot sandbox) -------
@@ -571,6 +650,59 @@ mod tests {
         );
         let out = run(&bwrap, &p, "test://x").expect("the resolver should run");
         assert_eq!(out.trim_end(), "/run/sbx-programs/env");
+    }
+
+    #[test]
+    fn run_binds_the_path_an_allow_env_paths_variable_names() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        // The case the field exists for: a user whose store is not where the manifest guessed.
+        // The manifest cannot name this directory — it did not exist when the plugin was signed —
+        // so the only thing that can reach it is the variable the user set. The variable name is
+        // unique to this test: these run as threads of one process, so a shared name would let two
+        // tests overwrite each other's environment.
+        const VAR: &str = "SBX_TEST_RESOLVER_ABS_STORE";
+        let store = TmpDir::new();
+        std::fs::write(store.join("entry"), "the-fixture-wrote-this").unwrap();
+        let (_dir, p) = fake_resolver_with(
+            &format!("cat \"${VAR}/entry\""),
+            SandboxGrant {
+                allow_env_paths: vec![VAR.to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        std::env::set_var(VAR, store.path());
+        let out = run(&bwrap, &p, "test://x");
+        std::env::remove_var(VAR);
+        // A hard-coded literal, so the assertion cannot be met by the test recomputing whatever
+        // the code produced. Dropping the bind in `cage_spec` makes `cat` fail instead.
+        assert_eq!(out.expect("the resolver should run"), "the-fixture-wrote-this");
+    }
+
+    #[test]
+    fn run_drops_a_relative_allow_env_paths_value_rather_than_binding_it() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        // A relative value cannot mean what it says inside a cage sharing no working directory, so
+        // it is dropped rather than bound — and the variable goes with it, because passing it while
+        // binding nothing would aim the tool at a path the cage does not have, which is the exact
+        // failure this field exists to remove.
+        const VAR: &str = "SBX_TEST_RESOLVER_REL_STORE";
+        let (_dir, p) = fake_resolver_with(
+            &format!("echo \"[${{{VAR}-unset}}]\""),
+            SandboxGrant {
+                allow_env_paths: vec![VAR.to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        std::env::set_var(VAR, "relative/store");
+        let out = run(&bwrap, &p, "test://x");
+        std::env::remove_var(VAR);
+        assert_eq!(out.expect("the resolver should run").trim_end(), "[unset]");
     }
 
     #[test]

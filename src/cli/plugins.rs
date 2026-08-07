@@ -1822,6 +1822,7 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     print_grant_programs(&p.sandbox.programs, err, r);
     print_grant_paths("allow_paths", &p.sandbox.allow_paths);
     print_grant_env("allow_env", &p.sandbox.allow_env);
+    print_grant_env_paths(&p.sandbox.allow_env_paths, err, r);
     ExitCode::SUCCESS
 }
 
@@ -1869,6 +1870,28 @@ fn print_grant_env(label: &str, keys: &[String]) {
     } else {
         println!("    {label}:    {}", keys.join(", "));
     }
+}
+
+/// The `allow_env_paths` grant, resolved the way a launch would resolve it: each variable with the
+/// path it currently names, so the answer to "will my relocated store be reachable?" comes before
+/// the first secret rather than during it.
+///
+/// An unset variable is not a fault — the manifest's own `allow_paths` then apply — so it is said
+/// plainly. A relative value is called out, since a launch drops it.
+fn print_grant_env_paths(keys: &[String], err: &str, r: &str) {
+    if keys.is_empty() {
+        println!("    allow_env_paths: (none)");
+        return;
+    }
+    let shown: Vec<String> = keys
+        .iter()
+        .map(|k| match std::env::var(k) {
+            Ok(v) if std::path::Path::new(&v).is_absolute() => format!("{k} -> {v}"),
+            Ok(v) => format!("{k} -> {err}{v} (not absolute, would be dropped){r}"),
+            Err(_) => format!("{k} -> unset (the manifest's own paths apply)"),
+        })
+        .collect();
+    println!("    allow_env_paths: {}", shown.join(", "));
 }
 
 #[cfg(test)]

@@ -2131,7 +2131,7 @@ mod tests {
         };
         let s = secret(
             SecretSource::Plugin {
-                plugin,
+                plugin: Box::new(plugin),
                 locator: "ghp-from-the-plugin".into(),
             },
             "api.github.com",
@@ -2176,7 +2176,7 @@ mod tests {
         let value = resolve_chain(
             &[
                 SecretSource::Plugin {
-                    plugin,
+                    plugin: Box::new(plugin),
                     locator: "missing".into(),
                 },
                 SecretSource::Env("SBX_TEST_CHAIN_FALLBACK".into()),

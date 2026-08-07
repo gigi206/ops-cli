@@ -320,7 +320,9 @@ pub(crate) enum SecretSource {
     /// from its stdout. The validated manifest travels with the source so the launch runs exactly
     /// the plugin the config layer validated.
     Plugin {
-        plugin: crate::plugins::ResolverPlugin,
+        /// Boxed: a validated manifest is much larger than any other source's locator, and an
+        /// un-boxed variant would make every `SecretSource` in a chain pay that size.
+        plugin: Box<crate::plugins::ResolverPlugin>,
         locator: String,
     },
 }

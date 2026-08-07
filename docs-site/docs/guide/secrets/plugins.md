@@ -35,6 +35,7 @@ description = "Generic KV-store resolver"   # optional, display-only
 programs    = ["vault"]            # host programs to locate on sbx's PATH and bind into the cage
 allow_paths = ["~/.vault-token"]   # extra host paths bound read-only (data, not binaries)
 allow_env   = ["VAULT_ADDR"]       # host env vars passed into the otherwise-cleared environment
+allow_env_paths = ["VAULT_CACERT"] # env vars whose VALUE is a path: passed through, and bound
 network     = false                # true = reach the network; false = empty network namespace
 ```
 
@@ -75,6 +76,27 @@ network     = false                # true = reach the network; false = empty net
   age identity), so the value never travels where another user could read it:
   see [the cage's environment is not readable by other
   users](../concepts/security-model#the-cages-environment-is-not-readable-by-other-users).
+- `allow_env_paths` is for a variable whose **value is a path to bind**
+  (`PASSWORD_STORE_DIR`, `GNUPGHOME`, `VAULT_CACERT`). A manifest can only name
+  the paths it knows in advance, yet every tool it drives offers a way to move
+  them, and passing the variable without binding what it names is worse than not
+  passing it: the tool is told to look somewhere the cage does not have, so it
+  fails where it would otherwise have worked.
+  - This is what makes a published plugin usable without editing it. Adjusting
+    an installed `plugin.toml` changes the tree digest, so `sbx plugins list`
+    reports the plugin as MODIFIED and the next reinstall drops the change.
+    Setting the variable moves the grant instead, and the plugin stays the
+    signed one.
+  - Listing a name here **implies** the pass-through, so it must not also appear
+    in `allow_env`. A manifest that lists it in both is refused, rather than
+    carrying two declarations of one grant that a later edit can make disagree.
+  - The value is the user's, so it is checked at invocation: it must be
+    **absolute**, since a relative bind argument would silently mean something
+    other than what it says inside a cage that shares no working directory. A
+    relative value is dropped with a warning, and the variable with it. An unset
+    variable simply leaves the manifest's own `allow_paths` in force.
+  - `sbx plugins info <name>` prints what each variable currently names, so a
+    relocated store can be confirmed reachable before the first secret.
 
 ### The execution contract
 

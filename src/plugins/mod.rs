@@ -185,6 +185,25 @@ pub(crate) struct SandboxGrant {
     pub(crate) allow_paths: Vec<PathBuf>,
     /// Host environment variable names passed through into the otherwise-cleared environment.
     pub(crate) allow_env: Vec<String>,
+    /// Environment variables whose **value is a path to bind**, read-only, when they are set.
+    ///
+    /// A manifest can only name paths it knows in advance (`~/.password-store`, `~/.gnupg`), yet
+    /// every tool it drives offers a variable to move that path (`PASSWORD_STORE_DIR`,
+    /// `GNUPGHOME`, `VAULT_CACERT`). Passing the variable without binding what it names is worse
+    /// than not passing it at all: the tool is told to look somewhere the cage does not have, so
+    /// it fails where it would otherwise have worked. The only remedy left to a user was to edit
+    /// the installed `plugin.toml`, which changes the tree digest — `sbx plugins list` then
+    /// reports the plugin as MODIFIED, and the next reinstall drops the edit.
+    ///
+    /// Listing a name here **implies** the pass-through, so it must not also appear in
+    /// `allow_env`: one name, one place, and no way for the two lists to disagree.
+    ///
+    /// The value is supplied at invocation, so it is checked then: it must be **absolute**, for
+    /// the same reason `$SBX_DATA_DIR` refuses a relative override — a relative bind argument
+    /// silently means something other than what it says. A variable that is unset, or that names
+    /// a path which does not exist, binds nothing; the plugin then fails closed on its own, with
+    /// its own message about what it could not find.
+    pub(crate) allow_env_paths: Vec<String>,
     /// Whether the plugin may reach the network (`false` runs it in an empty network namespace).
     pub(crate) network: bool,
 }
@@ -359,6 +378,8 @@ struct RawSandbox {
     #[serde(default)]
     allow_env: Vec<String>,
     #[serde(default)]
+    allow_env_paths: Vec<String>,
+    #[serde(default)]
     network: bool,
 }
 
@@ -406,6 +427,22 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
             return Err(format!("`allow_env` has an invalid variable name `{key}`"));
         }
     }
+    for key in &raw.sandbox.allow_env_paths {
+        if !is_valid_env_key(key) {
+            return Err(format!(
+                "`allow_env_paths` has an invalid variable name `{key}`"
+            ));
+        }
+        // Naming it here already passes it through, so listing it twice is not a harmless
+        // redundancy: it is two declarations of one grant that a later edit can make disagree.
+        // Refused rather than deduplicated, so the manifest keeps saying exactly one thing.
+        if raw.sandbox.allow_env.iter().any(|e| e == key) {
+            return Err(format!(
+                "`{key}` is in both `allow_env` and `allow_env_paths` — `allow_env_paths` \
+                 already passes the variable through, so list it there only"
+            ));
+        }
+    }
 
     Ok(Some(ResolverPlugin {
         name,
@@ -416,6 +453,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
             programs: raw.sandbox.programs,
             allow_paths,
             allow_env: raw.sandbox.allow_env,
+            allow_env_paths: raw.sandbox.allow_env_paths,
             network: raw.sandbox.network,
         },
         version: raw.version,
@@ -1225,6 +1263,74 @@ mod tests {
         assert_eq!(
             p.sandbox.allow_paths,
             vec![PathBuf::from("/home/u/.vault-token")]
+        );
+    }
+
+    #[test]
+    fn loads_env_paths_a_user_can_redirect_a_grant_with() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "pass",
+            r#"
+                type   = "resolver"
+                scheme = "pass"
+                exec   = "resolve"
+                [sandbox]
+                allow_paths     = ["~/.password-store"]
+                allow_env_paths = ["PASSWORD_STORE_DIR", "GNUPGHOME"]
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let p = reg.resolver("pass").expect("pass resolver");
+        assert_eq!(
+            p.sandbox.allow_env_paths,
+            vec!["PASSWORD_STORE_DIR".to_string(), "GNUPGHOME".to_string()]
+        );
+        // The manifest's own default survives alongside it: the variable moves the grant for the
+        // user who sets one, and changes nothing for everyone else.
+        assert_eq!(
+            p.sandbox.allow_paths,
+            vec![PathBuf::from("/home/u/.password-store")]
+        );
+    }
+
+    #[test]
+    fn a_variable_in_both_env_lists_is_refused() {
+        // `allow_env_paths` already passes the variable through, so listing it twice is two
+        // declarations of one grant that a later edit can make disagree.
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "p",
+            "type = \"resolver\"\nscheme = \"p\"\nexec = \"resolve\"\n\
+             [sandbox]\nallow_env = [\"GNUPGHOME\"]\nallow_env_paths = [\"GNUPGHOME\"]\n",
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.resolver("p").is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("allow_env_paths") && w.contains("GNUPGHOME")),
+            "the refusal names the field and the variable: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_env_path_variable_name_is_refused() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "p",
+            "type = \"resolver\"\nscheme = \"p\"\nexec = \"resolve\"\n\
+             [sandbox]\nallow_env_paths = [\"2BAD\"]\n",
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.resolver("p").is_none());
+        assert!(
+            warnings.iter().any(|w| w.contains("allow_env_paths")),
+            "{warnings:?}"
         );
     }
 

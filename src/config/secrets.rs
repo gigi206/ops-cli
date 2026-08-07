@@ -409,7 +409,7 @@ pub(super) fn parse_secret_ref(
             Some(plugin) => {
                 validate_plugin_locator(other, locator)?;
                 Ok(SecretSource::Plugin {
-                    plugin: plugin.clone(),
+                    plugin: Box::new(plugin.clone()),
                     locator: locator.to_string(),
                 })
             }
