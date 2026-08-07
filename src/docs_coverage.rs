@@ -19,10 +19,13 @@ fn guide() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs-site/docs/guide")
 }
 
-/// The whole guide as one string. Every check that asks "is this named anywhere" reads this, since
-/// a field is legitimately documented on whichever page owns its subject.
-fn whole_guide() -> String {
-    fn walk(dir: &Path, out: &mut String) {
+/// Every guide page's contents, one string per file.
+///
+/// Kept per file rather than pre-joined because code-fence state must not cross a page boundary:
+/// one page whose fences do not balance would otherwise invert every page after it in the walk,
+/// and the resulting check would be wrong in a way that looks like a documentation gap.
+fn guide_pages() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -31,12 +34,11 @@ fn whole_guide() -> String {
             if path.is_dir() {
                 walk(&path, out);
             } else if path.extension().is_some_and(|e| e == "md") {
-                out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
-                out.push('\n');
+                out.push(std::fs::read_to_string(&path).unwrap_or_default());
             }
         }
     }
-    let mut out = String::new();
+    let mut out = Vec::new();
     walk(&guide(), &mut out);
     out
 }
@@ -88,35 +90,124 @@ fn every_cli_verb_has_a_reference_page() {
     );
 }
 
-/// Every config field the schema accepts is named somewhere in the guide.
+/// The part of the guide where a config field is *written* rather than merely mentioned: the
+/// contents of every fenced code block, plus every markdown table row.
 ///
-/// The field names are read out of the schema source, because a Rust struct carries no runtime
-/// list of its fields. Two serde attributes decide what a reader would actually write: `rename`
-/// gives the TOML spelling (so `value_type` is written `type`), and `skip` marks a field that is
-/// never read from a file at all, which there is nothing to document.
-/// A struct field's name, given what follows its visibility: `foo: Bar` yields `foo`, while a
-/// `struct`/`enum`/`fn` declaration yields nothing (only fields are documented surface).
-fn field_name(rest: &str) -> Option<String> {
-    let name = rest.split(':').next()?;
+/// This is what stops the check below from passing vacuously. A field whose name is an ordinary
+/// word (`env`, `name`, `network`, `plugin`, `type`) occurs constantly in prose, so asking whether
+/// the guide contains that word answers nothing: the whole schema could go undocumented and the
+/// test would still be green. Those two surfaces are where the guide actually shows a field, in
+/// the form a reader would type it, and neither is reachable by writing an English sentence.
+fn documented_surface(pages: &[String]) -> String {
+    let mut out = String::new();
+    for page in pages {
+        // Fence state is per page, never carried into the next one.
+        let mut in_fence = false;
+        for line in page.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if !in_fence && !trimmed.starts_with('|') {
+                continue;
+            }
+            // Runs of spaces collapse to one, because the guide aligns its assignments
+            // (`nonce      = false`) and a field would otherwise look undocumented for having
+            // been laid out tidily.
+            let mut last_space = false;
+            for c in trimmed.chars() {
+                if c == ' ' {
+                    if !last_space {
+                        out.push(' ');
+                    }
+                    last_space = true;
+                } else {
+                    out.push(c);
+                    last_space = false;
+                }
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A struct field's name and type, given what follows its visibility: `foo: Bar` yields
+/// `("foo", "Bar")`, while a `struct`/`enum`/`fn` declaration yields nothing (only fields are
+/// documented surface).
+fn field_decl(rest: &str) -> Option<(String, String)> {
+    let (name, ty) = rest.split_once(':')?;
     let is_field = !name.is_empty()
         && name
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        && rest.len() > name.len();
-    is_field.then(|| name.to_string())
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    is_field.then(|| {
+        (
+            name.to_string(),
+            ty.trim().trim_end_matches(',').trim().to_string(),
+        )
+    })
 }
 
+/// Whether a field's type makes it a **family of sections** (`[name.<key>]`) rather than a value.
+///
+/// The discriminator is the map's value type, not the map itself: `BTreeMap<String, String>` is an
+/// inline table of scalars a reader writes as `env = { A = "1" }`, whereas
+/// `BTreeMap<String, RawPluginConfig>` is a family of sections written as `[plugin.vault]`.
+///
+/// "Starts with an uppercase letter" does not separate the two on its own, `String` and `Vec` being
+/// uppercase as well, so the container types are named and excluded. Getting this backwards is not
+/// a harmless miss: it demands a section header for a field that has none, and the resulting
+/// failure reads as a documentation gap that no amount of documenting can close.
+fn is_section_family(ty: &str) -> bool {
+    if !ty.starts_with("BTreeMap") && !ty.starts_with("HashMap") {
+        return false;
+    }
+    let Some(args) = ty.split_once('<').map(|(_, rest)| rest) else {
+        return false;
+    };
+    let Some(value) = args.split(',').nth(1).map(str::trim) else {
+        return false;
+    };
+    let container = ["String", "Vec<", "Option<", "BTreeMap<", "HashMap<", "Box<"]
+        .iter()
+        .any(|c| value.starts_with(c));
+    !container && value.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// Every config field the schema accepts is *shown* in the guide, in the form a reader writes it.
+///
+/// The field names are read out of the schema source, because a Rust struct carries no runtime
+/// list of its fields. Three serde attributes decide what a reader would actually write: `rename`
+/// gives the TOML spelling (so `value_type` is written `type`), `skip` marks a field that is never
+/// read from a file at all, and `flatten` marks one whose *name is never written* — the reader
+/// types the inner keys directly (`[task.db-query]`, not `tasks`), so the Rust name is an
+/// implementation detail with nothing to document.
+///
+/// What this does **not** check: a field name is not unique across the schema, so a field of one
+/// table is satisfied by the same name documented under another (`env` appears both as the
+/// top-level table and inside `[plugin.<name>]`). Closing that would need each field's full TOML
+/// path, which the struct nesting alone does not give. The check is presence in the right *form*,
+/// which is what makes the common-word hole harmless, not presence in the right *place*.
 #[test]
-fn every_config_field_is_named_in_the_guide() {
+fn every_config_field_is_shown_in_the_guide() {
     let source =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/schema.rs"))
             .expect("the config schema source is readable");
 
-    let mut fields: BTreeSet<String> = BTreeSet::new();
+    // `(toml name, type, is a top-level section)`. The last one is what decides how strictly the
+    // field must be shown: a family of sections at the root of the file is the one shape a reader
+    // cannot guess from a field table, so it alone must appear as a header.
+    let mut fields: BTreeSet<(String, String, bool)> = BTreeSet::new();
     let mut renamed: Option<String> = None;
     let mut skipped = false;
+    let mut at_root = false;
     for line in source.lines() {
         let line = line.trim();
+        if let Some(rest) = line.strip_prefix("pub(crate) struct ") {
+            at_root = rest.starts_with("RawConfig");
+        }
         if line.starts_with("#[serde(") || line.starts_with("#[cfg_attr(") {
             if let Some(rest) = line.split("rename = \"").nth(1) {
                 if let Some(name) = rest.split('"').next() {
@@ -124,14 +215,15 @@ fn every_config_field_is_named_in_the_guide() {
                 }
             }
             // `skip` alone; `skip_serializing_if` still describes a field a file may set.
-            if line.contains("skip)") || line.contains("skip,") {
+            // `flatten` hides the name from the file entirely: the reader writes the inner keys.
+            if line.contains("skip)") || line.contains("skip,") || line.contains("flatten") {
                 skipped = true;
             }
             continue;
         }
-        if let Some(name) = line.strip_prefix("pub(crate) ").and_then(field_name) {
+        if let Some((name, ty)) = line.strip_prefix("pub(crate) ").and_then(field_decl) {
             if !skipped {
-                fields.insert(renamed.clone().unwrap_or(name));
+                fields.insert((renamed.clone().unwrap_or(name), ty, at_root));
             }
             renamed = None;
             skipped = false;
@@ -147,11 +239,49 @@ fn every_config_field_is_named_in_the_guide() {
         fields.len()
     );
 
-    let guide = whole_guide();
-    let missing: Vec<&String> = fields.iter().filter(|f| !guide.contains(*f)).collect();
+    let pages = guide_pages();
+    let guide = pages.join("\n");
+    let surface = documented_surface(&pages);
+    assert!(
+        surface.len() > guide.len() / 20,
+        "the code-block and table extraction found almost nothing ({} of {} bytes), so it has \
+         stopped matching the guide's shape and every field would look undocumented",
+        surface.len(),
+        guide.len()
+    );
+
+    let missing: Vec<String> = fields
+        .iter()
+        .filter(|(name, ty, at_root)| {
+            if *at_root && is_section_family(ty) {
+                // A top-level family of sections is only really documented once its header form is
+                // shown: `[plugin.vault]` teaches the shape, a bare `plugin` teaches nothing. Held
+                // to this only at the root, since the same type nested inside a table is often
+                // written inline instead (`params = { sql = "..." }`).
+                !guide.contains(&format!("[{name}."))
+            } else {
+                // The forms a reader types: an assignment, a section header (whether top-level or
+                // qualified, since `[task.defaults]` documents `defaults` as surely as
+                // `[defaults]` would), or the name set as code in a field table.
+                ![
+                    format!("{name} ="),
+                    format!("{name}="),
+                    format!("[{name}]"),
+                    format!("[{name}."),
+                    format!(".{name}]"),
+                    format!(".{name}."),
+                    format!("`{name}`"),
+                ]
+                .iter()
+                .any(|form| surface.contains(form))
+            }
+        })
+        .map(|(name, _, _)| name.clone())
+        .collect();
     assert!(
         missing.is_empty(),
-        "these config fields are named nowhere in the guide: {missing:?}"
+        "these config fields are never shown in a code block or a field table in the guide, so a \
+         reader is never told how to write them: {missing:?}"
     );
 }
 
