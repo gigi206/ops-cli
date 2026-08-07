@@ -72,8 +72,31 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
     // They join `allow_env` because naming one in `allow_env_paths` *is* the pass-through: binding
     // the path without handing the tool the variable pointing at it would leave the tool reading
     // its default, with the grant paid for nothing.
-    let env_paths = resolve_env_paths(&plugin.sandbox.allow_env_paths);
+    let mut env_paths = resolve_env_paths(&plugin.sandbox.allow_env_paths);
     allow_env.extend(env_paths.iter().cloned());
+    // What the host's `[plugin.<name>]` table answers, applied last so it WINS over the same name
+    // in sbx's environment: a config that names a value is more deliberate than whatever the
+    // invoking shell happened to export. Each name was already checked against the manifest by the
+    // config layer, so nothing here can introduce a variable the plugin does not read.
+    for (key, value) in &plugin.host.env {
+        allow_env.retain(|(k, _)| k != key);
+        allow_env.push((key.clone(), value.clone()));
+        // A path-valued one is bound as well as passed, exactly as when it comes from the
+        // environment — otherwise configuring a relocated store would aim the tool at a path the
+        // cage does not have, the failure `allow_env_paths` exists to remove.
+        if plugin.sandbox.allow_env_paths.iter().any(|k| k == key) {
+            env_paths.retain(|(k, _)| k != key);
+            if Path::new(value).is_absolute() {
+                env_paths.push((key.clone(), value.clone()));
+            } else {
+                crate::diag::warn(&format!(
+                    "not binding ${key} for the `{}` resolver plugin — the value `{value}` \
+                     configured for it is not an absolute path",
+                    plugin.scheme
+                ));
+            }
+        }
+    }
     let programs = resolve_programs(plugin)?;
     // A nix-installed program is not a self-contained file, so the paths it needs come with it.
     let closure = nix_closures(&programs)?;
@@ -525,6 +548,7 @@ mod tests {
             sandbox: grant,
             version: None,
             description: None,
+            host: Default::default(),
         }
     }
 

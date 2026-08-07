@@ -176,6 +176,19 @@ pub(crate) struct RawConfig {
     /// trusted source), then merged onto the baseline by `sbx app <name>`.
     #[serde(default)]
     pub(crate) app: BTreeMap<String, RawApp>,
+    /// Per-plugin settings for the installed resolver plugins, as `[plugin.<name>]` tables.
+    ///
+    /// A plugin manifest says what a resolver *needs* — the host tools it runs, the variables it
+    /// reads. Where those come from is a property of the machine, not of the plugin, so it is
+    /// declared here instead: the host answers what the plugin asks. A manifest deliberately
+    /// cannot answer for itself, which is what keeps installing a third-party plugin from
+    /// becoming permission to provision software on this host.
+    ///
+    /// A security field, gated like `[packages]`: honored from the global config or a trusted
+    /// project, dropped from an untrusted one. It can cause a build and set the environment of a
+    /// binary that runs host-side on the plaintext path.
+    #[serde(default)]
+    pub(crate) plugin: BTreeMap<String, RawPluginConfig>,
     /// Resource limits for the cage's cgroup scope (anti-DoS), overriding sbx's built-in
     /// defaults. A security field — honored from the global config or a trusted project,
     /// ignored from an untrusted one: loosening a limit (a higher `tasks_max`, an unbounded
@@ -473,6 +486,24 @@ pub(crate) struct RawSshAgent {
 /// baseline. The overlay fields reuse the baseline shapes and gate identically — an
 /// untrusted project's app may add `env`/`packages` and choose the command, but its
 /// `binds`/`network`/`secret` are dropped, exactly as for the baseline.
+/// One `[plugin.<name>]` table: what this host supplies to the named resolver plugin.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawPluginConfig {
+    /// Values for variables the plugin reads, as `<VAR> = "<value>"`.
+    ///
+    /// Only a variable the manifest declares in `allow_env` or `allow_env_paths` may be set; any
+    /// other is refused, naming it. The manifest states what the plugin reads and the config
+    /// supplies the values, so a config can never inject an arbitrary variable into the
+    /// environment of a third-party binary. A variable from `allow_env_paths` names a path, so
+    /// setting it here both configures the tool and binds that path into the resolver's sandbox.
+    ///
+    /// Not for secrets: a value here sits in plaintext in a config file. A credential belongs in
+    /// `[secret]`, whose sources are resolved at launch and never written down.
+    #[serde(default)]
+    pub(crate) env: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawApp {
     /// The command to run, as an argv. A bare string is taken as a single-element argv

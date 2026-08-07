@@ -75,6 +75,7 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
+        plugin: Default::default(),
         fs: None,
         notify: None,
         rest: Default::default(),
@@ -6219,6 +6220,7 @@ fn plugin(scheme: &str) -> crate::plugins::ResolverPlugin {
         sandbox: crate::plugins::SandboxGrant::default(),
         version: None,
         description: None,
+        host: Default::default(),
     }
 }
 
@@ -6230,6 +6232,133 @@ fn vhs_with(secret: RawHostSecret, plugins: &PluginRegistry) -> Result<HeaderSec
         &SecretDefaults::default(),
         plugins,
     )
+}
+
+/// A plugin declaring the variables it reads, so the `[plugin.<name>]` validation has something
+/// to check a config against.
+fn plugin_reading(scheme: &str, env: &[&str], env_paths: &[&str]) -> crate::plugins::ResolverPlugin {
+    let mut p = plugin(scheme);
+    p.sandbox.allow_env = env.iter().map(|s| s.to_string()).collect();
+    p.sandbox.allow_env_paths = env_paths.iter().map(|s| s.to_string()).collect();
+    p
+}
+
+/// A config whose only content is one `[plugin.<name>]` table.
+fn raw_plugin_table(name: &str, env: &[(&str, &str)]) -> RawConfig {
+    let mut cfg = raw(&[], &[]);
+    cfg.plugin.insert(
+        name.to_string(),
+        crate::config::schema::RawPluginConfig {
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        },
+    );
+    cfg
+}
+
+/// A secret whose single source is `<scheme>://x`, so a resolved config carries that plugin.
+fn secret_using(scheme: &str) -> RawConfig {
+    let mut cfg = raw(&[], &[]);
+    let reff = format!("{scheme}://x");
+    let sec = raw_secret_from(vec![reff.as_str()]);
+    cfg.secret = Some(raw_secret_section(vec![("api.example.com".to_string(), sec)]));
+    cfg
+}
+
+#[test]
+fn a_plugin_table_supplies_only_the_variables_the_manifest_reads() {
+    let reg = PluginRegistry::with([plugin_reading(
+        "vault",
+        &["VAULT_ADDR"],
+        &["VAULT_CACERT"],
+    )]);
+    let mut global = secret_using("vault");
+    global.plugin = raw_plugin_table("vault", &[
+            ("VAULT_ADDR", "https://vault.example.com"),
+            ("VAULT_CACERT", "/etc/ca/vault.pem"),
+            ("VAULT_TOKEN_HELPER", "/usr/local/bin/helper"),
+        ])
+    .plugin;
+    let r = super::resolve(global, None, &reg);
+    let host = match &r.secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => &plugin.host,
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    // The two the manifest declares are supplied, in the order the config lists them.
+    assert_eq!(
+        host.env,
+        vec![
+            ("VAULT_ADDR".to_string(), "https://vault.example.com".to_string()),
+            ("VAULT_CACERT".to_string(), "/etc/ca/vault.pem".to_string()),
+        ]
+    );
+    // The third is refused: a config may not put a variable the plugin does not read into the
+    // environment of a binary that runs host-side on the plaintext path.
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("VAULT_TOKEN_HELPER") && w.contains("does not read")),
+        "the refusal names the variable: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn an_untrusted_projects_plugin_table_is_dropped_and_named() {
+    let reg = PluginRegistry::with([plugin_reading("vault", &["VAULT_ADDR"], &[])]);
+    let project = raw_plugin_table("vault", &[("VAULT_ADDR", "https://attacker.example")]);
+    let r = super::resolve(
+        secret_using("vault"),
+        Some((project, TrustState::Untrusted)),
+        &reg,
+    );
+    let host = match &r.secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => &plugin.host,
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    assert!(
+        host.env.is_empty(),
+        "an untrusted project supplies nothing: {:?}",
+        host.env
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("[plugin.*]") && w.contains("vault")),
+        "the drop is named: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_trusted_projects_plugin_table_layers_over_the_global_one() {
+    let reg = PluginRegistry::with([plugin_reading("vault", &["VAULT_ADDR"], &[])]);
+    let mut global = secret_using("vault");
+    global.plugin = raw_plugin_table("vault", &[("VAULT_ADDR", "https://global.example")]).plugin;
+    let project = raw_plugin_table("vault", &[("VAULT_ADDR", "https://project.example")]);
+    let r = super::resolve(global, Some((project, TrustState::Trusted)), &reg);
+    let host = match &r.secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => &plugin.host,
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    // A hard-coded literal, not a value recomputed from the input: the project layer wins.
+    assert_eq!(
+        host.env,
+        vec![("VAULT_ADDR".to_string(), "https://project.example".to_string())]
+    );
+}
+
+#[test]
+fn a_plugin_table_naming_no_installed_plugin_is_reported() {
+    let reg = PluginRegistry::with([plugin_reading("vault", &["VAULT_ADDR"], &[])]);
+    let mut global = secret_using("vault");
+    global.plugin = raw_plugin_table("valut", &[("VAULT_ADDR", "https://x.example")]).plugin;
+    let r = super::resolve(global, None, &reg);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("valut") && w.contains("no secret uses")),
+        "a typo is named rather than left inert in silence: {:?}",
+        r.warnings
+    );
 }
 
 #[test]

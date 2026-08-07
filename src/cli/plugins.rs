@@ -1857,7 +1857,49 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     if let Some(n) = crate::sandbox::resolver::nix_closure_paths(&p.sandbox.programs) {
         println!("    nix closure: {n} store paths, so a store-installed program can run");
     }
+    print_host_config(p, err, r);
     ExitCode::SUCCESS
+}
+
+
+/// What this host answers for a plugin, from `[plugin.<name>]` in the resolved config.
+///
+/// Read through the config layer rather than from the manifest, because that is where the table
+/// is layered and gated: an untrusted project's is already dropped by the time it gets here, so
+/// what is printed is what a launch would use. Kept on its own lines under the grant — the grant
+/// is what the plugin asked for and was signed with, this is what the machine supplies, and
+/// reading them as one block would blur which of the two a line came from.
+///
+/// A variable the manifest does not declare is shown as ignored rather than omitted: the config
+/// says it, so the answer to "why is it not applying" belongs here.
+fn print_host_config(p: &crate::plugins::ResolverPlugin, err: &str, r: &str) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let resolved = crate::config::load(&cwd);
+    let Some(raw) = resolved.plugin.get(&p.name) else {
+        return;
+    };
+    if raw.env.is_empty() {
+        return;
+    }
+    println!("  host config (`[plugin.{}]`):", p.name);
+    if !raw.env.is_empty() {
+        let shown: Vec<String> = raw
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let declared = p.sandbox.allow_env.iter().any(|d| d == k)
+                    || p.sandbox.allow_env_paths.iter().any(|d| d == k);
+                if declared {
+                    format!("{k}={v}")
+                } else {
+                    format!("{err}{k} (ignored: the manifest does not read it){r}")
+                }
+            })
+            .collect();
+        println!("    env:         {}", shown.join(", "));
+    }
 }
 
 /// One `sbx plugins info` grant line per declared program, resolved **here and now** against the

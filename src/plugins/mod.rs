@@ -80,6 +80,24 @@ pub(crate) struct ResolverPlugin {
     pub(crate) version: Option<String>,
     /// The manifest's one-line description, if any. Display-only.
     pub(crate) description: Option<String>,
+    /// What the *host* supplies to this plugin, from a `[plugin.<name>]` table in the global or a
+    /// trusted project config. Empty unless one is declared.
+    ///
+    /// Kept beside the manifest rather than folded into `sandbox`, because the two answer
+    /// different questions and must stay legible apart: the grant is what the plugin **asked
+    /// for** and was signed with; this is what this machine **answers**. `sbx plugins info`
+    /// shows them as separate lines for the same reason.
+    pub(crate) host: HostConfig,
+}
+
+/// The host's answer to what a plugin's manifest declares: values for the variables it reads.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct HostConfig {
+    /// Values for variables the manifest declares in `allow_env`/`allow_env_paths`, validated
+    /// against it: a variable the plugin does not read is refused, not passed. These take
+    /// precedence over the same name in sbx's own environment — a config that names a value is
+    /// more deliberate than whatever the invoking shell happened to export.
+    pub(crate) env: Vec<(String, String)>,
 }
 
 impl ResolverPlugin {
@@ -460,6 +478,9 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
         },
         version: raw.version,
         description: raw.description,
+        // Filled in by the config layer once `[plugin.<name>]` has been layered and gated: a
+        // manifest is loaded from disk with no notion of what this host answers.
+        host: HostConfig::default(),
     }))
 }
 

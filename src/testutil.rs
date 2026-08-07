@@ -100,6 +100,7 @@ pub(crate) fn resolved(
     apps: Vec<(&str, crate::config::ResolvedApp)>,
 ) -> crate::config::Resolved {
     crate::config::Resolved {
+        plugin: Default::default(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: Default::default(),

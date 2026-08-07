@@ -105,6 +105,41 @@ network     = false                # true = reach the network; false = empty net
   - `sbx plugins info <name>` prints what each variable currently names, so a
     relocated store can be confirmed reachable before the first secret.
 
+## Configuring a plugin from your own config
+
+A manifest says what a resolver *needs*. What this machine *supplies* is declared on your side,
+in a `[plugin.<name>]` table in the global config or a trusted project's:
+
+```toml
+[plugin.vault]
+env = { VAULT_ADDR = "https://vault.example.com", VAULT_NAMESPACE = "team-a" }
+
+[plugin.pass]
+env = { PASSWORD_STORE_DIR = "/data/secrets" }
+```
+
+This is why the variables exist at all. `VAULT_ADDR` had to be exported by whatever shell
+launched `sbx`; now it can live in the project that needs it, versioned with the rest of the
+configuration.
+
+- **Only a variable the manifest reads may be set.** A name that appears in neither `allow_env`
+  nor `allow_env_paths` is dropped with a warning naming it, so a config can never put an
+  arbitrary variable into the environment of a third-party binary that runs host-side on the
+  plaintext path.
+- **A path-valued variable is bound as well as passed.** `PASSWORD_STORE_DIR` above both tells
+  `pass` where the store is and gives the sandbox access to it, since the manifest declares that
+  name in `allow_env_paths`.
+- **A value here wins over the same name in sbx's environment.** A config that names a value is
+  more deliberate than whatever the invoking shell happened to export.
+- **It is a security field**, gated like `[packages]`: honored from the global config or a
+  trusted project, dropped with a warning from an untrusted one, and ignored in a one-shot
+  `--config` blob.
+- **Not for secrets.** A value here sits in plaintext in a config file. A credential belongs in
+  [`[secret]`](../configuration/secret), whose sources are resolved at launch.
+
+`sbx plugins info <name>` prints the table under the grant, marking any variable that will be
+ignored, so the answer to "why is my setting not applying" is in the same place as the setting.
+
 ### The execution contract
 
 The runner passes the **full reference** as the executable's single argument

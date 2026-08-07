@@ -492,6 +492,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         deb: _,
         appimage: _,
         task: _,
+        plugin: _,
         rest: _,
     } = higher;
 

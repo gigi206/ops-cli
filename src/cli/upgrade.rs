@@ -888,6 +888,7 @@ mod tests {
         let rev_a = "a".repeat(40);
         let rev_b = "b".repeat(40);
         let cfg = |global: &str| config::Resolved {
+            plugin: Default::default(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: Default::default(),

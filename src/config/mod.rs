@@ -185,6 +185,10 @@ pub(crate) struct Resolved {
     /// Declared tools, in declaration order, each tagged with its source's trust.
     /// Admission (and the nix work it implies) is the launcher's, not decided here.
     pub(crate) packages: Vec<Package>,
+    /// Per-plugin settings for the installed resolver plugins, keyed by plugin name: where to get
+    /// a program the manifest declares when `PATH` does not have it, and values for the variables
+    /// it reads. Layered global-under-project and gated by trust, like `[packages]`.
+    pub(crate) plugin: BTreeMap<String, crate::config::schema::RawPluginConfig>,
     /// The global config's `nixpkgs` override (trusted by location), or `None` for
     /// the default channel. Drives the base userland and is the default source for a
     /// project's tools.
@@ -679,6 +683,11 @@ impl Resolved {
             net: _,
             app: _,
             bundle: _,
+            // `[plugin.*]` joins them, and for the sharpest version of the same reason: it can
+            // trigger a build and set the environment of a binary that runs host-side on the
+            // plaintext path. That is declared in a config someone reads, not assembled on a
+            // command line for one launch.
+            plugin: _,
             flakes: _,
             tarball: _,
             deb: _,
@@ -1038,6 +1047,100 @@ fn override_fatal_error(fatal: Vec<String>, notes: Vec<String>) -> Vec<String> {
 /// The fix is a plain `nix:<pkg>`, which is host-provisioned and seeded into each project's store,
 /// per-project-aligned by construction — so this warns rather than rerouting. Trusted-only: a withheld
 /// package never equips, so it stays silent. `source` prefixes the message (e.g. `` `app <name> ` ``).
+/// Attach each `[plugin.<name>]` table to the plugin instances the secrets reference, validating
+/// it against the manifest that instance carries.
+///
+/// The manifest states what the plugin reads; the config supplies the values. So a variable the
+/// manifest does not declare is **refused and dropped**, named — a config must not be able to put
+/// an arbitrary variable into the environment of a third-party binary that runs host-side on the
+/// plaintext path. Dropping rather than failing the launch keeps this additive-and-fail-closed
+/// like every other config field: less is supplied, never more.
+///
+/// A table naming no installed plugin is reported too. It is almost always a typo, and staying
+/// silent would leave the user waiting for settings that never applied.
+fn apply_plugin_host_config(
+    secrets: &mut [HeaderSecret],
+    apps: &mut BTreeMap<String, ResolvedApp>,
+    cfg: &BTreeMap<String, crate::config::schema::RawPluginConfig>,
+    warnings: &mut Vec<String>,
+) {
+    if cfg.is_empty() {
+        return;
+    }
+    let mut matched: BTreeSet<String> = BTreeSet::new();
+    for secret in secrets.iter_mut() {
+        apply_to_sources(&mut secret.sources, cfg, &mut matched, warnings);
+    }
+    for app in apps.values_mut() {
+        for secret in app.secrets.iter_mut() {
+            apply_to_sources(&mut secret.sources, cfg, &mut matched, warnings);
+        }
+    }
+    for name in cfg.keys() {
+        if !matched.contains(name) {
+            warnings.push(format!(
+                "`[plugin.{name}]`: no secret uses a plugin by that name — check the spelling \
+                 against `sbx plugins list` (the table is otherwise inert)"
+            ));
+        }
+    }
+}
+
+
+/// Attach the table to every plugin instance in one source chain. Split out of
+/// [`apply_plugin_host_config`] so the `matched` set can outlive each call without a closure
+/// capturing it by reference across iterations.
+fn apply_to_sources(
+    sources: &mut [SecretSource],
+    cfg: &BTreeMap<String, crate::config::schema::RawPluginConfig>,
+    matched: &mut BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    for source in sources.iter_mut() {
+        let SecretSource::Plugin { plugin, .. } = source else {
+            continue;
+        };
+        let Some(raw) = cfg.get(&plugin.name) else {
+            continue;
+        };
+        matched.insert(plugin.name.clone());
+        let mut env = Vec::new();
+        for (key, value) in &raw.env {
+            let declared = plugin.sandbox.allow_env.iter().any(|k| k == key)
+                || plugin.sandbox.allow_env_paths.iter().any(|k| k == key);
+            if declared {
+                env.push((key.clone(), value.clone()));
+            } else {
+                warnings.push(format!(
+                    "`[plugin.{}] env`: ignoring `{key}` — the plugin's manifest does not read \
+                     it (it declares: {})",
+                    plugin.name,
+                    declared_vars(plugin)
+                ));
+            }
+        }
+        plugin.host = crate::plugins::HostConfig { env };
+    }
+}
+
+/// The variables a plugin's manifest says it reads, for a diagnostic that names the alternatives
+/// instead of only what was rejected.
+fn declared_vars(plugin: &crate::plugins::ResolverPlugin) -> String {
+    let mut all: Vec<&str> = plugin
+        .sandbox
+        .allow_env
+        .iter()
+        .chain(plugin.sandbox.allow_env_paths.iter())
+        .map(String::as_str)
+        .collect();
+    all.sort_unstable();
+    if all.is_empty() {
+        "none".to_string()
+    } else {
+        all.join(", ")
+    }
+}
+
 fn warn_mise_nix_packages(source: &str, packages: &[Package], warnings: &mut Vec<String>) {
     for pkg in packages {
         if pkg.state != TrustState::Trusted {
@@ -1117,6 +1220,9 @@ fn resolve(
         GLOBAL_CONFIG,
         global.binds,
     );
+    // Per-plugin settings, global layer: trusted by location, so taken in full.
+    let mut plugin_cfg: BTreeMap<String, crate::config::schema::RawPluginConfig> =
+        std::mem::take(&mut global.plugin);
     apply_tools(
         &mut packages,
         &mut warnings,
@@ -1375,6 +1481,23 @@ fn resolve(
         // dropped here. Whether an untrusted project's tools are actually realised
         // is the launcher's call, the one place that can weigh it against the work
         // a tool would have to build.
+        // `[plugin.*]` is a security field: it can trigger a build and set the environment of a
+        // binary that runs host-side on the plaintext path. A trusted project layers its tables
+        // over the global ones by plugin name; an untrusted one is dropped, named rather than
+        // silently ignored so the difference between "not configured" and "not trusted" is
+        // visible.
+        if !proj.plugin.is_empty() {
+            if trusted {
+                plugin_cfg.extend(proj.plugin.clone());
+            } else {
+                let mut names: Vec<&str> = proj.plugin.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `[plugin.*]` ({}) — it can provision a program                      and set the environment of a host-side resolver, so it is honored only from                      a trusted project (`sbx trust`)",
+                    names.join(", ")
+                ));
+            }
+        }
         apply_tools(
             &mut packages,
             &mut warnings,
@@ -1645,7 +1768,7 @@ fn resolve(
     enforce_secret_posture(&network, &mut secrets, &mut warnings);
     warn_l4_l7_conflicts(&network, &mut warnings);
 
-    let apps = resolve_apps(
+    let mut apps = resolve_apps(
         &mut warnings,
         global_apps,
         project_apps,
@@ -1668,12 +1791,18 @@ fn resolve(
         warn_mise_nix_packages(&format!("app `{app_name}` "), &app.packages, &mut warnings);
     }
 
+    // Answer each plugin the config configures, now that `[plugin.*]` has been layered and gated.
+    // Done here rather than where a `SecretSource::Plugin` is parsed, because the answer must see
+    // the FINAL table: a project layer that is read after the secrets would otherwise be missed.
+    apply_plugin_host_config(&mut secrets, &mut apps, &plugin_cfg, &mut warnings);
+
     Resolved {
         env,
         env_layer,
         binds,
         bind_layer,
         packages,
+        plugin: plugin_cfg,
         nixpkgs_global,
         nixpkgs_project,
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.

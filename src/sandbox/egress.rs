@@ -2128,6 +2128,7 @@ mod tests {
             sandbox: crate::plugins::SandboxGrant::default(),
             version: None,
             description: None,
+            host: Default::default(),
         };
         let s = secret(
             SecretSource::Plugin {
@@ -2171,6 +2172,7 @@ mod tests {
             sandbox: crate::plugins::SandboxGrant::default(),
             version: None,
             description: None,
+            host: Default::default(),
         };
         std::env::set_var("SBX_TEST_CHAIN_FALLBACK", "from-the-next-source");
         let value = resolve_chain(

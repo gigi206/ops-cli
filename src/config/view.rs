@@ -1945,6 +1945,7 @@ mod tests {
         // A baseline credential the app inherits — and that the app's narrowed network drops, the
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
+            plugin: Default::default(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: Default::default(),
