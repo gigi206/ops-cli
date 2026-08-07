@@ -2559,16 +2559,21 @@ const PAGES: &[Page] = &[
     // ---- plugins store subcommands ------------------------------------------------
     Page {
         path: &["plugins", "store", "list"],
-        synopsis: "sbx plugins store list [--installed]  (alias: sbx plugins store ls)",
+        synopsis: "sbx plugins store list [<name>] [--installed]  (alias: sbx plugins store ls)",
         summary: "list the configured plugin stores and what they offer",
-        options: &[(
-            "--installed",
-            "only the entries already installed from each store",
-        )],
-        details: "Every configured store with its accepted revision and the plugins it lists.\n\
-            Each entry is marked [installed] when it is the one in place, or names what holds\n\
-            its name or scheme otherwise — two stores can list a plugin of the same name, but\n\
-            only one can hold it. No fetch, no network.",
+        options: &[
+            ("[<name>]", "only this store, instead of every configured one"),
+            (
+                "--installed",
+                "only the entries already installed from each store",
+            ),
+        ],
+        details: "Every configured store with its accepted revision and the plugins it lists,\n\
+            or just one when named. Each entry is marked [installed] when it is the one in\n\
+            place, or names what holds its name or scheme otherwise — two stores can list a\n\
+            plugin of the same name, but only one can hold it. A name matching no configured\n\
+            store is an error naming the ones there are, since an empty listing would read as\n\
+            'this store offers nothing'. No fetch, no network.",
     },
     Page {
         path: &["plugins", "store", "add"],

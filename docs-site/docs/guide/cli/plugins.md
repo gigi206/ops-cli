@@ -46,7 +46,7 @@ A **remote signed store** is a git repository whose catalogue is verified agains
 pinned Ed25519 public key, with anti-rollback on the revision.
 
 ```
-sbx plugins store list
+sbx plugins store list [<name>]
 sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)
 sbx plugins store update [name]
 sbx plugins store install <store> <plugin>
@@ -122,7 +122,7 @@ The strong form pins the key out of band, so the store cannot vouch for itself:
 
 ```sh
 sbx plugins store add --name mine --url https://git.example.com/plugins.git --key @store.pub
-sbx plugins store list                 # what it offers, each entry marked
+sbx plugins store list <name>          # what one store offers, each entry marked
 sbx plugins store install mine kp      # pinned by content hash; no network
 sbx plugins list                       # kp:// now present, origin: store 'mine'
 ```

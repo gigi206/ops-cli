@@ -35,7 +35,8 @@ downgraded to an older, superseded catalogue (anti-rollback).
 ## Managing stores
 
 ```
-sbx plugins store list [--installed]  # every configured store, plugins included
+sbx plugins store list [<name>] [--installed]  # configured stores, plugins included
+                                      #   <name> restricts it to one store
                                       #   --installed keeps only what is already in place
 sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)
 sbx plugins store update [name]       # re-fetch one or all; re-verify + anti-rollback + atomic swap

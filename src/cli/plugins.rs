@@ -1211,24 +1211,40 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
 /// plugins it lists — each with its scheme, version, description, and whether it is already
 /// installed from that store. No fetch, no network.
 fn plugins_store_list_cmd(args: &[OsString]) -> ExitCode {
+    let (only_installed, only_store) = match parse_store_list_args(args) {
+        Ok(parsed) => parsed,
+        Err(bad) => {
+            diag::error(&format!("sbx: unexpected argument '{bad}'"));
+            eprintln!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["plugins", "store", "list"])
+            );
+            return ExitCode::from(2);
+        }
+    };
+    plugins_store_list(only_installed, only_store.as_deref())
+}
+
+/// Split `store list`'s arguments into (`--installed`, the store to restrict to), or the first
+/// argument that is neither. Pure, so the accepted shapes are pinned without a data directory.
+///
+/// A bare word names the store. Listing every configured store stays the default, but once there
+/// is more than one that stops answering "what does *this* one offer" without the reader
+/// filtering by eye. A second bare word is an error rather than a silent overwrite: it means the
+/// caller expected something the verb does not do.
+fn parse_store_list_args(args: &[OsString]) -> Result<(bool, Option<String>), String> {
     let mut only_installed = false;
+    let mut only_store: Option<String> = None;
     for a in args {
         match a.to_str() {
             Some("--installed") => only_installed = true,
-            other => {
-                diag::error(&format!(
-                    "sbx: unexpected argument '{}'",
-                    other.unwrap_or("(non-UTF-8)")
-                ));
-                eprintln!(
-                    "sbx: usage: {}",
-                    help::synopsis_of(&["plugins", "store", "list"])
-                );
-                return ExitCode::from(2);
+            Some(word) if !word.starts_with('-') && only_store.is_none() => {
+                only_store = Some(word.to_string());
             }
+            other => return Err(other.unwrap_or("(non-UTF-8)").to_string()),
         }
     }
-    plugins_store_list(only_installed)
+    Ok((only_installed, only_store))
 }
 
 /// One listed plugin: the shape `store list` and `store info` both reduce a catalogue to.
@@ -1319,7 +1335,7 @@ fn listed_from_catalogue(cat: &catalogue::Catalogue) -> Vec<Listed<'_>> {
 /// listed, for answering "what do I actually have from here" without reading past everything on
 /// offer. The sources themselves are still all shown: a store with nothing installed says so,
 /// rather than vanishing and leaving the user unsure whether it is configured at all.
-fn plugins_store_list(only_installed: bool) -> ExitCode {
+fn plugins_store_list(only_installed: bool, only_store: Option<&str>) -> ExitCode {
     let layout = store::Layout::from_env();
     // Without a data directory nothing is installed as far as this listing can tell, so every entry
     // renders unmarked rather than the command failing on an inspection verb.
@@ -1330,7 +1346,19 @@ fn plugins_store_list(only_installed: bool) -> ExitCode {
     // Configured stores, read from their owner-only caches (trusted by location). Each is expanded
     // down to its plugins: a bare count would say a store has something to offer without saying
     // what, which is the one question this command exists to answer.
-    let names = layout.as_ref().map(stores::list).unwrap_or_default();
+    let mut names = layout.as_ref().map(stores::list).unwrap_or_default();
+    // A name that matches nothing is refused rather than rendered as an empty listing: "no such
+    // store" and "this store lists nothing" are different answers, and only one of them is a typo.
+    if let Some(want) = only_store {
+        if !names.iter().any(|n| n == want) {
+            diag::error(&format!("sbx: no configured plugin store named '{want}'"));
+            if !names.is_empty() {
+                eprintln!("sbx: configured stores: {}", names.join(", "));
+            }
+            return ExitCode::from(2);
+        }
+        names.retain(|n| n == want);
+    }
     if names.is_empty() {
         println!("{h}configured plugin stores:{r} (none)");
         println!(
@@ -1902,6 +1930,42 @@ fn print_grant_env_paths(keys: &[String], err: &str, r: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn store_list_takes_a_store_name_a_flag_or_both() {
+        use std::ffi::OsString;
+        let os = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
+        assert_eq!(
+            super::parse_store_list_args(&os(&[])).unwrap(),
+            (false, None)
+        );
+        assert_eq!(
+            super::parse_store_list_args(&os(&["--installed"])).unwrap(),
+            (true, None)
+        );
+        assert_eq!(
+            super::parse_store_list_args(&os(&["sbx-plugins"])).unwrap(),
+            (false, Some("sbx-plugins".to_string()))
+        );
+        // Order must not matter: a user types whichever came to mind first.
+        assert_eq!(
+            super::parse_store_list_args(&os(&["--installed", "sbx-plugins"])).unwrap(),
+            (true, Some("sbx-plugins".to_string()))
+        );
+        assert_eq!(
+            super::parse_store_list_args(&os(&["sbx-plugins", "--installed"])).unwrap(),
+            (true, Some("sbx-plugins".to_string()))
+        );
+        // An unknown flag, and a second name, are refused rather than absorbed.
+        assert_eq!(
+            super::parse_store_list_args(&os(&["--nope"])).unwrap_err(),
+            "--nope"
+        );
+        assert_eq!(
+            super::parse_store_list_args(&os(&["a", "b"])).unwrap_err(),
+            "b"
+        );
+    }
+
     use super::*;
     use crate::plugins::origin::Origin;
     use std::collections::BTreeMap;
