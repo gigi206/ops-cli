@@ -174,6 +174,22 @@ impl Layout {
     pub(crate) fn store_path(&self, name: &str) -> PathBuf {
         self.stores_dir().join(name)
     }
+
+    /// Where sbx writes the mark it signs its own desktop notifications with, in the fill that
+    /// suits a `dark` desktop or the one that suits a light one.
+    ///
+    /// A notification daemon runs in its own process and opens the icon file itself, so the mark
+    /// has to exist on disk somewhere it can reach — a static binary carrying the image in its
+    /// `.rodata` has nothing to hand it otherwise. Here rather than in an XDG icon theme because
+    /// this is a directory sbx already owns: no install step to run, and owner-only, so what a
+    /// daemon renders as "sbx" cannot be replaced by a project.
+    ///
+    /// Two files rather than one rewritten in place, so switching desktop theme changes only which
+    /// path is sent — nothing is rewritten under a daemon that may be reading it.
+    pub(crate) fn icon_path(&self, dark: bool) -> PathBuf {
+        self.data_dir
+            .join(if dark { "sbx-dark.png" } else { "sbx.png" })
+    }
 }
 
 /// Follow a volume pointer in `default_dir`, mounting the volume if it is not already.
@@ -1749,6 +1765,16 @@ mod tests {
         let layout = Layout::under(Path::new("/data/sbx"));
         assert_eq!(layout.data_dir.as_path(), Path::new("/data/sbx"));
         assert_eq!(layout.store_dir(), Path::new("/data/sbx/store"));
+    }
+
+    #[test]
+    fn the_two_notification_marks_are_separate_files() {
+        // A notification daemon opens these by path, in another process, so the names are part of
+        // what sbx puts on a user's disk rather than an internal detail. Pinned literally: deriving
+        // one from the other is how the two fills end up being the same file.
+        let layout = Layout::under(Path::new("/data/sbx"));
+        assert_eq!(layout.icon_path(false), Path::new("/data/sbx/sbx.png"));
+        assert_eq!(layout.icon_path(true), Path::new("/data/sbx/sbx-dark.png"));
     }
 
     #[test]

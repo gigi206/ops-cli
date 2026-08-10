@@ -24,6 +24,7 @@
 //! a headless host) falls back to stderr with one warning, never a repeated one, and never a failure
 //! — a launch must not break because a notification could not be delivered.
 
+use futures_util::FutureExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, RwLock};
@@ -43,10 +44,32 @@ use crate::sandbox::redact::{Placeholder, redact_string};
 /// rather than silently swallowed.
 const QUEUE_CAP: usize = 256;
 
-/// The application name every sbx notification carries, and the icon it asks for (a freedesktop icon
-/// name resolved from the user's theme — sbx ships no image of its own).
+/// The application name every sbx notification carries.
 const APP_NAME: &str = "sbx";
-const APP_ICON: &str = "dialog-warning";
+
+/// The icon asked for when the mark cannot be put on disk — a freedesktop name resolved from the
+/// user's theme, which is what this sink sent before it carried a mark of its own. A refusal still
+/// reads as a warning, which is the part that matters.
+const FALLBACK_ICON: &str = "dialog-warning";
+
+/// The mark itself, in the two fills it is drawn in: the canonical one, and the lighter twin meant
+/// for a dark desktop. Raster rather than the SVG they are drawn from, because several daemons
+/// decode icons through gdk-pixbuf, which will not touch an SVG unless librsvg is installed — and
+/// an icon that fails to decode is worse than one that was never sent.
+///
+/// Carried in the binary because the daemon is a *separate process* that opens the file itself:
+/// there is no way to hand it an image held in memory. `assets/render-logo.py` regenerates both by
+/// parsing the SVG, so the drawing stays the single source of truth.
+static LOGO_LIGHT: &[u8] = include_bytes!("../../assets/sbx.png");
+static LOGO_DARK: &[u8] = include_bytes!("../../assets/sbx-dark.png");
+
+/// How long one announcement waits on the desktop portal for the light/dark preference before
+/// signing itself in the canonical fill.
+///
+/// The read is a sub-millisecond round trip on a live connection, so this is not a budget — it is
+/// the guard for a portal that has stopped answering, which must cost a bounded pause rather than
+/// an announcement that never arrives.
+const THEME_READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How often the delivery thread wakes to re-check the stop flag while the queue is empty.
 ///
@@ -138,20 +161,27 @@ impl Sink for StderrSink {
 /// in-cage relays use; sbx's own world is std threads).
 struct DesktopSink {
     proxy: crate::sandbox::notify_relay::HostNotificationsProxy<'static>,
+    /// The desktop portal's Settings interface on the same connection, for the light/dark
+    /// preference. Bound once and held: binding is not free next to the read it serves, and this is
+    /// read on every announcement. `None` when there is no portal — the ordinary case on a plain
+    /// window manager — and the mark is then sent in its canonical fill.
+    settings: Option<crate::sandbox::theme_relay::HostSettingsProxy<'static>>,
     /// The bus this sink is bound to, so a reconnect goes back to the **same** bus rather than to
     /// whatever the ambient environment names. `None` is the session bus, which is the production
     /// case; a test binds a private one and must not have its retry escape onto the user's desktop.
     address: Option<String>,
 }
 
-/// One notification call over an already-bound proxy. Separated from [`DesktopSink::deliver`] so the
+/// One notification call over already-bound proxies. Separated from [`DesktopSink::deliver`] so the
 /// retry after a reconnect runs exactly the same code as the first attempt.
-fn notify_over(
+async fn notify_over(
     proxy: &crate::sandbox::notify_relay::HostNotificationsProxy<'static>,
+    settings: Option<&crate::sandbox::theme_relay::HostSettingsProxy<'static>>,
     summary: &str,
     body: &str,
     replaces: Option<u32>,
 ) -> Result<u32, ()> {
+    let icon = icon_for(settings).await;
     let mut hints = std::collections::HashMap::new();
     if let Ok(v) = zbus::zvariant::Value::from(URGENCY_NORMAL).try_into() {
         hints.insert("urgency".to_string(), v);
@@ -159,21 +189,130 @@ fn notify_over(
     if let Ok(v) = zbus::zvariant::Value::from("security").try_into() {
         hints.insert("category".to_string(), v);
     }
-    async_io::block_on(proxy.notify(
-        APP_NAME,
-        replaces.unwrap_or(0),
-        APP_ICON,
-        summary,
-        body,
-        // No action buttons: an action needs a live `ActionInvoked` subscription to mean anything,
-        // and a one-click "allow" on a security refusal is a decision that belongs at a prompt, not
-        // on a toast.
-        Vec::new(),
-        hints,
-        // Let the daemon apply its own default timeout.
-        -1,
-    ))
-    .map_err(|_| ())
+    // The same icon under the 1.2 hint as well as the `app_icon` argument, because daemons differ
+    // in which of the two they read. Only when it is a real file: a theme name is what `app_icon`
+    // is for, and a daemon that failed to resolve it under `image-path` could render nothing at
+    // all rather than falling back.
+    if icon != FALLBACK_ICON
+        && let Ok(v) = zbus::zvariant::Value::from(icon).try_into()
+    {
+        hints.insert("image-path".to_string(), v);
+    }
+    proxy
+        .notify(
+            APP_NAME,
+            replaces.unwrap_or(0),
+            icon,
+            summary,
+            body,
+            // No action buttons: an action needs a live `ActionInvoked` subscription to mean
+            // anything, and a one-click "allow" on a security refusal is a decision that belongs at
+            // a prompt, not on a toast.
+            Vec::new(),
+            hints,
+            // Let the daemon apply its own default timeout.
+            -1,
+        )
+        .await
+        .map_err(|_| ())
+}
+
+/// The icon one announcement is signed with: the mark in the fill the desktop is wearing **now**,
+/// or [`FALLBACK_ICON`] when it could not be put on disk.
+///
+/// The preference is read per announcement rather than resolved once, so a desktop switched from
+/// light to dark mid-session is followed rather than remembered. That costs one round trip on a
+/// connection this sink already holds — less than the `Notify` call it accompanies — and it happens
+/// only when there is something to announce, which the coalescer already makes rare.
+async fn icon_for(
+    settings: Option<&crate::sandbox::theme_relay::HostSettingsProxy<'static>>,
+) -> &'static str {
+    mark_for(marks(), prefers_dark(settings).await)
+}
+
+/// Which mark to send for a desktop that is (or is not) dark. Pure, so the fallback ladder is
+/// pinned by tests without a portal, a bus, or a disk.
+///
+/// Either fill beats a theme name, so a missing twin falls back to the other one before giving up
+/// on the mark entirely: the point of the two files is the *nuance*, and losing the nuance is not a
+/// reason to lose the identity.
+fn mark_for(marks: &'static Marks, dark: bool) -> &'static str {
+    let (first, second) = if dark {
+        (&marks.dark, &marks.light)
+    } else {
+        (&marks.light, &marks.dark)
+    };
+    first
+        .as_deref()
+        .or(second.as_deref())
+        .unwrap_or(FALLBACK_ICON)
+}
+
+/// Whether the desktop says it is dark, bounded by [`THEME_READ_TIMEOUT`]. Anything else — no
+/// portal, no answer, an answer that is not `prefer-dark` — is light, which is the canonical fill.
+async fn prefers_dark(
+    settings: Option<&crate::sandbox::theme_relay::HostSettingsProxy<'static>>,
+) -> bool {
+    let Some(settings) = settings else {
+        return false;
+    };
+    let scheme = futures_util::select! {
+        scheme = crate::sandbox::theme_relay::color_scheme_of(settings).fuse() => scheme,
+        _ = futures_util::FutureExt::fuse(async_io::Timer::after(THEME_READ_TIMEOUT)) => None,
+    };
+    scheme.as_deref() == Some("prefer-dark")
+}
+
+/// Where each fill of the mark ended up on disk, `None` for one that could not be written.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Marks {
+    light: Option<String>,
+    dark: Option<String>,
+}
+
+/// The marks on disk, written on first use and remembered for the process.
+///
+/// Both fills are written, not just the one the desktop wants right now: they cost a kilobyte
+/// between them, and having both means switching theme mid-session changes which path is sent
+/// rather than rewriting a file a daemon may be reading.
+fn marks() -> &'static Marks {
+    static WRITTEN: std::sync::OnceLock<Marks> = std::sync::OnceLock::new();
+    WRITTEN.get_or_init(|| {
+        let Some(layout) = crate::store::Layout::from_env() else {
+            return Marks::default();
+        };
+        Marks {
+            light: write_mark(&layout.icon_path(false), LOGO_LIGHT),
+            dark: write_mark(&layout.icon_path(true), LOGO_DARK),
+        }
+    })
+}
+
+/// Put `bytes` at `path` and answer with the path, or `None` if it could not be placed there.
+///
+/// Split from [`marks`] so the whole write is testable against a directory of the test's choosing,
+/// without an environment variable a parallel test would race on.
+///
+/// Two properties matter here and neither is decoration. The write is **atomic** — a private name
+/// then a rename — because a daemon may be opening the previous copy at that moment, and half a
+/// PNG renders as nothing. And it is **skipped when the bytes already match**, which is the
+/// ordinary case: the file is only rewritten on the first launch after the mark itself changes.
+fn write_mark(path: &std::path::Path, bytes: &[u8]) -> Option<String> {
+    let named = path.to_str()?.to_string();
+    if std::fs::read(path).is_ok_and(|on_disk| on_disk == bytes) {
+        return Some(named);
+    }
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    // The pid makes the temporary name private to this process, so two launches writing the mark at
+    // once cannot interleave into one file. Whichever renames last wins, and both wrote the same
+    // bytes.
+    let tmp = path.with_extension(format!("png.{}", std::process::id()));
+    std::fs::write(&tmp, bytes).ok()?;
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    Some(named)
 }
 
 impl DesktopSink {
@@ -203,8 +342,13 @@ impl DesktopSink {
             // than discovering it at the first refusal — when the fallback would be too late to warn
             // about. The answer itself is not used.
             proxy.get_server_information().await.ok()?;
+            // The portal is optional: a desktop without one simply never says it is dark. Bound
+            // here so a reconnect rebinds it alongside the notifications proxy, on the same
+            // connection, rather than leaving a proxy pointing at a connection that has gone.
+            let settings = crate::sandbox::theme_relay::bind_host_settings(&conn).await;
             Some(DesktopSink {
                 proxy,
+                settings,
                 address: address.map(str::to_string),
             })
         })
@@ -225,14 +369,31 @@ impl Sink for DesktopSink {
         body: &str,
         replaces: Option<u32>,
     ) -> Result<Option<u32>, ()> {
-        if let Ok(id) = notify_over(&self.proxy, summary, body, replaces) {
+        let sent = async_io::block_on(notify_over(
+            &self.proxy,
+            self.settings.as_ref(),
+            summary,
+            body,
+            replaces,
+        ));
+        if let Ok(id) = sent {
             return Ok(Some(id));
         }
         let fresh = DesktopSink::connect_to(self.address.as_deref()).ok_or(())?;
         self.proxy = fresh.proxy;
+        // The portal proxy rides the connection that just went away, so it is replaced along with
+        // the notifications one rather than left pointing at a dead connection.
+        self.settings = fresh.settings;
         // The id the old daemon handed out means nothing to a new one, so a retry after a reconnect
         // posts a fresh notification rather than trying to revise one that no longer exists.
-        notify_over(&self.proxy, summary, body, None).map(Some)
+        async_io::block_on(notify_over(
+            &self.proxy,
+            self.settings.as_ref(),
+            summary,
+            body,
+            None,
+        ))
+        .map(Some)
     }
 }
 
@@ -724,11 +885,130 @@ mod tests {
         assert_eq!(drop_report(n.dropped.load(Ordering::Relaxed)), None);
     }
 
+    #[test]
+    fn both_marks_are_pngs_and_are_not_the_same_image() {
+        // The two fills are separate files generated from separate drawings, and the build would be
+        // just as happy if one were missing and the other included twice — which would silently
+        // undo the whole light/dark distinction.
+        for (name, bytes) in [("light", LOGO_LIGHT), ("dark", LOGO_DARK)] {
+            assert_eq!(
+                &bytes[..8],
+                b"\x89PNG\r\n\x1a\x0a",
+                "{name}: a daemon decodes this through gdk-pixbuf, so it must be a real PNG"
+            );
+        }
+        assert_ne!(
+            LOGO_LIGHT, LOGO_DARK,
+            "the dark twin must be its own image, not a second copy of the canonical fill"
+        );
+    }
+
+    #[test]
+    fn a_mark_is_written_once_and_is_the_bytes_that_were_embedded() {
+        let tmp = crate::testutil::TmpDir::new();
+        let path = tmp.path().join("sub").join("sbx.png");
+
+        // The parent does not exist yet: a first launch must create it rather than give up.
+        let named = write_mark(&path, LOGO_LIGHT).expect("the mark is written");
+        assert_eq!(named, path.to_str().expect("a UTF-8 temp path"));
+        assert_eq!(
+            std::fs::read(&path).expect("the mark is on disk"),
+            LOGO_LIGHT,
+            "what a daemon opens must be exactly what was embedded"
+        );
+
+        // Writing again is a no-op: the file is only rewritten when the mark itself changes, so a
+        // launch does not disturb a copy a daemon may be reading.
+        let before = std::fs::metadata(&path).expect("stat").modified().ok();
+        assert_eq!(write_mark(&path, LOGO_LIGHT).as_deref(), Some(&*named));
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").modified().ok(),
+            before,
+            "an unchanged mark must not be rewritten"
+        );
+
+        // Different bytes at the same path do replace it — the upgrade case — and nothing is left
+        // beside it, because the write goes through a private name and a rename.
+        assert!(write_mark(&path, LOGO_DARK).is_some());
+        assert_eq!(std::fs::read(&path).expect("the new mark"), LOGO_DARK);
+        let strays: Vec<_> = std::fs::read_dir(path.parent().expect("a parent"))
+            .expect("the directory")
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n != "sbx.png")
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "the temporary copy must not survive: {strays:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_write_falls_back_to_the_theme_name_rather_than_to_nothing() {
+        // A read-only data directory is the case this must survive: the announcement still has to
+        // go out, carrying the warning icon it carried before the mark existed.
+        let tmp = crate::testutil::TmpDir::new();
+        let dir = tmp.path().join("locked");
+        std::fs::create_dir_all(&dir).expect("the directory");
+        let mut perms = std::fs::metadata(&dir).expect("stat").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&dir, perms).expect("lock the directory");
+
+        let refused = write_mark(&dir.join("sbx.png"), LOGO_LIGHT);
+
+        // Restore before asserting, so a failure does not leave an undeletable directory behind.
+        let mut perms = std::fs::metadata(&dir).expect("stat").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&dir, perms).expect("unlock the directory");
+
+        assert_eq!(
+            refused, None,
+            "an unwritable mark is reported, not invented"
+        );
+        assert_eq!(
+            mark_for(Box::leak(Box::new(Marks::default())), false),
+            FALLBACK_ICON,
+            "with no mark at all, the announcement still carries a warning icon"
+        );
+    }
+
+    #[test]
+    fn the_fill_follows_the_desktop_and_degrades_to_whichever_mark_exists() {
+        let both: &'static Marks = Box::leak(Box::new(Marks {
+            light: Some("/data/sbx.png".to_string()),
+            dark: Some("/data/sbx-dark.png".to_string()),
+        }));
+        assert_eq!(mark_for(both, false), "/data/sbx.png");
+        assert_eq!(mark_for(both, true), "/data/sbx-dark.png");
+
+        // One fill missing: the nuance is lost, the identity is not. Losing the twin must never
+        // send a desktop back to an anonymous theme icon.
+        let light_only: &'static Marks = Box::leak(Box::new(Marks {
+            light: Some("/data/sbx.png".to_string()),
+            dark: None,
+        }));
+        assert_eq!(mark_for(light_only, true), "/data/sbx.png");
+        let dark_only: &'static Marks = Box::leak(Box::new(Marks {
+            light: None,
+            dark: Some("/data/sbx-dark.png".to_string()),
+        }));
+        assert_eq!(mark_for(dark_only, false), "/data/sbx-dark.png");
+    }
+
     /// A stand-in notifications daemon on a private bus: it owns the interface and counts calls, so
     /// a test can serve real `Notify` requests and then take the server away.
+    ///
+    /// It also records each call's `app_icon` and hint keys. Those are built inside `notify_over`
+    /// and are invisible to a caller holding a `Sink`, so serving the call is the only place they
+    /// can be observed as the daemon actually receives them.
     struct FakeDaemon {
         calls: Arc<AtomicU64>,
+        seen: Arc<RwLock<Vec<Served>>>,
     }
+
+    /// One served `Notify`, in the parts a test asserts on: the icon argument, the hint keys, and
+    /// the `image-path` hint's value.
+    type Served = (String, Vec<String>, Option<String>);
 
     #[zbus::interface(name = "org.freedesktop.Notifications")]
     impl FakeDaemon {
@@ -737,14 +1017,22 @@ mod tests {
             &self,
             _app_name: String,
             replaces_id: u32,
-            _app_icon: String,
+            app_icon: String,
             _summary: String,
             _body: String,
             _actions: Vec<String>,
-            _hints: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+            hints: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
             _expire_timeout: i32,
         ) -> u32 {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut keys: Vec<String> = hints.keys().cloned().collect();
+            keys.sort();
+            let image_path = hints
+                .get("image-path")
+                .and_then(|v| String::try_from(v.clone()).ok());
+            if let Ok(mut seen) = self.seen.write() {
+                seen.push((app_icon, keys, image_path));
+            }
             if replaces_id != 0 { replaces_id } else { 77 }
         }
 
@@ -781,8 +1069,9 @@ mod tests {
         };
 
         let calls = Arc::new(AtomicU64::new(0));
+        let seen: Arc<RwLock<Vec<Served>>> = Arc::new(RwLock::new(Vec::new()));
         // First server: owns the interface and answers.
-        let server = serve_fake(&address, Arc::clone(&calls));
+        let server = serve_fake(&address, Arc::clone(&calls), Arc::clone(&seen));
         let mut sink =
             DesktopSink::connect_to(Some(&address)).expect("the fake daemon is reachable");
         assert_eq!(
@@ -790,6 +1079,45 @@ mod tests {
             Ok(Some(77)),
             "a live daemon answers with its id"
         );
+
+        // What crossed the bus, as the daemon received it. Asserted against literal file names
+        // rather than against what the code under test computes: deriving the expectation from
+        // `marks()` would let a run where nothing could be written agree with itself and pass.
+        //
+        // The mark is written to the real data directory here, because that is the whole point —
+        // the path handed to a daemon has to be one that exists outside this process. It is the
+        // same file a launch would write, so the test leaves nothing a run would not have left.
+        {
+            let seen = seen.read().expect("the recording survives the call");
+            let (icon, hints, image_path) = seen.first().expect("the call was served");
+            assert_ne!(
+                icon, FALLBACK_ICON,
+                "a run with a resolvable data directory must sign with the mark, not a theme name"
+            );
+            let sent = std::path::Path::new(icon);
+            let name = sent.file_name().and_then(|n| n.to_str());
+            assert!(
+                matches!(name, Some("sbx.png" | "sbx-dark.png")),
+                "one of the two fills, named as it is on disk: {icon}"
+            );
+            assert!(
+                sent.is_absolute() && sent.exists(),
+                "a daemon opens this path itself, in another process: {icon}"
+            );
+            // `image-path` rides along only when the icon is a file, and must name the same file:
+            // a hint pointing somewhere the `app_icon` argument does not is how a daemon ends up
+            // rendering one image and journalling another.
+            assert_eq!(
+                image_path.as_deref(),
+                Some(icon.as_str()),
+                "a file icon travels in both slots and names the same file, since daemons differ \
+                 on which of the two they read: {hints:?}"
+            );
+            assert!(
+                hints.iter().any(|k| k == "urgency") && hints.iter().any(|k| k == "category"),
+                "the hints that classify a refusal must survive the icon work: {hints:?}"
+            );
+        }
 
         // Take the server away, and wait for the *bus* to agree the name is unowned: closing a
         // connection releases its names asynchronously, so asserting straight after the drop races
@@ -806,7 +1134,7 @@ mod tests {
 
         // A replacement daemon appears (the `gnome-shell` restart case): the very next delivery
         // reconnects and succeeds, which is the whole point of the retry.
-        let _server = serve_fake(&address, Arc::clone(&calls));
+        let _server = serve_fake(&address, Arc::clone(&calls), Arc::clone(&seen));
         assert_eq!(
             sink.deliver("s", "b", None),
             Ok(Some(77)),
@@ -816,6 +1144,112 @@ mod tests {
             calls.load(Ordering::Relaxed),
             2,
             "one call served by each daemon"
+        );
+    }
+
+    /// A stand-in desktop portal, answering the appearance `color-scheme` read with whatever the
+    /// test currently wants. Shared and mutable so one test can change the desktop's mind between
+    /// two announcements.
+    struct FakePortal {
+        scheme: Arc<AtomicU64>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.portal.Settings")]
+    impl FakePortal {
+        async fn read(
+            &self,
+            _namespace: String,
+            _key: String,
+        ) -> zbus::fdo::Result<zbus::zvariant::OwnedValue> {
+            let n = self.scheme.load(Ordering::Relaxed) as u32;
+            zbus::zvariant::Value::from(n)
+                .try_into()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot build the reply".into()))
+        }
+    }
+
+    /// The fill that is sent follows the desktop, and follows it **per announcement**.
+    ///
+    /// This is the property the whole two-file arrangement exists for, and it is invisible to every
+    /// other test here: `mark_for` proves the choice is made correctly given an answer, and the
+    /// reconnect test proves a mark crosses the bus, but neither shows the portal's answer reaching
+    /// the choice. A stand-in portal on the private bus closes that, and changing its answer between
+    /// two deliveries is what distinguishes "read once and remembered" from "read every time".
+    #[test]
+    fn the_fill_sent_follows_the_portal_and_is_re_read_per_announcement() {
+        let Ok(bus) = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--print-address", "--nofork"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("skipping: no dbus-daemon on PATH");
+            return;
+        };
+        let mut bus = ChildGuard(bus);
+        let address = {
+            use std::io::BufRead as _;
+            let out = bus.0.stdout.take().expect("piped stdout");
+            let mut line = String::new();
+            std::io::BufReader::new(out)
+                .read_line(&mut line)
+                .expect("the bus prints its address");
+            line.trim().to_string()
+        };
+
+        // Both fills must exist for this test to mean anything: with one missing the ladder would
+        // send the survivor whatever the portal said, and the assertions would pass for the wrong
+        // reason. On this machine that means the data directory has to be resolvable.
+        let marks = marks();
+        assert!(
+            marks.light.is_some() && marks.dark.is_some(),
+            "both fills must be on disk for the choice to be observable: {marks:?}"
+        );
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen: Arc<RwLock<Vec<Served>>> = Arc::new(RwLock::new(Vec::new()));
+        let _daemon = serve_fake(&address, Arc::clone(&calls), Arc::clone(&seen));
+
+        // `prefer-light` (2) to begin with. Owning the portal name here also keeps the bus from
+        // activating the real one behind our back.
+        let scheme = Arc::new(AtomicU64::new(2));
+        let _portal = async_io::block_on(async {
+            zbus::connection::Builder::address(address.as_str())
+                .unwrap()
+                .name("org.freedesktop.portal.Desktop")
+                .unwrap()
+                .serve_at(
+                    "/org/freedesktop/portal/desktop",
+                    FakePortal {
+                        scheme: Arc::clone(&scheme),
+                    },
+                )
+                .unwrap()
+                .build()
+                .await
+                .expect("the fake portal owns the name")
+        });
+
+        let mut sink =
+            DesktopSink::connect_to(Some(&address)).expect("the fake daemon is reachable");
+        assert!(sink.deliver("s", "b", None).is_ok());
+
+        // The desktop switches to dark *after* the sink was built and has already announced once.
+        scheme.store(1, Ordering::Relaxed);
+        assert!(sink.deliver("s", "b", None).is_ok());
+
+        let seen = seen.read().expect("the recording survives the calls");
+        let names: Vec<Option<&str>> = seen
+            .iter()
+            .map(|(icon, _, _)| {
+                std::path::Path::new(icon)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![Some("sbx.png"), Some("sbx-dark.png")],
+            "the first announcement is light, and the second follows the switch to dark"
         );
     }
 
@@ -844,14 +1278,19 @@ mod tests {
         });
     }
 
-    /// Own `org.freedesktop.Notifications` on `address` until the returned connection is dropped.
-    fn serve_fake(address: &str, calls: Arc<AtomicU64>) -> zbus::Connection {
+    /// Own `org.freedesktop.Notifications` on `address` until the returned connection is dropped,
+    /// recording each call's icon and hint keys into `seen`.
+    fn serve_fake(
+        address: &str,
+        calls: Arc<AtomicU64>,
+        seen: Arc<RwLock<Vec<Served>>>,
+    ) -> zbus::Connection {
         async_io::block_on(async {
             zbus::connection::Builder::address(address)
                 .unwrap()
                 .name("org.freedesktop.Notifications")
                 .unwrap()
-                .serve_at("/org/freedesktop/Notifications", FakeDaemon { calls })
+                .serve_at("/org/freedesktop/Notifications", FakeDaemon { calls, seen })
                 .unwrap()
                 .build()
                 .await

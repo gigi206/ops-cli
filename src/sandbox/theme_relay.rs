@@ -36,7 +36,7 @@ use zbus::zvariant::Value;
     default_service = "org.freedesktop.portal.Desktop",
     default_path = "/org/freedesktop/portal/desktop"
 )]
-trait HostSettings {
+pub(crate) trait HostSettings {
     /// The current value of one setting. Used for the at-launch read; the signal below carries
     /// every later change.
     fn read(&self, namespace: &str, key: &str) -> zbus::Result<zbus::zvariant::OwnedValue>;
@@ -78,7 +78,34 @@ pub(crate) fn read_host_color_scheme() -> Option<String> {
 /// `color-scheme`, and map the `uint32` to its keyfile value. Every failure is `None` (best-effort).
 async fn current_color_scheme() -> Option<String> {
     let conn = zbus::Connection::session().await.ok()?;
-    let settings = HostSettingsProxy::new(&conn).await.ok()?;
+    color_scheme_over(&conn).await
+}
+
+/// The same read over a connection the caller **already holds**, binding a proxy for the one read.
+///
+/// For the callers that ask once. A caller that asks repeatedly should bind with
+/// [`bind_host_settings`] and keep the proxy: binding is not free next to the read it serves, so
+/// re-binding per read is the one shape to avoid.
+pub(crate) async fn color_scheme_over(conn: &zbus::Connection) -> Option<String> {
+    color_scheme_of(&bind_host_settings(conn).await?).await
+}
+
+/// Bind the portal's Settings interface on an existing connection, to be held by a caller that
+/// reads the preference more than once — the notification sink asks on every announcement, so that
+/// it always signs itself in the theme the desktop is wearing *now* rather than the one it wore
+/// when the launch started.
+pub(crate) async fn bind_host_settings(
+    conn: &zbus::Connection,
+) -> Option<HostSettingsProxy<'static>> {
+    HostSettingsProxy::new(conn).await.ok()
+}
+
+/// The read itself, over an already-bound proxy. Every failure is `None` (best-effort): no portal,
+/// no such setting, or a reply carrying something other than the `uint32` the spec defines.
+///
+/// This is the single place the appearance setting is turned into a value, so the read at launch
+/// and the reads during a session cannot end up interpreting it two different ways.
+pub(crate) async fn color_scheme_of(settings: &HostSettingsProxy<'_>) -> Option<String> {
     let value = settings
         .read("org.freedesktop.appearance", "color-scheme")
         .await

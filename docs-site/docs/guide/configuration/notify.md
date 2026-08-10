@@ -34,6 +34,20 @@ With no session bus to reach, over `ssh`, on a headless host, from `cron`, sbx s
 falls back to a line on stderr. A notification is always best-effort: a launch never fails because
 one could not be delivered.
 
+## What it looks like
+
+Each notification is signed with the sbx mark, so a refusal is recognisable before it is read. A
+notification daemon opens the icon file itself, in its own process, so the mark is written into
+sbx's data directory (`sbx.png` and `sbx-dark.png`, beside the store) and named to the daemon by
+path. It is written once and left alone unless the mark itself changes.
+
+The two files are the same drawing in the two fills it comes in, one for a light desktop and one
+for a dark one. Which is sent is decided per notification, from the desktop portal's appearance
+setting, so switching your desktop between light and dark is followed rather than fixed at launch.
+A desktop with no portal, one that does not answer, or a data directory that cannot be written all
+fall back to the theme's own warning icon: the refusal is still announced, and still reads as a
+warning.
+
 ## Which sandbox it came from
 
 Every notification names its session in the **summary**, after the headline:
