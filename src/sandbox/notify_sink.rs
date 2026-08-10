@@ -44,8 +44,23 @@ use crate::sandbox::redact::{Placeholder, redact_string};
 /// rather than silently swallowed.
 const QUEUE_CAP: usize = 256;
 
-/// The application name every sbx notification carries.
+/// The application name every sbx notification carries, alone when there is no session to name.
 const APP_NAME: &str = "sbx";
+
+/// The application name a notification is sent under: `sbx`, or `sbx · kiro@ops-cli[4242]` once
+/// there is a session to name.
+///
+/// The session rides here rather than in the summary because a desktop gives the sending
+/// application a line of its own and shows it whole, while it truncates the summary. With two or
+/// three sandboxes running at once, "which one was that?" is the first question a toast has to
+/// answer, and answering it in the summary meant the answer was the first thing cut.
+fn app_name(context: &str) -> String {
+    if context.is_empty() {
+        APP_NAME.to_string()
+    } else {
+        format!("{APP_NAME} · {context}")
+    }
+}
 
 /// The icon asked for when the mark cannot be put on disk — a freedesktop name resolved from the
 /// user's theme, which is what this sink sent before it carried a mark of its own. A refusal still
@@ -138,7 +153,26 @@ pub(crate) trait Sink: Send {
 /// Used when there is no session bus to reach. It has no ids and no replacement, so an `always` event
 /// prints a line per occurrence — on a terminal that is the expected behaviour, and the desktop
 /// sink's in-place update has no meaning here.
-struct StderrSink;
+/// One stderr line for an announcement: `session: summary: body`, dropping whichever part is
+/// absent. Pure, so the empty cases are pinned by tests rather than read off a terminal.
+///
+/// A refusal with nothing to add has an empty body, and a launch that is not a session has no
+/// context, so both ends have to disappear cleanly instead of stranding a separator.
+fn stderr_line(context: &str, summary: &str, body: &str) -> String {
+    match (context, body) {
+        ("", "") => summary.to_string(),
+        ("", _) => format!("{summary}: {body}"),
+        (ctx, "") => format!("{ctx}: {summary}"),
+        (ctx, _) => format!("{ctx}: {summary}: {body}"),
+    }
+}
+
+struct StderrSink {
+    /// The session this sink speaks for. A terminal has no application header to carry it, so what
+    /// the desktop shows beside the icon is prefixed onto the line here — otherwise falling back to
+    /// stderr would quietly lose which sandbox a refusal came from.
+    context: String,
+}
 
 impl Sink for StderrSink {
     fn deliver(
@@ -147,7 +181,7 @@ impl Sink for StderrSink {
         body: &str,
         _replaces: Option<u32>,
     ) -> Result<Option<u32>, ()> {
-        crate::diag::warn(&format!("{summary}: {body}"));
+        crate::diag::warn(&stderr_line(&self.context, summary, body));
         // stderr cannot go away, so this sink never asks to be replaced — it is what replacement
         // falls back *to*.
         Ok(None)
@@ -166,6 +200,9 @@ struct DesktopSink {
     /// read on every announcement. `None` when there is no portal — the ordinary case on a plain
     /// window manager — and the mark is then sent in its canonical fill.
     settings: Option<crate::sandbox::theme_relay::HostSettingsProxy<'static>>,
+    /// The name this sink announces under, session included. Fixed for the session: which sandbox
+    /// is speaking cannot change under a running launch.
+    app_name: String,
     /// The bus this sink is bound to, so a reconnect goes back to the **same** bus rather than to
     /// whatever the ambient environment names. `None` is the session bus, which is the production
     /// case; a test binds a private one and must not have its retry escape onto the user's desktop.
@@ -177,6 +214,7 @@ struct DesktopSink {
 async fn notify_over(
     proxy: &crate::sandbox::notify_relay::HostNotificationsProxy<'static>,
     settings: Option<&crate::sandbox::theme_relay::HostSettingsProxy<'static>>,
+    app_name: &str,
     summary: &str,
     body: &str,
     replaces: Option<u32>,
@@ -200,7 +238,7 @@ async fn notify_over(
     }
     proxy
         .notify(
-            APP_NAME,
+            app_name,
             replaces.unwrap_or(0),
             icon,
             summary,
@@ -318,14 +356,14 @@ fn write_mark(path: &std::path::Path, bytes: &[u8]) -> Option<String> {
 impl DesktopSink {
     /// Connect to the session bus and bind the notifications proxy, or `None` when there is no bus to
     /// reach (a headless or `ssh` session, a cron run) or no daemon serving the interface.
-    fn connect() -> Option<DesktopSink> {
-        DesktopSink::connect_to(None)
+    fn connect(context: &str) -> Option<DesktopSink> {
+        DesktopSink::connect_to(None, app_name(context))
     }
 
     /// [`connect`](DesktopSink::connect) against a named bus address rather than the ambient session
     /// one — the seam the reconnect test drives, so that path is exercised against a real bus and a
     /// real daemon going away, without touching the user's desktop.
-    fn connect_to(address: Option<&str>) -> Option<DesktopSink> {
+    fn connect_to(address: Option<&str>, app_name: String) -> Option<DesktopSink> {
         async_io::block_on(async {
             let conn = match address {
                 Some(addr) => zbus::connection::Builder::address(addr)
@@ -349,6 +387,7 @@ impl DesktopSink {
             Some(DesktopSink {
                 proxy,
                 settings,
+                app_name,
                 address: address.map(str::to_string),
             })
         })
@@ -372,6 +411,7 @@ impl Sink for DesktopSink {
         let sent = async_io::block_on(notify_over(
             &self.proxy,
             self.settings.as_ref(),
+            &self.app_name,
             summary,
             body,
             replaces,
@@ -379,7 +419,8 @@ impl Sink for DesktopSink {
         if let Ok(id) = sent {
             return Ok(Some(id));
         }
-        let fresh = DesktopSink::connect_to(self.address.as_deref()).ok_or(())?;
+        let fresh =
+            DesktopSink::connect_to(self.address.as_deref(), self.app_name.clone()).ok_or(())?;
         self.proxy = fresh.proxy;
         // The portal proxy rides the connection that just went away, so it is replaced along with
         // the notifications one rather than left pointing at a dead connection.
@@ -389,6 +430,7 @@ impl Sink for DesktopSink {
         async_io::block_on(notify_over(
             &self.proxy,
             self.settings.as_ref(),
+            &self.app_name,
             summary,
             body,
             None,
@@ -475,14 +517,16 @@ impl Notifier {
             // Connecting here, on the delivery thread, keeps the bus handshake off the launch path.
             let mut sink: Box<dyn Sink> = match sink {
                 Some(s) => s,
-                None => match DesktopSink::connect() {
+                None => match DesktopSink::connect(&context) {
                     Some(d) => Box::new(d),
                     None => {
                         crate::diag::note(
                             "no desktop notification daemon reachable — reporting blocked \
                              requests on stderr instead",
                         );
-                        Box::new(StderrSink)
+                        Box::new(StderrSink {
+                            context: context.clone(),
+                        })
                     }
                 },
             };
@@ -506,7 +550,7 @@ impl Notifier {
                 else {
                     continue;
                 };
-                let (summary, body) = block.render(&context);
+                let (summary, body) = block.render();
                 // Read under the lock only here, on the delivery thread — never on the thread that
                 // refused. The set is filled once, when the proxy resolves the launch's credentials.
                 let (summary, body) = match needles.read() {
@@ -531,7 +575,9 @@ impl Notifier {
                             "the desktop notification daemon went away — reporting blocked \
                              requests on stderr for the rest of this session",
                         );
-                        sink = Box::new(StderrSink);
+                        sink = Box::new(StderrSink {
+                            context: context.clone(),
+                        });
                         let _ = sink.deliver(&summary, &body, None);
                     }
                 }
@@ -694,8 +740,8 @@ mod tests {
             vec![net_block("api.example.com:443", "denied-default")],
         );
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, "sbx blocked a network request");
-        assert_eq!(out[0].1, "api.example.com:443");
+        assert_eq!(out[0].0, "Blocked: api.example.com:443");
+        assert_eq!(out[0].1, "");
         assert_eq!(out[0].2, None);
     }
 
@@ -762,7 +808,7 @@ mod tests {
             ],
         );
         assert_eq!(out.len(), 1, "only the proc block is announced");
-        assert_eq!(out[0].0, "sbx blocked a program from running");
+        assert_eq!(out[0].0, "Blocked: /usr/bin/curl");
     }
 
     #[test]
@@ -886,6 +932,42 @@ mod tests {
     }
 
     #[test]
+    fn the_session_names_the_sender_and_a_launch_without_one_is_just_sbx() {
+        assert_eq!(app_name("kiro@ops-cli[4242]"), "sbx · kiro@ops-cli[4242]");
+        // No session to name: the bare product name, never a dangling separator.
+        assert_eq!(app_name(""), "sbx");
+    }
+
+    #[test]
+    fn the_stderr_fallback_keeps_the_session_a_desktop_would_have_shown() {
+        // A terminal has no application header, so dropping to stderr would lose which sandbox
+        // refused if the line did not carry it. Every combination is spelled out because the empty
+        // cases are where a separator strands itself.
+        assert_eq!(
+            stderr_line(
+                "kiro@ops-cli[4242]",
+                "Blocked: api.example.com:443",
+                "no rule"
+            ),
+            "kiro@ops-cli[4242]: Blocked: api.example.com:443: no rule"
+        );
+        // A refusal with nothing to add, and a launch that is not a session: both ends have to
+        // disappear without stranding the separator that joined them.
+        assert_eq!(
+            stderr_line("kiro@ops-cli[4242]", "Blocked: x", ""),
+            "kiro@ops-cli[4242]: Blocked: x"
+        );
+        assert_eq!(stderr_line("", "Blocked: x", "why"), "Blocked: x: why");
+        assert_eq!(stderr_line("", "Blocked: x", ""), "Blocked: x");
+
+        // And the sink itself uses it, rather than composing a second line of its own.
+        let mut sink = StderrSink {
+            context: "kiro@ops-cli[4242]".to_string(),
+        };
+        assert_eq!(sink.deliver("Blocked: x", "why", None), Ok(None));
+    }
+
+    #[test]
     fn both_marks_are_pngs_and_are_not_the_same_image() {
         // The two fills are separate files generated from separate drawings, and the build would be
         // just as happy if one were missing and the other included twice — which would silently
@@ -1006,16 +1088,16 @@ mod tests {
         seen: Arc<RwLock<Vec<Served>>>,
     }
 
-    /// One served `Notify`, in the parts a test asserts on: the icon argument, the hint keys, and
-    /// the `image-path` hint's value.
-    type Served = (String, Vec<String>, Option<String>);
+    /// One served `Notify`, in the parts a test asserts on: the application name, the icon
+    /// argument, the hint keys, and the `image-path` hint's value.
+    type Served = (String, String, Vec<String>, Option<String>);
 
     #[zbus::interface(name = "org.freedesktop.Notifications")]
     impl FakeDaemon {
         #[allow(clippy::too_many_arguments)]
         async fn notify(
             &self,
-            _app_name: String,
+            app_name: String,
             replaces_id: u32,
             app_icon: String,
             _summary: String,
@@ -1031,7 +1113,7 @@ mod tests {
                 .get("image-path")
                 .and_then(|v| String::try_from(v.clone()).ok());
             if let Ok(mut seen) = self.seen.write() {
-                seen.push((app_icon, keys, image_path));
+                seen.push((app_name, app_icon, keys, image_path));
             }
             if replaces_id != 0 { replaces_id } else { 77 }
         }
@@ -1072,8 +1154,8 @@ mod tests {
         let seen: Arc<RwLock<Vec<Served>>> = Arc::new(RwLock::new(Vec::new()));
         // First server: owns the interface and answers.
         let server = serve_fake(&address, Arc::clone(&calls), Arc::clone(&seen));
-        let mut sink =
-            DesktopSink::connect_to(Some(&address)).expect("the fake daemon is reachable");
+        let mut sink = DesktopSink::connect_to(Some(&address), app_name("kiro@demo-app[4242]"))
+            .expect("the fake daemon is reachable");
         assert_eq!(
             sink.deliver("s", "b", None),
             Ok(Some(77)),
@@ -1089,7 +1171,12 @@ mod tests {
         // same file a launch would write, so the test leaves nothing a run would not have left.
         {
             let seen = seen.read().expect("the recording survives the call");
-            let (icon, hints, image_path) = seen.first().expect("the call was served");
+            let (name, icon, hints, image_path) = seen.first().expect("the call was served");
+            // Which sandbox spoke rides the application name, on the line a desktop shows whole.
+            assert_eq!(
+                name, "sbx · kiro@demo-app[4242]",
+                "the session names the sender, not the summary that gets truncated"
+            );
             assert_ne!(
                 icon, FALLBACK_ICON,
                 "a run with a resolvable data directory must sign with the mark, not a theme name"
@@ -1229,8 +1316,8 @@ mod tests {
                 .expect("the fake portal owns the name")
         });
 
-        let mut sink =
-            DesktopSink::connect_to(Some(&address)).expect("the fake daemon is reachable");
+        let mut sink = DesktopSink::connect_to(Some(&address), app_name(""))
+            .expect("the fake daemon is reachable");
         assert!(sink.deliver("s", "b", None).is_ok());
 
         // The desktop switches to dark *after* the sink was built and has already announced once.
@@ -1240,7 +1327,7 @@ mod tests {
         let seen = seen.read().expect("the recording survives the calls");
         let names: Vec<Option<&str>> = seen
             .iter()
-            .map(|(icon, _, _)| {
+            .map(|(_, icon, _, _)| {
                 std::path::Path::new(icon)
                     .file_name()
                     .and_then(|n| n.to_str())

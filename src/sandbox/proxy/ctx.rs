@@ -888,7 +888,8 @@ mod wiring_tests {
         );
         let out = seen.lock().unwrap().clone();
         assert_eq!(out.len(), 1, "only the refusal is announced: {out:?}");
-        assert!(out[0].starts_with("sbx blocked a network request|"));
-        assert!(out[0].contains("api.example.com:443"));
+        // The host leads the summary, so a desktop that truncates to one line still shows what was
+        // refused; the explanation and the fix follow in the body.
+        assert!(out[0].starts_with("Blocked: api.example.com:443|"));
     }
 }

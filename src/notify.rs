@@ -88,20 +88,24 @@ impl NotifyEvent {
         }
     }
 
-    /// The one-line headline for this event, the notification's summary.
+    /// The word a summary opens on, before the subject.
     ///
-    /// Four of the five open on the same verb, because they are the same act seen in four places:
-    /// something was attempted and sbx stopped it. One word makes a toast recognisable before it is
-    /// read. `Trust` keeps its own, and the difference is not cosmetic — nothing was attempted
-    /// there, so calling it a block would describe an agent halted mid-action when what happened is
-    /// that a file was not taken at its word.
-    fn headline(self) -> &'static str {
+    /// Four of the five share it, because they are the same act seen in four places: something was
+    /// attempted and sbx stopped it. `Trust` keeps its own, and the difference is not cosmetic —
+    /// nothing was attempted there, so calling it a block would describe an agent halted mid-action
+    /// when what happened is that a file was not taken at its word.
+    ///
+    /// One word rather than a sentence because a desktop **truncates the summary**, and what a
+    /// sentence pushes past the cut is the subject: the host, the path, the task. Which of the four
+    /// lenses refused is then carried by the body and by the subject's own shape, neither of which
+    /// a reader has to reach the end of a line to see.
+    fn verb(self) -> &'static str {
         match self {
-            NotifyEvent::Network => "sbx blocked a network request",
-            NotifyEvent::Proc => "sbx blocked a program from running",
-            NotifyEvent::SshAgent => "sbx blocked a request for an ssh key",
-            NotifyEvent::Task => "sbx blocked a task",
-            NotifyEvent::Trust => "sbx dropped a setting from an untrusted config",
+            NotifyEvent::Network
+            | NotifyEvent::Proc
+            | NotifyEvent::SshAgent
+            | NotifyEvent::Task => "Blocked",
+            NotifyEvent::Trust => "Dropped",
         }
     }
 
@@ -268,22 +272,17 @@ impl Block {
     /// The notification's `(summary, body)`. Pure, so both forms are pinned by tests without a
     /// notification daemon; the sink adds nothing to what this returns beyond redaction.
     ///
-    /// `context` names the session this refusal came from (see [`Origin::label`]) and rides the
-    /// **summary**, not the body: with two or three sandboxes running at once, "which one was that?"
-    /// is the first question a toast has to answer, and the summary is the part that is read first
-    /// and never truncated. Empty for a launch that has no session to name, and then the summary is
-    /// the headline alone.
-    pub(crate) fn render(&self, context: &str) -> (String, String) {
-        let mut summary = self.event.headline().to_string();
-        if !context.is_empty() {
-            summary.push_str(" · ");
-            summary.push_str(context);
-        }
-        let mut body = self.subject.clone();
-        if !self.detail.is_empty() {
-            body.push_str(" — ");
-            body.push_str(&self.detail);
-        }
+    /// The summary is `verb: subject`, and the subject leads because a desktop **truncates the
+    /// summary to one line**. Everything placed before the subject is something a reader is made to
+    /// scan past, and everything placed after it can be cut off entirely — which is what happened to
+    /// the session label when it rode here: it was the part a reader most needed and the part the
+    /// desktop dropped first. The session now names the sending application instead, which the
+    /// desktop shows on its own line and does not truncate (see [`Origin::label`]).
+    ///
+    /// The body carries the explanation and the suggested fix, and no longer repeats the subject.
+    pub(crate) fn render(&self) -> (String, String) {
+        let summary = format!("{}: {}", self.event.verb(), self.subject);
+        let mut body = self.detail.clone();
         if !self.fix.is_empty() {
             // A visible separator rather than a newline: a notification daemon is free to flatten
             // `\n` into a space (GNOME Shell does), and the sentence then runs into the suggestion —
@@ -445,19 +444,12 @@ mod tests {
             NotifyEvent::SshAgent,
             NotifyEvent::Task,
         ] {
-            assert!(
-                event.headline().starts_with("sbx blocked "),
-                "{event:?}: {}",
-                event.headline()
-            );
+            assert_eq!(event.verb(), "Blocked", "{event:?}");
         }
         // `trust` is the exception on purpose. Nothing ran and nothing was stopped: a field was not
         // taken at its word when the config was read. Calling that a block would have the reader
         // looking for an agent that was halted, and there was none.
-        assert_eq!(
-            NotifyEvent::Trust.headline(),
-            "sbx dropped a setting from an untrusted config"
-        );
+        assert_eq!(NotifyEvent::Trust.verb(), "Dropped");
     }
 
     #[test]
@@ -740,30 +732,9 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_names_the_session_a_refusal_came_from() {
-        // Which sandbox it was rides the summary, not the body: with two or three running at once
-        // that is the first question, and the summary is what a toast shows first and never cuts.
-        let b = block(
-            NotifyEvent::Network,
-            "api.example.com:443",
-            "denied-default",
-        );
-        let (summary, body) = b.render("kiro@ops-cli[4242]");
-        assert_eq!(
-            summary,
-            "sbx blocked a network request · kiro@ops-cli[4242]"
-        );
-        assert_eq!(
-            body, "api.example.com:443",
-            "the body is unchanged by context"
-        );
-
-        // With nothing to name, the summary is the headline alone — never a trailing separator.
-        assert_eq!(b.render("").0, "sbx blocked a network request");
-    }
-
-    #[test]
-    fn a_rendered_block_leads_with_the_subject_and_carries_its_fix() {
+    fn the_summary_leads_with_the_subject_so_a_truncation_cannot_cut_it() {
+        // A desktop cuts the summary to one line. Whatever a reader needs has to be at the front,
+        // and the subject is what a refusal is *about* — the host, the path, the task.
         let b = Block {
             event: NotifyEvent::Network,
             subject: "api.example.com:443".to_string(),
@@ -771,12 +742,13 @@ mod tests {
             detail: "no rule in the network policy allows this host".to_string(),
             fix: "sbx net allow api.example.com".to_string(),
         };
-        let (summary, body) = b.render("");
-        assert_eq!(summary, "sbx blocked a network request");
+        let (summary, body) = b.render();
+        assert_eq!(summary, "Blocked: api.example.com:443");
         assert_eq!(
             body,
-            "api.example.com:443 — no rule in the network policy allows this host \
-             · allow it: sbx net allow api.example.com"
+            "no rule in the network policy allows this host \
+             · allow it: sbx net allow api.example.com",
+            "the body explains and suggests; it no longer repeats the subject"
         );
         // No newline anywhere: a daemon that flattens one would run the sentence into the
         // suggestion, which is how "…allows this host allow it: …" reads on a real desktop.
@@ -785,9 +757,31 @@ mod tests {
             "the body must not rely on a newline: {body:?}"
         );
 
-        // A refusal with no sound fix to offer says only what happened.
+        // Nothing about the summary depends on the session: which sandbox spoke is carried by the
+        // sending application's name, on a line of its own that is not truncated.
+        assert!(
+            !summary.contains("ops-cli") && !summary.contains('['),
+            "the session must not have crept back into the summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_with_nothing_to_add_says_only_what_it_refused() {
+        // `detail` and `fix` are both optional, and two events (ssh_agent, trust) carry the whole
+        // story in the subject. The body is then empty rather than padded.
         let bare = block(NotifyEvent::Proc, "/usr/bin/curl", "denied-by-rule");
-        assert_eq!(bare.render("").1, "/usr/bin/curl");
+        assert_eq!(
+            bare.render(),
+            ("Blocked: /usr/bin/curl".to_string(), String::new())
+        );
+
+        // The trust drop is the one event that is not a block, and its summary says so.
+        let dropped = block(
+            NotifyEvent::Trust,
+            ".sbx.toml: ignoring `network`",
+            "not-trusted",
+        );
+        assert_eq!(dropped.render().0, "Dropped: .sbx.toml: ignoring `network`");
     }
 
     #[test]

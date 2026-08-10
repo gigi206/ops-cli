@@ -50,10 +50,13 @@ warning.
 
 ## Which sandbox it came from
 
-Every notification names its session in the **summary**, after the headline:
+Every notification names its session as the **sending application**, on the line a desktop shows
+beside the icon:
 
 ```
-sbx blocked a network request · kiro@ops-cli[48213]
+sbx · kiro@ops-cli[48213]
+  Blocked: api.example.com:443
+  no rule in the network policy allows this host · allow it: sbx net allow api.example.com
 ```
 
 - `kiro`, the app, when the launch is one (absent for a bare `sbx run`);
@@ -61,13 +64,25 @@ sbx blocked a network request · kiro@ops-cli[48213]
 - `48213`, the launching sbx **pid**, the same one [`sbx session ls`](../cli/session) lists and
   that [`sbx attach`](../cli/session) and [`sbx stop`](../cli/session) take.
 
-It rides the summary rather than the body because with two or three sandboxes running at once,
-"which one was that?" is the first question a toast has to answer, and the summary is the part read
-first and never truncated. The pid is what makes it actionable: from the toast you can go straight to
-`sbx attach <pid>` or `sbx net logs` for that session.
+It names the application rather than riding the summary because a desktop **truncates the summary
+to one line** and shows the application name whole. With two or three sandboxes running at once,
+"which one was that?" is the first question a toast has to answer, and putting the answer in the
+summary meant it was the first thing cut off. The pid is what makes it actionable: from the toast
+you can go straight to `sbx attach <pid>` or `sbx net logs` for that session.
 
 The project's **full path** is deliberately not there, no toast is wide enough, and lives in
 `sbx session ls`.
+
+For the same reason, the summary leads with **what was refused**, the host or the path or the task,
+rather than with a sentence describing it. What a truncation takes away is then the tail of a long
+host name and not the fact that a refusal happened at all. Which lens refused is carried by the body
+and by the shape of the subject itself.
+
+Falling back to stderr keeps the session, since a terminal has no application line to carry it:
+
+```
+sbx: kiro@ops-cli[48213]: Blocked: api.example.com:443: no rule in the network policy allows this host
+```
 
 ## Modes
 
