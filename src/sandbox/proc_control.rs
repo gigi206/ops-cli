@@ -285,7 +285,12 @@ pub(crate) struct ParkedView {
 
 /// List the `execve`s currently parked for a decision on one session's control socket (`LIST`).
 pub(crate) fn read_pending(socket: &Path) -> io::Result<Vec<ParkedView>> {
-    let reply = query(socket, "LIST")?;
+    read_pending_within(socket, QUERY_TIMEOUT)
+}
+
+/// [`read_pending`] under a caller-chosen deadline — see [`GLANCE_TIMEOUT`].
+pub(crate) fn read_pending_within(socket: &Path, timeout: Duration) -> io::Result<Vec<ParkedView>> {
+    let reply = query_within(socket, "LIST", timeout)?;
     let mut out = Vec::new();
     for line in reply.lines() {
         if line == "ok" {
@@ -388,11 +393,27 @@ pub(crate) fn read_overlay_rules(socket: &Path) -> io::Result<Vec<OverlayRule>> 
     Ok(out)
 }
 
+/// How long a query the user typed waits on a session that is slow to answer. Generous:
+/// the caller is a verb whose whole job is that answer, and a wrong verdict is worse than
+/// a wait.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The budget a query made *on the user's behalf* gets — the completion oracle, which runs
+/// on a keystroke. A session that does not answer inside it is reported as holding nothing,
+/// because a menu that is one item short is better than a prompt that stalls.
+pub(crate) const GLANCE_TIMEOUT: Duration = Duration::from_millis(150);
+
 /// Send one command line to a session's control socket and return the full reply text.
 fn query(socket: &Path, cmd: &str) -> io::Result<String> {
+    query_within(socket, cmd, QUERY_TIMEOUT)
+}
+
+/// [`query`] under a caller-chosen deadline, for a caller that would rather come back empty
+/// than wait.
+fn query_within(socket: &Path, cmd: &str, timeout: Duration) -> io::Result<String> {
     let stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     (&stream).write_all(format!("{cmd}\n").as_bytes())?;
     (&stream).flush()?;
     let mut reply = String::new();

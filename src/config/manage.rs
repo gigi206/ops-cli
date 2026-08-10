@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use toml_edit::{value, Array, DocumentMut, Item, Table, TableLike, Value};
+use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value, value};
 
 /// Which config file an operation targets.
 pub(crate) enum Scope {
@@ -100,7 +100,7 @@ pub(crate) enum ManageError {
 }
 
 /// Which egress list a rule is added to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressList {
     Allow,
     Deny,
@@ -120,7 +120,7 @@ impl EgressList {
 }
 
 /// Which process/exec list a rule is added to (`[proc].allow` / `[proc].deny`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcList {
     Allow,
     Deny,
@@ -150,7 +150,10 @@ impl std::fmt::Display for ManageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ManageError::NoGlobalDir => {
-                write!(f, "no global config directory (set XDG_CONFIG_HOME or HOME)")
+                write!(
+                    f,
+                    "no global config directory (set XDG_CONFIG_HOME or HOME)"
+                )
             }
             ManageError::Read(p, e) => write!(f, "cannot read {}: {e}", p.display()),
             ManageError::Write(p, e) => write!(f, "cannot write {}: {e}", p.display()),
@@ -204,7 +207,10 @@ impl std::fmt::Display for ManageError {
                  (`sbx config set network deny|allow`) before adding rules"
             ),
             ManageError::MalformedNetwork(s) => {
-                write!(f, "the `network` field is malformed ({s}) — edit it with `sbx config edit`")
+                write!(
+                    f,
+                    "the `network` field is malformed ({s}) — edit it with `sbx config edit`"
+                )
             }
             ManageError::GroupCollision(names) => write!(
                 f,
@@ -215,7 +221,11 @@ impl std::fmt::Display for ManageError {
             ManageError::BundleCollision(names) => write!(
                 f,
                 "{} already defined: {} — re-run with --force to overwrite",
-                if names.len() == 1 { "bundle" } else { "bundles" },
+                if names.len() == 1 {
+                    "bundle"
+                } else {
+                    "bundles"
+                },
                 names.join(", ")
             ),
             ManageError::ProcAllowNeedsPosture => write!(
@@ -235,7 +245,10 @@ impl std::fmt::Display for ManageError {
                  `sbx config edit` so the rule takes effect"
             ),
             ManageError::MalformedProc(s) => {
-                write!(f, "the `proc` field is malformed ({s}) — edit it with `sbx config edit`")
+                write!(
+                    f,
+                    "the `proc` field is malformed ({s}) — edit it with `sbx config edit`"
+                )
             }
         }
     }
@@ -479,16 +492,16 @@ fn rule_list_verb(key: &str) -> Option<String> {
         ("network.", &["allow", "deny", "mute"][..]),
         ("proc.", &["allow", "deny"][..]),
     ] {
-        if let Some(tail) = key.rsplit_once(table).map(|(_, tail)| tail) {
-            if let Some(verb) = verbs.iter().find(|v| **v == tail) {
-                let namespace = table.trim_end_matches('.');
-                let namespace = if namespace == "network" {
-                    "net"
-                } else {
-                    namespace
-                };
-                return Some(format!("{namespace} {verb}"));
-            }
+        if let Some(tail) = key.rsplit_once(table).map(|(_, tail)| tail)
+            && let Some(verb) = verbs.iter().find(|v| **v == tail)
+        {
+            let namespace = table.trim_end_matches('.');
+            let namespace = if namespace == "network" {
+                "net"
+            } else {
+                namespace
+            };
+            return Some(format!("{namespace} {verb}"));
         }
     }
     None
@@ -965,6 +978,53 @@ fn remove_rule_from(
     }
     write_doc(path, &doc)?;
     Ok(RemoveOutcome::Removed)
+}
+
+/// The egress rules the `list` of one config file holds, under `[app.<name>]` when an app is named.
+/// The read-only sibling of [`remove_egress_rule`]: what it returns is exactly the set a removal
+/// could take out, which is what makes it safe to complete from.
+pub(crate) fn egress_rules_in(path: &Path, app: Option<&str>, list: EgressList) -> Vec<String> {
+    rules_in(path, app, "network", list.key())
+}
+
+/// The process/exec rules the `list` of one config file holds — the read-only sibling of
+/// [`remove_proc_rule`], as [`egress_rules_in`] is of its egress twin.
+pub(crate) fn proc_rules_in(path: &Path, app: Option<&str>, list: ProcList) -> Vec<String> {
+    rules_in(path, app, "proc", list.key())
+}
+
+/// The string entries of the array at `key` inside the target's `table`, navigating exactly as
+/// [`remove_rule_from`] does so the two cannot disagree about where a rule lives. Unreadable file,
+/// absent table, bare-string posture: all simply empty, never an error.
+fn rules_in(path: &Path, app: Option<&str>, table: &str, key: &str) -> Vec<String> {
+    let Ok(doc) = read_or_empty(path) else {
+        return Vec::new();
+    };
+    let parent = match app {
+        None => Some(doc.as_table()),
+        Some(name) => doc
+            .as_table()
+            .get("app")
+            .and_then(Item::as_table)
+            .and_then(|apps| apps.get(name))
+            .and_then(Item::as_table),
+    };
+    let Some(parent) = parent else {
+        return Vec::new();
+    };
+    let array = match parent.get(table) {
+        Some(Item::Table(t)) => t.get(key).and_then(Item::as_array),
+        Some(Item::Value(v)) if v.is_inline_table() => v
+            .as_inline_table()
+            .and_then(|it| it.get(key))
+            .and_then(Value::as_array),
+        _ => None,
+    };
+    array
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Remove the first exact-string match of `rule` from `arr`, reporting whether one was removed.
@@ -2147,9 +2207,11 @@ mod tests {
             add_proc_rule(&p, None, ProcList::Allow, "git").unwrap(),
             AddOutcome::Added { created_mode: None }
         );
-        assert!(std::fs::read_to_string(&p)
-            .unwrap()
-            .contains("allow = [\"git\"]"));
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("allow = [\"git\"]")
+        );
     }
 
     #[test]

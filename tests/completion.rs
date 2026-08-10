@@ -59,7 +59,33 @@ fn oracle(path: &[String], cursor: &str) -> Vec<String> {
 /// whatever the binary actually offers: a subcommand added tomorrow is swept the day it
 /// lands. The `help` verb mirrors the whole tree beneath itself, so the walk covers each
 /// path twice, once directly and once through `sbx help ...`.
+///
+/// Only names that resolve to a page are descended into: the menus also hold value
+/// vocabulary — live ids, literal targets — that is machine state, not command tree, and
+/// walking into it would loop on a real registry the moment one exists.
 fn walk() -> Vec<Vec<String>> {
+    /// Whether a path names a page, and so is command tree rather than a value.
+    ///
+    /// A leading `help` is stripped before asking, because it is exactly what the page
+    /// tree does not contain: `sbx help` has no page of its own (`sbx help help` is
+    /// refused), so probing the path verbatim would answer "not a page" for `help` and
+    /// prune the mirrored half of the tree — the half this walk exists to cover.
+    fn is_page(path: &[String]) -> bool {
+        let under_help = path.first().is_some_and(|w| w == "help");
+        let probed: Vec<&str> = path
+            .iter()
+            .skip(usize::from(under_help))
+            .map(String::as_str)
+            .collect();
+        // `sbx help` itself: a real verb, and the root of the mirror.
+        if probed.is_empty() {
+            return under_help;
+        }
+        let mut argv = vec!["help"];
+        argv.extend(probed.iter().copied());
+        let out = sbx(&argv);
+        out.status.success() && stdout_of(&out).contains(&format!("sbx {} —", probed.join(" ")))
+    }
     let mut found: Vec<Vec<String>> = Vec::new();
     let mut queue: Vec<Vec<String>> = vec![Vec::new()];
     while let Some(path) = queue.pop() {
@@ -69,6 +95,9 @@ fn walk() -> Vec<Vec<String>> {
         for child in oracle(&path, "") {
             let mut deeper = path.clone();
             deeper.push(child);
+            if !is_page(&deeper) {
+                continue;
+            }
             queue.push(deeper.clone());
             found.push(deeper);
         }
@@ -186,8 +215,10 @@ fn the_oracle_narrows_as_the_path_deepens() {
     assert!(names(&["app", ""]).contains(&"import".to_string()));
     assert_eq!(names(&["plugins", "store", "publ"]), ["publish"]);
     assert!(names(&["run", "--det"]).contains(&"--detach".to_string()));
-    // Past a `--` the words belong to the launched command.
-    assert!(names(&["run", "--", ""]).is_empty());
+    // Past a `--` the words belong to the launched command: none of sbx's own names, and
+    // the file marker rather than an empty answer, so the shell completes that word.
+    assert_eq!(names(&["run", "--", ""]), ["__sbx_files__"]);
+    assert_eq!(names(&["run", "--", "ls", ""]), ["__sbx_files__"]);
 }
 
 #[test]
@@ -271,6 +302,109 @@ fn the_bash_script_parses_and_completes() {
     assert!(drive(&["sbx", "run", "--det"], 2).contains(&"--detach".to_string()));
     // Three levels deep.
     assert_eq!(drive(&["sbx", "plugins", "store", "rek"], 3), ["rekey"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_path_position_completes_files_in_a_real_bash() {
+    if !shell_available("bash") {
+        eprintln!("skipping the bash file-completion drive: bash is not installed");
+        return;
+    }
+    let dir = scratch("bash-files");
+    let script = dir.join("sbx.bash");
+    std::fs::write(&script, stdout_of(&sbx(&["completion", "bash"]))).expect("write script");
+    std::fs::write(dir.join("plain.toml"), b"").expect("a fixture file");
+    // A name holding a space: the case word splitting quietly turns into two candidates.
+    std::fs::write(dir.join("spaced name.toml"), b"").expect("a fixture file");
+
+    let drive = |words: &[&str], cword: usize| -> Vec<String> {
+        let quoted: Vec<String> = words.iter().map(|w| format!("'{w}'")).collect();
+        let out = run_shell(
+            "bash",
+            &format!(
+                "cd {dir}; source {script}; COMP_WORDS=({words}); COMP_CWORD={cword}; \
+                 _sbx_complete; printf '%s\\n' \"${{COMPREPLY[@]}}\"",
+                dir = dir.display(),
+                script = script.display(),
+                words = quoted.join(" ")
+            ),
+        );
+        assert!(
+            out.status.success(),
+            "driving the function failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout_of(&out)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+
+    // `--config <toml|@file>` names a path sbx cannot enumerate, so the marker hands the
+    // word to bash. One file, one candidate — the space must not split it in two.
+    assert_eq!(
+        drive(&["sbx", "run", "--config", "spaced"], 3),
+        ["spaced name.toml"]
+    );
+    // Past a `--` the line belongs to the launched command. Answering nothing there would
+    // leave `sbx run -- ls <TAB>` completing nothing at all, so the word is the shell's.
+    assert_eq!(drive(&["sbx", "run", "--", "ls", "pl"], 4), ["plain.toml"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_path_position_reaches_zshs_own_file_completion() {
+    if !shell_available("zsh") {
+        eprintln!("skipping the zsh file-completion drive: zsh is not installed");
+        return;
+    }
+    let dir = scratch("zsh-files");
+    let script = dir.join("_sbx");
+    std::fs::write(&script, stdout_of(&sbx(&["completion", "zsh"]))).expect("write script");
+
+    // `_files` is zsh's own file completion and needs a real completion context, which a
+    // driven function does not have, so it stands in for itself here. What that still pins
+    // is the half this script owns, and the half whose shape differs from bash's: the
+    // marker branch is reached from *inside* the loop reading the oracle, and it hands the
+    // word over rather than rendering the marker as a candidate. The bash sibling above
+    // drives the real file completion end to end.
+    let driver = format!(
+        r#"
+        compdef() {{ : }}
+        _files() {{ print -r -- FILES }}
+        _describe() {{ local n=${{@[-1]}}; local -a a; a=( ${{(P)n}} ); print -rl -- ${{a%%:*}} }}
+        source {script}
+        drive() {{ words=(sbx "$@"); CURRENT=${{#words}}; _sbx }}
+        print -r -- "config=$(drive run --config spa)"
+        print -r -- "dashdash=$(drive run -- ls pl)"
+        print -r -- "verb=$(drive comp)"
+        "#,
+        script = script.display()
+    );
+    let out = run_shell("zsh", &driver);
+    let stdout = stdout_of(&out);
+    let says = |line: &str| stdout.lines().any(|l| l == line);
+    // A path a flag names, and every word past a `--`, are zsh's to complete.
+    assert!(
+        says("config=FILES"),
+        "`--config` did not reach _files:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        says("dashdash=FILES"),
+        "the line past a `--` did not reach _files:\n{stdout}"
+    );
+    // A command position still completes verbs, and never reaches file completion.
+    assert!(says("verb=completion"), "a verb position broke:\n{stdout}");
+    // The marker is an instruction, never something the user can be offered.
+    assert!(
+        !stdout.contains("__sbx_files__"),
+        "the marker leaked into the menu:\n{stdout}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

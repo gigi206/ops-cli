@@ -67,19 +67,49 @@ keep several builds around: completion answers for whichever `sbx` your `PATH` r
 | `sbx plugins store <TAB>` | three levels deep, same as the help tree |
 | `sbx run --<TAB>` | that command's options |
 | `sbx help <TAB>` | the command tree again, so `sbx help plugins store <TAB>` works |
-| anything else | left to the shell's own file completion |
+| `sbx app run <TAB>` | the values that position takes, see below |
+| `sbx run -- ls <TAB>` | nothing of sbx's: the shell completes the launched command's line |
 
 Under zsh each candidate carries its one-line description, the same summary the help page
 shows.
 
-**Values are not completed.** An app name, a session id, a config key or a path falls
-through to the shell's file completion. Completing them would mean reading the project
-config, scanning the session registry or touching the store on every keypress, and a
-completion has to be instant; the binary's own listing verbs ([`sbx app list`](app),
-[`sbx session ls`](session)) stay the way to see them.
+### Values
 
-**Nothing is offered past a `--`.** Everything after the separator belongs to the launched
-command, so `sbx run -- ls <TAB>` completes files, not sbx's verbs.
+Where the help table says a word is a **value** rather than a command, the oracle completes
+the value. Two kinds:
+
+- **Read from this machine**, fresh on every request: the live sessions' ids, the configured
+  stores and their catalogue plugins, the installed resolver plugins, the app profiles, the
+  per-project trees, and the table names and `[task.<name>]` sections of the config files in
+  front of you.
+- **Spelled out by the grammar itself**: a `bash` or `zsh` for this page, an upgrade target,
+  a `--net` posture, a `--gui` or `--notify` mode, a `--verdict`.
+
+A **removal verb completes what it can remove**. `sbx net unallow <TAB>` offers the allow
+rules already written, `undeny` the deny rules, `unmute` the mute rules, and
+`sbx proc unallow`/`undeny` their `[proc]` twins. `--app <name>` moves the offer to that
+app's own profile, the file the removal would edit. The add verbs deliberately offer none
+of them: `sbx net allow` takes precisely a rule that is *not* in the list yet.
+
+Only a value sbx cannot enumerate is left to the shell: a filesystem path, and the command
+line past a `--`. There the oracle answers with a reserved marker instead of a candidate,
+and the script turns it into the shell's own file completion, so a name holding a space
+stays one candidate.
+
+A few positions complete nothing on purpose, because the set they name is not one this
+machine holds: a number, free text being composed, a URL or flake ref, an HTTP method, a
+seccomp token. That list is pinned by a test, so a value position added later is either
+completed or declared, never silently empty.
+
+:::note
+Value completion reads the registries the listing verbs read: the session registry, the
+store checkouts, the profile directory, the two config files. These are small, local, and
+read-only, and no value position reaches for the network or the nix store. A page whose
+registry cannot be read simply offers nothing there.
+:::
+
+**Nothing of sbx's is offered past a `--`.** Everything after the separator belongs to the
+launched command, so `sbx run -- ls <TAB>` completes files, not sbx's verbs.
 
 ## How it works
 
@@ -99,10 +129,17 @@ that renders `sbx help`, which has two consequences worth relying on:
 - **A stale script is not a thing.** Upgrading sbx upgrades what it completes, without
   regenerating anything. The script only ever needs rewriting if its own protocol changes.
 
-The oracle writes nothing to stderr and touches no configuration, store or session state.
-Both are deliberate: the script is `eval`'d at shell startup and runs on every completion
-request, so a stray diagnostic would land in the middle of your prompt, and a disk read
-would show up as lag on every keypress.
+The oracle writes nothing to stderr, and it never writes anything anywhere: it reads
+registries, and answers. Both are deliberate. The script is `eval`'d at shell startup and
+runs on every completion request, so a stray diagnostic would land in the middle of your
+prompt, and a completion that changed state would make pressing Tab a thing you had to
+think about.
+
+A command path answers from the help table alone and reads nothing. A value position reads
+the registry behind it, and does so fresh rather than from a cache, so a session you just
+started completes without a stale list to refresh. Where a registry is another process
+rather than a file, the oracle gives it a short budget and drops it from the menu if it
+does not answer inside it: a menu one item short beats a prompt that stalls.
 
 ## Adding a shell
 

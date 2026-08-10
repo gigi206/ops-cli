@@ -66,16 +66,19 @@ const PAGES: &[Page] = &[
             ("bash", "the bash completion script"),
             ("zsh", "the zsh completion script"),
         ],
-        details:
-            "Writes a completion script to stdout. The shell is required, and one that is not\n\
+        details: "Writes a completion script to stdout. The shell is required, and one that is not\n\
             supported is refused by name rather than guessed at.\n\n\
             The script holds no copy of the command tree: it forwards the words typed so far to\n\
             sbx, which answers from the same table that renders these help pages — so completion\n\
             cannot drift from the CLI, and a command added tomorrow completes with no script to\n\
             regenerate. Command and subcommand names complete at every depth, option names once\n\
-            a word begins with `-`. Values are left to the shell's own file completion, and\n\
-            everything after a `--` belongs to the launched command, so `sbx run -- ls <TAB>`\n\
-            completes files rather than sbx's verbs.\n\n\
+            a word begins with `-`, and the values the table names are completed from sbx's own\n\
+            registries: the live sessions' ids, the configured stores, installed plugins, the\n\
+            app profiles, the per-project trees, the config keys and task sections of the\n\
+            files in front of this one, plus the cells the grammar itself spells out (a\n\
+            `bash`/`zsh`, an upgrade target, a `--net` posture). Only a path is left to the\n\
+            shell's own file completion; everything after a `--` belongs to the launched\n\
+            command, so `sbx run -- ls <TAB>` completes files rather than sbx's verbs.\n\n\
             Load it into the current shell with `source <(sbx completion bash)` (or `zsh`), or\n\
             install it once: bash reads\n\
             `~/.local/share/bash-completion/completions/sbx`, zsh reads an `_sbx` file on its\n\
@@ -160,8 +163,7 @@ const PAGES: &[Page] = &[
             ),
             ("--", "end sbx's own flags; everything after runs literally"),
         ],
-        details:
-            "Runs <command> inside the project sandbox and propagates its exit status. A `--`\n\
+        details: "Runs <command> inside the project sandbox and propagates its exit status. A `--`\n\
             separates sbx's flags from the command's, so `sbx run -- --detach` runs the\n\
             literal `--detach`.\n\n\
             With no command, `sbx run` opens the project shell: on a terminal, an interactive\n\
@@ -220,8 +222,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx mise <args...>",
         summary: "run the in-cage mise to self-equip a project's toolchain",
         options: &[],
-        details:
-            "Passes its arguments through to the mise that runs inside the cage, so an agent\n\
+        details: "Passes its arguments through to the mise that runs inside the cage, so an agent\n\
             can self-equip a project's tools into the project's own store, e.g.\n\
             `sbx mise install nix:jq` or `sbx mise use -g aqua:BurntSushi/ripgrep`.\n\
             For mise's own help, run `sbx mise help`.",
@@ -231,8 +232,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx app <subcommand> [args...]",
         summary: "launch or manage named application profiles",
         options: &[],
-        details:
-            "A named application profile (a project [app.<name>] overlay, or an imported\n\
+        details: "A named application profile (a project [app.<name>] overlay, or an imported\n\
             apps/<name>.toml profile — a global app lives as a profile file, not inline in\n\
             sbx.toml) runs inside the project sandbox, each with its own persistent isolated home.\n\n\
             `sbx app run <name>` launches one; `import`/`export`/`rm`/`list`/`show`/`prune` manage\n\
@@ -270,6 +270,11 @@ const PAGES: &[Page] = &[
                 "with --net-learn, print the rules that would be added without writing them",
             ),
             (
+                "<name>",
+                "the application profile to launch: an imported app, or one the project \
+                 declares in an `[app.<name>]` overlay",
+            ),
+            (
                 "--config <toml|@file>",
                 "one-shot config override for this launch, beating the app's own posture; \
                  repeatable (see `sbx help run`)",
@@ -281,8 +286,7 @@ const PAGES: &[Page] = &[
                  see `sbx help run`",
             ),
         ],
-        details:
-            "`sbx app run <name>` launches a named application profile (a project [app.<name>]\n\
+        details: "`sbx app run <name>` launches a named application profile (a project [app.<name>]\n\
             overlay, or an imported apps/<name>.toml profile — a global app lives as a profile file,\n\
             not inline in sbx.toml) inside the project sandbox, each with its own persistent isolated\n\
             home.\n\n\
@@ -334,8 +338,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx test <subcommand> <target>",
         summary: "check whether an access would be allowed, and why",
         options: &[],
-        details:
-            "A diagnostic surface meant to grow with sbx's access controls. No launch, no nix,\n\
+        details: "A diagnostic surface meant to grow with sbx's access controls. No launch, no nix,\n\
             no network — it reports a verdict against the resolved policy.",
     },
     Page {
@@ -343,8 +346,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net <subcommand> [args...]",
         summary: "inspect the egress policy, its rules, and parked `ask` requests",
         options: &[],
-        details:
-            "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
+        details: "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
             `groups` lists the reusable `[net.groups]` egress groups (referenced by `@<name>`) and\n\
             resolves one to its entries; `allow`/`deny <rule>` persist a rule to config and\n\
             `unallow`/`undeny` take one back out; `mute`/`unmute <rule>` add/remove a\n\
@@ -360,8 +362,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx proc <subcommand> [args...]",
         summary: "observe — and, under [proc] enforcement, block — what a sandbox execs",
         options: &[],
-        details:
-            "The in-cage process/exec surface, sibling of `sbx net`. `sbx proc ls` snapshots a\n\
+        details: "The in-cage process/exec surface, sibling of `sbx net`. `sbx proc ls` snapshots a\n\
             session's process tree and `sbx proc live` watches it redrawn — both read-only, host-side,\n\
             and always available (they read `/proc` with no privilege, no cage cooperation, no\n\
             launch). `sbx proc logs` is the exec-event feed: the processes the agent has spawned, in\n\
@@ -385,10 +386,12 @@ const PAGES: &[Page] = &[
                 "<id>",
                 "the PID `sbx session ls` shows; omit it when only one session is live",
             ),
-            ("--json", "emit the tree as JSON instead of the indented view"),
+            (
+                "--json",
+                "emit the tree as JSON instead of the indented view",
+            ),
         ],
-        details:
-            "Shows the tree of processes the agent has spawned inside the cage, read host-side from\n\
+        details: "Shows the tree of processes the agent has spawned inside the cage, read host-side from\n\
             `/proc` — the launcher (or bubblewrap on the exec path) is the root, and every cage\n\
             process is one of its descendants. No privilege, no cage cooperation, no launch. With no\n\
             id the sole live session is used; otherwise name one by its PID.",
@@ -411,8 +414,7 @@ const PAGES: &[Page] = &[
                 "emit one snapshot object per tick (NDJSON), for a pipe",
             ),
         ],
-        details:
-            "The `top`-style live view of `sbx proc ls`: the process tree an agent has spawned inside\n\
+        details: "The `top`-style live view of `sbx proc ls`: the process tree an agent has spawned inside\n\
             its cage, redrawn in place on an interval until the session ends or you interrupt, so you\n\
             see processes start and finish in real time. Requires a terminal; `--json` streams one\n\
             snapshot per tick and works in a pipe. Read-only and host-side — it just polls `/proc`.",
@@ -430,13 +432,9 @@ const PAGES: &[Page] = &[
                 "-f, --follow",
                 "stream new events until the session ends (Ctrl+C to stop)",
             ),
-            (
-                "--json",
-                "emit one object per event (NDJSON), for a pipe",
-            ),
+            ("--json", "emit one object per event (NDJSON), for a pipe"),
         ],
-        details:
-            "The exec-event feed — the processes an agent spawns inside its cage, in order, with the\n\
+        details: "The exec-event feed — the processes an agent spawns inside its cage, in order, with the\n\
             time each was first seen. Unlike `sbx proc ls`/`live` (which snapshot the tree of any\n\
             session), this reads a recorded event stream, so the session must have been launched with\n\
             observation on: `sbx run --observe` (or `sbx app run <name> --observe`). A session without\n\
@@ -468,8 +466,7 @@ const PAGES: &[Page] = &[
                 "decide every parked exec in session `<pid>` at once",
             ),
         ],
-        details:
-            "Under `[proc] mode = \"ask\"`, an exec matching neither the `allow` nor `deny` list is\n\
+        details: "Under `[proc] mode = \"ask\"`, an exec matching neither the `allow` nor `deny` list is\n\
             parked — the process blocks in the syscall — awaiting a decision. `sbx proc pending` lists\n\
             the parked execs across the live sessions; `allow <id>` lets one run, `deny <id>` refuses\n\
             it (EPERM, never running). A parked exec not decided within the ask timeout is auto-denied\n\
@@ -477,8 +474,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["proc", "allow"],
-        synopsis:
-            "sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        synopsis: "sbx proc allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist an allow rule to a config file's [proc] list (or load it live with --session)",
         options: &[
             (
@@ -500,8 +496,7 @@ const PAGES: &[Page] = &[
                 "with `--session`, widen the live load to every reachable session (all projects), not just the current one",
             ),
         ],
-        details:
-            "Adds a rule to the `[proc]` allow list. An `allow` rule only takes effect under\n\
+        details: "Adds a rule to the `[proc]` allow list. An `allow` rule only takes effect under\n\
             `mode = \"ask\"` (it exempts a target from parking); under `enforce` everything not denied\n\
             already runs, so an allow there is inert and is refused. Set `mode = \"ask\"` first (or use\n\
             `deny`). Writing the project config re-trusts it (it must be absent or already trusted\n\
@@ -519,13 +514,15 @@ const PAGES: &[Page] = &[
         synopsis: "sbx proc unallow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "remove an allow rule from a config file's [proc] list (the inverse of `sbx proc allow`)",
         options: &[
-            ("<rule>", "the allow rule to remove — an exact-string match of what was written, as `sbx config show` lists it"),
+            (
+                "<rule>",
+                "the allow rule to remove — an exact-string match of what was written, as `sbx config show` lists it",
+            ),
             ("-l, --local", "edit the project .sbx.toml (the default)"),
             ("-g, --global", "edit the global sbx.toml"),
             ("-a, --app <name>", "edit that app's `[app.<name>.proc]`"),
         ],
-        details:
-            "Removes an `allow` rule added by `sbx proc allow`. Idempotent: removing a rule that is\n\
+        details: "Removes an `allow` rule added by `sbx proc allow`. Idempotent: removing a rule that is\n\
             not there is a reported no-op, not an error. Editing the project config re-trusts it\n\
             (only when something actually changed); the global config and app profiles are trusted\n\
             by location.\n\
@@ -545,8 +542,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["proc", "deny"],
-        synopsis:
-            "sbx proc deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
+        synopsis: "sbx proc deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist a deny rule to a config file's [proc] list (or load it live with --session)",
         options: &[
             (
@@ -568,8 +564,7 @@ const PAGES: &[Page] = &[
                 "with `--session`, widen the live load to every reachable session (all projects), not just the current one",
             ),
         ],
-        details:
-            "Adds a rule to the `[proc]` deny list — the target is blocked before its `execve` runs\n\
+        details: "Adds a rule to the `[proc]` deny list — the target is blocked before its `execve` runs\n\
             (EPERM, the syscall never runs), and `deny` always wins over `allow`. On a fresh project\n\
             with no `[proc]` yet, `deny` bootstraps `mode = \"enforce\"` (a denylist), so it takes\n\
             effect at once; an existing `off`/`observe` mode is refused (a rule would be inert). Writing\n\
@@ -587,13 +582,15 @@ const PAGES: &[Page] = &[
         synopsis: "sbx proc undeny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "remove a deny rule from a config file's [proc] list (the inverse of `sbx proc deny`)",
         options: &[
-            ("<rule>", "the deny rule to remove — an exact-string match of what was written, as `sbx config show` lists it"),
+            (
+                "<rule>",
+                "the deny rule to remove — an exact-string match of what was written, as `sbx config show` lists it",
+            ),
             ("-l, --local", "edit the project .sbx.toml (the default)"),
             ("-g, --global", "edit the global sbx.toml"),
             ("-a, --app <name>", "edit that app's `[app.<name>.proc]`"),
         ],
-        details:
-            "Removes a `deny` rule added by `sbx proc deny`. Idempotent: removing a rule that is not\n\
+        details: "Removes a `deny` rule added by `sbx proc deny`. Idempotent: removing a rule that is not\n\
             there is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
             when something actually changed); the global config and app profiles are trusted by\n\
             location.\n\
@@ -617,17 +614,13 @@ const PAGES: &[Page] = &[
         synopsis: "sbx proc rules [-a|--app <name>] [--all]",
         summary: "list the live --session rule overlay of the running enforcing session(s)",
         options: &[
-            (
-                "-a, --app <name>",
-                "list only the session(s) of that app",
-            ),
+            ("-a, --app <name>", "list only the session(s) of that app"),
             (
                 "--all",
                 "list every reachable session (all projects), not just the current one",
             ),
         ],
-        details:
-            "Lists the exec rules loaded live with `sbx proc allow`/`deny --session` across the running\n\
+        details: "Lists the exec rules loaded live with `sbx proc allow`/`deny --session` across the running\n\
             enforcing session(s). These are session-scoped and never written to config, so nothing else\n\
             surfaces them — the config-file `[proc]` rules are shown by `sbx config show`. Scopes to the\n\
             current project by default; `-a <app>`/`--all` widen it.",
@@ -637,8 +630,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx fs <subcommand> [args...]",
         summary: "observe the files a running sandbox writes in its project",
         options: &[],
-        details:
-            "The filesystem lens of a running session, sibling of `sbx proc` (processes) and `sbx net`\n\
+        details: "The filesystem lens of a running session, sibling of `sbx proc` (processes) and `sbx net`\n\
             (egress). `sbx fs logs` is the file-write feed: the files the agent creates, writes,\n\
             deletes, or moves in its project tree, observed host-side with inotify — available for a\n\
             session launched with observation on (`sbx run --observe`).\n\
@@ -672,13 +664,9 @@ const PAGES: &[Page] = &[
                 "-f, --follow",
                 "stream new events until the session ends (Ctrl+C to stop)",
             ),
-            (
-                "--json",
-                "emit one object per event (NDJSON), for a pipe",
-            ),
+            ("--json", "emit one object per event (NDJSON), for a pipe"),
         ],
-        details:
-            "The file-write feed — the files an agent creates, writes (`write` is a completed\n\
+        details: "The file-write feed — the files an agent creates, writes (`write` is a completed\n\
             write-and-close), deletes (`remove`), or moves (`rename`) in its project tree, in order,\n\
             with the time each change was seen. Observed host-side with inotify (no privilege, no cage\n\
             cooperation), so the session must have been launched with observation on: `sbx run\n\
@@ -699,8 +687,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx ssh-agent <subcommand> [args...]",
         summary: "what a running sandbox asked your ssh keys to sign",
         options: &[],
-        details:
-            "The credential lens of a running session, sibling of `sbx net` (egress), `sbx fs`\n\
+        details: "The credential lens of a running session, sibling of `sbx net` (egress), `sbx fs`\n\
             (files) and `sbx proc` (processes). A cage granted a key through `[ssh_agent] allow`\n\
             never holds it — it asks a filtering broker, which asks your own agent. `sbx ssh-agent\n\
             logs` is the record of those asks.\n\
@@ -722,8 +709,7 @@ const PAGES: &[Page] = &[
             ),
             ("--json", "emit one object per event (NDJSON), for a pipe"),
         ],
-        details:
-            "One line per decision the ssh-agent broker made, in order, with the time it was made:\n\
+        details: "One line per decision the ssh-agent broker made, in order, with the time it was made:\n\
             \n\
               list     which granted keys were offered, and how many were withheld\n\
               sign     a signature was produced — with which key, and toward which server\n\
@@ -746,8 +732,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx secret <subcommand> [args...]",
         summary: "the credential inventory this configuration declares",
         options: &[],
-        details:
-            "What credentials this project carries and what they are for — by name. Values are never\n\
+        details: "What credentials this project carries and what they are for — by name. Values are never\n\
             read and sources are never resolved: an inventory that decrypted a sops file to print a\n\
             name would be a way to make sbx decrypt on demand.\n\
             \n\
@@ -769,8 +754,7 @@ const PAGES: &[Page] = &[
                 "also show where each value would come from, by locator (a variable name, a file path)",
             ),
         ],
-        details:
-            "One line per credential: its name, where it goes (a destination host for a wire\n\
+        details: "One line per credential: its name, where it goes (a destination host for a wire\n\
             injection, the operation and variable for a task credential), and its description.\n\
             \n\
             Set `name` and `description` on a `[secret.\"host\"]` entry to make this listing legible —\n\
@@ -783,8 +767,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx task <subcommand> [args...]",
         summary: "list and invoke the declared operations a session offers",
         options: &[],
-        details:
-            "A **declared operation** is a fixed command sbx runs on a caller's behalf, in an\n\
+        details: "A **declared operation** is a fixed command sbx runs on a caller's behalf, in an\n\
             ephemeral sibling cage, with a credential the caller never holds — so an agent can use a\n\
             token or a database password without the value ever entering its own cage. Declared as\n\
             `[task.<name>]` in a trusted config, an app profile, or a bundle.\n\
@@ -825,8 +808,7 @@ const PAGES: &[Page] = &[
                 "the session to ask (host-side, when several offer operations)",
             ),
         ],
-        details:
-            "One row per operation: its name, its parameter names and its timeout. A column appears\n\
+        details: "One row per operation: its name, its parameter names and its timeout. A column appears\n\
             only when some operation makes it worth showing — a hidden stream, an output directory,\n\
             a missing tool — because a column that reads the same on every line is not information.\n\
             \n\
@@ -861,8 +843,7 @@ const PAGES: &[Page] = &[
             ("<operation>", "show only what this one carries"),
             ("--session <id>", "the session to ask"),
         ],
-        details:
-            "Names, the operation each belongs to, the encoding it is rendered with, and its\n\
+        details: "Names, the operation each belongs to, the encoding it is rendered with, and its\n\
             description. Never a value, and never a source locator: what a caller needs to know is\n\
             which credentials an operation carries, not where they come from.\n\
             \n\
@@ -874,7 +855,10 @@ const PAGES: &[Page] = &[
         synopsis: "sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--detach] [--session <id>] [--json]",
         summary: "invoke one declared operation",
         options: &[
-            ("<name>", "the operation to run, as `sbx task list` shows it"),
+            (
+                "<name>",
+                "the operation to run, as `sbx task list` shows it",
+            ),
             (
                 "-p, --param KEY=VALUE",
                 "a declared parameter's value; repeatable. Refused unless it satisfies the declared bound",
@@ -887,11 +871,16 @@ const PAGES: &[Page] = &[
                 "--detach",
                 "start it and print its invocation id instead of waiting; collect it with `sbx task result` (host-side only)",
             ),
-            ("--session <id>", "the session to run in (host-side, when several offer operations)"),
-            ("--json", "print the whole result as one JSON document on stdout, streams included"),
+            (
+                "--session <id>",
+                "the session to run in (host-side, when several offer operations)",
+            ),
+            (
+                "--json",
+                "print the whole result as one JSON document on stdout, streams included",
+            ),
         ],
-        details:
-            "The exit code is the command's own, so an operation composes in a script like the program\n\
+        details: "The exit code is the command's own, so an operation composes in a script like the program\n\
             it wraps; a *refusal* — an unknown operation, a value outside its bound, an unlisted\n\
             variable, an exhausted quota — is exit **125** and never runs anything, so it stays\n\
             distinguishable from the command having run and failed.\n\
@@ -933,8 +922,7 @@ const PAGES: &[Page] = &[
             ("--session <id>", "the session that ran it"),
             ("--json", "the same document `sbx task run --json` prints"),
         ],
-        details:
-            "Identical to what a foreground `sbx task run` would have printed, down to the exit code:\n\
+        details: "Identical to what a foreground `sbx task run` would have printed, down to the exit code:\n\
             detaching changes *when* a result arrives and nothing about what it is. The streams are\n\
             already substituted and truncated exactly as they would have been.\n\
             \n\
@@ -959,8 +947,7 @@ const PAGES: &[Page] = &[
                 "the session to ask, when several offer operations",
             ),
         ],
-        details:
-            "One line per invocation in flight: its id, which operation it is, how long it has been\n\
+        details: "One line per invocation in flight: its id, which operation it is, how long it has been\n\
             running, the pid of its cage, and its state — `running`, `detached` (nobody is waiting\n\
             for it), or `stopping` (a stop has been asked for and it has not ended yet).\n\
             \n\
@@ -981,10 +968,12 @@ const PAGES: &[Page] = &[
                 "<invocation>|<operation>",
                 "an invocation id, running or finished, or an operation's name",
             ),
-            ("--session <id>", "which session to ask, when several declare the same name"),
+            (
+                "--session <id>",
+                "which session to ask, when several declare the same name",
+            ),
         ],
-        details:
-            "The listings answer \"what is there\" a line at a time; this answers \"what is *that*\" in\n\
+        details: "The listings answer \"what is there\" a line at a time; this answers \"what is *that*\" in\n\
             full: for a running invocation its state, pid and elapsed time, and the command with this\n\
             invocation's parameters substituted in; for one that is over, what the log kept. Both\n\
             then carry the declaration it runs under — the ceilings, the streams, what it may reach\n\
@@ -1010,10 +999,12 @@ const PAGES: &[Page] = &[
                 "<invocation|operation>",
                 "the invocation id `sbx task status` shows, or the operation's name when only one of its invocations is running",
             ),
-            ("--session <id>", "the session it is running in, when several offer operations"),
+            (
+                "--session <id>",
+                "the session it is running in, when several offer operations",
+            ),
         ],
-        details:
-            "The cage is torn down, so nothing the operation started outlives it. The caller gets its\n\
+        details: "The cage is torn down, so nothing the operation started outlives it. The caller gets its\n\
             result with whatever the command produced up to that point, marked **stopped** — which\n\
             stays distinct from the timeout that ends an invocation the same way, because one is the\n\
             declaration's ceiling firing and the other is you deciding.\n\
@@ -1037,8 +1028,7 @@ const PAGES: &[Page] = &[
             ),
             ("--session <id>", "the session whose log to read"),
         ],
-        details:
-            "One line per invocation: its id, when it finished, which operation, the exit code, how\n\
+        details: "One line per invocation: its id, when it finished, which operation, the exit code, how\n\
             many credential values were substituted out, whether the output was truncated, whether\n\
             the timeout fired or a stop ended it, and how long it took. A refusal is recorded too,\n\
             with its reason.\n\
@@ -1058,8 +1048,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx plugins <subcommand> [args...]",
         summary: "inspect and manage resolver plugins and plugin stores",
         options: &[],
-        details:
-            "Host-level — reads the data directory, not a project's config. A resolver plugin\n\
+        details: "Host-level — reads the data directory, not a project's config. A resolver plugin\n\
             declares a `scheme://` sbx can route a secret `from` reference to.",
     },
     Page {
@@ -1067,8 +1056,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx session <subcommand> [args...]",
         summary: "inspect and control the live sandbox sessions",
         options: &[],
-        details:
-            "A session is a live sandbox cage. `sbx session ls` lists them, `sbx session logs`\n\
+        details: "A session is a live sandbox cage. `sbx session ls` lists them, `sbx session logs`\n\
             shows a detached one's output, `sbx session attach` runs a shell or a command inside\n\
             one, and `sbx session stop` ends them. Host-side — reads the on-disk session registry\n\
             (daemonless), launches nothing. `sbx sessions` is an alias.\n\
@@ -1080,8 +1068,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx session ls  (alias: sbx session list)",
         summary: "list the live sandbox sessions",
         options: &[],
-        details:
-            "Lists the live sandbox sessions from the on-disk registry (daemonless). Reading\n\
+        details: "Lists the live sandbox sessions from the on-disk registry (daemonless). Reading\n\
             the registry re-validates and prunes dead records, so the list is always\n\
             current. An app session shows its app name, so you can tell which sessions are\n\
             agents. MODE says how each was launched: `detached` for a background daemon\n\
@@ -1104,8 +1091,7 @@ const PAGES: &[Page] = &[
                 "show every session that wrote to this log, not just the most recent",
             ),
         ],
-        details:
-            "A session started with --detach has no terminal, so its output is redirected to\n\
+        details: "A session started with --detach has no terminal, so its output is redirected to\n\
             `<data>/logs/<id>.log`. This reads that file back. A foreground session has no log —\n\
             its output is on the terminal that started it — and `sbx session ls` marks which is\n\
             which in its MODE column.\n\
@@ -1134,8 +1120,7 @@ const PAGES: &[Page] = &[
                 "run this command in the cage instead of an interactive shell",
             ),
         ],
-        details:
-            "Joins the running cage the way `docker exec` does — the agent's live processes, its\n\
+        details: "Joins the running cage the way `docker exec` does — the agent's live processes, its\n\
             real /tmp, and its network. With no command it opens an interactive shell (needs a\n\
             terminal); with `-- command` it runs that command: through a pty when stdin is a\n\
             terminal (interactive, job control), through inherited stdio when it is a pipe or\n\
@@ -1164,8 +1149,7 @@ const PAGES: &[Page] = &[
                 "seconds to wait after SIGTERM before SIGKILL (default 10; 0 = at once)",
             ),
         ],
-        details:
-            "Sends SIGTERM, then SIGKILL after the grace delay. Either ids or --all is required,\n\
+        details: "Sends SIGTERM, then SIGKILL after the grace delay. Either ids or --all is required,\n\
             not both. --all targets every session, interactive shells included.",
     },
     Page {
@@ -1187,8 +1171,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx untrust [path]",
         summary: "revoke a project config's trust",
         options: &[("[path]", "the config to act on (default ./.sbx.toml)")],
-        details:
-            "Revokes a config's trust, so its security-relevant fields stop applying until it\n\
+        details: "Revokes a config's trust, so its security-relevant fields stop applying until it\n\
             is trusted again.",
     },
     Page {
@@ -1196,8 +1179,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx config <subcommand>",
         summary: "inspect and edit the project configuration",
         options: &[],
-        details:
-            "Inspect or edit the configuration for the current project. `sbx config show` prints\n\
+        details: "Inspect or edit the configuration for the current project. `sbx config show` prints\n\
             the resolved, trust-gated view a launch would use (add --json for the machine-readable\n\
             model); get/set/add/rm/unset read and edit a single raw layer file; path prints which file a\n\
             scope targets; and edit opens it in your editor.\n\
@@ -1218,8 +1200,7 @@ const PAGES: &[Page] = &[
                 "address the key under that app (app.<name>.<key> inline, or -g reads its profile)",
             ),
         ],
-        details:
-            "Prints the value declared at a dotted key in one layer file. This is the raw declared\n\
+        details: "Prints the value declared at a dotted key in one layer file. This is the raw declared\n\
             value in that file — for the effective resolved value across layers, use `sbx config\n\
             show` (or `sbx config show --json`). An unset key exits 1; an array or table value is\n\
             edited with `sbx config edit`, not read as a single value.\n\
@@ -1251,8 +1232,7 @@ const PAGES: &[Page] = &[
                 "re-trust the file after writing (applies its security fields at once)",
             ),
         ],
-        details:
-            "Writes a value at a dotted key, preserving the file's other keys, comments, and\n\
+        details: "Writes a value at a dotted key, preserving the file's other keys, comments, and\n\
             formatting. Creates the file and intermediate tables as needed.\n\
             \n\
             The value is written in the type the schema expects: `true`/`false` become booleans and\n\
@@ -1280,7 +1260,10 @@ const PAGES: &[Page] = &[
         synopsis: "sbx config add <key> <entry> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
         summary: "add one entry to a list field, leaving the rest of the list alone",
         options: &[
-            ("<key>", "a dotted key holding a list, e.g. fs.deny or seccomp.allow"),
+            (
+                "<key>",
+                "a dotted key holding a list, e.g. fs.deny or seccomp.allow",
+            ),
             ("<entry>", "the entry to add; already present is a no-op"),
             ("-l, --local", "the project .sbx.toml (the default)"),
             ("-g, --global", "the global sbx.toml"),
@@ -1294,8 +1277,7 @@ const PAGES: &[Page] = &[
                 "re-trust the file after writing (applies its security fields at once)",
             ),
         ],
-        details:
-            "Appends one entry to the list at <key>, creating the list (and its table) if absent.\n\
+        details: "Appends one entry to the list at <key>, creating the list (and its table) if absent.\n\
             The rest of the list, the file's other keys, and its comments are untouched — which is\n\
             what separates this from `sbx config set <key> '[…]'`, where you restate the whole list\n\
             and can drop an entry by omission. So `config add fs.deny .env` adds one path where\n\
@@ -1320,7 +1302,10 @@ const PAGES: &[Page] = &[
         synopsis: "sbx config rm <key> <entry> [-l|--local|-g|--global|-c <file>] [-a|--app <name>] [--trust]",
         summary: "remove one entry from a list field",
         options: &[
-            ("<key>", "a dotted key holding a list, e.g. fs.deny or network.allow"),
+            (
+                "<key>",
+                "a dotted key holding a list, e.g. fs.deny or network.allow",
+            ),
             ("<entry>", "the entry to remove; not present is a no-op"),
             ("-l, --local", "the project .sbx.toml (the default)"),
             ("-g, --global", "the global sbx.toml"),
@@ -1334,8 +1319,7 @@ const PAGES: &[Page] = &[
                 "re-trust the file after writing (applies its security fields at once)",
             ),
         ],
-        details:
-            "Removes one entry from the list at <key>, leaving the other entries and the file's\n\
+        details: "Removes one entry from the list at <key>, leaving the other entries and the file's\n\
             comments in place. An entry that is not there changes nothing (and so never re-arms\n\
             trust), the same as `sbx config unset` on a key that was not set.\n\
             \n\
@@ -1366,8 +1350,7 @@ const PAGES: &[Page] = &[
             ),
             ("--trust", "re-trust the file after writing"),
         ],
-        details:
-            "Removes a dotted key from one layer file. Removing a key that is not set changes\n\
+        details: "Removes a dotted key from one layer file. Removing a key that is not set changes\n\
             nothing (and so never re-arms trust). A removal that does change a trusted project\n\
             file re-arms its trust gate, the same as `set` (the global config and app profiles\n\
             are trusted by location, so a removal there needs no re-trust).\n\
@@ -1383,13 +1366,15 @@ const PAGES: &[Page] = &[
         synopsis: "sbx config path [-l|--local|-g|--global|-c <file>]",
         summary: "show the config files in resolution order, or one scope's path",
         options: &[
-            ("(no flag)", "list every config layer in resolution order, marking which exist"),
+            (
+                "(no flag)",
+                "list every config layer in resolution order, marking which exist",
+            ),
             ("-l, --local", "print only the project .sbx.toml path"),
             ("-g, --global", "print only the global sbx.toml path"),
             ("-c <file>", "print only this explicit config file path"),
         ],
-        details:
-            "With no scope flag, lists the config files a launch resolves — the global sbx.toml\n\
+        details: "With no scope flag, lists the config files a launch resolves — the global sbx.toml\n\
             (the base) then the project .sbx.toml (which overlays it) — and whether each exists,\n\
             so it is clear where sbx looks even before any file is created. With a scope flag,\n\
             prints just that file's path (the one get/set/add/rm/unset/edit would touch) — for scripting\n\
@@ -1405,8 +1390,7 @@ const PAGES: &[Page] = &[
             ("-c <file>", "an explicit config file"),
             ("--trust", "re-trust the file after editing"),
         ],
-        details:
-            "Opens the target file in $VISUAL or $EDITOR (falling back to vi) — the way to edit\n\
+        details: "Opens the target file in $VISUAL or $EDITOR (falling back to vi) — the way to edit\n\
             fields `set` does not handle as a single value, such as binds, an allowlist, secrets,\n\
             or app tables. A `binds` entry is an absolute host path, bound read-only by default;\n\
             write it as a table `{ path = \"/abs/path\", mode = \"rw\" }` to bind it read-write\n\
@@ -1444,11 +1428,16 @@ const PAGES: &[Page] = &[
                 "-g, --global",
                 "show only what the global config (and imported profiles) contributes",
             ),
-            ("-l, --local", "show only what the project .sbx.toml contributes"),
-            ("-d, --default", "show the built-in defaults alone (no config)"),
+            (
+                "-l, --local",
+                "show only what the project .sbx.toml contributes",
+            ),
+            (
+                "-d, --default",
+                "show the built-in defaults alone (no config)",
+            ),
         ],
-        details:
-            "Shows the resolved configuration for the current project — the layered global and\n\
+        details: "Shows the resolved configuration for the current project — the layered global and\n\
             project environment, binds, packages, tools, network, GUI, secrets, the closed and\n\
             read-only project paths, the declared operations, resource limits, the seccomp\n\
             relaxation, the host device grant, the ssh-agent grant, and app profiles, after the\n\
@@ -1535,8 +1524,7 @@ const PAGES: &[Page] = &[
                  and inodes freed. Covers this project's store, and the shared store under --all.",
             ),
         ],
-        details:
-            "By default it sweeps the current project's store. Reclamation is irreversible, so\n\
+        details: "By default it sweeps the current project's store. Reclamation is irreversible, so\n\
             the destructive form is opt-in.\n\
             \n\
             `--all` additionally collects the shared store — the closures no live project or\n\
@@ -1570,21 +1558,50 @@ const PAGES: &[Page] = &[
         synopsis: "sbx storage <init|migrate|use|status|up|down|unuse> [--image <path>] [--size <n>]",
         summary: "manage a compressed, self-growing volume for sbx's data directory",
         options: &[
-            ("init", "create the volume (refuses to touch an existing one)"),
-            ("migrate", "copy the existing data directory into the volume, then use it"),
-            ("use", "make sbx keep its data there, mounting it automatically from now on"),
-            ("status", "where the volume stands, and what it costs the host"),
-            ("up", "mount it now (rarely needed: sbx mounts it when it needs it)"),
+            (
+                "init",
+                "create the volume (refuses to touch an existing one)",
+            ),
+            (
+                "migrate",
+                "copy the existing data directory into the volume, then use it",
+            ),
+            (
+                "use",
+                "make sbx keep its data there, mounting it automatically from now on",
+            ),
+            (
+                "status",
+                "where the volume stands, and what it costs the host",
+            ),
+            (
+                "up",
+                "mount it now (rarely needed: sbx mounts it when it needs it)",
+            ),
             ("down", "unmount and detach it"),
-            ("unuse", "go back to the ordinary data directory, leaving the volume untouched"),
-            ("--force", "with `use`/`migrate`, proceed although a directory holds data"),
-            ("--image <path>", "the image file (default: beside the data directory)"),
-            ("--size <n>", "logical size at init, e.g. 200G (default 200G)"),
-            ("--label <name>", "filesystem label, which names the mount point"),
+            (
+                "unuse",
+                "go back to the ordinary data directory, leaving the volume untouched",
+            ),
+            (
+                "--force",
+                "with `use`/`migrate`, proceed although a directory holds data",
+            ),
+            (
+                "--image <path>",
+                "the image file (default: beside the data directory)",
+            ),
+            (
+                "--size <n>",
+                "logical size at init, e.g. 200G (default 200G)",
+            ),
+            (
+                "--label <name>",
+                "filesystem label, which names the mount point",
+            ),
             ("--json", "emit `status` as a JSON document"),
         ],
-        details:
-            "sbx's data directory is the one tree that grows without bound — the shared nix store,\n\
+        details: "sbx's data directory is the one tree that grows without bound — the shared nix store,\n\
             a runtime tree per project, a home per app — and it is inode-heavy by nature. On a\n\
             filesystem whose inode table is fixed when it is created, it can crowd the host long\n\
             before the disk is full. A volume puts that tree inside a single host file: one inode\n\
@@ -1636,8 +1653,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx store [--json]",
         summary: "report what sbx occupies on disk, subtree by subtree",
         options: &[("--json", "emit the report as a JSON document")],
-        details:
-            "The footprint of sbx's whole data directory, largest subtree first, each with its\n\
+        details: "The footprint of sbx's whole data directory, largest subtree first, each with its\n\
             size and its inode count. `sbx app list` accounts for the app homes and `sbx projects\n\
             list` for the per-project runtime trees; this covers everything, including the shared\n\
             nix store, which is routinely the largest tree and which `sbx gc` describes only in\n\
@@ -1700,10 +1716,12 @@ const PAGES: &[Page] = &[
                 "--gc",
                 "after a real removal, collect the shared store's now-orphaned closures",
             ),
-            ("-f, --force", "allow removing the current project's own tree"),
+            (
+                "-f, --force",
+                "allow removing the current project's own tree",
+            ),
         ],
-        details:
-            "The per-project runtime trees live under `<data>/projects/<id>` and hold each\n\
+        details: "The per-project runtime trees live under `<data>/projects/<id>` and hold each\n\
             project's writable store, isolated home, and locks. `sbx projects list` lists them\n\
             (richer than `sbx path`'s projects section — it adds each tree's on-disk size); `sbx\n\
             projects rm` removes them.\n\
@@ -1722,11 +1740,8 @@ const PAGES: &[Page] = &[
         path: &["path"],
         synopsis: "sbx path [--json]",
         summary: "show every directory sbx uses on disk, grouped by XDG base",
-        options: &[
-            ("--json", "emit the layout as a JSON document for scripting"),
-        ],
-        details:
-            "Lists the on-disk locations sbx owns — the data, config, and state trees — and\n\
+        options: &[("--json", "emit the layout as a JSON document for scripting")],
+        details: "Lists the on-disk locations sbx owns — the data, config, and state trees — and\n\
             marks which exist, so it is clear where sbx puts things even before any file is\n\
             created. Under `projects/` it enumerates each project's runtime tree and annotates it\n\
             with a liveness state — `live` (a running session holds it), `idle` (the project\n\
@@ -1753,8 +1768,7 @@ const PAGES: &[Page] = &[
             ),
             ("--force", "overwrite an existing profile of the same name"),
         ],
-        details:
-            "The deliberate command IS the consent — an agent in the cage cannot run it, and the\n\
+        details: "The deliberate command IS the consent — an agent in the cage cannot run it, and the\n\
             profile stays inert until `sbx app <name>` launches it. The granted posture is\n\
             printed so the act is informed. The bytes are copied verbatim.",
     },
@@ -1769,8 +1783,7 @@ const PAGES: &[Page] = &[
                 "write to a file (default: stdout, composable and clobber-safe)",
             ),
         ],
-        details:
-            "An imported profile is emitted verbatim; an inline app is serialized to a minimal\n\
+        details: "An imported profile is emitted verbatim; an inline app is serialized to a minimal\n\
             profile, as authored (security fields and all — import is the trust act, not\n\
             export). The exported file re-imports identically.",
     },
@@ -1813,8 +1826,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx app list  (alias: sbx app ls)",
         summary: "list apps with their profile and installed home",
         options: &[],
-        details:
-            "One row per app: whether it has an imported profile (the `import`/`rm` artifact) and\n\
+        details: "One row per app: whether it has an imported profile (the `import`/`rm` artifact) and\n\
             whether it has an installed home on disk (its mise tools + login state, with disk size)\n\
             — which `sbx app rm <name> --purge` removes. An app can have a profile with no home yet\n\
             (never launched), or a home with no profile (launched from an inline/project app, or a\n\
@@ -1835,8 +1847,7 @@ const PAGES: &[Page] = &[
             ("<id>", "the tree id (as `sbx projects list` shows it)"),
             ("--json", "emit the detail as a JSON document for scripting"),
         ],
-        details:
-            "The realized-on-disk detail for one per-project runtime tree: its state and size (broken\n\
+        details: "The realized-on-disk detail for one per-project runtime tree: its state and size (broken\n\
             down store / home / other), the nixpkgs channel or pin it resolves against, the store\n\
             roots built in its (shared) store grouped by backend — `nix`, `deb`, `appimage` (a\n\
             host-side `flake:` or `tarball:` build is provisioned like a `nix:` one, so it appears\n\
@@ -1856,8 +1867,7 @@ const PAGES: &[Page] = &[
             ("<name>", "the app whose home(s) to prune"),
             ("-y, --yes", "apply the removal (previews by default)"),
         ],
-        details:
-            "Removes the mise tools an app's home(s) carry that the app's config does not declare —\n\
+        details: "Removes the mise tools an app's home(s) carry that the app's config does not declare —\n\
             the `installed (undeclared)` leftovers `sbx app show` surfaces (a tool from a former\n\
             profile, or one added by hand). Each is deleted from the home's `mise/installs/` and\n\
             dropped from that home's `mise/config.toml` `[tools]` so a later launch does not\n\
@@ -1874,8 +1884,7 @@ const PAGES: &[Page] = &[
             ("<name>", "the app to inspect"),
             ("--json", "emit the detail as a JSON document for scripting"),
         ],
-        details:
-            "The realized-on-disk detail for one app: its profile source, its isolated home(s) with\n\
+        details: "The realized-on-disk detail for one app: its profile source, its isolated home(s) with\n\
             on-disk size (and the mise-tools share broken out), and each declared package annotated\n\
             with whether it is actually installed. A `mise:` tool is read from the app's home; a\n\
             `deb:`/`appimage:`/`flake:` build lives in the per-project nix store, so it is reported\n\
@@ -1891,7 +1900,10 @@ const PAGES: &[Page] = &[
         synopsis: "sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>",
         summary: "test a URL (or an http:///tcp:// target) against the resolved network policy",
         options: &[
-            ("<url>", "the URL (or a bare host, completed to https) to test. `http://host` tests the inspected-cleartext path (opt-in — only an `http://` rule opens it); `tcp://host:port` tests a raw L4 splice instead"),
+            (
+                "<url>",
+                "the URL (or a bare host, completed to https) to test. `http://host` tests the inspected-cleartext path (opt-in — only an `http://` rule opens it); `tcp://host:port` tests a raw L4 splice instead",
+            ),
             (
                 "-a, --app <name>",
                 "test against that app's effective policy (baseline + overlay), not the baseline",
@@ -1901,8 +1913,7 @@ const PAGES: &[Page] = &[
                 "the HTTP method to test (default GET); a method-scoped rule like `{GET} host` only matches that verb (ignored for a tcp:// target — a raw stream has no method)",
             ),
         ],
-        details:
-            "Reports ALLOWED/DENIED/WOULD ASK and the rule that decides it, against the effective\n\
+        details: "Reports ALLOWED/DENIED/WOULD ASK and the rule that decides it, against the effective\n\
             egress policy a launch serves: the built-in self-equip allow-set is included, and a\n\
             declared credential injection is noted (by header and source, never the value, and not\n\
             resolved). A `tcp://host:port` target instead reports SPLICED/NOT SPLICED — whether a\n\
@@ -1933,8 +1944,7 @@ const PAGES: &[Page] = &[
             ),
             ("--json", "emit the mode and rules as JSON"),
         ],
-        details:
-            "Lists the allow/deny rules of the effective filtering posture, each tagged config or\n\
+        details: "Lists the allow/deny rules of the effective filtering posture, each tagged config or\n\
             built-in, reflecting the trust gate (an untrusted project's rules are dropped). Every\n\
             rule names its layer: an inspected-over-TLS rule shows `https://` (a bare host is https on\n\
             443), an inspected-cleartext rule shows `http://` (default port 80), a raw L4 rule shows\n\
@@ -1959,8 +1969,7 @@ const PAGES: &[Page] = &[
             ),
             ("--json", "emit the bundles as JSON"),
         ],
-        details:
-            "A `[bundle.<name>]` bundle is everything one tool needs to be INSTALLED and to REACH its\n\
+        details: "A `[bundle.<name>]` bundle is everything one tool needs to be INSTALLED and to REACH its\n\
             own services: its `packages`, the `env` it reads, its `allow`/`deny`/`mute` egress rules,\n\
             and its `[secret]` credential. An app names one with `use = [\"<name>\"]` and it is folded\n\
             in before resolution — so an orchestrator that drives another agent's CLI states that\n\
@@ -1978,11 +1987,13 @@ const PAGES: &[Page] = &[
         synopsis: "sbx bundle export [<name>…] [-o|--out <file>]",
         summary: "write tool bundles as a portable [bundle.<name>] fragment",
         options: &[
-            ("<name>…", "export only the named bundle(s) (default: every bundle)"),
+            (
+                "<name>…",
+                "export only the named bundle(s) (default: every bundle)",
+            ),
             ("-o, --out <file>", "write to <file> instead of stdout"),
         ],
-        details:
-            "Emits the bundles as a portable `[bundle.<name>]` TOML fragment — to stdout by default\n\
+        details: "Emits the bundles as a portable `[bundle.<name>]` TOML fragment — to stdout by default\n\
             (`sbx bundle export > bundles.toml`), or to `--out <file>`. The inverse of `import`.\n\
             Source comments are not carried (a bundle is data). Read-only, no launch.",
     },
@@ -1991,11 +2002,16 @@ const PAGES: &[Page] = &[
         synopsis: "sbx bundle import <file> [-f|--force]",
         summary: "merge a [bundle.<name>] fragment into the global config",
         options: &[
-            ("<file>", "a `[bundle.<name>]` fragment (e.g. from `sbx bundle export`)"),
-            ("-f, --force", "overwrite a bundle whose name already exists (default: refuse)"),
+            (
+                "<file>",
+                "a `[bundle.<name>]` fragment (e.g. from `sbx bundle export`)",
+            ),
+            (
+                "-f, --force",
+                "overwrite a bundle whose name already exists (default: refuse)",
+            ),
         ],
-        details:
-            "Merges the fragment's bundles into the global config, preserving every existing bundle and\n\
+        details: "Merges the fragment's bundles into the global config, preserving every existing bundle and\n\
             comment (`toml_edit`). Bundles are global-only, so the target is always the global config,\n\
             which is trusted by location — the deliberate command is the consent (an agent in the cage\n\
             cannot run it), so there is no prompt. A name that already exists is refused unless\n\
@@ -2015,8 +2031,7 @@ const PAGES: &[Page] = &[
             ),
             ("--json", "emit the groups and their entries as JSON"),
         ],
-        details:
-            "A `[net.groups]` group is a named set of egress entries declared once in the global\n\
+        details: "A `[net.groups]` group is a named set of egress entries declared once in the global\n\
             config and referenced from a `[network]` allow/deny list with `@<name>`, so a set of hosts\n\
             is shared across apps instead of rewritten per profile. Groups are global-only, so this\n\
             command has no scope flag — it always reads the global config. `sbx net groups` lists the\n\
@@ -2029,11 +2044,13 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net groups export [<name>…] [-o|--out <file>]",
         summary: "write egress groups as a portable [net.groups] fragment",
         options: &[
-            ("<name>…", "export only the named group(s) (default: every group)"),
+            (
+                "<name>…",
+                "export only the named group(s) (default: every group)",
+            ),
             ("-o, --out <file>", "write to <file> instead of stdout"),
         ],
-        details:
-            "Emits the reusable egress groups as a portable `[net.groups]` TOML fragment — to stdout\n\
+        details: "Emits the reusable egress groups as a portable `[net.groups]` TOML fragment — to stdout\n\
             by default (`sbx net groups export > groups.toml`), or to `--out <file>`. The inverse of\n\
             `import`. Source comments are not carried (a group is data). Read-only, no launch.",
     },
@@ -2042,11 +2059,16 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net groups import <file> [-f|--force]",
         summary: "merge a [net.groups] fragment into the global config",
         options: &[
-            ("<file>", "a `[net.groups]` fragment (e.g. from `sbx net groups export`)"),
-            ("-f, --force", "overwrite a group whose name already exists (default: refuse)"),
+            (
+                "<file>",
+                "a `[net.groups]` fragment (e.g. from `sbx net groups export`)",
+            ),
+            (
+                "-f, --force",
+                "overwrite a group whose name already exists (default: refuse)",
+            ),
         ],
-        details:
-            "Merges the fragment's groups into the global config, preserving every existing group and\n\
+        details: "Merges the fragment's groups into the global config, preserving every existing group and\n\
             comment (`toml_edit`). Groups are global-only, so the target is always the global config,\n\
             which is trusted by location — the deliberate command is the consent (an agent in the cage\n\
             cannot run it), so there is no prompt. A name that already exists is refused unless\n\
@@ -2060,15 +2082,26 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist an allow rule to a config file (or load it live with --session)",
         options: &[
-            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
+            (
+                "<rule>",
+                "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch",
+            ),
             ("-l, --local", "write the project .sbx.toml (the default)"),
             ("-g, --global", "write the global sbx.toml"),
-            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)"),
-            ("--session", "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default"),
-            ("--all", "with `--session`, widen the live load to every reachable session (all projects), not just the current one"),
+            (
+                "-a, --app <name>",
+                "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)",
+            ),
+            (
+                "--session",
+                "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default",
+            ),
+            (
+                "--all",
+                "with `--session`, widen the live load to every reachable session (all projects), not just the current one",
+            ),
         ],
-        details:
-            "Validates the rule, then adds it. With no filtering posture yet, `allow` bootstraps a\n\
+        details: "Validates the rule, then adds it. With no filtering posture yet, `allow` bootstraps a\n\
             deny-by-default allowlist. Writing the project config re-trusts it (it must be absent or\n\
             already trusted first); the global config is trusted by location.\n\
             \n\
@@ -2087,13 +2120,15 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net unallow <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "remove an allow rule from a config file (the inverse of `sbx net allow`)",
         options: &[
-            ("<rule>", "the allow rule to remove — an exact-string match of what was written, as `sbx net rules` lists it"),
+            (
+                "<rule>",
+                "the allow rule to remove — an exact-string match of what was written, as `sbx net rules` lists it",
+            ),
             ("-l, --local", "edit the project .sbx.toml (the default)"),
             ("-g, --global", "edit the global sbx.toml"),
             ("-a, --app <name>", "edit that app's `[app.<name>.network]`"),
         ],
-        details:
-            "Removes an `allow` rule added by `sbx net allow`. Idempotent: removing a rule that is not\n\
+        details: "Removes an `allow` rule added by `sbx net allow`. Idempotent: removing a rule that is not\n\
             present is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
             when something actually changed); the global config and app profiles are trusted by\n\
             location.\n\
@@ -2115,15 +2150,26 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist a deny rule to a config file (or load it live with --session)",
         options: &[
-            ("<rule>", "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch"),
+            (
+                "<rule>",
+                "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch",
+            ),
             ("-l, --local", "write the project .sbx.toml (the default)"),
             ("-g, --global", "write the global sbx.toml"),
-            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)"),
-            ("--session", "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default"),
-            ("--all", "with `--session`, widen the live load to every reachable session (all projects), not just the current one"),
+            (
+                "-a, --app <name>",
+                "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)",
+            ),
+            (
+                "--session",
+                "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default",
+            ),
+            (
+                "--all",
+                "with `--session`, widen the live load to every reachable session (all projects), not just the current one",
+            ),
         ],
-        details:
-            "Validates the rule, then adds it (deny always wins over allow). A deny needs an existing\n\
+        details: "Validates the rule, then adds it (deny always wins over allow). A deny needs an existing\n\
             filtering posture — it will not open one — so set the posture first on a fresh config.\n\
             Writing the project config re-trusts it; the global config is trusted by location.\n\
             \n\
@@ -2138,13 +2184,15 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net undeny <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "remove a deny rule from a config file (the inverse of `sbx net deny`)",
         options: &[
-            ("<rule>", "the deny rule to remove — an exact-string match of what was written, as `sbx net rules` lists it"),
+            (
+                "<rule>",
+                "the deny rule to remove — an exact-string match of what was written, as `sbx net rules` lists it",
+            ),
             ("-l, --local", "edit the project .sbx.toml (the default)"),
             ("-g, --global", "edit the global sbx.toml"),
             ("-a, --app <name>", "edit that app's `[app.<name>.network]`"),
         ],
-        details:
-            "Removes a `deny` rule added by `sbx net deny`. Idempotent: removing a rule that is not\n\
+        details: "Removes a `deny` rule added by `sbx net deny`. Idempotent: removing a rule that is not\n\
             present is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
             when something actually changed); the global config and app profiles are trusted by\n\
             location.\n\
@@ -2168,15 +2216,26 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "suppress a denied request's log line without changing the verdict (SELinux `dontaudit`)",
         options: &[
-            ("<rule>", "an egress rule, the same grammar as `allow`/`deny` (a host, `*.domain`, `host/path`, IP, `re:<regex>`, an optional `{GET,POST}` verb prefix, or `@<group>`). It matches a *denied* request whose log line should be kept out of the default `sbx net log`"),
+            (
+                "<rule>",
+                "an egress rule, the same grammar as `allow`/`deny` (a host, `*.domain`, `host/path`, IP, `re:<regex>`, an optional `{GET,POST}` verb prefix, or `@<group>`). It matches a *denied* request whose log line should be kept out of the default `sbx net log`",
+            ),
             ("-l, --local", "write the project .sbx.toml (the default)"),
             ("-g, --global", "write the global sbx.toml"),
-            ("-a, --app <name>", "write the rule under that app's `[app.<name>.network]` (e.g. an imported profile); with `--session`, scope the live load to that app's session(s)"),
-            ("--session", "load the mute into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); it takes effect immediately and dies with the session. Scopes to the current project by default"),
-            ("--all", "with `--session`, widen the live load to every reachable session (all projects)"),
+            (
+                "-a, --app <name>",
+                "write the rule under that app's `[app.<name>.network]` (e.g. an imported profile); with `--session`, scope the live load to that app's session(s)",
+            ),
+            (
+                "--session",
+                "load the mute into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); it takes effect immediately and dies with the session. Scopes to the current project by default",
+            ),
+            (
+                "--all",
+                "with `--session`, widen the live load to every reachable session (all projects)",
+            ),
         ],
-        details:
-            "Adds a `mute` (`dontaudit`) rule: a request matching it is still **denied** and still\n\
+        details: "Adds a `mute` (`dontaudit`) rule: a request matching it is still **denied** and still\n\
             **counted** in `sbx net stats` — only its line is kept out of the default `sbx net log`\n\
             (see it with `sbx net log --all`). It is a log filter, never a verdict: it cannot open\n\
             egress. Use it to quiet the refusals you have deliberately left denied (telemetry, feature\n\
@@ -2198,28 +2257,31 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net unmute <rule> [-l|--local|-g|--global] [-a|--app <name>]",
         summary: "remove a mute rule from a config file (the inverse of `sbx net mute`)",
         options: &[
-            ("<rule>", "the mute rule to remove — an exact-string match of what was muted"),
+            (
+                "<rule>",
+                "the mute rule to remove — an exact-string match of what was muted",
+            ),
             ("-l, --local", "edit the project .sbx.toml (the default)"),
             ("-g, --global", "edit the global sbx.toml"),
             ("-a, --app <name>", "edit that app's `[app.<name>.network]`"),
         ],
-        details:
-            "Removes a `mute` rule added by `sbx net mute`. Idempotent: unmuting a rule that is not\n\
+        details: "Removes a `mute` rule added by `sbx net mute`. Idempotent: unmuting a rule that is not\n\
             present is a reported no-op, not an error. Editing the project config re-trusts it (only\n\
             when something actually changed); the global config and app profiles are trusted by\n\
             location.",
     },
     Page {
         path: &["net", "pending"],
-        synopsis:
-            "sbx net pending [-a <app>] [--json] | sbx net pending allow|deny <id>|--all [-a <app>] [--save ...] | sbx net pending watch [-i <secs>]",
+        synopsis: "sbx net pending [-a <app>] [--json] | sbx net pending allow|deny <id>|--all [-a <app>] [--save ...] | sbx net pending watch [-i <secs>]",
         summary: "list and answer egress requests parked by the `ask` posture",
         options: &[
-            ("-a, --app <name>", "limit the listing / `--all` drain to one app's session(s)"),
+            (
+                "-a, --app <name>",
+                "limit the listing / `--all` drain to one app's session(s)",
+            ),
             ("--json", "list the pending requests as JSON"),
         ],
-        details:
-            "Under `[network] mode = \"ask\"` a request no rule decides parks until answered. With no\n\
+        details: "Under `[network] mode = \"ask\"` a request no rule decides parks until answered. With no\n\
             verb, lists what is parked across every live ask-mode session, each with a `<pid>.<seq>`\n\
             id; identical retries of one URL collapse to a single `×N` line. `allow <id>`/`deny <id>`\n\
             answer that whole destination (every identical retry at once); `allow|deny --all` drain\n\
@@ -2231,11 +2293,16 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net pending watch [-i|--interval <secs>] [-a|--app <name>]",
         summary: "redraw the parked-request listing live until interrupted",
         options: &[
-            ("-i, --interval <secs>", "seconds between refreshes (default 2)"),
-            ("-a, --app <name>", "limit the listing to one app's session(s)"),
+            (
+                "-i, --interval <secs>",
+                "seconds between refreshes (default 2)",
+            ),
+            (
+                "-a, --app <name>",
+                "limit the listing to one app's session(s)",
+            ),
         ],
-        details:
-            "Polls the same live control sockets as `sbx net pending` and redraws the listing in\n\
+        details: "Polls the same live control sockets as `sbx net pending` and redraws the listing in\n\
             place every few seconds (top-style — the terminal scrollback is preserved), so a parked\n\
             request appears as soon as an agent triggers it. Answer it from another shell with\n\
             `sbx net pending allow|deny <id>`; the watch picks up the change on the next refresh.\n\
@@ -2247,16 +2314,33 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net pending allow <id> [-a <app>] [--session] [--save [-l|-g]] | sbx net pending allow --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "allow a parked egress request (optionally remembering or saving a rule)",
         options: &[
-            ("<id>", "the `<pid>.<seq>` id from `sbx net pending` or the launch notice"),
-            ("--all", "allow every parked request at once (every session, or with `-a <app>` only that app's)"),
-            ("--session", "also remember the host:port for this live session, so it is not re-asked"),
-            ("--save", "also persist an allow rule per answered host (scope below; by id or in bulk with --all)"),
-            ("-l, --local", "with --save: write the project .sbx.toml (the default; with --all, drains only this project)"),
+            (
+                "<id>",
+                "the `<pid>.<seq>` id from `sbx net pending` or the launch notice",
+            ),
+            (
+                "--all",
+                "allow every parked request at once (every session, or with `-a <app>` only that app's)",
+            ),
+            (
+                "--session",
+                "also remember the host:port for this live session, so it is not re-asked",
+            ),
+            (
+                "--save",
+                "also persist an allow rule per answered host (scope below; by id or in bulk with --all)",
+            ),
+            (
+                "-l, --local",
+                "with --save: write the project .sbx.toml (the default; with --all, drains only this project)",
+            ),
             ("-g, --global", "with --save: write the global sbx.toml"),
-            ("-a, --app <name>", "scope to an app: with `<id>` assert the id is that app's session; with `--all` limit the drain to it; with `--save` write under its `[app.<name>.network]`"),
+            (
+                "-a, --app <name>",
+                "scope to an app: with `<id>` assert the id is that app's session; with `--all` limit the drain to it; with `--save` write under its `[app.<name>.network]`",
+            ),
         ],
-        details:
-            "Unblocks the parked request — and every identical retry of the same URL — letting it\n\
+        details: "Unblocks the parked request — and every identical retry of the same URL — letting it\n\
             proceed. `--session` remembers the exact host:port for the running session (it is not\n\
             re-asked); `--save` persists an allow rule so the host is pre-decided next launch. The\n\
             unblock sticks even if a save fails. The two combine; the id addresses one live session's\n\
@@ -2276,16 +2360,33 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net pending deny <id> [-a <app>] [--session] [--save [-l|-g]] | sbx net pending deny --all [-a <app>] [--session] [--save [-l|-g]]",
         summary: "deny a parked egress request (optionally remembering or saving a rule)",
         options: &[
-            ("<id>", "the `<pid>.<seq>` id from `sbx net pending` or the launch notice"),
-            ("--all", "deny every parked request at once (every session, or with `-a <app>` only that app's)"),
-            ("--session", "also remember the host:port as denied for this live session, so it is not re-asked"),
-            ("--save", "also persist a deny rule per answered host (scope below; by id or in bulk with --all)"),
-            ("-l, --local", "with --save: write the project .sbx.toml (the default; with --all, drains only this project)"),
+            (
+                "<id>",
+                "the `<pid>.<seq>` id from `sbx net pending` or the launch notice",
+            ),
+            (
+                "--all",
+                "deny every parked request at once (every session, or with `-a <app>` only that app's)",
+            ),
+            (
+                "--session",
+                "also remember the host:port as denied for this live session, so it is not re-asked",
+            ),
+            (
+                "--save",
+                "also persist a deny rule per answered host (scope below; by id or in bulk with --all)",
+            ),
+            (
+                "-l, --local",
+                "with --save: write the project .sbx.toml (the default; with --all, drains only this project)",
+            ),
             ("-g, --global", "with --save: write the global sbx.toml"),
-            ("-a, --app <name>", "scope to an app: with `<id>` assert the id is that app's session; with `--all` limit the drain to it; with `--save` write under its `[app.<name>.network]`"),
+            (
+                "-a, --app <name>",
+                "scope to an app: with `<id>` assert the id is that app's session; with `--all` limit the drain to it; with `--save` write under its `[app.<name>.network]`",
+            ),
         ],
-        details:
-            "Refuses the parked request — and every identical retry of the same URL — (the proxy\n\
+        details: "Refuses the parked request — and every identical retry of the same URL — (the proxy\n\
             returns a 403 to the cage). `--session` remembers the host:port as denied for the running\n\
             session (it is not re-asked); `--save` persists a deny rule so the host is auto-denied\n\
             next launch. The answer sticks even if a save fails.\n\
@@ -2303,12 +2404,17 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net stats [-a|--app <name>] [--reset] [--json]",
         summary: "per-host egress decision counters (allow / deny / blocked)",
         options: &[
-            ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
-            ("--reset", "clear this project's recorded stat files instead of showing them (ended sessions; a live session's counters reappear on its next request)"),
+            (
+                "-a, --app <name>",
+                "scope to the sessions of that app, not the whole project",
+            ),
+            (
+                "--reset",
+                "clear this project's recorded stat files instead of showing them (ended sessions; a live session's counters reappear on its next request)",
+            ),
             ("--json", "emit the counters as JSON"),
         ],
-        details:
-            "Reports, per destination host, how many requests this project's launches allowed,\n\
+        details: "Reports, per destination host, how many requests this project's launches allowed,\n\
             denied by a rule (or an `ask` decision), or had blocked by a security guard — SSRF, an\n\
             outbound-secret tripwire, or a domain-fronting host mismatch. Each request is counted\n\
             once. Counters accrue while a filtering posture (deny / allow / ask) runs and persist after\n\
@@ -2324,27 +2430,59 @@ const PAGES: &[Page] = &[
                    [-f|--follow] [-i|--interval <secs>] [--json]",
         summary: "the live, per-request egress log of a running session",
         options: &[
-            ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
-            ("--host <h>", "only events whose destination host is exactly <h>"),
-            ("--verdict <v>", "only events with this verdict: allow, deny, blocked, or error"),
+            (
+                "-a, --app <name>",
+                "scope to the sessions of that app, not the whole project",
+            ),
+            (
+                "--host <h>",
+                "only events whose destination host is exactly <h>",
+            ),
+            (
+                "--verdict <v>",
+                "only events with this verdict: allow, deny, blocked, or error",
+            ),
             ("-n <N>", "show only the most recent N events (per session)"),
-            ("--all", "also show refusals a `[network] mute` rule suppressed (tagged `muted`); the \
-                       default view omits them (they stay counted in `sbx net stats`)"),
-            ("--with-query", "keep the URL query in the shown path (dropped by default; already \
-                              secret-redacted)"),
-            ("--with-status", "show the upstream HTTP status (200/404/…) — completed L7 requests \
-                               only; `-` for an L4 splice, a refusal, or an error"),
-            ("--with-headers", "show each exchange's request and response heads, when the session \
-                                captured them (`[network] capture`)"),
-            ("--with-body", "show the captured bodies too (implies `--with-headers`); needs \
-                             `[network] capture = \"bodies\"`"),
-            ("-f, --follow", "after the initial listing, keep appending new events (a `tail -f`) \
-                              until Ctrl-C"),
-            ("-i, --interval <secs>", "the `--follow` poll interval in seconds (default 1)"),
-            ("--json", "emit the events as JSON (one object per line under `--follow`)"),
+            (
+                "--all",
+                "also show refusals a `[network] mute` rule suppressed (tagged `muted`); the \
+                       default view omits them (they stay counted in `sbx net stats`)",
+            ),
+            (
+                "--with-query",
+                "keep the URL query in the shown path (dropped by default; already \
+                              secret-redacted)",
+            ),
+            (
+                "--with-status",
+                "show the upstream HTTP status (200/404/…) — completed L7 requests \
+                               only; `-` for an L4 splice, a refusal, or an error",
+            ),
+            (
+                "--with-headers",
+                "show each exchange's request and response heads, when the session \
+                                captured them (`[network] capture`)",
+            ),
+            (
+                "--with-body",
+                "show the captured bodies too (implies `--with-headers`); needs \
+                             `[network] capture = \"bodies\"`",
+            ),
+            (
+                "-f, --follow",
+                "after the initial listing, keep appending new events (a `tail -f`) \
+                              until Ctrl-C",
+            ),
+            (
+                "-i, --interval <secs>",
+                "the `--follow` poll interval in seconds (default 1)",
+            ),
+            (
+                "--json",
+                "emit the events as JSON (one object per line under `--follow`)",
+            ),
         ],
-        details:
-            "A chronological, per-request record of every egress decision the proxy made this\n\
+        details: "A chronological, per-request record of every egress decision the proxy made this\n\
             session — the session id (the PID `sbx session ls` shows), the local `hh:mm:ss` time, host:port,\n\
             method, path, verdict, and the reason category. It is read from the same control sockets\n\
             `sbx net pending` uses, and `sbx net log` is an accepted alias.\n\
@@ -2440,13 +2578,21 @@ const PAGES: &[Page] = &[
         synopsis: "sbx net live [-a|--app <name>] [-i|--interval <secs>] [--json]",
         summary: "a live view of the egress tunnels currently open (a `top` for connections)",
         options: &[
-            ("-a, --app <name>", "scope to the sessions of that app, not the whole project"),
-            ("-i, --interval <secs>", "the redraw interval in seconds (default 1)"),
-            ("--json", "emit one snapshot object per tick (NDJSON) instead of the redraw; works in a \
-                        pipe and needs no terminal"),
+            (
+                "-a, --app <name>",
+                "scope to the sessions of that app, not the whole project",
+            ),
+            (
+                "-i, --interval <secs>",
+                "the redraw interval in seconds (default 1)",
+            ),
+            (
+                "--json",
+                "emit one snapshot object per tick (NDJSON) instead of the redraw; works in a \
+                        pipe and needs no terminal",
+            ),
         ],
-        details:
-            "Shows the egress tunnels open RIGHT NOW — one line per flow: destination host:port, the\n\
+        details: "Shows the egress tunnels open RIGHT NOW — one line per flow: destination host:port, the\n\
             transport (`https` inspected TLS, `http` inspected cleartext, `tcp` raw L4 splice), how\n\
             long it has been open, and the bytes transferred each way (`↑` client→upstream,\n\
             `↓` upstream→client). Rows are grouped by session (the PID `sbx session ls` shows) so several\n\
@@ -2485,8 +2631,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx plugins info <scheme>",
         summary: "show a plugin's manifest and sandbox grant",
         options: &[("<scheme>", "the resolver scheme to detail")],
-        details:
-            "Includes where the plugin came from. A built-in scheme is reported as such; a\n\
+        details: "Includes where the plugin came from. A built-in scheme is reported as such; a\n\
             scheme several plugins claim is a non-zero miss that names every claimant (all\n\
             disabled until one remains); any other miss re-emits the load warnings, so a\n\
             plugin dropped as malformed explains itself.",
@@ -2563,8 +2708,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx plugins store <subcommand> [args...]",
         summary: "manage signed plugin stores",
         options: &[],
-        details:
-            "A remote signed store is a git repository whose catalogue is verified against a\n\
+        details: "A remote signed store is a git repository whose catalogue is verified against a\n\
             pinned public key, with anti-rollback on the revision.",
     },
     // ---- plugins store subcommands ------------------------------------------------
@@ -2573,7 +2717,10 @@ const PAGES: &[Page] = &[
         synopsis: "sbx plugins store list [<name>] [--installed]  (alias: sbx plugins store ls)",
         summary: "list the configured plugin stores and what they offer",
         options: &[
-            ("[<name>]", "only this store, instead of every configured one"),
+            (
+                "[<name>]",
+                "only this store, instead of every configured one",
+            ),
             (
                 "--installed",
                 "only the entries already installed from each store",
@@ -2602,8 +2749,7 @@ const PAGES: &[Page] = &[
                 "accept the key the store ships on first use (weaker — trust-on-first-use)",
             ),
         ],
-        details:
-            "Exactly one of --key or --trust is required: a store with no verifying key would\n\
+        details: "Exactly one of --key or --trust is required: a store with no verifying key would\n\
             be unsigned, refused fail-closed. With --trust the pinned key's fingerprint is\n\
             printed for out-of-band verification. With neither, sbx fetches the store into a\n\
             throwaway clone, shows the key it ships, and stops without configuring anything.",
@@ -2623,8 +2769,7 @@ const PAGES: &[Page] = &[
                 "the catalogue revision (monotonic; consumers refuse a rollback)",
             ),
         ],
-        details:
-            "The producing counterpart of `store add` — an operator tool, never reachable from\n\
+        details: "The producing counterpart of `store add` — an operator tool, never reachable from\n\
             a cage. The signing key is the store's secret and never leaves the operator's\n\
             host; the public key it prints is what consumers pin.",
     },
@@ -2636,8 +2781,7 @@ const PAGES: &[Page] = &[
             "[name]",
             "a configured store to update (default: every one)",
         )],
-        details:
-            "Each re-fetch re-verifies the catalogue against the store's pinned key and refuses\n\
+        details: "Each re-fetch re-verifies the catalogue against the store's pinned key and refuses\n\
             a revision that would roll back, replacing the cache atomically.",
     },
     Page {
@@ -2662,8 +2806,7 @@ const PAGES: &[Page] = &[
                 "the key you obtained from a source the store does not control",
             ),
         ],
-        details:
-            "The way out of trust-on-first-use: a key accepted from the store itself is flagged\n\
+        details: "The way out of trust-on-first-use: a key accepted from the store itself is flagged\n\
             until a second source confirms it. This changes no enforcement — the pinned key is\n\
             untouched — it records that you compared them, so the caution stops being shown. A\n\
             key that does not match is refused and changes nothing. No fetch, no network.",
@@ -2679,10 +2822,12 @@ const PAGES: &[Page] = &[
                 "--trust",
                 "re-accept whatever key the store now ships (weaker — flagged afterwards)",
             ),
-            ("--yes", "confirm without a terminal (for an intentional scripted rotation)"),
+            (
+                "--yes",
+                "confirm without a terminal (for an intentional scripted rotation)",
+            ),
         ],
-        details:
-            "A store that rotates its signing key makes `update` fail, correctly — a pinned key\n\
+        details: "A store that rotates its signing key makes `update` fail, correctly — a pinned key\n\
             is the point. This is the deliberate way through: it names both keys, states what an\n\
             unannounced rotation means, and asks a terminal to confirm. The rollback floor is\n\
             carried over, and the new key must actually sign the fetched catalogue.",
@@ -2692,8 +2837,7 @@ const PAGES: &[Page] = &[
         synopsis: "sbx plugins store info <name>",
         summary: "detail a configured remote store",
         options: &[("<name>", "the configured store to detail")],
-        details:
-            "Its origin URL, the pinned public key, whether that key was supplied or merely\n\
+        details: "Its origin URL, the pinned public key, whether that key was supplied or merely\n\
             accepted on first use, the accepted revision, and each plugin it lists, marked as\n\
             installed from this store or blocked by what holds the name or scheme. Reads only\n\
             the owner-only cache: no fetch, no network.",
