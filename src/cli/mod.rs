@@ -28,6 +28,7 @@ pub(crate) mod upgrade;
 
 use crate::diag;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// Refuse an argument a verb does not take, rather than ignoring it. Silently dropping one is worse
@@ -156,6 +157,65 @@ pub(crate) fn one_name<'a>(
     }
 }
 
+/// What parsing a `<verb> <file> [switch]` command line yielded: the path with the switch's state,
+/// or the refusal as the lines to print in order. An unknown flag prints the synopsis under itself
+/// because the fix is to read the verb's options; the other two refusals say enough on their own.
+#[derive(Debug, PartialEq)]
+pub(crate) enum OneFile {
+    Run { file: PathBuf, switch: bool },
+    Error(Vec<String>),
+}
+
+/// Parse the grammar the fragment-importing verbs share (`sbx bundle import`,
+/// `sbx net groups import`): exactly one file, one optional boolean switch under any of its
+/// spellings. Pure, so the grammar is unit-tested without writing to anyone's config.
+///
+/// The file is taken as raw bytes rather than through `to_str`, so a path that is not valid UTF-8
+/// still names the file the user meant; that is the opposite of [`parse_one_name`], where the
+/// argument has to match something sbx knows by name. A second file is refused rather than
+/// overwriting the first, since importing the wrong fragment writes to the global config.
+pub(crate) fn parse_one_file(args: &[OsString], path: &[&str], switches: &[&str]) -> OneFile {
+    let verb = path.join(" ");
+    let usage = format!("sbx: usage: {}", crate::help::synopsis_of(path));
+    let mut switch = false;
+    let mut file: Option<PathBuf> = None;
+    for arg in args {
+        match arg.to_str() {
+            Some(s) if switches.contains(&s) => switch = true,
+            Some(flag) if flag.starts_with('-') => {
+                return OneFile::Error(vec![format!("sbx: {verb}: unknown flag `{flag}`"), usage]);
+            }
+            _ => {
+                if file.is_some() {
+                    return OneFile::Error(vec![format!("sbx: {verb}: expected exactly one file")]);
+                }
+                file = Some(PathBuf::from(arg));
+            }
+        }
+    }
+    match file {
+        Some(file) => OneFile::Run { file, switch },
+        None => OneFile::Error(vec![usage]),
+    }
+}
+
+/// [`parse_one_file`] plus the reporting, the way [`one_name`] pairs with [`parse_one_name`].
+pub(crate) fn one_file(
+    args: &[OsString],
+    path: &[&str],
+    switches: &[&str],
+) -> Result<(PathBuf, bool), ExitCode> {
+    match parse_one_file(args, path, switches) {
+        OneFile::Run { file, switch } => Ok((file, switch)),
+        OneFile::Error(lines) => {
+            for line in lines {
+                diag::error(&line);
+            }
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
 /// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single
 /// removal, keeping the order the user typed. Without this the second pass over a name finds
 /// nothing left to remove and reports a phantom failure over work that in fact succeeded.
@@ -270,8 +330,9 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{OneName, dedupe_names, one_name, parse_one_name};
+    use super::{OneFile, OneName, dedupe_names, one_name, parse_one_file, parse_one_name};
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     #[test]
     fn dedupe_names_keeps_the_first_of_each_in_order() {
@@ -428,6 +489,102 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    /// `sbx bundle import`'s grammar, spelled out literally the same way.
+    fn import(args: &[OsString]) -> OneFile {
+        parse_one_file(args, &["bundle", "import"], &["-f", "--force"])
+    }
+
+    #[test]
+    fn a_file_parses_with_either_spelling_of_the_switch() {
+        assert_eq!(
+            import(&os(&["frag.toml"])),
+            OneFile::Run {
+                file: PathBuf::from("frag.toml"),
+                switch: false
+            }
+        );
+        for line in [
+            vec!["frag.toml", "-f"],
+            vec!["frag.toml", "--force"],
+            vec!["--force", "frag.toml"],
+        ] {
+            assert_eq!(
+                import(&os(&line)),
+                OneFile::Run {
+                    file: PathBuf::from("frag.toml"),
+                    switch: true
+                },
+                "{line:?}"
+            );
+        }
+    }
+
+    /// The deliberate difference from [`parse_one_name`]: a path is bytes, so one that is not valid
+    /// UTF-8 still names the file the user meant instead of being refused.
+    #[test]
+    fn a_file_whose_name_is_not_utf8_is_still_the_file() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![0x66, 0xff, 0x2e, 0x74, 0x6f, 0x6d, 0x6c]);
+        assert_eq!(
+            parse_one_file(
+                std::slice::from_ref(&raw),
+                &["bundle", "import"],
+                &["-f", "--force"]
+            ),
+            OneFile::Run {
+                file: PathBuf::from(&raw),
+                switch: false
+            }
+        );
+    }
+
+    #[test]
+    fn refusing_a_file_says_what_to_do_next() {
+        assert_eq!(
+            import(&os(&["--bogus"])),
+            OneFile::Error(vec![
+                "sbx: bundle import: unknown flag `--bogus`".to_string(),
+                "sbx: usage: sbx bundle import <file> [-f|--force]".to_string(),
+            ])
+        );
+        // A second file is refused rather than overwriting the first, which would import the wrong
+        // fragment into the global config.
+        assert_eq!(
+            import(&os(&["one.toml", "two.toml"])),
+            OneFile::Error(vec![
+                "sbx: bundle import: expected exactly one file".to_string()
+            ])
+        );
+        for line in [vec![], vec!["-f"]] {
+            assert_eq!(
+                import(&os(&line)),
+                OneFile::Error(vec![
+                    "sbx: usage: sbx bundle import <file> [-f|--force]".to_string()
+                ]),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// The second verb sharing the grammar, asserted whole for the same reason as the one below.
+    #[test]
+    fn the_file_refusals_name_the_verb_that_was_run() {
+        let path = ["net", "groups", "import"];
+        assert_eq!(
+            parse_one_file(&os(&["--bogus"]), &path, &["-f", "--force"]),
+            OneFile::Error(vec![
+                "sbx: net groups import: unknown flag `--bogus`".to_string(),
+                "sbx: usage: sbx net groups import <file> [-f|--force]".to_string(),
+            ])
+        );
+        assert_eq!(
+            parse_one_file(&os(&["a", "b"]), &path, &["-f", "--force"]),
+            OneFile::Error(vec![
+                "sbx: net groups import: expected exactly one file".to_string()
+            ])
+        );
     }
 
     /// The messages interpolate the verb and its own wording, so a second `path` is asserted whole:

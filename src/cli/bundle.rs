@@ -283,34 +283,10 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
 /// already exists is refused unless `--force` overwrites it. An imported bundle is **inert** until
 /// an app names it in `use`.
 fn bundle_import(args: &[OsString]) -> ExitCode {
-    let mut force = false;
-    let mut file: Option<PathBuf> = None;
-    for arg in args {
-        match arg.to_str() {
-            Some("--force") | Some("-f") => force = true,
-            Some(s) if s.starts_with('-') => {
-                diag::error(&format!("sbx: bundle import: unknown flag `{s}`"));
-                diag::error(&format!(
-                    "sbx: usage: {}",
-                    help::synopsis_of(&["bundle", "import"])
-                ));
-                return ExitCode::from(2);
-            }
-            _ => {
-                if file.is_some() {
-                    diag::error("sbx: bundle import: expected exactly one file");
-                    return ExitCode::from(2);
-                }
-                file = Some(PathBuf::from(arg));
-            }
-        }
-    }
-    let Some(file) = file else {
-        diag::error(&format!(
-            "sbx: usage: {}",
-            help::synopsis_of(&["bundle", "import"])
-        ));
-        return ExitCode::from(2);
+    let (file, force) = match crate::cli::one_file(args, &["bundle", "import"], &["-f", "--force"])
+    {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
     };
 
     let bundles = match config::read_bundle_fragment(&file) {
