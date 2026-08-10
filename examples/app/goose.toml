@@ -3,6 +3,13 @@
 #   sbx app import examples/app/goose.toml
 #   sbx app run goose
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/goose.toml
+#     sbx app import    examples/app/goose.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Goose is a general-purpose, multi-provider AI agent written in Rust. It ships as a
 # self-contained release binary (no node, no runtime deps) distributed on GitHub releases;
 # sbx equips it fresh from upstream via mise's `aqua` backend, which selects the right asset
@@ -30,16 +37,23 @@ cmd = "goose"
 #    { path = "~/.config/goose", mode = "rw" },
 #]
 
-[packages]
-# Goose itself via mise's aqua backend (release binary). The aqua registry selects the asset
-# (the plain gnu tarball, not the vulkan variant) and verifies GitHub artifact attestations.
-# The first-launch download (github.com, api.github.com, release-assets.githubusercontent.com)
-# rides sbx's built-in nix-cache allow-set — the one host that does NOT is the sigstore TUF
-# repo mise contacts to verify the attestation, listed explicitly in [network] below.
-goose = "mise:aqua:block/goose"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `goose` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/goose.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["goose"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle goose`, and what the
+# launch ends up with via `sbx config show --app goose`.
 allow = [
     # Install: Goose's GitHub release carries artifact attestations, which mise verifies via
     # Sigstore (the CNCF signing/transparency infrastructure). The TUF root repository
@@ -50,7 +64,6 @@ allow = [
     # download itself (github.com + release-assets.githubusercontent.com) rides the built-in
     # github allow-set. Verification is install-time only — a warm/offline relaunch reuses the
     # installed binary and never touches sigstore.
-    "{*} https://*.sigstore.dev",
     # Runtime provider host — uncomment the ONE matching your chosen provider (see the
     # [env]/[secret] examples below): OpenRouter, Anthropic, or OpenAI. An app is read-by-default
     # ({GET,HEAD}); the completions endpoint is a POST, so each is opened to all verbs with `{*}`.
@@ -63,10 +76,8 @@ allow = [
 # Provider-neutral: disable the parts that have no business in a cage, regardless of provider.
 # No system keyring exists in the hermetic cage; tell Goose to read the key from the env (or its
 # config file) instead.
-GOOSE_DISABLE_KEYRING = "1"
 # Cut Goose's non-essential traffic at the source (telemetry, update checks) so the tool never
 # generates it — complementing the [network] deny-by-construction backstop.
-GOOSE_TELEMETRY_OFF = "1"
 
 # --- Provider example (commented) — uncomment ONE block to inject a key host-side. ---
 # OpenRouter (one key, hundreds of models, OpenAI-compatible bearer auth):

@@ -2,6 +2,13 @@
 #
 #   sbx app import examples/app/opencode-web.toml
 #   sbx app run opencode-web
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/opencode.toml
+#     sbx app import    examples/app/opencode-web.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
 #   # then open http://127.0.0.1:4096 in your browser
 #
 # This is the third face of opencode (alongside the `opencode` CLI/TUI and the `opencode-desktop`
@@ -44,9 +51,17 @@ forward = [4096]
 #    { path = "~/.local/share/opencode", mode = "rw" },  # auth + sessions (SQLite)
 #]
 
-[packages]
-opencode = "mise:opencode"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `opencode` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/opencode.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["opencode"]
 
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 [network]
 mode = "deny"
 # Same runtime egress as the `opencode` CLI profile — the web server is the same opencode server.
@@ -56,10 +71,10 @@ mode = "deny"
 # and add it here (or check with `sbx test net <url>`). For a DIRECT provider instead of the
 # gateway, add its host (`{*} https://api.anthropic.com`, `{*} https://api.openai.com`, or
 # `{*} https://openrouter.ai`) and fill the [secret] block below.
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle opencode`, and what the
+# launch ends up with via `sbx config show --app opencode-web`.
 allow = [
-    "{GET} https://models.dev",
-    "{GET} https://registry.npmjs.org",
-    "{*} https://opencode.ai",
     # /share syncs a session to opencode's servers on demand (HTTPS POST, not a WebSocket).
     #"{*} https://opncd.ai",
     # A WebSocket is opened only by the OpenAI "Responses" transport, targeting the OpenAI

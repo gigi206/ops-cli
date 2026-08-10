@@ -1,0 +1,22 @@
+# `openrouter` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an app's
+# allow list — a bundle exists to carry maps (`packages`/`env`/`[secret]`), which a pure host
+# set has none of.
+#
+#   sbx net groups import examples/net-groups/openrouter.toml
+#   # then in an app profile's [network]:   allow = ["@openrouter"]
+#
+# The OpenRouter API host, for agents that route through OpenRouter. It is a BYOK CHOICE, not a
+# shipped default: the hermes profiles run on the NousResearch account login and reference it
+# COMMENTED, so nothing changes until you enable it — uncomment `"@openrouter"` in the app, or
+# add it live with `sbx net allow @openrouter -a <app>`. OpenRouter is an API-KEY provider, not
+# OAuth: the group carries the egress only — the consuming app still provides the key itself,
+# with the commented `[secret."openrouter.ai"]` block (`env://OPENROUTER_API_KEY`, bearer) and
+# the `OPENROUTER_API_KEY` env placeholder. Groups are global-only (like bundles): an app's
+# allow may reference one, a project may not define one.
+
+[net.groups]
+openrouter = [
+    # All verbs: chat completions are a POST, the models catalogue and key check are GETs.
+    "{*} https://openrouter.ai",
+]

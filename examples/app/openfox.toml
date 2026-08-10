@@ -2,6 +2,14 @@
 #
 #   sbx app import examples/app/openfox.toml
 #   sbx app run openfox
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/openfox.toml
+#     sbx app import    examples/app/openfox.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 #   # then open http://127.0.0.1:10369 in your browser
 #
 # OpenFox is a Node.js/TypeScript coding agent with a "Plan → Builder" workflow, an integrated
@@ -63,7 +71,7 @@
 # are published for Node 24 / this platform) and then execs openfox. That fetch runs INSIDE the
 # cage, so it needs the npm registry in `allow` below (the release assets it pulls next ride the
 # built-in github allow-set); it is idempotent (the guard skips it once the binary exists).
-# Keeping openfox as a `mise:npm:` `[packages]` entry means `sbx upgrade mise` still rolls it.
+# Keeping openfox as a `mise:npm:` entry in its bundle means `sbx upgrade mise` still rolls it.
 #
 # The web server auto-opens a browser by default; the hermetic cage has none, so `cmd` passes
 # `--no-browser` and you open the URL yourself. Do NOT set OPENFOX_HOST=0.0.0.0 (that exposes the
@@ -97,18 +105,17 @@ forward = [10369]
 #    { path = "~/.config/openfox", mode = "rw" },
 #]
 
-[packages]
-# A node runtime (OpenFox needs it at runtime AND to install/rebuild; `nix:nodejs` is v24.x,
-# satisfying OpenFox's Node >= 24 requirement — and matching the ABI the prebuilt native addons
-# target) then OpenFox itself via mise's npm backend, so `sbx upgrade mise` can roll it forward.
-# Both are trusted-only [packages]; this profile is trusted by location once imported. The native
-# addons are healed at launch by the `cmd` wrapper above (mise installs them --ignore-scripts).
-nodejs = "nix:nodejs"
-openfox = "mise:npm:openfox"
-# OpenFox's integrated terminal / sub-agents run shell commands. The hermetic cage ships a curated
-# base toolset (bash, coreutils, curl, git, less, grep, sed, awk, find, which) plus node. If your
-# agent needs more tools (a compiler, a language runtime, ripgrep, …), declare them here per app or
-# in the project's own `.sbx.toml [packages]`.
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `openfox` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/openfox.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["openfox"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"

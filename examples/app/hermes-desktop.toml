@@ -3,6 +3,12 @@
 #   sbx app import examples/app/hermes-desktop.toml
 #   sbx app run hermes-desktop
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
 # A third way to run Hermes alongside `sbx app run hermes` (the terminal CLI) and `sbx app run hermes-web`
 # (the browser dashboard). Hermes Desktop is the native Electron app — a real window with chat,
 # streaming tool output, side-by-side previews, a file browser, voice, and settings. Unlike
@@ -167,7 +173,8 @@ allow = [
     # --- The browser toolset's driver ---
     # `agent-browser`, fetched from npm at launch (mise's npm backend installs in-cage, unlike the
     # host-side `flake:` build). The audit POST is noisy and non-essential, so it is muted below.
-    "{GET} https://registry.npmjs.org",
+    # The registry lane itself is the shared `@npm-registry` group.
+    "@npm-registry",
     # --- Runtime ---
     # The LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter; with the
     # NousResearch account login instead (no BYOK key set — the shipped default), model traffic goes
@@ -178,9 +185,10 @@ allow = [
     # they render on the sign-in page in the in-cage Chromium. Read-only, so {GET} (least privilege).
     "{GET} https://web-assets.nousresearch.com",
     "{*} https://inference-api.nousresearch.com",
-    # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
+    # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked) — the shared
+    # `@models-catalog` group.
     "{*} https://hermes-agent.nousresearch.com",
-    "{GET} https://models.dev",
+    "@models-catalog",
     # Hermes' "pet" gallery (agent/pet) — a public, read-only pixel-art sprite gallery: the manifest
     # (petdex.dev/api/manifest, 307 → R2) and the sprite assets (assets.petdex.dev), all pinned to
     # *.petdex.dev by Hermes (anti-SSRF), GET-only, no data sent. Cosmetic; drop this line if you do
@@ -228,8 +236,8 @@ allow = [
 # this list from the CLI with `sbx net mute|unmute -a hermes-desktop`.
 mute = [
     # npm's audit POST on every install of the browser driver: refused anyway, just kept out of the
-    # default log.
-    "https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    # default log. Shared with every npm-backed profile, so it comes from a group.
+    "@npm-audit",
     # A cloud SDK in the closure probes the AWS metadata endpoint on startup; the proxy refuses
     # link-local/metadata by construction (SSRF guard), nothing to discover off-cloud. Denied, muted.
     "169.254.169.254",
@@ -237,22 +245,12 @@ mute = [
     # from the Privy modal (you signed in with Google, not a wallet).
     "browser-intake-datadoghq.com",
     "explorer-api.walletconnect.com",
-    # The in-cage Chromium's own background services during the login flow — none functional to Hermes:
-    # Play logging, tag-manager/analytics, autofill, push signaling, device check-in, the ML
-    # optimization guide, the spellcheck-dictionary / component updater, Safe Browsing, the password
-    # leak check, clock sync, and the cross-domain sign-in cookie check. Left denied, muted.
-    "play.google.com",
+    # The in-cage Chromium's own background services during the login flow — none functional to
+    # Hermes, and shared with every other profile that embeds a browser engine, so they come from a
+    # group rather than a copy.
+    "@chromium-background",
+    # Tag-manager analytics on the login page (not a Chromium background service).
     "www.googletagmanager.com",
-    "content-autofill.googleapis.com",
-    "signaler-pa.googleapis.com",
-    "android.clients.google.com",
-    "optimizationguide-pa.googleapis.com",
-    "redirector.gvt1.com",
-    "update.googleapis.com",
-    "safebrowsing.googleapis.com",
-    "passwordsleakcheck-pa.googleapis.com",
-    "clients2.google.com",
-    "accounts.youtube.com",
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.

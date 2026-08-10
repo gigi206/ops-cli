@@ -3,6 +3,14 @@
 #   sbx app import examples/app/copilot.toml
 #   sbx app run copilot
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, and its GitHub account sign-in from a shared egress GROUP — import both:
+#     sbx bundle import    examples/bundle/copilot.toml
+#     sbx net groups import examples/net-groups/github-oauth.toml
+#     sbx app import       examples/app/copilot.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # GitHub ships the Copilot CLI as a self-contained release binary (`copilot-linux-x64.tar.gz`
 # on github/copilot-cli releases) — no node runtime, no nixpkgs attribute needed. sbx equips it
 # fresh from upstream via mise's `aqua` backend, which selects the asset through the aqua
@@ -45,33 +53,36 @@ cmd = "copilot"
 #    { path = "~/.config/copilot", mode = "rw" },
 #]
 
-[packages]
-# Copilot itself via mise's aqua backend (the official GitHub release binary, checksum-verified
-# against the release's own SHA256SUMS.txt). The download rides sbx's built-in nix-cache allow-set
-# (github.com + *.githubusercontent.com are always permitted, read-only), so the install needs no
-# entry in [network] below.
-copilot = "mise:aqua:github/copilot-cli"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `copilot` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE AND THE GROUP FIRST — they are not in this file:
+#     sbx bundle import    examples/bundle/copilot.toml
+#     sbx net groups import examples/net-groups/github-oauth.toml
+# Without them the launch warns that a bundle/group is undeclared and the agent is simply absent.
+# The `copilot` bundle carries the agent itself; the GitHub account sign-in hosts
+# (github.com/login/* path-scoped, plus the api.github.com entitlement lookups) arrive together
+# with the shared `@github-oauth` group.
+use = ["copilot"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); the endpoints below carry POSTs (the device flow, the
 # chat completions), so each is opened to all verbs with `{*}`.
 [network]
 mode = "deny"
+# The agent's OWN hosts (the Copilot API and the suggestion/proxy services) arrive with its bundle
+# (`use` above); the GitHub ACCOUNT hosts arrive with the shared `@github-oauth` group named in the
+# header. Check the union with `sbx config show --app copilot`.
 allow = [
-    # The OAuth device flow `/login` uses, plus the enterprise/authorization pages. Path-scoped:
-    # only the login endpoints, not all of github.com (whose read-only lane the built-in allow-set
-    # already provides).
-    "{*} https://github.com/login/*",
-    # User + Copilot entitlement lookups (`/user`, `/copilot_internal/*`). The built-in allow-set
-    # covers api.github.com read-only; the CLI also POSTs here, hence the explicit all-verbs entry.
-    "{*} https://api.github.com",
-    # The Copilot API itself — chat completions and the agent's tool traffic. GitHub routes by
-    # subscription (`*.individual.`/`*.business.`/`*.enterprise.`), and the CLI is documented to
-    # use the plain `api.githubcopilot.com` too; the subdomain wildcard covers the apex and all of
-    # them at once.
-    "{*} https://*.githubcopilot.com",
-    # The suggestion/proxy services named in GitHub's allowlist reference.
-    "{*} https://copilot-proxy.githubusercontent.com",
-    "{*} https://origin-tracker.githubusercontent.com",
+    # GitHub account sign-in: the device-flow `/login` pages (path-scoped: only the login
+    # endpoints, not all of github.com, whose read-only lane the built-in allow-set already
+    # provides) and the `api.github.com` entitlement lookups (`/user`, `/copilot_internal/*`,
+    # where the built-in GET lane is not enough and the CLI POSTs). The set is the account lane
+    # itself, not this agent's, so it comes from a group rather than a copy.
+    "@github-oauth",
 ]
 
 # Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): the telemetry and
@@ -85,9 +96,6 @@ allow = [
 # allowance), so its GETs are ALLOWED and only its writes — which is what a telemetry upload is —
 # are refused and muted here. The other two are refused outright.
 mute = [
-    "collector.github.com",                      # GitHub telemetry collector (refused outright)
-    "copilot-telemetry.githubusercontent.com",   # Copilot telemetry uploads (the POSTs; GETs ride the built-in read lane)
-    "default.exp-tas.com",                       # experimentation / feature flags (refused outright)
 ]
 
 [env]

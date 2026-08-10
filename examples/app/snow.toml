@@ -4,6 +4,13 @@
 #   sbx app import examples/app/snow.toml
 #   sbx app run snow
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/snow.toml
+#     sbx app import    examples/app/snow.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Snow ships on npm as `snow-ai`, published from the author's own repository (`MayDay-wpf/snow-cli`,
 # which the package's `repository` and `homepage` both point at). It is a node CLI, so the cage gets
 # a node runtime alongside it; `sbx upgrade mise` rolls it forward.
@@ -37,18 +44,27 @@ cmd = "snow"
 #    { path = "~/.snow", mode = "rw" },
 #]
 
-[packages]
-# A node runtime — Snow is a node CLI.
-nodejs = "nix:nodejs"
-snow = "mise:npm:snow-ai"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `snow` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/snow.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["snow"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a completions endpoint is a POST, so a provider host is
 # opened to all verbs with `{*}`.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle snow`, and what the
+# launch ends up with via `sbx config show --app snow`.
 allow = [
     # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarball.
-    "{GET} https://registry.npmjs.org",
     # Runtime: uncomment the ONE provider you configured (and its key below). A DeepSeek or other
     # OpenAI-compatible endpoint goes here too, as its own host.
     #"{*} https://api.openai.com",
@@ -62,7 +78,6 @@ allow = [
 # `mute` never changes the verdict (it stays refused) and never hides a count. See everything with
 # `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a snow`.
 mute = [
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
 ]
 
 # --- Provider key (commented) — uncomment the placeholder and the matching [secret] block. The

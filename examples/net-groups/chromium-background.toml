@@ -1,0 +1,40 @@
+# `chromium-background` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — mute list.
+#
+#   sbx net groups import examples/net-groups/chromium-background.toml
+#   # then in an app's or bundle's mute list:   "@chromium-background"
+#
+# The background services a Chromium engine reaches on its own, whatever it is embedded in: the
+# component and variations updaters, Safe Browsing, the autofill and password-leak checks, the
+# optimization-guide hints, and the Play/YouTube identity endpoints. None of them is the app's own
+# traffic, every one of them is denied by the deny-by-default posture, and each is retried on a
+# schedule the app does not control — so their refusals crowd out the actionable ones in
+# `sbx net logs`.
+#
+# A mute never changes the verdict and never hides a count: these hosts stay denied, `sbx net stats`
+# still tallies them, and `sbx net log --all` still shows them.
+#
+# This is a mute group, so it is slot-pure and cannot also carry allow entries. It is deliberately
+# limited to the hosts a Chromium embed reaches by itself: a vendor's own crash reporter or
+# analytics belongs in that profile's own mute list, next to the app it describes, and a host the
+# app legitimately reaches belongs in `allow` (muting an allowed host does nothing).
+#
+# The profiles that mute this lane reference the group rather than carrying their own copy, so it is
+# described once. A profile that embeds a browser engine and has not needed it yet simply does not
+# reference it: adding the reference is the way to quiet the lane, not a copy of the hosts.
+
+[net.groups]
+chromium-background = [
+    "clients2.google.com",                  # component updater
+    "android.clients.google.com",           # component / variations fetch
+    "update.googleapis.com",                # Omaha update check
+    "redirector.gvt1.com",                  # update payload redirector
+    "safebrowsing.googleapis.com",          # Safe Browsing lists
+    "optimizationguide-pa.googleapis.com",  # optimization hints
+    "content-autofill.googleapis.com",      # autofill suggestions
+    "passwordsleakcheck-pa.googleapis.com", # leaked-credential check
+    "signaler-pa.googleapis.com",           # sign-in state signalling
+    "play.google.com",                      # identity / entitlement
+    "accounts.youtube.com",                 # identity cookie sync
+]

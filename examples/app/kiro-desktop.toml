@@ -3,6 +3,9 @@
 #   sbx app import examples/app/kiro-desktop.toml
 #   sbx app run kiro-desktop
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
 # This is the Kiro **desktop IDE** (the full GUI editor from kiro.dev, by AWS — a Code-OSS / VS Code
 # fork). For the headless terminal agent, use `examples/app/kiro.toml` instead (`kiro-cli`, a native Rust
 # CLI that fits Mode-B far more cleanly). Confined by sbx, the editor sees only the cage filesystem
@@ -299,21 +302,13 @@ mute = [
     # The in-cage Chromium's OWN telemetry/component-update noise during sign-in (not Kiro traffic) —
     # component/DRM/self updates, Safe Browsing, connectivity checks, translate, YouTube cookie sync.
     # None is the Google SSO flow (that lives on accounts.google.<ccTLD>, allowed above).
-    "redirector.gvt1.com",
-    "update.googleapis.com",
-    "safebrowsing.googleapis.com",
-    "optimizationguide-pa.googleapis.com",
+    # The in-cage Chromium's own background services during the sign-in, none login-critical (the
+    # Google auth completes without them), and shared with every other profile that embeds a browser
+    # engine, so they come from a group rather than a copy. The group includes the password
+    # leak-check, which stays DENIED: no passwords are sent to Google's leak service.
+    "@chromium-background",
+    # Chrome's page-translation service — same class, but not every browser embed reaches it.
     "translate.googleapis.com",
-    "clients2.google.com",
-    "android.clients.google.com",
-    "play.google.com",
-    "accounts.youtube.com",
-    # More in-cage Chromium features that phone Google during the sign-in, none login-critical (the
-    # Google auth completes without them): real-time signaling, form autofill, and the password
-    # leak-check (which we deliberately keep DENIED — no passwords are sent to Google's leak service).
-    "signaler-pa.googleapis.com",
-    "content-autofill.googleapis.com",
-    "passwordsleakcheck-pa.googleapis.com",
 ]
 
 [env]

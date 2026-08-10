@@ -1,0 +1,43 @@
+# `openclaude` — "Claude Code with any LLM": what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/openclaude.toml
+#   # then in an app profile:   use = ["openclaude"]
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
+# Derived from `examples/app/openclaude.toml`, whose namesake profile now names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# NO PROVIDER HOST, deliberately. OpenClaude is BYOK with no default provider — the profile
+# leaves every provider host commented for the user to choose (OpenRouter, OpenAI, DeepSeek,
+# Anthropic, Gemini, opencode.ai gateways, GitLawb's opengateway, or a `tcp://localhost:<port>`
+# relay to a local model), and a bundle may only carry what its profile declares. The consuming
+# app therefore opens its OWN provider host (and supplies the key). What is here is the install
+# lane only.
+#
+# There is deliberately NO `mute` either: OpenClaude removed telemetry from its source
+# (`src/init.ts` — telemetry initialization is a no-op), so nothing is refused beyond what the
+# consuming app's own allowlist does not open.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.openclaude]
+allow = [
+    # Install: mise's npm backend fetches the packument and the tarball in-cage, so the
+    # registry is subject to this policy — opened read-only as a whole, like the other
+    # npm-backed profiles. The self-update check rides the built-in github allow-set.
+    "@npm-registry",
+]
+
+[bundle.openclaude.packages]
+nodejs = "nix:nodejs"                    # Node ≥ 22 from nixpkgs — the fork's runtime
+openclaude = "mise:npm:@gitlawb/openclaude"  # the vendor's own npm scope; no postinstall scripts

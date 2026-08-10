@@ -5,6 +5,10 @@
 #   sbx app run trae
 #   sbx app run trae -- run "Add unit tests to utils.py"
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/pypi.toml
+#     sbx net groups import examples/net-groups/github.toml
+#
 # NOTE — `trae.ai` is ByteDance's commercial IDE product (Trae Code + Trae Work,
 # separate Electron apps with a vendor account). This profile is for the
 # research-grade, MIT-licensed, open-source CLI AGENT that ByteDance publishes
@@ -165,11 +169,11 @@ allow = [
     # Bootstrap, first leg: `git clone` over HTTPS. Smart HTTP is NOT read-only —
     # it GETs `/info/refs?service=git-upload-pack` and then POSTs the wants to
     # `/git-upload-pack`, so the built-in self-equip allow-set (`{GET,HEAD}
-    # github.com`) is not enough and the clone needs the write verb explicitly.
-    "{*} https://github.com",
+    # github.com`) is not enough and the clone needs the write verb explicitly —
+    # the shared `@github` group.
+    "@github",
     # Bootstrap, second leg: `uv tool install .` builds the source tree and
     # resolves its dependency set (tree-sitter, textual, mcp, the provider SDKs)
-    # from PyPI — the index and the wheel host, both pure downloads.
-    "{GET} https://pypi.org",
-    "{GET} https://files.pythonhosted.org",
+    # from PyPI — the shared `@pypi` group.
+    "@pypi",
 ]

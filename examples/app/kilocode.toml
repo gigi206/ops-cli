@@ -3,6 +3,13 @@
 #   sbx app import examples/app/kilocode.toml
 #   sbx app run kilocode
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/kilocode.toml
+#     sbx app import    examples/app/kilocode.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # The tool is equipped fresh from upstream: mise's `github` backend pulls Kilo Code's
 # standalone release binary (`kilo-linux-x64.tar.gz`) — verified by GitHub artifact
 # attestation + SLSA provenance, self-contained (no node/bun runtime), no nixpkgs lag. It
@@ -32,20 +39,29 @@ cmd = "kilo"
 #    { path = "~/.config/kilo", mode = "rw" },
 #]
 
-[packages]
-kilo = "mise:github:Kilo-Org/kilocode"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `kilocode` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/kilocode.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["kilocode"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"
 # api.anthropic.com: the provider API — opened to every verb with `{*}` (an app is read-by-default,
 # and the CLI POSTs completions). models.dev: the model catalogue — a read-only fetch, `{GET,HEAD}`.
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle kilocode`, and what the
+# launch ends up with via `sbx config show --app kilocode`.
 allow = [
-  "{GET} https://models.dev",
-  "{*} https://api.kilo.ai",
   # Kilo's session-export / cloud-sync ingest (POST /v1/session-export/batch) — the feature that
   # backs up/syncs your coding sessions to the cloud. Allowed so cloud sync works; the host stays
   # out of `mute` so a sync failure stays visible in the log.
-  "{*} https://supermassive-black-hole.kiloapps.io",
   #"{*} https://us.i.posthog.com",
   # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
   #"{*} https://openrouter.ai",
@@ -62,9 +78,7 @@ allow = [
 #
 # Not here: `supermassive-black-hole.kiloapps.io` (Kilo's session-export / cloud-sync ingest) is
 # ALLOWED in `allow` above (cloud sync enabled), so it never reaches the mute filter.
-mute = [
-    "*.i.posthog.com",                        # Kilo PostHog product telemetry (POST /batch/)
-]
+mute = []
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage.
 # Provide it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g.

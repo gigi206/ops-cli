@@ -29,19 +29,32 @@ const NIX_LD_SHIM: &str = "libexec/nix-ld";
 
 /// The curated base CLI tools every cage carries: `(nixpkgs attribute, a binary the output
 /// must contain, gcroot name)`. The attribute and the binary name diverge for the GNU
-/// userland (`gnugrep` → `grep`, `gnused` → `sed`, `gawk` → `awk`). Kept small and transverse —
+/// userland (`gnugrep` → `grep`, `gnused` → `sed`, `gawk` → `awk`) and for the two tools
+/// nixpkgs names after their project rather than their command (`ripgrep` → `rg`,
+/// `yq-go` → `yq`). Kept small and transverse —
 /// heavier, language-specific, or GUI-oriented tooling is a project concern, never the base
 /// (a desktop helper like `xdg-utils` drags a dbus/glib/X11 stack into a headless cage for no
 /// benefit; declare it per project if ever needed).
+///
+/// `ripgrep`, `fd` and `yq-go` sit beside their elders rather than replacing them. `grep`,
+/// `sed` and `find` stay because third-party code the cage runs assumes them — a vendor
+/// install script, a `configure`, an npm postinstall — and the plugin's own flake hash walks
+/// the tree with `find`. `rg` and `fd` are what an agent harness looks up on `PATH` before
+/// falling back to downloading its own copy, and `yq` is the YAML and TOML counterpart of
+/// `jq`. The Go `yq` is chosen over the Python `yq` wrapper deliberately: it is a single
+/// static binary, so the base gains no language runtime of its own.
 const BASE_TOOLS: &[(&str, &str, &str)] = &[
     ("curl", "bin/curl", "curl"),
     ("git", "bin/git", "git"),
     ("less", "bin/less", "less"),
     ("gnugrep", "bin/grep", "gnugrep"),
+    ("ripgrep", "bin/rg", "ripgrep"),
     ("gnused", "bin/sed", "gnused"),
     ("gawk", "bin/awk", "gawk"),
     ("findutils", "bin/find", "findutils"),
+    ("fd", "bin/fd", "fd"),
     ("jq", "bin/jq", "jq"),
+    ("yq-go", "bin/yq", "yq-go"),
     ("which", "bin/which", "which"),
 ];
 
@@ -273,7 +286,8 @@ pub(crate) fn resolve_userland(
 
     // Curated base CLI tools: a small, broadly-useful set every project gets without
     // per-project provisioning — an HTTP client, version control, a pager, the text-processing
-    // trio, file search, a JSON query tool, and `which`. Each is nix-built, so it shares the
+    // trio, file search (POSIX and fast), structured-data queries for JSON and YAML, and
+    // `which`. Each is nix-built, so it shares the
     // base glibc (the one-channel rule) and runs from the relocated store; its closure joins the
     // seed and its `bin` joins the base PATH. Heavier or language-specific tooling stays a
     // project concern (`[packages]` or a `nix:` mise tool), not the base.

@@ -3,6 +3,10 @@
 #   sbx app import examples/app/vibe.toml
 #   sbx app run vibe
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/pypi.toml
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
 # Vibe (github.com/mistralai/mistral-vibe) is a Python coding agent published to PyPI as the
 # `mistral-vibe` package (it exposes the `vibe` command; requires Python >=3.12). sbx equips it via
 # mise's pipx backend — `mise:pipx:mistral-vibe` in [packages] — so `sbx upgrade mise` rolls it
@@ -120,9 +124,9 @@ allow = [
     '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
     "{GET} https://*.gstatic.com",
     "{GET} https://*.googleusercontent.com",
-    # Install-time (mise's `uv tool install`): the Python wheels and the package index.
-    "{GET} https://files.pythonhosted.org",
-    "{GET} https://pypi.org",
+    # Install-time (mise's `uv tool install`): the Python wheels and the package index —
+    # the shared `@pypi` group.
+    "@pypi",
     # (cache.nixos.org + github.com — the nix binary cache for uv/Python/chromium — are already in
     # sbx's built-in nix-cache allow-set, so they need no entry here.)
 ]
@@ -131,16 +135,16 @@ allow = [
 # in `sbx net stats`; see them with `--all`). These are the usual Chromium background hosts; watch
 # `sbx net log -a vibe` on your first sign-in and add any other host it hammers.
 mute = [
-    "www.google.com",             # Chromium: omnibox / async requests (observed on sign-in)
-    "*.gvt1.com",                 # Chromium: spellcheck dictionary + component downloads (observed)
-    "android.clients.google.com", # Chromium: device check-in telemetry (observed)
-    "*.googleapis.com",           # Chromium update / optimization-guide / safebrowsing
-    "clients2.google.com",        # Chromium update ping
-    "clientservices.googleapis.com",
+    # The in-cage Chromium's own background services, shared with every other profile that embeds a
+    # browser engine, so they come from a group rather than a copy.
+    "@chromium-background",
+    # Wider than the group: the remaining `*.googleapis.com` / `*.gvt1.com` background services this
+    # browser reaches, without enumerating them.
+    "*.googleapis.com",
+    "*.gvt1.com",
+    "www.google.com",             # Chromium: omnibox / async requests, seen during sign-in
     "*.sentry.io",                # page telemetry (Mistral console + auth pages)
     "static.cloudflareinsights.com", # Cloudflare web-analytics beacon
-    "play.google.com",            # Google Play logging (POST /log), recurring during Google sign-in
-    "accounts.youtube.com",       # Google cross-domain CheckConnection, recurs each login (desktop profiles mute it too)
 ]
 # NOT muted on purpose (refused by the allowlist, but only ONE hit — not spam, so keeping it VISIBLE in
 # `sbx net log` is more useful than hiding it): `widget.intercom.io` (Intercom support-chat widget, not

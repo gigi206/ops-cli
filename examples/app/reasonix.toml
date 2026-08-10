@@ -3,6 +3,13 @@
 #   sbx app import examples/app/reasonix.toml
 #   sbx app run reasonix
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/reasonix.toml
+#     sbx app import    examples/app/reasonix.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Reasonix is a config- and plugin-driven coding harness: a single static Go binary
 # whose append-only session history is aligned to DeepSeek's prefix cache, so long
 # sessions keep a 90%+ cache-hit and cheap input tokens. It ships a DeepSeek provider
@@ -63,27 +70,31 @@ exec reasonix "$@"
 #    { path = "~/.reasonix", mode = "rw" },
 #]
 
-[packages]
-# Node for the JS shim (runtime, unlike most npm-native CLIs — see the header), then Reasonix
-# itself via mise's npm backend (shim on registry, binary via the platform optional dep).
-# Both are trusted-only [packages]; this profile is trusted by location once imported.
-nodejs = "nix:nodejs"
-reasonix = "mise:npm:reasonix"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `reasonix` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/reasonix.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["reasonix"]
 
-# An app is read-by-default ({GET,HEAD}); the completions/balance endpoints are POSTs, so the
-# provider host is opened to all verbs with `{*}`.
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
+
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle reasonix`, and what the
+# launch ends up with via `sbx config show --app reasonix`.
 allow = [
     # Install: the shim's packument and tarball plus the platform binary optional dep — npm
     # spreads these across sibling paths, so the registry host is opened read-only as a whole
     # (like the other npm-backed profiles), not path-scoped.
-    "{GET} https://registry.npmjs.org",
     # Runtime: DeepSeek's OpenAI-compatible endpoint — `POST /chat/completions` for prompts
     # (the prefix-cache loop keeps replaying the same growing prefix), plus the optional
     # `GET /user/balance` balance check. A direct provider is still any OpenAI-compatible
     # base_url in `reasonix.toml`; add its host here if you configure one.
-    "{*} https://api.deepseek.com",
 ]
 
 # Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit POST at
@@ -93,8 +104,6 @@ allow = [
 # counts them); `mute` only keeps their otherwise-noisy `denied-default` lines out of the default
 # log. See them anytime with `sbx net log --all -a reasonix`.
 mute = [
-    "crash.reasonix.io",                            # Reasonix telemetry consent/upgrade gateway (denied)
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.

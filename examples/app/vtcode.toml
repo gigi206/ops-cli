@@ -3,6 +3,13 @@
 #   sbx app import examples/app/vtcode.toml
 #   sbx app run vtcode
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/vtcode.toml
+#     sbx app import    examples/app/vtcode.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # VT Code ships as a self-contained Rust release binary on its own GitHub releases
 # (`vtcode-<version>-x86_64-unknown-linux-gnu.tar.gz`) — no node, no runtime deps. sbx equips it
 # fresh from upstream via mise's `github` backend (the same clean path `kilocode` uses); the binary
@@ -11,8 +18,8 @@
 # would replace the binary underneath the pinned install.
 #
 # The agent's own search tools are external programs: ripgrep for content search and ast-grep for
-# its symbol/outline maps (upstream's one-line installer pulls both). They are declared below as
-# `nix:` packages, so they are host-provisioned, seeded into the project store and available
+# its symbol/outline maps (upstream's one-line installer pulls both). They are declared in the
+# `vtcode` bundle as `nix:` packages, so they are host-provisioned, seeded into the project store and available
 # offline — no second download path.
 #
 # BYOK, MULTI-PROVIDER. VT Code supports 21+ providers; its own default is OpenRouter (default
@@ -44,16 +51,17 @@ cmd = "vtcode"
 #    { path = "~/.config/vtcode", mode = "rw" },
 #]
 
-[packages]
-# VT Code itself from upstream's GitHub release. The download rides sbx's built-in read-only
-# allow-set (github.com + *.githubusercontent.com), so the install needs no [network] entry.
-vtcode = "mise:github:vinhnx/VTCode"
-# The two external tools the agent's search stack shells out to.
-ripgrep = "nix:ripgrep"
-ast-grep = "nix:ast-grep"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `vtcode` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/vtcode.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["vtcode"]
 
-# An app is read-by-default ({GET,HEAD}); a completions endpoint is a POST, so the provider host is
-# opened to all verbs with `{*}`.
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 [network]
 mode = "deny"
 allow = [

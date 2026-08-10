@@ -3519,10 +3519,13 @@ fn the_curated_base_tools_run_in_the_cage() {
              curl --version >/dev/null; \
              git --version >/dev/null; \
              grep --version >/dev/null; \
+             rg --version >/dev/null; \
              sed --version >/dev/null; \
              awk --version >/dev/null; \
              find --version >/dev/null; \
+             fd --version >/dev/null; \
              jq --version >/dev/null; \
+             yq --version >/dev/null; \
              less --version >/dev/null; \
              which ls >/dev/null; \
              echo ALL_TOOLS_OK",

@@ -1,0 +1,52 @@
+# `mimo` — MiMo Code, Xiaomi's agentic coding CLI (a fork of opencode): what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/mimo.toml
+#   # then in an app profile:   use = ["mimo"]
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
+# Derived from `examples/app/mimo.toml`, whose namesake profile now names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# The hosts below are the MiMo-flavored default: the Xiaomi MiMo platform backend (all model
+# traffic plus the built-in web search), the OAuth/account host, the model catalogue, the npm
+# install lane, the schema/docs site, and the self-update CDN. The alternate PROVIDER hosts are
+# BYOK and the profile leaves them commented (OpenRouter, OpenAI, …) — a bundle may only carry
+# what its profile declares, so the consuming app opens its OWN provider host (and supplies the
+# key).
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.mimo]
+allow = [
+    # Xiaomi MiMo Open Platform API — OpenAI-compatible, base /v1: all model traffic
+    # (completions POSTs plus the built-in web search, which POSTs /chat/completions to the
+    # same host).
+    "{*} https://api.xiaomimimo.com",
+    # The OAuth login host, the plugin console, and the token-plan management page — the
+    # account posture.
+    "{*} https://platform.xiaomimimo.com",
+    # The config/tui/theme `$schema` and the docs (auto-injected by the CLI; read-only).
+    "{GET} https://mimo.xiaomi.com",
+    # The model catalogue, a read-only fetch (opencode heredity).
+    "@models-catalog",
+    # Install: the shim's packument + tarball and the platform optional-dep binary, via
+    # mise's npm backend — the registry is subject to this policy, opened read-only.
+    "@npm-registry",
+    # The self-update binary CDN, hit by `mimo upgrade` (read-only).
+    "{GET} https://mimocode.cnbj1.mi-fds.com",
+]
+
+[bundle.mimo.packages]
+nodejs = "nix:nodejs"           # the `bin/mimo` Node shim is what launches — needed at RUNTIME
+mimo = "mise:npm:@mimo-ai/cli"  # the vendor's own npm scope

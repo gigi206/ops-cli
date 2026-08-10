@@ -1,0 +1,43 @@
+# `ante` — Antigma's "self-contained agent that self-organizes": what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/ante.toml
+#   # then in an app profile:   use = ["ante"]
+#
+# Derived from `examples/app/ante.toml`, whose namesake profile now names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# The hosts below are the tool's own lanes, independent of the model you point it at: the
+# in-cage self-update manifest, the optional first-party Antix Console, the `/offline-mode`
+# GGUF weights, and GitHub for MCP/slash-command installs. The PROVIDER hosts are BYOK and the
+# profile leaves them commented (Anthropic, OpenAI, xAI, DeepSeek, Z.AI, OpenRouter, Gemini,
+# DashScope, …) — a bundle may only carry what its profile declares, so the consuming app opens
+# its OWN provider host (and supplies the key). `/offline-mode` needs no provider at all.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.ante]
+allow = [
+    # In-cage self-update — `ante update` re-queries the signed manifest at
+    # `download.ante.run/channels/stable/manifest.json` and pulls the new tarball from the
+    # same host. `{GET}` (plain download; the post-update binary install happens locally).
+    "{GET} https://download.ante.run",
+    # First-party Antix Console — the vendor's account / billing / team dashboard. Optional
+    # (the CLI does not require an Antix account).
+    "{*} https://antix.antigma.ai",
+    # Hugging Face — `/offline-mode` fetches GGUF weights to the cage's home. `{GET}`.
+    "{GET} https://huggingface.co",
+    # GitHub — MCP server installs, slash-command marketplace fetches. `{GET}`.
+    "{GET} https://github.com",
+]
+
+[bundle.ante.packages]
+ante = "mise:github:AntigmaLabs/ante-preview"  # the static-pie musl release binary; no runtime deps

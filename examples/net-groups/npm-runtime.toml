@@ -1,0 +1,20 @@
+# `npm-runtime` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list. A bundle exists to carry maps (`packages`/`env`/
+# `[secret]`), which a pure host set has none of.
+#
+#   sbx net groups import examples/net-groups/npm-runtime.toml
+#   # then in an app's allow list:   "@npm-runtime"
+#
+# The npm RUNTIME lane: registry.npmjs.org opened to EVERY verb (`{*}`), for the agents whose
+# orchestrator/SDK pulls packages at runtime (AionUi's chrome-devtools-mcp, Freebuff's Bun
+# orchestrator, opencode's `@opencode-ai/plugin`) — NOT the read-only INSTALL lane
+# (`@npm-registry` is `{GET}`-only). Same host, two lanes: they must stay separate fragments
+# because a group expands into the list that references it, and an allow entry cannot be two
+# different verbs. Groups are global-only (like bundles): an app's or bundle's lists may
+# reference one, a project may not define one.
+
+[net.groups]
+npm-runtime = [
+    "{*} https://registry.npmjs.org",
+]

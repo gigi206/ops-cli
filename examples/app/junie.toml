@@ -3,6 +3,10 @@
 #   sbx app import examples/app/junie.toml
 #   sbx app run junie
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#
 # JetBrains publishes Junie from its own npm scope (`@jetbrains/junie`) — but that package is only
 # a SHIM: its `postinstall` downloads the real build (a ~260 MB zip of a JVM application with a
 # bundled JetBrains Runtime) from `github.com/JetBrains/junie/releases`, installs a launcher shim
@@ -79,7 +83,8 @@ allow = [
     # Install: the shim package from npm. The release zip itself (github.com + the
     # *.githubusercontent.com asset host) and the installer's update index on
     # raw.githubusercontent.com ride sbx's built-in read-only allow-set, so they need no entry.
-    "{GET} https://registry.npmjs.org",
+    # The registry lane itself is the shared `@npm-registry` group.
+    "@npm-registry",
     # The vendor's own distribution host: release channels, updates, and the `/cli` token page.
     "{*} https://junie.jetbrains.com",
     # Runtime: the JetBrains AI service the agent talks to, and its sibling cloud endpoint.
@@ -98,7 +103,7 @@ allow = [
 # changes the verdict (they stay refused) and never hides a count. See them with
 # `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a junie`.
 mute = [
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "@npm-audit",
     "youtrack.jetbrains.com",
 ]
 

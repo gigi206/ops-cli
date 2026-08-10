@@ -4,6 +4,13 @@
 #   sbx app import examples/app/openclaude.toml
 #   sbx app run openclaude
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/openclaude.toml
+#     sbx app import    examples/app/openclaude.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # OpenClaude is a Claude-Code-style terminal coding agent that routes to OpenAI-compatible APIs
 # (OpenRouter, OpenAI, DeepSeek, Groq, Mistral, LM Studio, …), Gemini, GitHub Models, Codex OAuth,
 # Ollama and partner gateways ("GitLawb Opengateway" is the startup default), with the same
@@ -61,11 +68,17 @@ cmd = "openclaude"
 #    { path = "~/.openclaude", mode = "rw" },
 #]
 
-[packages]
-# Node ≥ 22 from nixpkgs (the fork's runtime — the npm shim is a `#!/usr/bin/env node` bin).
-nodejs = "nix:nodejs"
-# The tool itself, from upstream's own npm scope — no postinstall scripts, installed in-cage.
-openclaude = "mise:npm:@gitlawb/openclaude"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `openclaude` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/openclaude.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["openclaude"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"
@@ -73,8 +86,10 @@ mode = "deny"
 # agent POSTs to is opened to all verbs with `{*}`; an app is read-by-default). registry.npmjs.org
 # is the equipping-time fetch (same as the `kimi` profile); the self-update check rides the
 # built-in github allow-set.
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle openclaude`, and what the
+# launch ends up with via `sbx config show --app openclaude`.
 allow = [
-    "{GET} https://registry.npmjs.org",
     # BYOK OpenAI-compatible host — uncomment the ONE you use, with the matching model host +
     # model in [env] and the [secret] block below. Examples:
     #"{*} https://openrouter.ai",

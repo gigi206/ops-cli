@@ -1,0 +1,24 @@
+# `github-oauth` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an app's
+# allow list — a bundle exists to carry maps (`packages`/`env`/`[secret]`), which a pure host
+# set has none of.
+#
+#   sbx net groups import examples/net-groups/github-oauth.toml
+#   # then in an app profile's [network]:   allow = ["@github-oauth"]
+#
+# The GitHub ACCOUNT sign-in host set, shared by agents that log in with a GitHub account:
+# the device-flow login pages (`github.com/login/*`, path-scoped — only the
+# login endpoints, not all of github.com, whose read-only lane the built-in allow-set already
+# provides) and the account/entitlement lookups the CLI POSTs to `api.github.com` (`/user`,
+# `/copilot_internal/*`; the built-in allow-set covers the read-only GET lane). NOT referenced
+# by any shipped profile right now — `copilot` keeps these hosts in its own `[network]` allow;
+# import this group the day a second app needs them. Install-time
+# `{GET}` fetches of github.com/api.github.com are NOT this group — they ride the built-in
+# allow-set. Groups are global-only (like bundles): an app's allow may reference one, a project
+# may not define one.
+
+[net.groups]
+github-oauth = [
+    "{*} https://github.com/login/*",
+    "{*} https://api.github.com",
+]

@@ -7418,6 +7418,61 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
 }
 
 #[test]
+fn every_shipped_profile_resolves_the_egress_groups_it_references() {
+    // Invariant 3 of the bundle test above reaches a profile only through its namesake bundle, so
+    // the profiles that have none — the desktop and web builds, and the agents packaged by a
+    // bootstrap or a source checkout — were never checked. They reference groups too, and a
+    // reference to a fragment that does not ship is fail-closed: the launch loses the whole lane,
+    // and the header's `sbx net groups import` line points at a file that is not there.
+    //
+    // This walks `examples/app/` directly, so a profile is covered whether or not a bundle exists
+    // for it.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut shipped_groups = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(root.join("examples/net-groups"))
+        .expect("examples/net-groups/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            shipped_groups.insert(path.file_stem().unwrap().to_str().unwrap().to_string());
+        }
+    }
+
+    let mut checked = 0;
+    for entry in std::fs::read_dir(root.join("examples/app"))
+        .expect("examples/app/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let profile = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
+        if let Some(schema::NetworkField::Table(t)) = &profile.network {
+            for (label, list) in [("allow", &t.allow), ("deny", &t.deny), ("mute", &t.mute)] {
+                for rule in list {
+                    if let Some(group) = rule.strip_prefix('@') {
+                        assert!(
+                            shipped_groups.contains(group),
+                            "`examples/app/{name}.toml` references @{group} in its {label} list, \
+                             but `examples/net-groups/{group}.toml` does not exist — the lane it \
+                             names would resolve to nothing"
+                        );
+                    }
+                }
+            }
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 60,
+        "expected the shipped profiles to be checked, saw {checked}"
+    );
+}
+
+#[test]
 fn an_unknown_key_is_named_rather_than_passed_over_in_silence() {
     // Unknown keys stay ignored — that is the forward-compatibility contract — but a misspelling
     // and a field from a newer sbx are indistinguishable in silence, and only one is harmless.

@@ -5,6 +5,9 @@
 #   sbx app run kiro -- chat                    # agentic chat/coding mode (strict egress)
 #   sbx app run kiro                            # the CLI (kiro-cli)
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
 # Kiro CLI is a **native glibc terminal program** (a Rust TUI: kiro-cli + kiro-cli-chat +
 # kiro-cli-term) — NOT an Electron/Chromium app. It runs like any other CLI in the cage; the
 # in-cage Chromium below is used ONLY to complete the OAuth sign-in, never for daily runs.
@@ -286,16 +289,10 @@ mute = [
     "prod.log.shortbread.aws.dev",
     "prod.tools.shortbread.aws.dev",
     "prod.tools.shortbread.analytics.console.aws.a2z.com",
-    # Chromium's own probes + Google noise during the in-cage sign-in (denied, non-essential —
-    # component/DRM/self updates, Safe Browsing lookups, connectivity checks, translate, YouTube
-    # cookie sync).
-    "redirector.gvt1.com",
-    "update.googleapis.com",
-    "safebrowsing.googleapis.com",
-    "clients2.google.com",
-    "android.clients.google.com",
-    "play.google.com",
-    "optimizationguide-pa.googleapis.com",
+    # Chromium's own probes + Google noise during the in-cage sign-in (denied, non-essential), shared
+    # with every other profile that embeds a browser engine, so they come from a group rather than a
+    # copy.
+    "@chromium-background",
+    # Chrome's page-translation service — same class, but not every browser embed reaches it.
     "translate.googleapis.com",
-    "accounts.youtube.com",
 ]

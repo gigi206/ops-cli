@@ -3,6 +3,13 @@
 #   sbx app import examples/app/mimo.toml
 #   sbx app run mimo
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/mimo.toml
+#     sbx app import    examples/app/mimo.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # MiMo Code is a terminal-native AI coding assistant distributed as a CLI (bin `mimo`), shipped
 # on npm as `@mimo-ai/cli`. It is a fork of opencode: the same TUI, LSP, MCP and plugin stack,
 # plus persistent memory, context management, subagent orchestration and the Compose workflows.
@@ -48,40 +55,24 @@ cmd = "mimo"
 #    { path = "~/.cache/mimocode", mode = "rw" },
 #]
 
-[packages]
-# A node runtime (the `bin/mimo` Node shim is what launches — needed at RUNTIME, not only to
-# install), plus MiMo Code itself via mise's npm backend. Both are trusted-only [packages];
-# this profile is trusted by location once imported. `sbx upgrade mise` rolls the CLI forward.
-nodejs = "nix:nodejs"
-mimo = "mise:npm:@mimo-ai/cli"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `mimo` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/mimo.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["mimo"]
 
-# Egress is denied by construction except the hosts the MiMo-flavored setup hits. Grounded in
-# the upstream source (packages/opencode), not guessed:
-#
-#  - api.xiaomimimo.com      the Xiaomi MiMo Open Platform API, OpenAI-compatible, base /v1 —
-#                            all model traffic (completions POSTs plus the built-in web search,
-#                            which POSTs /chat/completions to the same host). Opened to every
-#                            verb with `{*}` (an app is read-by-default {GET,HEAD}).
-#  - platform.xiaomimimo.com the OAuth login host, the plugin console, and the token-plan
-#                            management page — the account posture (opened to `{*}`).
-#  - models.dev              the model catalogue, a read-only fetch (opencode heredity).
-#  - registry.npmjs.org      installing the CLI via mise's npm backend (the shim's packument +
-#                            tarball and the platform optional-dep binary).
-#  - mimo.xiaomi.com         the config/tui/theme `$schema` and the docs (auto-injected by the
-#                            CLI for your editor; optional in a cage — read-only).
-#  - mimocode.cnbj1.mi-fds.com  the self-update binary CDN, hit by `mimo upgrade` (read-only).
-#
-# ── Alternate providers (uncomment the host(s) you actually use, and pair each with a
-#    matching [secret] block — the OpenRouter one is at the bottom) ──────────────────────────
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
+
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle mimo`, and what the
+# launch ends up with via `sbx config show --app mimo`.
 allow = [
-    "{*} https://api.xiaomimimo.com",
-    "{*} https://platform.xiaomimimo.com",
-    "{GET} https://mimo.xiaomi.com",
-    "{GET} https://models.dev",
-    "{GET} https://registry.npmjs.org",
-    "{GET} https://mimocode.cnbj1.mi-fds.com",
     #"{*} https://openrouter.ai",
     #"{*} https://api.openai.com",
 ]

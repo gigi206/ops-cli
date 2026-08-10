@@ -3,10 +3,15 @@
 #   sbx bundle import examples/bundle/copilot.toml
 #   # then in an app profile:   use = ["copilot"]
 #
-# Derived from `examples/app/copilot.toml`, which stays the self-contained way to run this agent on
-# its own (`sbx app import`, one step, nothing else needed). This bundle is for an app that EMBEDS
-# the agent — an orchestrator spawning it as a subprocess — so that app states the requirement ONCE
-# instead of copying it. A test pins the two artifacts together, so they cannot drift apart.
+# Derived from `examples/app/copilot.toml`, whose namesake profile now names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# The GitHub ACCOUNT sign-in hosts are NOT here — they live in the consuming app's own
+# [network] allow (github.com/login/*, api.github.com). A shared `github-oauth` egress group
+# still exists under `examples/net-groups/` for the day several apps need the same lane again;
+# nothing ships referencing it right now.
 #
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's OWN
@@ -19,8 +24,9 @@
 
 [bundle.copilot]
 allow = [
-    "{*} https://github.com/login/*",
-    "{*} https://api.github.com",
+    # The agent's OWN product hosts. The GitHub account sign-in hosts (github.com/login/*,
+    # api.github.com for the device-flow polling and entitlement lookups) live in the consuming
+    # app's own [network] allow, not here.
     "{*} https://*.githubcopilot.com",
     "{*} https://copilot-proxy.githubusercontent.com",
     "{*} https://origin-tracker.githubusercontent.com",

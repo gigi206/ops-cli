@@ -99,9 +99,9 @@ mise run lint-bundled    # compile + clippy the bundled-* feature paths (needs h
 ## Building the documentation site
 
 The user guide lives in
-[`docs-site/docs/guide/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/docs-site/docs/guide/)
+`docs-site/docs/guide/`
 and is built with [Docusaurus](https://docusaurus.io/), configured in
-[`docusaurus.config.ts`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/docs-site/docusaurus.config.ts).
+`docusaurus.config.ts`.
 Mermaid diagrams render in the browser, from `@docusaurus/theme-mermaid`.
 
 ```sh

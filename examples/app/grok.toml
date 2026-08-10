@@ -3,6 +3,13 @@
 #   sbx app import examples/app/grok.toml
 #   sbx app run grok
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/grok.toml
+#     sbx app import    examples/app/grok.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # xAI publishes the CLI as a single static release binary in its own public artifact bucket
 # (`storage.googleapis.com/grok-build-public-artifacts/cli/grok-<version>-linux-x86_64`), which is
 # what mise's `aqua` backend fetches through the aqua registry entry `x.ai/cli/grok` — no node
@@ -40,23 +47,31 @@ cmd = "grok"
 #    { path = "~/.grok", mode = "rw" },
 #]
 
-[packages]
-# Grok itself via mise's aqua backend. The aqua entry is an `http`-type package: it downloads the
-# raw binary straight from xAI's artifact bucket (allowed, path-scoped, in [network] below).
-grok = "mise:aqua:x.ai/cli/grok"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `grok` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/grok.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["grok"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); the model endpoints carry POSTs, so each is opened to all
 # verbs with `{*}`.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle grok`, and what the
+# launch ends up with via `sbx config show --app grok`.
 allow = [
     # Install + self-update: xAI's public artifact bucket, path-scoped to the Grok CLI prefix —
     # not all of Google Cloud Storage (the same least-privilege shape `claude-code.toml` uses for
     # Anthropic's bucket). Read-only: a download is a GET.
-    "{GET} https://storage.googleapis.com/grok-build-public-artifacts/*",
     # BYOK model traffic — xAI's API, the default path here (pair it with the [env] + [secret]
     # blocks below, or with a key passed per launch via `--env XAI_API_KEY=…`).
-    "{*} https://api.x.ai",
     # Account path instead of BYOK: the sign-in host and the CLI chat proxy (HTTPS + WebSocket).
     #"{*} https://accounts.x.ai",
     #"{*,WS} https://cli-chat-proxy.grok.com",
@@ -66,15 +81,12 @@ allow = [
 # sink the CLI reports to, deliberately left DENIED. A `mute` never changes the verdict (it stays
 # refused) and never hides a count (`sbx net stats` still tallies it); it only keeps the line out
 # of the default log. See it with `sbx net log --all`; edit with `sbx net mute|unmute <host> -a grok`.
-mute = [
-    "api.mixpanel.com",   # product analytics
-]
+mute = []
 
 [env]
 # sbx owns upgrades (`sbx upgrade mise`), so tell the CLI not to replace its own binary underneath
 # the pinned install. Belt and braces: even if the value is not honored, the allowlist above admits
 # only GETs to the artifact prefix, and a warm launch reuses the pinned version offline.
-GROK_DISABLE_AUTOUPDATER = "1"
 
 # --- BYOK (commented) — uncomment together with the `{*} https://api.x.ai` allow line above. The
 # in-cage placeholder lets the CLI start and issue its request; the proxy strips it and substitutes

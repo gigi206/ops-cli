@@ -1,0 +1,160 @@
+# nanobot — HKUDS' ultra-lightweight, self-hosted personal AI agent (PyPI `nanobot-ai`),
+# sandboxed by sbx. A "lightweight OpenClaw alternative": one small agent loop with tools
+# (files, shell, web search/fetch, MCP, subagents), long-term memory, model routing, and
+# scheduled automations — runnable as a terminal chat (`nanobot agent`), a WebUI/gateway, or an
+# OpenAI-compatible API server.
+#
+#   sbx app import examples/app/nanobot.toml
+#   sbx app run nanobot
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/nanobot.toml
+#     sbx app import    examples/app/nanobot.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
+# PACKAGING — a clean PyPI install. mise's `pipx` backend runs `uv tool install nanobot-ai`
+# (the same clean path `aider`/`vibe` use — `nix:uv` puts uv on PATH, `nix:python312` supplies
+# an interpreter in the `>=3.11` range the project requires), resolving the wheels from PyPI on
+# first launch and reusing them offline after. The 0.3.0 wheel is pure Python
+# (`py3-none-any`, ~3 MB) and already bundles the WebUI, so there is no postinstall to skip.
+# `sbx upgrade mise` rolls it forward.
+#
+# FIRST RUN — the chat needs a configured provider + model preset; on a bare default config
+# `nanobot agent` exits with an error. Configure once, inside the cage:
+#     sbx app run nanobot -- onboard --wizard
+# (The wizard is interactive. When it asks for the API key, type the literal
+# `${OPENROUTER_API_KEY}` — or whichever `[env]` name you uncommented below — so the config
+# keeps a host-side reference: nanobot expands `${ENV}` from the cage env at every launch, and
+# the egress proxy substitutes the real value on the wire.) Then pick any model ID the provider
+# serves. Afterwards:
+#     sbx app run nanobot                # interactive terminal chat (the bare-launch default)
+#     sbx app run nanobot -- agent -m "Hello!"   # one-shot check
+#     sbx app run nanobot -- status               # config/workspace/provider readiness, no model call
+#
+# CONFIG + STATE — `~/.nanobot/config.json` (provider keys as `${ENV}` references, model
+# presets) and `~/.nanobot/workspace/` (sessions, memory, skills, automations, generated
+# files), both in the app's persistent isolated home. The host's own `~/.nanobot` is NOT bound
+# in: it holds the plaintext keys, and the profile's whole point is that the key never enters
+# the cage.
+#
+# WEBUI / GATEWAY — `nanobot webui` and `nanobot gateway` bind the WebSocket UI to
+# `127.0.0.1:8765` (gateway health `127.0.0.1:18790`) INSIDE the cage: unreachable from your
+# host browser, and this profile ships no in-cage browser. The terminal `agent` path is the
+# sandboxed entry; the gateway's chat channels (Telegram/Discord/…) are out of scope here.
+#
+# CREDENTIALS — BYOK, one env var per provider (the provider registry in the shipped wheel
+# names each provider's env key and default API host; the key is read on the HOST and injected
+# by the egress proxy on the wire — never in the cage, see the [secret] blocks below):
+#
+#  - **OpenRouter**: `OPENROUTER_API_KEY` → openrouter.ai (one key, hundreds of models).
+#  - **OpenAI**: `OPENAI_API_KEY` → api.openai.com.
+#  - **Anthropic**: `ANTHROPIC_API_KEY` → api.anthropic.com (native backend, `x-api-key`).
+#  - **Gemini**: `GEMINI_API_KEY` → generativelanguage.googleapis.com.
+#  - **DeepSeek**: `DEEPSEEK_API_KEY` → api.deepseek.com.
+#  - **Local** (Ollama/LM Studio on the HOST loopback): a `tcp://localhost:<port>` allow rule
+#    (ollama :11434, LM Studio :1234) + the provider's `apiBase` in the config — sbx relays the
+#    port into the cage under the allowlist, so the model stays reachable (the `openfox` fix).
+# Uncomment the ONE pair you use in `allow` + `[env]` + `[secret]` below; a key whose env var
+# is unset in the cage expands to "" and the provider answers 401 — the proxy needs the
+# placeholder to substitute.
+#
+# TOOLS — the built-in web search defaults to DuckDuckGo (the `ddgs` dependency) and the web
+# fetch tool follows arbitrary URLs; both are REFUSED by the allowlist unless you open them
+# (search is one commented line below; fetch has no fixed host). The optional search providers
+# (Brave/Tavily/Jina/Exa/…) each need their own host + `[secret]`. MCP servers are reachable
+# only for hosts you allow. None of these are opened by default — least privilege.
+#
+# UNVERIFIED (like every profile until run with a real key): the live equip + first prompt
+# under the allowlist, the placeholder→real-key substitution for a `${ENV}` key in
+# `config.json`, and the exact conversation transport. Grounded here: the PyPI packaging
+# (`nanobot-ai` 0.3.0, pure wheel, console script `nanobot`, `requires-python >=3.11`), the
+# env expansion (`${ENV}` in `providers.*.apiKey`, resolved on every launch —
+# `cli/commands.py` `_load_runtime_config` → `config/loader.py` `resolve_config_env_vars`;
+# an unset variable expands to ""), the provider registry (env keys + default API hosts read
+# out of `providers/registry.py`), the CLI surface (docs/cli-reference.md), and the absence of
+# any telemetry host in the wheel.
+cmd = [
+    "bash",
+    "-c",
+    '''
+# Bare `sbx app run nanobot` lands in the agent chat; `-- <args>` appends arrive as $1 $2 …
+# and pass through verbatim (the same `$0` placeholder convention as warp.toml).
+if [ "$#" -eq 0 ]; then
+    exec nanobot agent
+fi
+exec nanobot "$@"
+    ''',
+    # `$0` placeholder: `sbx app run nanobot -- <args>` appends <args> to this cmd
+    # array, so they arrive as `$1 $2 …` and reach the CLI verbatim via `exec … "$@"`.
+    "nanobot",
+]
+
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `nanobot` BUNDLE — the package(s) (uv/python312 for the pipx install), the
+# PyPI install lane, and its (empty) telemetry mutes — from one declaration shared with the
+# bundle file itself, so this profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/nanobot.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["nanobot"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
+
+[network]
+mode = "deny"
+# Egress is denied by construction except the ONE provider you actually use (the model host the
+# agent POSTs to is opened to all verbs with `{*}`; an app is read-by-default). The PyPI hosts
+# are the install-time fetch (same as `aider`).
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle nanobot`, and what
+# the launch ends up with via `sbx config show --app nanobot`.
+allow = [
+    # BYOK provider — uncomment the ONE you use, with the matching [env] + [secret] below.
+    #"{*} https://openrouter.ai",
+    #"{*} https://api.openai.com",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://generativelanguage.googleapis.com",
+    #"{*} https://api.deepseek.com",
+    # Agent tool egress (REFUSED by default; the built-in web search's default provider — open
+    # only if you want the agent to search the web; the proxy reports the refused verb if a
+    # search needs POST rather than GET).
+    #"{GET,HEAD} https://duckduckgo.com",
+]
+mute = [
+]
+
+# BYOK: the real key is read on the HOST and injected by the egress proxy — never in the cage.
+# The in-cage placeholder lets `nanobot` expand its `${ENV}` config reference and issue the
+# request; the proxy strips it and substitutes the real key on the wire to the matching host.
+# Uncomment the pair matching the ONE provider `allow` opens, and write THAT `${ENV}` name as
+# the provider's `apiKey` in `~/.nanobot/config.json` (the wizard accepts the literal string).
+[env]
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+#GEMINI_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+#DEEPSEEK_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+#[secret."generativelanguage.googleapis.com"]
+#from = "env://GEMINI_API_KEY"
+#header = "x-goog-api-key"
+#type = "raw"
+#[secret."api.deepseek.com"]
+#from = "env://DEEPSEEK_API_KEY"
+#header = "Authorization"
+#type = "bearer"

@@ -3,6 +3,13 @@
 #   sbx app import examples/app/sigit.toml
 #   sbx app run sigit
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/sigit.toml
+#     sbx app import    examples/app/sigit.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # **The profile with no credential at all.** Every other agent here talks to somebody's API; siGit
 # Code runs the model itself — it downloads a Qwen3 GGUF from Hugging Face on first launch (roughly
 # 1–2 GB, into the app's persistent isolated home) and infers in-process. So there is no account, no
@@ -42,22 +49,29 @@ cmd = "sigit"
 #    { path = "~/.cache/sigit", mode = "rw" },
 #]
 
-[packages]
-# A node runtime — the npm entry point is a JS shim over the platform binary.
-nodejs = "nix:nodejs"
-sigit = "mise:npm:@smbcloud/sigit"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `sigit` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/sigit.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["sigit"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}) — which is all a model download needs, so nothing here is
 # opened to writes.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle sigit`, and what the
+# launch ends up with via `sbx config show --app sigit`.
 allow = [
     # Install: the packument (version resolution, also used by `sbx upgrade mise`) and the tarballs
     # (the shim plus its ~78 MB platform package).
-    "{GET} https://registry.npmjs.org",
     # The model itself: the repository metadata, and the LFS/CAS content hosts it redirects to.
-    "{GET} https://huggingface.co",
-    "{GET} https://*.hf.co",
     # Its web-search tool's backend — refused on purpose, since a local-model agent that reaches no
     # network at all is the point of this profile. Uncomment to let that tool work; the `mute` below
     # then has nothing to suppress (a mute only ever hides a *refusal*), so you can leave it.
@@ -68,6 +82,4 @@ allow = [
 # the web-search backend left denied just above. A `mute` never changes the verdict and never hides
 # a count. See everything with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a sigit`.
 mute = [
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
-    "html.duckduckgo.com",
 ]

@@ -1,0 +1,20 @@
+# `npm-registry` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list. A bundle exists to carry maps (`packages`/`env`/
+# `[secret]`), which a pure host set has none of.
+#
+#   sbx net groups import examples/net-groups/npm-registry.toml
+#   # then in an app's or bundle's allow list:   "@npm-registry"
+#
+# The npm INSTALL lane, shared by every agent that rides the npm registry (mise's npm backend
+# fetches the packument and the tarball in-cage, so the registry is subject to this policy —
+# opened read-only as a whole): one `{GET}` for the whole registry. The npm audit POST that
+# follows installs is a SEPARATE group (`npm-audit`), referenced from the mute list: a group
+# expands into the list that references it, so an allow and a mute cannot share one group.
+# Groups are global-only (like bundles): an app's or bundle's lists may reference one, a
+# project may not define one.
+
+[net.groups]
+npm-registry = [
+    "{GET} https://registry.npmjs.org",
+]

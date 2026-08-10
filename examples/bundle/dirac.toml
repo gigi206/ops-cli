@@ -2,11 +2,14 @@
 #
 #   sbx bundle import examples/bundle/dirac.toml
 #   # then in an app profile:   use = ["dirac"]
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
 #
-# Derived from `examples/app/dirac.toml`, which stays the self-contained way to run this agent on its
-# own (`sbx app import`, one step, nothing else needed). This bundle is for an app that EMBEDS the
-# agent — an orchestrator spawning it as a subprocess — so that app states the requirement ONCE
-# instead of copying it. A test pins the two artifacts together, so they cannot drift apart.
+# Derived from `examples/app/dirac.toml`, whose namesake profile now names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
 #
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
@@ -26,13 +29,13 @@
 
 [bundle.dirac]
 allow = [
-    "{GET} https://registry.npmjs.org",
+    "@npm-registry",
 ]
 mute = [
     "dirac.run",
     "us.i.posthog.com",
     "us.posthog.com",
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "@npm-audit",
 ]
 
 [bundle.dirac.packages]

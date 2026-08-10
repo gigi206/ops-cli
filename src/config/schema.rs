@@ -695,9 +695,10 @@ pub(crate) struct RawInlineFlake {
 /// `[packages]` entry `<name> = "tarball:resolve"` / `"deb:resolve"`. It gives sbx a **command** that
 /// discovers the newest release's download URL of a prebuilt app whose URL is version-stamped (no
 /// stable `latest` alias): the command prints the concrete URL to stdout, and sbx runs it
-/// **sandboxed** (in a hermetic bubblewrap cage with sbx's base tools — `curl`/`coreutils`/`grep`/
-/// `sed`/`awk` — and the app's own `nix:` `[packages]` on `PATH`, so a command that needs e.g. `jq`
-/// just declares it), then validates the printed URL (against the backend's shape — `.tar.gz` or
+/// **sandboxed** (in a hermetic bubblewrap cage carrying sbx's base userland — the shell, coreutils
+/// and the curated base tools, `curl` and `jq` among them — plus the app's own `nix:` `[packages]` on
+/// `PATH`, so a command that needs a tool the base does not carry just declares it), then validates
+/// the printed URL (against the backend's shape — `.tar.gz` or
 /// `.deb`) and pins it. `sbx upgrade` re-runs the command and rolls the app forward. Because the
 /// command is arbitrary code, this is honored **only from a trusted source**; it never runs for an
 /// untrusted layer.

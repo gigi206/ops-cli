@@ -1,0 +1,19 @@
+# `pypi` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list. A bundle exists to carry maps (`packages`/`env`/
+# `[secret]`), which a pure host set has none of.
+#
+#   sbx net groups import examples/net-groups/pypi.toml
+#   # then in an app's or bundle's allow list:   "@pypi"
+#
+# The Python INSTALL lane, shared by every agent that rides PyPI (mise's pipx backend and
+# the uv bootstraps run `uv tool install` / `pip install` in-cage, so the index is subject
+# to this policy — opened read-only as a whole): the package index and the wheel host, both
+# pure `{GET}` downloads. Groups are global-only (like bundles): an app's or bundle's lists
+# may reference one, a project may not define one.
+
+[net.groups]
+pypi = [
+    "{GET} https://pypi.org",
+    "{GET} https://files.pythonhosted.org",
+]

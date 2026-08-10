@@ -30,14 +30,14 @@ in the global config:
 ```toml
 # ~/.config/sbx/sbx.toml — applies to every project and every app
 [packages]
-rg = "nix:ripgrep"
+ast-grep = "nix:ast-grep"
 ```
 
 ```sh
-sbx run -- rg --version      # any project
-sbx app run review           # any app: rg is on PATH there too
-sbx config show -g           # what the global layer contributes
-sbx config show -a review    # rg tagged "inherited" in the app's effective config
+sbx run -- ast-grep --version  # any project
+sbx app run review             # any app: ast-grep is on PATH there too
+sbx config show -g             # what the global layer contributes
+sbx config show -a review      # ast-grep tagged "inherited" in the app's effective config
 ```
 
 By contrast, a project's mise files ([`[tools]`](tools)) are **project-local by

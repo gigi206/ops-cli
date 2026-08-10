@@ -3,6 +3,13 @@
 #   sbx app import examples/app/droid.toml
 #   sbx app run droid
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/droid.toml
+#     sbx app import    examples/app/droid.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Droid ships a genuine terminal CLI on npm (the `droid` package), distributed as a
 # self-contained native binary resolved through a platform-specific optional dependency
 # — so sbx equips it in-cage with a node runtime (for the npm install) plus mise's npm
@@ -45,30 +52,31 @@ cmd = "droid"
 #    { path = "~/.factory", mode = "rw" },
 #]
 
-[packages]
-# A node runtime (the npm install needs it), then Droid itself via mise's npm backend. The
-# executed `droid` is a native binary (resolved via the package's optional dependency), so
-# node is needed only to install. Both are trusted-only [packages]; this profile is trusted
-# by location once imported.
-nodejs = "nix:nodejs"
-droid = "mise:npm:droid"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `droid` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/droid.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["droid"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); these are write hosts (install/login/API POSTs), so
 # each is opened to all verbs with `{*}`.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle droid`, and what the
+# launch ends up with via `sbx config show --app droid`.
 allow = [
     # Install: the npm package and its platform binary (an optional dep).
-    "{GET} https://registry.npmjs.org",
     # Runtime: Factory's account/login and API gateway. Model traffic flows through Factory's
     # gateway by default (so no separate provider host is needed unless you switch to BYOK).
-    "{*} https://app.factory.ai",
-    "{*} https://api.factory.ai",
     # (Add `downloads.factory.ai` only if you let Droid self-update its binary, and a model
     #  provider host — e.g. `openrouter.ai` — only if you configure direct BYOK in settings.json.)
-    "{*} https://api.workos.com",
-    "{GET,HEAD} https://docs.factory.ai",
-    "{POST} https://github.com/Factory-AI/factory-plugins.git/git-upload-pack",
     # Uncomment for the direct-OpenRouter BYOK path below.
     #"{*} https://openrouter.ai",
 ]
@@ -82,12 +90,9 @@ allow = [
 # Remove the entry here the day you decide to allow the endpoint (uncomment the `{POST} telemetry.factory.ai`
 # line above instead).
 mute = [
-    "telemetry.factory.ai",            # Factory telemetry (POST /api/ingest)
     # Factory's OpenTelemetry collector on Google Cloud Run — a regional host whose `us-central1`
     # (or other region) label varies while the project number `123358924663` stays stable, so a
     # regex covers every regional variant rather than enumerating them. POST /v1/metrics.
-    "re:^https://otel-collector-123358924663\\.[^.]+\\.run\\.app",
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
 ]
 
 # OPTIONAL direct-OpenRouter BYOK (commented). Droid's default is the Factory account above,

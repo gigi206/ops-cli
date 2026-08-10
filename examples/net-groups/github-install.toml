@@ -1,0 +1,18 @@
+# `github-install` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list.
+#
+#   sbx net groups import examples/net-groups/github-install.toml
+#   # then in an app's or bundle's allow list:   "@github-install"
+#
+# The GitHub GET install lane: the source/release hosts every `mise:github:` backend fetches
+# from, opened `{GET}`-only — shared by `autohand`, `command-code` and `crush`. (The built-in
+# allow-set already covers the read-only GitHub lanes; these are the explicit belt-and-suspenders
+# declarations the profiles shipped.) Groups are global-only (like bundles): an app's or
+# bundle's lists may reference one, a project may not define one.
+
+[net.groups]
+github-install = [
+    "{GET} https://github.com",
+    "{GET} https://api.github.com",
+]

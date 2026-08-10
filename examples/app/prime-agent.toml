@@ -6,6 +6,10 @@
 #   sbx app run prime-agent -- -p "<task>"       # one-shot, non-interactive
 #   sbx app run prime-agent -- agents            # browse running, idle and saved sessions
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/pypi.toml
+#
 # WHY A CAGE. Prime Agent hands the model ONE built-in tool: a long-lived IPython kernel. File
 # edits, project commands, tool use and context management all happen as model-written Python
 # executed in that kernel, and `await rlm("subtask")` spawns real child agents that use the same
@@ -152,14 +156,11 @@ allow = [
     # tarball's own internal dependency URLs also point at. The agent's startup notice reads its
     # release manifest (`latest.json`) from the same host.
     "{GET} https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev",
-    # The third-party npm dependencies of that tarball.
-    "{GET} https://registry.npmjs.org",
-    # The Python kernel: ipykernel, prime-agent-runtime and the default working set.
-    "{GET} https://pypi.org",
-    "{GET} https://files.pythonhosted.org",
-    # The model provider. Anthropic here; swap the host for the provider you key it to, and keep the
-    # `[secret]` block on the same host.
-    "{*} https://api.anthropic.com",
+    # The third-party npm dependencies of that tarball (the shared `@npm-registry` group).
+    "@npm-registry",
+    # The Python kernel: ipykernel, prime-agent-runtime and the default working set (the
+    # shared `@pypi` group).
+    "@pypi",
 ]
 
 [env]
@@ -169,12 +170,3 @@ allow = [
 # the proxy at all. This makes it route through the proxy, so every request is subject to the
 # allowlist above.
 NODE_USE_ENV_PROXY = "1"
-
-# BYOK: the real key is read on the HOST and injected by the egress proxy — never in the cage.
-# Uncomment the placeholder and the block together.
-#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
-
-#[secret."api.anthropic.com"]
-#from = "env://ANTHROPIC_API_KEY"
-#header = "x-api-key"
-#type = "raw"

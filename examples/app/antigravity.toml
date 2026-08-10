@@ -1,7 +1,10 @@
 # Antigravity IDE — Google's agentic IDE (desktop, Electron / VS Code fork), sandboxed by sbx.
 #
-#   sbx app import examples/app/antigravity-ide.toml
-#   sbx app run antigravity-ide
+#   sbx app import examples/app/antigravity.toml
+#   sbx app run antigravity
+#
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
 #
 # This is the GRAPHICAL IDE (a VS Code / Windsurf-class fork), distinct from the `agy` terminal CLI
 # (profiled in `agy.toml`). Google ships the v2 Linux IDE **only as a plain `.tar.gz`** from its Edge
@@ -276,26 +279,16 @@ mute = [
     # build fetches the tarball over the HOST network, not this allowlist, so gvt1 is not needed here).
     "antigravity-ide-auto-updater-974169037036.us-central1.run.app",
     "edgedl.me.gvt1.com",
-    # The in-cage Chromium's own background services — irrelevant to the login: crash reporting, clock
-    # sync, device check-in, the ML "optimization guide", the component/extension + app updater, Play
-    # logging, Safe Browsing, form autofill, and the cross-domain sign-in cookie check.
+    # The in-cage Chromium's own background services — irrelevant to the login. Shared with every
+    # other profile that embeds a browser engine, so they come from a group rather than a copy.
+    "@chromium-background",
+    # Crash reporting (the app's own, not Chromium's).
     "*.sentry.io",
-    "clients2.google.com",
-    "android.clients.google.com",
-    "optimizationguide-pa.googleapis.com",
-    "update.googleapis.com",
-    "play.google.com",
-    "safebrowsing.googleapis.com",
-    "content-autofill.googleapis.com",
-    "accounts.youtube.com",
-    "redirector.gvt1.com",
     # VS Code telemetry (Antigravity is a VS Code fork) — Microsoft's OneCollector endpoint (browser +
     # mobile events subdomains). Denied; muted.
     "*.events.data.microsoft.com",
-    # Google push/sync signaling, Chromium's password-leak check, and Google page chrome (favicon,
-    # account `async/folae`) — none needed for the agent or the login (which completes without them).
-    "signaler-pa.googleapis.com",
-    "passwordsleakcheck-pa.googleapis.com",
+    # Google page chrome (favicon, account `async/folae`) — not needed for the agent or the login,
+    # which completes without it.
     "www.google.com",
     # Google Tag Manager — analytics / marketing tags, not functional. Denied; muted.
     "www.googletagmanager.com",

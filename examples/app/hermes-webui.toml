@@ -3,6 +3,13 @@
 #   sbx app import examples/app/hermes-webui.toml
 #   sbx app run hermes-webui      # then open http://127.0.0.1:8787 in your host browser
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/hermes.toml
+#     sbx app import    examples/app/hermes-webui.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # NOT the same app as the `hermes-web` profile. `hermes-web` runs `hermes dashboard`, the browser
 # dashboard shipped INSIDE NousResearch's own hermes-agent. This profile runs a SEPARATE, third-party
 # project — https://github.com/nesquena/hermes-webui — an unofficial, community-maintained web UI for
@@ -202,6 +209,16 @@ gui = "offscreen"
 #    { path = "~/.hermes", mode = "rw" },
 #]
 
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `hermes` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/hermes.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["hermes"]
+
 [packages]
 # The WebUI itself, from its own upstream flake (`bin/hermes-webui` — a wrapper that runs bootstrap
 # with `--foreground --no-browser --skip-agent-install`, and carries the WebUI's own pyyaml +
@@ -210,7 +227,6 @@ hermes-webui = "flake:github:nesquena/hermes-webui#default"
 # The agent the WebUI imports and runs in-process. The SAME `#default` output as the `hermes`,
 # `hermes-web`, and `hermes-desktop` profiles, so the heavy build is shared with them rather than
 # duplicated. It supplies the `run_agent` module, its interpreter, and every provider client.
-hermes = "flake:github:NousResearch/hermes-agent#default"
 # The browser toolset (see `gui = "offscreen"` above). `agent-browser` is Hermes' own browser-driver
 # CLI: a self-contained Rust binary shipped in its npm tarball, so mise's `--ignore-scripts` install
 # is not merely harmless but wanted — it skips the postinstall that would otherwise download a
@@ -219,7 +235,6 @@ hermes = "flake:github:NousResearch/hermes-agent#default"
 # PATH, not the cage's). Chromium is HEAVY — ~620 MB unpacked, a larger closure — and lands in the
 # project store on the first launch. agent-browser finds Chromium on PATH by itself; point it
 # elsewhere with `AGENT_BROWSER_EXECUTABLE_PATH` if you ever need to.
-nodejs = "nix:nodejs"
 chromium = "nix:chromium"
 agent-browser = "mise:npm:agent-browser"
 
@@ -233,23 +248,23 @@ mode = "deny"
 mute = [
     "169.254.169.254",
     # npm's audit POST on every install: refused anyway, just kept out of the default log.
-    "https://registry.npmjs.org/-/npm/v1/security/advisories/*",
 ]
+# The agent's OWN hosts arrive with its bundle (`use` above) and are unioned into this list at
+# resolution. Check the union with `sbx config show --app hermes-webui`.
 allow = [
+    # OpenRouter BYOK — OPTIONAL, and off by default: the shipped default is the NousResearch
+    # account login (no BYOK key). To enable, uncomment the line below, import the group once
+    # (`sbx net groups import examples/net-groups/openrouter.toml`), set OPENROUTER_API_KEY, and
+    # uncomment the [secret."openrouter.ai"] block further down.
+    #"@openrouter",
     # The browser toolset's `agent-browser` CLI, fetched from npm at launch (mise's npm backend
     # installs in-cage, unlike the host-side `flake:` build). The audit POST is noisy and
     # non-essential, so it is muted rather than allowed.
-    "{GET} https://registry.npmjs.org",
     # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter; with
     # a NousResearch account login instead (the shipped default, no BYOK key set), the model traffic
     # goes to the account's own API: portal is the OAuth token endpoint, inference-api serves the
     # models. The agent runs in-process, so this is the same provider egress as the `hermes` CLI.
-    "{*} https://openrouter.ai",
-    "{*} https://portal.nousresearch.com",
-    "{*} https://inference-api.nousresearch.com",
     # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
-    "{*} https://hermes-agent.nousresearch.com",
-    "{GET} https://models.dev",
     # Other providers the WebUI's picker offers — uncomment the one you use, and add a matching
     # [secret] block (or set the key in Settings → Providers, which stores it in the isolated home).
     #"{*} https://api.anthropic.com",
@@ -272,7 +287,6 @@ allow = [
 # `clone(CLONE_NEWUSER)`), so without it the browser aborts at startup and every browser tool fails.
 # Dropping Chromium's inner sandbox is acceptable here because bubblewrap + seccomp + the empty netns
 # IS the boundary. `--disable-dev-shm-usage` keeps it off the cage's small /dev/shm.
-AGENT_BROWSER_ARGS = "--no-sandbox,--disable-dev-shm-usage"
 # Bind address + port INSIDE the cage. 127.0.0.1 is the upstream default and the right value: the
 # forwarder above bridges the host's loopback to the cage's, so there is no reason to expose the
 # server on 0.0.0.0 (which would publish it to your LAN if the netns were ever shared). Keep this

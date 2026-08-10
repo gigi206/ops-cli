@@ -3,8 +3,15 @@
 #   sbx app import examples/app/hermes.toml
 #   sbx app run hermes
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/hermes.toml
+#     sbx app import    examples/app/hermes.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Hermes ships as a nix flake, and sbx equips it via the flake's `#default` output —
-# `flake:github:NousResearch/hermes-agent#default` in [packages] — so `sbx upgrade flake` rolls it
+# `flake:github:NousResearch/hermes-agent#default` in its bundle — so `sbx upgrade flake` rolls it
 # forward. That output bundles everything in one package: the Python agent (built with uv2nix, its
 # own interpreter — no separate `nix:python`), the node-based TUI/web front-ends, and all the
 # optional extras (voice, edge-tts, mcp, exa, firecrawl, …), each wired by the derivation's own
@@ -67,6 +74,16 @@ gui = "offscreen"
 #    { path = "~/.hermes", mode = "rw" },
 #]
 
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `hermes` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/hermes.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["hermes"]
+
 [packages]
 # Hermes via the flake's `#default` output, built host-side — so `sbx upgrade flake` rolls it forward.
 # One package supplies the interpreter, the node TUI/web front-ends, and every optional extra
@@ -76,7 +93,6 @@ gui = "offscreen"
 # allowlist. `[voice]` (bundled) needs `audio = true` above for the actual microphone access;
 # `[voice]`'s Whisper model and `[edge-tts]`'s TTS fetch runtime assets on first use from hosts in
 # the allowlist below (see the voice entries) — cached in the app home after.
-hermes = "flake:github:NousResearch/hermes-agent#default"
 # The browser toolset (see `gui = "offscreen"` above). `agent-browser` is Hermes' own browser-driver
 # CLI: a self-contained Rust binary shipped in its npm tarball, so mise's `--ignore-scripts` install
 # is not merely harmless but wanted — it skips the postinstall that would otherwise download a
@@ -85,7 +101,6 @@ hermes = "flake:github:NousResearch/hermes-agent#default"
 # PATH, not the cage's). Chromium is HEAVY — ~620 MB unpacked, a larger closure — and lands in the
 # project store on the first launch. agent-browser finds Chromium on PATH by itself; point it
 # elsewhere with `AGENT_BROWSER_EXECUTABLE_PATH` if you ever need to.
-nodejs = "nix:nodejs"
 chromium = "nix:chromium"
 agent-browser = "mise:npm:agent-browser"
 
@@ -94,39 +109,36 @@ mode = "deny"
 # npm's audit POST fires on every install and is refused (it is not in `allow`). The verdict is
 # unchanged — this only keeps the noise out of the default `sbx net log`, SELinux `dontaudit`-style.
 # Still visible with `sbx net log --all`.
-mute = ["https://registry.npmjs.org/-/npm/v1/security/advisories/*"]
+mute = []
+# The agent's OWN hosts arrive with its bundle (`use` above) and are unioned into this list at
+# resolution. Check the union with `sbx config show --app hermes`.
 allow = [
+    # OpenRouter BYOK — OPTIONAL, and off by default: the shipped default is the NousResearch
+    # account login (no BYOK key). To enable, uncomment the line below, import the group once
+    # (`sbx net groups import examples/net-groups/openrouter.toml`), set OPENROUTER_API_KEY, and
+    # uncomment the [secret."openrouter.ai"] block further down.
+    #"@openrouter",
     # Runtime — the LLM provider. With a BYOK key (the [secret] block below) that is OpenRouter;
     # with the NousResearch account login instead (no BYOK key set — the shipped default), the
     # model traffic goes to the account's own API: portal is the OAuth token endpoint, and
     # inference-api serves the models (GET /v1/models, POST /v1/chat/completions).
-    "{*} https://openrouter.ai",
-    "{*} https://portal.nousresearch.com",
-    "{*} https://inference-api.nousresearch.com",
     # Runtime: model catalogs (read-only; TTL-cached on disk, fail-soft if blocked).
-    "{*} https://hermes-agent.nousresearch.com",
-    "{GET} https://models.dev",
     # Hermes' "pet" gallery (agent/pet) — a public, read-only pixel-art sprite gallery: the manifest
     # (petdex.dev/api/manifest, 307 → R2) and the sprite assets (assets.petdex.dev), all pinned to
     # *.petdex.dev by Hermes (anti-SSRF), GET-only, no data sent. Cosmetic; drop this line if you do
     # not want the pixel pets.
-    "{GET} https://*.petdex.dev",
     # Voice STT (`/voice on` / Ctrl+B): the local faster-whisper model is fetched from Hugging Face
     # on first use — metadata/resolve on huggingface.co, the model blobs via the Xet CDN under
     # *.xethub.hf.co (read-only, cached in the app home after). Live-verified via hermes-web.
-    "{GET,HEAD} https://huggingface.co",
-    "{GET,HEAD} https://*.xethub.hf.co",
     # Voice replies / read-aloud (edge-tts) — Microsoft's free online TTS, over a WebSocket. `{WS}` is
     # the explicit WebSocket opt-in (sbx gates a WS behind it) and `{GET}` covers the voice-list fetch.
     # Two things make it work under the MITM allowlist: sbx sets `wss_proxy` so the WS routes through
     # the proxy (a WS client resolves its proxy by URL scheme — `https_proxy` alone would not cover it,
     # and it would connect directly and fail DNS in the empty netns); and the audio hole's Python shim
     # points certifi at sbx's CA, so edge-tts (which pins certifi) trusts the MITM. Live-verified.
-    "{GET,WS} https://speech.platform.bing.com",
     # The browser toolset's `agent-browser` CLI, fetched from npm at launch (mise's npm backend
     # installs in-cage, unlike the host-side `flake:` build above). The audit POST is noisy and
     # non-essential, so it is muted rather than allowed.
-    "{GET} https://registry.npmjs.org",
     # (No build-time entries: a remote `flake:` ref builds HOST-SIDE, over the host network, so the
     # build's own fetches — the PyPI wheels for uv2nix, the npm registry for the node front-ends, the
     # git smart-HTTP fetch of the hermes-agent repo, the nix binary cache — never pass through this
@@ -148,7 +160,6 @@ allow = [
 # `clone(CLONE_NEWUSER)`), so without it the browser aborts at startup and every browser tool fails.
 # Dropping Chromium's inner sandbox is acceptable here because bubblewrap + seccomp + the empty netns
 # IS the boundary. `--disable-dev-shm-usage` keeps it off the cage's small /dev/shm.
-AGENT_BROWSER_ARGS = "--no-sandbox,--disable-dev-shm-usage"
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."openrouter.ai"]

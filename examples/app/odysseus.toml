@@ -5,6 +5,11 @@
 #   sbx app run odysseus
 #   # then open http://127.0.0.1:7000 in your host browser
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/pypi.toml
+#
 # Odysseus is a Docker-compose stack upstream (app + ChromaDB + SearXNG + ntfy),
 # but the cage cannot run Docker. This profile uses the UPSTREAM NATIVE path instead:
 # a plain Python/uvicorn server. The `cmd` clones the repo into the app's isolated
@@ -251,13 +256,13 @@ allow = [
     # explicit entry — without it `git clone` is refused and the app never installs.
     # Scoped to the one endpoint on the one repo rather than opening github to POST.
     "{POST} https://github.com/odysseus-dev/odysseus.git/git-upload-pack",
-    # First-launch install — the Python wheels + the package index.
-    "{GET} https://pypi.org",
-    "{GET} https://files.pythonhosted.org",
+    # First-launch install — the Python wheels + the package index (the shared `@pypi` group).
+    "@pypi",
     # First-launch Browser MCP: `npx -y @playwright/mcp` installs the package from
     # npm (like hermes-web's agent-browser). The audit POST is noisy and non-essential,
-    # so it is muted rather than allowed (see `mute` below).
-    "{GET} https://registry.npmjs.org",
+    # so it is muted rather than allowed (see `mute` below). The registry lane itself is
+    # the shared `@npm-registry` group.
+    "@npm-registry",
     # ChromaDB's default embedding model (all-MiniLM-L6-v2) is fetched from
     # Hugging Face on first start if Odysseus uses Chroma's built-in embeddings.
     # Harmless under --net shared; needed in deny+allow mode. The APEX alone is not
@@ -285,9 +290,10 @@ allow = [
     # Any other provider you configure in Settings: the proxy names the blocked host,
     # open it with `sbx net allow -a odysseus <url>`.
 ]
-# npm's audit POST on every install: refused anyway, just kept out of the default log.
+# npm's audit POST on every install: refused anyway, just kept out of the default log. Shared with
+# every npm-backed profile, so it comes from a group rather than a copy.
 mute = [
-    "https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "@npm-audit",
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in

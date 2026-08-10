@@ -3,6 +3,13 @@
 #   sbx app import examples/app/codebuddy.toml
 #   sbx app run codebuddy
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/codebuddy.toml
+#     sbx app import    examples/app/codebuddy.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # CodeBuddy Code ships as an npm package from Tencent's own scope (`@tencent-ai/codebuddy-code`),
 # a node CLI (`#!/usr/bin/env node`, Node ≥ 18.20.8 — the cage synthesises `/usr/bin/env`, so the
 # shebang resolves). sbx equips it in-cage with mise's npm backend over a node runtime; the first
@@ -47,25 +54,26 @@ cmd = "codebuddy"
 #    { path = "~/.codebuddy", mode = "rw" },
 #]
 
-[packages]
-# A node runtime (needed to install AND to run — the CLI is a node program, unlike the
-# native-binary npm agents), then CodeBuddy itself from Tencent's official npm scope.
-nodejs = "nix:nodejs"
-codebuddy = "mise:npm:@tencent-ai/codebuddy-code"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `codebuddy` BUNDLE — the package(s), the environment it reads, the hosts it
+# must reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so
+# this profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/codebuddy.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["codebuddy"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); the service endpoints carry POSTs, so they are opened to
 # all verbs with `{*}`.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle codebuddy`, and what
+# the launch ends up with via `sbx config show --app codebuddy`.
 allow = [
-    # Install: the packument (version resolution, also used by `sbx upgrade mise`), the tarball,
-    # and the platform packages published at their own top-level paths — npm spreads these across
-    # sibling paths, so the registry host is opened read-only as a whole.
-    "{GET} https://registry.npmjs.org",
-    # Runtime: the international service endpoint (login, account, model traffic) and the code
-    # service host observed beside it.
-    "{*} https://www.codebuddy.ai",
-    "{*} https://code.codebuddy.ai",
     # China edition instead — uncomment these and remove the two above if that is your account.
     #"{*} https://www.codebuddy.cn",
     #"{*} https://tencent.sso.codebuddy.cn",
@@ -76,13 +84,6 @@ allow = [
 # and never hides a count. See it with `sbx net log --all`; edit with
 # `sbx net mute|unmute <rule> -a codebuddy`.
 mute = [
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
 ]
 
 [env]
-# sbx owns upgrades (`sbx upgrade mise`), so stop the CLI replacing its own install underneath the
-# pinned one; and cut its telemetry at the source rather than relying only on the deny-by-
-# construction allowlist. Both keys are read by the shipped bundle (`DISABLE_AUTOUPDATER` accepts
-# "1"/"true"; `DISABLE_TELEMETRY` is checked for presence).
-DISABLE_AUTOUPDATER = "1"
-DISABLE_TELEMETRY = "1"

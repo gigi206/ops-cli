@@ -3,6 +3,9 @@
 #   sbx app import examples/app/cursor.toml
 #   sbx app run cursor
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
 # This is the Cursor **desktop editor** (the full GUI IDE). For the headless terminal agent, use
 # `examples/app/cursor-agent.toml` instead (a CLI that fits Mode-B far more cleanly). Confined by sbx,
 # the editor sees only the cage filesystem (the project directory you launch it from + its own
@@ -294,19 +297,17 @@ mute = [
     # model/agent traffic and not needed for editing/AI, so it stays denied by construction; muted so
     # its refusals don't clutter `sbx net logs` (still counted in `sbx net stats`; see them with `--all`).
     "*.gvt1.com",
-    # The in-cage Chromium's OWN telemetry/component-update noise (not Cursor traffic) — safebrowsing,
-    # optimization-guide, component update, "checkin", the time server. Denied by construction; muted so
-    # they don't drown the actionable Cursor denials. None is the Google SSO flow (that lives on
-    # `accounts.google.<ccTLD>`, a different host — see the SSO block in `allow`).
+    # The in-cage Chromium's OWN telemetry/component-update noise (not Cursor traffic), shared with
+    # every other profile that embeds a browser engine, so it comes from a group rather than a copy.
+    # None of it is the Google SSO flow (that lives on `accounts.google.<ccTLD>`, a different host —
+    # see the SSO block in `allow`).
+    "@chromium-background",
+    # Wider than the group: every remaining `*-pa.googleapis.com` background service this editor's
+    # engine reaches, without enumerating them.
     "*.googleapis.com",
-    "clients2.google.com",
-    "android.clients.google.com",
     "www.google.com",
     # Analytics on the WorkOS/Cursor login page (not auth traffic). Denied by construction; muted.
     "www.googletagmanager.com",
-    # Google post-consent extras (the SSO completes without them; the desktop profiles mute these).
-    "accounts.youtube.com",
-    "play.google.com",
     # Auth-page + app telemetry (not auth-completion traffic). Denied by construction; muted.
     "*.sentry.io",
     "browser-intake-datadoghq.com",

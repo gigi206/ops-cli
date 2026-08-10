@@ -3,6 +3,13 @@
 #   sbx app import examples/app/claude-code.toml
 #   sbx app run claude-code
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/claude-code.toml
+#     sbx app import    examples/app/claude-code.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # The tool is equipped fresh from upstream (mise's `aqua` backend pulls Anthropic's
 # standalone `claude` release binary) into the app's persistent home — no host
 # mutation, no nixpkgs lag, and none of the unfree-license gate nixpkgs imposes.
@@ -17,8 +24,9 @@ cmd = "claude"
 # (alsa-plugins + an asound.conf routing `default` → pulse), so an ALSA capture reaches the host
 # microphone — see docs-site/docs/guide/configuration/audio.md. A security field, trusted-only: the PulseAudio
 # bus exposes the microphone AND all system-audio output.
-# NOTE: `/voice` requires signing in with a Claude.ai account; it is NOT available with an API key
-# (which this profile uses by default). Comment `audio` out if you never use voice dictation.
+# NOTE: `/voice` requires signing in with a Claude.ai account, which is this profile's default path
+# (no credential is baked in — see the [env] block below). It is NOT available if you instead
+# uncomment the API-key placeholder. Comment `audio` out if you never use voice dictation.
 audio = true
 
 # Your host Claude config, mounted read-write at its real absolute path. `binds` is a
@@ -30,8 +38,17 @@ audio = true
 #    { path = "~/.claude.json", mode = "rw" },
 #]
 
-[packages]
-claude-code = "mise:aqua:anthropics/claude-code"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `claude-code` BUNDLE — the package(s), the environment it reads, the hosts it
+# must reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so
+# this profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/claude-code.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["claude-code"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # Egress is denied by construction except the Anthropic API, the Claude platform host
 # the CLI contacts at startup (its connectivity/account check — without it the tool
@@ -59,17 +76,10 @@ mode = "deny"
 # deny = [
 #     "*.datadoghq.com:*",  # Datadog telemetry / operational logs
 # ]
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle claude-code`, and what
+# the launch ends up with via `sbx config show --app claude-code`.
 allow = [
-    # Claude API — the account/connectivity check plus the `/voice` speech-to-text WebSocket
-    # (`api.anthropic.com/api/ws/speech_to_text/voice_stream`). `{*,WS}` = all HTTP verbs AND the
-    # WebSocket: sbx requires an explicit `WS` opt-in that a plain `{*}` does NOT cover (a WS is an
-    # unredactable bidirectional channel), so without the `WS` voice dictation reads `denied-method`.
-    "{*,WS} https://api.anthropic.com",
-    "{*} https://platform.claude.com",
-    "{GET} https://downloads.claude.ai",
-    "{*} https://mcp-proxy.anthropic.com",
-    "{*} https://console.anthropic.com",
-    "{GET} https://storage.googleapis.com:443/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/*",
 ]
 
 # BYOK (API-key auth) is commented out below, so this profile ships with no baked-in credential —
@@ -79,12 +89,6 @@ allow = [
 # $ANTHROPIC_API_KEY (or a resolver, e.g. sops://secrets.yaml#anthropic) and swapped onto the wire by
 # the egress proxy; it never enters the cage — the in-cage value stays a placeholder.
 [env]
-# Cut Claude Code's non-essential / telemetry / error-reporting traffic at the source, so the tool
-# never even generates it. CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is the umbrella (all non-essential
-# background traffic at once, except the WebFetch host-safety check, which keeps its own opt-out).
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
-DISABLE_TELEMETRY = "1"
-DISABLE_ERROR_REPORTING = "1"
 # ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
 
 # [secret."api.anthropic.com"]

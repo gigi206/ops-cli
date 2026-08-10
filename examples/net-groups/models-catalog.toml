@@ -1,0 +1,16 @@
+# `models-catalog` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list.
+#
+#   sbx net groups import examples/net-groups/models-catalog.toml
+#   # then in an app's or bundle's allow list:   "@models-catalog"
+#
+# The model catalogue (`models.dev`), fetched read-only by the agents that list models at
+# startup — shared by `cline`, `hermes`, `kilocode`, `kimi`, `mimo` and `opencode`. Groups are
+# global-only (like bundles): an app's or bundle's lists may reference one, a project may not
+# define one.
+
+[net.groups]
+models-catalog = [
+    "{GET} https://models.dev",
+]

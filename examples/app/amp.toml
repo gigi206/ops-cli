@@ -3,6 +3,10 @@
 #   sbx app import examples/app/amp.toml
 #   sbx app run amp
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#
 # Amp ships on npm as `@ampcode/cli` — a small JS wrapper whose real payload is a single-file
 # native binary published as a PLATFORM OPTIONAL DEPENDENCY (`@ampcode/cli-linux-x64`, an ELF
 # compiled by Bun, ~111 MiB). Verified against the published tarball at
@@ -82,8 +86,8 @@ allow = [
     # Install: the packument (version resolution, also used by `sbx upgrade mise`), the wrapper
     # tarball, and the platform binary published at its own top-level path — npm spreads these
     # across sibling paths, so the registry host is opened read-only as a whole, like the other
-    # npm-backed profiles.
-    "{GET} https://registry.npmjs.org",
+    # npm-backed profiles — the shared `@npm-registry` group.
+    "@npm-registry",
     # Runtime: Amp's service (threads, model traffic, account) and its static asset host.
     "{*} https://ampcode.com",
     "{GET} https://static.ampcode.com",
@@ -94,7 +98,7 @@ allow = [
 # never changes the verdict (it stays refused) and never hides a count (`sbx net stats` still
 # tallies it). See it with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a amp`.
 mute = [
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+    "@npm-audit",
 ]
 
 [env]

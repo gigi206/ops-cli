@@ -1,0 +1,47 @@
+# `reasonix` — the DeepSeek-native AI coding agent: what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/reasonix.toml
+#   # then in an app profile:   use = ["reasonix"]
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#
+# Derived from `examples/app/reasonix.toml`, whose namesake profile now names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# The hosts below are the tool's own lanes: DeepSeek (its out-of-the-box provider preset) and
+# the npm install lane. Any other OpenAI-compatible base_url is a config choice — the consuming
+# app opens that host itself. Reasonix resolves its provider key ONLY from its home's
+# `~/.reasonix/.env` (never the process environment), so a consuming app seeds that file the
+# way the profile's wrapper does; a bundle cannot carry a `cmd`.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.reasonix]
+allow = [
+    # Install: the shim's packument and tarball plus the platform binary optional dep — npm
+    # spreads these across sibling paths, so the registry host is opened read-only as a whole,
+    # not path-scoped.
+    "@npm-registry",
+    # Runtime: DeepSeek's OpenAI-compatible endpoint — `POST /chat/completions` for prompts
+    # (the prefix-cache loop keeps replaying the same growing prefix), plus the optional
+    # `GET /user/balance` balance check.
+    "{*} https://api.deepseek.com",
+]
+mute = [
+    "crash.reasonix.io",                            # Reasonix telemetry/upgrade gateway (denied)
+    "@npm-audit",  # npm audit (noisy)
+]
+
+[bundle.reasonix.packages]
+nodejs = "nix:nodejs"      # the `bin/reasonix.js` shim is what launches — needed at RUNTIME
+reasonix = "mise:npm:reasonix"  # upstream's own npm scope; binary via the platform optional dep

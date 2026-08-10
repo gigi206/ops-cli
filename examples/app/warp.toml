@@ -1,0 +1,174 @@
+# warp — Warp's agentic coding CLI (the "Warp Agent CLI"), sandboxed by sbx.
+#
+#   sbx app import examples/app/warp.toml
+#   sbx app run warp
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/warp.toml
+#     sbx app import    examples/app/warp.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
+# PACKAGING — a bootstrap install, NOT a clean sbx backend. Warp distributes the Agent CLI as a
+# versioned tar.gz from its own release infrastructure: the official installer
+# (`curl -fsSL https://app.warp.dev/download/agent-cli | bash`) resolves
+# `app.warp.dev/download/agent-cli/artifact?os=<os>&arch=<arch>` to a 302 onto
+# `releases.warp.dev/stable/<version>/tui/<os>/<arch>/warp-tui-stable-<os>-<arch>.tar.gz`. There
+# is no GitHub release, no aqua package, no nixpkgs attribute, and no npm package — and the
+# tarball's payload is a `warp-tui-stable` binary plus a sibling `resources/` tree the binary
+# resolves relative to its own location at runtime (verified in the shipped artifact). So the
+# profile uses the bootstrap pattern proven by `rovo.toml`/`pool.toml`: the `cmd` wrapper
+# resolves the artifact endpoint, downloads the tarball, validates the payload (binary AND
+# resources/), installs it into the app's persistent isolated home, and execs the binary.
+#
+# Installed once on the first launch; persistent across projects (the same isolated home). Re-run
+# the bootstrap to advance: `sbx app run warp --env WARP_REINSTALL=1` (the `--env` override is
+# read on the HOST and authoritative for that one launch). The install layout mirrors the
+# official one (`~/.warp/tui/current/…`); the CLI's own background auto-updater is disabled
+# because the layout is not a "managed install" (observed in the CLI's own log:
+# `TUI autoupdate disabled: not running from a managed install`) — advancing is exactly the
+# `WARP_REINSTALL=1` re-bootstrap above, which is also what a fresh download gets you.
+#
+# CREDENTIAL POSTURE — a Warp account. Two paths:
+#
+#  - **DEVICE-CODE LOGIN (RECOMMENDED)** — `warp` prints a verification link and a device code,
+#    then polls until you approve. Approve from any browser — your host browser included — so
+#    the cage needs no browser and no `gui`. The session token persists in the app's isolated
+#    home (`~/.warp/tui`), so later launches stay signed in. (Sign out with `/logout`.)
+#  - **WARP_API_KEY (headless)** — set the `WARP_API_KEY` environment variable; the CLI reads it
+#    directly, so a key is a credential the cage must hold. For a one-shot launch, pass it
+#    without baking it into this file:
+#        sbx app run warp --env WARP_API_KEY=…
+#    (`--env` is an authoritative one-shot override read on the HOST; the value reaches the cage
+#    env for that launch only.) For a persistent injection, uncomment the `[env]` placeholder
+#    below and add a `[secret]` block — but the wire header the CLI sends the key in is NOT yet
+#    verified (observe it with `sbx app run warp --net-learn` after login, or check the egress
+#    log) — until then the device-code login is the supported path.
+#
+# BYOK provider keys (OpenAI / Anthropic / Google / X Premium) are stored by `/api-keys` in the
+# OS "secure storage" — there is no system keyring in the hermetic cage, so in-cage BYOK is
+# unverified; the Warp-account path above is the one this profile ships for. Cloud handoff
+# (`/handoff`) targets the Oz platform — uncomment `oz.warp.dev` in the allowlist if you use it.
+#
+# TELEMETRY — the binary bakes in a Sentry DSN (crash/error reporting) and a RudderStack
+# analytics dataplane; both are denied by construction (`deny` mode) and muted in the bundle.
+#
+# UNVERIFIED: the device-code login itself and the authenticated conversation transport (both
+# need a real Warp account), the wire header for `WARP_API_KEY` (see the credentials section),
+# and in-cage BYOK (no system keyring — the CLI's own log reports
+# `no secret service provider or dbus session found`). VERIFIED live in this cage: the full
+# bootstrap (download, payload validation, install) and the TUI launch — it starts, initializes
+# its server stack, loads its bundled skills, and logs its expected endpoints
+# (`app.warp.dev` + `wss://rtc.app.warp.dev/graphql/v2` + `wss://sessions.app.warp.dev`), with
+# its Sentry/RudderStack telemetry refused (403) exactly as the bundle's mutes intend. Grounded
+# here: the packaging and payload layout (read out of the downloaded
+# `warp-tui-stable-linux-x86_64.tar.gz`), the artifact endpoint + redirect (resolved live against
+# app.warp.dev), the host set and the WebSocket URLs (read out of the binary's outbound URL
+# table), the `WARP_API_KEY` env name (printed by the binary's own `--help`), and the device-code
+# flow (docs + the binary's OAuth strings).
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+# --- locate the platform triple (release naming is <os>/<arch>: os=linux|macos,
+#     arch=x86_64|aarch64) ---
+case "$(uname -s)" in
+  Linux)  os="linux" ;;
+  Darwin) os="macos" ;;
+  *) echo "warp: unsupported OS $(uname -s)" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+  x86_64)          arch="x86_64" ;;
+  aarch64 | arm64) arch="aarch64" ;;
+  *) echo "warp: unsupported arch $(uname -m)" >&2; exit 1 ;;
+esac
+
+# --- the Warp CLI binary links liblzma.so.5 (xz), which the hermetic cage lacks; the bundle
+#     declares `nix:xz` (the pinned nixpkgs has no `liblzma` attribute, and `xz` is split — the
+#     `xz-5.8.3-bin` on PATH carries no libraries). The library lives in the `out` output, whose
+#     store path is content-addressed and cannot be written literally, so find it by its name —
+#     the same pattern `odysseus.toml` uses for libstdc++. ---
+for d in /nix/store/*xz-*/lib; do
+  [ -e "$d/liblzma.so.5" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+done
+
+# --- install path inside the app's persistent isolated home ---
+bin="$HOME/.warp/tui/current/warp-tui-stable"
+
+if [ ! -x "$bin" ] || [ -n "$WARP_REINSTALL" ]; then
+  # Resolve the artifact endpoint (302 -> releases.warp.dev/<channel>/<version>/tui/<os>/<arch>)
+  # and download the tarball — fail closed (`-fsSL` errors on non-2xx, silent on progress).
+  url="https://app.warp.dev/download/agent-cli/artifact?os=$os&arch=$arch"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL "$url" -o "$tmp/warp-tui.tar.gz"
+  mkdir -p "$tmp/payload"
+  tar xzf "$tmp/warp-tui.tar.gz" -C "$tmp/payload"
+  # Validate before touching the install: the binary AND its sibling `resources/` tree (the
+  # binary resolves `resources/` relative to its own location — a bare binary starts broken).
+  [ -x "$tmp/payload/warp-tui-stable" ] || { echo "warp: payload lacks warp-tui-stable" >&2; exit 1; }
+  [ -d "$tmp/payload/resources" ] || { echo "warp: payload lacks resources/" >&2; exit 1; }
+  mkdir -p "$HOME/.warp/tui"
+  # Replace `current` whether it is the updater's symlink or a plain directory from an earlier
+  # bootstrap; never touch `versions/` (a live update may be staged there).
+  if [ -L "$HOME/.warp/tui/current" ]; then
+    rm -f "$HOME/.warp/tui/current"
+  else
+    rm -rf "$HOME/.warp/tui/current"
+  fi
+  mv "$tmp/payload" "$HOME/.warp/tui/current"
+fi
+
+exec "$bin" "$@"
+    ''',
+    # `$0` placeholder: `sbx app run warp -- <args>` appends <args> to this cmd
+    # array, so they arrive as `$1 $2 …` and reach the agent verbatim via
+    # `exec … "$@"`.
+    "warp",
+]
+
+# Your host Warp CLI settings (theme, statusline, MCP config, execution profiles), mounted
+# read-write at its real absolute path. `binds` is a security field, honored only because this
+# profile lives in your trusted config dir; `mode = "rw"` lets the caged `warp` read and write
+# these host files. Uncomment to share your host Warp CLI setup with the cage instead of the
+# app's isolated home (the default). Note the CLI writes credentials to `~/.warp/tui` (kept in
+# the isolated home either way), not to this directory.
+#binds = [
+#    { path = "~/.config/warp-terminal/cli", mode = "rw" },  # settings.toml + .mcp.json (Linux)
+#]
+
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `warp` BUNDLE — the package(s) (gnutar/gzip for the bootstrap wrapper), the
+# hosts it must reach, and its telemetry mutes — from one declaration shared with the bundle
+# file itself, so this profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/warp.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["warp"]
+
+# No `[packages]` here: the bootstrap's tar/gzip come from its bundle — see `use` above.
+
+[network]
+mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle warp`, and what the
+# launch ends up with via `sbx config show --app warp`.
+# Optional extras (uncomment what you use):
+#   "{*} https://oz.warp.dev",        # cloud handoff (`/handoff`) + cloud-agent runs
+#   "{GET,HEAD} https://api.github.com",  # the statusline GitHub-PR chip (a read-only fetch)
+allow = [
+]
+
+# No credential is baked in — the device-code login persists its token in the app's isolated
+# home. For a persistent WARP_API_KEY injection (once the wire header is verified, see the
+# header), uncomment the placeholder and the [secret] block:
+[env]
+#WARP_API_KEY = "warp-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."app.warp.dev"]
+#from = "env://WARP_API_KEY"
+#header = "Authorization"
+#type = "bearer"

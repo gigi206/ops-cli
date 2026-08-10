@@ -1,0 +1,21 @@
+# `github` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — allow list. A bundle exists to carry maps (`packages`/`env`/
+# `[secret]`), which a pure host set has none of.
+#
+#   sbx net groups import examples/net-groups/github.toml
+#   # then in an app's or bundle's allow list:   "@github"
+#
+# The GitHub WEB runtime lane: github.com opened to EVERY verb (`{*}`) — for the apps that
+# POST to GitHub at runtime (git-forge integrations that open repos and file PRs, `git
+# clone` smart-HTTP negotiation, GitHub account sign-in). NOT the read-only INSTALL lane
+# (`@github-install` is `{GET}`-only), not the API host (separate `@api-github` fragment —
+# a group expands into the list that references it, so an app takes the lane it needs,
+# verb-exact), and not the path-scoped device-flow pages (`github.com/login/*`), which an
+# app may keep scoped instead of taking the whole host. Groups are global-only (like
+# bundles): an app's or bundle's lists may reference one, a project may not define one.
+
+[net.groups]
+github = [
+    "{*} https://github.com",
+]

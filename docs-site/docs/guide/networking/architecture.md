@@ -63,7 +63,7 @@ curl https://1.2.3.4/        → Could not connect
 
 The one **GUI-only nuance**: under `gui = "offscreen"` or `gui = "wayland"`,
 [`configuration/gui.md#offscreen`](../configuration/gui#offscreen) shows how a small
-host-side [``__netns-holder` binary](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/src/sandbox/netns.rs) adds a `dummy0`
+host-side `__netns-holder` binary (`src/sandbox/netns.rs`) adds a `dummy0`
 interface (a kernel black hole, no peer, no route, drops everything) before exec'ing bwrap.
 Chromium/Electron decide `navigator.onLine` from the **presence of a non-loopback
 interface**, not from actual reachability, so a loopback-only cage reads as "no

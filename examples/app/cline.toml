@@ -3,6 +3,13 @@
 #   sbx app import examples/app/cline.toml
 #   sbx app run cline
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/cline.toml
+#     sbx app import    examples/app/cline.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Cline ships a genuine terminal CLI on npm (the `cline` package), distributed as a
 # self-contained native binary resolved through platform-specific optional dependencies
 # — so sbx equips it in-cage with a node runtime (for the npm install) plus mise's npm
@@ -21,8 +28,8 @@
 # type "bearer"). Cline reads ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY directly.
 #
 # Cline stores its config + credentials under ~/.cline in the app's persistent isolated home.
-# (Cline probes the host name at startup; `hostname` is declared in `[packages]` below since the
-# hermetic cage ships none.) If a request is blocked, the proxy reports the host it refused —
+# (Cline probes the host name at startup; `hostname` comes from the `cline` bundle via `use`
+# below — the hermetic cage ships none.) If a request is blocked, the proxy reports the host it refused —
 # add it to `allow` (or check ahead with `sbx test net <url>`).
 cmd = "cline"
 
@@ -34,37 +41,26 @@ cmd = "cline"
 #    { path = "~/.cline", mode = "rw" },
 #]
 
-[packages]
-# A node runtime (the npm install needs it), then Cline itself via mise's npm backend. The
-# executed `cline` is a native binary (resolved via the package's optional dependencies), so
-# node is needed only to install. Both are trusted-only [packages]; this profile is trusted
-# by location once imported.
-nodejs = "nix:nodejs"
-cline = "mise:npm:cline"
-# Cline probes the host name at startup; the hermetic cage ships no `hostname`,
-# so provide it to avoid the `hostname: command not found` noise.
-hostname = "nix:hostname"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `cline` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/cline.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["cline"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); these are write hosts (install POSTs, API POSTs), so
 # each is opened to all verbs with `{*}`.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle cline`, and what the
+# launch ends up with via `sbx config show --app cline`.
 allow = [
-    # Install: the packument (`npm view`/version resolution hits `/cline`, as does `sbx upgrade`),
-    # the tarball (`/cline/-/…`), and the platform binary (an optional dependency published at its
-    # own top-level path) — npm spreads these across sibling paths, so the registry host is opened
-    # read-only as a whole (like the other npm-backed profiles), not path-scoped.
-    "{GET} https://registry.npmjs.org",
-    # Runtime: Cline's backend/account control plane and its telemetry endpoint. Telemetry can
-    # be turned off in Cline's settings; keep `data.cline.bot` here (or deny it explicitly) to
-    # avoid silent drops. Cline publishes no exhaustive host list — if a real run is refused a
-    # host, the proxy names it; add it here.
-    "{*} https://api.cline.bot",
-    "{*} https://data.cline.bot",
-    # A third-party model catalogue Cline fetches to suggest models (observed on a live run).
-    "{GET} https://models.dev",
-    # WorkOS device-authorization endpoint — Cline's account login flow.
-    "{*} https://api.workos.com",
     # Direct-OpenRouter BYOK: uncomment together with the [secret] block below.
     #"{*} https://openrouter.ai",
 ]
@@ -78,8 +74,6 @@ allow = [
 # Remove the entry here the day you decide to allow the endpoint (uncomment the `{*} https://otel.cline.bot`
 # line above instead).
 mute = [
-    "otel.cline.bot",                  # Cline OpenTelemetry telemetry (POST /v1/logs)
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage.

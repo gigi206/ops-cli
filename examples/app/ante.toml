@@ -3,6 +3,13 @@
 #
 #   sbx app import examples/app/ante.toml
 #   sbx app run ante
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/ante.toml
+#     sbx app import    examples/app/ante.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
 #   sbx app run ante -- -p "explain the README"   # headless
 #
 # Ante is "a ghost in your shell" — a self-contained Rust coding agent (~15 MB,
@@ -120,12 +127,17 @@ cmd = "ante"
 #    { path = "~/.ante", mode = "rw" },
 #]
 
-[packages]
-# Ante itself via mise's `github` backend. The release asset is the
-# `_linux-x86_64-musl.tar.gz` static-pie binary, auto-rolled by `sbx upgrade
-# mise`. No additional packages required (the binary is statically linked;
-# no `nix-ld` shim, no node runtime, no companion interpreter).
-ante = "mise:github:AntigmaLabs/ante-preview"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `ante` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/ante.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["ante"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
 # prompts / context, reading completions) is opened to all verbs with `{*}`.
@@ -134,24 +146,23 @@ ante = "mise:github:AntigmaLabs/ante-preview"
 # `huggingface.co` for `/offline-mode` model weights) and the vendor docs.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle ante`, and what the
+# launch ends up with via `sbx config show --app ante`.
 allow = [
     # In-cage self-update — `ante update` re-queries the signed manifest at
     # `download.ante.run/channels/stable/manifest.json` and pulls the new
     # tarball from the same host. `{GET}` (plain download; the post-update
     # binary install happens locally).
-    "{GET} https://download.ante.run",
     # First-party Antix Console — the vendor's account / billing / team
     # dashboard. Optional (the CLI does not require an Antix account); the
     # user only hits it if they sign in from inside the cage.
-    "{*} https://antix.antigma.ai",
     # Hugging Face — `/offline-mode` fetches GGUF weights from
     # `huggingface.co` to the cage's home. `{GET}` (plain download).
     # Skip this entry if you pre-stage weights on disk and bind them in
     # (see the `binds` comment).
-    "{GET} https://huggingface.co",
     # GitHub — MCP server installs, slash-command marketplace fetches, the
     # stdio `npx`-style fetch. `{GET}`.
-    "{GET} https://github.com",
     # Provider BYOK — uncomment the ONE(s) the model you call with
     # `ante /model <id>` picks. The matching env var (e.g. `ANTHROPIC_API_KEY`)
     # carries the key — host-side, injected on the wire, never in the cage.

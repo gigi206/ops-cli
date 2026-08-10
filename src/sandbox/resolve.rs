@@ -25,9 +25,9 @@ const RESOLVE_CA_DEST: &str = "/etc/ssl/certs/ca-bundle.crt";
 
 /// The least-privilege sandbox a `resolve` command runs in: a hermetic bubblewrap cage carrying sbx's
 /// base userland (never the host `/usr`), so the command is portable by construction — it sees exactly
-/// `curl`/`coreutils`/`grep`/`sed`/`awk` plus whatever `nix:` tools the app declared (their bins on
-/// `PATH`), and a command reaching for a tool that is not there fails cleanly rather than silently
-/// depending on the host.
+/// the shell, coreutils and the curated base tools ([`super::fhs`] is the single source of truth for
+/// that set) plus whatever `nix:` tools the app declared (their bins on `PATH`), and a command
+/// reaching for a tool that is not there fails cleanly rather than silently depending on the host.
 pub(crate) struct ResolveCage<'a> {
     /// The bubblewrap engine to exec.
     pub(crate) bwrap: &'a Path,
@@ -38,7 +38,8 @@ pub(crate) struct ResolveCage<'a> {
     /// The host-side physical path of sbx's CA bundle, bound so the command's HTTPS is hermetic.
     pub(crate) ca_bundle: &'a Path,
     /// The `PATH` bin directories (logical store paths): sbx's base tools plus the app's `nix:` package
-    /// bins, so a resolve command can use e.g. `jq` by declaring `jq = "nix:jq"`.
+    /// bins, so a resolve command can use a tool the base does not carry by declaring it (e.g.
+    /// `yq = "nix:yq-go"`).
     pub(crate) bins: Vec<PathBuf>,
 }
 

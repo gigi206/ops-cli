@@ -3,6 +3,13 @@
 #   sbx app import examples/app/freebuff.toml
 #   sbx app run freebuff
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/freebuff.toml
+#     sbx app import    examples/app/freebuff.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Freebuff is a Node CLI distributed on npm, so sbx equips it in-cage with a node
 # runtime (nix) plus mise's npm backend. The npm package is a thin launcher: on the
 # first run it downloads the real ~46 MB binary from www.codebuff.com into the app's
@@ -34,12 +41,17 @@ cmd = "freebuff"
 #    { path = "~/.config/manicode", mode = "rw" },
 #]
 
-[packages]
-# A node runtime (the launcher and the npm install need it), then freebuff itself via
-# mise's npm backend. Both are trusted-only [packages]; this profile is trusted by
-# location once imported.
-nodejs = "nix:nodejs"
-freebuff = "mise:npm:freebuff"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `freebuff` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/freebuff.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["freebuff"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"
@@ -49,13 +61,10 @@ mode = "deny"
 # further runtime host the proxy reports on first real use.
 # An app is read-by-default ({GET,HEAD}); these are write hosts (install/login/REST POSTs),
 # so each is opened to all verbs with `{*}`.
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle freebuff`, and what the
+# launch ends up with via `sbx config show --app freebuff`.
 allow = [
-  "{GET} https://registry.npmjs.org",
-  "{GET} https://www.codebuff.com",
-  "{GET} https://codebuff.com",
-  "{*} https://www.codebuff.com/api/*",
-  "{GET} https://freebuff.com",
-  "{POST} https://freebuff.com/api/auth/cli/code",
   # Uncomment only if you route freebuff to a direct OpenRouter endpoint (see the note below).
   #"{*} https://openrouter.ai",
 ]
@@ -70,8 +79,6 @@ allow = [
 # from the CLI with `sbx net mute|unmute <host> -a freebuff`. Remove the entry here the day you
 # decide to allow the endpoint (uncomment the `{POST} https://us.i.posthog.com/batch/` line above).
 mute = [
-    "*.i.posthog.com",                # Codebuff PostHog telemetry (POST /batch/)
-    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",  # npm audit (non-essential to install, noisy)
 ]
 
 # OPTIONAL direct-OpenRouter BYOK (commented). By default freebuff authenticates to a CODEBUFF

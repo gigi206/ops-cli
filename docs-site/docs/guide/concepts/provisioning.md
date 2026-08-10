@@ -121,9 +121,18 @@ therefore never depends on the host having a CA bundle.
 ## A curated base toolset
 
 The base userland ships a small everyday CLI set: `curl`, `git`, `less`, `grep`,
-`jq`, `sed`, `awk`, `find`, `which`: provisioned into `sbx`'s store and **sharing the
-base glibc**. An agent gets the ordinary tools without declaring them (and the
-in-cage mise plugin, which shells out to `find` / `which`, has them available).
+`rg`, `sed`, `awk`, `find`, `fd`, `jq`, `yq`, `which`: provisioned into `sbx`'s store
+and **sharing the base glibc**. An agent gets the ordinary tools without declaring
+them, and the in-cage mise plugin has `find` available for its own flake and
+extension lookups.
+
+The fast searchers sit **beside** their POSIX elders, they do not replace them.
+`grep`, `sed` and `find` stay because third-party code the cage runs assumes them:
+a vendor install script piped into a shell, a `configure`, an npm postinstall.
+`rg` and `fd` are there because an agent harness looks them up on `PATH` before
+falling back to downloading its own copy. `yq` is the YAML and TOML counterpart of
+`jq`, and it is the Go implementation, so the base carries no language runtime for
+it.
 
 ## The nix-ld shim for cross-glibc tools
 

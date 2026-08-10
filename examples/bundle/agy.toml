@@ -3,11 +3,16 @@
 #   sbx bundle import examples/bundle/agy.toml
 #   # then in an app profile:   use = ["agy"]
 #
-# Derived from `examples/app/agy.toml`, which stays the self-contained way to run this
-# agent on its own (`sbx app import`, one step, nothing else needed). This bundle is for an app
-# that EMBEDS the agent — an orchestrator spawning it as a subprocess — so that app states the
-# requirement ONCE instead of copying it. A test pins the two artifacts together, so they cannot
-# drift apart.
+# Derived from `examples/app/agy.toml`, whose namesake profile now names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# The Google ACCOUNT sign-in hosts are NOT here — they live in the consuming app's own
+# [network] allow (accounts.google.com, oauth2.googleapis.com, www.googleapis.com/oauth2/*,
+# lh3.googleusercontent.com). A shared `google-oauth` egress group still exists under
+# `examples/net-groups/` for the day several apps need the same lane again; nothing ships
+# referencing it right now.
 #
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
@@ -20,10 +25,9 @@
 
 [bundle.agy]
 allow = [
-    "{*} https://accounts.google.com",
-    "{*} https://oauth2.googleapis.com",
-    "{GET} https://www.googleapis.com/oauth2/*",
-    "{GET} https://lh3.googleusercontent.com",
+    # The agent's OWN product hosts. The Google account sign-in hosts (accounts.google.com,
+    # oauth2.googleapis.com, www.googleapis.com/oauth2/*, lh3.googleusercontent.com) live in the
+    # consuming app's own [network] allow, not here.
     "{GET} https://antigravity-cli-auto-updater-974169037036.us-central1.run.app",
     "{GET} https://antigravity.google",
     "{*} https://cloudcode-pa.googleapis.com",

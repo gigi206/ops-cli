@@ -3,6 +3,13 @@
 #   sbx app import examples/app/opencode.toml
 #   sbx app run opencode
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/opencode.toml
+#     sbx app import    examples/app/opencode.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # The tool is equipped fresh from upstream (mise's registry resolves `opencode` to
 # its standalone release binary) — no nixpkgs lag. It is equipped at the latest
 # upstream version on the first launch in a project; advancing an already-installed
@@ -24,8 +31,17 @@ cmd = "opencode"
 #    { path = "~/.local/share/opencode", mode = "rw" },  # auth + sessions (SQLite)
 #]
 
-[packages]
-opencode = "mise:opencode"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `opencode` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/opencode.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["opencode"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"
@@ -41,10 +57,10 @@ mode = "deny"
 # observed reaching npm is opencode's PLUGIN loader (`@opencode-ai/plugin`, seen live in the egress
 # log of the `opencode-desktop` profile, the same tool). Keep it if you use plugins; a setup that
 # loads none can drop this line and lose nothing.
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle opencode`, and what the
+# launch ends up with via `sbx config show --app opencode`.
 allow = [
-  "{GET} https://models.dev",
-  "{GET} https://registry.npmjs.org",
-  "{*} https://opencode.ai",
   # /share syncs a session to opencode's servers on demand (the `/share` command), by HTTPS POST — not
   # a WebSocket. Uncomment to allow sharing.
   #"{*} https://opncd.ai",

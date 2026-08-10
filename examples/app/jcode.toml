@@ -3,6 +3,13 @@
 #   sbx app import examples/app/jcode.toml
 #   sbx app run jcode
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/jcode.toml
+#     sbx app import    examples/app/jcode.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # jcode ships as a self-contained Rust release binary on its own GitHub releases
 # (`jcode-linux-x86_64.tar.gz`). sbx equips it fresh from upstream via mise's `github`
 # backend (the same clean path `vtcode`/`cortex` use) — no nixpkgs lag, no node. The binary
@@ -78,17 +85,23 @@ exit 127
 #    { path = "~/.config/jcode", mode = "rw" },
 #]
 
-[packages]
-# jcode itself from upstream's GitHub release. The download rides sbx's built-in read-only
-# allow-set (github.com + *.githubusercontent.com), so the install needs no [network] entry.
-jcode = "mise:github:1jehuang/jcode"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `jcode` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/jcode.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["jcode"]
 
-# Egress is denied by construction except the provider you actually use. An app is
-# read-by-default ({GET,HEAD}); a completions endpoint is a POST, so the model host is
-# opened to all verbs with `{*}`. Nothing else is opened — the agent reaches the web only
-# through whatever hosts you add here.
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
+
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle jcode`, and what the
+# launch ends up with via `sbx config show --app jcode`.
 allow = [
     # Uncomment the ONE provider you use (and the matching [secret] block below).
     #"{*} https://openrouter.ai",
@@ -107,7 +120,6 @@ allow = [
 # telemetry.jcode.sh -a jcode`. Remove both the env var and this entry the day you decide to
 # allow telemetry.
 mute = [
-    "telemetry.jcode.sh",
 ]
 
 # Telemetry: opt-out from the start (upstream also honors `DO_NOT_TRACK=1` and a
@@ -118,8 +130,6 @@ mute = [
 # provider-key placeholders below stay commented — the real key never enters the cage: the
 # proxy strips the placeholder and substitutes the key, read on the HOST, on the wire.
 [env]
-JCODE_NO_TELEMETRY = "1"
-JCODE_NO_BROWSER = "1"
 #OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
 #ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
 #OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"

@@ -54,6 +54,7 @@ const sidebars: SidebarsConfig = {
             'configuration/binds',
             'configuration/packages',
             'configuration/tools',
+            'configuration/recommended-tools',
             'configuration/nixpkgs',
           ],
         },

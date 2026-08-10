@@ -4,12 +4,20 @@
 #   sbx app import examples/app/orca-desktop.toml
 #   sbx app run orca-desktop
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import    examples/bundle/opencode.toml
+#     sbx net groups import examples/net-groups/npm-runtime.toml
+#     sbx app import       examples/app/orca-desktop.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Orca (github.com/stablyai/orca, MIT, onorca.dev) is a DESKTOP "ADE": an Electron app that runs
 # agent CLIs side by side — Claude Code, Codex, OpenCode, … — each in its own isolated git
 # worktree, with Ghostty-class terminals, an embedded Chromium browser, an editor and an account/
 # usage pane. Orca itself ships no model runtime: every "agent" in a worktree is a CLI installed
-# in the cage. This profile therefore also equips ONE pilot agent — `opencode` — in `[packages]`,
-# so `orca worktree create --agent opencode --prompt "…"` works out of the box (Orca
+# in the cage. This profile therefore also equips ONE pilot agent — `opencode` — via its bundle (`use`
+# below), so `orca worktree create --agent opencode --prompt "…"` works out of the box (Orca
 # preconfigures OpenCode; other TUI agents resolve by name once installed in the cage — add them
 # to `[packages]` the same way). Orca's own CLI — `orca-ide` — is the SAME Electron binary run
 # with `ELECTRON_RUN_AS_NODE=1 out/cli/index.js` (upstream packages the CLI entrypoint outside
@@ -122,6 +130,16 @@ gui = "wayland"
 gpu = true
 dbus = true
 
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `opencode` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/opencode.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["opencode"]
+
 [packages]
 # The ADE itself, from upstream's GitHub release (see "THE `deb:github:` BACKEND" above).
 orca-desktop = "deb:github:stablyai/orca"
@@ -130,7 +148,6 @@ chromium = "nix:chromium"
 # The PILOT interior agent — the same `opencode` the CLI profile equips (`mise:opencode`), so
 # `orca worktree create --agent opencode --prompt "…"` has something to launch. Add other agent
 # CLIs (claude-code, codex, …) here the same way; Orca resolves any installed TUI agent by name.
-opencode = "mise:opencode"
 
 [network]
 mode = "deny"
@@ -144,10 +161,11 @@ mode = "deny"
 # `www.onorca.dev` docs/update metadata) are denied by default; open the ones you use.
 # If a request is refused, the proxy names the host — watch `sbx net logs -a orca-desktop` and
 # add it here (or check ahead with `sbx test net <url>`).
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle opencode`, and what the
+# launch ends up with via `sbx config show --app orca-desktop`.
 allow = [
-    "{GET} https://models.dev",
-    "{*} https://registry.npmjs.org",
-    "{*} https://opencode.ai",
+    "@npm-runtime",
     # Direct-OpenRouter BYOK for the pilot opencode agent: uncomment together with the [secret]
     # block below.
     #"{*} https://openrouter.ai",

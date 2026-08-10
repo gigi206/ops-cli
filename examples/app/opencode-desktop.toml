@@ -3,6 +3,10 @@
 #   sbx app import examples/app/opencode-desktop.toml
 #   sbx app run opencode-desktop
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-runtime.toml
+#
 # This is the GRAPHICAL sibling of the `opencode` profile (the terminal CLI/TUI) and of
 # `opencode-web` (the same server in your browser). opencode ships a native desktop app built with
 # Electron; on Linux upstream distributes it only as a `.deb`/`.rpm`, neither of which installs in
@@ -93,15 +97,16 @@ mode = "deny"
 # is the gateway ("Zen") plus auth and the config/theme schemas, opened to every verb with `{*}`
 # (an app is read-by-default, and the app POSTs completions through the gateway). registry.npmjs.org
 # is a RUNTIME fetch — opencode pulls its `@opencode-ai/plugin` package at startup (and the app
-# checks GitHub releases for updates, already covered by the built-in github allow-set).
+# checks GitHub releases for updates, already covered by the built-in github allow-set) — the
+# shared `@npm-runtime` group.
 #
 # If a request is refused, the proxy names the host — watch `sbx net logs -a opencode-desktop` and
 # add it here (or check ahead with `sbx test net <url>`). For a DIRECT provider instead of the
 # gateway, add its host (`{*} https://api.anthropic.com`, `{*} https://api.openai.com`, or
 # `{*} https://openrouter.ai`) and fill the [secret] block below.
 allow = [
-    "{GET} https://models.dev",
-    "{*} https://registry.npmjs.org",
+    "@models-catalog",
+    "@npm-runtime",
     "{*} https://opencode.ai",
     # /share syncs a session to opencode's servers on demand (HTTPS POST, not a WebSocket).
     #"{*} https://opncd.ai",

@@ -3,6 +3,14 @@
 #   sbx app import examples/app/agy.toml
 #   sbx app run agy
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, and its Google account sign-in from a shared egress GROUP — import both:
+#     sbx bundle import    examples/bundle/agy.toml
+#     sbx net groups import examples/net-groups/google-oauth.toml
+#     sbx app import       examples/app/agy.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # `agy` is a genuine terminal TUI (distinct from the Antigravity *IDE*, a GUI desktop
 # app), shipped as a self-contained native Linux binary — so it needs no display and
 # runs headless in the hermetic cage. sbx equips it in-cage from the upstream GitHub
@@ -55,37 +63,32 @@ cmd = "agy"
 #    { path = "~/.antigravity", mode = "rw" },
 #]
 
-[packages]
-# Antigravity's standalone terminal binary, pulled fresh from its upstream GitHub release by
-# mise's aqua backend (a native binary — no node/electron runtime). Trusted-only [packages];
-# this profile is trusted by location once imported. GitHub-distributed, so the install fetch
-# rides sbx's built-in nix-cache allow-set (github / githubusercontent) — no extra `allow` needed
-# for the download itself.
-agy = "mise:aqua:google-antigravity/antigravity-cli"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `agy` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import    examples/bundle/agy.toml
+# Without it the launch warns that a bundle is undeclared and the agent is simply absent.
+# The `agy` bundle carries the agent itself; the Google account sign-in hosts (accounts.google.com,
+# oauth2.googleapis.com, …) live in the app's OWN [network] allow below, not in the bundle.
+use = ["agy"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); the login/token endpoints are write hosts, so each is
 # opened to all verbs with `{*}`.
 [network]
 mode = "deny"
+# The agent's OWN hosts arrive with its bundle (`use` above); the Google ACCOUNT hosts arrive with
+# the shared `@google-oauth` group named in the header. Check the union with
+# `sbx config show --app agy`.
 allow = [
-    # Google Sign-In: the OAuth authorization + token exchange the login flow POSTs to.
-    "{*} https://accounts.google.com",
-    "{*} https://oauth2.googleapis.com",
-    # Google Sign-In profile lookup — the OAuth userinfo endpoint the login flow reads after the
-    # token exchange. Path-scoped to the OAuth namespace (www.googleapis.com hosts many other APIs).
-    "{GET} https://www.googleapis.com/oauth2/*",
-    # The profile photo URL returned by userinfo points here — the login flow fetches the actual
-    # avatar bytes (GET /a/<id>=s96-c) from Google's image CDN.
-    "{GET} https://lh3.googleusercontent.com",
-    # The binary's background self-updater (a Google Cloud Run host) — a signed-binary download.
-    "{GET} https://antigravity-cli-auto-updater-974169037036.us-central1.run.app",
-    # Docs / bootstrap — a read-only fetch.
-    "{GET} https://antigravity.google",
-    # Model / agent traffic — Google's Cloud Code (Gemini Code Assist) backend, the host(s) the caged
-    # agent POSTs its completions to (observed on a real session). `daily-` is the staging channel of
-    # the same backend. Opened to all verbs (`{*}`) since they carry request bodies.
-    "{*} https://cloudcode-pa.googleapis.com",
-    "{*} https://daily-cloudcode-pa.googleapis.com",
+    # Google account sign-in: the sign-in pages and the token endpoints are write hosts, opened
+    # to all verbs with `{*}`; the profile fetch and the avatar CDN are read-only. The set is the
+    # account lane itself, not this agent's, so it comes from a group rather than a copy.
+    "@google-oauth",
 ]
 
 # Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): hosts we deliberately
@@ -95,9 +98,4 @@ allow = [
 # out of the default log. See them anytime with `sbx net log --all`, and edit this list from the CLI
 # with `sbx net mute|unmute <host> -a agy`. Remove an entry here the day you decide to `allow` it.
 mute = [
-    "play.googleapis.com",              # Google Play Services telemetry (POST /log)
-    "antigravity-unleash.goog",         # Unleash feature flags (remote toggles)
-    "playwright.azureedge.net",         # Playwright browser-driver download…
-    "playwright-akamai.azureedge.net",  # …and its two CDN fallback mirrors
-    "playwright-verizon.azureedge.net",
 ]

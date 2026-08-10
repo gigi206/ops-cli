@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's [`examples/app/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/app/) directory ships **65 importable
+The repository's `examples/app/` directory ships **67 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -8,14 +8,14 @@ sbx app import examples/app/claude-code.toml
 sbx app run claude-code
 ```
 
-See also: [Portable profiles](profiles) · [The app framework](../apps/) · [Secrets](../secrets/) · the repository [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/).
+See also: [Portable profiles](profiles) · [The app framework](../apps/) · [Secrets](../secrets/) · the repository `examples/README.md`.
 
 The tables below list every shipped profile, grouped by **how you interact with it**: a
-terminal agent, a desktop window, or a UI served in your host browser. The per-profile
-packaging notes and the "not here yet, and why" triage live in
-[`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/).
+terminal agent, a desktop window, or a UI served in your host browser. Each profile's own
+header carries its packaging specifics; how the artifacts are built and fit together, and
+the "not here yet, and why" triage, live in `examples/README.md`.
 
-## Terminal agents (46)
+## Terminal agents (48)
 
 The common case: a CLI or TUI that runs in the terminal you launched it from.
 
@@ -49,6 +49,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `kimi` | `nix:nodejs` (+ `mise:npm:@moonshot-ai/kimi-code`) | `api.kimi.com` (`KIMI_API_KEY` / Moonshot account) |
 | `mimo` | `nix:nodejs` (+ `mise:npm:@mimo-ai/cli`) | `api.xiaomimimo.com` (MiMo Auto / Xiaomi account) |
 | `muse` | bootstrap installer (`cmd` wrapper) + `nix:tzdata` (zone database, no toolchain package) | `api.meta.ai` (Meta Model API / Muse Spark BYOK) or a Meta account (device login) |
+| `nanobot` | `mise:pipx:nanobot-ai` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenRouter / OpenAI / Anthropic / Gemini / DeepSeek / any OpenAI-compatible / local) |
 | `nova` | `nix:nodejs` (+ `mise:npm:@compass-ai/nova`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
 | `omp` | `mise:github:can1357/oh-my-pi` (a high-capability fork of Pi — this repo's `pi`) | provider-dependent (BYOK) |
 | `openclaude` | `nix:nodejs` (+ `mise:npm:@gitlawb/openclaude`) | provider-dependent (BYOK: OpenAI-compatible / Anthropic / Gemini) |
@@ -66,6 +67,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `snow` | `nix:nodejs` (+ `mise:npm:snow-ai`) | provider-dependent (BYOK) |
 | `stakpak` | `mise:github:stakpak/agent` | `apiv2.stakpak.dev` (`STAKPAK_API_KEY`) or BYOK: a DevOps agent |
 | `trae` | bootstrap installer (`cmd` wrapper; + `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / OpenRouter / Doubao / Azure / Ollama) |
+| `warp` | bootstrap installer (`cmd` wrapper; + `nix:gnutar`, `nix:gzip`) | `app.warp.dev` + `sessions`/`rtc.app.warp.dev` WS (Warp account, device-code login; `WARP_API_KEY`) |
 | `vtcode` | `mise:github:vinhnx/VTCode` (+ `nix:ripgrep`, `nix:ast-grep`) | provider-dependent (BYOK, default OpenRouter) |
 
 ## Desktop applications (14)
@@ -111,9 +113,14 @@ default (`home_scope = "global"`).
 
 ## Bundles: the shared pieces
 
-Beyond the app profiles, [`examples/bundle/`](https://github.com/gigi206/ops-cli/tree/docs/docusaurus/examples/bundle/)
-ships **26 reusable tool bundles**: a named set of packages and egress rules that several
-profiles pull in with `use = [...]` instead of restating it. See
+Beyond the app profiles, `examples/bundle/`
+ships **38 reusable tool bundles**: a named set of packages and egress rules that
+profiles pull in with `use = [...]` instead of restating it — the namesake profile
+names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
+GitHub installs, the models catalogue, the identity providers) live separately as
+`[net.groups]` fragments under
+`examples/net-groups/`,
+referenced with `@name` from an app's or bundle's allow list. See
 [Bundles](../configuration/bundles) and [`sbx bundle`](../cli/bundle).
 
 ## Two credential postures
@@ -187,6 +194,6 @@ The profiles **import and resolve** cleanly (covered by a test), and each tool i
 **provisioned fresh and runs** under its own allowlist. The one remaining *live*
 end-to-end is the **credential step**: for BYOK profiles, the CLI authenticating
 through the proxy-injected key; for account profiles, completing the login inside the
-cage. See the repository [`examples/README.md`](https://github.com/gigi206/ops-cli/blob/docs/docusaurus/examples/) for the
+cage. See the repository `examples/README.md` for the
 per-tool status and the "not here yet, and why" triage (tools that are not a runnable
 agent, or whose provenance is not established).

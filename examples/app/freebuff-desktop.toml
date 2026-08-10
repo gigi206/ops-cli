@@ -3,6 +3,12 @@
 #   sbx app import examples/app/freebuff-desktop.toml
 #   sbx app run freebuff-desktop
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-runtime.toml
+#     sbx net groups import examples/net-groups/github.toml
+#     sbx net groups import examples/net-groups/github-api.toml
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
 # Freebuff is CodebuffAI's free desktop coding agent: an Electron shell whose UI is served by a bundled
 # Bun "orchestrator" child process on the cage loopback, driving the `@codebuff/sdk`. On Linux upstream
 # distributes it ONLY as an `.AppImage` (no `.deb`, no nixpkgs attr, no buildable flake), so sbx packages
@@ -172,12 +178,14 @@ allow = [
   # Freebuff's own site/API (login landing, update checks). Its own vendor domain, not a third party.
   "{*} https://freebuff.com",
   "{*} https://www.freebuff.com",
-  # Runtime npm fetches — Freebuff's Bun orchestrator/SDK pulls packages (agent CLIs, plugins) at runtime.
-  "{*} https://registry.npmjs.org",
-  # GitHub OAuth (sign in with GitHub). github.com/api.github.com are also in sbx's built-in
-  # nix-cache allow-set, so they are always reachable; listed here for clarity.
-  "{*} https://github.com",
-  "{*} https://api.github.com",
+  # Runtime npm fetches — Freebuff's Bun orchestrator/SDK pulls packages (agent CLIs, plugins)
+  # at runtime (the shared `@npm-runtime` group).
+  "@npm-runtime",
+  # GitHub account sign-in and forge access (the shared `@github` + `@github-api` groups).
+  # github.com/api.github.com are also in sbx's built-in nix-cache allow-set, so they are
+  # always reachable; listed here for clarity.
+  "@github",
+  "@github-api",
   # Google OAuth (sign in with Google).
   '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
   "{*} https://oauth2.googleapis.com",
@@ -217,21 +225,13 @@ mute = [
   "*.sentry.io",
   "www.redditstatic.com",
   "code.trygravity.ai",
-  # In-cage Chromium's own Google background traffic (none required for function): update checks, safe
-  # browsing, time/checkin, autofill predictions, on-device model, translate, push signaling, Play
-  # logging, cross-property session sync, and the leaked-password check (which would send password data
-  # to Google — denying it is a feature, not a loss).
-  "clients2.google.com",
-  "android.clients.google.com",
-  "accounts.youtube.com",
-  "play.google.com",
-  "update.googleapis.com",
-  "safebrowsing.googleapis.com",
-  "optimizationguide-pa.googleapis.com",
+  # In-cage Chromium's own Google background traffic (none required for function), shared with every
+  # other profile that embeds a browser engine, so it comes from a group rather than a copy. It
+  # includes the leaked-password check, which would send password data to Google: denying it is a
+  # feature, not a loss.
+  "@chromium-background",
+  # Chrome's page-translation service — same class, but not every browser embed reaches it.
   "translate.googleapis.com",
-  "content-autofill.googleapis.com",
-  "signaler-pa.googleapis.com",
-  "passwordsleakcheck-pa.googleapis.com",
 ]
 
 # CREDENTIAL POSTURE — account / OAuth, NOT a header-injectable API key.

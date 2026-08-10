@@ -3,6 +3,11 @@
 #   sbx app import examples/app/t3code.toml
 #   sbx app run t3code
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/github.toml
+#
 # T3 Code is a free, open-source Electron desktop app: ONE interface that drives OTHER coding agents
 # — Claude Code, Codex, OpenCode, Cursor — spawning each as a CLI subprocess, switching models
 # mid-conversation, and generating PRs with one-button commit/push to your GitHub. It does NOT ship
@@ -226,11 +231,11 @@ allow = [
     "{*} https://t3.chat",
     # The model catalogue. Named in the shipped backend bundle; not seen on the wire on a
     # signed-out launch, so treat it as opened ahead of need rather than confirmed.
-    "{GET} https://models.dev",
+    "@models-catalog",
     # mise's npm/aqua fetches for the agents provisioned into the cage.
-    "{GET} https://registry.npmjs.org",
+    "@npm-registry",
     # Git-forge integrations (opening a repo, generating a PR). Keep only the forge you use.
-    "{*} https://github.com",
+    "@github",
     #"{*} https://gitlab.com",
     #"{*} https://api.bitbucket.org",
     # Chromium's spellcheck dictionary, fetched by the in-cage browser on first use.

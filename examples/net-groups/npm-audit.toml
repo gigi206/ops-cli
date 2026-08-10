@@ -1,0 +1,18 @@
+# `npm-audit` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
+# app's — or a bundle's — mute list.
+#
+#   sbx net groups import examples/net-groups/npm-audit.toml
+#   # then in an app's or bundle's mute list:   "@npm-audit"
+#
+# The npm audit POST that follows every install: denied by the deny-by-default posture, and
+# muted so its refusals do not drown the actionable ones in `sbx net logs` (still denied, still
+# counted in `sbx net stats`). Companion of the `npm-registry` allow group — the two are
+# separate because a group expands into the list that references it, so an allow and a mute
+# cannot share one group. Groups are global-only (like bundles): an app's or bundle's lists may
+# reference one, a project may not define one.
+
+[net.groups]
+npm-audit = [
+    "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
+]

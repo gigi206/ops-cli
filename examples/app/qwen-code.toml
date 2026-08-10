@@ -3,6 +3,13 @@
 #   sbx app import examples/app/qwen-code.toml
 #   sbx app run qwen-code
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/qwen-code.toml
+#     sbx app import    examples/app/qwen-code.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # The tool is a pure-Node terminal CLI distributed on npm as `@qwen-code/qwen-code`
 # (bin `qwen`); it is equipped fresh from upstream via mise's npm backend — no nixpkgs
 # lag. It is equipped at the latest upstream version on the first launch in a project;
@@ -48,24 +55,17 @@ cmd = "qwen"
 #    { path = "~/.qwen", mode = "rw" },
 #]
 
-[packages]
-# A node runtime (the npm install needs it) plus Qwen Code itself via mise's npm backend.
-# The installed `qwen` is a Node entry point (the package's `bin`), so node is needed at
-# runtime too — both are trusted-only [packages], honored because this profile is trusted
-# by location once imported. `sbx upgrade mise` rolls the CLI forward.
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `qwen-code` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
 #
-# NATIVE ADDONS — why no `npm rebuild` wrapper here. mise's npm backend installs with
-# `--ignore-scripts`, which breaks any package that builds or downloads its `.node` binary
-# in a postinstall (the failure mode `openfox.toml` heals with an explicit `npm rebuild`).
-# Qwen Code's native pieces are NOT of that kind: `@lydell/node-pty` and
-# `@teddyzhu/clipboard` ship PREBUILT per-platform packages (`…-linux-x64`,
-# `…-linux-x64-gnu`) that npm selects through optionalDependencies, so the binary arrives
-# in the tarball and no install script has to run. The one unproven case is
-# `@qwen-code/audio-capture`, which lists no platform siblings — if a future release grows
-# a voice mode and it crashes on a missing `.node`, wrap `cmd` in a guarded
-# `npm rebuild @qwen-code/audio-capture` the way `openfox.toml` does.
-nodejs = "nix:nodejs"
-qwen = "mise:npm:@qwen-code/qwen-code"
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/qwen-code.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["qwen-code"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # Egress is denied by construction except the hosts the selected provider hits. Qwen Code
 # streams completions over HTTPS SSE (the OpenAI-compatible transport), NOT a WebSocket, so
@@ -86,12 +86,13 @@ qwen = "mise:npm:@qwen-code/qwen-code"
 # for one the proxy names it and `sbx net allow -a qwen-code <url>` opens exactly that.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle qwen-code`, and what the
+# launch ends up with via `sbx config show --app qwen-code`.
 allow = [
     # Native Alibaba / Dashscope provider (compatible-mode + Coding Plan endpoints).
-    "{*} https://dashscope.aliyuncs.com",
     # Install: the npm packument + tarball for `@qwen-code/qwen-code`, plus the
     # platform-specific optional dependencies npm resolves alongside it.
-    "{GET} https://registry.npmjs.org",
     # ── Alternative providers (uncomment the host(s) you actually use) ──────────────
     # OpenRouter (one key, hundreds of models — the universal OpenAI-compatible choice):
     #   set OPENAI_BASE_URL=https://openrouter.ai/api/v1, OPENROUTER_API_KEY, and uncomment
@@ -117,7 +118,6 @@ mute = [
     # prefix is theirs to change between releases, so the apex wildcard covers it across
     # upgrades. Denied (a mute is never a verdict); allow it in [network] above if you
     # actually want the agent's usage statistics to leave the cage.
-    "*.rum.aliyuncs.com",
 ]
 
 # BYOK (native Dashscope provider): the real key is read on the HOST and injected by the

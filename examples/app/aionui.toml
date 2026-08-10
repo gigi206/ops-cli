@@ -3,6 +3,9 @@
 #   sbx app import examples/app/aionui.toml
 #   sbx app run aionui
 #
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-runtime.toml
+#
 # AionUi is a free, open-source Electron + React desktop app: ONE interface over 20+ AI agents. It
 # ships a built-in agent and auto-detects CLI agents installed on the machine (Claude Code, Codex,
 # Gemini CLI, …) to "Cowork" with them — reading files, writing code, generating images, browsing,
@@ -21,7 +24,8 @@
 #     sbx app import    examples/app/aionui.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent (this file used to miss `platform.claude.com`). The
-# standalone agent profiles — `examples/app/opencode.toml` and friends — stay one-step imports.
+# other standalone agent profiles point at their own bundles the same way; only the profiles
+# without a bundle (desktop/web builds) stay one-step imports.
 # With `use` empty you Cowork with AionUi's BUILT-IN agent alone, which needs no CLI.
 #
 # THE `deb:github:` BACKEND (no third party, tracks upstream automatically). Upstream distributes
@@ -247,7 +251,7 @@ allow = [
     # (r3---sn-*.gvt1.com), so scope by regex to the dict path across every gvt1 subdomain — tight
     # (only /edgedl/chrome/dict/), not the whole Google CDN.
     're:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
-    "{*} https://registry.npmjs.org",                          # browser-automation Cowork: AionUi fetches the chrome-devtools-mcp package
+    "@npm-runtime",                          # browser-automation Cowork: AionUi fetches the chrome-devtools-mcp package
 ]
 # Silence denied telemetry: keep refusals to Sentry out of the default `sbx net logs` (still denied,
 # still counted in `sbx net stats`; see them with `--all`). Watch the logs on first run and add any

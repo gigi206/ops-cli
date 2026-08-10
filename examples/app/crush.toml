@@ -4,6 +4,13 @@
 #   sbx app import examples/app/crush.toml
 #   sbx app run crush
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/crush.toml
+#     sbx app import    examples/app/crush.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Crush is Charm's "Your new coding bestie" — a Go-binary terminal coding agent (TUI)
 # distributed on GitHub releases as `crush_<ver>_Linux_x86_64.tar.gz` (verified
 # v0.88.0, static-pie ELF, ~27 MiB compressed, ~80 MiB unpacked, with man pages and
@@ -116,12 +123,17 @@ cmd = "crush"
 #    { path = "~/.local/share/crush",    mode = "rw" },   # data: ephemeral state, session storage
 #]
 
-[packages]
-# Crush itself via mise's `github` backend. The release asset is the
-# `_Linux_<arch>.tar.gz` Go binary, auto-rolled by `sbx upgrade mise`. No
-# additional packages required (the binary is static-pie; no `nix-ld` shim,
-# no node runtime, no companion interpreter).
-crush = "mise:github:charmbracelet/crush"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `crush` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/crush.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["crush"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
 # prompts / context, reading completions) is opened to all verbs with `{*}`.
@@ -130,25 +142,23 @@ crush = "mise:github:charmbracelet/crush"
 # and MCP installs) and the vendor docs.
 [network]
 mode = "deny"
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle crush`, and what the
+# launch ends up with via `sbx config show --app crush`.
 allow = [
     # First-party Hyper — Charm's subscription model API. ZDR + GDPR, the
     # default provider when no other `*_API_KEY` is set (verified in the
     # binary's outbound URL table).
-    "{*} https://hyper.charm.land",
     # Catwalk — the community-supported model registry Crush pulls on startup
     # to refresh its provider list (auto-update can be disabled in the
     # `crushrc` with `option provider-auto-update false`, but the cage opens
     # it by default).
-    "{GET} https://catwalk.charm.land",
     # GitHub — OAuth device flow (`github.com/login/device/code`),
     # OAuth token exchange (`github.com/login/oauth/access_token`), the
     # Copilot API (`api.githubcopilot.com`), and `api.github.com` for the
     # MCP server catalog and any GitHub-flavored tools the user wires in.
     # `{GET}` for the catalog and the device-code page; `{*}` for the
     # post-flow token exchange and Copilot POSTs.
-    "{GET} https://github.com",
-    "{GET} https://api.github.com",
-    "{*} https://api.githubcopilot.com",
     # Provider BYOK — uncomment the ONE(s) the model you call with
     # `crush --model <model>` picks. The first-party `hyper.charm.land` above
     # is enough for the default route; open another only if you switch
@@ -193,8 +203,6 @@ allow = [
 # (whatever sub-path of `hyper.charm.land` it lives on), so these envs are
 # the suspenders to the belt.
 [env]
-CRUSH_DISABLE_METRICS = "1"
-DO_NOT_TRACK         = "1"
 
 # --- BYOK example (commented, headless). The in-cage placeholder lets
 # `crush` start and issue its first request; the egress proxy strips the
