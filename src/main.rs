@@ -55,10 +55,11 @@ fn main() -> ExitCode {
     // names (so `sbx plugins store add --help` lands on that page). `run` (which forwards
     // `--help` after a `--`) and `mise` (a passthrough) handle a leading help flag
     // themselves; an *unknown* command is left to the dispatch below, which names it.
-    if help::is_command(name) && !matches!(help::canonical(&[], name), "run" | "mise") {
-        if let Some(code) = help::maybe_help(name, &rest) {
-            return code;
-        }
+    if help::is_command(name)
+        && !matches!(help::canonical(&[], name), "run" | "mise")
+        && let Some(code) = help::maybe_help(name, &rest)
+    {
+        return code;
     }
 
     cli::dispatch(name, rest)
@@ -612,10 +613,10 @@ fn open_rule_write<'a>(
             ),
         ));
     }
-    if let Some(name) = app {
-        if !config::is_valid_app_name(name) {
-            return Err((2, format!("`{name}` is not a valid app name")));
-        }
+    if let Some(name) = app
+        && !config::is_valid_app_name(name)
+    {
+        return Err((2, format!("`{name}` is not a valid app name")));
     }
     // The file, the in-file table shape, and the human target are resolved together — and shared
     // with the drain path — so the write and the message it prints can never disagree about where
@@ -652,8 +653,7 @@ fn open_rule_write<'a>(
 /// What an unresolvable trust store means on an *add* path, where the rule would be written but
 /// could not be trusted, so it would not take effect. The removal path states the fact alone; the
 /// difference is user-visible and deliberate.
-const NO_TRUST_STORE_ON_ADD: &str =
-    "cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule would be written but \
+const NO_TRUST_STORE_ON_ADD: &str = "cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule would be written but \
      could not be trusted, so it would not take effect — use --global, or set the trust store";
 
 /// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting

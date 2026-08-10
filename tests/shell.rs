@@ -102,7 +102,9 @@ fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal()
     std::fs::write(project.path().join("MARKER"), b"x").unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping interactive sbx run smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping interactive sbx run smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
 
@@ -196,7 +198,9 @@ fn an_interactive_observed_run_records_events_for_proc_logs() {
     let project = TmpDir::new("obs-proj");
     let data = TmpDir::new("obs-data");
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping interactive-observe smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping interactive-observe smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
 
@@ -316,7 +320,9 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping sbx app resize smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping sbx app resize smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
 

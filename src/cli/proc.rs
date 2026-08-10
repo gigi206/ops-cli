@@ -90,11 +90,11 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
             return ExitCode::from(2);
         }
     };
-    if let Some(name) = &parsed.app {
-        if !config::is_valid_app_name(name) {
-            diag::error(&format!("sbx: invalid app name '{name}'"));
-            return ExitCode::from(2);
-        }
+    if let Some(name) = &parsed.app
+        && !config::is_valid_app_name(name)
+    {
+        diag::error(&format!("sbx: invalid app name '{name}'"));
+        return ExitCode::from(2);
     }
     if let Err(e) = proc_policy::validate_rule(&rule) {
         diag::error(&format!("sbx: invalid rule {rule:?}: {e}"));
@@ -114,7 +114,7 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
         if parsed.scope_explicit {
             diag::error(
                 "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not \
-                 apply — use -a <app> or --all to scope the session(s)"
+                 apply — use -a <app> or --all to scope the session(s)",
             );
             return ExitCode::from(2);
         }
@@ -125,7 +125,7 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
     if all {
         diag::error(
             "sbx: --all only applies with --session (it widens a live rule to every session); a config \
-             write targets one file — drop --all"
+             write targets one file — drop --all",
         );
         return ExitCode::from(2);
     }
@@ -203,11 +203,11 @@ fn proc_remove_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCo
             return ExitCode::from(2);
         }
     };
-    if let Some(name) = &parsed.app {
-        if !config::is_valid_app_name(name) {
-            diag::error(&format!("sbx: invalid app name '{name}'"));
-            return ExitCode::from(2);
-        }
+    if let Some(name) = &parsed.app
+        && !config::is_valid_app_name(name)
+    {
+        diag::error(&format!("sbx: invalid app name '{name}'"));
+        return ExitCode::from(2);
     }
     // The rule is NOT validated here, unlike the add path. A config file may already hold a rule a
     // later grammar would refuse, and refusing to remove it would leave the user no way out but a
@@ -559,7 +559,10 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
 /// Decide one (or, with `*`, all) parked `execve` by id `<session-pid>.<notif-id>`.
 fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
     let Some(id) = args.first().and_then(|a| a.to_str()) else {
-        diag::error(&format!("sbx: proc pending {}: an id is required (`<session-pid>.<notif-id>`, or `<session-pid>.*`)", if allow { "allow" } else { "deny" }));
+        diag::error(&format!(
+            "sbx: proc pending {}: an id is required (`<session-pid>.<notif-id>`, or `<session-pid>.*`)",
+            if allow { "allow" } else { "deny" }
+        ));
         return ExitCode::from(2);
     };
     let Some((pid_s, notif_s)) = id.split_once('.') else {
@@ -941,9 +944,11 @@ mod tests {
             parse_proc_live_args(&osv(&["-i", "0"])).is_err(),
             "zero interval busy-loops"
         );
-        assert!(parse_proc_live_args(&osv(&["-i", "soon"]))
-            .unwrap_err()
-            .contains("soon"));
+        assert!(
+            parse_proc_live_args(&osv(&["-i", "soon"]))
+                .unwrap_err()
+                .contains("soon")
+        );
         assert!(
             parse_proc_live_args(&osv(&["-i"])).is_err(),
             "missing value"

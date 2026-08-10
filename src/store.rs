@@ -70,10 +70,10 @@ impl Layout {
         if data_dir.is_none() {
             // The decision came from `data_dir_from`; the wording comes from the same
             // check it consulted, so the two cannot describe different refusals.
-            if let Some(over) = over.as_deref().filter(|o| !o.is_empty()) {
-                if let Err(why) = check_data_dir_override(over) {
-                    crate::diag::error(&format!("sbx: {why}"));
-                }
+            if let Some(over) = over.as_deref().filter(|o| !o.is_empty())
+                && let Err(why) = check_data_dir_override(over)
+            {
+                crate::diag::error(&format!("sbx: {why}"));
             }
         }
         let mut data_dir = data_dir?;
@@ -1131,10 +1131,10 @@ pub(crate) fn revision_of(flake_ref: &str) -> &str {
 /// signed-cache-built catalogue.
 fn resolve_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> io::Result<String> {
     ensure(layout)?;
-    if let Some((locked_source, locked_rev)) = read_lock(lock_path) {
-        if locked_source == source {
-            return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{locked_rev}"));
-        }
+    if let Some((locked_source, locked_rev)) = read_lock(lock_path)
+        && locked_source == source
+    {
+        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{locked_rev}"));
     }
     let rev = resolve_source_rev(nix, source)?;
     write_lock(lock_path, source, &rev)?;
@@ -1438,10 +1438,10 @@ pub(crate) fn root_channel_source(nix: &Path, layout: &Layout, roots: &Path, fla
     // The link points at the *logical* `/nix/store/...` path, which does not exist on the host, so
     // its target is probed through `physical_path` — never followed — exactly as the marked-output
     // reuse does. A dangling link (its revision collected) falls through and is re-rooted.
-    if let Ok(logical) = std::fs::read_link(&link) {
-        if physical_path(layout, &logical).symlink_metadata().is_ok() {
-            return;
-        }
+    if let Ok(logical) = std::fs::read_link(&link)
+        && physical_path(layout, &logical).symlink_metadata().is_ok()
+    {
+        return;
     }
 
     let Some(source) = channel_source_path(nix, layout, flake_ref) else {
@@ -1450,10 +1450,10 @@ pub(crate) fn root_channel_source(nix: &Path, layout: &Layout, roots: &Path, fla
     let Some(nix_store) = resolve_nix_store(Some(layout)) else {
         return;
     };
-    if let Some(parent) = link.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
+    if let Some(parent) = link.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
     }
     // `--indirect` registers the link in the store's own `gcroots/auto/`, which is what makes it a
     // root the collector honours; `--realise` is how `nix-store` names the path to root.
@@ -2179,9 +2179,11 @@ mod tests {
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         std::fs::write(layout.data_dir().join(NIXPKGS_LOCK), "garbage\n").unwrap();
 
-        assert!(LockTarget::global(&layout, None)
-            .resolve(Path::new(BOGUS_NIX), &layout)
-            .is_err());
+        assert!(
+            LockTarget::global(&layout, None)
+                .resolve(Path::new(BOGUS_NIX), &layout)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2290,9 +2292,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(LockTarget::global(&layout, Some("nixos-23.11"))
-            .resolve(Path::new(BOGUS_NIX), &layout)
-            .is_err());
+        assert!(
+            LockTarget::global(&layout, Some("nixos-23.11"))
+                .resolve(Path::new(BOGUS_NIX), &layout)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2407,9 +2411,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(LockTarget::global(&layout, None)
-            .refresh(Path::new(BOGUS_NIX), &layout)
-            .is_err());
+        assert!(
+            LockTarget::global(&layout, None)
+                .refresh(Path::new(BOGUS_NIX), &layout)
+                .is_err()
+        );
         // a failed upgrade is non-destructive: the prior lock is left intact, never
         // truncated, so the next launch still resolves the known-good revision
         assert_eq!(
@@ -2548,13 +2554,17 @@ mod tests {
         let e = host_exec_verdict(1234, reg(0o755), 1000).unwrap_err();
         assert!(e.contains("owned by uid 1234"), "got: {e}");
         // world-writable is refused even when owned by us
-        assert!(host_exec_verdict(1000, reg(0o757), 1000)
-            .unwrap_err()
-            .contains("world-writable"));
+        assert!(
+            host_exec_verdict(1000, reg(0o757), 1000)
+                .unwrap_err()
+                .contains("world-writable")
+        );
         // a non-regular file (here a directory) is refused
-        assert!(host_exec_verdict(1000, libc::S_IFDIR | 0o755, 1000)
-            .unwrap_err()
-            .contains("not a regular file"));
+        assert!(
+            host_exec_verdict(1000, libc::S_IFDIR | 0o755, 1000)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
     }
 
     #[test]
@@ -2759,9 +2769,10 @@ mod tests {
         // the version marker records the embedded hash
         assert_eq!(std::fs::read_to_string(dir.join(".sha256")).unwrap(), sha);
         // no temp artifact is left behind
-        assert!(!dir
-            .join(format!(".nix.tmp.{}", std::process::id()))
-            .exists());
+        assert!(
+            !dir.join(format!(".nix.tmp.{}", std::process::id()))
+                .exists()
+        );
     }
 
     #[test]
@@ -2951,9 +2962,10 @@ mod tests {
             !dir.join(".sha256").exists(),
             "bwrap must not write nix's marker"
         );
-        assert!(!dir
-            .join(format!(".bwrap.tmp.{}", std::process::id()))
-            .exists());
+        assert!(
+            !dir.join(format!(".bwrap.tmp.{}", std::process::id()))
+                .exists()
+        );
 
         // Idempotent at the same hash: a sentinel overwrite survives a re-call.
         std::fs::write(&bwrap, b"sentinel").unwrap();

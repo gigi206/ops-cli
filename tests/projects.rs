@@ -158,7 +158,7 @@ fn show_reports_store_roots_and_declared_but_not_built() {
     let tree = "1111111111111111";
     fx.make_tree(tree, Some(&proj));
     fx.make_gcroot(tree, "built"); // the `built` package's gcroot
-                                   // The project declares two nix packages: one is realized (`built`), one is not (`absent`).
+    // The project declares two nix packages: one is realized (`built`), one is not (`absent`).
     std::fs::write(
         proj.join(".sbx.toml"),
         "[packages]\nbuilt = \"nix:hello\"\nabsent = \"nix:missing\"\n",
@@ -193,11 +193,13 @@ fn show_reports_store_roots_and_declared_but_not_built() {
     // --json carries the same distinction.
     let out = fx.sbx(&["projects", "show", tree, "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    assert!(v["store_roots"]["nix"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|x| x == "built"));
+    assert!(
+        v["store_roots"]["nix"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "built")
+    );
     let unbuilt = v["unbuilt"].as_array().expect("unbuilt array");
     assert_eq!(unbuilt.len(), 1, "one unbuilt package: {v}");
     assert!(unbuilt[0]["locator"].as_str().unwrap().contains("absent"));

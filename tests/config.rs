@@ -1319,7 +1319,9 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!("skipping package PATH test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping package PATH test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
     fx.write_project("[packages]\nhello = \"nix:hello\"\n");
@@ -1364,7 +1366,9 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!("skipping unrealisable-package test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping unrealisable-package test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
     // a well-formed attribute (so it passes validation and reaches nix) that no real
@@ -1558,7 +1562,9 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!("skipping cross-channel pin test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping cross-channel pin test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
 
@@ -2594,10 +2600,11 @@ fn config_set_get_unset_on_a_global_app_route_to_its_profile_file() {
         std::fs::remove_file(&profile).ok();
         // The write must first create the app so `cmd` makes it a launchable profile (an app with
         // no cmd is not shown); set the posture; then confirm both the file and the resolved view.
-        assert!(fx
-            .run(&["config", "set", "cmd", "agent", "--app", "demo", "-g"])
-            .status
-            .success());
+        assert!(
+            fx.run(&["config", "set", "cmd", "agent", "--app", "demo", "-g"])
+                .status
+                .success()
+        );
         let out = fx.run(&["config", "set", "network", posture, "--app", "demo", "-g"]);
         assert!(
             out.status.success(),
@@ -2627,10 +2634,11 @@ fn config_set_get_unset_on_a_global_app_route_to_its_profile_file() {
     }
 
     // `get` reads a scalar leaf back from the profile.
-    assert!(fx
-        .run(&["config", "set", "network", "deny", "--app", "demo", "-g"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["config", "set", "network", "deny", "--app", "demo", "-g"])
+            .status
+            .success()
+    );
     let got = fx.run(&["config", "get", "network", "--app", "demo", "-g"]);
     assert!(got.status.success());
     assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "deny");
@@ -2646,15 +2654,17 @@ fn unset_network_mode_on_a_global_app_yields_an_inheriting_table() {
     fx.write_profile("demo", "cmd = \"agent\"\n");
 
     // `sbx net allow` bootstraps a `deny`-mode table in the profile...
-    assert!(fx
-        .run(&["net", "allow", "api.example.com", "--app", "demo", "-g"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["net", "allow", "api.example.com", "--app", "demo", "-g"])
+            .status
+            .success()
+    );
     // ...then `unset network.mode` leaves the rules but no mode.
-    assert!(fx
-        .run(&["config", "unset", "network.mode", "--app", "demo", "-g"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["config", "unset", "network.mode", "--app", "demo", "-g"])
+            .status
+            .success()
+    );
     let profile = fx.config_home.path().join("sbx/apps/demo.toml");
     let body = std::fs::read_to_string(&profile).unwrap();
     assert!(
@@ -2698,8 +2708,8 @@ fn config_set_on_a_full_profile_survives_validation_and_resolves() {
     );
 
     // Tune the ask timeout on the table AND flip the mode — both write into the existing profile.
-    assert!(fx
-        .run(&[
+    assert!(
+        fx.run(&[
             "config",
             "set",
             "network.mode",
@@ -2709,7 +2719,8 @@ fn config_set_on_a_full_profile_survives_validation_and_resolves() {
             "-g"
         ])
         .status
-        .success());
+        .success()
+    );
     let out = fx.run(&[
         "config",
         "set",
@@ -3513,10 +3524,11 @@ fn sbx_app_rm_rejects_an_invalid_name_before_removing_anything() {
 fn config_get_set_unset_round_trip() {
     let fx = Fixture::new();
     // set creates the file; get reads it back; unset removes it; get then exits 1.
-    assert!(fx
-        .run(&["config", "set", "env.FOO", "bar"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["config", "set", "env.FOO", "bar"])
+            .status
+            .success()
+    );
     let got = fx.run(&["config", "get", "env.FOO"]);
     assert!(got.status.success());
     assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "bar");
@@ -3598,9 +3610,11 @@ fn config_path_reports_the_target_file_per_scope() {
     // An explicit scope prints a single bare path — the scripting contract.
     let local = fx.run(&["config", "path", "--local"]);
     assert!(local.status.success());
-    assert!(String::from_utf8_lossy(&local.stdout)
-        .trim()
-        .ends_with(".sbx.toml"));
+    assert!(
+        String::from_utf8_lossy(&local.stdout)
+            .trim()
+            .ends_with(".sbx.toml")
+    );
 
     let global = fx.run(&["config", "path", "--global"]);
     assert!(global.status.success());
@@ -3736,24 +3750,27 @@ fn config_set_add_and_rm_edit_a_list_through_the_real_binary() {
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
     let read = || std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
 
-    assert!(fx
-        .run(&["config", "set", "fs.deny", r#"[".env", "old.key"]"#])
-        .status
-        .success());
+    assert!(
+        fx.run(&["config", "set", "fs.deny", r#"[".env", "old.key"]"#])
+            .status
+            .success()
+    );
     assert!(
         read().contains(r#"deny = [".env", "old.key"]"#),
         "a TOML array sets the whole list:\n{}",
         read()
     );
 
-    assert!(fx
-        .run(&["config", "rm", "fs.deny", "old.key"])
-        .status
-        .success());
-    assert!(fx
-        .run(&["config", "add", "fs.deny", "secrets/"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["config", "rm", "fs.deny", "old.key"])
+            .status
+            .success()
+    );
+    assert!(
+        fx.run(&["config", "add", "fs.deny", "secrets/"])
+            .status
+            .success()
+    );
     assert!(
         read().contains(r#"deny = [".env", "secrets/"]"#),
         "add/rm move one entry and leave the rest:\n{}",

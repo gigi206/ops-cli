@@ -34,7 +34,7 @@
 use std::collections::BTreeSet;
 
 use super::control::LogEvent;
-use crate::allowlist::{canonical_segments, classify, Decision, EgressPolicy};
+use crate::allowlist::{Decision, EgressPolicy, canonical_segments, classify};
 
 /// The refusal reasons that mean "this destination is simply not in the allowlist yet" — the only
 /// ones a candidate rule may be synthesized from.

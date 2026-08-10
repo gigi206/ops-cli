@@ -482,9 +482,9 @@ fn validate_unmask(raw: &[String]) -> Result<Vec<String>, String> {
             Ok(ok) => out.push(ok),
             Err(reason) => {
                 return Err(format!(
-                "`unmask` entry `{entry}` {reason} — it names an `[fs] deny` entry, in the same \
+                    "`unmask` entry `{entry}` {reason} — it names an `[fs] deny` entry, in the same \
                      form that list is written in"
-            ))
+                ));
             }
         }
     }
@@ -702,17 +702,19 @@ fn check_placeholders_declared(
 /// mistyped one through the "declared but never used" check.
 pub(crate) fn placeholders(element: &str) -> impl Iterator<Item = &str> {
     let mut rest = element;
-    std::iter::from_fn(move || loop {
-        let open = rest.find('{')?;
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('}') else {
-            rest = "";
-            return None;
-        };
-        let name = &after[..close];
-        rest = &after[close + 1..];
-        if !name.is_empty() {
-            return Some(name);
+    std::iter::from_fn(move || {
+        loop {
+            let open = rest.find('{')?;
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('}') else {
+                rest = "";
+                return None;
+            };
+            let name = &after[..close];
+            rest = &after[close + 1..];
+            if !name.is_empty() {
+                return Some(name);
+            }
         }
     })
 }

@@ -353,7 +353,7 @@ mod tests {
     fn push_attr_frames_a_tlv_padded_to_four() {
         let mut buf = Vec::new();
         push_attr(&mut buf, IFLA_INFO_KIND, b"dummy\0"); // 6-byte payload
-                                                         // rta_len = 4 + 6 = 10, padded to 12 bytes on the wire.
+        // rta_len = 4 + 6 = 10, padded to 12 bytes on the wire.
         assert_eq!(buf.len(), 12);
         assert_eq!(u16::from_ne_bytes([buf[0], buf[1]]), 10); // rta_len excludes padding
         assert_eq!(u16::from_ne_bytes([buf[2], buf[3]]), IFLA_INFO_KIND);

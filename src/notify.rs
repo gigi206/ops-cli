@@ -387,10 +387,10 @@ impl Coalescer {
                 if mode == NotifyMode::Once {
                     return Speak::Stay;
                 }
-                if let (Some(period), Some(last)) = (policy.repeat_after(), prior.at) {
-                    if now.duration_since(last) < period {
-                        return Speak::Stay;
-                    }
+                if let (Some(period), Some(last)) = (policy.repeat_after(), prior.at)
+                    && now.duration_since(last) < period
+                {
+                    return Speak::Stay;
                 }
                 prior.at = Some(now);
                 Speak::Say { replaces: prior.id }

@@ -893,17 +893,17 @@ fn install_inner(
             quoted_list(claimants)
         ));
     }
-    if let Some(other) = installed.resolver(&probe.scheme) {
-        if other.dir != dest {
-            let holder = other.dir_name();
-            return Err(format!(
-                "scheme `{}://` is already claimed by the installed plugin `{}` (from {}) — \
+    if let Some(other) = installed.resolver(&probe.scheme)
+        && other.dir != dest
+    {
+        let holder = other.dir_name();
+        return Err(format!(
+            "scheme `{}://` is already claimed by the installed plugin `{}` (from {}) — \
                  remove it first with `sbx plugins rm {holder}`",
-                probe.scheme,
-                other.name,
-                origin::read(layout, holder).short()
-            ));
-        }
+            probe.scheme,
+            other.name,
+            origin::read(layout, holder).short()
+        ));
     }
 
     // Stage into a temp sibling *outside* the plugins directory (so a concurrent `list` never scans
@@ -1708,20 +1708,28 @@ mod tests {
     #[test]
     fn verdict_exec_refuses_foreign_owner_group_or_world_write_and_non_regular() {
         let reg = libc::S_IFREG;
-        assert!(verdict_exec(reg | 0o755, 1234, 1000)
-            .unwrap_err()
-            .contains("owned by uid 1234"));
+        assert!(
+            verdict_exec(reg | 0o755, 1234, 1000)
+                .unwrap_err()
+                .contains("owned by uid 1234")
+        );
         // group-writable is refused here (stricter than the config gate)
-        assert!(verdict_exec(reg | 0o775, 1000, 1000)
-            .unwrap_err()
-            .contains("group or other"));
-        assert!(verdict_exec(reg | 0o777, 1000, 1000)
-            .unwrap_err()
-            .contains("group or other"));
+        assert!(
+            verdict_exec(reg | 0o775, 1000, 1000)
+                .unwrap_err()
+                .contains("group or other")
+        );
+        assert!(
+            verdict_exec(reg | 0o777, 1000, 1000)
+                .unwrap_err()
+                .contains("group or other")
+        );
         // a directory (no S_IFREG) is refused
-        assert!(verdict_exec(libc::S_IFDIR | 0o755, 1000, 1000)
-            .unwrap_err()
-            .contains("not a regular file"));
+        assert!(
+            verdict_exec(libc::S_IFDIR | 0o755, 1000, 1000)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@
 //! one is a hard error naming the attribute — never a silent drop, unlike a best-effort
 //! bind.
 
-use crate::config::{untrusted_reason, Backend, Package, PROJECT_CONFIG};
+use crate::config::{Backend, PROJECT_CONFIG, Package, untrusted_reason};
 use crate::store::{self, Layout};
 use crate::trust::TrustState;
 use std::io;

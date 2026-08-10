@@ -532,12 +532,13 @@ fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -2522,10 +2523,12 @@ mod tests {
         assert!(EgressPolicy::default().ask_notice());
         // `with_ask_notice(false)` silences it; `true` restores it.
         assert!(!EgressPolicy::default().with_ask_notice(false).ask_notice());
-        assert!(EgressPolicy::default()
-            .with_ask_notice(false)
-            .with_ask_notice(true)
-            .ask_notice());
+        assert!(
+            EgressPolicy::default()
+                .with_ask_notice(false)
+                .with_ask_notice(true)
+                .ask_notice()
+        );
     }
 
     #[test]

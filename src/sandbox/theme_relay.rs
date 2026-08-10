@@ -146,13 +146,15 @@ async fn run(
         futures_util::select! {
             _ = shutdown.recv().fuse() => break,
             sig = changes.next().fuse() => match sig {
-                Some(sig) => if let Ok(args) = sig.args() {
-                    if args.namespace == "org.freedesktop.appearance" && args.key == "color-scheme" {
-                        if let Some(n) = extract_u32(&args.value) {
-                            write_keyfile(&keyfile, super::portal::color_scheme_name(n));
-                        }
+                Some(sig) => {
+                    if let Ok(args) = sig.args()
+                        && args.namespace == "org.freedesktop.appearance"
+                        && args.key == "color-scheme"
+                        && let Some(n) = extract_u32(&args.value)
+                    {
+                        write_keyfile(&keyfile, super::portal::color_scheme_name(n));
                     }
-                },
+                }
                 None => break,
             },
         }

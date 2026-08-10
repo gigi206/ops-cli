@@ -920,10 +920,10 @@ fn app_list() -> ExitCode {
             Ok(entries) => {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().and_then(|x| x.to_str()) == Some("toml") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            profiles.insert(stem.to_string());
-                        }
+                    if path.extension().and_then(|x| x.to_str()) == Some("toml")
+                        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    {
+                        profiles.insert(stem.to_string());
                     }
                 }
             }
@@ -1561,7 +1561,9 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         println!(
             "{}",
             style::dim_prose(
-                &format!("would prune {count} undeclared tool(s) ({size}) — re-run with `--yes` to apply."),
+                &format!(
+                    "would prune {count} undeclared tool(s) ({size}) — re-run with `--yes` to apply."
+                ),
                 &pal
             )
         );

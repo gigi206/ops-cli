@@ -233,17 +233,18 @@ pub(crate) fn pins(layout: &Layout, project_id: &str, lock_file: &str) -> BTreeM
     };
     for line in text.lines() {
         let mut it = line.splitn(3, '\t');
-        if let (Some(key), Some(hash)) = (it.next(), it.next()) {
-            if !key.is_empty() && is_sri(hash) {
-                let url = it.next().filter(|u| !u.is_empty()).unwrap_or(key);
-                map.insert(
-                    key.to_string(),
-                    Pin {
-                        hash: hash.to_string(),
-                        url: url.to_string(),
-                    },
-                );
-            }
+        if let (Some(key), Some(hash)) = (it.next(), it.next())
+            && !key.is_empty()
+            && is_sri(hash)
+        {
+            let url = it.next().filter(|u| !u.is_empty()).unwrap_or(key);
+            map.insert(
+                key.to_string(),
+                Pin {
+                    hash: hash.to_string(),
+                    url: url.to_string(),
+                },
+            );
         }
     }
     map
@@ -981,7 +982,7 @@ mod tests {
     use super::super::deb::Deb;
     use super::super::tarball::Tarball;
     use super::*;
-    use crate::testutil::{resolved, TmpDir};
+    use crate::testutil::{TmpDir, resolved};
 
     /// A backend that records what [`upgrade`] asked of it and answers with a canned pin, so the
     /// generic roll can be exercised without a nix engine or a network. It borrows `tarball:`'s

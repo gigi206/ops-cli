@@ -802,28 +802,34 @@ mod tests {
         };
 
         // a first resolution
-        assert!(text(store::Upgrade {
-            source: "nixos-unstable".into(),
-            previous: None,
-            revision: rev.into(),
-        })
-        .contains("first pin"));
+        assert!(
+            text(store::Upgrade {
+                source: "nixos-unstable".into(),
+                previous: None,
+                revision: rev.into(),
+            })
+            .contains("first pin")
+        );
 
         // an unchanged channel
-        assert!(text(store::Upgrade {
-            source: "nixos-unstable".into(),
-            previous: Some(rev.into()),
-            revision: rev.into(),
-        })
-        .contains("already at the latest"));
+        assert!(
+            text(store::Upgrade {
+                source: "nixos-unstable".into(),
+                previous: Some(rev.into()),
+                revision: rev.into(),
+            })
+            .contains("already at the latest")
+        );
 
         // a fixed revision pin cannot roll
-        assert!(text(store::Upgrade {
-            source: rev.into(),
-            previous: Some(rev.into()),
-            revision: rev.into(),
-        })
-        .contains("fixed revision"));
+        assert!(
+            text(store::Upgrade {
+                source: rev.into(),
+                previous: Some(rev.into()),
+                revision: rev.into(),
+            })
+            .contains("fixed revision")
+        );
 
         // a roll-forward shows old → new
         let rolled = text(store::Upgrade {
@@ -1137,7 +1143,9 @@ mod tests {
         assert!(text.contains("flake:github:o/c: 9ae611a — newly pinned"));
         assert!(text.contains("flake:github:o/old#x: removed from the lock"));
         assert!(text.contains("flake:github:o/d#default: re-resolve failed, kept 11707dc"));
-        assert!(text.contains("flake:github:o/e#default: re-resolve failed — metadata unreachable"));
+        assert!(
+            text.contains("flake:github:o/e#default: re-resolve failed — metadata unreachable")
+        );
 
         // Colored: the reference rides the name span and the withheld note rides warn.
         let p = style::Palette::colored();
@@ -1288,8 +1296,11 @@ mod tests {
         );
         assert!(text.contains("appimage:https://e/c.AppImage: XH0ykkcZ — newly pinned"));
         assert!(text.contains("appimage:https://e/old.AppImage: removed from the lock"));
-        assert!(text
-            .contains("appimage:https://e/d.AppImage: re-resolve failed — prefetch unreachable"));
+        assert!(
+            text.contains(
+                "appimage:https://e/d.AppImage: re-resolve failed — prefetch unreachable"
+            )
+        );
 
         // The withheld note also rides *after* a roll that did happen, not only in place of the
         // "none declared" line.

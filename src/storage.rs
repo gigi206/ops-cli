@@ -286,15 +286,15 @@ fn unescape_mountinfo(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'\\' && i + 3 < b.len() {
-            if let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
                 .ok()
                 .and_then(|o| u8::from_str_radix(o, 8).ok())
-            {
-                out.push(c as char);
-                i += 4;
-                continue;
-            }
+        {
+            out.push(c as char);
+            i += 4;
+            continue;
         }
         out.push(b[i] as char);
         i += 1;
@@ -987,7 +987,7 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
             return Err(format!(
                 "{} does not exist — create it with `sbx storage init`",
                 image.display()
-            ))
+            ));
         }
         State::Mounted { mount_point, .. } => return Ok(mount_point),
         State::Attached { loop_dev } => loop_dev,
@@ -1005,14 +1005,14 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
     // A volume mounted `noexec` would host a store whose binaries cannot run — a failure that
     // surfaces far from its cause, so it is caught here rather than at the first launch.
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    if let Some((_, options)) = mount_of(&loop_dev, &mountinfo) {
-        if mount_is_noexec(&options) {
-            return Err(format!(
-                "{} is mounted noexec, so a store there cannot run anything \
+    if let Some((_, options)) = mount_of(&loop_dev, &mountinfo)
+        && mount_is_noexec(&options)
+    {
+        return Err(format!(
+            "{} is mounted noexec, so a store there cannot run anything \
                  (check the udisks mount options configured on this host)",
-                mount_point.display()
-            ));
-        }
+            mount_point.display()
+        ));
     }
 
     // Best-effort: an uncompressed volume is a working volume, just a larger one.
@@ -1785,9 +1785,11 @@ this line has no separator at all
             std::fs::read_link(dst.join("store/pkg/current")).unwrap(),
             PathBuf::from("bin/tool")
         );
-        assert!(std::fs::symlink_metadata(dst.join("store/pkg/current"))
-            .unwrap()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(dst.join("store/pkg/current"))
+                .unwrap()
+                .is_symlink()
+        );
     }
 
     #[test]

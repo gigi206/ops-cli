@@ -432,7 +432,7 @@ mod locale_tests {
 #[cfg(test)]
 mod resolve_tests {
     use super::*;
-    use crate::store::{physical_path, Layout};
+    use crate::store::{Layout, physical_path};
     use crate::testutil::TmpDir;
 
     #[test]

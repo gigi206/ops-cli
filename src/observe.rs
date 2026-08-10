@@ -278,10 +278,10 @@ mod tests {
         // Wait for the child `sleep` to appear under the shell.
         let deadline = Instant::now() + Duration::from_secs(5);
         let found = loop {
-            if let Some(node) = tree(root_pid) {
-                if !node.children.is_empty() {
-                    break Some(node);
-                }
+            if let Some(node) = tree(root_pid)
+                && !node.children.is_empty()
+            {
+                break Some(node);
             }
             if Instant::now() >= deadline {
                 break tree(root_pid);

@@ -8,8 +8,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::{
-    config, nix_version, probe_userns, read_sysctl, sandbox, short_rev, storage, store, style,
-    Userns,
+    Userns, config, nix_version, probe_userns, read_sysctl, sandbox, short_rev, storage, store,
+    style,
 };
 
 /// Remediation for a missing capability-bearing user namespace — the boundary
@@ -404,7 +404,9 @@ fn classify_launch_failure(
                 "  {} sandbox           bubblewrap could not launch a hardened process",
                 tag_fail(pal)
             );
-            println!("         {dim}· user namespaces: capability-bearing (the failure is in bubblewrap, not the namespace){r}");
+            println!(
+                "         {dim}· user namespaces: capability-bearing (the failure is in bubblewrap, not the namespace){r}"
+            );
             for line in bwrap_stderr
                 .unwrap_or_default()
                 .lines()

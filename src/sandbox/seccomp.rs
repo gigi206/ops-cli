@@ -88,25 +88,24 @@ type Rules = BTreeMap<i64, Vec<SeccompRule>>;
 
 /// Match `clone`/`unshare` calls that request the given namespace flag in arg0.
 fn arg0_has_flag(flag: u64) -> SeccompRule {
-    SeccompRule::new(vec![SeccompCondition::new(
-        0,
-        SeccompCmpArgLen::Qword,
-        SeccompCmpOp::MaskedEq(flag),
-        flag,
-    )
-    .expect("a constant condition is valid")])
+    SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(flag),
+            flag,
+        )
+        .expect("a constant condition is valid"),
+    ])
     .expect("a single-condition rule is valid")
 }
 
 /// Match an `ioctl` whose request (arg1) equals `request`.
 fn arg1_is(request: u64) -> SeccompRule {
-    SeccompRule::new(vec![SeccompCondition::new(
-        1,
-        SeccompCmpArgLen::Qword,
-        SeccompCmpOp::Eq,
-        request,
-    )
-    .expect("a constant condition is valid")])
+    SeccompRule::new(vec![
+        SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, request)
+            .expect("a constant condition is valid"),
+    ])
     .expect("a single-condition rule is valid")
 }
 

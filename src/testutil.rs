@@ -1,9 +1,75 @@
 //! Test-only helpers shared across the module unit tests.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Held for the whole body of any test that pins an environment variable.
+///
+/// The environment is one slot shared by every thread of the test binary, and the tests run
+/// in parallel: `setenv` may reallocate `environ` while another thread is inside `getenv`.
+/// One lock for the whole binary — not one per module — is what makes that impossible, and
+/// what makes the `unsafe` in [`EnvVar`] sound.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`ENV_LOCK`]. A test that panicked while holding it poisons the mutex, but the
+/// poison flag says nothing about the environment: [`EnvVar`] restores every variable on
+/// the way out of that panic, so the next test takes the lock over a clean environment.
+pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One environment variable pinned for the length of a test and put back exactly as it was
+/// on the way out — including when the way out is a panic. A variable left set would decide
+/// what every later test in the binary reads, and a test that restores only on success
+/// leaves it set precisely when something went wrong.
+///
+/// The caller holds [`env_lock`] for a scope that outlives the guard.
+pub(crate) struct EnvVar {
+    key: &'static str,
+    prior: Option<OsString>,
+}
+
+impl EnvVar {
+    /// Pin `key` to `value` until the guard is dropped.
+    pub(crate) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let guard = Self {
+            key,
+            prior: std::env::var_os(key),
+        };
+        // SAFETY: the caller holds `ENV_LOCK` for a scope that outlives this guard, so no
+        // other thread of this binary reads or writes the environment meanwhile.
+        unsafe { std::env::set_var(key, value) };
+        guard
+    }
+
+    /// Pin `key` to *unset* until the guard is dropped — what a test asserting the absent
+    /// case needs, since the variable may be set in the environment the run inherited.
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let guard = Self {
+            key,
+            prior: std::env::var_os(key),
+        };
+        // SAFETY: as in `set`.
+        unsafe { std::env::remove_var(key) };
+        guard
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        // SAFETY: as in `set` — the lock is held until after this guard is dropped.
+        unsafe {
+            match self.prior.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
 
 /// A unique temp directory that removes itself on drop, so tests leave nothing
 /// behind (cleanup runs on panic-unwind too, not just on success).

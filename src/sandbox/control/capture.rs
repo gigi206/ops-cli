@@ -32,7 +32,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::sandbox::proxy::{redact_in_place, SecretNeedle};
+use crate::sandbox::proxy::{SecretNeedle, redact_in_place};
 
 /// How much of each exchange a launch captures. `Off` is the default and costs nothing — no buffer
 /// is ever allocated on the forwarding path.

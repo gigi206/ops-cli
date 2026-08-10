@@ -131,7 +131,9 @@ fn a_second_sandbox_shares_the_projects_persistent_home() {
 
     // Skip where the host cannot sandbox (this first run also warms the userland).
     if !run(&["run", "--", "true"], project.path(), data.path()).0 {
-        eprintln!("skipping shared-home smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping shared-home smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
 

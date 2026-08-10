@@ -610,15 +610,15 @@ pub(crate) fn start(
     // reaches a notification body unredacted. The union is bounded by the number of *distinct*
     // credentials declared, not by the number of invocations, because an identical needle is
     // recognised and skipped.
-    if let Some(wiring) = notify {
-        if let Ok(mut shared) = wiring.needles.write() {
-            for needle in &redactions {
-                let known = shared
-                    .iter()
-                    .any(|n| n.name() == needle.name() && n.as_bytes() == needle.as_bytes());
-                if !known {
-                    shared.push(needle.clone());
-                }
+    if let Some(wiring) = notify
+        && let Ok(mut shared) = wiring.needles.write()
+    {
+        for needle in &redactions {
+            let known = shared
+                .iter()
+                .any(|n| n.name() == needle.name() && n.as_bytes() == needle.as_bytes());
+            if !known {
+                shared.push(needle.clone());
             }
         }
     }
@@ -724,11 +724,11 @@ pub(crate) fn start(
             .mode(0o600)
             .open(&ca_file)?;
         f.write_all(ctx.ca_cert_pem().as_bytes())?;
-        if let Some(bundle) = ca_bundle.filter(|_| splices_any) {
-            if let Ok(roots) = std::fs::read(bundle) {
-                f.write_all(b"\n")?;
-                f.write_all(&roots)?;
-            }
+        if let Some(bundle) = ca_bundle.filter(|_| splices_any)
+            && let Ok(roots) = std::fs::read(bundle)
+        {
+            f.write_all(b"\n")?;
+            f.write_all(&roots)?;
         }
     }
 
@@ -1055,7 +1055,7 @@ fn classify_value(raw: String, header: &str, label: &str) -> io::Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::TmpDir;
+    use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1622,11 +1622,13 @@ mod tests {
             .clone()
             .expect("ask mode must bind a control socket");
         assert!(control.exists(), "the control socket must be bound");
-        assert!(control
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("control-"));
+        assert!(
+            control
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("control-")
+        );
 
         // ...but it is NEVER among the cage's binds — the proxy socket and the CA are all that cross
         // in, so the in-cage agent cannot reach the control plane to answer its own asks.
@@ -1866,7 +1868,8 @@ mod tests {
     fn a_missing_sops_file_is_absent_and_falls_through() {
         // a sops source whose file does not exist is a clean absent: the chain falls through to a
         // set env fallback (no sops is ever invoked, so this is hermetic).
-        std::env::set_var("SBX_TEST_EGRESS_SSBX_FB", "fallback-token-value");
+        let _lock = env_lock();
+        let _var = EnvVar::set("SBX_TEST_EGRESS_SSBX_FB", "fallback-token-value");
         let dir = TmpDir::new();
         let (injs, _n) = resolve_injections(
             &[secret_chain(
@@ -1885,7 +1888,6 @@ mod tests {
             Path::new(UNUSED_BWRAP),
         )
         .unwrap();
-        std::env::remove_var("SBX_TEST_EGRESS_SSBX_FB");
         assert_eq!(injs[0].value, "Bearer fallback-token-value");
     }
 
@@ -1920,7 +1922,8 @@ mod tests {
 
     #[test]
     fn resolve_injections_reads_env_and_shapes_the_value() {
-        std::env::set_var("SBX_TEST_EGRESS_TOKEN", "s3cret-token-value");
+        let _lock = env_lock();
+        let _var = EnvVar::set("SBX_TEST_EGRESS_TOKEN", "s3cret-token-value");
         let s = secret(
             SecretSource::Env("SBX_TEST_EGRESS_TOKEN".into()),
             "api.github.com",
@@ -1928,7 +1931,6 @@ mod tests {
             crate::config::HeaderShape::new("Bearer ", false),
         );
         let (injs, needles) = resolve_injections_at_root(&[s]).unwrap();
-        std::env::remove_var("SBX_TEST_EGRESS_TOKEN");
         assert_eq!(injs.len(), 1);
         assert_eq!(injs[0].header, "Authorization");
         assert_eq!(injs[0].value, "Bearer s3cret-token-value");
@@ -1961,7 +1963,8 @@ mod tests {
     fn an_empty_source_fails_closed() {
         // a value that is only a newline trims to empty → a clean "absent"; with no other source
         // the whole chain resolves nothing, which fails closed naming the secret.
-        std::env::set_var("SBX_TEST_EGRESS_EMPTY", "\n");
+        let _lock = env_lock();
+        let _var = EnvVar::set("SBX_TEST_EGRESS_EMPTY", "\n");
         let s = secret(
             SecretSource::Env("SBX_TEST_EGRESS_EMPTY".into()),
             "h.test",
@@ -1969,7 +1972,6 @@ mod tests {
             crate::config::HeaderShape::new("", false),
         );
         let err = resolve_injections_at_root(&[s]).unwrap_err().to_string();
-        std::env::remove_var("SBX_TEST_EGRESS_EMPTY");
         assert!(
             err.contains("no source resolved") && err.contains('H'),
             "an empty source must fail closed naming the secret: {err}"
@@ -1978,8 +1980,9 @@ mod tests {
 
     #[test]
     fn a_fallback_chain_uses_the_first_resolved_source() {
+        let _lock = env_lock();
         // first source absent (unset var) → falls through to the second (a file)
-        std::env::remove_var("SBX_TEST_EGRESS_FALLBACK");
+        let unset = EnvVar::unset("SBX_TEST_EGRESS_FALLBACK");
         let dir = TmpDir::new();
         let file = dir.join("tok");
         std::fs::write(&file, "tok3n-from-the-file\n").unwrap();
@@ -1996,7 +1999,8 @@ mod tests {
         assert_eq!(injs[0].value, "Bearer tok3n-from-the-file");
 
         // once the first source IS set, it wins — the file fallback is not consulted
-        std::env::set_var("SBX_TEST_EGRESS_FALLBACK", "tok3n-from-the-env");
+        drop(unset);
+        let _var = EnvVar::set("SBX_TEST_EGRESS_FALLBACK", "tok3n-from-the-env");
         let (injs, _n) = resolve_injections_at_root(&[secret_chain(
             vec![
                 SecretSource::Env("SBX_TEST_EGRESS_FALLBACK".into()),
@@ -2007,7 +2011,6 @@ mod tests {
             crate::config::HeaderShape::new("Bearer ", false),
         )])
         .unwrap();
-        std::env::remove_var("SBX_TEST_EGRESS_FALLBACK");
         assert_eq!(injs[0].value, "Bearer tok3n-from-the-env");
     }
 
@@ -2016,8 +2019,9 @@ mod tests {
         // a *directory* at a file source: read_to_string fails with a non-NotFound error, so it is a
         // HARD error — the launch must fail closed even though a perfectly good second source is set,
         // proving a hard error is never silently downgraded to the fallback.
+        let _lock = env_lock();
         let dir = TmpDir::new();
-        std::env::set_var(
+        let _var = EnvVar::set(
             "SBX_TEST_EGRESS_HARD_FALLBACK",
             "would-resolve-if-consulted",
         );
@@ -2031,7 +2035,6 @@ mod tests {
             crate::config::HeaderShape::new("Bearer ", false),
         );
         let err = resolve_injections_at_root(&[s]).map(|_| ());
-        std::env::remove_var("SBX_TEST_EGRESS_HARD_FALLBACK");
         assert!(
             err.is_err(),
             "an unreadable first source must fail closed, not fall through to the set second source"
@@ -2073,7 +2076,8 @@ mod tests {
 
     #[test]
     fn a_basic_secret_redacts_both_the_pair_and_its_base64() {
-        std::env::set_var("SBX_TEST_EGRESS_BASIC", "alice:correct-horse");
+        let _lock = env_lock();
+        let _var = EnvVar::set("SBX_TEST_EGRESS_BASIC", "alice:correct-horse");
         let s = secret(
             SecretSource::Env("SBX_TEST_EGRESS_BASIC".into()),
             "h.test",
@@ -2081,7 +2085,6 @@ mod tests {
             crate::config::HeaderShape::new("Basic ", true),
         );
         let (injs, needles) = resolve_injections_at_root(&[s]).unwrap();
-        std::env::remove_var("SBX_TEST_EGRESS_BASIC");
         // basic carries the base64 on the wire, so BOTH the raw user:pass and its base64 are
         // needles — a reflecting upstream echoes the base64, the raw pair is the underlying secret.
         let raw = b"alice:correct-horse".to_vec();
@@ -2174,7 +2177,8 @@ mod tests {
             description: None,
             host: Default::default(),
         };
-        std::env::set_var("SBX_TEST_CHAIN_FALLBACK", "from-the-next-source");
+        let _lock = env_lock();
+        let _var = EnvVar::set("SBX_TEST_CHAIN_FALLBACK", "from-the-next-source");
         let value = resolve_chain(
             &[
                 SecretSource::Plugin {
@@ -2187,13 +2191,14 @@ mod tests {
             Path::new("/"),
             &bwrap,
         );
-        std::env::remove_var("SBX_TEST_CHAIN_FALLBACK");
         assert_eq!(value.unwrap(), "from-the-next-source");
     }
 
     #[test]
     fn a_short_secret_is_injected_but_not_redacted() {
-        std::env::set_var("SBX_TEST_EGRESS_SHORT", "abc"); // 3 bytes, below REDACT_MIN_LEN
+        let _lock = env_lock();
+        // 3 bytes, below REDACT_MIN_LEN
+        let _var = EnvVar::set("SBX_TEST_EGRESS_SHORT", "abc");
         let s = secret(
             SecretSource::Env("SBX_TEST_EGRESS_SHORT".into()),
             "h.test",
@@ -2201,7 +2206,6 @@ mod tests {
             crate::config::HeaderShape::new("Bearer ", false),
         );
         let (injs, needles) = resolve_injections_at_root(&[s]).unwrap();
-        std::env::remove_var("SBX_TEST_EGRESS_SHORT");
         assert_eq!(injs[0].value, "Bearer abc", "the injection still applies");
         assert!(
             needles.is_empty(),

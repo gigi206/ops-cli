@@ -72,11 +72,7 @@ impl Palette {
         let on = is_tty
             && std::env::var_os("NO_COLOR").is_none()
             && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
-        if on {
-            Self::colored()
-        } else {
-            Self::plain()
-        }
+        if on { Self::colored() } else { Self::plain() }
     }
 
     /// Whether this palette paints nothing — the discriminant every span painter keys on, so a

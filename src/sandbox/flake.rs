@@ -71,16 +71,17 @@ pub(crate) fn pins(layout: &Layout, project_id: &str) -> BTreeMap<String, FlakeP
     let mut entries = BTreeMap::new();
     if let Ok(text) = std::fs::read_to_string(lock_path(layout, project_id)) {
         for line in text.lines() {
-            if let [declared, rev, locked] = line.split('\t').collect::<Vec<_>>()[..] {
-                if is_rev(rev) && is_locked_ref(locked) {
-                    entries.insert(
-                        declared.to_string(),
-                        FlakePin {
-                            rev: rev.to_string(),
-                            locked_ref: locked.to_string(),
-                        },
-                    );
-                }
+            if let [declared, rev, locked] = line.split('\t').collect::<Vec<_>>()[..]
+                && is_rev(rev)
+                && is_locked_ref(locked)
+            {
+                entries.insert(
+                    declared.to_string(),
+                    FlakePin {
+                        rev: rev.to_string(),
+                        locked_ref: locked.to_string(),
+                    },
+                );
             }
         }
     }
@@ -328,7 +329,7 @@ pub(crate) fn upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{app_with, resolved, TmpDir};
+    use crate::testutil::{TmpDir, app_with, resolved};
 
     const REV: &str = "11707dc2f618dd54ca8739b309ec4fc024de578b";
 

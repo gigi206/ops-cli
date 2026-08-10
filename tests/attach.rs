@@ -224,7 +224,9 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping sbx attach app e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping sbx attach app e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
 

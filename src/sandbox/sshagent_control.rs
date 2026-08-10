@@ -174,22 +174,22 @@ impl AgentRing {
         // the ring's lock would stall the reader answering `sbx ssh-agent logs`. A `list` or a
         // `sign` is the channel working as granted — only a refusal is the boundary biting, and it is
         // the one outcome the cage sees as a bare protocol failure it need never mention.
-        if kind == AgentKind::Refuse {
-            if let Some(notifier) = &self.notifier {
-                notifier.block(crate::notify::Block {
-                    event: crate::notify::NotifyEvent::SshAgent,
-                    // The detail is already the whole of what happened — which key, toward which
-                    // destination — so it is the identity a repeat is measured on. Two refusals of
-                    // the same key toward the same host read identically and coalesce; a different
-                    // key, or the same key toward somewhere else, is its own problem.
-                    subject: detail.to_string(),
-                    reason: "withheld".to_string(),
-                    detail: String::new(),
-                    // Nothing to suggest: widening `[ssh_agent] allow` because the cage reached for a
-                    // key it was not given is the opposite of the answer.
-                    fix: String::new(),
-                });
-            }
+        if kind == AgentKind::Refuse
+            && let Some(notifier) = &self.notifier
+        {
+            notifier.block(crate::notify::Block {
+                event: crate::notify::NotifyEvent::SshAgent,
+                // The detail is already the whole of what happened — which key, toward which
+                // destination — so it is the identity a repeat is measured on. Two refusals of
+                // the same key toward the same host read identically and coalesce; a different
+                // key, or the same key toward somewhere else, is its own problem.
+                subject: detail.to_string(),
+                reason: "withheld".to_string(),
+                detail: String::new(),
+                // Nothing to suggest: widening `[ssh_agent] allow` because the cage reached for a
+                // key it was not given is the opposite of the answer.
+                fix: String::new(),
+            });
         }
         self.ring.push_with(|seq, at_epoch_ms| AgentEvent {
             seq,
@@ -383,8 +383,8 @@ mod notify_tests {
                 .map_err(|_| "the notifier is still shared")
                 .unwrap(),
         );
-        let out = seen.lock().unwrap().clone();
-        out
+
+        seen.lock().unwrap().clone()
     }
 
     #[test]

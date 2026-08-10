@@ -246,7 +246,7 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{app_with, resolved, TmpDir};
+    use crate::testutil::{TmpDir, app_with, resolved};
 
     const HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
 

@@ -478,15 +478,17 @@ mod tests {
     fn an_unsafe_name_never_reaches_the_filesystem() {
         let tmp = crate::testutil::TmpDir::new();
         let layout = layout(tmp.path());
-        assert!(record(
-            &layout,
-            "../escape",
-            &Origin::Local {
-                path: None,
-                sha256: None
-            }
-        )
-        .is_err());
+        assert!(
+            record(
+                &layout,
+                "../escape",
+                &Origin::Local {
+                    path: None,
+                    sha256: None
+                }
+            )
+            .is_err()
+        );
         assert_eq!(read(&layout, "../escape"), Origin::Unknown);
     }
 

@@ -14,7 +14,7 @@
 //! the per-store cache, and the embedded default public key live with their
 //! consumers (`crate::stores` and the `plugins` command surface).
 
-use ring::signature::{UnparsedPublicKey, ED25519};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -232,7 +232,7 @@ fn repo_rel(rel: &Path) -> Result<String, String> {
                 return Err(format!(
                     "plugin tree has an unexpected path: {}",
                     rel.display()
-                ))
+                ));
             }
         }
     }

@@ -720,35 +720,35 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
     // The grants a profile arrives with, each of which widens what the cage reaches of the host —
     // and each of which lands in the *global* config, where it is trusted by location. A consent
     // report that omitted them would be consent to something unstated.
-    if let Some(devices) = &app.devices {
-        if !devices.allow.is_empty() {
-            lines.push(format!("devices: {}", devices.allow.join(", ")));
-        }
+    if let Some(devices) = &app.devices
+        && !devices.allow.is_empty()
+    {
+        lines.push(format!("devices: {}", devices.allow.join(", ")));
     }
-    if let Some(seccomp) = &app.seccomp {
-        if !seccomp.allow.is_empty() {
-            lines.push(format!("seccomp allow: {}", seccomp.allow.join(", ")));
-        }
+    if let Some(seccomp) = &app.seccomp
+        && !seccomp.allow.is_empty()
+    {
+        lines.push(format!("seccomp allow: {}", seccomp.allow.join(", ")));
     }
-    if let Some(ssh_agent) = &app.ssh_agent {
-        if !ssh_agent.allow.is_empty() {
-            lines.push(format!(
-                "ssh-agent: {} — this app's cage may ask your agent to sign with {}{}",
-                ssh_agent.allow.join(", "),
-                if ssh_agent.allow.len() == 1 {
-                    "that key"
-                } else {
-                    "those keys"
-                },
-                // Stated because it changes what importing means in practice, not because it is a
-                // risk: `confirm` only ever narrows, and cannot be turned off by a later layer.
-                if ssh_agent.confirm == Some(true) {
-                    ", asking you before each signature"
-                } else {
-                    ""
-                }
-            ));
-        }
+    if let Some(ssh_agent) = &app.ssh_agent
+        && !ssh_agent.allow.is_empty()
+    {
+        lines.push(format!(
+            "ssh-agent: {} — this app's cage may ask your agent to sign with {}{}",
+            ssh_agent.allow.join(", "),
+            if ssh_agent.allow.len() == 1 {
+                "that key"
+            } else {
+                "those keys"
+            },
+            // Stated because it changes what importing means in practice, not because it is a
+            // risk: `confirm` only ever narrows, and cannot be turned off by a later layer.
+            if ssh_agent.confirm == Some(true) {
+                ", asking you before each signature"
+            } else {
+                ""
+            }
+        ));
     }
     if let Some(section) = &app.secret {
         let mut any = false;
@@ -1166,10 +1166,10 @@ pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> 
     // 2. An inline app: serialize its raw definition. The project layer is preferred over the
     //    global (the local definition is the one being packaged for sharing).
     let mut warnings = Vec::new();
-    if let Some((mut project, _, _)) = read_project(cwd, &mut warnings) {
-        if let Some(app) = project.app.remove(name) {
-            return schema::serialize_app(&app).map(String::into_bytes);
-        }
+    if let Some((mut project, _, _)) = read_project(cwd, &mut warnings)
+        && let Some(app) = project.app.remove(name)
+    {
+        return schema::serialize_app(&app).map(String::into_bytes);
     }
     let mut global = read_global(&mut warnings);
     if let Some(app) = global.app.remove(name) {

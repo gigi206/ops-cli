@@ -656,7 +656,7 @@ fn gcroot_roots(store_dir: &Path, roots: &[PathBuf]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
-    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     /// A `(device, inode)` pair — equal across two paths iff they are the same
     /// inode. The device is part of the key because an inode number alone can
@@ -1094,7 +1094,7 @@ mod tests {
 mod smoke {
     use super::*;
     use crate::store::{self, Layout, LockTarget};
-    use crate::testutil::{fingerprint, TmpDir};
+    use crate::testutil::{TmpDir, fingerprint};
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
 

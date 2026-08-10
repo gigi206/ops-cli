@@ -80,10 +80,10 @@ pub(super) fn split_authority(authority: &str) -> Option<(String, u16)> {
 
 /// A `Host` header value with any `:port` removed (handling a bracketed IPv6 literal).
 pub(super) fn strip_port(authority: &str) -> String {
-    if let Some(rest) = authority.strip_prefix('[') {
-        if let Some((addr, _)) = rest.split_once(']') {
-            return addr.to_string();
-        }
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some((addr, _)) = rest.split_once(']')
+    {
+        return addr.to_string();
     }
     match authority.rsplit_once(':') {
         Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h.to_string(),
@@ -465,11 +465,7 @@ pub(super) fn force_close_in_head(head: &[u8]) -> Vec<u8> {
         }
         out.extend_from_slice(line);
     }
-    if terminated {
-        out
-    } else {
-        head.to_vec()
-    }
+    if terminated { out } else { head.to_vec() }
 }
 
 /// The framing state machine's position inside a response body.

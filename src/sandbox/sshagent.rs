@@ -44,8 +44,8 @@ use crate::store::Layout;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Where the broker's socket appears in the cage. Under the `/tmp` tmpfs (a writable mountpoint — a
 /// bind onto the read-only root would fail). The cage cannot unlink it (a bind-mount target is
@@ -470,14 +470,14 @@ fn respond<S: Read + Write>(
             // The prompt is raised *before* the request is forwarded, so a refusal means the host
             // agent was never asked — the same shape as an unlisted key, and for the same reason:
             // what is not approved must leave no trace of having been attempted.
-            if let Some(confirmer) = conn.confirm {
-                if !confirmer.allows(&confirm_prompt(&label, &toward)) {
-                    conn.ring.push(
-                        AgentKind::Refuse,
-                        &format!("you declined to let the cage sign with {label}{toward}"),
-                    );
-                    return Ok(refused);
-                }
+            if let Some(confirmer) = conn.confirm
+                && !confirmer.allows(&confirm_prompt(&label, &toward))
+            {
+                conn.ring.push(
+                    AgentKind::Refuse,
+                    &format!("you declined to let the cage sign with {label}{toward}"),
+                );
+                return Ok(refused);
             }
             let reply = exchange(host, request)?;
             // The host agent has the last word — a key loaded with `ssh-add -c` or `-h` can still

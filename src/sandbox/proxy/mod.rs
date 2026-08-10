@@ -151,8 +151,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rustls::{ClientConnection, ServerConnection, StreamOwned};
@@ -173,15 +173,15 @@ mod pool;
 mod ssrf;
 mod websocket;
 mod wire;
-use ca::upstream_server_name;
 pub(crate) use ca::Ca;
+use ca::upstream_server_name;
 use capture::{CaptureGuard, CaptureReader};
 use ctx::effective_policy;
-pub(crate) use ctx::{builtin_allow_rules, union_with_builtin, ProxyCtx};
+pub(crate) use ctx::{ProxyCtx, builtin_allow_rules, union_with_builtin};
 pub(crate) use inject::{HeaderInjection, SecretNeedle};
 use pool::{PoolKey, UpstreamTls};
+pub(crate) use ssrf::{AddrRefusal, ip_refusal, names_exact_host};
 use ssrf::{checked_address, resolve_checked};
-pub(crate) use ssrf::{ip_refusal, names_exact_host, AddrRefusal};
 use websocket::*;
 use wire::*;
 
@@ -602,7 +602,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 refusal.status_line(),
                 refusal.tag(),
                 &refusal.message(ctx, &connect_host, port, &imethod),
-            )
+            );
         }
     };
 
@@ -650,7 +650,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 refusal.status_line(),
                 refusal.tag(),
                 &refusal.message(&connect_host),
-            )
+            );
         }
     };
 
@@ -699,7 +699,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 &imethod,
                 &itarget,
                 e,
-            )
+            );
         }
     };
 
@@ -889,7 +889,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                         &imethod,
                         &itarget,
                         e,
-                    )
+                    );
                 }
             };
             upstream = fresh;
@@ -987,10 +987,10 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // Record only a FINAL status (>= 200). Any interim 1xx was relayed and read past above, so what
     // is left is the request's real outcome; a head cut short parses to nothing and simply leaves
     // the event without a status.
-    if let Some(code) = parse_status_code(&resp_head) {
-        if code >= 200 {
-            ctx.set_status(allow_seq, code);
-        }
+    if let Some(code) = parse_status_code(&resp_head)
+        && code >= 200
+    {
+        ctx.set_status(allow_seq, code);
     }
     // A head the upstream never finished sending delimits nothing — relay the rest until it closes.
     let framing = if complete {
@@ -1029,10 +1029,12 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     drop(framed);
     let no_residual = up_br.buffer().is_empty();
     drop(up_br);
-    if ended_as_framed && no_residual && response_keeps_alive(&resp_head) {
-        if let (Some(pool), Some(key)) = (ctx.pool.as_ref(), pool_key) {
-            pool.park(key, upstream, ctx.timeout);
-        }
+    if ended_as_framed
+        && no_residual
+        && response_keeps_alive(&resp_head)
+        && let (Some(pool), Some(key)) = (ctx.pool.as_ref(), pool_key)
+    {
+        pool.park(key, upstream, ctx.timeout);
     }
     // The response is fully relayed — close the intercepted TLS cleanly so the client sees a proper
     // end-of-stream, not a bare socket drop (the reported `without sending TLS close_notify`).
@@ -1156,7 +1158,7 @@ fn splice_l4(
                 refusal.status_line(),
                 refusal.tag(),
                 &refusal.message(connect_host),
-            )
+            );
         }
     };
 
@@ -1472,7 +1474,7 @@ fn handle_cleartext(
                 refusal.status_line(),
                 refusal.tag(),
                 &refusal.message(&host),
-            )
+            );
         }
     };
 
@@ -1580,10 +1582,10 @@ fn handle_cleartext(
         &[],
         false,
     )?;
-    if let Some(code) = parse_status_code(&resp_head) {
-        if code >= 200 {
-            ctx.set_status(allow_seq, code);
-        }
+    if let Some(code) = parse_status_code(&resp_head)
+        && code >= 200
+    {
+        ctx.set_status(allow_seq, code);
     }
     let framing = if complete {
         response_framing(&resp_head, method)
@@ -1800,7 +1802,7 @@ fn handle_https_forward(
                     refusal.status_line(),
                     refusal.tag(),
                     &refusal.message(ctx, &host, port, method),
-                )
+                );
             }
         };
 
@@ -1822,7 +1824,7 @@ fn handle_https_forward(
                 refusal.status_line(),
                 refusal.tag(),
                 &refusal.message(&host),
-            )
+            );
         }
     };
 
@@ -2057,10 +2059,10 @@ fn handle_https_forward(
             &format!("`{host}` closed the connection without sending a response"),
         );
     }
-    if let Some(code) = parse_status_code(&resp_head) {
-        if code >= 200 {
-            ctx.set_status(allow_seq, code);
-        }
+    if let Some(code) = parse_status_code(&resp_head)
+        && code >= 200
+    {
+        ctx.set_status(allow_seq, code);
     }
     let framing = if complete {
         response_framing(&resp_head, method)
@@ -2088,10 +2090,12 @@ fn handle_https_forward(
     drop(framed);
     let no_residual = up_br.buffer().is_empty();
     drop(up_br);
-    if ended_as_framed && no_residual && response_keeps_alive(&resp_head) {
-        if let (Some(pool), Some(key)) = (ctx.pool.as_ref(), pool_key) {
-            pool.park(key, upstream, ctx.timeout);
-        }
+    if ended_as_framed
+        && no_residual
+        && response_keeps_alive(&resp_head)
+        && let (Some(pool), Some(key)) = (ctx.pool.as_ref(), pool_key)
+    {
+        pool.park(key, upstream, ctx.timeout);
     }
     Ok(())
 }
@@ -2330,10 +2334,10 @@ fn acquire_upstream(
     port: u16,
     host: &str,
 ) -> Result<(UpstreamTls, bool), UpstreamError> {
-    if let (Some(pool), Some(key)) = (ctx.pool.as_ref(), key) {
-        if let Some(stream) = pool.checkout(key) {
-            return Ok((stream, true));
-        }
+    if let (Some(pool), Some(key)) = (ctx.pool.as_ref(), key)
+        && let Some(stream) = pool.checkout(key)
+    {
+        return Ok((stream, true));
     }
     connect_upstream(ip, port, host, ctx).map(|stream| (stream, false))
 }
@@ -2880,7 +2884,7 @@ fn invalid(msg: &'static str) -> io::Error {
 mod tests {
     use super::ca::CertResolver;
     use super::*;
-    use crate::allowlist::{classify, DefaultAction, EgressPolicy};
+    use crate::allowlist::{DefaultAction, EgressPolicy, classify};
     use crate::testutil::TmpDir;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -4413,7 +4417,7 @@ mod tests {
     /// metadata address is refused even when the rule names the host outright.
     #[test]
     fn the_cleartext_path_blocks_ssrf_to_private_and_metadata_addresses() {
-        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
         use crate::sandbox::egress_stats::{Counts, EgressStats};
 
         // wildcard match (no exact-named host) → loopback → blocked
@@ -5059,7 +5063,7 @@ mod tests {
     /// from reading the real response, never from sbx's own verdict.
     #[test]
     fn an_allowed_request_records_the_upstream_status_code() {
-        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
 
         for response in [
@@ -5119,7 +5123,7 @@ mod tests {
     /// test cannot see this — the entire response fits in the buffer, so the seam is never crossed.
     #[test]
     fn a_large_response_body_relays_intact_past_the_head_read() {
-        use crate::sandbox::control::{LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing};
         // Larger than one pump chunk, so the relay must read well past what the head read buffered.
         // Derived from the chunk constant rather than written as a literal, so growing the chunk
         // cannot quietly cost this test its teeth. A leaked static slice satisfies `spawn_upstream`.
@@ -6002,7 +6006,7 @@ mod tests {
     /// carrying the secret. So even in owner-only RAM the log never holds the raw credential.
     #[test]
     fn a_logged_path_has_its_secret_query_redacted_at_push() {
-        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
         let ca = Arc::new(Ca::ephemeral().unwrap());
         let der = ca.ca_cert_der();
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
@@ -6750,7 +6754,7 @@ mod tests {
     #[test]
     fn a_session_injected_allow_makes_a_request_proceed_without_parking() {
         use crate::sandbox::control::{
-            self, LogRing, ManualRules, PendingState, Verdict, LOG_RING_CAP,
+            self, LOG_RING_CAP, LogRing, ManualRules, PendingState, Verdict,
         };
         use crate::testutil::TmpDir;
         use std::os::unix::net::UnixListener;
@@ -7047,7 +7051,7 @@ mod tests {
     /// reaches the resolve step, where the injected resolver fails.
     #[test]
     fn a_dns_failure_for_an_allowed_host_is_a_clean_502_not_a_dropped_connection() {
-        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
         let proxy_ca_der = proxy_ca.ca_cert_der();
         let log = Arc::new(LogRing::new(LOG_RING_CAP));
@@ -7628,7 +7632,7 @@ mod tests {
     #[test]
     fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         use crate::allowlist::DefaultAction;
-        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
         use crate::sandbox::egress_stats::{Counts, EgressStats};
 
         let dir = TmpDir::new();
@@ -8408,7 +8412,7 @@ mod tests {
 
     #[test]
     fn an_ip_literal_target_without_a_tcp_rule_is_refused_and_logged_blocked() {
-        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
         // With no `tcp://` rule the inspected L7 path refuses an IP-literal CONNECT pre-tunnel; the
         // attempt is logged (host = the IP the agent tried) as a block — a "what is it reaching for"
         // record the stats bucketing never captured.
@@ -8431,7 +8435,7 @@ mod tests {
 
     #[test]
     fn an_unroutable_non_connect_request_is_refused_and_logged() {
-        use crate::sandbox::control::{LogRing, LogVerdict, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
         // A non-CONNECT request that is NOT a routable `http://` absolute-form (here a bare
         // origin-form `GET /secret`, which carries no host to route) still hits the `method-not-allowed`
         // branch — an `http://` absolute-form is handled by the cleartext path, but this is neither.
@@ -8571,7 +8575,7 @@ mod tests {
     /// absent exactly when it was needed.
     #[test]
     fn a_secret_reflected_into_a_websocket_frame_is_reported_on_its_event() {
-        use crate::sandbox::control::{LogRing, SecretWay, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, SecretWay};
         const LEAK: &[u8] = br#"{"echo":"SECRET-VALUE-0123456789"}"#;
         let (addr, upstream_ca, up) = spawn_leaking_ws_upstream(LEAK);
         let mut roots = RootCertStore::empty();
@@ -8635,7 +8639,7 @@ mod tests {
     /// wrong bytes — this asserts both at once.
     #[test]
     fn a_capturing_launch_records_both_directions_without_disturbing_the_relay() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, up) = spawn_upstream(
             "upstream.test",
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"reply\":\"pong\"}\n",
@@ -8701,7 +8705,7 @@ mod tests {
     /// so no payload is retained.
     #[test]
     fn the_headers_level_captures_no_payload_at_all() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, up) = spawn_upstream(
             "upstream.test",
             b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nsecret-reply",
@@ -8757,7 +8761,7 @@ mod tests {
     /// *relay*) would be the dangerous failure.
     #[test]
     fn a_body_over_the_cap_is_marked_truncated_and_still_relayed_whole() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         // 3 KiB of body against a 1 KiB cap.
         let body = vec![b'y'; 3 * 1024];
         let mut resp =
@@ -8811,7 +8815,7 @@ mod tests {
     /// forwarded upstream WITH the secret, so a capture taken one step later would hold it.
     #[test]
     fn an_injected_credential_is_named_in_the_capture_but_never_valued() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, up) = spawn_upstream(
             "upstream.test",
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
@@ -8871,7 +8875,7 @@ mod tests {
     /// a credential even when the upstream hands one back.
     #[test]
     fn a_reflected_secret_is_masked_out_of_the_capture() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, up) = spawn_upstream(
             "upstream.test",
             b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\nyou sent s3cr3t-token back",
@@ -8919,7 +8923,7 @@ mod tests {
     #[test]
     fn a_cleartext_exchange_is_captured_in_both_directions() {
         use crate::sandbox::control::{
-            CaptureCaps, CaptureLevel, CaptureRing, LogRing, LOG_RING_CAP,
+            CaptureCaps, CaptureLevel, CaptureRing, LOG_RING_CAP, LogRing,
         };
         let (addr, _up_head) = spawn_plain_upstream(
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
@@ -8946,17 +8950,21 @@ mod tests {
         assert!(resp.contains("hello"), "the relay still works: {resp:?}");
 
         let cap = one_capture(&ctx, &log);
-        assert!(String::from_utf8(cap.req_head.bytes.clone())
-            .unwrap()
-            .starts_with("POST http://upstream.test"));
+        assert!(
+            String::from_utf8(cap.req_head.bytes.clone())
+                .unwrap()
+                .starts_with("POST http://upstream.test")
+        );
         assert_eq!(
             String::from_utf8(cap.req_body.bytes.clone()).unwrap(),
             "payload",
             "the cleartext request body is captured"
         );
-        assert!(String::from_utf8(cap.res_head.bytes.clone())
-            .unwrap()
-            .starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            String::from_utf8(cap.res_head.bytes.clone())
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK")
+        );
         assert_eq!(
             String::from_utf8(cap.res_body.bytes.clone()).unwrap(),
             "hello"
@@ -8968,7 +8976,7 @@ mod tests {
     /// case where a truncation could go unrecorded — and the cage must still receive every byte.
     #[test]
     fn a_request_body_over_the_cap_is_marked_truncated_and_still_forwarded_whole() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         // Exactly twice the 1 KiB cap, so the relay's copy lands the cut on a boundary.
         let body = "z".repeat(2048);
         let (addr, upstream_ca, up) = spawn_upstream(
@@ -9022,7 +9030,7 @@ mod tests {
     /// no plaintext into the control plane.
     #[test]
     fn a_non_capturing_launch_files_nothing() {
-        use crate::sandbox::control::{LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, up) = spawn_upstream(
             "upstream.test",
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
@@ -9254,7 +9262,7 @@ mod tests {
     /// frames must arrive as a SECOND filing folded into the handshake's entry, not as a duplicate.
     #[test]
     fn a_websocket_transcript_is_captured_in_both_directions_without_disturbing_the_relay() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, up) = spawn_frame_ws_upstream();
         let mut roots = RootCertStore::empty();
         roots.add(upstream_ca).unwrap();
@@ -9330,7 +9338,7 @@ mod tests {
     /// stream that is not WebSocket framing yields no transcript rather than an invented one.
     #[test]
     fn a_websocket_handshake_is_captured_including_the_101_but_not_the_frames() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, up) = spawn_ws_upstream();
         let mut roots = RootCertStore::empty();
         roots.add(upstream_ca).unwrap();
@@ -9443,7 +9451,7 @@ mod tests {
     /// because the only thing that ends this tunnel is the release at the bottom of the test.
     #[test]
     fn a_websocket_capture_is_filed_while_the_tunnel_is_still_open() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, release, up) = spawn_held_ws_upstream();
         let mut roots = RootCertStore::empty();
         roots.add(upstream_ca).unwrap();
@@ -9545,7 +9553,7 @@ mod tests {
     /// than every other response path, so it would be the one to silently miss the tee.
     #[test]
     fn a_declined_websocket_upgrade_is_captured_like_an_ordinary_response() {
-        use crate::sandbox::control::{CaptureLevel, LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
         let (addr, upstream_ca, up) = spawn_upstream(
             "upstream.test",
             b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 14\r\n\r\nnot-upgradable",

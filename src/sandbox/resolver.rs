@@ -656,7 +656,7 @@ fn cage_spec(
 mod tests {
     use super::*;
     use crate::plugins::{ResolverPlugin, SandboxGrant};
-    use crate::testutil::TmpDir;
+    use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
 
     fn plugin_in(dir: &Path, grant: SandboxGrant) -> ResolverPlugin {
@@ -1056,10 +1056,9 @@ mod tests {
         };
         // The case the field exists for: a user whose store is not where the manifest guessed.
         // The manifest cannot name this directory — it did not exist when the plugin was signed —
-        // so the only thing that can reach it is the variable the user set. The variable name is
-        // unique to this test: these run as threads of one process, so a shared name would let two
-        // tests overwrite each other's environment.
+        // so the only thing that can reach it is the variable the user set.
         const VAR: &str = "SBX_TEST_RESOLVER_ABS_STORE";
+        let _lock = env_lock();
         let store = TmpDir::new();
         std::fs::write(store.join("entry"), "the-fixture-wrote-this").unwrap();
         let (_dir, p) = fake_resolver_with(
@@ -1069,9 +1068,8 @@ mod tests {
                 ..SandboxGrant::default()
             },
         );
-        std::env::set_var(VAR, store.path());
+        let _var = EnvVar::set(VAR, store.path());
         let out = run(&bwrap, &p, "test://x");
-        std::env::remove_var(VAR);
         // A hard-coded literal, so the assertion cannot be met by the test recomputing whatever
         // the code produced. Dropping the bind in `cage_spec` makes `cat` fail instead.
         assert_eq!(
@@ -1091,6 +1089,7 @@ mod tests {
         // binding nothing would aim the tool at a path the cage does not have, which is the exact
         // failure this field exists to remove.
         const VAR: &str = "SBX_TEST_RESOLVER_REL_STORE";
+        let _lock = env_lock();
         let (_dir, p) = fake_resolver_with(
             &format!("echo \"[${{{VAR}-unset}}]\""),
             SandboxGrant {
@@ -1098,9 +1097,8 @@ mod tests {
                 ..SandboxGrant::default()
             },
         );
-        std::env::set_var(VAR, "relative/store");
+        let _var = EnvVar::set(VAR, "relative/store");
         let out = run(&bwrap, &p, "test://x");
-        std::env::remove_var(VAR);
         assert_eq!(out.expect("the resolver should run").trim_end(), "[unset]");
     }
 

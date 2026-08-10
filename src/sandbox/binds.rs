@@ -2480,12 +2480,16 @@ mod tests {
         let p2 = Path::new("/home/u/other");
 
         // sbx run and a per-project app: no split.
-        assert!(project_runtime(data, p1, Runtime::ProjectDefault)
-            .mise_project_src
-            .is_none());
-        assert!(project_runtime(data, p1, Runtime::ProjectApp("demo-app"))
-            .mise_project_src
-            .is_none());
+        assert!(
+            project_runtime(data, p1, Runtime::ProjectDefault)
+                .mise_project_src
+                .is_none()
+        );
+        assert!(
+            project_runtime(data, p1, Runtime::ProjectApp("demo-app"))
+                .mise_project_src
+                .is_none()
+        );
 
         // A global app: the pool sits under projects/<id>/apps/<name>/mise (app-keyed, per-project).
         let pool = project_runtime(data, p1, Runtime::GlobalApp("demo-app"))
@@ -2657,10 +2661,11 @@ mod tests {
         .expect("build spec");
 
         // The spec binds the pool, so the registration dir is reachable in-cage.
-        assert!(spec
-            .mounts
-            .iter()
-            .any(|m| m.dest() == Path::new(MISE_PROJECT_INCAGE)));
+        assert!(
+            spec.mounts
+                .iter()
+                .any(|m| m.dest() == Path::new(MISE_PROJECT_INCAGE))
+        );
 
         let id = project_id(&project.path().canonicalize().unwrap());
         let per_project_link = data
@@ -2703,7 +2708,7 @@ mod tests {
 #[cfg(test)]
 mod smoke {
     use super::*;
-    use crate::testutil::{fingerprint, TmpDir};
+    use crate::testutil::{TmpDir, fingerprint};
     use std::process::Command;
 
     /// `(bwrap, nix)` when bwrap, a capability-bearing userns, and nix are all

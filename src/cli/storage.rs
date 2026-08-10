@@ -258,18 +258,18 @@ fn down(args: Vec<OsString>) -> ExitCode {
 
     // Unmounting a volume sbx is set to follow is temporary by design: the next command
     // mounts it again. Saying so beats leaving the user to wonder why it came back.
-    if let Ok(dir) = default_dir() {
-        if storage::read_pointer(&dir).as_deref() == Some(image.as_path()) {
-            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!(
-                "\n{}",
-                style::prose(
-                    "note: sbx is still set to use this volume, so the next command will mount \
+    if let Ok(dir) = default_dir()
+        && storage::read_pointer(&dir).as_deref() == Some(image.as_path())
+    {
+        let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+        println!(
+            "\n{}",
+            style::prose(
+                "note: sbx is still set to use this volume, so the next command will mount \
                      it again.\n      `sbx storage unuse` stops that.",
-                    &pal
-                )
-            );
-        }
+                &pal
+            )
+        );
     }
     ExitCode::SUCCESS
 }
@@ -413,15 +413,15 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
 
     // Fail before starting rather than half-way: the volume compresses and shares blocks, so
     // needing the full apparent size is a deliberate over-estimate.
-    if let Some(free) = storage::free_bytes(&mount_point) {
-        if free < before.bytes {
-            return fail(format!(
-                "the volume has {} free but the data is {} — grow the volume, or run \
+    if let Some(free) = storage::free_bytes(&mount_point)
+        && free < before.bytes
+    {
+        return fail(format!(
+            "the volume has {} free but the data is {} — grow the volume, or run \
                  `sbx gc --all --prune` first",
-                sandbox::human_bytes(free),
-                sandbox::human_bytes(before.bytes)
-            ));
-        }
+            sandbox::human_bytes(free),
+            sandbox::human_bytes(before.bytes)
+        ));
     }
 
     println!("  copying (the original is untouched until this succeeds)…");
@@ -614,13 +614,13 @@ fn live_sessions_under(mount_point: &Path) -> usize {
 /// inspected: `volume (<fs>)` when an adopted volume is mounted, else `local (<fs>)` for the host
 /// filesystem the default directory sits on. The same distinction `sbx doctor` leads with.
 fn active_backing_kind(adopted: Option<&Path>) -> String {
-    if let Some(image) = adopted {
-        if let Ok(storage::State::Mounted { mount_point, .. }) = storage::state(image) {
-            let fs = storage::fs_kind(&mount_point)
-                .map(|k| k.name())
-                .unwrap_or_else(|| "btrfs".to_string());
-            return format!("volume ({fs})");
-        }
+    if let Some(image) = adopted
+        && let Ok(storage::State::Mounted { mount_point, .. }) = storage::state(image)
+    {
+        let fs = storage::fs_kind(&mount_point)
+            .map(|k| k.name())
+            .unwrap_or_else(|| "btrfs".to_string());
+        return format!("volume ({fs})");
     }
     let fs = default_dir()
         .ok()
@@ -1036,7 +1036,11 @@ fn propose(default_dir: &Path, pre: &storage::Preflight) {
             // which `from_env` honours *before* the pointer; later processes follow the pointer
             // normally. (btrfs-progs is provisioned into the host store, not the volume — it is
             // only needed to create the filesystem, so that is harmless.)
-            std::env::set_var("SBX_DATA_DIR", &mount_point);
+            // SAFETY: this runs on the first line of `cli::dispatch`, before any command
+            // handler has started a thread, and behind a blocking prompt on a terminal —
+            // so sbx is single-threaded here and nothing else can be reading the
+            // environment while it is rewritten.
+            unsafe { std::env::set_var("SBX_DATA_DIR", &mount_point) };
         }
         Err(e) => {
             diag::error(&format!("sbx: could not set up the volume: {e}"));

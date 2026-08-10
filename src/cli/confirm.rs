@@ -462,7 +462,12 @@ mod tests {
              sbx plugins store add --name hub --url https://example.invalid/s.git --trust\n"
         );
         assert_eq!(
-            render_store_configured("hub", 3, &[("vault", "vault", "1.0"), ("pass", "pass", "")], &p),
+            render_store_configured(
+                "hub",
+                3,
+                &[("vault", "vault", "1.0"), ("pass", "pass", "")],
+                &p
+            ),
             "configured store 'hub' (rev 3, 2 plugins):\n  vault  (vault://)  v1.0\n  pass  (pass://)\n"
         );
         assert_eq!(
@@ -528,8 +533,10 @@ mod tests {
         assert!(installed.contains(&format!("{}installed{}", p.ok, p.reset)));
         assert!(installed.contains(&format!("'{}pass{}'", p.name, p.reset)));
 
-        assert!(render_removed(Some("store"), "hub", &p)
-            .contains(&format!("{}removed{}", p.ok, p.reset)));
+        assert!(
+            render_removed(Some("store"), "hub", &p)
+                .contains(&format!("{}removed{}", p.ok, p.reset))
+        );
 
         let tofu = render_store_tofu("ab12", "hub", &p);
         assert!(

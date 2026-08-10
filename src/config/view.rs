@@ -780,19 +780,18 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     // (`All`) view: the single-source `--global/--local/--default` views show what one config *file*
     // contributes, which an override is not. Per-invocation CLI flags are not previewed here (run the
     // launch to see them); passing default (empty) CLI overrides reads only the ambient environment.
-    if matches!(source, super::Source::All) {
-        if let Ok(ov) = super::overrides::collect(&super::CliOverrides::default()) {
-            if !ov.is_empty() {
-                // A set-but-invalid override value would abort a real launch; here (a read-only view)
-                // surface the error as a note and show the untouched baseline, so `sbx config show`
-                // neither lies about the override nor pretends a bad value took effect.
-                if let Err(e) = resolved.apply_override_channel(&ov) {
-                    resolved.warnings.push(e);
-                }
-                if let Err(errs) = resolved.apply_override(ov) {
-                    resolved.warnings.extend(errs);
-                }
-            }
+    if matches!(source, super::Source::All)
+        && let Ok(ov) = super::overrides::collect(&super::CliOverrides::default())
+        && !ov.is_empty()
+    {
+        // A set-but-invalid override value would abort a real launch; here (a read-only view)
+        // surface the error as a note and show the untouched baseline, so `sbx config show`
+        // neither lies about the override nor pretends a bad value took effect.
+        if let Err(e) = resolved.apply_override_channel(&ov) {
+            resolved.warnings.push(e);
+        }
+        if let Err(errs) = resolved.apply_override(ov) {
+            resolved.warnings.extend(errs);
         }
     }
 
@@ -1056,14 +1055,14 @@ fn tools_view(m: &super::MiseConfig, resolved: &Resolved) -> ToolsView {
 /// exactly the lock a launch would consult. Best-effort: if the data dir or project identity
 /// cannot be resolved, it falls back to the source and origin alone.
 fn nixpkgs_channel(cwd: &Path, resolved: &Resolved) -> ChannelView {
-    if let Some(layout) = store::Layout::from_env() {
-        if let Ok(target) = sandbox::effective_lock_target(cwd, &layout, resolved) {
-            return ChannelView {
-                source: target.source().to_string(),
-                origin: target.origin().label().to_string(),
-                locked_rev: target.locked_revision(),
-            };
-        }
+    if let Some(layout) = store::Layout::from_env()
+        && let Ok(target) = sandbox::effective_lock_target(cwd, &layout, resolved)
+    {
+        return ChannelView {
+            source: target.source().to_string(),
+            origin: target.origin().label().to_string(),
+            locked_rev: target.locked_revision(),
+        };
     }
     let (source, origin) = match (&resolved.nixpkgs_project, &resolved.nixpkgs_global) {
         (Some(p), _) => (p.as_str(), "project pin"),
@@ -1536,7 +1535,7 @@ mod tests {
 
     #[test]
     fn net_rules_view_projects_allow_deny_and_builtin_by_source() {
-        use crate::allowlist::{classify, EgressPolicy};
+        use crate::allowlist::{EgressPolicy, classify};
         let policy = EgressPolicy::new(
             vec![classify("github.com").unwrap()],
             vec![classify("evil.com").unwrap()],
@@ -1561,16 +1560,18 @@ mod tests {
         assert!(builtin.contains(&"{GET,HEAD} https://cache.nixos.org"));
         // github.com is also {GET,HEAD} (tarball fetch is GET); a git POST is the user's to allow
         assert!(builtin.contains(&"{GET,HEAD} https://github.com"));
-        assert!(rules
-            .iter()
-            .filter(|r| r.source == RuleSourceView::Builtin)
-            .all(|r| r.kind == NetRuleKind::Allow));
+        assert!(
+            rules
+                .iter()
+                .filter(|r| r.source == RuleSourceView::Builtin)
+                .all(|r| r.kind == NetRuleKind::Allow)
+        );
         assert_eq!(builtin.len(), sandbox::builtin_allow_rules().len());
     }
 
     #[test]
     fn net_rules_view_collapses_a_group_and_expands_on_demand() {
-        use crate::allowlist::{classify, EgressPolicy};
+        use crate::allowlist::{EgressPolicy, classify};
         // Two rules tagged as one group, plus a directly-written rule.
         let mut g1 = classify("{*} a.example.com:443").unwrap();
         g1.group = Some("mcp".into());

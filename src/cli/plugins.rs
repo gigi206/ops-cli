@@ -1719,7 +1719,9 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
     if stale.is_empty() {
         // The claim is only ever about the cached catalogue, so it says so rather than implying a
         // freshness nothing checked.
-        println!("{dim}(compared against the cached catalogues — `sbx plugins store update` re-fetches them){r}");
+        println!(
+            "{dim}(compared against the cached catalogues — `sbx plugins store update` re-fetches them){r}"
+        );
         return ExitCode::SUCCESS;
     }
 

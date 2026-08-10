@@ -31,8 +31,8 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Which bucket a recorded request falls into — one per request (see the module note).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,10 +384,10 @@ pub(crate) fn aggregate(
         if session.project != project {
             continue;
         }
-        if let Some(want) = app {
-            if session.app.as_deref() != Some(want) {
-                continue;
-            }
+        if let Some(want) = app
+            && session.app.as_deref() != Some(want)
+        {
+            continue;
         }
         for (host, c) in session.counts {
             let e = total.entry(host).or_default();
@@ -427,10 +427,10 @@ pub(crate) fn reset(egress_dir: &Path, project: &str, app: Option<&str>) -> usiz
         if session.project != project {
             continue;
         }
-        if let Some(want) = app {
-            if session.app.as_deref() != Some(want) {
-                continue;
-            }
+        if let Some(want) = app
+            && session.app.as_deref() != Some(want)
+        {
+            continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;

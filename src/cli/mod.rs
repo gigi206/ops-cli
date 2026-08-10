@@ -270,7 +270,7 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_names, one_name, parse_one_name, OneName};
+    use super::{OneName, dedupe_names, one_name, parse_one_name};
     use std::ffi::OsString;
 
     #[test]

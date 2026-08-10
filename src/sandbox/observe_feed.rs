@@ -24,14 +24,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::fs_control::{self, fs_control_dir, fs_control_socket, FsRing, FS_RING_CAP};
+use super::fs_control::{self, FS_RING_CAP, FsRing, fs_control_dir, fs_control_socket};
 use super::fs_watch::FsWatcher;
-use super::proc_control::{self, proc_control_dir, proc_control_socket, ExecRing, EXEC_RING_CAP};
+use super::proc_control::{self, EXEC_RING_CAP, ExecRing, proc_control_dir, proc_control_socket};
 use crate::observe::{self, ProcInfo};
 
 /// How often the observer polls `/proc` for new cage processes. Short enough to catch most of what an
@@ -154,21 +154,20 @@ fn run_loop(
     while !stop.load(Ordering::Relaxed) {
         let table = observe::read_proc_table();
         for pid in descendant_pids(&table, root) {
-            if seen.insert(pid) {
-                if let Some(info) = table.get(&pid) {
-                    if !is_plumbing(&info.comm) {
-                        let cmd = command_of(info);
-                        ring.push(pid, &cmd);
-                        if inline {
-                            // One `\n`-terminated line per event. Inline runs only on the non-tty
-                            // foreground path (an interactive terminal reads `sbx proc logs`/`live`
-                            // instead), so no raw-mode `\r` framing is needed — plain newlines are
-                            // correct here.
-                            // Verbatim, never through the span painter: `cmd` is the agent's own
-                            // argv, and a backtick pair inside it is command text, not markup.
-                            eprintln!("{}[sbx:exec]{} {}", pal.dim, pal.reset, cmd);
-                        }
-                    }
+            if seen.insert(pid)
+                && let Some(info) = table.get(&pid)
+                && !is_plumbing(&info.comm)
+            {
+                let cmd = command_of(info);
+                ring.push(pid, &cmd);
+                if inline {
+                    // One `\n`-terminated line per event. Inline runs only on the non-tty
+                    // foreground path (an interactive terminal reads `sbx proc logs`/`live`
+                    // instead), so no raw-mode `\r` framing is needed — plain newlines are
+                    // correct here.
+                    // Verbatim, never through the span painter: `cmd` is the agent's own
+                    // argv, and a backtick pair inside it is command text, not markup.
+                    eprintln!("{}[sbx:exec]{} {}", pal.dim, pal.reset, cmd);
                 }
             }
         }

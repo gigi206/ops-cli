@@ -859,15 +859,18 @@ pub(crate) fn update(
     // fetch signed by the wrong key is refused before its `rev` is even consulted.
     let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
     let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
-    let catalogue =
-        crate::plugins::catalogue::verified_catalogue(&catalogue_bytes, &signature, &cfg.pubkey)
-            .map_err(|why| {
-                // The verifier is deliberately an opaque "it did not verify" (no oracle). But the single
-                // likeliest cause is one this side *can* name without weakening that: the store now ships a
-                // different key than the one pinned. Saying so turns an unactionable failure into a
-                // decision — a rotation the author announced, or a store that is no longer the same one.
-                match read_repo_pubkey(&checkout) {
-                    Ok(shipped) if shipped != cfg.pubkey => format!(
+    let catalogue = crate::plugins::catalogue::verified_catalogue(
+        &catalogue_bytes,
+        &signature,
+        &cfg.pubkey,
+    )
+    .map_err(|why| {
+        // The verifier is deliberately an opaque "it did not verify" (no oracle). But the single
+        // likeliest cause is one this side *can* name without weakening that: the store now ships a
+        // different key than the one pinned. Saying so turns an unactionable failure into a
+        // decision — a rotation the author announced, or a store that is no longer the same one.
+        match read_repo_pubkey(&checkout) {
+            Ok(shipped) if shipped != cfg.pubkey => format!(
                 "the catalogue is no longer signed by the key pinned for store `{name}` — the \
                  key this store ships has CHANGED\n  pinned: {}\n  now:    {}\n  an \
                  announced rotation is legitimate; an unannounced one is what a takeover looks \
@@ -876,9 +879,9 @@ pub(crate) fn update(
                 crate::plugins::catalogue::to_hex(&cfg.pubkey),
                 crate::plugins::catalogue::to_hex(&shipped)
             ),
-                    _ => why,
-                }
-            })?;
+            _ => why,
+        }
+    })?;
 
     if catalogue.rev < cfg.locked_rev {
         return Err(format!(

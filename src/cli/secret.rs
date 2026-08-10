@@ -81,11 +81,11 @@ fn secret_list(args: &[OsString]) -> ExitCode {
     }
     // Fold an app's overlay so the inventory is the effective set that app would launch with, the
     // same way `sbx net rules --app` reads the effective policy.
-    if let Some(name) = &app {
-        if let Err(e) = crate::fold_app_overlay(&mut resolved, name) {
-            diag::error(&format!("sbx: secret list: {e}"));
-            return ExitCode::from(2);
-        }
+    if let Some(name) = &app
+        && let Err(e) = crate::fold_app_overlay(&mut resolved, name)
+    {
+        diag::error(&format!("sbx: secret list: {e}"));
+        return ExitCode::from(2);
     }
 
     let palette = style::Palette::for_stream(std::io::stdout().is_terminal());

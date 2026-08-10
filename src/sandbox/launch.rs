@@ -29,7 +29,7 @@
 use super::binds::{self, Userland};
 use super::egress;
 use super::forward;
-use super::pty::{copy_winsize, pump, RawMode, WinchRelay};
+use super::pty::{RawMode, WinchRelay, copy_winsize, pump};
 use super::spec::{NetPolicy, SandboxSpec, TerminalPolicy};
 use super::sshagent;
 use crate::session::{self, Kind, RecordGuard, Session};
@@ -232,14 +232,15 @@ fn launch(
 /// with the two ways out. A configured `ask_timeout`, or a non-ask posture, is silent.
 fn warn_ask_under_detach(network: &crate::config::NetworkPolicy) {
     use crate::allowlist::DefaultAction;
-    if let crate::config::NetworkPolicy::Allowlist(policy) = network {
-        if policy.default_action() == DefaultAction::Ask && policy.ask_timeout().is_none() {
-            crate::diag::warn(
-                "`ask` egress under --detach with no `ask_timeout`: a background session has no \
+    if let crate::config::NetworkPolicy::Allowlist(policy) = network
+        && policy.default_action() == DefaultAction::Ask
+        && policy.ask_timeout().is_none()
+    {
+        crate::diag::warn(
+            "`ask` egress under --detach with no `ask_timeout`: a background session has no \
                  terminal to prompt, so an undecided request parks indefinitely. Set \
                  `[network] ask_timeout`, or answer it with `sbx net pending`.",
-            );
-        }
+        );
     }
 }
 
@@ -1337,7 +1338,7 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
                 shared_store_gc(&layout, prune, optimise, pal);
             }
             None => crate::diag::error(
-                "sbx gc: cannot locate sbx's data directory; skipping the shared-store housekeeping."
+                "sbx gc: cannot locate sbx's data directory; skipping the shared-store housekeeping.",
             ),
         }
     }
@@ -1350,7 +1351,7 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
         // is flattened.
         Err(_) if all => {
             crate::diag::error(
-                "sbx gc: the current project's store was not swept (see above); the shared-store collection ran."
+                "sbx gc: the current project's store was not swept (see above); the shared-store collection ran.",
             );
             ExitCode::SUCCESS
         }
@@ -2303,14 +2304,14 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         .ok()
         .zip(Layout::from_env())
         .and_then(|(cwd, layout)| Some((layout, binds::project_identity(&cwd).ok()?)));
-    if let Some((layout, (id, project))) = &early {
-        if !super::projectstore::store_exists(layout, id) {
-            println!(
-                "{h}sbx gc{r} — {n}{}{r}: {dim}no per-project store yet, nothing to reclaim.{r}",
-                project.display()
-            );
-            return Ok(());
-        }
+    if let Some((layout, (id, project))) = &early
+        && !super::projectstore::store_exists(layout, id)
+    {
+        println!(
+            "{h}sbx gc{r} — {n}{}{r}: {dim}no per-project store yet, nothing to reclaim.{r}",
+            project.display()
+        );
+        return Ok(());
     }
 
     let prep = prepare()?;
@@ -2325,13 +2326,13 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
 
     // Refuse if a live sandbox holds this project: collecting a store a running cage reads and
     // writes could drop a path it still needs. The registry list prunes dead records as it goes.
-    if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list() {
-        if sessions.iter().any(|s| s.project == project) {
-            crate::diag::error(
-                "sbx gc: a sandbox is running in this project — stop it first (see `sbx session ls`).",
-            );
-            return Err(ExitCode::FAILURE);
-        }
+    if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list()
+        && sessions.iter().any(|s| s.project == project)
+    {
+        crate::diag::error(
+            "sbx gc: a sandbox is running in this project — stop it first (see `sbx session ls`).",
+        );
+        return Err(ExitCode::FAILURE);
     }
 
     // Surface what the trust gate dropped or withheld, exactly as a launch would.
@@ -2614,33 +2615,34 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
 
     // mesa driver roots under `gpu = true`, so gc keeps the built output rather than collecting and
     // re-provisioning it each launch — mirroring the launch path's GPU provisioning and the fonts.
-    if prep.cfg.gpu {
-        if let Ok(layer) = super::gpu::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            gui_roots.push(layer.root);
-        }
+    if prep.cfg.gpu
+        && let Ok(layer) = super::gpu::provision(&prep.nix, &prep.layout, &prep.nixpkgs)
+    {
+        gui_roots.push(layer.root);
     }
 
     // audio userspace roots under `audio = true`, same reason: gc keeps the client libraries and
     // ALSA shim rather than collecting and re-provisioning them each launch.
-    if prep.cfg.audio {
-        if let Ok(layer) = super::audio::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            gui_roots.extend(layer.roots);
-        }
+    if prep.cfg.audio
+        && let Ok(layer) = super::audio::provision(&prep.nix, &prep.layout, &prep.nixpkgs)
+    {
+        gui_roots.extend(layer.roots);
     }
 
     // GUI data root (GSettings schemas + GTK themes) under `gui = "wayland"`, same reason: gc keeps
     // the provisioned output.
-    if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
-        if let Ok(layer) = super::guidata::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            gui_roots.push(layer.root);
-        }
+    if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
+        && let Ok(layer) = super::guidata::provision(&prep.nix, &prep.layout, &prep.nixpkgs)
+    {
+        gui_roots.push(layer.root);
     }
 
     // In-cage portal roots under `gui = "wayland"` + `dbus = true`: gc keeps the portal closure.
-    if prep.cfg.dbus && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
-        if let Ok(p) = super::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            gui_roots.extend(p.roots);
-        }
+    if prep.cfg.dbus
+        && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland)
+        && let Ok(p) = super::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs)
+    {
+        gui_roots.extend(p.roots);
     }
 
     seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots).map_err(|e| {
@@ -5720,7 +5722,9 @@ mod tests {
         // took its name. bwrap reads NUL-separated arguments.
         assert_eq!(
             carried,
-            format!("--setenv\0PGPASSWORD\0{SENTINEL}\0--setenv\0PATH\0/bin\0--setenv\0API_TOKEN\0{WRITTEN}\0")
+            format!(
+                "--setenv\0PGPASSWORD\0{SENTINEL}\0--setenv\0PATH\0/bin\0--setenv\0API_TOKEN\0{WRITTEN}\0"
+            )
         );
     }
 
@@ -5817,8 +5821,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
 
         // No roll (the progress/equip preamble carries no ` → `) → nothing surfaced, so the caller
         // falls through to the up-to-date / generic branch.
-        let none =
-            "mise ~/.config/mise/config.toml tools: npm:demo-tool@3.0.40\nadded 3 packages in 617ms\n";
+        let none = "mise ~/.config/mise/config.toml tools: npm:demo-tool@3.0.40\nadded 3 packages in 617ms\n";
         assert!(mise_transitions(none).is_empty());
     }
 
@@ -6281,12 +6284,18 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         // teeth: dropping a source loses exactly its roots — a launch that forgot to
         // forward the tools' (or packages', or fonts') roots would seed an incomplete
         // closure, and the cage would silently re-fetch the missing one.
-        assert!(!collect_roots(&userland, &pkg_roots, &[], &font_roots)
-            .contains(&PathBuf::from("/nix/store/nodejs")));
-        assert!(!collect_roots(&userland, &[], &tool_roots, &font_roots)
-            .contains(&PathBuf::from("/nix/store/jq")));
-        assert!(!collect_roots(&userland, &pkg_roots, &tool_roots, &[])
-            .contains(&PathBuf::from("/nix/store/dejavu")));
+        assert!(
+            !collect_roots(&userland, &pkg_roots, &[], &font_roots)
+                .contains(&PathBuf::from("/nix/store/nodejs"))
+        );
+        assert!(
+            !collect_roots(&userland, &[], &tool_roots, &font_roots)
+                .contains(&PathBuf::from("/nix/store/jq"))
+        );
+        assert!(
+            !collect_roots(&userland, &pkg_roots, &tool_roots, &[])
+                .contains(&PathBuf::from("/nix/store/dejavu"))
+        );
     }
 
     #[test]

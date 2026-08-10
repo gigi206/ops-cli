@@ -344,10 +344,11 @@ fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
 fn net_mute_and_unmute_round_trip_through_config() {
     let fx = Fixture::new();
     // A mute needs a filtering posture (nothing to suppress otherwise) — bootstrap one first.
-    assert!(fx
-        .run(&["net", "allow", "api.example.com"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["net", "allow", "api.example.com"])
+            .status
+            .success()
+    );
 
     // Mute a noisy denied host: it persists to `[network] mute` and re-trusts the project.
     let muted = fx.run(&["net", "mute", "play.googleapis.com"]);
@@ -404,14 +405,16 @@ fn net_mute_and_unmute_round_trip_through_config() {
 fn net_unallow_and_undeny_round_trip_through_config() {
     let fx = Fixture::new();
     // `allow` bootstraps the filtering posture a `deny` then needs.
-    assert!(fx
-        .run(&["net", "allow", "api.example.com"])
-        .status
-        .success());
-    assert!(fx
-        .run(&["net", "deny", "tracker.example.com"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["net", "allow", "api.example.com"])
+            .status
+            .success()
+    );
+    assert!(
+        fx.run(&["net", "deny", "tracker.example.com"])
+            .status
+            .success()
+    );
     let rules = String::from_utf8_lossy(&fx.run(&["net", "rules"]).stdout).into_owned();
     assert!(
         rules.contains("api.example.com") && rules.contains("tracker.example.com"),
@@ -496,10 +499,11 @@ fn a_removal_reaches_an_app_scope_in_the_project_and_in_its_profile() {
     let fx = Fixture::new();
 
     // The project's own app table.
-    assert!(fx
-        .run(&["net", "allow", "api.example.com", "--app", "demo-app"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["net", "allow", "api.example.com", "--app", "demo-app"])
+            .status
+            .success()
+    );
     let out = fx.run(&["net", "unallow", "api.example.com", "--app", "demo-app"]);
     assert!(
         out.status.success() && String::from_utf8_lossy(&out.stdout).contains("removed"),
@@ -711,10 +715,11 @@ fn net_allow_rejects_a_portless_tcp_rule() {
         String::from_utf8_lossy(&out.stderr)
     );
     // `tcp://host:*` (every port) is accepted — the explicit way to open all ports and protocols.
-    assert!(fx
-        .run(&["net", "allow", "tcp://ssh.example.com:*"])
-        .status
-        .success());
+    assert!(
+        fx.run(&["net", "allow", "tcp://ssh.example.com:*"])
+            .status
+            .success()
+    );
 }
 
 #[test]

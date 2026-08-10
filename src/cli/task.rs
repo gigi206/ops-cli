@@ -19,7 +19,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::sandbox::task_control::{client, TASK_SOCKET_ENV};
+use crate::sandbox::task_control::{TASK_SOCKET_ENV, client};
 use std::io::IsTerminal;
 
 use crate::{diag, help, sandbox, store, style};

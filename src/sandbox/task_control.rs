@@ -941,7 +941,7 @@ fn serve_host(
             // "there is no such invocation" are different things to be told.
             super::task::StopOutcome::NotRunning if log.recorded(id) => format!("finished {id}"),
             super::task::StopOutcome::NotRunning => {
-                return writeln!(writer, "err no invocation {id}")
+                return writeln!(writer, "err no invocation {id}");
             }
         };
         writeln!(writer, "{line}")?;

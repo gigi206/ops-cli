@@ -165,10 +165,10 @@ pub(crate) fn project_keep_roots(
             return;
         };
         for entry in entries.flatten() {
-            if let Ok(target) = std::fs::read_link(entry.path()) {
-                if let Some(base) = target.file_name() {
-                    keep.insert(base.to_os_string());
-                }
+            if let Ok(target) = std::fs::read_link(entry.path())
+                && let Some(base) = target.file_name()
+            {
+                keep.insert(base.to_os_string());
             }
         }
     };
@@ -479,7 +479,7 @@ pub(crate) fn reap_dead_projects(
                 dead,
                 unidentified,
                 reaped_unidentified,
-            }
+            };
         }
     };
     for entry in entries.flatten() {
@@ -489,10 +489,10 @@ pub(crate) fn reap_dead_projects(
         }
         // A live session still using this tree: never touch it, whatever its marker says — this
         // guard also protects the `--unidentified` path below, which reaps without a deadness proof.
-        if let Some(id) = dir.file_name().and_then(|n| n.to_str()) {
-            if live_ids.contains(id) {
-                continue;
-            }
+        if let Some(id) = dir.file_name().and_then(|n| n.to_str())
+            && live_ids.contains(id)
+        {
+            continue;
         }
         match read_marker(&dir) {
             // Identified, and the project is gone with its parent still present — reclaimable.
@@ -851,10 +851,10 @@ fn prune_mise_config(path: &Path, declared: &[&str]) {
             .iter()
             .any(|d| *d == key || super::inspect::mise_munge(d) == super::inspect::mise_munge(key))
     });
-    if tools.len() != before {
-        if let Ok(out) = toml::to_string(&doc) {
-            let _ = std::fs::write(path, out);
-        }
+    if tools.len() != before
+        && let Ok(out) = toml::to_string(&doc)
+    {
+        let _ = std::fs::write(path, out);
     }
 }
 
@@ -1582,10 +1582,12 @@ mod tests {
         // A prune drops exactly the two superseded roots.
         let removed = prune_superseded_roots(store.path(), &keep, true);
         assert_eq!(removed.len(), 2);
-        assert!(gcroots
-            .join("ccc-mise-2026.6.0")
-            .symlink_metadata()
-            .is_err());
+        assert!(
+            gcroots
+                .join("ccc-mise-2026.6.0")
+                .symlink_metadata()
+                .is_err()
+        );
         assert!(gcroots.join("ddd-chromium-old").symlink_metadata().is_err());
         // The current builds, the flake root, and nix's auto dir are untouched.
         assert!(gcroots.join("aaa-glibc-2.42-67").symlink_metadata().is_ok());

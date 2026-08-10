@@ -28,16 +28,16 @@ pub(crate) mod view;
 pub(crate) use types::*;
 
 pub(crate) use load::{
-    bundles, control_plane_pins, export_profile, is_valid_bundle_name, load, load_scoped,
+    Source, bundles, control_plane_pins, export_profile, is_valid_bundle_name, load, load_scoped,
     net_groups, profile_path, profiles_dir, read_bundle_fragment, read_net_groups_fragment,
-    validate_profile, Source,
+    validate_profile,
 };
 pub(crate) use overrides::{CliOverrides, Override};
 pub(crate) use schema::RawBundle;
 // Consumed by the resolution engine that stays in this file (and `global_path` by `manage`).
 use load::{canonicalize_binds, global_path, read_global, sbx_control_plane_roots};
 // The secret source/validation machinery the resolution engine folds into the resolved set.
-use secrets::{apply_secret_section, count_host_secrets, upsert_secret, SecretDefaults};
+use secrets::{SecretDefaults, apply_secret_section, count_host_secrets, upsert_secret};
 // The two leaf checks the task engine re-runs at invocation time: a caller's value against its
 // declared bound, and the `{param}` placeholders in one argv element. They live with the validator
 // so the check a task is accepted under and the check its invocation enforces cannot drift.
@@ -1217,16 +1217,16 @@ fn warn_mise_nix_packages(source: &str, packages: &[Package], warnings: &mut Vec
         if pkg.state != TrustState::Trusted {
             continue;
         }
-        if let Backend::Mise(token) = &pkg.backend {
-            if let Some(attr) = token.strip_prefix("nix:") {
-                warnings.push(format!(
+        if let Backend::Mise(token) = &pkg.backend
+            && let Some(attr) = token.strip_prefix("nix:")
+        {
+            warnings.push(format!(
                     "{source}package `{}` uses `mise:nix:{attr}`: for a global app its install record \
                      is pinned app-global while its `/nix` store path is per-project, so it misaligns \
                      across projects — declare it as `nix:{attr}` (host-provisioned, \
                      per-project-aligned) instead",
                     pkg.name
                 ));
-            }
         }
     }
 }
@@ -1262,13 +1262,13 @@ fn resolve(
     // pre-classified once here; a `[network]` `allow`/`deny` list references one with `@<name>`.
     // A project's `[net.groups]` is a security-relevant input it may not supply, so it is ignored.
     let net_groups = build_net_groups(&mut warnings, std::mem::take(&mut global.net.groups));
-    if let Some((proj, _)) = &project {
-        if !proj.net.groups.is_empty() {
-            warnings.push(format!(
-                "{PROJECT_CONFIG}: ignoring `[net.groups]` — egress groups are defined in the \
+    if let Some((proj, _)) = &project
+        && !proj.net.groups.is_empty()
+    {
+        warnings.push(format!(
+            "{PROJECT_CONFIG}: ignoring `[net.groups]` — egress groups are defined in the \
                  global config only; a project's `[network]` may reference them with `@<name>`"
-            ));
-        }
+        ));
     }
 
     // Say what was passed over before anything is applied, so a misspelled field is named next to
@@ -2251,7 +2251,9 @@ fn apply_ssh_agent(
             continue;
         }
         let reason = if key == "*" {
-            Some("there is no wildcard — name each key by its `SHA256:…` fingerprint or its comment, as `ssh-add -l` prints them")
+            Some(
+                "there is no wildcard — name each key by its `SHA256:…` fingerprint or its comment, as `ssh-add -l` prints them",
+            )
         } else if let Some(digest) = key.strip_prefix("SHA256:") {
             let base64ish = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/';
             (digest.len() != 43 || !digest.chars().all(base64ish))
@@ -2632,11 +2634,11 @@ fn resolve_app(
                 notify_origin = Provenance::Global;
             }
         }
-        if let Some(value) = app.gui {
-            if let Some(policy) = validate_gui(&mut warnings, &source, value) {
-                gui = Some(policy);
-                gui_origin = Provenance::Global;
-            }
+        if let Some(value) = app.gui
+            && let Some(policy) = validate_gui(&mut warnings, &source, value)
+        {
+            gui = Some(policy);
+            gui_origin = Provenance::Global;
         }
         if let Some(value) = app.gpu {
             gpu = Some(value);
@@ -2716,12 +2718,12 @@ fn resolve_app(
             cmd_trusted = true;
             cmd_origin = Provenance::Global;
         }
-        if let Some(raw) = app.home_scope {
-            if let Some(scope) = validate_home_scope(&mut warnings, &source, &raw) {
-                home_scope = scope;
-                home_scope_trusted = true;
-                home_scope_origin = Some(Provenance::Global);
-            }
+        if let Some(raw) = app.home_scope
+            && let Some(scope) = validate_home_scope(&mut warnings, &source, &raw)
+        {
+            home_scope = scope;
+            home_scope_trusted = true;
+            home_scope_origin = Some(Provenance::Global);
         }
     }
 

@@ -38,8 +38,8 @@ use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use super::fs_control::{FsKind, FsRing};
@@ -234,10 +234,8 @@ fn add_tree(
             // `file_type` does not traverse a symlink, so a symlink to a directory is not recursed
             // into — the watch set stays within the real project tree.
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if emit {
-                if let Ok(rel) = path.strip_prefix(root) {
-                    push_rel(ring, rel, FsKind::Create);
-                }
+            if emit && let Ok(rel) = path.strip_prefix(root) {
+                push_rel(ring, rel, FsKind::Create);
             }
             if is_dir {
                 stack.push(path);

@@ -327,14 +327,16 @@ fn build_ref(resolver: &str, key: &str, defaults: &SecretDefaults) -> Result<Str
                 Some(other) => {
                     return Err(format!(
                         "unknown env `case` `{other}` (expected \"upper\", \"lower\", or \"asis\")"
-                    ))
+                    ));
                 }
             };
             Ok(format!("env://{name}"))
         }
         "sops" => {
             let file = defaults.sops_file.as_deref().ok_or_else(|| {
-                format!("key `{key}` uses the sops resolver, but `[secret.defaults.sops] file` is unset")
+                format!(
+                    "key `{key}` uses the sops resolver, but `[secret.defaults.sops] file` is unset"
+                )
             })?;
             if file.contains('#') {
                 return Err(format!(
@@ -569,10 +571,10 @@ pub(super) fn validate_header_shape(
     value_type: Option<&str>,
     prefix: Option<&str>,
 ) -> Result<HeaderShape, String> {
-    if let Some(p) = prefix {
-        if p.chars().any(char::is_control) {
-            return Err("the `prefix` contains a control character".to_string());
-        }
+    if let Some(p) = prefix
+        && p.chars().any(char::is_control)
+    {
+        return Err("the `prefix` contains a control character".to_string());
     }
     let (default_prefix, base64) =
         match value_type {
@@ -582,7 +584,7 @@ pub(super) fn validate_header_shape(
             Some(other) => {
                 return Err(format!(
                     "unknown `type` `{other}` (expected \"bearer\", \"basic\", or \"raw\")"
-                ))
+                ));
             }
             None => return Err(
                 "missing `type` (one of \"bearer\", \"basic\", or \"raw\"; set it on the secret \

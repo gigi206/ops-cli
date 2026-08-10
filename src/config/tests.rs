@@ -307,9 +307,10 @@ fn build_net_groups_validates_names_entries_and_rejects_nesting() {
         3,
         "one warning each for name/nesting/malformed: {w:?}"
     );
-    assert!(w
-        .iter()
-        .any(|m| m.contains("ignoring net group `bad name!`")));
+    assert!(
+        w.iter()
+            .any(|m| m.contains("ignoring net group `bad name!`"))
+    );
     assert!(w.iter().any(|m| m.contains("nested reference `@ok`")));
     assert!(w.iter().any(|m| m.contains("net group `malformed`")));
 }
@@ -718,10 +719,11 @@ fn an_app_layers_global_under_project_overriding_the_command_and_unioning_fields
     assert!(app.env.iter().any(|(k, v)| k == "BASE" && v == "g"));
     assert!(app.env.iter().any(|(k, v)| k == "EXTRA" && v == "p"));
     // The global package is carried, trusted by location.
-    assert!(app
-        .packages
-        .iter()
-        .any(|p| p.name == "tool" && p.state == TrustState::Trusted));
+    assert!(
+        app.packages
+            .iter()
+            .any(|p| p.name == "tool" && p.state == TrustState::Trusted)
+    );
 }
 
 #[test]
@@ -745,10 +747,11 @@ fn an_untrusted_project_apps_security_fields_drop_but_env_packages_and_command_s
     // the launcher to weigh.
     assert_eq!(app.cmd, vec!["id".to_string()]);
     assert!(app.env.iter().any(|(k, _)| k == "OK"));
-    assert!(app
-        .packages
-        .iter()
-        .any(|p| p.name == "pkg" && p.state == TrustState::Untrusted));
+    assert!(
+        app.packages
+            .iter()
+            .any(|p| p.name == "pkg" && p.state == TrustState::Untrusted)
+    );
     // The drops are explained.
     assert!(app.warnings.iter().any(|w| w.contains("bind")));
     assert!(app.warnings.iter().any(|w| w.contains("network")));
@@ -848,10 +851,11 @@ fn an_untrusted_project_cannot_override_a_trusted_apps_package() {
     // The trusted token survives, still trusted; the attacker's is refused with a warning.
     assert_eq!(p.backend, Backend::Mise("aqua:example/demo-tool".into()));
     assert_eq!(p.state, TrustState::Trusted);
-    assert!(app
-        .warnings
-        .iter()
-        .any(|w| w.contains("demo-tool") && w.contains("override")));
+    assert!(
+        app.warnings
+            .iter()
+            .any(|w| w.contains("demo-tool") && w.contains("override"))
+    );
     // Security teeth: the attacker's token is not merely lower-priority — it is absent, so it
     // can never reach `mise use -g`. Exactly one `demo-tool`, and it is the trusted one.
     assert_eq!(
@@ -2370,10 +2374,11 @@ fn a_bare_small_memory_number_is_refused_as_a_likely_percentage_typo() {
     };
     let r = resolve_no_plugins(global, None);
     assert_eq!(r.limits.memory_max, None, "the bare byte count is refused");
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("did you mean") && w.contains("memory_max")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("did you mean") && w.contains("memory_max"))
+    );
 
     // A deliberate unit or percentage is honored — the guard only catches the bare small int.
     let global = raw_limits(None, Some("90%"), None);
@@ -2676,10 +2681,11 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     };
     base.merge_app(app);
     assert!(base.secrets.is_empty());
-    assert!(base
-        .warnings
-        .iter()
-        .any(|w| w.contains("credential injection requires")));
+    assert!(
+        base.warnings
+            .iter()
+            .any(|w| w.contains("credential injection requires"))
+    );
 }
 
 #[test]
@@ -2734,7 +2740,7 @@ fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
 
 #[test]
 fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
-    use crate::allowlist::{classify, EgressPolicy, Methods};
+    use crate::allowlist::{EgressPolicy, Methods, classify};
     let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
     let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
         fs: Default::default(),
@@ -3515,10 +3521,11 @@ fn a_malformed_or_unprefixed_package_is_dropped() {
     );
     assert_eq!(r.warnings.len(), 3, "one warning per dropped package");
     // the bare one names the fix, not a generic error
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("bare") && w.contains("backend prefix")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("bare") && w.contains("backend prefix"))
+    );
 }
 
 #[test]
@@ -3594,10 +3601,11 @@ fn a_flake_prefixed_package_parses_as_a_flake_backend_and_rejects_local_sources(
         );
     }
     assert_eq!(r.warnings.len(), 9, "one warning per refused flake ref");
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("local") && w.contains("flake reference")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("local") && w.contains("flake reference"))
+    );
 }
 
 fn raw_flakes(flakes: &[(&str, &str, Option<&str>)]) -> RawConfig {
@@ -3682,14 +3690,16 @@ fn a_malformed_inline_flake_is_dropped_with_a_warning() {
     assert!(pkg(&r.packages, "empty").is_none());
     assert!(pkg(&r.packages, "badattr").is_none());
     assert!(pkg(&r.packages, "ok").is_some());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("empty") && w.contains("flake")));
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("badattr") && w.contains("attribute")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("empty") && w.contains("flake"))
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("badattr") && w.contains("attribute"))
+    );
 }
 
 #[test]
@@ -3709,10 +3719,11 @@ fn a_name_in_both_packages_and_flakes_warns_and_the_inline_flake_wins() {
         pkg(&r.packages, "dup").unwrap().backend,
         Backend::FlakeInline { .. }
     ));
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("dup") && w.contains("both")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("dup") && w.contains("both"))
+    );
 }
 
 #[test]
@@ -3892,19 +3903,19 @@ fn an_appimage_prefixed_package_parses_as_an_appimage_backend() {
     // provisioner. A direct URL must be `https://` ending in `.AppImage` (case-insensitively) and
     // carry no shell/nix metacharacter; the `github:` form reuses the shared locator validator.
     let r = resolve_no_plugins(
-            raw_packages(&[
-                (
-                    "demo-app",
-                    "appimage:https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage",
-                ),
-                ("demo-repo", "appimage:github:example/demo-app"),
-                ("plain", "appimage:http://example.com/x.AppImage"), // not https: refused
-                ("notimg", "appimage:https://example.com/x.deb"),    // wrong extension: refused
-                ("spacey", "appimage:https://example.com/a b.AppImage"), // whitespace: refused
-                ("badrepo", "appimage:github:only"),                 // one segment: refused
-            ]),
-            None,
-        );
+        raw_packages(&[
+            (
+                "demo-app",
+                "appimage:https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage",
+            ),
+            ("demo-repo", "appimage:github:example/demo-app"),
+            ("plain", "appimage:http://example.com/x.AppImage"), // not https: refused
+            ("notimg", "appimage:https://example.com/x.deb"),    // wrong extension: refused
+            ("spacey", "appimage:https://example.com/a b.AppImage"), // whitespace: refused
+            ("badrepo", "appimage:github:only"),                 // one segment: refused
+        ]),
+        None,
+    );
     assert_eq!(
             pkg(&r.packages, "demo-app").unwrap().backend,
             Backend::AppImage(
@@ -3927,9 +3938,9 @@ fn an_appimage_prefixed_package_parses_as_an_appimage_backend() {
     assert!(!is_valid_appimage_url("http://e/x.AppImage")); // not https
     assert!(!is_valid_appimage_url("https://e/x.deb")); // wrong extension
     assert!(!is_valid_appimage_url("https://e/a b.AppImage")); // whitespace
-                                                               // the bare `appimage:resolve` sentinel is not a locator: it is bound to its
-                                                               // `[appimage.<name>]` table by `apply_tools`, so parsing it as a backend locator is refused
-                                                               // (checked before the `appimage:` strip, or it would parse as an `appimage:` URL `resolve`).
+    // the bare `appimage:resolve` sentinel is not a locator: it is bound to its
+    // `[appimage.<name>]` table by `apply_tools`, so parsing it as a backend locator is refused
+    // (checked before the `appimage:` strip, or it would parse as an `appimage:` URL `resolve`).
     assert!(parse_backend("appimage:resolve").is_err());
 }
 
@@ -3955,8 +3966,8 @@ fn tarball_backend_parses_and_validates() {
     assert!(!is_valid_tarball_url("https://e/app.deb")); // wrong extension
     assert!(!is_valid_tarball_url("https://e/app.tar")); // not gz-compressed
     assert!(!is_valid_tarball_url("https://e/a b.tar.gz")); // raw whitespace
-                                                            // a mistyped form is refused up front; the bare `tarball:resolve` sentinel is refused here
-                                                            // too (it is bound to its table by `apply_tools`, not parsed as a locator).
+    // a mistyped form is refused up front; the bare `tarball:resolve` sentinel is refused here
+    // too (it is bound to its table by `apply_tools`, not parsed as a locator).
     assert!(parse_backend("tarball:https://e/app.zip").is_err());
     assert!(parse_backend("tarball:not-a-url").is_err());
     assert!(parse_backend("tarball:resolve").is_err());
@@ -4010,10 +4021,11 @@ fn an_orphan_tarball_table_is_ignored_with_a_warning() {
     );
     let r = resolve_no_plugins(raw, None);
     assert!(pkg(&r.packages, "orphan").is_none());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("orphan") && w.contains("[packages]")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("orphan") && w.contains("[packages]"))
+    );
 }
 
 #[test]
@@ -4021,10 +4033,11 @@ fn an_orphan_tarball_sentinel_is_ignored_with_a_warning() {
     // A `<name> = "tarball:resolve"` with no `[tarball.<name>]` table can never resolve.
     let r = resolve_no_plugins(raw_packages(&[("lonely", TARBALL_RESOLVE_SENTINEL)]), None);
     assert!(pkg(&r.packages, "lonely").is_none());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("lonely") && w.contains("[tarball.lonely]")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("lonely") && w.contains("[tarball.lonely]"))
+    );
 }
 
 #[test]
@@ -4143,10 +4156,11 @@ fn an_orphan_deb_table_is_ignored_with_a_warning() {
     );
     let r = resolve_no_plugins(raw, None);
     assert!(pkg(&r.packages, "orphan").is_none());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("orphan") && w.contains("[packages]")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("orphan") && w.contains("[packages]"))
+    );
 }
 
 /// A `[deb.<name>]` table carrying only `libs` — no `resolve`, so it decorates a package declared
@@ -4247,10 +4261,11 @@ fn an_invalid_library_attribute_is_dropped_on_its_own() {
         pkg(&r.packages, "app").unwrap().libs,
         vec!["webkitgtk_4_1", "libsoup_3"]
     );
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("invalid library attribute")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("invalid library attribute"))
+    );
 }
 
 #[test]
@@ -4259,10 +4274,11 @@ fn libs_on_a_non_prebuilt_package_are_ignored_with_a_warning() {
     // silently would leave the user believing a library set was applied somewhere.
     let r = resolve_no_plugins(raw_deb_libs("app", "nix:hello", &["webkitgtk_4_1"]), None);
     assert!(pkg(&r.packages, "app").unwrap().libs.is_empty());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("libs") && w.contains("prebuilt")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("libs") && w.contains("prebuilt"))
+    );
 }
 
 #[test]
@@ -4308,10 +4324,11 @@ fn an_untrusted_project_cannot_repatch_a_trusted_apps_package() {
         .find(|p| p.name == "demo-desktop")
         .expect("the app's package survives");
     assert_eq!(p.libs, vec!["gtk3"], "the trusted library set must stand");
-    assert!(app
-        .warnings
-        .iter()
-        .any(|w| w.contains("libs") && w.contains("trusted")));
+    assert!(
+        app.warnings
+            .iter()
+            .any(|w| w.contains("libs") && w.contains("trusted"))
+    );
 }
 
 #[test]
@@ -4326,10 +4343,11 @@ fn libs_naming_no_package_at_all_are_ignored_with_a_warning() {
     );
     let r = resolve_no_plugins(raw, None);
     assert!(pkg(&r.packages, "ghost").is_none());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("ghost") && w.contains("[packages]")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("ghost") && w.contains("[packages]"))
+    );
 }
 
 #[test]
@@ -4337,10 +4355,11 @@ fn an_orphan_deb_sentinel_is_ignored_with_a_warning() {
     // A `<name> = "deb:resolve"` with no `[deb.<name>]` table can never resolve.
     let r = resolve_no_plugins(raw_packages(&[("lonely", DEB_RESOLVE_SENTINEL)]), None);
     assert!(pkg(&r.packages, "lonely").is_none());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("lonely") && w.contains("[deb.lonely]")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("lonely") && w.contains("[deb.lonely]"))
+    );
 }
 
 #[test]
@@ -4408,10 +4427,11 @@ fn an_orphan_appimage_table_is_ignored_with_a_warning() {
     );
     let r = resolve_no_plugins(raw, None);
     assert!(pkg(&r.packages, "orphan").is_none());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("orphan") && w.contains("[packages]")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("orphan") && w.contains("[packages]"))
+    );
 }
 
 #[test]
@@ -4419,10 +4439,11 @@ fn an_orphan_appimage_sentinel_is_ignored_with_a_warning() {
     // A `<name> = "appimage:resolve"` with no `[appimage.<name>]` table can never resolve.
     let r = resolve_no_plugins(raw_packages(&[("lonely", APPIMAGE_RESOLVE_SENTINEL)]), None);
     assert!(pkg(&r.packages, "lonely").is_none());
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("lonely") && w.contains("[appimage.lonely]")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("lonely") && w.contains("[appimage.lonely]"))
+    );
 }
 
 #[test]
@@ -4704,9 +4725,11 @@ fn an_unknown_gui_posture_is_dropped_with_a_warning() {
 #[test]
 fn the_default_forward_is_empty() {
     // No declared ports means no inbound hole — the cage exposes no forwarded port.
-    assert!(resolve_no_plugins(RawConfig::default(), None)
-        .forward
-        .is_empty());
+    assert!(
+        resolve_no_plugins(RawConfig::default(), None)
+            .forward
+            .is_empty()
+    );
 }
 
 #[test]
@@ -4786,9 +4809,11 @@ fn validate_device_path_accepts_devs_and_rejects_the_rest() {
 #[test]
 fn the_default_devices_grant_is_empty() {
     // No `[devices]` means the cage keeps its minimal, hostless `/dev`.
-    assert!(resolve_no_plugins(RawConfig::default(), None)
-        .devices
-        .is_empty());
+    assert!(
+        resolve_no_plugins(RawConfig::default(), None)
+            .devices
+            .is_empty()
+    );
 }
 
 /// A `RawConfig` declaring an `[fs]` table from the given deny/readonly entries.
@@ -5017,10 +5042,11 @@ fn a_malformed_device_entry_is_dropped_and_the_rest_kept() {
     // A bad entry is dropped (warned), the valid ones kept — a collection, not all-or-nothing.
     let r = resolve_no_plugins(raw_devices(&["/etc/shadow", "/dev/kvm"]), None);
     assert_eq!(r.devices, vec![PathBuf::from("/dev/kvm")]);
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("[devices] allow") && w.contains("/etc/shadow")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("[devices] allow") && w.contains("/etc/shadow"))
+    );
 }
 
 #[test]
@@ -5135,10 +5161,11 @@ fn a_malformed_entry_in_either_list_is_dropped_keeping_the_valid_ones() {
         other => panic!("expected an allowlist, got {other:?}"),
     }
     assert_eq!(r.warnings.len(), 2);
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("ignoring allow entry")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("ignoring allow entry"))
+    );
     assert!(r.warnings.iter().any(|w| w.contains("ignoring deny entry")));
 }
 
@@ -7009,10 +7036,11 @@ fn a_secret_without_an_allowlist_is_dropped_with_a_warning() {
     );
     assert!(r.secrets.is_empty());
     assert_eq!(r.network, NetworkPolicy::Shared);
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("requires") && w.contains("filtering")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("requires") && w.contains("filtering"))
+    );
 }
 
 #[test]
@@ -7054,10 +7082,12 @@ fn a_missing_or_unknown_secret_type_is_rejected() {
         None,
     );
     assert!(missing.secrets.is_empty());
-    assert!(missing
-        .warnings
-        .iter()
-        .any(|w| w.contains("missing `type`")));
+    assert!(
+        missing
+            .warnings
+            .iter()
+            .any(|w| w.contains("missing `type`"))
+    );
 
     let unknown = resolve_no_plugins(
         raw_secrets(
@@ -7074,10 +7104,12 @@ fn a_missing_or_unknown_secret_type_is_rejected() {
         None,
     );
     assert!(unknown.secrets.is_empty());
-    assert!(unknown
-        .warnings
-        .iter()
-        .any(|w| w.contains("unknown `type`")));
+    assert!(
+        unknown
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown `type`"))
+    );
 }
 
 #[test]
@@ -7243,19 +7275,41 @@ fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
 
 #[test]
 fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
-    // The shipped bundles under `examples/bundle/` restate what the agent profile of the same name
-    // under `examples/app/` declares, so an orchestrator can name the agent instead of copying it.
-    // Two artifacts describing one tool is the drift risk this whole feature exists to remove — so
-    // it is pinned here, and it is pinnable *because* both are authored in this repo for the same
+    // The shipped bundles under `examples/bundle/` are the single source of truth for what each
+    // agent needs: the namesake profile under `examples/app/` no longer restates any of it — it
+    // names the bundle with `use = ["<name>"]` and declares nothing the bundle provides. Two
+    // artifacts describing one tool is the drift risk this whole feature exists to remove — so it
+    // is pinned here, and it is pinnable *because* both are authored in this repo for the same
     // agent. (The general form — inferring the same obligation between two unrelated profiles — is
     // NOT sound: a front-end legitimately exposes a smaller surface than the agent it embeds. Here
     // the obligation is declared by construction, which is the whole difference.)
     //
-    // Containment, not equality: a bundle may carry LESS than its profile (the profile also holds a
-    // `cmd`, postures, and any stack that only works under a `gui` posture a bundle cannot set). It
-    // must never carry something the profile does not, which is what would make it a second, drifting
-    // source of truth.
+    // The old containment direction (bundle ⊆ profile) is gone: after the thin-profile sweep the
+    // profile declares none of the bundle's packages, env or egress, so containment would compare
+    // against empty lists and prove nothing. Three invariants replace it, still pinnable against
+    // the real artifacts:
+    //   1. The namesake profile names THIS bundle — `use = ["<name>"]`, nothing else.
+    //   2. No duplication: the profile carries no package, env key or egress rule the bundle
+    //      provides. (It may carry things the bundle does not — hermes keeps the in-cage
+    //      chromium/agent-browser for its web variants, openfox a wider npm rule — but a second
+    //      copy of the same requirement is exactly the drift this feature removes.)
+    //   3. Every `@group` reference — from a bundle or its namesake profile — resolves to a
+    //      shipped fragment under `examples/net-groups/`, so a header's REQUIRES block (and an
+    //      app's allow list) can never point at a fragment that does not exist.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let groups_dir = root.join("examples/net-groups");
+    let mut shipped_groups = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&groups_dir).expect("examples/net-groups/ dir exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        // Parsed with sbx's own parser, so a fragment this test accepts is one `sbx net groups
+        // import` accepts.
+        schema::parse(&std::fs::read(&path).expect("read the group fragment")).unwrap();
+        shipped_groups.insert(path.file_stem().unwrap().to_str().unwrap().to_string());
+    }
+
     let dir = root.join("examples/bundle");
     let mut checked = 0;
     for entry in std::fs::read_dir(&dir).expect("examples/bundle/ dir exists") {
@@ -7267,8 +7321,8 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
 
         // Parsed with sbx's own parser, so a fragment this test accepts is one `sbx bundle import`
         // accepts — and a field written in the wrong TOML place (an `allow` under `[…packages]`,
-        // which parses as an unknown key and vanishes) fails the containment below rather than
-        // passing unnoticed.
+        // which parses as an unknown key and vanishes) fails the checks below rather than passing
+        // unnoticed.
         let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
         let bundle = raw.bundle.get(&name).unwrap_or_else(|| {
             panic!("{name}.toml must declare `[bundle.{name}]` (keyed by its file stem)")
@@ -7281,53 +7335,84 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
         )
         .unwrap();
 
-        for (tool, locator) in &bundle.packages {
-            assert_eq!(
-                profile.packages.get(tool),
-                Some(locator),
-                "bundle `{name}` provisions {tool} = {locator}, which `examples/app/{name}.toml` \
-                 does not declare identically — one of the two moved"
+        // Invariant 1: the namesake profile is thin and names this bundle, and only it.
+        assert_eq!(
+            profile.uses,
+            vec![name.clone()],
+            "bundle `{name}` must be named by `use = [\"{name}\"]` in `examples/app/{name}.toml` — \
+             the namesake profile is thin and names its bundle"
+        );
+
+        // Invariant 2: nothing the bundle provides is restated in the profile.
+        for key in profile.packages.keys() {
+            assert!(
+                !bundle.packages.contains_key(key),
+                "`examples/app/{name}.toml` declares the package {key}, which the `{name}` bundle \
+                 already provisions — one of the two moved"
             );
         }
-        for (key, value) in &bundle.env {
-            assert_eq!(
-                profile.env.get(key),
-                Some(value),
-                "bundle `{name}` sets {key}, which its profile does not set identically"
+        for key in profile.env.keys() {
+            assert!(
+                !bundle.env.contains_key(key),
+                "`examples/app/{name}.toml` sets the env var {key}, which the `{name}` bundle \
+                 already sets — one of the two moved"
             );
+        }
+        if let Some(schema::NetworkField::Table(t)) = &profile.network {
+            for (label, from, into) in [
+                ("allow", &t.allow, &bundle.allow),
+                ("deny", &t.deny, &bundle.deny),
+                ("mute", &t.mute, &bundle.mute),
+            ] {
+                for rule in from {
+                    if rule.starts_with('@') {
+                        // A shared-group reference belongs to the profile (the bundle may carry
+                        // group references of its own); it must still resolve — invariant 3.
+                        continue;
+                    }
+                    assert!(
+                        !into.contains(rule),
+                        "`examples/app/{name}.toml` carries the {label} rule {rule:?}, which the \
+                         `{name}` bundle already provides — one of the two moved"
+                    );
+                }
+            }
         }
 
-        // The egress lists live in the profile's `[network]` table. A bundle carrying rules whose
-        // profile declares no table would mean the rules were invented here, not derived.
-        let (allow, deny, mute) = match &profile.network {
-            Some(schema::NetworkField::Table(t)) => (&t.allow, &t.deny, &t.mute),
-            other => {
-                assert!(
-                    bundle.allow.is_empty() && bundle.deny.is_empty() && bundle.mute.is_empty(),
-                    "bundle `{name}` carries egress rules but its profile declares no `[network]` \
-                     table (it is {other:?}) — they came from nowhere"
-                );
-                checked += 1;
-                continue;
-            }
-        };
-        for (label, from, into) in [
-            ("allow", &bundle.allow, allow),
-            ("deny", &bundle.deny, deny),
-            ("mute", &bundle.mute, mute),
+        // Invariant 3: every @group reference resolves to a shipped fragment.
+        for (label, list) in [
+            ("allow", &bundle.allow),
+            ("deny", &bundle.deny),
+            ("mute", &bundle.mute),
         ] {
-            for rule in from {
-                assert!(
-                    into.contains(rule),
-                    "bundle `{name}` has the {label} rule {rule:?}, absent from \
-                     `examples/app/{name}.toml` — the two have drifted apart"
-                );
+            for rule in list {
+                if let Some(group) = rule.strip_prefix('@') {
+                    assert!(
+                        shipped_groups.contains(group),
+                        "bundle `{name}` references @{group} in its {label} list, but \
+                         `examples/net-groups/{group}.toml` does not exist — the header's REQUIRES \
+                         block would import nothing"
+                    );
+                }
+            }
+        }
+        if let Some(schema::NetworkField::Table(t)) = &profile.network {
+            for (label, list) in [("allow", &t.allow), ("deny", &t.deny), ("mute", &t.mute)] {
+                for rule in list {
+                    if let Some(group) = rule.strip_prefix('@') {
+                        assert!(
+                            shipped_groups.contains(group),
+                            "`examples/app/{name}.toml` references @{group} in its {label} list, \
+                             but `examples/net-groups/{group}.toml` does not exist"
+                        );
+                    }
+                }
             }
         }
         checked += 1;
     }
     assert!(
-        checked >= 16,
+        checked >= 36,
         "expected the shipped agent bundles to be checked, saw {checked}"
     );
 }
@@ -7939,10 +8024,11 @@ fn an_unknown_notify_event_or_mode_is_named() {
     // An unknown *mode* keeps the layer below rather than guessing a quieter one.
     let bad_mode: RawConfig = toml::from_str("notify = \"one\"").unwrap();
     let r = resolve_no_plugins(bad_mode, None);
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("unknown notify mode `one`")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("unknown notify mode `one`"))
+    );
     assert_eq!(
         r.notify.mode_for(NotifyEvent::Network),
         NotifyMode::Always,
@@ -7972,10 +8058,11 @@ fn notify_repeat_after_resolves_and_is_flagged_where_it_cannot_bite() {
         toml::from_str("[notify]\nmode = \"always\"\nrepeat_after = \"soon\"").unwrap();
     let r = resolve_no_plugins(bad, None);
     assert_eq!(r.notify.repeat_after(), None);
-    assert!(r
-        .warnings
-        .iter()
-        .any(|w| w.contains("invalid `repeat_after`")));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("invalid `repeat_after`"))
+    );
 
     // Set where nothing ever repeats, it is called out rather than silently ignored.
     let moot: RawConfig =

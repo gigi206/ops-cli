@@ -7,8 +7,8 @@
 //! allow-set, and [`effective_policy`] folds a live `--session` overlay onto the config policy.
 
 use std::io;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use rustls::{ClientConfig, ServerConfig};
@@ -17,8 +17,8 @@ use crate::allowlist::{self, EgressPolicy, Rule};
 use crate::sandbox::control::SecretWay;
 use crate::sandbox::egress_stats::{EgressStats, StatKind};
 
-use super::ca::{ensure_provider, upstream_config, upstream_config_h2, Ca, CertResolver};
-use super::dns::{caching_resolver, Resolver};
+use super::ca::{Ca, CertResolver, ensure_provider, upstream_config, upstream_config_h2};
+use super::dns::{Resolver, caching_resolver};
 use super::inject::{HeaderInjection, SecretNeedle};
 use super::redact_in_place;
 
@@ -748,43 +748,49 @@ mod notify_tests {
     fn a_muted_denial_is_not_announced() {
         // A `mute` (`dontaudit`) rule says "stop telling me about this one". Honouring that for the
         // log while still raising a desktop notification would defeat the point of the rule.
-        assert!(refusal_block(
-            "api.example.com",
-            443,
-            StatKind::Deny,
-            "denied-default",
-            true,
-            false,
-            SUGGEST
-        )
-        .is_none());
+        assert!(
+            refusal_block(
+                "api.example.com",
+                443,
+                StatKind::Deny,
+                "denied-default",
+                true,
+                false,
+                SUGGEST
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn an_answered_ask_is_not_announced_twice() {
         // Under the interactive posture the person was already shown this exact request and answered
         // it (or let it time out). A second, after-the-fact notification is pure noise.
-        assert!(refusal_block(
-            "api.example.com",
-            443,
-            StatKind::Deny,
-            "asked-denied",
-            false,
-            true,
-            SUGGEST
-        )
-        .is_none());
+        assert!(
+            refusal_block(
+                "api.example.com",
+                443,
+                StatKind::Deny,
+                "asked-denied",
+                false,
+                true,
+                SUGGEST
+            )
+            .is_none()
+        );
         // With the park notices off, nothing announced it the first time, so the refusal is said.
-        assert!(refusal_block(
-            "api.example.com",
-            443,
-            StatKind::Deny,
-            "asked-denied",
-            false,
-            false,
-            SUGGEST
-        )
-        .is_some());
+        assert!(
+            refusal_block(
+                "api.example.com",
+                443,
+                StatKind::Deny,
+                "asked-denied",
+                false,
+                false,
+                SUGGEST
+            )
+            .is_some()
+        );
     }
 
     #[test]

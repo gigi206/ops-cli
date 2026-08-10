@@ -90,32 +90,32 @@ pub(crate) mod inspect;
 mod observe_feed;
 
 pub(crate) use appimage::{
-    pinned_hashes as appimage_pinned_hashes, upgrade_project as upgrade_appimage,
-    withheld as withheld_appimage_packages, AppImageUpgrade,
+    AppImageUpgrade, pinned_hashes as appimage_pinned_hashes, upgrade_project as upgrade_appimage,
+    withheld as withheld_appimage_packages,
 };
 pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};
-pub(crate) use cgroup::{probe as resource_limits, LimitReport};
+pub(crate) use cgroup::{LimitReport, probe as resource_limits};
 pub(crate) use deb::{
-    pinned_hashes as deb_pinned_hashes, upgrade_project as upgrade_deb,
-    withheld as withheld_deb_packages, DebUpgrade,
+    DebUpgrade, pinned_hashes as deb_pinned_hashes, upgrade_project as upgrade_deb,
+    withheld as withheld_deb_packages,
 };
 pub(crate) use flake::{
-    pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,
-    withheld as withheld_flake_packages, FlakeUpgrade,
+    FlakeUpgrade, pinned_revs as flake_pinned_revs, upgrade as upgrade_flake,
+    withheld as withheld_flake_packages,
 };
 pub(crate) use gc::{
-    classify_tree, human_bytes, installed_app_homes, prune_app_tools, purge_app_homes, tree_size,
-    tree_usage, InstalledApp,
+    InstalledApp, classify_tree, human_bytes, installed_app_homes, prune_app_tools,
+    purge_app_homes, tree_size, tree_usage,
 };
 pub(crate) use launch::{
-    app, attach, detach_log_path, effective_lock_target, gc, parse_session_header, projects_list,
-    projects_rm, projects_show, rm_apply as projects_rm_apply, run, run_mise, stop,
-    superseded_reclaimable_hint, upgrade_mise_packages, SessionHeader,
+    SessionHeader, app, attach, detach_log_path, effective_lock_target, gc, parse_session_header,
+    projects_list, projects_rm, projects_show, rm_apply as projects_rm_apply, run, run_mise, stop,
+    superseded_reclaimable_hint, upgrade_mise_packages,
 };
 pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};
 pub(crate) use netns::run_holder;
-pub(crate) use nixhub::{current_system, parse_nix_tools, upgrade_tools, ToolUpgrade};
+pub(crate) use nixhub::{ToolUpgrade, current_system, parse_nix_tools, upgrade_tools};
 /// The one outcome type the three prebuilt backends share. `DebUpgrade` and its siblings are
 /// aliases of it, so a caller matching on outcomes names the variants through this — a `use` path
 /// resolves through modules, and an alias is not one.
@@ -124,11 +124,11 @@ pub(crate) use prebuilt::Upgrade as PrebuiltUpgrade;
 pub(crate) use projectstore::PROJECT_MARKER;
 pub(crate) use projectstore::{reflink_verdict, supports_reflink};
 pub(crate) use proxy::{
-    builtin_allow_rules, ip_refusal, names_exact_host, union_with_builtin, AddrRefusal,
+    AddrRefusal, builtin_allow_rules, ip_refusal, names_exact_host, union_with_builtin,
 };
 pub(crate) use search::run as search;
 pub(crate) use smoke::run as smoke;
 pub(crate) use tarball::{
-    pinned_hashes as tarball_pinned_hashes, upgrade_project as upgrade_tarball,
-    withheld as withheld_tarball_packages, TarballUpgrade,
+    TarballUpgrade, pinned_hashes as tarball_pinned_hashes, upgrade_project as upgrade_tarball,
+    withheld as withheld_tarball_packages,
 };

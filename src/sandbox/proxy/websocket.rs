@@ -8,7 +8,7 @@
 use super::capture::{CapBuf, CaptureGuard};
 use super::*;
 use crate::sandbox::control::SecretWay;
-use miniz_oxide::inflate::stream::{inflate, InflateState};
+use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 
 /// The traffic capture's decoder for one direction of an established WebSocket: it follows the frame
@@ -644,10 +644,10 @@ pub(super) fn relay_upgrade(
         // The upstream declined the upgrade — relay its response as a normal one, then close. The
         // upstream keeps the read timeout it was given (the handshake did not force `Connection:
         // close`), so a keep-alive response without an EOF is bounded by that timeout, not hung.
-        if let Some(code) = parse_status_code(&resp_head) {
-            if code >= 200 {
-                ctx.set_status(allow_seq, code);
-            }
+        if let Some(code) = parse_status_code(&resp_head)
+            && code >= 200
+        {
+            ctx.set_status(allow_seq, code);
         }
         br.get_mut().write_all(&resp_head)?;
         down.fetch_add(resp_head.len() as u64, Ordering::Relaxed);
@@ -799,10 +799,10 @@ fn follow(tee: &mut Option<FrameTee>, chunk: &[u8], way: SecretWay, obs: &Tunnel
     let Some(tee) = tee.as_mut() else {
         return;
     };
-    if tee.push(chunk) {
-        if let Some(c) = obs.capture {
-            c.file_frames_snapshot();
-        }
+    if tee.push(chunk)
+        && let Some(c) = obs.capture
+    {
+        c.file_frames_snapshot();
     }
     for name in tee.sightings() {
         obs.ctx.websocket_secret_seen(obs.seq, &name, way);
@@ -1053,7 +1053,7 @@ mod tests {
         payload: &[u8],
         compressor: &mut miniz_oxide::deflate::core::CompressorOxide,
     ) -> Vec<u8> {
-        use miniz_oxide::deflate::core::{compress, TDEFLFlush};
+        use miniz_oxide::deflate::core::{TDEFLFlush, compress};
         let mut out = vec![0u8; payload.len() * 2 + 128];
         let (_, _, written) = compress(compressor, payload, &mut out, TDEFLFlush::Sync);
         out.truncate(written);
@@ -1225,7 +1225,7 @@ mod tests {
     /// be inflated once whole. A decoder that inflated per frame would fail on the second half.
     #[test]
     fn a_compressed_message_fragmented_across_frames_is_inflated_once_whole() {
-        use miniz_oxide::deflate::core::{compress, CompressorOxide, TDEFLFlush};
+        use miniz_oxide::deflate::core::{CompressorOxide, TDEFLFlush, compress};
         let mut comp = CompressorOxide::new(raw_deflate_flags());
         let payload = br#"{"a":"first-half","b":"second-half","a2":"first-half"}"#;
         let mut body = vec![0u8; payload.len() * 2 + 128];

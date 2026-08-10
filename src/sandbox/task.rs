@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use crate::config::{OutputDisposition, TaskSpec};
 
 use super::proxy::SecretNeedle;
-use super::redact::{redact_named, Placeholder};
+use super::redact::{Placeholder, redact_named};
 use super::spec::{Mount, NetPolicy, SandboxSpec};
 
 /// Where a task's `$HOME` and scratch space live inside its cage: a fresh tmpfs, so nothing it
@@ -882,13 +882,14 @@ impl TaskEngine {
         // The task tool pool, **read-only** and at the same in-cage path the install cage used —
         // that agreement is what keeps the absolute paths mise baked into the pool valid. Bound only
         // when this task declares a tool, so a task that needs none sees no pool at all.
-        if let Some((pool, _)) = &self.pool {
-            if !task.packages.is_empty() && pool.is_dir() {
-                mounts.push(Mount::RoBind {
-                    src: pool.clone(),
-                    dest: PathBuf::from(super::taskpool::POOL_INCAGE),
-                });
-            }
+        if let Some((pool, _)) = &self.pool
+            && !task.packages.is_empty()
+            && pool.is_dir()
+        {
+            mounts.push(Mount::RoBind {
+                src: pool.clone(),
+                dest: PathBuf::from(super::taskpool::POOL_INCAGE),
+            });
         }
         mounts.push(Mount::Proc {
             dest: PathBuf::from("/proc"),
@@ -1109,22 +1110,22 @@ impl TaskEngine {
     /// Record the cage's pid against the live invocation, so a reader can see which process a
     /// long-running operation is.
     fn note_pid(&self, id: u64, pid: u32) {
-        if let Ok(mut running) = self.running.lock() {
-            if let Some(entry) = running.get_mut(&id) {
-                entry.pid = Some(pid);
-            }
+        if let Ok(mut running) = self.running.lock()
+            && let Some(entry) = running.get_mut(&id)
+        {
+            entry.pid = Some(pid);
         }
     }
 
     /// Record what this invocation actually runs, once its parameters are substituted in.
     fn note_argv(&self, id: u64, argv: &[OsString]) {
-        if let Ok(mut running) = self.running.lock() {
-            if let Some(entry) = running.get_mut(&id) {
-                entry.argv = argv
-                    .iter()
-                    .map(|a| a.to_string_lossy().into_owned())
-                    .collect();
-            }
+        if let Ok(mut running) = self.running.lock()
+            && let Some(entry) = running.get_mut(&id)
+        {
+            entry.argv = argv
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
         }
     }
 
@@ -1290,7 +1291,7 @@ impl TaskEngine {
                     "the invocation registry is unavailable, so the limit on detached \
                             invocations cannot be checked"
                         .to_string(),
-                )
+                );
             }
             Err(_) => {}
         }
@@ -1378,10 +1379,10 @@ impl TaskEngine {
                 _ => {}
             }
         }
-        if let Some((pool, _)) = &self.pool {
-            if !task.packages.is_empty() {
-                consider(pool, Path::new(super::taskpool::POOL_INCAGE));
-            }
+        if let Some((pool, _)) = &self.pool
+            && !task.packages.is_empty()
+        {
+            consider(pool, Path::new(super::taskpool::POOL_INCAGE));
         }
         // The project, read-only at the path it occupies on the host. Bound when the cage is built
         // rather than carried in the base list, and it has to be named here too: a command that is a
@@ -2174,7 +2175,7 @@ fn resolve_secret(
 mod smoke {
     use super::*;
     use crate::config::{Encoding, OutputDisposition, ParamBound, TaskParam, TaskSecret};
-    use crate::testutil::TmpDir;
+    use crate::testutil::{EnvVar, TmpDir, env_lock};
 
     /// The engine, wired to a real provisioned userland — or `None` to skip. `pool`, when given,
     /// points the engine at a task tool pool already realized on disk.
@@ -2326,7 +2327,8 @@ mod smoke {
         std::fs::write(project.path().join("README"), b"hi").unwrap();
         // The credential is read host-side from sbx's own environment, so the value never has to be
         // written anywhere the cage can see.
-        std::env::set_var("SBX_SMOKE_TASK_TOKEN", "smoke-token-abcdef");
+        let _lock = env_lock();
+        let _token = EnvVar::set("SBX_SMOKE_TASK_TOKEN", "smoke-token-abcdef");
 
         let shell = match crate::store::resolve_nix(None).and_then(|nix| {
             let data = TmpDir::new();
@@ -2392,7 +2394,6 @@ mod smoke {
             matches!(refused, Err(TaskError::Refused(_))),
             "an out-of-bound value must be refused: {refused:?}"
         );
-        std::env::remove_var("SBX_SMOKE_TASK_TOKEN");
     }
 
     /// A withheld stream's substitution count does not go back to the caller, and the host-side log
@@ -2405,7 +2406,8 @@ mod smoke {
     #[test]
     fn a_withheld_streams_substitution_count_stays_host_side() {
         let project = TmpDir::new();
-        std::env::set_var("SBX_SMOKE_COUNT_TOKEN", "count-token-abcdef");
+        let _lock = env_lock();
+        let _token = EnvVar::set("SBX_SMOKE_COUNT_TOKEN", "count-token-abcdef");
 
         let shell = match crate::store::resolve_nix(None).and_then(|nix| {
             let data = TmpDir::new();
@@ -2461,7 +2463,6 @@ mod smoke {
             outcome.redacted_withheld, 1,
             "and the withheld stream's is kept apart, not dropped: {outcome:?}"
         );
-        std::env::remove_var("SBX_SMOKE_COUNT_TOKEN");
     }
 
     /// The paths an exec refusal names are substituted, proven through the real supervisor rather
@@ -2478,7 +2479,8 @@ mod smoke {
         let project = TmpDir::new();
         // Its own variable and its own value: the environment is process-global, so sharing the
         // other smoke test's name would have each one clearing the other's credential mid-run.
-        std::env::set_var("SBX_SMOKE_REFUSAL_TOKEN", "refusal-token-abcdef");
+        let _lock = env_lock();
+        let _token = EnvVar::set("SBX_SMOKE_REFUSAL_TOKEN", "refusal-token-abcdef");
 
         let shell = match crate::store::resolve_nix(None).and_then(|nix| {
             let data = TmpDir::new();
@@ -2541,7 +2543,6 @@ mod smoke {
                     || r.target.contains("refusal-token-abcdef")),
             "the plaintext must never reach the caller in a refusal: {refused:?}"
         );
-        std::env::remove_var("SBX_SMOKE_REFUSAL_TOKEN");
     }
 
     /// The task tool pool, end to end in a real cage: a tool realized in the pool exactly as mise

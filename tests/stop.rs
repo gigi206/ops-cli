@@ -287,10 +287,10 @@ fn process_with_arg(needle: &str) -> bool {
         return false;
     };
     for entry in entries.flatten() {
-        if let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) {
-            if String::from_utf8_lossy(&bytes).contains(needle) {
-                return true;
-            }
+        if let Ok(bytes) = std::fs::read(entry.path().join("cmdline"))
+            && String::from_utf8_lossy(&bytes).contains(needle)
+        {
+            return true;
         }
     }
     false
@@ -330,7 +330,9 @@ fn stop_tears_down_a_supervised_app_session() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!("skipping sbx stop supervised e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping sbx stop supervised e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
 
@@ -442,7 +444,9 @@ fn stop_all_stops_every_session() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!("skipping sbx stop --all e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping sbx stop --all e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
     let trusted = sbx_run(

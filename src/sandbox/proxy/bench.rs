@@ -29,7 +29,7 @@
 
 use super::ca::CertResolver;
 use super::*;
-use crate::allowlist::{classify, EgressPolicy};
+use crate::allowlist::{EgressPolicy, classify};
 use crate::testutil::TmpDir;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

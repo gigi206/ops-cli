@@ -88,11 +88,11 @@ fn net_test(args: &[OsString]) -> ExitCode {
     // Fold a named app's overlay onto the baseline so the URL is tested against the *effective*
     // policy `sbx app <name>` would launch with (its own posture, allow/deny rules, credentials),
     // not the bare baseline.
-    if let Some(name) = &app {
-        if let Err(e) = fold_app_overlay(&mut resolved, name) {
-            diag::error(&format!("sbx: test net: {e}"));
-            return ExitCode::from(2);
-        }
+    if let Some(name) = &app
+        && let Err(e) = fold_app_overlay(&mut resolved, name)
+    {
+        diag::error(&format!("sbx: test net: {e}"));
+        return ExitCode::from(2);
     }
 
     // A bare host (no scheme) is completed to https — the common case for a quick check.
@@ -156,19 +156,19 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 // splice the proxy would refuse. A `tcp://` rule always names its host exactly, so
                 // the private-address exception applies here; only a never-reachable address (a
                 // link-local, the cloud metadata one, multicast) is refused.
-                if let allowlist::L4Decision::Splice(rule) = &l4 {
-                    if let Some(refusal) = literal_addr_refusal(&host, Some(rule)) {
-                        print!(
-                            "{}",
-                            render_addr_refusal(
-                                target,
-                                &format!("a tcp:// rule allows the splice ({rule})"),
-                                &refusal,
-                                &pal
-                            )
-                        );
-                        return ExitCode::SUCCESS;
-                    }
+                if let allowlist::L4Decision::Splice(rule) = &l4
+                    && let Some(refusal) = literal_addr_refusal(&host, Some(rule))
+                {
+                    print!(
+                        "{}",
+                        render_addr_refusal(
+                            target,
+                            &format!("a tcp:// rule allows the splice ({rule})"),
+                            &refusal,
+                            &pal
+                        )
+                    );
+                    return ExitCode::SUCCESS;
                 }
                 print!("{}", render_l4_decision(target, &l4, &pal));
                 return ExitCode::SUCCESS;
@@ -221,15 +221,13 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 decision,
                 allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
             );
-            if allowed {
-                if let Some(refusal) = literal_addr_refusal(&host, deciding) {
-                    let by = match deciding {
-                        Some(rule) => format!("the policy allows it (allow rule: {rule})"),
-                        None => "the policy allows it (allow-by-default)".to_string(),
-                    };
-                    print!("{}", render_addr_refusal(&url, &by, &refusal, &pal));
-                    return ExitCode::SUCCESS;
-                }
+            if allowed && let Some(refusal) = literal_addr_refusal(&host, deciding) {
+                let by = match deciding {
+                    Some(rule) => format!("the policy allows it (allow rule: {rule})"),
+                    None => "the policy allows it (allow-by-default)".to_string(),
+                };
+                print!("{}", render_addr_refusal(&url, &by, &refusal, &pal));
+                return ExitCode::SUCCESS;
             }
             print!("{}", render_net_decision(&url, &decision, builtin, &pal));
             if allowed

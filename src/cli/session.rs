@@ -60,11 +60,7 @@ struct Row {
 /// redirected to a file `sbx session logs` can read, a foreground one's is on the user's own
 /// terminal — so the column doubles as the guide to which sessions that verb applies to.
 fn session_mode(s: &session::Session) -> &'static str {
-    if s.detached {
-        "detached"
-    } else {
-        "foreground"
-    }
+    if s.detached { "detached" } else { "foreground" }
 }
 
 /// `sbx session ls`: list the live sandbox sessions from the on-disk registry. Reading
@@ -292,7 +288,7 @@ fn parse_logs_args(args: &[OsString]) -> Result<LogsArgs, String> {
                 return Err(format!(
                     "usage: {}",
                     help::synopsis_of(&["session", "logs"])
-                ))
+                ));
             }
         }
     }
@@ -402,7 +398,7 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     let log = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return explain_missing_log(data_dir, parsed.id, &path)
+            return explain_missing_log(data_dir, parsed.id, &path);
         }
         Err(e) => {
             diag::error(&format!(

@@ -242,16 +242,22 @@ mod tests {
         assert!(validate_entry("**/*.pem").unwrap_err().contains("`**`"));
         assert!(validate_entry("a/**/b").unwrap_err().contains("`**`"));
         // Outside the project.
-        assert!(validate_entry("/etc/shadow")
-            .unwrap_err()
-            .contains("relative to the project root"));
+        assert!(
+            validate_entry("/etc/shadow")
+                .unwrap_err()
+                .contains("relative to the project root")
+        );
         // Traversal.
-        assert!(validate_entry("../secrets")
-            .unwrap_err()
-            .contains("`..` component"));
-        assert!(validate_entry("a/../b")
-            .unwrap_err()
-            .contains("`..` component"));
+        assert!(
+            validate_entry("../secrets")
+                .unwrap_err()
+                .contains("`..` component")
+        );
+        assert!(
+            validate_entry("a/../b")
+                .unwrap_err()
+                .contains("`..` component")
+        );
         // The degenerate ones.
         assert!(validate_entry("").unwrap_err().contains("empty"));
         assert!(validate_entry("   ").unwrap_err().contains("empty"));

@@ -937,10 +937,10 @@ impl Drop for FlowGuard {
     fn drop(&mut self) {
         // Remove the flow from the live view the instant its tunnel closes (a detached guard has no
         // registry and nothing to remove).
-        if let Some(registry) = &self.registry {
-            if let Ok(mut g) = registry.inner.lock() {
-                g.flows.remove(&self.id);
-            }
+        if let Some(registry) = &self.registry
+            && let Ok(mut g) = registry.inner.lock()
+        {
+            g.flows.remove(&self.id);
         }
     }
 }

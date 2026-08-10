@@ -17,12 +17,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::{allowlist, config, diag, help, sandbox, style, trust};
 use crate::{
-    egress_data_dir, egress_write_target, fold_app_overlay, format_log_time, net_mode_word,
-    open_rule_write, pending_session_context, persist_egress_rule, precheck_local_save,
-    session_app_of, session_pids_for_app, session_pids_for_project, split_scope, RuleWrite,
+    RuleWrite, egress_data_dir, egress_write_target, fold_app_overlay, format_log_time,
+    net_mode_word, open_rule_write, pending_session_context, persist_egress_rule,
+    precheck_local_save, session_app_of, session_pids_for_app, session_pids_for_project,
+    split_scope,
 };
+use crate::{allowlist, config, diag, help, sandbox, style, trust};
 
 /// `sbx net <subcommand>`: the interactive-egress namespace. `rules` lists the effective egress
 /// rules (optionally for one app), `allow`/`deny` persist a rule to a config file, `pending`
@@ -770,33 +771,33 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
     // as a *different* app, the assertion is wrong → flag it (and, with `--save`, the save would land
     // in the wrong app's config). An unregistered session or a plain shell (no known app) is given the
     // benefit of the doubt — the id is authoritative.
-    if let Some(name) = parsed.app.as_deref() {
-        if let Some(actual) = session_app_of(&data_dir, pid) {
-            if actual != name {
-                diag::error(&format!(
-                    "sbx: {id} is a session of app `{actual}`, not `{name}`"
-                ));
-                return ExitCode::from(2);
-            }
-        }
+    if let Some(name) = parsed.app.as_deref()
+        && let Some(actual) = session_app_of(&data_dir, pid)
+        && actual != name
+    {
+        diag::error(&format!(
+            "sbx: {id} is a session of app `{actual}`, not `{name}`"
+        ));
+        return ExitCode::from(2);
     }
-    let (host, count) =
-        match sandbox::control::answer_request(&data_dir, pid, seq, verdict, session) {
-            Ok(sandbox::control::AnswerOutcome::Answered { host, count }) => (host, count),
-            Ok(sandbox::control::AnswerOutcome::NotFound) => {
-                diag::error(&format!(
+    let (host, count) = match sandbox::control::answer_request(
+        &data_dir, pid, seq, verdict, session,
+    ) {
+        Ok(sandbox::control::AnswerOutcome::Answered { host, count }) => (host, count),
+        Ok(sandbox::control::AnswerOutcome::NotFound) => {
+            diag::error(&format!(
                 "sbx: no pending request '{id}' (it may have been answered already or timed out)"
             ));
-                return ExitCode::from(2);
-            }
-            Err(_) => {
-                diag::error(&format!(
-                    "sbx: no live session for '{id}' (the launch may have ended, or its socket is \
+            return ExitCode::from(2);
+        }
+        Err(_) => {
+            diag::error(&format!(
+                "sbx: no live session for '{id}' (the launch may have ended, or its socket is \
                  stale)"
-                ));
-                return ExitCode::from(2);
-            }
-        };
+            ));
+            return ExitCode::from(2);
+        }
+    };
     // `<id>` names one parked request, but identical retries of the same URL collapse to one decision
     // — so the answer may have woken several. `×N` mirrors the grouped listing.
     let times = if count > 1 {
@@ -874,10 +875,10 @@ fn net_pending_answer_all(
     let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
     let mut unsupported: Vec<u32> = Vec::new();
     for pid in sandbox::control::session_pids(&data_dir) {
-        if let Some(pids) = &app_pids {
-            if !pids.contains(&pid) {
-                continue;
-            }
+        if let Some(pids) = &app_pids
+            && !pids.contains(&pid)
+        {
+            continue;
         }
         match sandbox::control::drain_session(&data_dir, pid, verdict, session) {
             Ok(sandbox::control::DrainOutcome::Drained(hosts)) if !hosts.is_empty() => {
@@ -1324,10 +1325,10 @@ fn filtered_log_events<'a>(
         .iter()
         .filter(|e| event_passes_filters(e, view))
         .collect();
-    if let Some(n) = view.limit {
-        if out.len() > n {
-            out = out.split_off(out.len() - n);
-        }
+    if let Some(n) = view.limit
+        && out.len() > n
+    {
+        out = out.split_off(out.len() - n);
     }
     out
 }
@@ -2124,11 +2125,11 @@ fn net_rules(args: &[OsString]) -> ExitCode {
     // Fold a named app's overlay so the rules listed are the *effective* set `sbx app <name>` would
     // launch with (its own posture, allow/deny, credentials), not the bare baseline — the same path
     // `sbx test net --app` uses, so the two read the same policy.
-    if let Some(name) = &app {
-        if let Err(e) = fold_app_overlay(&mut resolved, name) {
-            diag::error(&format!("sbx: net rules: {e}"));
-            return ExitCode::from(2);
-        }
+    if let Some(name) = &app
+        && let Err(e) = fold_app_overlay(&mut resolved, name)
+    {
+        diag::error(&format!("sbx: net rules: {e}"));
+        return ExitCode::from(2);
     }
 
     // A `--filter` is a search for a host, so it forces expansion: otherwise the substring would run
@@ -2838,11 +2839,11 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             return ExitCode::from(2);
         }
     };
-    if let Some(name) = &parsed.app {
-        if !config::is_valid_app_name(name) {
-            diag::error(&format!("sbx: invalid app name '{name}'"));
-            return ExitCode::from(2);
-        }
+    if let Some(name) = &parsed.app
+        && !config::is_valid_app_name(name)
+    {
+        diag::error(&format!("sbx: invalid app name '{name}'"));
+        return ExitCode::from(2);
     }
     // Validate the rule before touching any file or session (fail-closed). A `@<name>` group reference
     // is an alias for a `[net.groups]` group, expanded at load time — not itself a classifiable rule —
@@ -2870,7 +2871,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         if parsed.scope_explicit {
             diag::error(
                 "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not \
-                 apply — use -a <app> or --all to scope the session(s)"
+                 apply — use -a <app> or --all to scope the session(s)",
             );
             return ExitCode::from(2);
         }
@@ -2879,7 +2880,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         if is_group {
             diag::error(
                 "sbx: --session cannot load a @group (a group is expanded from the config at launch) \
-                 — pass the concrete rules, or add the group to the config without --session"
+                 — pass the concrete rules, or add the group to the config without --session",
             );
             return ExitCode::from(2);
         }
@@ -2897,7 +2898,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     if all {
         diag::error(
             "sbx: --all only applies with --session (it widens a live rule to every session); a config \
-             write targets one file — drop --all"
+             write targets one file — drop --all",
         );
         return ExitCode::from(2);
     }
@@ -2973,11 +2974,11 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
             return ExitCode::from(2);
         }
     };
-    if let Some(name) = &parsed.app {
-        if !config::is_valid_app_name(name) {
-            diag::error(&format!("sbx: invalid app name '{name}'"));
-            return ExitCode::from(2);
-        }
+    if let Some(name) = &parsed.app
+        && !config::is_valid_app_name(name)
+    {
+        diag::error(&format!("sbx: invalid app name '{name}'"));
+        return ExitCode::from(2);
     }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
@@ -3694,9 +3695,11 @@ mod tests {
         // A zero interval would busy-loop — refused, not silently clamped.
         assert!(parse_watch_args(&osv(&["-i", "0"])).is_err());
         // A non-numeric interval is an error naming the offending value.
-        assert!(parse_watch_args(&osv(&["-i", "soon"]))
-            .unwrap_err()
-            .contains("soon"));
+        assert!(
+            parse_watch_args(&osv(&["-i", "soon"]))
+                .unwrap_err()
+                .contains("soon")
+        );
         // A flag missing its value is an error, not a panic.
         assert!(parse_watch_args(&osv(&["-i"])).is_err());
         assert!(parse_watch_args(&osv(&["--app"])).is_err());
@@ -3735,9 +3738,11 @@ mod tests {
             parse_live_args(&osv(&["-i", "0"])).is_err(),
             "zero interval busy-loops"
         );
-        assert!(parse_live_args(&osv(&["-i", "soon"]))
-            .unwrap_err()
-            .contains("soon"));
+        assert!(
+            parse_live_args(&osv(&["-i", "soon"]))
+                .unwrap_err()
+                .contains("soon")
+        );
         assert!(
             parse_live_args(&osv(&["-i"])).is_err(),
             "missing interval value"
@@ -4174,9 +4179,11 @@ mod tests {
         assert_eq!(parse_log_args(&osv(&["-f"])).unwrap().interval_secs, 1);
         // A zero or non-numeric interval is refused (a zero would busy-poll).
         assert!(parse_log_args(&osv(&["-i", "0"])).is_err());
-        assert!(parse_log_args(&osv(&["-i", "soon"]))
-            .unwrap_err()
-            .contains("soon"));
+        assert!(
+            parse_log_args(&osv(&["-i", "soon"]))
+                .unwrap_err()
+                .contains("soon")
+        );
         assert!(parse_log_args(&osv(&["-i"])).is_err());
 
         // Every verdict token parses through the flag (in particular `error`, the log-only one).
@@ -4193,12 +4200,16 @@ mod tests {
         }
 
         // Rejects: an unknown verdict (naming it), a non-numeric count, a missing value, a bad flag.
-        assert!(parse_log_args(&osv(&["--verdict", "nope"]))
-            .unwrap_err()
-            .contains("nope"));
-        assert!(parse_log_args(&osv(&["-n", "lots"]))
-            .unwrap_err()
-            .contains("lots"));
+        assert!(
+            parse_log_args(&osv(&["--verdict", "nope"]))
+                .unwrap_err()
+                .contains("nope")
+        );
+        assert!(
+            parse_log_args(&osv(&["-n", "lots"]))
+                .unwrap_err()
+                .contains("lots")
+        );
         assert!(parse_log_args(&osv(&["--host"])).is_err());
         assert!(parse_log_args(&osv(&["--verdict"])).is_err());
         assert!(parse_log_args(&osv(&["-n"])).is_err());

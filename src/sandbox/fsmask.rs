@@ -28,7 +28,7 @@
 
 use super::binds::ExtraBind;
 use super::spec::Mount;
-use crate::config::fspolicy::{has_wildcard, matches_component, FsPolicy};
+use crate::config::fspolicy::{FsPolicy, has_wildcard, matches_component};
 use std::collections::BTreeSet;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

@@ -25,14 +25,14 @@
 //! — a launch must not break because a notification could not be delivered.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::notify::{Block, Coalescer, NotifyPolicy, Speak};
 use crate::sandbox::proxy::SecretNeedle;
-use crate::sandbox::redact::{redact_string, Placeholder};
+use crate::sandbox::redact::{Placeholder, redact_string};
 
 /// How many pending announcements the queue holds before it starts dropping.
 ///
@@ -510,8 +510,8 @@ mod tests {
                 n.block(b);
             }
         }
-        let out = seen.lock().unwrap().clone();
-        out
+
+        seen.lock().unwrap().clone()
     }
 
     fn net_block(subject: &str, reason: &str) -> Block {
@@ -745,11 +745,7 @@ mod tests {
             _expire_timeout: i32,
         ) -> u32 {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            if replaces_id != 0 {
-                replaces_id
-            } else {
-                77
-            }
+            if replaces_id != 0 { replaces_id } else { 77 }
         }
 
         async fn get_server_information(&self) -> (String, String, String, String) {

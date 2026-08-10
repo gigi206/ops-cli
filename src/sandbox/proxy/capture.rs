@@ -707,9 +707,11 @@ mod tests {
 
         let (found, _) = ring.get(&[seq]);
         let cap = &found[0];
-        assert!(String::from_utf8(cap.req_head.bytes.clone())
-            .unwrap()
-            .starts_with("POST /v1/messages HTTP/1.1"));
+        assert!(
+            String::from_utf8(cap.req_head.bytes.clone())
+                .unwrap()
+                .starts_with("POST /v1/messages HTTP/1.1")
+        );
         assert_eq!(
             String::from_utf8(cap.injected.bytes.clone()).unwrap(),
             "x-api-key\nauthorization",

@@ -277,46 +277,48 @@ pub(super) unsafe fn enter_and_exec(
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
 ) -> ! {
-    // One atomic join of every cage namespace we do not already share — *including* the
-    // user namespace — through the pidfd. The kernel orders the user-namespace entry
-    // internally so the capability to enter the mnt/net/… namespaces it owns is held at
-    // the right instant, which a sequence of per-namespace `setns` calls cannot reproduce.
-    let mask = cage.mask;
-    let pidfd = cage.pidfd.as_raw_fd();
-    if libc::setns(pidfd, mask) != 0 {
-        // The combined join is atomic, so a cage without a cgroup namespace (or one that
-        // refuses that single join) would fail the whole call; retry without it — the
-        // cgroup namespace only changes a cosmetic `/proc/self/cgroup` view.
-        if libc::setns(pidfd, mask & !libc::CLONE_NEWCGROUP) != 0 {
+    unsafe {
+        // One atomic join of every cage namespace we do not already share — *including* the
+        // user namespace — through the pidfd. The kernel orders the user-namespace entry
+        // internally so the capability to enter the mnt/net/… namespaces it owns is held at
+        // the right instant, which a sequence of per-namespace `setns` calls cannot reproduce.
+        let mask = cage.mask;
+        let pidfd = cage.pidfd.as_raw_fd();
+        if libc::setns(pidfd, mask) != 0 {
+            // The combined join is atomic, so a cage without a cgroup namespace (or one that
+            // refuses that single join) would fail the whole call; retry without it — the
+            // cgroup namespace only changes a cosmetic `/proc/self/cgroup` view.
+            if libc::setns(pidfd, mask & !libc::CLONE_NEWCGROUP) != 0 {
+                libc::_exit(126);
+            }
+        }
+        // Fork so the shell runs *in* the cage's pid namespace (a `setns` into a pid
+        // namespace only moves the caller's future children into it).
+        let child = libc::fork();
+        if child < 0 {
             libc::_exit(126);
         }
-    }
-    // Fork so the shell runs *in* the cage's pid namespace (a `setns` into a pid
-    // namespace only moves the caller's future children into it).
-    let child = libc::fork();
-    if child < 0 {
+        if child == 0 {
+            confine_and_exec(filters, tty, argv, envp);
+        }
+        // Parent of the shell: reap it and mirror its exit status up to the pty supervisor.
+        let mut status: libc::c_int = 0;
+        loop {
+            if libc::waitpid(child, &mut status, 0) >= 0 {
+                break;
+            }
+            if *libc::__errno_location() != libc::EINTR {
+                libc::_exit(126);
+            }
+        }
+        if libc::WIFEXITED(status) {
+            libc::_exit(libc::WEXITSTATUS(status));
+        }
+        if libc::WIFSIGNALED(status) {
+            libc::_exit(128 + libc::WTERMSIG(status));
+        }
         libc::_exit(126);
     }
-    if child == 0 {
-        confine_and_exec(filters, tty, argv, envp);
-    }
-    // Parent of the shell: reap it and mirror its exit status up to the pty supervisor.
-    let mut status: libc::c_int = 0;
-    loop {
-        if libc::waitpid(child, &mut status, 0) >= 0 {
-            break;
-        }
-        if *libc::__errno_location() != libc::EINTR {
-            libc::_exit(126);
-        }
-    }
-    if libc::WIFEXITED(status) {
-        libc::_exit(libc::WEXITSTATUS(status));
-    }
-    if libc::WIFSIGNALED(status) {
-        libc::_exit(128 + libc::WTERMSIG(status));
-    }
-    libc::_exit(126);
 }
 
 /// The grandchild: set up the terminal per [`TtyMode`], re-apply the cage's confinement,
@@ -332,47 +334,49 @@ unsafe fn confine_and_exec(
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
 ) -> ! {
-    match tty {
-        // setsid + make the pty slave our controlling terminal + dup it onto stdio — the
-        // same `login_tty` the an interactive `sbx run` supervisor uses, so job control works inside.
-        TtyMode::Pty(slave) => {
-            if libc::login_tty(slave) != 0 {
-                libc::_exit(127);
+    unsafe {
+        match tty {
+            // setsid + make the pty slave our controlling terminal + dup it onto stdio — the
+            // same `login_tty` the an interactive `sbx run` supervisor uses, so job control works inside.
+            TtyMode::Pty(slave) => {
+                if libc::login_tty(slave) != 0 {
+                    libc::_exit(127);
+                }
             }
+            // A non-interactive command: keep sbx's own stdin/stdout/stderr so bytes pass
+            // through unmodified (no controlling terminal, no pty line translation).
+            TtyMode::Inherit => {}
         }
-        // A non-interactive command: keep sbx's own stdin/stdout/stderr so bytes pass
-        // through unmodified (no controlling terminal, no pty line translation).
-        TtyMode::Inherit => {}
+        // Re-apply the cage confinement — NONE of it survived `setns`. `no_new_privs`
+        // before seccomp: an unprivileged filter install requires it.
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            libc::_exit(125);
+        }
+        // Drop the capability bounding + ambient sets. Defense in depth: already inert
+        // under `no_new_privs` with an empty permitted set, but this matches the cage
+        // exactly. Best-effort (a bounding-set drop can lack CAP_SETPCAP after `setns`);
+        // the inert-under-no_new_privs argument holds regardless.
+        let mut cap: libc::c_int = 0;
+        while cap <= 63 {
+            libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0);
+            cap += 1;
+        }
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+        // The seccomp denylist — the load-bearing re-application: this refuses the
+        // mount/namespace/ptrace family the confined agent cannot call.
+        if !super::seccomp::install_filters(filters) {
+            libc::_exit(125);
+        }
+        libc::execve(*argv, argv, envp);
+        // Only reached if execve failed (e.g. the cage's /bin/bash is gone).
+        libc::_exit(127);
     }
-    // Re-apply the cage confinement — NONE of it survived `setns`. `no_new_privs`
-    // before seccomp: an unprivileged filter install requires it.
-    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-        libc::_exit(125);
-    }
-    // Drop the capability bounding + ambient sets. Defense in depth: already inert
-    // under `no_new_privs` with an empty permitted set, but this matches the cage
-    // exactly. Best-effort (a bounding-set drop can lack CAP_SETPCAP after `setns`);
-    // the inert-under-no_new_privs argument holds regardless.
-    let mut cap: libc::c_int = 0;
-    while cap <= 63 {
-        libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0);
-        cap += 1;
-    }
-    libc::prctl(
-        libc::PR_CAP_AMBIENT,
-        libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
-        0,
-        0,
-        0,
-    );
-    // The seccomp denylist — the load-bearing re-application: this refuses the
-    // mount/namespace/ptrace family the confined agent cannot call.
-    if !super::seccomp::install_filters(filters) {
-        libc::_exit(125);
-    }
-    libc::execve(*argv, argv, envp);
-    // Only reached if execve failed (e.g. the cage's /bin/bash is gone).
-    libc::_exit(127);
 }
 
 #[cfg(test)]

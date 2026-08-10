@@ -548,15 +548,18 @@ mod tests {
     fn the_profile_throttles_then_caps_memory_and_bounds_tasks() {
         let p = profile(&Limits::default());
         // Memory is both throttled (high) and hard-capped (max); tasks are bounded.
-        assert!(p
-            .iter()
-            .any(|(c, v)| *c == "memory" && v.starts_with("MemoryHigh=")));
-        assert!(p
-            .iter()
-            .any(|(c, v)| *c == "memory" && v.starts_with("MemoryMax=")));
-        assert!(p
-            .iter()
-            .any(|(c, v)| *c == "pids" && v.starts_with("TasksMax=")));
+        assert!(
+            p.iter()
+                .any(|(c, v)| *c == "memory" && v.starts_with("MemoryHigh="))
+        );
+        assert!(
+            p.iter()
+                .any(|(c, v)| *c == "memory" && v.starts_with("MemoryMax="))
+        );
+        assert!(
+            p.iter()
+                .any(|(c, v)| *c == "pids" && v.starts_with("TasksMax="))
+        );
     }
 
     #[test]

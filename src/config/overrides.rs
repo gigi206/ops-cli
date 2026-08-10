@@ -272,10 +272,10 @@ fn scan_ambient() -> AmbientOverrides {
             if !key.is_empty() {
                 a.limits.push((key.to_lowercase(), v));
             }
-        } else if let Some(name) = k.strip_prefix(SBX_PACKAGE_PREFIX) {
-            if !name.is_empty() {
-                a.packages.push((name.to_string(), v));
-            }
+        } else if let Some(name) = k.strip_prefix(SBX_PACKAGE_PREFIX)
+            && !name.is_empty()
+        {
+            a.packages.push((name.to_string(), v));
         }
     }
     a
@@ -899,7 +899,7 @@ fn set_limit(
         other => {
             return Err(format!(
                 "{label}: unknown limit `{other}` (memory_high | memory_max | tasks_max)"
-            ))
+            ));
         }
     }
     Ok(())
@@ -1113,10 +1113,11 @@ mod tests {
         .unwrap();
         assert_eq!(ov.raw.forward, Some(vec![1455, 3000, 8080, 9090]));
         // The env contributed a security-relevant collection, so a source notice fires.
-        assert!(ov
-            .notices()
-            .iter()
-            .any(|n| n.contains("forward") && n.contains("environment")));
+        assert!(
+            ov.notices()
+                .iter()
+                .any(|n| n.contains("forward") && n.contains("environment"))
+        );
     }
 
     #[test]
@@ -1181,10 +1182,11 @@ mod tests {
         assert_eq!(ov.raw.gpu, Some(false));
         assert_eq!(ov.raw.dbus, Some(true));
         // `gpu` was also set on the CLI, so no notice for it; `dbus` came only from the environment.
-        assert!(ov
-            .notices()
-            .iter()
-            .any(|n| n.contains("dbus") && n.contains("environment")));
+        assert!(
+            ov.notices()
+                .iter()
+                .any(|n| n.contains("dbus") && n.contains("environment"))
+        );
         assert!(!ov.notices().iter().any(|n| n.contains("`gpu`")));
     }
 

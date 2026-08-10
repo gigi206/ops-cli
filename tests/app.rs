@@ -236,16 +236,20 @@ fn show_json_carries_each_packages_installed_state() {
             .unwrap_or_else(|| panic!("no {backend} package in {v}"))
     };
     assert_eq!(by_backend("mise")["installed"]["state"], "installed");
-    assert!(by_backend("mise")["installed"]["detail"]
-        .as_str()
-        .unwrap()
-        .contains("1.2.3"));
+    assert!(
+        by_backend("mise")["installed"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("1.2.3")
+    );
     assert_eq!(by_backend("deb")["installed"]["state"], "installed");
     assert_eq!(by_backend("nix")["installed"]["state"], "installed");
-    assert!(by_backend("nix")["installed"]["detail"]
-        .as_str()
-        .unwrap()
-        .contains("built in 1 tree"));
+    assert!(
+        by_backend("nix")["installed"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("built in 1 tree")
+    );
     // The one installed tool is declared, so nothing is orphaned.
     assert!(
         v["orphans"].as_array().expect("orphans array").is_empty(),
@@ -286,10 +290,12 @@ fn show_detects_a_remote_flake_built_into_the_per_project_store() {
         .find(|p| p["backend"] == "flake")
         .expect("the flake package");
     assert_eq!(flake["installed"]["state"], "installed");
-    assert!(flake["installed"]["detail"]
-        .as_str()
-        .unwrap()
-        .contains("tree"));
+    assert!(
+        flake["installed"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("tree")
+    );
 }
 
 #[test]
@@ -328,10 +334,12 @@ fn show_detects_an_inline_flake_built_into_the_home() {
         .expect("the inline flake package");
     // `installed`, not `per-project` — the decisive check that FlakeInline is read via its out-link.
     assert_eq!(flake["installed"]["state"], "installed");
-    assert!(flake["installed"]["detail"]
-        .as_str()
-        .unwrap()
-        .contains("agent-2.0"));
+    assert!(
+        flake["installed"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("agent-2.0")
+    );
 }
 
 #[test]

@@ -58,13 +58,13 @@ fn parse_source(locator: &str) -> DebSource {
             packages_url: url.to_string(),
         };
     }
-    if let Some(path) = locator.strip_prefix("github:") {
-        if let Some((owner, repo)) = path.split_once('/') {
-            return DebSource::Github {
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-            };
-        }
+    if let Some(path) = locator.strip_prefix("github:")
+        && let Some((owner, repo)) = path.split_once('/')
+    {
+        return DebSource::Github {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        };
     }
     DebSource::Url(locator.to_string())
 }
@@ -199,10 +199,12 @@ fn select_latest_apt_deb(index: &str) -> Result<(String, String), String> {
     // when the file does not end in a blank line.
     for line in index.lines().chain(std::iter::once("")) {
         if line.trim().is_empty() {
-            if let (Some(p), Some(v), Some(f)) = (pkg.take(), ver.take(), file.take()) {
-                if !p.is_empty() && !v.is_empty() && !f.is_empty() {
-                    stanzas.push((p, v, f));
-                }
+            if let (Some(p), Some(v), Some(f)) = (pkg.take(), ver.take(), file.take())
+                && !p.is_empty()
+                && !v.is_empty()
+                && !f.is_empty()
+            {
+                stanzas.push((p, v, f));
             }
         } else if let Some(v) = line.strip_prefix("Package:") {
             pkg = Some(v.trim().to_string());
@@ -435,7 +437,7 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
 mod tests {
     use super::*;
     use crate::store;
-    use crate::testutil::{app_with, resolved, TmpDir};
+    use crate::testutil::{TmpDir, app_with, resolved};
 
     const HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
 
@@ -593,12 +595,16 @@ mod tests {
         // x86_64 selects the amd64 deb, never the arm64 deb or the mac/win assets.
         assert_eq!(
             select_deb_asset(&json, "x86_64-linux").as_deref(),
-            Some("https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-amd64.deb")
+            Some(
+                "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-amd64.deb"
+            )
         );
         // aarch64 selects the arm64 deb from the same release.
         assert_eq!(
             select_deb_asset(&json, "aarch64-linux").as_deref(),
-            Some("https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-arm64.deb")
+            Some(
+                "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-arm64.deb"
+            )
         );
     }
 
@@ -840,7 +846,9 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         assert!(parse_numeric_version("").is_none());
         // repo root is the URL up to the `/dists/` segment; Filename resolves against it.
         assert_eq!(
-            apt_repo_root("https://apt.example.com/demo-app/apt/stable/dists/stable/main/binary-amd64/Packages"),
+            apt_repo_root(
+                "https://apt.example.com/demo-app/apt/stable/dists/stable/main/binary-amd64/Packages"
+            ),
             Some("https://apt.example.com/demo-app/apt/stable")
         );
         assert_eq!(apt_repo_root("https://h/no-dists/Packages"), None);

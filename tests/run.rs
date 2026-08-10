@@ -2899,27 +2899,27 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
             &["net", "logs", "--with-status", "--json"],
         );
         last = String::from_utf8_lossy(&out.stdout).into_owned();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&last) {
-            if let Some(rows) = v["logs"].as_array() {
-                saw_allow = host_verdict(rows, "cache.nixos.org", "allow");
-                saw_deny = host_verdict(rows, "example.com", "deny");
-                if saw_allow && saw_deny {
-                    // Teeth on the record shape: the allowed event carries its method + path, and —
-                    // the status peek, flowing proxy→ring→reader — the upstream `200` from
-                    // nix-cache-info (amended in once the response returns, ~ms after the allow push).
-                    let allow = rows
-                        .iter()
-                        .find(|r| r["host"] == "cache.nixos.org" && r["verdict"] == "allow")
-                        .unwrap();
-                    assert_eq!(allow["method"], "GET", "the allow event carries the method");
-                    assert_eq!(
-                        allow["path"], "/nix-cache-info",
-                        "the allow event carries the (query-dropped) path"
-                    );
-                    saw_status = allow["status"] == 200;
-                    if saw_status {
-                        break;
-                    }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&last)
+            && let Some(rows) = v["logs"].as_array()
+        {
+            saw_allow = host_verdict(rows, "cache.nixos.org", "allow");
+            saw_deny = host_verdict(rows, "example.com", "deny");
+            if saw_allow && saw_deny {
+                // Teeth on the record shape: the allowed event carries its method + path, and —
+                // the status peek, flowing proxy→ring→reader — the upstream `200` from
+                // nix-cache-info (amended in once the response returns, ~ms after the allow push).
+                let allow = rows
+                    .iter()
+                    .find(|r| r["host"] == "cache.nixos.org" && r["verdict"] == "allow")
+                    .unwrap();
+                assert_eq!(allow["method"], "GET", "the allow event carries the method");
+                assert_eq!(
+                    allow["path"], "/nix-cache-info",
+                    "the allow event carries the (query-dropped) path"
+                );
+                saw_status = allow["status"] == 200;
+                if saw_status {
+                    break;
                 }
             }
         }
@@ -5890,12 +5890,12 @@ fn the_cage_runs_under_a_resource_limit_scope() {
     // Poll the cage's host-visible cgroup until the scope's task cap appears.
     let mut pids_max = String::new();
     for _ in 0..50 {
-        if let Some(scope) = host_cgroup_path(pid) {
-            if let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max")) {
-                pids_max = v.trim().to_string();
-                if pids_max == TASK_CAP {
-                    break;
-                }
+        if let Some(scope) = host_cgroup_path(pid)
+            && let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max"))
+        {
+            pids_max = v.trim().to_string();
+            if pids_max == TASK_CAP {
+                break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -5978,12 +5978,12 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
 
     let mut pids_max = String::new();
     for _ in 0..50 {
-        if let Some(scope) = host_cgroup_path(pid) {
-            if let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max")) {
-                pids_max = v.trim().to_string();
-                if pids_max == OVERRIDE_CAP {
-                    break;
-                }
+        if let Some(scope) = host_cgroup_path(pid)
+            && let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max"))
+        {
+            pids_max = v.trim().to_string();
+            if pids_max == OVERRIDE_CAP {
+                break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -6660,12 +6660,12 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
 
     let mut pids_max = String::new();
     for _ in 0..50 {
-        if let Some(scope) = host_cgroup_path(pid) {
-            if let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max")) {
-                pids_max = v.trim().to_string();
-                if pids_max == OVERRIDE_CAP {
-                    break;
-                }
+        if let Some(scope) = host_cgroup_path(pid)
+            && let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max"))
+        {
+            pids_max = v.trim().to_string();
+            if pids_max == OVERRIDE_CAP {
+                break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -6729,12 +6729,12 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
 
     let mut pids_max = String::new();
     for _ in 0..50 {
-        if let Some(scope) = host_cgroup_path(pid) {
-            if let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max")) {
-                pids_max = v.trim().to_string();
-                if pids_max == OVERRIDE_CAP {
-                    break;
-                }
+        if let Some(scope) = host_cgroup_path(pid)
+            && let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max"))
+        {
+            pids_max = v.trim().to_string();
+            if pids_max == OVERRIDE_CAP {
+                break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -6783,10 +6783,10 @@ fn cage_userns_ready(session_pid: u32) -> bool {
         };
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             // The ppid is the field after the `(comm)` group, so parse past the last `)`.
-            if let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) {
-                if let Some(ppid) = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok()) {
-                    children.entry(ppid).or_default().push(pid);
-                }
+            if let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..])
+                && let Some(ppid) = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok())
+            {
+                children.entry(ppid).or_default().push(pid);
             }
         }
     }

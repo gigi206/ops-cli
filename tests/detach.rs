@@ -218,7 +218,9 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!("skipping sbx detach e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)");
+        eprintln!(
+            "skipping sbx detach e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
+        );
         return;
     }
 

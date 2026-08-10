@@ -389,15 +389,15 @@ pub(crate) fn upgrade_tools(
     for tool in &declared.nix {
         let existing = lock.get(&tool.pkg, &tool.version, system);
         // An exact concrete request already resolved to itself is frozen — skip the query.
-        if let Some(pin) = &existing {
-            if pin.version == tool.version {
-                outcomes.push(ToolUpgrade::Unchanged {
-                    pkg: tool.pkg.clone(),
-                    request: tool.version.clone(),
-                    version: pin.version.clone(),
-                });
-                continue;
-            }
+        if let Some(pin) = &existing
+            && pin.version == tool.version
+        {
+            outcomes.push(ToolUpgrade::Unchanged {
+                pkg: tool.pkg.clone(),
+                request: tool.version.clone(),
+                version: pin.version.clone(),
+            });
+            continue;
         }
         match resolve(nix, layout, tool, system, true) {
             Ok(pin) => {
@@ -489,23 +489,21 @@ impl ResolutionLock {
             for line in text.lines() {
                 if let [pkg, version, system, commit, attr, resolved] =
                     line.split('\t').collect::<Vec<_>>()[..]
+                    && is_valid_pkg(pkg)
+                    && is_valid_version(version)
+                    && is_valid_system(system)
+                    && is_commit(commit)
+                    && is_valid_attr(attr)
+                    && is_valid_version(resolved)
                 {
-                    if is_valid_pkg(pkg)
-                        && is_valid_version(version)
-                        && is_valid_system(system)
-                        && is_commit(commit)
-                        && is_valid_attr(attr)
-                        && is_valid_version(resolved)
-                    {
-                        entries.insert(
-                            (pkg.to_string(), version.to_string(), system.to_string()),
-                            Pin {
-                                commit: commit.to_string(),
-                                attr: attr.to_string(),
-                                version: resolved.to_string(),
-                            },
-                        );
-                    }
+                    entries.insert(
+                        (pkg.to_string(), version.to_string(), system.to_string()),
+                        Pin {
+                            commit: commit.to_string(),
+                            attr: attr.to_string(),
+                            version: resolved.to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -993,9 +991,11 @@ mod tests {
         let path = dir.join("tools.lock");
 
         // an absent lock is empty
-        assert!(ResolutionLock::read(&path)
-            .get("jq", "latest", "x86_64-linux")
-            .is_none());
+        assert!(
+            ResolutionLock::read(&path)
+                .get("jq", "latest", "x86_64-linux")
+                .is_none()
+        );
 
         // a recorded pin round-trips through write + read
         let pin = Pin {
@@ -1011,15 +1011,19 @@ mod tests {
             Some(pin)
         );
         // the version request is part of the key, so a different one is a miss
-        assert!(ResolutionLock::read(&path)
-            .get("jq", "1.6", "x86_64-linux")
-            .is_none());
+        assert!(
+            ResolutionLock::read(&path)
+                .get("jq", "1.6", "x86_64-linux")
+                .is_none()
+        );
 
         // a corrupt line (non-hex commit) is skipped, so the entry re-resolves
         std::fs::write(&path, "jq\tlatest\tx86_64-linux\tNOTHEX\tjq\t1.7\n").unwrap();
-        assert!(ResolutionLock::read(&path)
-            .get("jq", "latest", "x86_64-linux")
-            .is_none());
+        assert!(
+            ResolutionLock::read(&path)
+                .get("jq", "latest", "x86_64-linux")
+                .is_none()
+        );
     }
 }
 
@@ -1086,16 +1090,18 @@ mod resolve_tests {
             "an untrusted project provisions no tools"
         );
         assert!(out.roots.is_empty(), "an untrusted project seeds no roots");
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w.contains("withholding") && w.contains("jq")));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("withholding") && w.contains("jq"))
+        );
         // the malformed `nix:` token is reported; the non-`nix:` `node` is NOT (it is
         // auto-equipped by the launcher, not provisioned here)
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w.contains("malformed") && w.contains("bad name")));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("malformed") && w.contains("bad name"))
+        );
         assert!(
             !out.warnings.iter().any(|w| w.contains("node")),
             "a non-nix: tool is auto-equipped in-cage, so `provision` must not warn about it"
@@ -1153,14 +1159,16 @@ mod resolve_tests {
             "an untrusted project provisions no tools"
         );
         assert!(out.roots.is_empty(), "an untrusted project seeds no roots");
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w.contains("withholding") && w.contains("jq")));
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w.contains("malformed") && w.contains("bad name")));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("withholding") && w.contains("jq"))
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("malformed") && w.contains("bad name"))
+        );
     }
 
     #[test]

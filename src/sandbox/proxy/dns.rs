@@ -49,20 +49,19 @@ where
     type DnsCache = Mutex<HashMap<String, (Vec<IpAddr>, Instant)>>;
     let cache: Arc<DnsCache> = Arc::new(Mutex::new(HashMap::new()));
     Box::new(move |host: &str| {
-        if !ttl.is_zero() {
-            if let Ok(map) = cache.lock() {
-                if let Some((ips, at)) = map.get(host) {
-                    if at.elapsed() < ttl {
-                        return Ok(ips.clone());
-                    }
-                }
-            }
+        if !ttl.is_zero()
+            && let Ok(map) = cache.lock()
+            && let Some((ips, at)) = map.get(host)
+            && at.elapsed() < ttl
+        {
+            return Ok(ips.clone());
         }
         let ips = inner(host)?;
-        if !ips.is_empty() && !ttl.is_zero() {
-            if let Ok(mut map) = cache.lock() {
-                map.insert(host.to_string(), (ips.clone(), Instant::now()));
-            }
+        if !ips.is_empty()
+            && !ttl.is_zero()
+            && let Ok(mut map) = cache.lock()
+        {
+            map.insert(host.to_string(), (ips.clone(), Instant::now()));
         }
         Ok(ips)
     })

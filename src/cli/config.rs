@@ -16,8 +16,8 @@ use crate::cli::confirm::{
     render_config_unchanged, render_config_write, render_list_edit, render_list_unchanged,
     render_trusted_whole_file,
 };
+use crate::{ScopeArgs, config_cwd, net_mode_word, short_rev, split_scope};
 use crate::{config, diag, help, style, trust};
-use crate::{config_cwd, net_mode_word, short_rev, split_scope, ScopeArgs};
 
 /// `sbx config [--json]` and the management verbs `get`/`set`/`unset`/`path`. With no verb it
 /// shows the resolved configuration for the current project — the layered global + project
@@ -145,17 +145,17 @@ fn config_show(args: &[OsString]) -> ExitCode {
     // A per-app view is inherently the app's effective configuration over the *full* baseline, so a
     // single-source restriction is meaningless there — reject the combination rather than silently
     // ignoring one flag.
-    if app.is_some() {
-        if let Some((flag, _)) = source {
-            diag::error(&format!(
-                "sbx: config show: `--app` does not combine with `{flag}`"
-            ));
-            diag::error(&format!(
-                "sbx: usage: {}",
-                help::synopsis_of(&["config", "show"])
-            ));
-            return ExitCode::from(2);
-        }
+    if app.is_some()
+        && let Some((flag, _)) = source
+    {
+        diag::error(&format!(
+            "sbx: config show: `--app` does not combine with `{flag}`"
+        ));
+        diag::error(&format!(
+            "sbx: usage: {}",
+            help::synopsis_of(&["config", "show"])
+        ));
+        return ExitCode::from(2);
     }
 
     let cwd = match std::env::current_dir() {
@@ -346,7 +346,9 @@ fn write_net_transport(
             "connection reuse: off (every request opens and validates its own upstream connection)",
         );
     } else if details {
-        line("connection reuse: on (a request may ride an upstream connection an earlier one left behind)");
+        line(
+            "connection reuse: on (a request may ride an upstream connection an earlier one left behind)",
+        );
     }
     match dns_cache_ttl {
         Some(0) => line("dns cache: off (every request re-resolves)"),
@@ -2146,14 +2148,14 @@ fn config_edit(args: &[OsString]) -> ExitCode {
     };
     // Make sure the parent directory exists so the editor can save a new file (the global config
     // directory may not exist yet).
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            diag::error(&format!(
-                "sbx: config: cannot create {}: {e}",
-                parent.display()
-            ));
-            return ExitCode::FAILURE;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        diag::error(&format!(
+            "sbx: config: cannot create {}: {e}",
+            parent.display()
+        ));
+        return ExitCode::FAILURE;
     }
 
     let store_dir = trust::default_store_dir();

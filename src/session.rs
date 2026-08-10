@@ -615,10 +615,10 @@ fn is_alive(session: &Session) -> bool {
 /// keyed by a bare pid cannot, and merely keeps a stale entry a while longer.
 pub(crate) fn pid_is_live(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc != 0 {
-        if let Some(libc::ESRCH) | Some(libc::EPERM) = io::Error::last_os_error().raw_os_error() {
-            return false;
-        }
+    if rc != 0
+        && let Some(libc::ESRCH) | Some(libc::EPERM) = io::Error::last_os_error().raw_os_error()
+    {
+        return false;
     }
     true
 }
@@ -764,10 +764,10 @@ mod tests {
     fn wait_for_comm(pid: u32, want: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-                if comm.trim() == want {
-                    return;
-                }
+            if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                && comm.trim() == want
+            {
+                return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }

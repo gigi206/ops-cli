@@ -59,13 +59,13 @@ enum AppImageSource {
 
 /// Parse a declared locator (already validated by `config::parse_backend`) into its source shape.
 fn parse_source(locator: &str) -> AppImageSource {
-    if let Some(path) = locator.strip_prefix("github:") {
-        if let Some((owner, repo)) = path.split_once('/') {
-            return AppImageSource::Github {
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-            };
-        }
+    if let Some(path) = locator.strip_prefix("github:")
+        && let Some((owner, repo)) = path.split_once('/')
+    {
+        return AppImageSource::Github {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        };
     }
     AppImageSource::Url(locator.to_string())
 }
@@ -315,7 +315,7 @@ pub(crate) fn withheld(cfg: &crate::config::Resolved) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{app_with, resolved, TmpDir};
+    use crate::testutil::{TmpDir, app_with, resolved};
 
     const HASH: &str = "sha256-+mBp+wPrJRV/HpaimQHcqBuwqZcPWTbKJVNCVW7ELgo=";
 
@@ -386,7 +386,9 @@ mod tests {
         // x86_64 selects the x86_64 AppImage, never the update yml.
         assert_eq!(
             select_appimage_asset(&json, "x86_64-linux").as_deref(),
-            Some("https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage")
+            Some(
+                "https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage"
+            )
         );
         // aarch64 host: no arm64 AppImage in this release → None (fail-closed, no guess).
         assert_eq!(select_appimage_asset(&json, "aarch64-linux"), None);

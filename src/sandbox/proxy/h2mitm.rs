@@ -21,8 +21,8 @@
 
 use super::capture::CapBuf;
 use super::{
-    carries_secret, decide_https, matching_injections, redact_in_place, resolve_checked,
-    upstream_server_name, AskPosture, ProxyCtx, SecretNeedle, StatKind,
+    AskPosture, ProxyCtx, SecretNeedle, StatKind, carries_secret, decide_https,
+    matching_injections, redact_in_place, resolve_checked, upstream_server_name,
 };
 use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -781,8 +781,8 @@ mod tests {
     /// terminated is absent.
     #[test]
     fn an_h2_stream_the_ssrf_guard_refuses_is_counted_like_the_http1_one() {
-        use crate::allowlist::{classify, EgressPolicy};
-        use crate::sandbox::control::{LogRing, LOG_RING_CAP};
+        use crate::allowlist::{EgressPolicy, classify};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing};
         use crate::sandbox::egress_stats::{Counts, EgressStats};
         use crate::testutil::TmpDir;
         use std::time::Duration;
@@ -884,7 +884,7 @@ mod tests {
         Counts,
         Vec<(String, LogVerdict, String)>,
     ) {
-        use crate::sandbox::control::{LogRing, LOG_RING_CAP};
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing};
         use crate::sandbox::egress_stats::EgressStats;
         use crate::testutil::TmpDir;
         use std::time::Duration;
@@ -983,7 +983,7 @@ mod tests {
     /// the fallback below.
     #[test]
     fn an_h2_stream_a_deny_rule_blocks_is_told_denied_by_rule() {
-        use crate::allowlist::{classify, DefaultAction, EgressPolicy};
+        use crate::allowlist::{DefaultAction, EgressPolicy, classify};
 
         let (status, reason, counts, events) = h2_verdict(
             EgressPolicy::new(vec![], vec![classify("grpc.test:*").unwrap()])
@@ -1001,7 +1001,7 @@ mod tests {
     /// "this host, but not this verb" from "not this host at all", whichever protocol it spoke.
     #[test]
     fn an_h2_stream_outside_the_allow_set_is_told_denied_method() {
-        use crate::allowlist::{classify, EgressPolicy};
+        use crate::allowlist::{EgressPolicy, classify};
 
         let (status, reason, counts, events) = h2_verdict(
             EgressPolicy::new(vec![classify("{GET} grpc.test:*").unwrap()], vec![]),
@@ -1017,7 +1017,7 @@ mod tests {
     /// a rule.
     #[test]
     fn an_h2_stream_to_an_unnamed_host_is_told_denied_default() {
-        use crate::allowlist::{classify, EgressPolicy};
+        use crate::allowlist::{EgressPolicy, classify};
 
         let (status, reason, counts, events) = h2_verdict(
             EgressPolicy::new(vec![classify("other.test:*").unwrap()], vec![]),

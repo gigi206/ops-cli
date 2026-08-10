@@ -693,9 +693,11 @@ mod tests {
             "20.11.0",
         );
 
-        assert!(bins_for(&pool, &["node@20.11.0".to_string()])
-            .missing
-            .is_empty());
+        assert!(
+            bins_for(&pool, &["node@20.11.0".to_string()])
+                .missing
+                .is_empty()
+        );
         // a version the pool does not hold at all
         let absent = bins_for(&pool, &["node@18.0.0".to_string()]);
         assert!(absent.bins.is_empty());
@@ -905,9 +907,11 @@ mod tests {
         .unwrap();
 
         // the version the config records is satisfied...
-        assert!(bins_for(&pool, &["node@22.3.0".to_string()])
-            .missing
-            .is_empty());
+        assert!(
+            bins_for(&pool, &["node@22.3.0".to_string()])
+                .missing
+                .is_empty()
+        );
         // ...and the one it does not is NOT, even though its install is right there
         assert_eq!(
             bins_for(&pool, &["node@24.4.1".to_string()]).missing,

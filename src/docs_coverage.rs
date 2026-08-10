@@ -54,10 +54,10 @@ fn page_stems(subdir: &str) -> BTreeSet<String> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "md") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                stems.insert(stem.to_string());
-            }
+        if path.extension().is_some_and(|e| e == "md")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            stems.insert(stem.to_string());
         }
     }
     stems
@@ -209,10 +209,10 @@ fn every_config_field_is_shown_in_the_guide() {
             at_root = rest.starts_with("RawConfig");
         }
         if line.starts_with("#[serde(") || line.starts_with("#[cfg_attr(") {
-            if let Some(rest) = line.split("rename = \"").nth(1) {
-                if let Some(name) = rest.split('"').next() {
-                    renamed = Some(name.to_string());
-                }
+            if let Some(rest) = line.split("rename = \"").nth(1)
+                && let Some(name) = rest.split('"').next()
+            {
+                renamed = Some(name.to_string());
             }
             // `skip` alone; `skip_serializing_if` still describes a field a file may set.
             // `flatten` hides the name from the file entirely: the reader writes the inner keys.

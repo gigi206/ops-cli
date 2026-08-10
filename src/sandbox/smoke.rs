@@ -215,27 +215,35 @@ mod tests {
             stderr: String::new(),
         };
         assert!(base.is_hardened());
-        assert!(!SmokeReport {
-            launched: false,
-            ..base.clone()
-        }
-        .is_hardened());
-        assert!(!SmokeReport {
-            no_new_privs: false,
-            ..base.clone()
-        }
-        .is_hardened());
-        assert!(!SmokeReport {
-            caps_dropped: false,
-            ..base.clone()
-        }
-        .is_hardened());
+        assert!(
+            !SmokeReport {
+                launched: false,
+                ..base.clone()
+            }
+            .is_hardened()
+        );
+        assert!(
+            !SmokeReport {
+                no_new_privs: false,
+                ..base.clone()
+            }
+            .is_hardened()
+        );
+        assert!(
+            !SmokeReport {
+                caps_dropped: false,
+                ..base.clone()
+            }
+            .is_hardened()
+        );
         // hermeticity is reported, not gated on here
-        assert!(SmokeReport {
-            host_home_absent: false,
-            ..base.clone()
-        }
-        .is_hardened());
+        assert!(
+            SmokeReport {
+                host_home_absent: false,
+                ..base.clone()
+            }
+            .is_hardened()
+        );
     }
 
     #[test]
