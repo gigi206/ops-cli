@@ -44,7 +44,7 @@ sbx plugins info openai        # the scheme, the grant, and where its state live
 ```
 
 A plugin that refreshes declares `state = true`, which is the only writable path
-in its sandbox — it has to keep the rotated token. `sbx plugins info` names the
+in its sandbox: it has to keep the rotated token. `sbx plugins info` names the
 directory, so you can see exactly what a third-party plugin may keep.
 
 ### 2. Seed the session, once
@@ -53,8 +53,11 @@ The plugin cannot sign you in: a first login is an interactive browser or
 device-code flow, and a resolver runs with no stdin and no terminal. Sign in with
 the application as usual, then move its refresh token across.
 
+`sbx path` lists every app's isolated home by absolute path, which is where the
+application wrote its session:
+
 ```sh
-AUTH=$(sbx app show codex | sed -n 's/^  home: *//p')/.codex/auth.json
+AUTH=$(sbx path | grep -E "/apps/codex$" | awk '{print $2}')/home/.codex/auth.json
 STATE=<the directory `sbx plugins info openai` printed>
 
 mkdir -p "$STATE" && chmod 700 "$STATE"
@@ -70,7 +73,7 @@ jq '.tokens.access_token  = "sbx-placeholder-not-a-real-credential"
 mv "$AUTH.new" "$AUTH"
 ```
 
-What to replace, and what to leave alone, is per application — see
+What to replace, and what to leave alone, is per application; see
 [the application's own habits](#the-applications-own-habits) below.
 
 ### 4. Declare the injection
@@ -94,7 +97,7 @@ sbx app run codex -- exec "…"
 
 At each launch `sbx` invokes the plugin. An access token still inside its lifetime
 is served from state, spending nothing. An expired one is exchanged, and whatever
-comes back is **written before the value is handed over** — the token that bought
+comes back is **written before the value is handed over**: the token that bought
 it is already spent, so losing the new one would cost a re-login.
 
 If the API answers `401` mid-session, the proxy
@@ -124,9 +127,10 @@ new one by a route of their own; `hermes` does, by a path this project has not
 identified. For those, the setup does not hold.
 
 **A WebSocket on the injected host is refused.** `sbx` will not inject into a host
-that also carries a WebSocket, because a frame cannot be redacted — the handshake
-gets a `403`. `codex` falls back to HTTPS on its own and keeps working; a feature
-with no fallback, like voice dictation over `api.anthropic.com`, would be lost.
+that also carries a WebSocket, because a frame cannot be redacted, so the handshake
+gets a `403`. `codex` falls back to HTTPS on its own and keeps working. A feature
+that has no such fallback loses the socket, so check what an application streams
+over the host you inject on before you commit to it.
 
 **Some applications keep their client secret to themselves.** A plugin can only
 refresh if the credentials for the exchange are obtainable. Where an application
@@ -143,6 +147,6 @@ engineering that breaks at the next release.
 
 ## See also
 
-- [Resolver plugins](plugins) — the manifest, the grant, and `state = true`
-- [Injection](injection) — strip-and-replace, and the `401` re-resolution
-- [Redaction](redaction) — what happens to a credential the cage obtained anyway
+- [Resolver plugins](plugins): the manifest, the grant, and `state = true`
+- [Injection](injection): strip-and-replace, and the `401` re-resolution
+- [Redaction](redaction): what happens to a credential the cage obtained anyway
