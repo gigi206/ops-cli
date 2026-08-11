@@ -18,6 +18,33 @@ but present. See [what the invariant covers](./#what-the-invariant-covers-and-wh
 
 :::
 
+## First, check what the application actually holds
+
+Not every sign-in produces an OAuth session. Some flows look like one, with a
+browser and a PKCE challenge, and end by handing the application a plain **API
+key**: a single long-lived string, no refresh token, no expiry. Mistral's `vibe`
+is one of those. Its account sign-in exchanges the authorization for an API key
+and saves it in the app's home.
+
+A plugin has nothing to do there. It exists to hold a refresh token and mint from
+it, and a credential that never rotates needs no minting. Take that one out of the
+cage the ordinary way: move the key into whatever you already keep secrets in, put
+a placeholder in its place, and name the resolver for that store.
+
+```toml
+[secret."api.mistral.ai"]
+header = "Authorization"
+type   = "bearer"
+from   = ["pass://mistral/api-key"]
+```
+
+Which one you are looking at is decided by what the application saved. Two values
+and an expiry mean an OAuth session, and the rest of this page applies. One value
+that never changes is an ordinary secret, and every resolver listed on
+[Resolver plugins](plugins) already covers it, with none of the care below: no
+seeding, no single-use token to lose, and a revoke-and-reissue that costs nothing
+more than editing your vault.
+
 ## The one rule
 
 **Exactly one thing may refresh a given account.**
