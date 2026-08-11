@@ -173,6 +173,7 @@ const sidebars: SidebarsConfig = {
         'secrets/resolvers',
         'secrets/injection',
         'secrets/redaction',
+        'secrets/oauth',
         'secrets/plugins',
         'secrets/stores',
       ],

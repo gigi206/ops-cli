@@ -38,6 +38,7 @@ mask_paths  = []                   # paths inside a granted one to hide again (a
 allow_env   = ["VAULT_ADDR"]       # host env vars passed into the otherwise-cleared environment
 allow_env_paths = ["VAULT_CACERT"] # env vars whose VALUE is a path: passed through, and bound
 network     = false                # true = reach the network; false = empty network namespace
+state       = false                # true = a private writable directory that survives the run
 ```
 
 - `type` must be `"resolver"`: the type is an explicit, extensible discriminator
@@ -50,6 +51,23 @@ network     = false                # true = reach the network; false = empty net
 - `[sandbox]` declares only the resolver-specific extra; the runner supplies the
   structural environment (a minimal `PATH`, a read-only host userland, `HOME`,
   and, under `network`, DNS/TLS files) on top of it.
+- `state` grants the plugin a private **writable** directory that survives the
+  run, and is the only thing in the cage that does (`HOME` is a tmpfs that dies
+  with it). It exists for one situation: a credential whose refresh token is
+  **single-use**. Each exchange invalidates the token that bought it, so a
+  resolver unable to keep what it just received destroys the session it was
+  resolving, and providers that detect the reuse revoke everything. Leave it
+  `false` for a resolver that only reads.
+
+  The grant is a boolean, never a path. `sbx` picks the location, one per
+  plugin, keeps it owner-only, and tells the plugin where it landed through
+  **`SBX_PLUGIN_STATE`**. A plugin cannot name the directory, cannot reach
+  another plugin's, and nothing in the agent's cage ever sees any of them.
+
+  One consequence to plan for: a resolver that refreshes must be the **only**
+  refresher. If the application also holds a working refresh token, both will
+  eventually exchange, the provider will see a reused token, and the session
+  dies. Give the application a placeholder before its first run.
 - `programs` names the host tools the plugin runs, **by name, never by path**.
   For each one sbx searches its own `PATH` (the one your shell gives it), so a
   tool you can run is a tool the plugin can run, whatever installed it: a
@@ -333,6 +351,7 @@ sbx plugins store install sbx-plugins vault   # then: from = "vault://secret/mya
 | `vault` | `vault://<mount>/<path>[?version=<n>]#<field>` | one field of a HashiCorp Vault KV secret, optionally at a past version | `programs = ["vault"]`; `allow_env` for `VAULT_ADDR`/`VAULT_TOKEN`/`VAULT_NAMESPACE`; `allow_paths` on `~/.vault-token`; `network = true` |
 | `openbao` | `openbao://<mount>/<path>[?version=<n>]#<field>` | the same, against an OpenBao server (`bao`) | `programs = ["bao"]`; the `BAO_*` equivalents; `network = true` |
 | `infisical` | `infisical://<project>/<env>[/<folder>][?<opts>]#<secret>` | one secret of an Infisical project | `programs = ["infisical"]`; `allow_env` for the `INFISICAL_*` credentials; `network = true` |
+| `bitwarden` | `bitwarden://<item>[#<field>]` | one field of an item in the Bitwarden vault the `bw` CLI keeps on disk: `password` by default, or `username`, `uri`, `totp`, `notes`, `field:<name>` | `programs = ["bw", "jq"]`; `allow_env` for `BW_SESSION`/`BW_PASSWORD`; `allow_paths` on the CLI's application directory; **no network** |
 | `keepassxc` | `keepassxc://<database>/<entry>[#<attribute>]` | one attribute of an entry in a `.kdbx` on disk, unlocked by a key file or password file beside it | `programs = ["keepassxc-cli"]`; `allow_paths` on the vault directories; **no network** |
 | `keepassxc-browser` | `keepassxc-browser://<url>[#<login>]` | a credential out of the database KeePassXC currently holds **unlocked**, over its browser-integration socket | `allow_paths` on that socket and the association; **no network** |
 
