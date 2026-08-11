@@ -9,8 +9,8 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -34,10 +34,9 @@ pub(super) fn ensure_provider() {
 /// is never written to the host; its certificate is trusted only inside the cage, so the
 /// interception cannot be leveraged against the user's own (Mode-A) traffic.
 pub(crate) struct Ca {
-    /// The CA signing key — kept private; never serialized off-process.
-    key: KeyPair,
-    /// The CA certificate, the issuer for every minted leaf.
-    cert: rcgen::Certificate,
+    /// The CA certificate together with the signing key behind it — the issuer of every minted
+    /// leaf. The key is kept private and never serialized off-process.
+    issuer: CertifiedIssuer<'static, KeyPair>,
     /// The CA certificate in DER, appended to each leaf's chain.
     cert_der: CertificateDer<'static>,
     /// The CA certificate in PEM, for injection into the cage trust store.
@@ -72,12 +71,11 @@ impl Ca {
         params
             .distinguished_name
             .push(DnType::CommonName, "sbx egress proxy CA");
-        let cert = params.self_signed(&key).map_err(io::Error::other)?;
-        let cert_der = cert.der().clone();
-        let cert_pem = cert.pem();
+        let issuer = CertifiedIssuer::self_signed(params, key).map_err(io::Error::other)?;
+        let cert_der = issuer.der().clone();
+        let cert_pem = issuer.pem();
         Ok(Ca {
-            key,
-            cert,
+            issuer,
             cert_der,
             cert_pem,
             leaves: Mutex::new(HashMap::new()),
@@ -132,7 +130,7 @@ impl Ca {
         // does not.
         params.use_authority_key_identifier_extension = true;
         let leaf = params
-            .signed_by(&leaf_key, &self.cert, &self.key)
+            .signed_by(&leaf_key, &self.issuer)
             .map_err(io::Error::other)?;
 
         let leaf_der = leaf.der().clone();
@@ -235,6 +233,48 @@ mod tests {
                 .windows(AKI_OID_DER.len())
                 .any(|w| w == AKI_OID_DER),
             "the leaf must carry an Authority Key Identifier, or a strict TLS stack refuses it"
+        );
+    }
+
+    /// The leaf's Authority Key Identifier must name *the signing CA*, not merely hold some
+    /// identifier: an extension carrying the wrong key satisfies a presence check while still
+    /// failing a verifier that walks the chain. The expected value is read from the CA's own
+    /// Subject Key Identifier (OID 2.5.29.14) — a different certificate than the one under test,
+    /// so neither side of the comparison is derived from the other.
+    #[test]
+    fn the_leaf_authority_identifier_is_the_signing_ca_own_key_identifier() {
+        const SKI_OID_DER: &[u8] = &[0x06, 0x03, 0x55, 0x1d, 0x0e];
+        const AKI_OID_DER: &[u8] = &[0x06, 0x03, 0x55, 0x1d, 0x23];
+        let ca = Ca::ephemeral().unwrap();
+        let ca_der = ca.ca_cert_der();
+
+        // The extension is `OID, OCTET STRING { OCTET STRING (the identifier) }`, so the identifier
+        // starts four bytes past the OID: two for each of the nested tag/length pairs.
+        let ski_at = ca_der
+            .as_ref()
+            .windows(SKI_OID_DER.len())
+            .position(|w| w == SKI_OID_DER)
+            .expect("the CA carries a Subject Key Identifier");
+        let value = &ca_der.as_ref()[ski_at + SKI_OID_DER.len()..];
+        let len = *value.get(3).expect("the identifier is length-prefixed") as usize;
+        assert_eq!(
+            len, 20,
+            "a key identifier is a 20-byte SHA-1 of the public key"
+        );
+        let ca_key_id = value.get(4..4 + len).expect("the identifier is complete");
+
+        let leaf = ca.leaf_for("api.example.com").unwrap();
+        let leaf_der = leaf.cert.first().expect("a leaf is sent first");
+        let aki_at = leaf_der
+            .as_ref()
+            .windows(AKI_OID_DER.len())
+            .position(|w| w == AKI_OID_DER)
+            .expect("the leaf carries an Authority Key Identifier");
+        assert!(
+            leaf_der.as_ref()[aki_at..]
+                .windows(ca_key_id.len())
+                .any(|w| w == ca_key_id),
+            "the leaf's Authority Key Identifier must hold the CA's key identifier"
         );
     }
 }

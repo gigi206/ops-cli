@@ -1392,7 +1392,7 @@ fn remove_at(doc: &mut toml_edit::DocumentMut, path: &[String], key: &str) -> bo
 
 /// The 1-based line `path` is written on, read from a span-preserving parse of the same text.
 fn line_of(text: &str, path: &[String]) -> Option<usize> {
-    let doc = toml_edit::ImDocument::parse(text).ok()?;
+    let doc = toml_edit::Document::parse(text).ok()?;
     let mut item = doc.as_item();
     for step in path {
         item = item.as_table_like()?.get(step)?;
