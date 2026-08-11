@@ -134,6 +134,38 @@ See [Observability](../networking/observability#a-secret-crossing-a-websocket) f
 `--json` shape. And as everywhere on this page, the structural controls below are what
 actually bound the damage.
 
+## Credentials the cage obtained for itself
+
+Everything above describes a **declared** secret. An agent that signs in by itself,
+through OAuth or SSO, ends up holding a token nobody declared, and the tripwires
+would have nothing to match it against.
+
+So the proxy remembers it. When an allowed request carries an authentication header
+(`Authorization`, `x-api-key`, and a short list of siblings), the token it holds is
+kept as a needle, and from then on it is treated like a declared secret's value:
+refused if the cage re-sends it anywhere, masked if a response reflects it, hidden
+from the capture.
+
+This is worth being explicit about, because it means `sbx` retains a value you never
+gave it. It only ever holds it in memory, never writes it and never logs it, and the
+proxy already *saw* it in any case, being the thing that terminates the cage's TLS.
+The choice is only whether it remembers what it has seen, and remembering is what
+lets it protect the credential at all.
+
+Four bounds keep this narrow:
+
+- only an **allowed** request is observed, so an agent cannot seed the scan set by
+  aiming at hosts it knows are refused;
+- observation happens **after** the outbound scan, so the request that teaches a
+  value is never refused by that value;
+- a short value is ignored, on a stricter floor than for a declared secret, since
+  one that occurs by chance would refuse ordinary requests;
+- the number kept is capped, because every needle is scanned against every request
+  head and every response chunk.
+
+It changes what is *scanned*, never what is *sent*: observing never creates an
+injection, so it cannot alter what the cage authenticates as.
+
 ## Seeing a tripwire fire
 
 Both directions are observable from the host, with the ordinary egress surfaces.

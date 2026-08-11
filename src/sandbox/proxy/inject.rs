@@ -157,6 +157,103 @@ impl Credentials {
             *current = std::sync::Arc::new(set);
         }
     }
+
+    /// Remember a credential the cage sent for itself, so the tripwires cover it too. Reports
+    /// whether it was newly kept.
+    ///
+    /// A credential an app obtained by its own sign-in is invisible to everything here: it belongs
+    /// to no declaration, so nothing refuses it on the way out, masks it on the way back, or hides
+    /// it from `sbx net logs`. sbx already *sees* it — it terminates the TLS — so the only question
+    /// is whether it retains it. Retaining it costs a value held in host memory, never written and
+    /// never logged; not retaining it leaves the credential with no protection at all.
+    ///
+    /// Only the injections are authoritative for what gets *sent*: this never adds an injection, so
+    /// observing can change what is scanned but never what the cage authenticates as.
+    pub(crate) fn observe(&self, header: &str, value: &str) -> bool {
+        let credential = credential_in(value);
+        if credential.len() < OBSERVE_MIN_LEN {
+            return false;
+        }
+        let bytes = credential.as_bytes();
+        {
+            let current = self.snapshot();
+            if current.needles.len() >= OBSERVE_MAX
+                || current.needles.iter().any(|n| n.as_bytes() == bytes)
+            {
+                return false;
+            }
+        }
+        let Ok(mut current) = self.current.write() else {
+            return false;
+        };
+        // Re-checked under the write lock: two threads can reach the check above with the same new
+        // credential, and a duplicate needle would scan the same bytes twice for the same result.
+        if current.needles.len() >= OBSERVE_MAX
+            || current.needles.iter().any(|n| n.as_bytes() == bytes)
+        {
+            return false;
+        }
+        let mut needles = current.needles.clone();
+        needles.push(SecretNeedle::named(
+            format!("observed:{header}"),
+            bytes.to_vec(),
+        ));
+        *current = std::sync::Arc::new(CredentialSet {
+            injections: current.injections.clone(),
+            needles,
+        });
+        true
+    }
+
+    /// Remember every credential a request head carries, given the head's headers. The caller must
+    /// have established that the request was **allowed**: observing a refused request would let an
+    /// agent seed the scan set by aiming at hosts it knows are denied.
+    pub(crate) fn observe_head(&self, headers: &[(String, String)]) -> usize {
+        headers
+            .iter()
+            .filter(|(name, _)| {
+                OBSERVED_AUTH_HEADERS
+                    .iter()
+                    .any(|known| name.eq_ignore_ascii_case(known))
+            })
+            .filter(|(name, value)| self.observe(name, value))
+            .count()
+    }
+}
+
+/// The request headers whose value is a credential worth remembering when the cage sends one of its
+/// own. Deliberately a short, explicit list rather than a heuristic: a guess that swept in a
+/// correlation id or a trace token would tripwire ordinary traffic and mask ordinary responses.
+const OBSERVED_AUTH_HEADERS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "x-auth-token",
+    "x-goog-api-key",
+];
+
+/// The shortest observed value kept. Higher than the floor for a *declared* secret, because that one
+/// was named by a human who accepted the consequence, while this one is inferred: a short value is
+/// far likelier to occur by chance in unrelated traffic, and a false needle blocks requests and
+/// mutates responses.
+const OBSERVE_MIN_LEN: usize = 16;
+
+/// The most observed credentials kept. A cage rotating through many values must not grow the scan
+/// set without bound, since every needle is scanned against every request head and every response
+/// chunk from an injection target.
+const OBSERVE_MAX: usize = 8;
+
+/// The credential inside an auth header value: the token, with a `Bearer`/`Basic`/`Token` scheme
+/// prefix removed. The bare token is what matters, since that is the spelling that would appear if
+/// it leaked somewhere other than this header.
+fn credential_in(value: &str) -> &str {
+    let value = value.trim();
+    for scheme in ["Bearer ", "bearer ", "Basic ", "basic ", "Token ", "token "] {
+        if let Some(rest) = value.strip_prefix(scheme) {
+            return rest.trim();
+        }
+    }
+    value
 }
 
 /// How a credential is re-resolved, host-side, when the upstream says the one being injected is no
@@ -439,6 +536,68 @@ mod tests {
             "Bearer old",
             "a failed refresh leaves the current credential in place"
         );
+    }
+
+    /// What is kept is the token, not the header value: a leaked credential shows up as the bare
+    /// token, so that is the spelling the tripwires have to match.
+    #[test]
+    fn an_observed_credential_is_kept_without_its_scheme_prefix() {
+        let creds = Credentials::new(Vec::new(), Vec::new());
+        assert!(creds.observe("authorization", "Bearer tok-0123456789abcdef"));
+        let set = creds.snapshot();
+        assert_eq!(set.needles.len(), 1);
+        assert_eq!(set.needles[0].as_bytes(), b"tok-0123456789abcdef");
+        assert!(
+            set.injections.is_empty(),
+            "observing must never change what the cage authenticates as"
+        );
+    }
+
+    /// A short value occurs by chance in unrelated traffic, and a false needle refuses requests and
+    /// mutates responses. The floor is higher than for a declared secret, which a human accepted.
+    #[test]
+    fn a_short_observed_value_is_not_kept() {
+        let creds = Credentials::new(Vec::new(), Vec::new());
+        assert!(!creds.observe("authorization", "Bearer short"));
+        assert!(creds.snapshot().needles.is_empty());
+    }
+
+    /// Every needle is scanned against every request head and every response chunk, so the same
+    /// credential seen on a thousand requests must cost one needle, not a thousand.
+    #[test]
+    fn the_same_credential_is_kept_once_and_the_set_is_capped() {
+        let creds = Credentials::new(Vec::new(), Vec::new());
+        assert!(creds.observe("authorization", "Bearer tok-0123456789abcdef"));
+        assert!(!creds.observe("authorization", "Bearer tok-0123456789abcdef"));
+        assert_eq!(creds.snapshot().needles.len(), 1);
+
+        for i in 0..20 {
+            creds.observe("authorization", &format!("Bearer tok-{i:0>20}"));
+        }
+        assert_eq!(
+            creds.snapshot().needles.len(),
+            OBSERVE_MAX,
+            "the scan set is bounded whatever the cage rotates through"
+        );
+    }
+
+    /// The header list is explicit on purpose: sweeping in a correlation id would tripwire ordinary
+    /// traffic and mask ordinary responses.
+    #[test]
+    fn only_the_named_auth_headers_are_observed() {
+        let creds = Credentials::new(Vec::new(), Vec::new());
+        let kept = creds.observe_head(&[
+            ("X-Request-Id".into(), "req-0123456789abcdef".into()),
+            (
+                "User-Agent".into(),
+                "some-agent/1.0-with-a-long-name".into(),
+            ),
+            ("Authorization".into(), "Bearer tok-0123456789abcdef".into()),
+        ]);
+        assert_eq!(kept, 1, "only the auth header counts");
+        let set = creds.snapshot();
+        assert_eq!(set.needles.len(), 1);
+        assert_eq!(set.needles[0].as_bytes(), b"tok-0123456789abcdef");
     }
 
     // The needle holds a secret to scan the wire for; its `Debug` reports only the byte length, never

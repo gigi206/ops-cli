@@ -666,6 +666,13 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    to. A redirect to another host opens a new tunnel and re-runs this match, so the secret
     //    cannot ride along to an unintended host. It is settled before any connection is taken,
     //    because which credentials a request carries is half of what partitions the pool below.
+    // 7b. Remember any credential the cage sent for itself (an OAuth token an app obtained by its own
+    //     sign-in), so the tripwires cover it as they cover a declared secret. Placed here for two
+    //     reasons: after the verdict, so a refused request cannot seed the scan set, and after the
+    //     outbound scan above, so a request is never refused by the very credential it just taught
+    //     sbx about. The needle takes effect from the next request on.
+    ctx.credentials.observe_head(&inner.headers);
+
     let injected_ids = matching_injection_ids(&creds, &connect_host, port, &itarget);
     let injected = injection_pairs(&creds, &injected_ids);
 

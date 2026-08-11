@@ -5137,6 +5137,67 @@ fn run_with_refresh(
     (credentials, calls)
 }
 
+/// What observing buys, end to end. A token the cage obtained by its own sign-in belongs to no
+/// declaration, so nothing used to refuse it on the way out. Once the proxy has seen the cage send
+/// it to an allowed host, re-sending it anywhere is refused like a declared secret's — the same
+/// tripwire, now covering a credential nobody configured.
+///
+/// The request that *taught* sbx the value is not itself refused: observing happens after the
+/// outbound scan, so a credential can never trip on its own first use.
+#[test]
+fn a_credential_the_cage_sent_itself_becomes_a_tripwire_for_the_next_request() {
+    let (addr, upstream_ca, _rx) = spawn_upstream_capturing(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["host.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+
+    // The cage authenticates with a credential of its own. Nothing is declared, so this is allowed
+    // and proxied — and it is where sbx learns the value.
+    let first = through_proxy(
+        ctx.clone(),
+        proxy_ca_der.clone(),
+        "host.test",
+        "host.test",
+        addr.port(),
+        b"GET / HTTP/1.1\r\nHost: host.test\r\nAuthorization: Bearer acquired-token-0123456789\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        first.contains("200"),
+        "the request that teaches the value must not be refused: {first:?}"
+    );
+
+    // Re-sending that same value, now in a query string, is exfiltration of a credential the cage
+    // holds — and is refused exactly as a declared secret's would be.
+    let second = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "host.test",
+        "host.test",
+        addr.port(),
+        b"GET /?leak=acquired-token-0123456789 HTTP/1.1\r\nHost: host.test\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        second.contains("403") && second.contains("outbound-secret"),
+        "an observed credential must be refused on the way out: {second:?}"
+    );
+}
+
 /// The mechanism end to end: an injection target answering `401` says the credential it was just
 /// given is no longer accepted, so the proxy re-resolves and the *next* request will carry the new
 /// value. The refused request itself is already lost — its head reached the cage before the status

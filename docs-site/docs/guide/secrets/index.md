@@ -37,18 +37,23 @@ brokered onto the wire. For those, the guarantee holds end to end.
 A credential the app **acquires by itself** is a different thing. An agent that
 completes an OAuth or SSO sign-in inside the cage receives its own token and
 writes it to its [isolated home](../apps/home), where it persists between
-launches. `sbx` never handed that token over, but it did not intercept it either:
-it sits at rest in a file the agent can read, it is not part of any `[secret]`
-declaration, and the [redaction tripwires](redaction) that watch declared values
-do not know it exists.
+launches. `sbx` never handed that token over, so the invariant has nothing to say
+about it: it sits at rest in a file the agent can read.
 
-So the honest boundary for an acquired credential is not the invariant, it is the
-rest of the sandbox: an empty network namespace, an egress allowlist that bounds
-where anything can be sent, and a home no other app or project shell can read.
+It is not left unwatched, though. The proxy terminates the cage's TLS, so it sees
+that credential the first time the cage authenticates with it, and from then on it
+is scanned for like a declared one: refused if it is re-sent anywhere, masked if it
+comes back in a response, hidden from `sbx net logs`. See
+[observed credentials](redaction#credentials-the-cage-obtained-for-itself).
+
+What that does **not** give you is the invariant. The token is still in the cage,
+still at rest in a file, still usable by anything running there. What bounds it is
+the perimeter: an empty network namespace, an egress allowlist deciding where
+anything can be sent at all, and a home no other app or project shell can read.
 That is real containment, and it is weaker than "the secret is absent by
 construction". Where an app can authenticate with a value you declare instead,
-prefer that: a declared secret is covered by the invariant, an acquired one is
-covered by the perimeter.
+prefer that: a declared secret is absent from the cage, an acquired one is merely
+bounded inside it.
 
 ## Two host-side layers: resolver × broker
 
