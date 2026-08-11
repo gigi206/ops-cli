@@ -333,6 +333,7 @@ fn bind_mode_tag(writable: bool, pal: &style::Palette) -> String {
 fn write_net_transport(
     o: &mut String,
     pool: bool,
+    ca_roots: bool,
     dns_cache_ttl: Option<u64>,
     details: bool,
     pal: &style::Palette,
@@ -349,6 +350,15 @@ fn write_net_transport(
         line(
             "connection reuse: on (a request may ride an upstream connection an earlier one left behind)",
         );
+    }
+    // The minimal anchor is the state worth naming unasked: it is what a tool that refuses a
+    // one-certificate trust store trips over, and its own error blames the bundle.
+    if !ca_roots {
+        line(
+            "cage ca: session CA only (no public roots; a tool that checks the store's shape may refuse it)",
+        );
+    } else if details {
+        line("cage ca: session CA + public roots (an ordinary, full trust store)");
     }
     match dns_cache_ttl {
         Some(0) => line("dns cache: off (every request re-resolves)"),
@@ -520,6 +530,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             capture,
             capture_max_kb,
             pool,
+            ca_roots,
             dns_cache_ttl,
             builtin,
         } => {
@@ -563,7 +574,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     )
                 );
             }
-            write_net_transport(&mut o, *pool, *dns_cache_ttl, details, pal);
+            write_net_transport(&mut o, *pool, *ca_roots, *dns_cache_ttl, details, pal);
             match default_action {
                 // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
                 NetDefaultView::Deny => {
@@ -1299,6 +1310,7 @@ fn render_app_detail(
             capture,
             capture_max_kb,
             pool,
+            ca_roots,
             dns_cache_ttl,
             builtin,
         } => {
@@ -1337,7 +1349,7 @@ fn render_app_detail(
                     )
                 );
             }
-            write_net_transport(&mut o, *pool, *dns_cache_ttl, details, pal);
+            write_net_transport(&mut o, *pool, *ca_roots, *dns_cache_ttl, details, pal);
             if details {
                 for rule in allow {
                     let _ = writeln!(o, "    allow {n}{rule}{r}");
@@ -2466,6 +2478,7 @@ mod tests {
                 capture: "off".to_string(),
                 capture_max_kb: None,
                 pool: true,
+                ca_roots: true,
                 dns_cache_ttl: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
@@ -2688,10 +2701,11 @@ mod tests {
         );
     }
 
-    /// `pool` and `dns_cache_ttl` decide how a permitted request is carried, and a trusted layer can
-    /// set either one for a project that cannot observe it from inside the cage — no client sees
-    /// whether its connection was reused, or how old the address it reached was. So each is shown
-    /// when a layer moved it off the product default, and stays out of the way when nothing did.
+    /// `pool`, `ca_roots` and `dns_cache_ttl` decide how a permitted request is carried, and a
+    /// trusted layer can set any of them for a project that has no reason to look: no client sees
+    /// whether its connection was reused or how old the address it reached was, and a trust store is
+    /// read without being examined until the day a tool refuses its shape. So each is shown when a
+    /// layer moved it off the product default, and stays out of the way when nothing did.
     #[test]
     fn config_render_shows_the_network_transport_settings_only_when_a_layer_set_them() {
         use config::view::NetworkView;
@@ -2699,24 +2713,32 @@ mod tests {
 
         let out = render_config(&sample_config_view(), &plain, false);
         assert!(
-            !out.contains("connection reuse") && !out.contains("dns cache"),
-            "neither earns a line at its default:\n{out}"
+            !out.contains("connection reuse")
+                && !out.contains("dns cache")
+                && !out.contains("cage ca"),
+            "none earns a line at its default:\n{out}"
         );
 
         let mut view = sample_config_view();
         if let NetworkView::Allowlist {
             pool,
+            ca_roots,
             dns_cache_ttl,
             ..
         } = &mut view.network
         {
             *pool = false;
+            *ca_roots = false;
             *dns_cache_ttl = Some(30);
         }
         let out = render_config(&view, &plain, false);
         assert!(
             out.contains("connection reuse: off"),
             "a launch that gave up reuse must say so:\n{out}"
+        );
+        assert!(
+            out.contains("cage ca: session CA only"),
+            "a launch that dropped the public roots must say so:\n{out}"
         );
         assert!(
             out.contains("dns cache: 30s"),
@@ -2805,6 +2827,7 @@ mod tests {
                 capture: "off".to_string(),
                 capture_max_kb: None,
                 pool: true,
+                ca_roots: true,
                 dns_cache_ttl: None,
                 builtin: vec!["cache.nixos.org".into()],
             },

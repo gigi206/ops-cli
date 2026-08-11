@@ -829,6 +829,12 @@ pub(crate) struct EgressPolicy {
     /// request left behind (`[network] pool`). On by default, and never a verdict — it changes how
     /// a request that is already allowed is carried, not whether it is. Read via [`Self::pool`].
     pool: bool,
+    /// Whether the cage's CA bundle carries the public roots after the per-session MITM CA
+    /// (`[network] ca_roots`). On by default, and never a verdict — it decides what the cage's trust
+    /// anchor *contains*, not which requests are permitted. Read via [`Self::ca_roots`], and only
+    /// ever as a preference: a policy that splices needs the roots whatever this says, because a
+    /// spliced stream is authenticated by the client against the real server.
+    ca_roots: bool,
 }
 
 impl Default for EgressPolicy {
@@ -860,6 +866,7 @@ impl EgressPolicy {
             capture: crate::sandbox::control::CaptureLevel::Off,
             capture_body_kb: None,
             pool: true,
+            ca_roots: true,
         }
     }
 
@@ -935,6 +942,20 @@ impl EgressPolicy {
     /// Whether the proxy may reuse a validated upstream connection across requests.
     pub(crate) fn pool(&self) -> bool {
         self.pool
+    }
+
+    /// Pair the cage's MITM CA with the public roots, or hand it the MITM CA alone, from
+    /// `[network] ca_roots`. Never a verdict — see the field.
+    pub(crate) fn with_ca_roots(mut self, ca_roots: bool) -> Self {
+        self.ca_roots = ca_roots;
+        self
+    }
+
+    /// Whether the cage's CA bundle should carry the public roots as a matter of preference. The
+    /// launch must still add them when [`Self::splices_any`] holds, whatever this returns: a spliced
+    /// stream reaches the real server, and the client needs the ordinary roots to authenticate it.
+    pub(crate) fn ca_roots(&self) -> bool {
+        self.ca_roots
     }
 
     /// Set the traffic-capture level and its per-body cap (builder style), from `[network] capture`

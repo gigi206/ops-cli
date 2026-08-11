@@ -4360,6 +4360,21 @@ fn validate_network_table(
     if let Some(pool) = table.pool {
         policy = policy.with_pool(pool);
     }
+    // What the cage's CA bundle contains. Never a verdict — it decides which anchors the cage trusts,
+    // not which requests are permitted, and dropping the roots only ever narrows that trust. The one
+    // case where they are load-bearing is a splice: `tcp://` hands the stream through untouched, so
+    // the client authenticates the real server itself and needs the ordinary roots to do it. Keep
+    // them there whatever the field says, and say so — a silently ignored setting reads as applied.
+    if let Some(ca_roots) = table.ca_roots {
+        if !ca_roots && policy.splices_any() {
+            warnings.push(format!(
+                "{source_label}: `ca_roots = false` is overridden by a `tcp://` rule — a spliced \
+                 stream is authenticated against the real server, so the public roots stay"
+            ));
+        } else {
+            policy = policy.with_ca_roots(ca_roots);
+        }
+    }
     // The traffic capture: how much of each permitted exchange the proxy keeps for
     // `sbx net logs --with-headers/--with-body`. Never a verdict. An unknown level is dropped with a
     // warning and the capture stays off — fail-closed, since the value names how much plaintext the

@@ -172,19 +172,26 @@ file contains follows from the question the previous paragraph raises: can anyth
 this cage reach a server the proxy does not stand in for?
 
 With every rule inspected, no. The proxy terminates each connection and presents its own
-leaf, so the session CA is the only anchor a client ever exercises, and the file holds
-that one certificate. Add a `tcp://` rule and the answer changes: a spliced stream
-reaches the real server, the client authenticates it, and the ordinary public roots are
-what lets it. The file then carries the session CA followed by the host's root bundle.
+leaf, so the session CA is the only anchor a client ever exercises. Add a `tcp://` rule
+and the answer changes: a spliced stream reaches the real server, the client
+authenticates it, and the ordinary public roots are what lets it.
 
-The difference is worth what it costs. The full bundle is about 460 KB and 120
-certificates, and a client that loads its trust store on each connection reads all of
-it: in a cage, `curl` spent about 13 ms in its TLS phase against about 1.3 ms on the
-session CA alone. That was the largest single cost on the inspected path.
+By default the file carries the session CA followed by the host's root bundle in both
+cases. Under an all-inspected policy those roots verify nothing, and they are kept for a
+different reason: a trust store holding a single certificate is an unusual file, and a
+client that sanity-checks its shape rejects it outright. That failure is cryptic, since
+the client blames the bundle rather than the sandbox, and it takes the whole tool down
+rather than one request.
 
-One consequence to know if a client starts failing: a tool that rejects a trust store for
-looking too small will do so under an all-inspected policy. None of `curl`, `git`, Python
-or Node does.
+The roots are not free. The full bundle is about 460 KB and 120 certificates, and a
+client that loads its trust store on each connection reads all of it: in a cage, `curl`
+spent about 13 ms in its TLS phase against about 1.3 ms on the session CA alone. That is
+the largest single cost on the inspected path.
+
+[`[network] ca_roots = false`](../configuration/network#the-cage-trust-anchor-ca_roots)
+buys it back for a cage whose tools are known not to make that check. It is a preference,
+not an override: where the policy carries a `tcp://` rule the roots are load-bearing, so
+they stay and the launch says so in a warning.
 
 ### Requests that arrive without a CONNECT
 

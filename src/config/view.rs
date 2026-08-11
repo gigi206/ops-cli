@@ -329,6 +329,12 @@ pub(crate) enum NetworkView {
         /// reuse is invisible from inside the cage. A global layer could otherwise set it for a
         /// project with no way to see it.
         pool: bool,
+        /// Whether the cage's CA file pairs the session CA with the public roots (`ca_roots`).
+        /// Surfaced for the diagnostic, not the secrecy: the bundle is readable in the cage, so this
+        /// hides from nobody, but a tool that refuses a minimal store fails by accusing the bundle,
+        /// and `sbx config` is where that is looked up. A launch that splices shows `true` here
+        /// whatever the field asked for, since the roots are then load-bearing.
+        ca_roots: bool,
         /// How long the proxy holds a resolved address, in seconds, when a layer set `dns_cache_ttl`
         /// — `None` when none did and the built-in cache applies. Surfaced alongside `pool` and for
         /// the same reason: it decides how long an address stands, and nothing in the cage observes
@@ -1118,6 +1124,9 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
                 .captures_bodies()
                 .then(|| a.capture_body_kb()),
             pool: a.pool(),
+            // The launch adds the roots for a splice whatever the field says, so report what the
+            // cage will actually hold rather than the preference that was written.
+            ca_roots: a.ca_roots() || a.splices_any(),
             dns_cache_ttl: a.dns_cache_ttl().map(|d| d.as_secs()),
             builtin: sandbox::builtin_allow_rules()
                 .iter()
@@ -1697,6 +1706,7 @@ mod tests {
                 capture: "off".to_string(),
                 capture_max_kb: None,
                 pool: true,
+                ca_roots: true,
                 dns_cache_ttl: Some(30),
                 builtin: vec!["cache.nixos.org".into()],
             },

@@ -1200,6 +1200,18 @@ pub(crate) struct NetworkTable {
     /// to repeat it with the client. Trusted/global-only like the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pool: Option<bool>,
+    /// Whether the cage's CA bundle carries the public root certificates after the per-session MITM
+    /// CA. **On by default**; set it to `false` to hand the cage the MITM CA alone. Under a filtering
+    /// posture the MITM CA is the only anchor that verifies anything: every byte the cage receives is
+    /// re-signed by it, so the roots are inert and cost real time — a bundle grows to ~460 KB and 120
+    /// certificates, which a client loading its store per connection pays for every time. What the
+    /// roots buy is shape: a one-certificate file is an unusual CA store, and a client that
+    /// sanity-checks it can reject the launch outright. Set `false` only for a cage whose tools are
+    /// known not to make that check. A `tcp://` rule overrides the choice — a spliced stream is
+    /// authenticated by the client against the real server, so the roots are then load-bearing and
+    /// stay, with a warning. Trusted/global-only like the rest of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ca_roots: Option<bool>,
     /// How much of each permitted exchange the egress proxy retains for `sbx net logs
     /// --with-headers`/`--with-body`: `"off"` (the default), `"headers"` (the request and response
     /// heads), or `"bodies"` (those plus a bounded prefix of each body). Never a verdict — a
@@ -2019,6 +2031,7 @@ mod tests {
                 default_methods: None,
                 dns_cache_ttl: None,
                 pool: None,
+                ca_roots: None,
             }))
         );
     }
@@ -2042,6 +2055,7 @@ mod tests {
                 default_methods: None,
                 dns_cache_ttl: None,
                 pool: None,
+                ca_roots: None,
             }))
         );
     }
@@ -2067,6 +2081,7 @@ mod tests {
                 default_methods: None,
                 dns_cache_ttl: None,
                 pool: None,
+                ca_roots: None,
             }))
         );
     }

@@ -57,6 +57,7 @@ for the full semantics.
 | `stats` | `false` turns off the per-host decision counters ([`sbx net stats`](../networking/observability)) |
 | `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
 | `pool` | `false` stops the proxy carrying a request over an upstream connection an earlier request left behind (default `true`): see below |
+| `ca_roots` | `false` hands the cage the session CA alone instead of pairing it with the public roots (default `true`): see below |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"` |
@@ -207,6 +208,36 @@ that fails on a fresh connection too, which would have failed without reuse anyw
 why reuse is on by default. It was not at first, and what changed the default was measuring
 what refusing it cost: 12 300 requests across a burst of four thousand and a ten-minute pass
 of one every two seconds, on one CDN over one link, produced no failure of any kind.
+
+## The cage trust anchor (`ca_roots`)
+
+The cage trusts one file, `/opt/sbx/egress-ca.pem`. It always opens with the per-session
+CA, which is what verifies every inspected byte, and by default the host's public root
+bundle follows it. **This is on by default.**
+
+Under an all-inspected policy those roots verify nothing: the proxy presents its own leaf
+for every connection, so the session CA alone would do. They are there for a different
+reason. A trust store holding a single certificate is an unusual file, and a client that
+sanity-checks its shape rejects it and refuses to start, blaming the bundle rather than
+the sandbox. One narrow gain is not worth a tool that will not run.
+
+```toml
+[network]
+mode     = "deny"
+allow    = ["api.example.com"]
+ca_roots = false   # the session CA alone: smaller and faster, if every tool tolerates it
+```
+
+What `false` buys is real. The full bundle is about 460 KB and 120 certificates, and a
+client that loads its trust store on each connection reads all of it: in a cage, `curl`
+spent about 13 ms in its TLS phase against about 1.3 ms on the session CA alone. Set it
+for a cage whose tools you have watched start, not as a default.
+
+It is a preference, not an override. A `tcp://` rule splices the stream through untouched,
+so the client authenticates the real server itself and the public roots are the only thing
+that lets it. Ask for the minimal bundle alongside such a rule and the roots stay, with a
+warning naming the rule that kept them. Like the rest of the table, the field is trusted
+and global-only.
 
 ## HTTP/2 and gRPC
 

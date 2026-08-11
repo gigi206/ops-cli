@@ -852,6 +852,7 @@ fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField 
         default_methods: None,
         dns_cache_ttl: None,
         pool: None,
+        ca_roots: None,
         capture: None,
         capture_max_kb: None,
     })
