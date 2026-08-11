@@ -1759,6 +1759,38 @@ fn plugins_info_reports_builtin_unknown_and_a_plugin() {
             && stdout.contains("GNUPGHOME"),
         "the plugin's manifest and grant must be shown:\n{stdout}"
     );
+    // Every other line of the grant is read-only, so the one that is not has to be legible even
+    // when it is absent: "no" states it, rather than leaving the reader to notice a missing line.
+    assert!(
+        stdout.contains("state:       no"),
+        "a plugin without writable state must say so:\n{stdout}"
+    );
+}
+
+/// The writable-state grant is the one thing a resolver gets that outlives its run, so `info` names
+/// it *and* where it lands — a reader auditing what a third-party plugin may keep should not have
+/// to reconstruct the path from the layout.
+#[test]
+fn plugins_info_names_the_writable_state_grant_and_its_location() {
+    let fx = Fixture::new();
+    fx.write_plugin(
+        "rotating",
+        "type=\"resolver\"\nscheme=\"rotating\"\nexec=\"resolve\"\n\
+         [sandbox]\nnetwork=true\nstate=true\n",
+    );
+    fx.write_plugin_exec("rotating", 0o755);
+
+    let info = fx.run(&["plugins", "info", "rotating"]);
+    assert!(info.status.success());
+    let stdout = String::from_utf8_lossy(&info.stdout);
+    assert!(
+        stdout.contains("state:       yes"),
+        "the grant must be named:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("plugin-state/rotating"),
+        "and so must the directory it lands in:\n{stdout}"
+    );
 }
 
 #[test]

@@ -1930,6 +1930,17 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     }
     println!("  sandbox grant:");
     println!("    network:     {}", p.sandbox.network);
+    // Named even when absent, and named *loudly* when present: every other line of this grant is
+    // read-only, so the one that is not is the line a reader most needs to find.
+    match p.sandbox.state {
+        true => println!(
+            "    state:       yes — a private writable directory that survives the run ({})",
+            crate::sandbox::resolver::state_dir(p)
+                .unwrap_or_default()
+                .display()
+        ),
+        false => println!("    state:       no (nothing the plugin writes outlives the run)"),
+    }
     print_grant_programs(&layout, p, err, r);
     print_grant_paths("allow_paths", &p.sandbox.allow_paths);
     print_grant_masks(&p.sandbox.mask_paths);
