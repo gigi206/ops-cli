@@ -3603,21 +3603,22 @@ mod smoke {
         let shared_paths = layout.store_dir().join("nix").join("store");
         let before = fingerprint(&shared_paths);
 
-        // cage 1: activate rg (ripgrep) — writes the global mise config + a shim into
-        // the persistent home, builds rg into the project's own store. rg is chosen over
-        // jq because jq is in the curated base toolset, so the base `jq` bin would already
-        // be on PATH and muddy the shim-vs-real-bin distinction this test asserts.
-        let (ok, _out, err) = run_script("mise use -g nix:ripgrep 1>&2");
-        assert!(ok, "`mise use -g nix:ripgrep` failed:\n{err}");
+        // cage 1: activate tree — writes the global mise config + a shim into the persistent
+        // home, builds tree into the project's own store. The tool has to sit OUTSIDE the
+        // curated base toolset (`fhs::BASE_TOOLS`): a base tool's own bin is already on PATH,
+        // which would muddy the shim-vs-real-bin distinction this test asserts. That rules out
+        // `jq`, and now `rg`, `fd` and `yq` as well.
+        let (ok, _out, err) = run_script("mise use -g nix:tree 1>&2");
+        assert!(ok, "`mise use -g nix:tree` failed:\n{err}");
 
-        // cage 2: a brand-new spec. The shims dir on PATH resolves rg for a direct
+        // cage 2: a brand-new spec. The shims dir on PATH resolves tree for a direct
         // (non-interactive) command; bash with the synthetic `--rcfile` activates mise,
-        // which puts the real rg bin on PATH. The inner interactive bash has no
+        // which puts the real tree bin on PATH. The inner interactive bash has no
         // controlling terminal here, so its job-control notice is sent to /dev/null.
         let script = "set +e\n\
-             echo \"SHIM_WHICH=$(command -v rg || echo NONE)\"\n\
-             echo \"SHIM_VER=$(rg --version 2>/dev/null)\"\n\
-             bash --rcfile /opt/sbx/bashrc -i -c 'echo \"ACT_WHICH=$(command -v rg || echo NONE)\"; echo \"ACT_VER=$(rg --version 2>/dev/null)\"' 2>/dev/null\n";
+             echo \"SHIM_WHICH=$(command -v tree || echo NONE)\"\n\
+             echo \"SHIM_VER=$(tree --version 2>/dev/null)\"\n\
+             bash --rcfile /opt/sbx/bashrc -i -c 'echo \"ACT_WHICH=$(command -v tree || echo NONE)\"; echo \"ACT_VER=$(tree --version 2>/dev/null)\"' 2>/dev/null\n";
         let (ok, out, err) = run_script(script);
         assert!(ok, "the later launch failed:\n{err}\nstdout:\n{out}");
         let marker = |key: &str| {
@@ -3626,30 +3627,31 @@ mod smoke {
                 .unwrap_or_else(|| panic!("missing marker {key} in:\n{out}"))
         };
 
-        // `sbx run` (non-interactive): rg is on PATH via the shims dir, resolved through
+        // `sbx run` (non-interactive): tree is on PATH via the shims dir, resolved through
         // the shim itself, and runs.
         assert!(
-            marker("SHIM_WHICH").ends_with("/shims/rg"),
-            "rg did not resolve through the shims dir: {}",
+            marker("SHIM_WHICH").ends_with("/shims/tree"),
+            "tree did not resolve through the shims dir: {}",
             marker("SHIM_WHICH")
         );
         assert!(
-            marker("SHIM_VER").starts_with("ripgrep"),
-            "the shimmed rg did not run: {}",
+            marker("SHIM_VER").starts_with("tree"),
+            "the shimmed tree did not run: {}",
             marker("SHIM_VER")
         );
 
         // an interactive `sbx run`: mise activate (via `--rcfile`) puts the *real* tool
-        // bin on PATH — ending in `/bin/rg`, not `/shims/rg`, so this proves activation
+        // bin on PATH — ending in `/bin/tree`, not `/shims/tree`, so this proves activation
         // engaged rather than the shim doing the work again.
         assert!(
-            marker("ACT_WHICH").ends_with("/bin/rg") && marker("ACT_WHICH").contains("/nix/store/"),
-            "mise activate did not put the real rg bin on PATH: {}",
+            marker("ACT_WHICH").ends_with("/bin/tree")
+                && marker("ACT_WHICH").contains("/nix/store/"),
+            "mise activate did not put the real tree bin on PATH: {}",
             marker("ACT_WHICH")
         );
         assert!(
-            marker("ACT_VER").starts_with("ripgrep"),
-            "the activated rg did not run: {}",
+            marker("ACT_VER").starts_with("tree"),
+            "the activated tree did not run: {}",
             marker("ACT_VER")
         );
 

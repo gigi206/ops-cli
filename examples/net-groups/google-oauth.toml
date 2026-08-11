@@ -9,8 +9,11 @@
 # The Google ACCOUNT sign-in host set, shared by agents that log in with a Google account:
 # the sign-in pages (`accounts.google.com`), the token endpoints
 # (`oauth2.googleapis.com`, `www.googleapis.com/oauth2/*`), and the post-auth profile fetch
-# (`lh3.googleusercontent.com`). NOT referenced by any shipped profile right now — `agy` keeps
-# these hosts in its own `[network]` allow; import this group the day a second app needs them.
+# (`lh3.googleusercontent.com`). `agy` names it: its consent is completed in the HOST browser from
+# a printed URL, so the cage needs the `.com` host only. A profile that completes the consent in an
+# IN-CAGE browser needs more, because Google redirects it to a country-code domain
+# (`accounts.google.fr`, …); those profiles carry their own anchored regex alongside the browser
+# hosts their Chromium needs, which is why the shipped desktop profiles do not name this group.
 # The consuming agent's bundle keeps its own product/API hosts; this group is the account.
 # Groups are global-only (like bundles): an app's allow may reference one, a project may not
 # define one.
