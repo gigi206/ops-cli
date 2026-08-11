@@ -231,7 +231,8 @@ async fn stream(
     // configured secret value verbatim, refuse it — a secret must not leave the cage, whatever
     // the verdict. Scanned on the client's head *before* sbx's own injection is added, so it can
     // never self-trip on an injected credential (parity with the HTTP/1.1 `carries_secret`).
-    if !ctx.redactions.is_empty() && head_carries_secret(&req, &ctx.redactions) {
+    let creds = ctx.credentials.snapshot();
+    if !creds.needles.is_empty() && head_carries_secret(&req, &creds.needles) {
         ctx.outcome(
             Proto::Https,
             connect_host,
@@ -319,6 +320,9 @@ async fn relay(
     path: &str,
     ctx: &ProxyCtx,
 ) {
+    // One credential state for the whole stream's relay: the injection applied below and the reflection
+    // masking decided further down must come from the same resolution.
+    let creds = ctx.credentials.snapshot();
     let tcp =
         match tokio::time::timeout(ctx.timeout, tokio::net::TcpStream::connect((ip, port))).await {
             Ok(Ok(t)) => t,
@@ -397,7 +401,7 @@ async fn relay(
     // path, so it reaches exactly its scoped destination. Runs after the verdict (a denied request
     // never got here). Each is **strip-and-replace**: the client's own copy of that header is
     // dropped and sbx's value is the only one forwarded.
-    let injected = matching_injections(ctx, host, port, path);
+    let injected = matching_injections(&creds, host, port, path);
 
     // Open the traffic capture for this stream, when the launch captures. The head recorded is the
     // client's own, rendered from the decoded request *before* the rebuild below adds any injected
@@ -489,13 +493,13 @@ async fn relay(
     // from such a host (parity with the HTTP/1.1 `masks_reflection`); every other response
     // streams untouched (no scan cost, and the mutate-on-match is confined to the one host the
     // reflection threat lives on).
-    let masks_reflection = !ctx.redactions.is_empty()
-        && ctx
+    let masks_reflection = !creds.needles.is_empty()
+        && creds
             .injections
             .iter()
             .any(|inj| super::names_exact_host(host, Some(&inj.rule)));
     if masks_reflection {
-        redact_header_map(&mut rparts.headers, &ctx.redactions);
+        redact_header_map(&mut rparts.headers, &creds.needles);
     }
 
     let mut out = Response::builder().status(rparts.status);
@@ -525,7 +529,7 @@ async fn relay(
         .filter(|c| c.keeps_body())
         .map(|c| c.response_sink());
     if masks_reflection {
-        let _ = relay_body_redacting(up_body, client_send_body, &ctx.redactions, res_sink).await;
+        let _ = relay_body_redacting(up_body, client_send_body, &creds.needles, res_sink).await;
     } else {
         let _ = relay_body(up_body, client_send_body, res_sink).await;
     }

@@ -437,7 +437,10 @@ mod tests {
     use crate::sandbox::control::{CaptureCaps, CaptureLevel, LOG_RING_CAP};
 
     fn ring(level: CaptureLevel, kb: u64) -> Arc<CaptureRing> {
-        Arc::new(CaptureRing::new(CaptureCaps::new(level, kb), vec![]))
+        Arc::new(CaptureRing::with_needles(
+            CaptureCaps::new(level, kb),
+            vec![],
+        ))
     }
 
     /// A guard over a real log ring, with an event already pushed at seq 1 so the amendment has a
@@ -584,7 +587,7 @@ mod tests {
     #[test]
     fn a_secret_split_across_two_reads_is_still_masked_because_masking_sees_the_whole_buffer() {
         use crate::sandbox::proxy::SecretNeedle;
-        let ring = Arc::new(CaptureRing::new(
+        let ring = Arc::new(CaptureRing::with_needles(
             CaptureCaps::new(CaptureLevel::Bodies, 8),
             vec![SecretNeedle::named("TOKEN", b"abcdef".to_vec())],
         ));

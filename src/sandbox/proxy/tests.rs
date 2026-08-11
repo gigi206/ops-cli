@@ -5081,6 +5081,115 @@ fn run_with_injections_and_redactions(
     (resp, head)
 }
 
+/// Drive one request through the proxy against an upstream that answers `status_line`, with a
+/// refresher wired, and report the credential state afterwards. The refresher counts its calls, so
+/// a test can tell "was not consulted" from "was consulted and changed nothing".
+fn run_with_refresh(
+    response: &'static [u8],
+    injections: Vec<HeaderInjection>,
+    request: &[u8],
+) -> (Arc<Credentials>, Arc<std::sync::atomic::AtomicUsize>) {
+    let (addr, upstream_ca, _rx) = spawn_upstream_capturing(response);
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+
+    let credentials = Arc::new(Credentials::new(injections, Vec::new()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let refresh = Arc::new(CredentialRefresh::new(
+        credentials.clone(),
+        Box::new(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((
+                vec![injection(
+                    "host.test:*",
+                    "Authorization",
+                    "Bearer refreshed",
+                )],
+                Vec::new(),
+            ))
+        }),
+    ));
+
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["host.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+            .with_shared_credentials(credentials.clone())
+            .with_refresh(refresh),
+    );
+    let _ = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "host.test",
+        "host.test",
+        addr.port(),
+        request,
+    );
+    (credentials, calls)
+}
+
+/// The mechanism end to end: an injection target answering `401` says the credential it was just
+/// given is no longer accepted, so the proxy re-resolves and the *next* request will carry the new
+/// value. The refused request itself is already lost — its head reached the cage before the status
+/// was read — which is why this asserts on the state, not on the response.
+#[test]
+fn a_401_from_an_injection_target_re_resolves_the_credential() {
+    let (credentials, calls) = run_with_refresh(
+        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        vec![injection("host.test:*", "Authorization", "Bearer stale")],
+        b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n",
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the refusal must consult the source exactly once"
+    );
+    assert_eq!(
+        credentials.snapshot().injections[0].value,
+        "Bearer refreshed",
+        "the next request carries the re-resolved value"
+    );
+}
+
+/// A `200` is not a signal about the credential. Re-resolving on anything but a refusal would spend
+/// a resolver run — a bwrap spawn for a plugin source — on every successful request.
+#[test]
+fn a_successful_response_never_re_resolves() {
+    let (credentials, calls) = run_with_refresh(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        vec![injection("host.test:*", "Authorization", "Bearer stale")],
+        b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n",
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(credentials.snapshot().injections[0].value, "Bearer stale");
+}
+
+/// A `401` from a host carrying no injection says nothing about our credentials. Acting on it would
+/// let any allowed host — one the agent chose — drive sbx's resolver at will.
+#[test]
+fn a_401_from_a_host_we_inject_nothing_into_is_not_a_refresh_signal() {
+    let (credentials, calls) = run_with_refresh(
+        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        vec![injection("other.test:*", "Authorization", "Bearer stale")],
+        b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n",
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an unrelated refusal must not reach the resolver"
+    );
+    assert_eq!(credentials.snapshot().injections[0].value, "Bearer stale");
+}
+
 /// The scan is on the pre-injection client head, so sbx's own injected credential — whose value
 /// equals a redaction needle — never self-trips: a clean client request is still proxied and
 /// receives the injection.
@@ -5620,7 +5729,7 @@ fn capturing_ctx(
     redactions: Vec<SecretNeedle>,
 ) -> Arc<ProxyCtx> {
     use crate::sandbox::control::{CaptureCaps, CaptureRing};
-    let ring = Arc::new(CaptureRing::new(
+    let ring = Arc::new(CaptureRing::with_needles(
         CaptureCaps::new(level, body_kb),
         redactions.clone(),
     ));
@@ -6030,7 +6139,7 @@ fn a_cleartext_exchange_is_captured_in_both_directions() {
     );
     let port = addr.port();
     let log = Arc::new(LogRing::new(LOG_RING_CAP));
-    let ring = Arc::new(CaptureRing::new(
+    let ring = Arc::new(CaptureRing::with_needles(
         CaptureCaps::new(CaptureLevel::Bodies, 8),
         vec![],
     ));
@@ -6176,7 +6285,10 @@ fn capturing_ws_ctx(
     level: crate::sandbox::control::CaptureLevel,
 ) -> Arc<ProxyCtx> {
     use crate::sandbox::control::{CaptureCaps, CaptureRing};
-    let ring = Arc::new(CaptureRing::new(CaptureCaps::new(level, 8), vec![]));
+    let ring = Arc::new(CaptureRing::with_needles(
+        CaptureCaps::new(level, 8),
+        vec![],
+    ));
     Arc::new(
         ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
             .unwrap()

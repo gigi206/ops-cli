@@ -178,7 +178,9 @@ use ca::upstream_server_name;
 use capture::{CaptureGuard, CaptureReader};
 use ctx::effective_policy;
 pub(crate) use ctx::{ProxyCtx, builtin_allow_rules, union_with_builtin};
-pub(crate) use inject::{HeaderInjection, SecretNeedle};
+pub(crate) use inject::{
+    CredentialRefresh, CredentialSet, Credentials, HeaderInjection, SecretNeedle,
+};
 use pool::{PoolKey, UpstreamTls};
 pub(crate) use ssrf::{AddrRefusal, ip_refusal, names_exact_host};
 use ssrf::{checked_address, resolve_checked};
@@ -250,6 +252,10 @@ const ASK_PENDING_CAP: usize = 256;
 /// agent can tell an explicit policy refusal from an unreachable host or a name that did not
 /// resolve, instead of an opaque status or a dropped connection.
 fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
+    // One credential state for the whole exchange: taken once here so the value injected and
+    // the needle scanned for can never come from two different resolutions, even if a refresh
+    // lands mid-request. A later exchange picks up the newer state.
+    let creds = ctx.credentials.snapshot();
     // 1. The CONNECT head, read byte-by-byte so the stream sits exactly at the TLS ClientHello
     //    (a buffered read would swallow the start of the handshake).
     let head = read_head_raw(&mut client, HEAD_MAX)?;
@@ -566,7 +572,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     can never trip it, and reached before the verdict so an exfil attempt never resolves a
     //     name or opens an upstream. A backstop against naive re-exfil only: it sees the head, not
     //     the streamed body, and matches the value byte-for-byte (any encoding evades it).
-    if carries_secret(&inner_bytes, &ctx.redactions) {
+    if carries_secret(&inner_bytes, &creds.needles) {
         ctx.outcome(
             super::control::Proto::Https,
             &connect_host,
@@ -612,7 +618,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     before any egress, so no `allow` is recorded — rather than open an unredactable channel
     //     that carries an injected secret. (Reached only when a `{WS}` rule already permitted the
     //     upgrade to this host; a WS to a non-`{WS}` host was denied by method above.)
-    if ws_upgrade && !matching_injections(ctx, &connect_host, port, &itarget).is_empty() {
+    if ws_upgrade && !matching_injections(&creds, &connect_host, port, &itarget).is_empty() {
         ctx.outcome(
             super::control::Proto::Https,
             &connect_host,
@@ -660,8 +666,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    to. A redirect to another host opens a new tunnel and re-runs this match, so the secret
     //    cannot ride along to an unintended host. It is settled before any connection is taken,
     //    because which credentials a request carries is half of what partitions the pool below.
-    let injected_ids = matching_injection_ids(ctx, &connect_host, port, &itarget);
-    let injected = injection_pairs(ctx, &injected_ids);
+    let injected_ids = matching_injection_ids(&creds, &connect_host, port, &itarget);
+    let injected = injection_pairs(&creds, &injected_ids);
 
     // 7a. Whether this request may share its upstream leg with others. It takes a launch that asked
     //     for reuse, an HTTP/1.1 request (the version whose connections persist by default), and no
@@ -937,13 +943,13 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     downloads) is streamed untouched, which both avoids the scan cost and confines the
     //     mutate-on-match to the one host the reflection threat actually lives on. Decided here
     //     because it covers the head as much as the body, and the head is relayed first.
-    let masks_reflection = !ctx.redactions.is_empty()
-        && ctx
+    let masks_reflection = !creds.needles.is_empty()
+        && creds
             .injections
             .iter()
             .any(|inj| names_exact_host(&connect_host, Some(&inj.rule)));
     let head_masking: &[SecretNeedle] = if masks_reflection {
-        &ctx.redactions
+        &creds.needles
     } else {
         &[]
     };
@@ -991,6 +997,13 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         && code >= 200
     {
         ctx.set_status(allow_seq, code);
+        // A `401` from a host this request carried a credential to is the destination itself saying
+        // the value is no longer accepted — the one signal worth re-resolving on, and a truer one
+        // than any declared expiry. Gated on `injected`, so a refusal from a host we inject nothing
+        // into can never make an in-cage agent drive sbx's resolver.
+        if code == 401 && !injected.is_empty() {
+            ctx.credential_refused();
+        }
     }
     // A head the upstream never finished sending delimits nothing — relay the rest until it closes.
     let framing = if complete {
@@ -1012,7 +1025,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             None => Box::new(response),
         };
         if masks_reflection {
-            pump_redacting(&mut response, br.get_mut(), &ctx.redactions)?;
+            pump_redacting(&mut response, br.get_mut(), &creds.needles)?;
         } else {
             pump_to_eof(&mut response, br.get_mut())?;
         }
@@ -1271,6 +1284,10 @@ fn handle_cleartext(
     target: &str,
     ctx: &ProxyCtx,
 ) -> io::Result<()> {
+    // One credential state for the whole exchange: taken once here so the value injected and
+    // the needle scanned for can never come from two different resolutions, even if a refresh
+    // lands mid-request. A later exchange picks up the newer state.
+    let creds = ctx.credentials.snapshot();
     // 1. Parse the absolute-form `http://host[:port]/path` target into (host, port=80 default, path).
     //    The host is canonicalized by the parser; the path is canonicalized inside `explain_clear`.
     let (host, port, path) = match allowlist::parse_url_target(target) {
@@ -1369,7 +1386,7 @@ fn handle_cleartext(
     // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
     //    configured secret verbatim. It matters more here than on the TLS path: a leaked secret sent
     //    in the clear is exposed on the wire, not just to the destination.
-    if carries_secret(head_bytes, &ctx.redactions) {
+    if carries_secret(head_bytes, &creds.needles) {
         ctx.outcome(
             super::control::Proto::Http,
             &host,
@@ -1643,6 +1660,10 @@ fn handle_https_forward(
     target: &str,
     ctx: &ProxyCtx,
 ) -> io::Result<()> {
+    // One credential state for the whole exchange: taken once here so the value injected and
+    // the needle scanned for can never come from two different resolutions, even if a refresh
+    // lands mid-request. A later exchange picks up the newer state.
+    let creds = ctx.credentials.snapshot();
     // 1. Parse the absolute-form `https://host[:port]/path` target into (host, port=443 default, path).
     //    The host is canonicalized by the parser; the path is canonicalized inside `explain`.
     let (host, port, path) = match allowlist::parse_url_target(target) {
@@ -1772,7 +1793,7 @@ fn handle_https_forward(
 
     // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
     //    configured secret verbatim, scanned before sbx's own injection so it cannot self-trip.
-    if carries_secret(head_bytes, &ctx.redactions) {
+    if carries_secret(head_bytes, &creds.needles) {
         ctx.outcome(
             super::control::Proto::Https,
             &host,
@@ -1833,8 +1854,8 @@ fn handle_https_forward(
     //    scoped destination. Unlike the `http://` path, the upstream is TLS, so a header secret rides
     //    it encrypted, never in the clear. Settled before a connection is taken, because which
     //    credentials a request carries is half of what partitions the pool.
-    let injected_ids = matching_injection_ids(ctx, &host, port, &path);
-    let injected = injection_pairs(ctx, &injected_ids);
+    let injected_ids = matching_injection_ids(&creds, &host, port, &path);
+    let injected = injection_pairs(&creds, &injected_ids);
 
     // 7a. Whether this request may share its upstream leg with others, on the same terms as the
     //     tunneled path: the launch has to have asked for reuse, and the request has to be HTTP/1.1.
@@ -2021,13 +2042,13 @@ fn handle_https_forward(
     //     Mask a reflected secret only for a response from an injection-target host (every other
     //     response streams untouched) — decided before the head is read, because the masking covers
     //     the head as much as the body and the head is relayed first.
-    let masks_reflection = !ctx.redactions.is_empty()
-        && ctx
+    let masks_reflection = !creds.needles.is_empty()
+        && creds
             .injections
             .iter()
             .any(|inj| names_exact_host(&host, Some(&inj.rule)));
     let head_masking: &[SecretNeedle] = if masks_reflection {
-        &ctx.redactions
+        &creds.needles
     } else {
         &[]
     };
@@ -2063,6 +2084,13 @@ fn handle_https_forward(
         && code >= 200
     {
         ctx.set_status(allow_seq, code);
+        // A `401` from a host this request carried a credential to is the destination itself saying
+        // the value is no longer accepted — the one signal worth re-resolving on, and a truer one
+        // than any declared expiry. Gated on `injected`, so a refusal from a host we inject nothing
+        // into can never make an in-cage agent drive sbx's resolver.
+        if code == 401 && !injected.is_empty() {
+            ctx.credential_refused();
+        }
     }
     let framing = if complete {
         response_framing(&resp_head, method)
@@ -2079,7 +2107,7 @@ fn handle_https_forward(
             None => Box::new(response),
         };
         if masks_reflection {
-            pump_redacting(&mut response, &mut client, &ctx.redactions)?;
+            pump_redacting(&mut response, &mut client, &creds.needles)?;
         } else {
             pump_to_eof(&mut response, &mut client)?;
         }
@@ -2485,22 +2513,28 @@ impl Head {
 /// canonicalized through the same matcher the verdict used. Borrowed from the context, so no
 /// secret is copied beyond the forwarded head.
 fn matching_injections<'a>(
-    ctx: &'a ProxyCtx,
+    creds: &'a CredentialSet,
     host: &str,
     port: u16,
     target: &str,
 ) -> Vec<(&'a str, &'a str)> {
-    injection_pairs(ctx, &matching_injection_ids(ctx, host, port, target))
+    injection_pairs(creds, &matching_injection_ids(creds, host, port, target))
 }
 
-/// The same match as [`matching_injections`], as **positions** in `ctx.injections`.
+/// The same match as [`matching_injections`], as **positions** in the credential set.
 ///
 /// This is what identifies a credential set without carrying one: the upstream-connection pool is
 /// partitioned by which credentials a request received, and its key has to name them without holding
 /// them. Ascending by construction, so two requests matching the same rules produce the same list.
 /// The two functions share this one matcher so the partition can never drift from the injection.
-fn matching_injection_ids(ctx: &ProxyCtx, host: &str, port: u16, target: &str) -> Vec<usize> {
-    ctx.injections
+fn matching_injection_ids(
+    creds: &CredentialSet,
+    host: &str,
+    port: u16,
+    target: &str,
+) -> Vec<usize> {
+    creds
+        .injections
         .iter()
         .enumerate()
         .filter(|(_, inj)| allowlist::rule_matches(&inj.rule, host, port, target))
@@ -2508,14 +2542,14 @@ fn matching_injection_ids(ctx: &ProxyCtx, host: &str, port: u16, target: &str) -
         .collect()
 }
 
-/// The `(header, value)` pairs named by positions in `ctx.injections`. Borrowed from the context, so
+/// The `(header, value)` pairs named by positions in the credential set. Borrowed from it, so
 /// no secret is copied beyond the forwarded head.
-fn injection_pairs<'a>(ctx: &'a ProxyCtx, ids: &[usize]) -> Vec<(&'a str, &'a str)> {
+fn injection_pairs<'a>(creds: &'a CredentialSet, ids: &[usize]) -> Vec<(&'a str, &'a str)> {
     ids.iter()
         .map(|&i| {
             (
-                ctx.injections[i].header.as_str(),
-                ctx.injections[i].value.as_str(),
+                creds.injections[i].header.as_str(),
+                creds.injections[i].value.as_str(),
             )
         })
         .collect()

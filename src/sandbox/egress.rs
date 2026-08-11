@@ -561,6 +561,23 @@ pub(crate) fn start(
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
     let (injections, redactions) = resolve_injections(secrets, project_root, bwrap)?;
 
+    // The credential state the proxy will read, built here so the refresher can hold the same one
+    // and swap it in place. Re-resolution repeats exactly this call, which is why the inputs are
+    // cloned rather than re-derived: a refresh that consulted different sources than the launch did
+    // would silently change what the cage authenticates as.
+    let credentials = std::sync::Arc::new(super::proxy::Credentials::new(injections, redactions));
+    let refresh = (!secrets.is_empty()).then(|| {
+        let (secrets, root, bwrap) = (
+            secrets.to_vec(),
+            project_root.to_path_buf(),
+            bwrap.to_path_buf(),
+        );
+        std::sync::Arc::new(super::proxy::CredentialRefresh::new(
+            credentials.clone(),
+            Box::new(move || resolve_injections(&secrets, &root, &bwrap)),
+        ))
+    });
+
     let dir = layout.data_dir().join("egress");
     DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
 
@@ -615,7 +632,11 @@ pub(crate) fn start(
     if let Some(wiring) = notify
         && let Ok(mut shared) = wiring.needles.write()
     {
-        for needle in &redactions {
+        // Seeded from the state as first resolved. A later refresh is NOT propagated here: the
+        // notifier would then redact against a superseded value. Bounded in practice — a refusal
+        // notice quotes the request, and the value it would have to match is one the upstream has
+        // already rejected — but it is a residual, not a guarantee.
+        for needle in &credentials.snapshot().needles {
             let known = shared
                 .iter()
                 .any(|n| n.name() == needle.name() && n.as_bytes() == needle.as_bytes());
@@ -631,7 +652,7 @@ pub(crate) fn start(
     let capture = capture_level.captures().then(|| {
         Arc::new(super::control::CaptureRing::new(
             super::control::CaptureCaps::new(capture_level, policy.capture_body_kb()),
-            redactions.clone(),
+            credentials.clone(),
         ))
     });
 
@@ -643,9 +664,11 @@ pub(crate) fn start(
     let wants_ca_roots = policy.ca_roots();
 
     let mut ctx = ProxyCtx::new(Arc::new(Ca::ephemeral()?), policy)?
-        .with_injections(injections)
-        .with_redactions(redactions)
+        .with_shared_credentials(credentials)
         .with_app(app.map(str::to_string));
+    if let Some(refresh) = refresh {
+        ctx = ctx.with_refresh(refresh);
+    }
     if let Some(capture) = &capture {
         ctx = ctx.with_capture(capture.clone());
     }

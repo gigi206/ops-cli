@@ -32,7 +32,9 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::sandbox::proxy::{SecretNeedle, redact_in_place};
+#[cfg(test)]
+use crate::sandbox::proxy::SecretNeedle;
+use crate::sandbox::proxy::redact_in_place;
 
 /// How much of each exchange a launch captures. `Off` is the default and costs nothing — no buffer
 /// is ever allocated on the forwarding path.
@@ -307,7 +309,11 @@ pub(crate) struct CaptureRing {
     caps: CaptureCaps,
     /// The secret values masked out of every capture on the way in. Held here rather than passed per
     /// call so masking cannot be skipped at a call site.
-    redactions: Vec<SecretNeedle>,
+    /// The live credential state, shared with the proxy rather than copied from it. A capture is
+    /// filed after the exchange it describes, and a credential can be re-resolved in between, so a
+    /// private copy would eventually mask against a superseded value — which is the one failure
+    /// that matters here, since an unmasked token is a token written into `sbx net logs`.
+    credentials: std::sync::Arc<crate::sandbox::proxy::Credentials>,
 }
 
 struct CaptureInner {
@@ -322,8 +328,12 @@ struct CaptureInner {
 }
 
 impl CaptureRing {
-    /// A ring capturing at `caps`, masking `redactions` out of everything it stores.
-    pub(crate) fn new(caps: CaptureCaps, redactions: Vec<SecretNeedle>) -> Self {
+    /// A ring capturing at `caps`, masking the current credential values out of everything it
+    /// stores.
+    pub(crate) fn new(
+        caps: CaptureCaps,
+        credentials: std::sync::Arc<crate::sandbox::proxy::Credentials>,
+    ) -> Self {
         CaptureRing {
             inner: Mutex::new(CaptureInner {
                 entries: VecDeque::new(),
@@ -331,8 +341,18 @@ impl CaptureRing {
                 evicted: 0,
             }),
             caps,
-            redactions,
+            credentials,
         }
+    }
+
+    /// A ring masking a fixed needle set, with no live state behind it. **Tests only**: production
+    /// shares the proxy's credentials so a refresh reaches the masking too.
+    #[cfg(test)]
+    pub(crate) fn with_needles(caps: CaptureCaps, needles: Vec<SecretNeedle>) -> Self {
+        Self::new(
+            caps,
+            std::sync::Arc::new(crate::sandbox::proxy::Credentials::new(Vec::new(), needles)),
+        )
     }
 
     /// The per-part caps this ring was built with, so the forwarding path sizes its buffers from the
@@ -364,7 +384,7 @@ impl CaptureRing {
             &mut capture.ws_up,
             &mut capture.ws_down,
         ] {
-            redact_in_place(&mut part.bytes, &self.redactions);
+            redact_in_place(&mut part.bytes, &self.credentials.snapshot().needles);
         }
         let weight = capture.weight();
         let mut g = self.inner.lock().unwrap();
@@ -524,7 +544,7 @@ mod tests {
 
     #[test]
     fn a_capture_is_masked_on_the_way_in_so_the_ring_never_holds_a_secret() {
-        let ring = CaptureRing::new(
+        let ring = CaptureRing::with_needles(
             CaptureCaps::new(CaptureLevel::Bodies, 8),
             vec![needle("s3cr3t-value")],
         );
@@ -553,7 +573,7 @@ mod tests {
 
     #[test]
     fn the_byte_budget_evicts_the_oldest_captures_and_counts_them() {
-        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
+        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
         // Each capture is a third of the budget, so the fifth leaves room for only the last three.
         let chunk = vec![b'x'; CAPTURE_TOTAL_BUDGET / 3];
         for seq in 1..=5u64 {
@@ -576,7 +596,7 @@ mod tests {
     /// the fold, or a long session's accounting drifts until it evicts captures it should have kept.
     #[test]
     fn a_second_filing_of_the_same_exchange_folds_into_the_first() {
-        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
+        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
         let mut handshake = Capture::new(4);
         handshake.req_head = bytes(b"GET /chat HTTP/1.1\r\n\r\n");
         handshake.res_head = bytes(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
@@ -607,7 +627,7 @@ mod tests {
     /// while the tunnel is open) — pinned here so the fold's contract is explicit.
     #[test]
     fn a_later_filing_replaces_a_part_it_carries_and_leaves_the_others_alone() {
-        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
+        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
         let mut first = Capture::new(1);
         first.res_head = bytes(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
         first.ws_down = CaptureBytes {
@@ -634,7 +654,7 @@ mod tests {
 
     #[test]
     fn entries_stay_in_sequence_order_even_when_exchanges_finish_out_of_order() {
-        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Headers, 8), vec![]);
+        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Headers, 8), vec![]);
         // A long-running exchange (seq 1) finishes after two later ones.
         for seq in [3u64, 2, 1] {
             let mut cap = Capture::new(seq);
@@ -648,7 +668,7 @@ mod tests {
 
     #[test]
     fn an_empty_capture_is_not_stored_at_all() {
-        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
+        let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
         ring.insert(Capture::new(7));
         assert!(ring.get(&[7]).0.is_empty());
     }

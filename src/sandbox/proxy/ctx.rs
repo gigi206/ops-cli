@@ -19,6 +19,8 @@ use crate::sandbox::egress_stats::{EgressStats, StatKind};
 
 use super::ca::{Ca, CertResolver, ensure_provider, upstream_config, upstream_config_h2};
 use super::dns::{Resolver, caching_resolver};
+use super::inject::{CredentialRefresh, Credentials};
+#[cfg(test)]
 use super::inject::{HeaderInjection, SecretNeedle};
 use super::redact_in_place;
 
@@ -79,8 +81,13 @@ pub(crate) struct ProxyCtx {
     pub(super) policy: EgressPolicy,
     pub(super) resolve: Resolver,
     pub(super) timeout: Duration,
-    pub(super) injections: Vec<HeaderInjection>,
-    pub(super) redactions: Vec<SecretNeedle>,
+    /// The live credential state: the injections to apply and the needles to scan for, as one
+    /// unit. Shared rather than owned because a credential can be re-resolved mid-session, and
+    /// because the capture ring masks with the same needles — one state, three consumers.
+    pub(super) credentials: Arc<Credentials>,
+    /// How to re-resolve those credentials when an injection target refuses one. `None` for a
+    /// launch with nothing to refresh.
+    pub(super) refresh: Option<Arc<CredentialRefresh>>,
     /// The shared queue of parked `ask`-posture requests. Under `DefaultAction::Ask` an undecided
     /// request enqueues here and blocks; the control socket ([`crate::sandbox::control`]) answers it. A
     /// throwaway internal queue by default (so a non-ask launch never touches it); the launch
@@ -181,8 +188,8 @@ impl ProxyCtx {
             policy,
             resolve,
             timeout: Duration::from_secs(30),
-            injections: Vec::new(),
-            redactions: Vec::new(),
+            credentials: Arc::new(Credentials::new(Vec::new(), Vec::new())),
+            refresh: None,
             pending: Arc::new(crate::sandbox::control::PendingState::new()),
             manual: Arc::new(crate::sandbox::control::ManualRules::new()),
             notices: false,
@@ -497,11 +504,12 @@ impl ProxyCtx {
     /// the same needle set and masking as the outbound/response redaction; `*` is ASCII and
     /// same-length, so the result stays valid UTF-8.
     fn redact_query(&self, path: &str) -> String {
-        if self.redactions.is_empty() {
+        let creds = self.credentials.snapshot();
+        if creds.needles.is_empty() {
             return path.to_string();
         }
         let mut bytes = path.as_bytes().to_vec();
-        redact_in_place(&mut bytes, &self.redactions);
+        redact_in_place(&mut bytes, &creds.needles);
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -521,22 +529,52 @@ impl ProxyCtx {
         self
     }
 
-    /// Attach the resolved host-side credential injections. The proxy applies each to an
-    /// allowed request whose host and path its `rule` matches, replacing any client-supplied
-    /// copy of the header — so the cage never holds the plaintext yet the request still carries
-    /// it. Set once by the launch ([`crate::sandbox::egress::start`]) after resolving the sources.
-    pub(crate) fn with_injections(mut self, injections: Vec<HeaderInjection>) -> Self {
-        self.injections = injections;
+    /// Share an already-built credential state, so a consumer outside the proxy (the capture ring's
+    /// masking) scans for exactly what this proxy injects, including after a refresh.
+    pub(crate) fn with_shared_credentials(mut self, credentials: Arc<Credentials>) -> Self {
+        self.credentials = credentials;
         self
     }
 
-    /// Attach the outbound-redaction needles (the configured secrets' wire values). The proxy
-    /// refuses any request whose decrypted head carries one verbatim, so a secret the agent
-    /// obtained cannot be re-sent in the clear. Set by the launch ([`crate::sandbox::egress::start`])
-    /// from the same resolved sources as the injections; the two never disagree.
-    pub(crate) fn with_redactions(mut self, redactions: Vec<SecretNeedle>) -> Self {
-        self.redactions = redactions;
+    /// Wire re-resolution, so an upstream that refuses the injected credential can be answered with
+    /// a freshly resolved one on the next request. Absent by default: a launch that never resolved a
+    /// credential has nothing to refresh, and one whose sources are all static gains nothing.
+    pub(crate) fn with_refresh(mut self, refresh: Arc<CredentialRefresh>) -> Self {
+        self.refresh = Some(refresh);
         self
+    }
+
+    /// Tell the refresher that an injection target refused the credential it was given.
+    ///
+    /// Called only for a `401` from a host that actually carries an injection: an unrelated refusal
+    /// says nothing about our credential, and spending a resolver run on it would let any allowed
+    /// host drive sbx's resolver. The refresher applies its own bounds on top (see
+    /// [`CredentialRefresh::on_refusal`]), so this is safe to call on every such response.
+    ///
+    /// The request that met the `401` is already lost: its head has been relayed to the cage by the
+    /// time the status is read. What a refresh buys is the *next* one, which is enough for a client
+    /// that retries — and every agent CLI observed here does.
+    pub(super) fn credential_refused(&self) {
+        if let Some(refresh) = &self.refresh {
+            refresh.on_refusal();
+        }
+    }
+
+    /// Set the injections alone, keeping the needles. **Tests only**, and deliberately so: the
+    /// production path goes through [`Self::with_credentials`], where the pairing is the shape of
+    /// the call and cannot be half-done. A test that exercises one side without the other is
+    /// stating exactly that, which is why the asymmetry is allowed here and nowhere else.
+    #[cfg(test)]
+    pub(crate) fn with_injections(self, injections: Vec<HeaderInjection>) -> Self {
+        let needles = self.credentials.snapshot().needles.clone();
+        self.with_shared_credentials(Arc::new(Credentials::new(injections, needles)))
+    }
+
+    /// Set the needles alone, keeping the injections. **Tests only** — see [`Self::with_injections`].
+    #[cfg(test)]
+    pub(crate) fn with_redactions(self, needles: Vec<SecretNeedle>) -> Self {
+        let injections = self.credentials.snapshot().injections.clone();
+        self.with_shared_credentials(Arc::new(Credentials::new(injections, needles)))
     }
 
     /// The CA certificate (PEM) a launch injects into the cage trust store so in-cage tools accept

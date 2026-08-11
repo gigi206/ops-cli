@@ -854,8 +854,9 @@ pub(super) fn relay_websocket(
         ),
         false => (None, None),
     };
-    let mut tee_up = FrameTee::new(to_upstream, &ctx.redactions, up_deflate);
-    let mut tee_down = FrameTee::new(to_client, &ctx.redactions, down_deflate);
+    let creds = ctx.credentials.snapshot();
+    let mut tee_up = FrameTee::new(to_upstream, &creds.needles, up_deflate);
+    let mut tee_down = FrameTee::new(to_client, &creds.needles, down_deflate);
     // The transcript is filed whenever a direction reaches its cap, and once more when the tunnel
     // ends (in the capture guard's teardown). Each direction has its own trigger, and each fires at
     // most once: one side of a live stream can fill in seconds while the other trickles for hours,

@@ -112,6 +112,35 @@ broker or observe interference: the proxy always presents `sbx`'s credential,
 and only that, to the upstream. Injection is re-matched per request, so it tracks
 the live, canonicalized destination rather than a once-computed guess.
 
+## When the upstream refuses the credential
+
+A credential can stop being accepted while the cage is still running: an access
+token expires, a secret is rotated, a session is revoked elsewhere. When an
+injection target answers **`401`**, `sbx` re-runs the resolver for that
+declaration and injects the newly resolved value from then on.
+
+The trigger is the refusal, not a declared expiry. An expiry is a claim about a
+clock this process does not own, and it says nothing about a token revoked early;
+a `401` is the destination itself stating that the value it was given is no
+longer good.
+
+**The refused request is lost.** Its response head reaches the cage before `sbx`
+reads the status, so what a refresh buys is the *next* request. In practice the
+agent retries and continues, but the first call after a credential goes stale
+does fail, and that is worth knowing before you read it as a bug.
+
+Three bounds keep a hopeless credential from spinning, since a resolver run can
+mean launching a sandboxed plugin:
+
+- a refusal within a short window of the last attempt is ignored;
+- a resolver that **errors** stops the mechanism for the session, since a broken
+  source is not a stale one and retrying only repeats the failure;
+- a resolver that returns **the same value** stops it too: the upstream just
+  refused that value, so re-sending it would only be refused again.
+
+A `401` from a host carrying no injection is never a signal. Otherwise any
+allowed destination, including one the agent chose, could drive the resolver.
+
 ## Worked example
 
 The declaration above (`sops://` source, `bearer` header) plays out like this:

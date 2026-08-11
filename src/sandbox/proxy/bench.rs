@@ -629,7 +629,7 @@ fn bulk_throughput() {
                 .with_redactions(needles.clone());
         }
         if label == "with capture = bodies" {
-            ctx = ctx.with_capture(Arc::new(CaptureRing::new(
+            ctx = ctx.with_capture(Arc::new(CaptureRing::with_needles(
                 CaptureCaps::new(CaptureLevel::Bodies, 64),
                 vec![],
             )));
