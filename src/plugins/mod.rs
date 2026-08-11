@@ -258,6 +258,20 @@ pub(crate) struct SandboxGrant {
     pub(crate) allow_env_paths: Vec<String>,
     /// Whether the plugin may reach the network (`false` runs it in an empty network namespace).
     pub(crate) network: bool,
+    /// Whether the plugin gets a private, **writable** directory to keep state in across runs.
+    ///
+    /// Everything else a plugin is granted is read-only, deliberately: a resolver reads a secret
+    /// from somewhere and prints it, and one that could write had a larger blast radius for no
+    /// gain. A credential with a *rotating* refresh token breaks that symmetry — each exchange
+    /// invalidates the token that bought it, so a resolver which cannot persist what it just
+    /// received destroys the session it was resolving. Providers that detect the reuse revoke
+    /// everything, and recovery is an interactive re-login.
+    ///
+    /// So the grant exists, and is narrow: a boolean, never a path. sbx picks the location
+    /// (`<data>/plugin-state/<name>`, owner-only), one per plugin, and tells the plugin where it
+    /// landed through `SBX_PLUGIN_STATE`. A plugin cannot name the directory, cannot reach
+    /// another plugin's, and nothing in the agent's cage ever sees any of them.
+    pub(crate) state: bool,
 }
 
 /// The installed resolver plugins, keyed by the scheme each claims, plus the schemes no plugin
@@ -435,6 +449,8 @@ struct RawSandbox {
     mask_paths: Vec<String>,
     #[serde(default)]
     network: bool,
+    #[serde(default)]
+    state: bool,
 }
 
 /// Load and validate one plugin directory. `Ok(None)` when the directory holds no
@@ -518,6 +534,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
             allow_env: raw.sandbox.allow_env,
             allow_env_paths: raw.sandbox.allow_env_paths,
             network: raw.sandbox.network,
+            state: raw.sandbox.state,
         },
         version: raw.version,
         description: raw.description,
@@ -1272,6 +1289,35 @@ mod tests {
         );
         assert_eq!(p.sandbox.allow_env, vec!["GNUPGHOME".to_string()]);
         assert!(!p.sandbox.network);
+        assert!(
+            !p.sandbox.state,
+            "a manifest that does not ask for state gets none: the cage stays read-only"
+        );
+    }
+
+    /// The writable-state grant is opt-in and says so in one word. It exists for a resolver whose
+    /// credential rotates on use — one that cannot keep what it just received destroys the session
+    /// it was resolving — and it is the only thing in the cage that outlives a run.
+    #[test]
+    fn a_manifest_can_ask_for_a_writable_state_directory() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "rotating",
+            r#"
+                name   = "rotating"
+                type   = "resolver"
+                scheme = "rotating"
+                exec   = "resolve"
+                [sandbox]
+                network = true
+                state   = true
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let p = reg.resolver("rotating").expect("rotating resolver");
+        assert!(p.sandbox.state);
     }
 
     #[test]

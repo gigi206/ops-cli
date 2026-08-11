@@ -48,6 +48,29 @@ const CAGE_HOME: &str = "/tmp";
 /// never meet, but one prefix meaning two unrelated things is a trap for a later reader.
 const CAGE_PROGRAMS: &str = "/run/sbx-programs";
 
+/// Where a `state = true` plugin's private directory is bound, and the value of
+/// `SBX_PLUGIN_STATE`. The one writable path in an otherwise read-only cage, so it is named
+/// separately from `HOME` (a tmpfs that dies with the run) to make the distinction visible in the
+/// argv: this one survives, and is the only thing that does.
+const CAGE_STATE: &str = "/run/sbx-state";
+
+/// The host directory backing [`CAGE_STATE`] for `plugin`, under `<data>/plugin-state/<name>`.
+///
+/// Derived from the plugin's own installed directory rather than from its manifest `name`: the
+/// directory name is what the installer already validated as a safe path component, so it cannot
+/// traverse, and two plugins cannot collide on it the way two manifests could.
+fn state_dir(plugin: &ResolverPlugin) -> Option<PathBuf> {
+    let name = plugin.dir.file_name()?;
+    Some(
+        plugin
+            .dir
+            .parent()?
+            .parent()?
+            .join("plugin-state")
+            .join(name),
+    )
+}
+
 /// Run `plugin` to resolve `reff`, returning its raw stdout on success (the caller classifies
 /// empty-as-absent). Fails closed: a non-zero exit, a runner that cannot spawn, or non-UTF-8
 /// output is a hard error naming the resolver — never the secret, and never the resolver's stdout.
@@ -66,6 +89,26 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
             ),
         )
     })?;
+
+    // The private state directory has to exist before bwrap binds it, and owner-only from the
+    // start: it will hold a refresh token, and a directory created world-readable and tightened
+    // afterwards is readable in between.
+    if plugin.sandbox.state
+        && let Some(dir) = state_dir(plugin)
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "could not create the state directory for the `{}` resolver plugin at {}: {e}",
+                    plugin.scheme,
+                    dir.display()
+                ))
+            })?;
+    }
 
     let mut allow_env = resolve_allow_env(&plugin.sandbox.allow_env);
     // The path-valued variables resolve the same way, and their values are additionally bound.
@@ -606,6 +649,18 @@ fn cage_spec(
     // A network grant shares the host network and binds the DNS + TLS files a resolver needs to
     // reach a remote secret store; without it the cage gets an empty network namespace (no egress
     // at all — fail-closed). The files are `try`, so a host missing one does not fail the launch.
+    // The private state directory, writable, for a plugin that declared it. Bound rather than
+    // created inside the cage so it outlives the run: what a rotating credential's resolver writes
+    // here is the only copy of the token that buys the next one.
+    if plugin.sandbox.state
+        && let Some(src) = state_dir(plugin)
+    {
+        mounts.push(Mount::Bind {
+            src,
+            dest: PathBuf::from(CAGE_STATE),
+        });
+    }
+
     let net = if plugin.sandbox.network {
         for f in [
             "/etc/resolv.conf",
@@ -633,6 +688,11 @@ fn cage_spec(
     // identity always wins over a manifest that happens to name them (self-harm at worst).
     let mut env: Vec<(String, String)> = allow_env.to_vec();
     env.push(("HOME".to_string(), CAGE_HOME.to_string()));
+    // Where the private state landed, for a plugin that asked for it. Named rather than assumed, so
+    // a plugin never hardcodes the path and sbx stays free to move it.
+    if plugin.sandbox.state {
+        env.push(("SBX_PLUGIN_STATE".to_string(), CAGE_STATE.to_string()));
+    }
     // The programs directory leads the cage's `PATH` when the manifest declares any, so a
     // declared tool wins over a same-named one in the host userland: the plugin runs the binary
     // sbx resolved and vetted, not whatever `/usr/bin` happens to hold.
@@ -676,6 +736,7 @@ mod tests {
     fn cage_spec_isolates_the_network_and_passes_the_ref_as_argv1() {
         let dir = TmpDir::new();
         let grant = SandboxGrant {
+            state: false,
             programs: vec![],
             allow_paths: vec![PathBuf::from("/home/u/.gnupg")],
             allow_env: vec![],
@@ -731,6 +792,7 @@ mod tests {
     fn cage_spec_shares_the_network_and_binds_dns_tls_under_a_network_grant() {
         let dir = TmpDir::new();
         let grant = SandboxGrant {
+            state: false,
             programs: vec![],
             allow_paths: vec![],
             allow_env: vec![],
@@ -760,6 +822,7 @@ mod tests {
     fn cage_spec_binds_declared_programs_and_leads_the_cage_path_with_them() {
         let dir = TmpDir::new();
         let grant = SandboxGrant {
+            state: false,
             programs: vec!["vault".to_string()],
             ..SandboxGrant::default()
         };
@@ -838,6 +901,7 @@ mod tests {
     fn a_mask_covers_a_granted_path_and_comes_after_every_bind() {
         let dir = TmpDir::new();
         let grant = SandboxGrant {
+            state: false,
             allow_paths: vec![PathBuf::from("/home/u/.gnupg")],
             mask_paths: vec![PathBuf::from("/home/u/.gnupg/private-keys-v1.d")],
             ..SandboxGrant::default()
@@ -1026,6 +1090,104 @@ mod tests {
         std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
         let p = plugin_in(dir.path(), grant);
         (dir, p)
+    }
+
+    /// A plugin installed the way the installer places one — `<data>/plugins/<name>` — so
+    /// [`state_dir`] resolves to a sibling `<data>/plugin-state/<name>` inside the temp tree.
+    fn installed_resolver(body: &str, grant: SandboxGrant) -> (TmpDir, ResolverPlugin) {
+        let root = TmpDir::new();
+        let dir = root.join("plugins").join("stateful");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exec = dir.join("resolve");
+        std::fs::write(&exec, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut p = plugin_in(&dir, grant);
+        p.exec = exec;
+        (root, p)
+    }
+
+    /// The one writable path in the cage exists only when the manifest asked for it, and the plugin
+    /// is told where it landed rather than having to know the path.
+    #[test]
+    fn cage_spec_binds_a_writable_state_dir_only_under_the_grant() {
+        for state in [false, true] {
+            let (_root, p) = installed_resolver(
+                "true",
+                SandboxGrant {
+                    state,
+                    ..SandboxGrant::default()
+                },
+            );
+            let spec = cage_spec(&p, "test://x", &[], &[], &[], &[]).unwrap();
+            let env = super::super::argv::env_args(&spec);
+            let argv: Vec<String> = super::super::argv::to_argv(&spec)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            // A writable bind is `--bind`; every other path this cage gets is `--ro-bind`.
+            let writable = argv
+                .windows(2)
+                .any(|w| w[0] == "--bind" && w[1].ends_with("plugin-state/stateful"));
+            assert_eq!(
+                writable, state,
+                "a writable state bind must appear exactly when the grant asked (state={state})"
+            );
+            assert_eq!(
+                contains_setenv(&env, "SBX_PLUGIN_STATE", CAGE_STATE),
+                state,
+                "the location is named to the plugin only under the grant (state={state})"
+            );
+        }
+    }
+
+    /// What the grant is for: a resolver that receives a single-use, rotating credential must be
+    /// able to keep what it just received, or the next run has nothing to exchange. The counter
+    /// stands in for that token — it survives the cage, which the `HOME` tmpfs would not.
+    #[test]
+    fn run_keeps_state_across_invocations_under_the_grant() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let (_root, p) = installed_resolver(
+            r#"n=$(cat "$SBX_PLUGIN_STATE/n" 2>/dev/null || echo 0)
+n=$((n+1))
+echo "$n" > "$SBX_PLUGIN_STATE/n"
+printf 'run-%s' "$n""#,
+            SandboxGrant {
+                state: true,
+                ..SandboxGrant::default()
+            },
+        );
+        assert_eq!(run(&bwrap, &p, "test://x").unwrap(), "run-1");
+        assert_eq!(
+            run(&bwrap, &p, "test://x").unwrap(),
+            "run-2",
+            "the second run must see what the first wrote"
+        );
+    }
+
+    /// Without the grant there is no writable path at all: `HOME` is a tmpfs that dies with the
+    /// run, so a plugin that tries to keep something starts over every time.
+    #[test]
+    fn run_keeps_nothing_across_invocations_without_the_grant() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let (_root, p) = installed_resolver(
+            r#"n=$(cat "$HOME/n" 2>/dev/null || echo 0)
+n=$((n+1))
+echo "$n" > "$HOME/n"
+printf 'run-%s' "$n""#,
+            SandboxGrant::default(),
+        );
+        assert_eq!(run(&bwrap, &p, "test://x").unwrap(), "run-1");
+        assert_eq!(
+            run(&bwrap, &p, "test://x").unwrap(),
+            "run-1",
+            "an ungranted plugin starts from nothing on every run"
+        );
     }
 
     #[test]
