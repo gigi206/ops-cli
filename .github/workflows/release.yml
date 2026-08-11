@@ -32,7 +32,7 @@ jobs:
     name: build + publish release asset
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (with the musl target)
         uses: dtolnay/rust-toolchain@stable
@@ -48,7 +48,7 @@ jobs:
         run: cargo install cargo-zigbuild --locked
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v27
+        uses: cachix/install-nix-action@v31
         with:
           extra_conf: |
             experimental-features = nix-command flakes
@@ -98,7 +98,7 @@ jobs:
           sha256sum sbx-linux-x86_64 | cut -d' ' -f1 > sbx-linux-x86_64.sha256
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             sbx-linux-x86_64

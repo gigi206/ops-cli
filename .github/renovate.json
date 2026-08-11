@@ -11,6 +11,13 @@
     "enabled": true,
     "schedule": ["before 9am on monday"]
   },
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "description": "A RustSec or OSV advisory is not a weekly chore: it leaves the schedule and opens its own pull request as soon as it lands.",
+    "labels": ["security"],
+    "schedule": ["at any time"],
+    "prPriority": 10
+  },
   "packageRules": [
     {
       "description": "Rust crates: keep Cargo.lock current; a major stands on its own PR so a breaking bump is never hidden in a batch.",
@@ -24,6 +31,59 @@
       "groupName": "github-actions",
       "addLabels": ["ci"],
       "semanticCommitType": "ci"
+    },
+    {
+      "description": "Docusaurus ships its core, preset and themes on one version line; bumping them apart breaks the docs build.",
+      "matchManagers": ["npm"],
+      "matchPackageNames": [
+        "@docusaurus/core",
+        "@docusaurus/preset-classic",
+        "@docusaurus/theme-mermaid"
+      ],
+      "groupName": "docusaurus",
+      "addLabels": ["docs"],
+      "semanticCommitType": "docs"
+    },
+    {
+      "description": "The search indexer is a pair: the CLI and its default UI are published together and are only compatible at the same version.",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["pagefind", "@pagefind/default-ui"],
+      "groupName": "pagefind",
+      "addLabels": ["docs"],
+      "semanticCommitType": "docs"
+    },
+    {
+      "description": "The TLS and hashing stack backs the egress proxy's certificates and the trust gate's digests. A major here is a review, not a merge: surface it on the dashboard rather than opening a pull request.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "ring",
+        "rustls",
+        "tokio-rustls",
+        "rcgen",
+        "sha2",
+        "webpki-roots"
+      ],
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true,
+      "addLabels": ["security"]
+    },
+    {
+      "description": "The nixpkgs revision the bundled engines are built from. Detection only: build.rs verifies a sha256 of the resulting binaries, so a revision bump has to carry a recomputed hash and cannot be merged on its own.",
+      "matchDepNames": ["NixOS/nixpkgs"],
+      "dependencyDashboardApproval": true,
+      "addLabels": ["engines"]
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "The pinned nixpkgs revision behind the static nix and bwrap engines, which no manager reads on its own because it lives inside a shell task.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^mise\\.toml$/"],
+      "matchStrings": ["github:NixOS/nixpkgs/(?<currentDigest>[0-9a-f]{40})#"],
+      "depNameTemplate": "NixOS/nixpkgs",
+      "packageNameTemplate": "https://github.com/NixOS/nixpkgs",
+      "currentValueTemplate": "nixos-unstable",
+      "datasourceTemplate": "git-refs"
     }
   ]
 }
