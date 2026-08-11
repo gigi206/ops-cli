@@ -230,6 +230,23 @@ fn split_one_rule(
     Ok((parsed, rule))
 }
 
+/// The `--interval` value the watching verbs share: whole seconds, at least one. Shared for the
+/// three refusals it carries rather than for its length — a message the user reads, written out
+/// once per call site, is a message that drifts between them.
+fn interval_seconds(value: Option<&OsString>) -> Result<u64, String> {
+    let v = value.ok_or_else(|| "`--interval` needs a value in seconds".to_string())?;
+    let secs: u64 = v.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
+        format!(
+            "invalid interval `{}` — expected a whole number of seconds",
+            v.to_string_lossy()
+        )
+    })?;
+    if secs == 0 {
+        return Err("interval must be at least 1 second".to_string());
+    }
+    Ok(secs)
+}
+
 /// Resolve the working directory, mapping a failure to an error exit. Shared by the verbs.
 fn config_cwd() -> Result<PathBuf, ExitCode> {
     std::env::current_dir().map_err(|e| {

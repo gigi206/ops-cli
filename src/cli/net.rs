@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::{
     RuleWrite, egress_data_dir, egress_write_target, fold_app_overlay, format_log_time,
-    net_mode_word, open_rule_write, pending_session_context, persist_egress_rule,
+    interval_seconds, net_mode_word, open_rule_write, pending_session_context, persist_egress_rule,
     precheck_local_save, session_app_of, session_pids_for_app, session_pids_for_project,
     split_one_rule, split_scope, split_session_flags,
 };
@@ -197,19 +197,7 @@ fn parse_watch_args(args: &[OsString]) -> Result<WatchArgs, String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.to_str() {
-            Some("-i") | Some("--interval") => {
-                let v = it.next().ok_or("`--interval` needs a value in seconds")?;
-                let secs: u64 = v.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
-                    format!(
-                        "invalid interval `{}` — expected a whole number of seconds",
-                        v.to_string_lossy()
-                    )
-                })?;
-                if secs == 0 {
-                    return Err("interval must be at least 1 second".into());
-                }
-                interval_secs = secs;
-            }
+            Some("-i") | Some("--interval") => interval_secs = interval_seconds(it.next())?,
             Some("-a") | Some("--app") => {
                 let name = it.next().ok_or("`--app` needs an app name")?;
                 app = Some(name.to_string_lossy().into_owned());
@@ -295,19 +283,7 @@ fn parse_live_args(args: &[OsString]) -> Result<LiveArgs, String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.to_str() {
-            Some("-i") | Some("--interval") => {
-                let v = it.next().ok_or("`--interval` needs a value in seconds")?;
-                let secs: u64 = v.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
-                    format!(
-                        "invalid interval `{}` — expected a whole number of seconds",
-                        v.to_string_lossy()
-                    )
-                })?;
-                if secs == 0 {
-                    return Err("interval must be at least 1 second".into());
-                }
-                interval_secs = secs;
-            }
+            Some("-i") | Some("--interval") => interval_secs = interval_seconds(it.next())?,
             Some("-a") | Some("--app") => {
                 let name = it.next().ok_or("`--app` needs an app name")?;
                 app = Some(name.to_string_lossy().into_owned());
