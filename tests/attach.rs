@@ -263,10 +263,13 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     // retry across it — and only across it: any other attach failure still fails on the first try.
     let attachable_by = Instant::now() + Duration::from_secs(60);
     let log = loop {
+        // `$HOME` is echoed before the write so a failure says *where* the marker went: without
+        // it, the assertion can only report that the file is absent from where it was expected,
+        // which is the one thing already known.
         let log = drive_attach(
             pid,
             data.path(),
-            b"printf done > \"$HOME/ATTACH_OK\"\nexit\n",
+            b"echo \"ATTACH_HOME=[$HOME]\"\nprintf done > \"$HOME/ATTACH_OK\"\nexit\n",
         );
         if !log.contains("has no live process to enter") || Instant::now() >= attachable_by {
             break log;
@@ -286,9 +289,30 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     let _ = agent.kill();
     let _ = agent.wait();
 
+    // On failure, say what the host actually holds: which of the two candidate homes exists, and
+    // what each contains. The shell's own `$HOME` is in `log`, so the two sides can be compared.
+    let survey = |label: &str, dir: &std::path::Path| {
+        let listing = std::fs::read_dir(dir).map_or_else(
+            |e| format!("<unreadable: {e}>"),
+            |entries| {
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+                    .collect();
+                names.sort();
+                if names.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    names.join(", ")
+                }
+            },
+        );
+        format!("{label} {}: {listing}", dir.display())
+    };
     assert!(
         app_home_marker.exists(),
-        "the attached shell did not land in the app's isolated home ({app_home_marker:?})\n{log}"
+        "the attached shell did not land in the app's isolated home ({app_home_marker:?})\n{}\n{}\n{log}",
+        survey("app home", &data.path().join("sbx/apps/probe/home")),
+        survey("apps dir", &data.path().join("sbx/apps")),
     );
 
     // Teeth: the project's default home (created by the warm-up `sbx run -- true`) must NOT have
