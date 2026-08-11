@@ -28,6 +28,28 @@ point). The irreducible lever is therefore **least privilege at the source**: a
 fine-scoped token or a read-only account is only as dangerous as its own
 permissions. Scope the secret tightly where it lives.
 
+### What the invariant covers, and what it does not
+
+The invariant is about what `sbx` **places** in the cage, so it governs
+**declared** secrets: the ones a `[secret]` entry names, resolved host-side and
+brokered onto the wire. For those, the guarantee holds end to end.
+
+A credential the app **acquires by itself** is a different thing. An agent that
+completes an OAuth or SSO sign-in inside the cage receives its own token and
+writes it to its [isolated home](../apps/home), where it persists between
+launches. `sbx` never handed that token over, but it did not intercept it either:
+it sits at rest in a file the agent can read, it is not part of any `[secret]`
+declaration, and the [redaction tripwires](redaction) that watch declared values
+do not know it exists.
+
+So the honest boundary for an acquired credential is not the invariant, it is the
+rest of the sandbox: an empty network namespace, an egress allowlist that bounds
+where anything can be sent, and a home no other app or project shell can read.
+That is real containment, and it is weaker than "the secret is absent by
+construction". Where an app can authenticate with a value you declare instead,
+prefer that: a declared secret is covered by the invariant, an acquired one is
+covered by the perimeter.
+
 ## Two host-side layers: resolver × broker
 
 A secret declaration composes two orthogonal halves, and **both run host-side**:

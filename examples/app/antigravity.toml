@@ -75,8 +75,11 @@
 #   The allowlist below is grounded on a real login (the `agy` Google chain + the observed
 #   `cloudcode-pa` model backend + the VS Code CDN); if a request is refused, watch
 #   `sbx net logs -a antigravity --all` and add the host (or check ahead with `sbx test net <url>`).
-# A pragmatic one-time escape: `sbx app run antigravity-ide --net shared` for the login only (host
-# network, no allowlist whack-a-mole; the token persists in the isolated home), then strict daily use.
+# A pragmatic one-time escape: `sbx app run antigravity-ide --net allow` for the login only (allow-by-
+# default, no allowlist whack-a-mole; the token persists in the isolated home), then strict daily use.
+# Prefer `allow` over `shared` here: it opens the same doors while keeping the proxy in front of the
+# cage, so `sbx net logs -a antigravity --all` still names every host the sign-in touched and the MITM
+# CA is still seeded. `--net shared` removes the proxy outright and is the last resort.
 #
 # CAVEATS (honest):
 #   * Quitting — a GUI Electron app ignores a single Ctrl+C and closing the window may not quit. Press

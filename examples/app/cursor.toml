@@ -69,11 +69,16 @@
 # `cursor://` callback to `cursor --open-url`, and registers a scheme handler so the portal (under
 # `dbus = true`) routes those links too. It needs `nix:chromium` (a large closure — see `[packages]`).
 #
-# FIRST LOGIN — run it once under `--net shared` (host network, no allowlist whack-a-mole while you
-# discover which SSO hosts the flow touches), let the session persist in the isolated home, then run
-# filtered:
-#     sbx app run cursor --net shared     # first run: complete the sign-in, watch `sbx net logs -a cursor`
+# FIRST LOGIN — run it once under `--net allow` (allow-by-default, so no allowlist whack-a-mole while
+# you discover which SSO hosts the flow touches), let the session persist in the isolated home, then
+# run filtered:
+#     sbx app run cursor --net allow      # first run: complete the sign-in, watch `sbx net logs -a cursor`
 #     sbx app run cursor                  # later runs: filtered by the allowlist below
+# `--net allow` is what makes that log useful: the proxy stays in front of the cage and names every
+# host the sign-in touched, so the allowlist below can be filled from what actually happened, and the
+# token the flow mints is minted where sbx can see it. `--net shared` opens the same doors but removes
+# the proxy entirely — nothing is recorded, and the MITM CA is not seeded — so keep it as the last
+# resort for a client whose TLS refuses interception.
 # If you sign in with Google/GitHub SSO, add the provider's host chain to `allow` (for Google the
 # repo-standard bounded regex — see `examples/app/claude-desktop.toml`; the `accounts.google.<ccTLD>/…/SetSID`
 # redirect is load-bearing). A plain EMAIL sign-in stays on Cursor's own domain and needs no SSO hosts.

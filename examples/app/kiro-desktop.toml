@@ -91,8 +91,10 @@
 #     sbx app run kiro-desktop
 #     sbx net logs -a kiro-desktop             # in another terminal: what was allowed, what was refused
 # A named deny is an allowlist gap — add the host to `allow` below. If you would rather not play
-# allowlist whack-a-mole while discovering the SSO hosts, do the first sign-in under `--net shared`
-# (host network, no filtering), let the token persist in the isolated home, then run filtered after.
+# allowlist whack-a-mole while discovering the SSO hosts, do the first sign-in under `--net allow`
+# (allow-by-default, so nothing is refused while the proxy still watches), let the token persist in
+# the isolated home, then run filtered after. That keeps `sbx net logs -a kiro-desktop` useful for
+# filling the allowlist afterwards, which `--net shared` does not: it removes the proxy outright.
 #
 # TRANSPORT NOTE (diagnosed live via `sbx net logs`). The browser half of the sign-in works under the
 # allowlist (Google/GitHub → app.kiro.dev → the localhost callback), and the IDE's BACKEND then

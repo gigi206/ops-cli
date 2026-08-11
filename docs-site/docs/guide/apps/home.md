@@ -12,6 +12,27 @@ An app's home is **always** per-app and isolated from the project's default shel
 An agent that logs in, writes a config, or accumulates history does so in its own home, an `sbx run` in the same project sees none of it, and neither does another app. This
 persistence is what lets an agent keep an identity across launches.
 
+:::warning What persisted login state actually is
+
+An agent that signs in inside the cage writes the resulting token to this home,
+in the clear, and it stays there between launches. That is what makes the login
+survive, and it is worth naming for what it is: a credential at rest that the
+agent itself can read.
+
+It is **not** covered by the [secrets invariant](../secrets/), which governs the
+values you declare in a `[secret]` entry and which `sbx` brokers onto the wire
+without ever placing them in the cage. A token the app obtained for itself was
+never handed over by `sbx`, so nothing intercepts it, redacts it, or scopes it to
+one host.
+
+What contains it instead is the perimeter: the cage's empty network namespace,
+the [egress allowlist](../networking/modes) that bounds where anything can be
+sent, and the isolation of this home from every other app and shell. Remove it
+with [`sbx app rm <name> --purge`](../cli/app#removing-an-app), which deletes the
+login state along with the home.
+
+:::
+
 ## `home_scope`: global vs per-project
 
 ```toml

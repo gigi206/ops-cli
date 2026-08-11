@@ -42,9 +42,11 @@
 #   * A refused host. Watch `sbx net log -a kiro --all` for a `denied-*` line and add it:
 #     `sbx net allow <host> -a kiro`. Chromium's own stderr is captured in `chromium-login.log`
 #     in the app home (path via `sbx app show kiro`) — read it to see what the page is waiting on.
-#   * `sbx app run kiro --net shared -- login …` — the host network, no allowlist at all, for the
-#     login only (you keep bubblewrap + seccomp + the isolated home + the minimal /dev). The token
-#     then persists, and daily use returns to the strict default.
+#   * `sbx app run kiro --net allow -- login …` — allow-by-default instead of the allowlist, for the
+#     login only (you keep bubblewrap + seccomp + the isolated home + the minimal /dev, AND the proxy,
+#     so `sbx net log -a kiro --all` still names every host the flow touched). The token then
+#     persists, and daily use returns to the strict default. `--net shared` opens the same doors but
+#     drops the proxy entirely, logs and MITM CA included: last resort only.
 #
 # HONEST GATE (cannot be pre-verified): the in-cage Chromium is a fresh, cookie-less profile, and
 # some IdPs — Google in particular — may wall "unusual/insecure browser" or a 2FA step in exactly
@@ -195,8 +197,8 @@ chromium = "nix:chromium"
 # A host the CLI reaches that is not listed returns a 403 whose body names the exact rule to
 # add — `sbx net allow <host> -a kiro` — so extend this as your first login/run surfaces one.
 # NOTE: this allowlist governs DAILY runs (`chat`/`kiro-cli`), which need no browser. The
-# in-cage browser LOGIN is done under `--net shared` (see the LOGIN note), so it bypasses this
-# list — do not try to enumerate the IdP's host sprawl here.
+# in-cage browser LOGIN is done under `--net allow` (see the LOGIN note), which replaces this
+# list for that one run — do not try to enumerate the IdP's host sprawl here.
 [network]
 mode = "deny"
 allow = [
