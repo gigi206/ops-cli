@@ -205,16 +205,27 @@ impl Credentials {
         true
     }
 
-    /// Remember every credential a request head carries, given the head's headers. The caller must
-    /// have established that the request was **allowed**: observing a refused request would let an
-    /// agent seed the scan set by aiming at hosts it knows are denied.
-    pub(crate) fn observe_head(&self, headers: &[(String, String)]) -> usize {
+    /// Remember every credential a request head carries, given the head's headers and the names of
+    /// the headers this request will have **replaced** by injection.
+    ///
+    /// The caller must have established that the request was **allowed**: observing a refused one
+    /// would let an agent seed the scan set by aiming at hosts it knows are denied.
+    ///
+    /// A header being injected is skipped, and that exclusion is load-bearing rather than an
+    /// optimisation. The value the client put there is stripped and never reaches the wire, so
+    /// there is nothing to tripwire — while remembering it would tripwire *the client's own
+    /// placeholder*, and the next request carrying that same placeholder would be refused as an
+    /// outbound leak. That is the exact shape of the intended setup, where an application holds a
+    /// worthless value and sbx substitutes the real one on every request: observing the placeholder
+    /// would break the design it exists to protect.
+    pub(crate) fn observe_head(&self, headers: &[(String, String)], injected: &[&str]) -> usize {
         headers
             .iter()
             .filter(|(name, _)| {
                 OBSERVED_AUTH_HEADERS
                     .iter()
                     .any(|known| name.eq_ignore_ascii_case(known))
+                    && !injected.iter().any(|inj| name.eq_ignore_ascii_case(inj))
             })
             .filter(|(name, value)| self.observe(name, value))
             .count()
@@ -586,18 +597,46 @@ mod tests {
     #[test]
     fn only_the_named_auth_headers_are_observed() {
         let creds = Credentials::new(Vec::new(), Vec::new());
-        let kept = creds.observe_head(&[
-            ("X-Request-Id".into(), "req-0123456789abcdef".into()),
-            (
-                "User-Agent".into(),
-                "some-agent/1.0-with-a-long-name".into(),
-            ),
-            ("Authorization".into(), "Bearer tok-0123456789abcdef".into()),
-        ]);
+        let kept = creds.observe_head(
+            &[
+                ("X-Request-Id".into(), "req-0123456789abcdef".into()),
+                (
+                    "User-Agent".into(),
+                    "some-agent/1.0-with-a-long-name".into(),
+                ),
+                ("Authorization".into(), "Bearer tok-0123456789abcdef".into()),
+            ],
+            &[],
+        );
         assert_eq!(kept, 1, "only the auth header counts");
         let set = creds.snapshot();
         assert_eq!(set.needles.len(), 1);
         assert_eq!(set.needles[0].as_bytes(), b"tok-0123456789abcdef");
+    }
+
+    /// The interaction that matters most, because it breaks the very setup observing exists to
+    /// protect. When sbx injects a header, the client's own value is stripped and never reaches the
+    /// wire — and in the intended arrangement that value is a *placeholder* the application carries
+    /// on every request. Remembering it would make the next request an outbound leak of a worthless
+    /// string, refusing traffic sbx itself arranged. Found by running a real agent, not by reading.
+    #[test]
+    fn a_header_that_will_be_injected_is_never_observed() {
+        let creds = Credentials::new(Vec::new(), Vec::new());
+        let kept = creds.observe_head(
+            &[(
+                "Authorization".into(),
+                "Bearer sbx-placeholder-not-a-real-credential".into(),
+            )],
+            &["authorization"],
+        );
+        assert_eq!(
+            kept, 0,
+            "an injected header's client value is not a credential"
+        );
+        assert!(
+            creds.snapshot().needles.is_empty(),
+            "and nothing is tripwired, so the next request carrying it still passes"
+        );
     }
 
     // The needle holds a secret to scan the wire for; its `Debug` reports only the byte length, never
