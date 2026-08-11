@@ -355,6 +355,26 @@ sbx plugins store install sbx-plugins vault   # then: from = "vault://secret/mya
 | `keepassxc` | `keepassxc://<database>/<entry>[#<attribute>]` | one attribute of an entry in a `.kdbx` on disk, unlocked by a key file or password file beside it | `programs = ["keepassxc-cli"]`; `allow_paths` on the vault directories; **no network** |
 | `keepassxc-browser` | `keepassxc-browser://<url>[#<login>]` | a credential out of the database KeePassXC currently holds **unlocked**, over its browser-integration socket | `allow_paths` on that socket and the association; **no network** |
 
+### The OAuth session holders
+
+Three more are published, and they are a different kind of resolver. A vault
+reader answers from something you already keep; these **hold the session
+themselves**, so that an application which signed in for itself no longer has to.
+Each mints a fresh access token from a refresh token that stays host-side, and
+each is the only party allowed to refresh its account.
+
+| Plugin | Reference form | Holds | Sandbox grant |
+|---|---|---|---|
+| `anthropic` | `anthropic://<account>` | a Claude.ai session, as `claude-code` obtains it | `programs = ["curl", "jq"]`; `network = true`; `state = true` |
+| `openai` | `openai://<account>` | an OpenAI session, as `codex` obtains it | `programs = ["curl", "jq"]`; `network = true`; `state = true` |
+| `nous` | `nous://<account>` | a Nous Portal session | `programs = ["curl", "jq"]`; `network = true`; `state = true` |
+
+They are the only published plugins that declare `state = true`, because a
+rotated refresh token that is not kept costs an interactive re-login. Setting one up takes two steps a
+vault reader does not need: seeding the session once, and taking the application's
+own copy away from it. Both are on [OAuth sessions](oauth), which also carries the
+per-application traps.
+
 Each is also a worked example of the manifest and the execution contract above:
 read its `plugin.toml`, its `resolve` script and its README when writing your own.
 They show what the structural cage forces on a resolver (declaring the host tools
