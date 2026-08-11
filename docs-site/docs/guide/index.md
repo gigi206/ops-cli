@@ -24,6 +24,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 ## Concepts
 
 - [What sbx is (and is not)](concepts/overview): the reference class, the two actor modes.
+- [Architecture](concepts/architecture): the map: the boundary, the launch pipeline, the control planes, the plugin chain.
 - [Security model](concepts/security-model): same-uid, confidentiality by absence, the bind layout.
 - [The trust gate](concepts/trust): the direnv content-hash model, free vs security fields.
 - [Enforcement stack](concepts/enforcement): bubblewrap, seccomp, cgroups, and the egress firewall.

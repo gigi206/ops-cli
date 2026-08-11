@@ -24,6 +24,7 @@ const sidebars: SidebarsConfig = {
       label: 'Concepts',
       items: [
         'concepts/overview',
+        'concepts/architecture',
         'concepts/security-model',
         'concepts/trust',
         'concepts/enforcement',
