@@ -523,9 +523,26 @@ fn nix_closure(program: &Path, layout: Option<&crate::store::Layout>) -> io::Res
 /// The path a declared program resolves to, or `None` when nothing usable is on `PATH`. Shared
 /// with `sbx plugins info`, so what a user is shown is what a launch would bind — a second
 /// lookup would be a second chance to disagree.
+/// Whether the cage will hold what a binary at this path needs to *load*, not merely the file.
+///
+/// The runner binds the host userland read-only and computes a closure for anything in the nix
+/// store, so a binary from either place brings its shared libraries with it. A binary from
+/// anywhere else — a Homebrew cellar, an `/opt` tree, a language package manager — is bound as one
+/// file whose libraries stay outside, and the cage answers `cannot execute: required file not
+/// found`: an error from the dynamic loader that names neither the missing library nor the reason.
+///
+/// Measured on this machine: Homebrew's `curl` needs 24 libraries under `/home/linuxbrew`, while
+/// `/usr/bin/curl` needs none outside the userland the cage already has.
+fn cage_can_load(path: &Path) -> bool {
+    ["/usr/", "/bin/", "/sbin/", NIX_STORE]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
 pub(crate) fn locate_program(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let euid = unsafe { libc::geteuid() };
+    let mut usable = Vec::new();
     for cand in crate::pathfind::find_all_on_path(name) {
         let Ok(meta) = std::fs::metadata(&cand) else {
             continue;
@@ -533,14 +550,40 @@ pub(crate) fn locate_program(name: &str) -> Option<PathBuf> {
         match crate::store::host_exec_verdict(meta.uid(), meta.mode(), euid) {
             // Canonicalized: binding the *symlink* would bind a dangling name, since a nix
             // profile's `bin/x` points into `/nix/store`, which the cage does not have.
-            Ok(()) => return std::fs::canonicalize(&cand).ok().or(Some(cand)),
+            Ok(()) => usable.push(std::fs::canonicalize(&cand).unwrap_or(cand)),
             Err(why) => crate::diag::warn(&format!(
                 "ignoring {} for the program `{name}` ({why})",
                 cand.display()
             )),
         }
     }
-    None
+
+    // Prefer a candidate the cage can actually load over an earlier one it cannot. `PATH` order
+    // expresses which build the *host* prefers, and that is a different question: a package manager
+    // placed ahead of the system usually wins on your shell and loses in here, for reasons no
+    // manifest can express and no error message explains.
+    if let Some(loadable) = usable.iter().find(|p| cage_can_load(p)) {
+        if usable.first() != Some(loadable) {
+            crate::diag::warn(&format!(
+                "using {} for the program `{name}` rather than {}, whose libraries live outside \
+                 the resolver sandbox",
+                loadable.display(),
+                usable[0].display()
+            ));
+        }
+        return Some(loadable.clone());
+    }
+    // Nothing the cage is known to hold. Take the first anyway — a statically linked binary or a
+    // self-contained bundle runs fine, and refusing here would break a working setup on a guess —
+    // but say what will break if it does not, since the loader's own message will not.
+    let first = usable.into_iter().next()?;
+    crate::diag::warn(&format!(
+        "the program `{name}` resolves to {}, outside the host userland the resolver sandbox \
+         binds — if it fails with `cannot execute: required file not found`, its shared libraries \
+         are the reason, and a system build of `{name}` would resolve it",
+        first.display()
+    ));
+    Some(first)
 }
 
 /// Build the cage for one resolver run. Pure: a plugin grant, the already-resolved `allow_env`
@@ -1090,6 +1133,35 @@ mod tests {
         std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
         let p = plugin_in(dir.path(), grant);
         (dir, p)
+    }
+
+    /// The cage binds the host userland and computes a nix closure; it holds nothing else. So a
+    /// binary from either place brings its libraries, and one from a package manager's own prefix
+    /// does not — which is the difference between a program that runs in the resolver sandbox and
+    /// one that dies in the loader with a message naming neither the library nor the cause.
+    #[test]
+    fn only_a_binary_the_cage_holds_the_libraries_for_counts_as_loadable() {
+        for path in [
+            "/usr/bin/curl",
+            "/bin/sh",
+            "/sbin/ip",
+            "/nix/store/abc-curl-8.0/bin/curl",
+        ] {
+            assert!(
+                cage_can_load(Path::new(path)),
+                "{path} is inside what the cage binds"
+            );
+        }
+        for path in [
+            "/home/linuxbrew/.linuxbrew/Cellar/curl/8.21.0/bin/curl",
+            "/opt/homebrew/bin/curl",
+            "/home/u/.local/bin/curl",
+        ] {
+            assert!(
+                !cage_can_load(Path::new(path)),
+                "{path} brings libraries the cage does not bind"
+            );
+        }
     }
 
     /// A plugin installed the way the installer places one — `<data>/plugins/<name>` — so
