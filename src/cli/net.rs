@@ -21,7 +21,7 @@ use crate::{
     RuleWrite, egress_data_dir, egress_write_target, fold_app_overlay, format_log_time,
     net_mode_word, open_rule_write, pending_session_context, persist_egress_rule,
     precheck_local_save, session_app_of, session_pids_for_app, session_pids_for_project,
-    split_scope,
+    split_one_rule, split_scope, split_session_flags,
 };
 use crate::{allowlist, config, diag, help, sandbox, style, trust};
 
@@ -2784,43 +2784,11 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
     };
     let verb = slot.label();
 
-    // `--session` (load the rule into the live overlay of the running session(s) instead of a config
-    // file) and its `--all` scope widener are extracted before `split_scope`, which rejects any flag
-    // it does not know; the config-scope flags (`--local`/`--global`/`-c`) and `-a` ride it.
-    let session = args.iter().any(|a| a.to_str() == Some("--session"));
-    let all = args.iter().any(|a| a.to_str() == Some("--all"));
-    let rest: Vec<OsString> = args
-        .iter()
-        .filter(|a| !matches!(a.to_str(), Some("--session") | Some("--all")))
-        .cloned()
-        .collect();
-    let parsed = match split_scope(&rest) {
-        Ok(p) => p,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::from(2);
-        }
+    let (session, all, rest) = split_session_flags(args);
+    let (parsed, rule) = match split_one_rule("net", verb, &rest) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    let rule = match parsed.positionals.as_slice() {
-        [r] => r.clone(),
-        [] => {
-            diag::error(&format!(
-                "sbx: usage: {}",
-                help::synopsis_of(&["net", verb])
-            ));
-            return ExitCode::from(2);
-        }
-        _ => {
-            diag::error(&format!("sbx: net {verb}: expected exactly one rule"));
-            return ExitCode::from(2);
-        }
-    };
-    if let Some(name) = &parsed.app
-        && !config::is_valid_app_name(name)
-    {
-        diag::error(&format!("sbx: invalid app name '{name}'"));
-        return ExitCode::from(2);
-    }
     // Validate the rule before touching any file or session (fail-closed). A `@<name>` group reference
     // is an alias for a `[net.groups]` group, expanded at load time — not itself a classifiable rule —
     // so it is validated as a group name rather than through `classify` (which would reject the `@`).
@@ -2929,33 +2897,10 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
         ));
         return ExitCode::from(2);
     }
-    let parsed = match split_scope(args) {
-        Ok(p) => p,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::from(2);
-        }
+    let (parsed, rule) = match split_one_rule("net", verb, args) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    let rule = match parsed.positionals.as_slice() {
-        [r] => r.clone(),
-        [] => {
-            diag::error(&format!(
-                "sbx: usage: {}",
-                help::synopsis_of(&["net", verb])
-            ));
-            return ExitCode::from(2);
-        }
-        _ => {
-            diag::error(&format!("sbx: net {verb}: expected exactly one rule"));
-            return ExitCode::from(2);
-        }
-    };
-    if let Some(name) = &parsed.app
-        && !config::is_valid_app_name(name)
-    {
-        diag::error(&format!("sbx: invalid app name '{name}'"));
-        return ExitCode::from(2);
-    }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {

@@ -172,6 +172,64 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
     })
 }
 
+/// `--session` (load the rule into the live overlay of the running session(s) instead of a config
+/// file) and its `--all` scope widener, lifted out before [`split_scope`], which rejects any flag it
+/// does not know. The config-scope flags (`--local`/`--global`/`-c`) and `-a` ride that call.
+fn split_session_flags(args: &[OsString]) -> (bool, bool, Vec<OsString>) {
+    let session = args.iter().any(|a| a.to_str() == Some("--session"));
+    let all = args.iter().any(|a| a.to_str() == Some("--all"));
+    let rest = args
+        .iter()
+        .filter(|a| !matches!(a.to_str(), Some("--session") | Some("--all")))
+        .cloned()
+        .collect();
+    (session, all, rest)
+}
+
+/// The single-rule front that `sbx net allow|deny|mute` and `sbx proc allow|deny` share, on both
+/// their add and their remove paths: the scope flags split off, exactly one positional, and an app
+/// name that must be valid. `namespace` names the command family, for the usage line and for the
+/// refusal that names it back.
+///
+/// The rule comes back as written: `proc` trims it and `net` does not, so that choice stays with the
+/// caller rather than being imposed here.
+fn split_one_rule(
+    namespace: &str,
+    verb: &str,
+    args: &[OsString],
+) -> Result<(ScopeArgs, String), ExitCode> {
+    let parsed = match split_scope(args) {
+        Ok(p) => p,
+        Err(e) => {
+            diag::error(&format!("sbx: {e}"));
+            return Err(ExitCode::from(2));
+        }
+    };
+    let rule = match parsed.positionals.as_slice() {
+        [r] => r.clone(),
+        [] => {
+            diag::error(&format!(
+                "sbx: usage: {}",
+                help::synopsis_of(&[namespace, verb])
+            ));
+            return Err(ExitCode::from(2));
+        }
+        _ => {
+            diag::error(&format!(
+                "sbx: {namespace} {verb}: expected exactly one rule"
+            ));
+            return Err(ExitCode::from(2));
+        }
+    };
+    if let Some(name) = &parsed.app
+        && !config::is_valid_app_name(name)
+    {
+        diag::error(&format!("sbx: invalid app name '{name}'"));
+        return Err(ExitCode::from(2));
+    }
+    Ok((parsed, rule))
+}
+
 /// Resolve the working directory, mapping a failure to an error exit. Shared by the verbs.
 fn config_cwd() -> Result<PathBuf, ExitCode> {
     std::env::current_dir().map_err(|e| {

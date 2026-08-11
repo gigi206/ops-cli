@@ -14,7 +14,8 @@ use crate::cli::logs;
 use crate::{config, diag, help, observe, proc_policy, sandbox, session, store, style};
 use crate::{
     egress_data_dir, format_log_time, persist_proc_rule, resolve_session_target,
-    session_pids_for_app, session_pids_for_project, split_scope,
+    session_pids_for_app, session_pids_for_project, split_one_rule, split_scope,
+    split_session_flags,
 };
 
 /// `sbx proc <subcommand>`: observe what a running sandbox is doing inside its cage. `ls` snapshots
@@ -59,43 +60,12 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
         config::manage::ProcList::Allow => "allow",
         config::manage::ProcList::Deny => "deny",
     };
-    // `--session` (load the rule into the live overlay of the running session(s)) and its `--all` scope
-    // widener are extracted before `split_scope`, which rejects any flag it does not know; the
-    // config-scope flags (`--local`/`--global`/`-c`) and `-a` ride it.
-    let session = args.iter().any(|a| a.to_str() == Some("--session"));
-    let all = args.iter().any(|a| a.to_str() == Some("--all"));
-    let rest: Vec<OsString> = args
-        .iter()
-        .filter(|a| !matches!(a.to_str(), Some("--session") | Some("--all")))
-        .cloned()
-        .collect();
-    let parsed = match split_scope(&rest) {
-        Ok(p) => p,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::from(2);
-        }
+    let (session, all, rest) = split_session_flags(args);
+    let (parsed, rule) = match split_one_rule("proc", verb, &rest) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    let rule = match parsed.positionals.as_slice() {
-        [r] => r.trim().to_string(),
-        [] => {
-            diag::error(&format!(
-                "sbx: usage: {}",
-                help::synopsis_of(&["proc", verb])
-            ));
-            return ExitCode::from(2);
-        }
-        _ => {
-            diag::error(&format!("sbx: proc {verb}: expected exactly one rule"));
-            return ExitCode::from(2);
-        }
-    };
-    if let Some(name) = &parsed.app
-        && !config::is_valid_app_name(name)
-    {
-        diag::error(&format!("sbx: invalid app name '{name}'"));
-        return ExitCode::from(2);
-    }
+    let rule = rule.trim().to_string();
     if let Err(e) = proc_policy::validate_rule(&rule) {
         diag::error(&format!("sbx: invalid rule {rule:?}: {e}"));
         return ExitCode::from(2);
@@ -182,33 +152,11 @@ fn proc_remove_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCo
         ));
         return ExitCode::from(2);
     }
-    let parsed = match split_scope(args) {
-        Ok(p) => p,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::from(2);
-        }
+    let (parsed, rule) = match split_one_rule("proc", verb, args) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    let rule = match parsed.positionals.as_slice() {
-        [r] => r.trim().to_string(),
-        [] => {
-            diag::error(&format!(
-                "sbx: usage: {}",
-                help::synopsis_of(&["proc", verb])
-            ));
-            return ExitCode::from(2);
-        }
-        _ => {
-            diag::error(&format!("sbx: proc {verb}: expected exactly one rule"));
-            return ExitCode::from(2);
-        }
-    };
-    if let Some(name) = &parsed.app
-        && !config::is_valid_app_name(name)
-    {
-        diag::error(&format!("sbx: invalid app name '{name}'"));
-        return ExitCode::from(2);
-    }
+    let rule = rule.trim().to_string();
     // The rule is NOT validated here, unlike the add path. A config file may already hold a rule a
     // later grammar would refuse, and refusing to remove it would leave the user no way out but a
     // hand edit; matching is an exact string compare, so an invalid rule simply matches nothing.
