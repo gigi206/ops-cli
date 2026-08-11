@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's `examples/app/` directory ships **67 importable
+The repository's `examples/app/` directory ships **68 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -15,7 +15,7 @@ terminal agent, a desktop window, or a UI served in your host browser. Each prof
 header carries its packaging specifics; how the artifacts are built and fit together, and
 the "not here yet, and why" triage, live in `examples/README.md`.
 
-## Terminal agents (48)
+## Terminal agents (49)
 
 The common case: a CLI or TUI that runs in the terminal you launched it from.
 
@@ -36,6 +36,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `cortex` | `mise:github:CortexLM/cortex-code` (+ `nix:alsa-lib`) | `api.cortex.foundation` (`CORTEX_API_KEY`) or BYOK |
 | `crush` | `mise:github:charmbracelet/crush` | `hyper.charm.land` (Hyper account) or multi-provider BYOK |
 | `cursor-agent` | `nix:gnutar` (+ `nix:gzip`) | `*.cursor.sh` (Cursor account / `CURSOR_API_KEY`) |
+| `deepagents-code` | `mise:pipx:deepagents-code` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Google) |
 | `devin` | bootstrap installer (`cmd` wrapper, verifies SHA256; + `nix:gnutar`, `nix:gzip`) | `api.devin.ai` (BYOK API key) |
 | `dirac` | `nix:nodejs` (+ `mise:npm:dirac-cli`, `nix:ripgrep`) | provider-dependent (BYOK, no vendor account) |
 | `droid` | `nix:nodejs` (+ `mise:npm:droid`) | `*.factory.ai` (account) |
@@ -114,7 +115,7 @@ default (`home_scope = "global"`).
 ## Bundles: the shared pieces
 
 Beyond the app profiles, `examples/bundle/`
-ships **38 reusable tool bundles**: a named set of packages and egress rules that
+ships **39 reusable tool bundles**: a named set of packages and egress rules that
 profiles pull in with `use = [...]` instead of restating it — the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as

@@ -1,0 +1,134 @@
+# Deep Agents Code — LangChain's terminal coding agent (`dcode`), sandboxed by sbx.
+#
+#   sbx app import examples/app/deepagents-code.toml
+#   sbx app run deepagents-code
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/deepagents-code.toml
+#     sbx app import    examples/app/deepagents-code.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
+# Deep Agents Code is the terminal agent LangChain builds on its Deep Agents SDK: a Textual TUI
+# with planning, subagent delegation, persistent memory, skills and approval controls. It is
+# model-agnostic and picks its provider from whichever credential it finds, so it needs ONE
+# provider key (or an interactive `/auth`) and nothing else.
+#
+# The tool is equipped fresh from upstream: mise's `pipx` backend runs `uv tool install
+# deepagents-code` (the same clean path `aider` uses — `nix:uv` puts uv on PATH, `nix:python312`
+# supplies an interpreter in the project's `>=3.11,<4.0` range), resolving the wheels from PyPI on
+# first launch and reusing them offline after. `sbx upgrade mise` rolls it forward. The upstream
+# `curl … | bash` installer is not used: it wraps that same `uv tool install` and edits your shell
+# profiles to do it. No nixpkgs lag, no source build, no vendor SDK shim.
+#
+# CONFIG + STATE — everything lives under `~/.deepagents`: `config.toml`, `hooks.json`, a global
+# `.env`, and `.state/` holding sessions, the saved credentials `/auth` writes and the cached
+# update check. Project-scoped material (skills, `AGENTS.md`) rides the project bind; the isolated
+# home keeps the rest, so a `/auth` login survives across launches without touching your host
+# config.
+#
+# CREDENTIALS — BYOK, one env var per provider; the agent auto-selects the first one it can prove
+# is configured (OpenAI, then Anthropic, then Google), and `/model` switches afterwards. The proxy
+# names a host the flow reaches that is not in `allow`; check ahead with `sbx test net <url>`.
+#
+#  - **OpenAI**: `OPENAI_API_KEY` → api.openai.com.
+#  - **Anthropic**: `ANTHROPIC_API_KEY` → api.anthropic.com.
+#  - **Google**: `GOOGLE_API_KEY` → generativelanguage.googleapis.com.
+#  - **Others** (OpenRouter, Groq, Ollama, Bedrock, …) ship as install extras, so they need the
+#    matching extra installed as well as their host opened. A local model on the HOST loopback is
+#    named with a `tcp://localhost:<port>` allow rule (ollama :11434): sbx opens a listener inside
+#    the cage on that exact port and relays it to the service on YOUR loopback, so the allowlist
+#    stays intact — one port at a time, no `network = "shared"` (see `openfox.toml`).
+#  - **Interactive**: `/auth` inside the TUI stores a key in the app's own state dir instead. That
+#    keeps the secret out of the host env, but it also puts the plaintext INSIDE the cage, which is
+#    what the [secret] blocks below exist to avoid — prefer them.
+#
+# The keys are read on the HOST and injected by the egress proxy on the wire — they never enter
+# the cage (see the [secret] blocks below).
+#
+# WEB SEARCH + TRACING, both opt-in and both off unless you configure them: search goes through
+# Tavily (`TAVILY_API_KEY`, api.tavily.com) and tracing through LangSmith (`LANGSMITH_TRACING=true`
+# plus `LANGSMITH_API_KEY`, api.smith.langchain.com). Their hosts are commented below; leave them
+# closed and the features simply stay unavailable. There is no third-party analytics: the only
+# traffic the agent originates on its own is its PyPI update check, which the bundle's `@pypi`
+# group already covers.
+#
+# MCP SERVERS you add are yours to open: each connector reaches its own host (an `mcp.*` endpoint,
+# a vendor API), so add it to `allow` when you add the server.
+#
+# UNVERIFIED (like every profile until run with a real key): the live equip + first prompt under
+# the allowlist. Grounded here: the PyPI packaging (name `deepagents-code`, console scripts `dcode`
+# and `deepagents-code`, `requires-python <4.0,>=3.11` — the published metadata), the config and
+# state paths under `~/.deepagents` (the upstream installer's own uninstall notes plus the CLI's
+# state dir), the credential env vars and their fallback order (`deepagents_code/model_config.py`,
+# `deepagents_code/config.py`), the Tavily/LangSmith opt-ins, and the PyPI update check
+# (`deepagents_code/_version.py`).
+cmd = "dcode"
+
+# Your host Deep Agents config, mounted read-write at its real absolute path. `binds` is a security
+# field, honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the
+# caged `dcode` write back to these host files (sessions, saved credentials, hooks). Uncomment to
+# share your host setup instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.deepagents", mode = "rw" },
+#]
+
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `deepagents-code` BUNDLE — the package(s), the environment it reads, the hosts
+# it must reach, and its telemetry mutes — from one declaration shared with the bundle file itself,
+# so this profile cannot fall behind when the agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/deepagents-code.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["deepagents-code"]
+
+# No `[packages]` here: the agent's package comes from its bundle — see `use` above.
+
+[network]
+mode = "deny"
+# Egress is denied by construction except the ONE provider you actually use (the model host the
+# agent POSTs to is opened to all verbs with `{*}`; an app is read-by-default). The PyPI hosts are
+# the install lane and the update check, and they arrive with the bundle.
+# The agent's OWN hosts are NOT listed here — they arrive with its bundle (`use` above) and are
+# unioned into this list at resolution. Check what that adds with `sbx bundle deepagents-code`, and
+# what the launch ends up with via `sbx config show --app deepagents-code`.
+allow = [
+    # BYOK provider — uncomment the ONE you use, with the matching [secret] block below.
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    #"{*} https://generativelanguage.googleapis.com",
+    # Optional features, off unless you configure them (see the header):
+    #"{*} https://api.tavily.com",          # web search
+    #"{*} https://api.smith.langchain.com", # LangSmith tracing
+]
+
+# BYOK: the real key is read on the HOST and injected by the egress proxy — never in the cage.
+# The in-cage placeholder lets `dcode` start and issue the request; the proxy strips it and
+# substitutes the real key on the wire to the matching host. Uncomment the pair matching the ONE
+# provider `allow` opens (the agent auto-selects the provider whose key is present).
+[env]
+#ANTHROPIC_API_KEY = "sk-ant-sbx-placeholder-replaced-by-the-egress-proxy"
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#GOOGLE_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
+#TAVILY_API_KEY = "tvly-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.anthropic.com"]
+#from = "env://ANTHROPIC_API_KEY"
+#header = "x-api-key"
+#type = "raw"
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"
+#[secret."generativelanguage.googleapis.com"]
+#from = "env://GOOGLE_API_KEY"
+#header = "x-goog-api-key"
+#type = "raw"
+# Web search, independent of the model provider: the Tavily client sends its key as a bearer
+# token, so it injects the same way. Uncomment together with the api.tavily.com allow rule.
+#[secret."api.tavily.com"]
+#from = "env://TAVILY_API_KEY"
+#header = "Authorization"
+#type = "bearer"

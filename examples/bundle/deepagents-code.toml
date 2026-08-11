@@ -1,0 +1,52 @@
+# `deepagents-code` — LangChain's terminal coding agent (`dcode`): what it needs to be installed
+# and to reach its own services.
+#
+#   sbx bundle import examples/bundle/deepagents-code.toml
+#   # then in an app profile:   use = ["deepagents-code"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/pypi.toml
+#
+# Derived from `examples/app/deepagents-code.toml`, whose namesake profile names this bundle in
+# `use` (thin profile): the bundle is the single source of truth for the agent's packages, env and
+# egress, while the app keeps its own command, posture and BYOK choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The egress entries below land in that app's
+# OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
+# could move its posture.
+#
+# NO PROVIDER HOST, deliberately. Deep Agents Code is BYOK with no default provider: it picks the
+# model from whichever credential it finds (`OPENAI_API_KEY`, then `ANTHROPIC_API_KEY`, then
+# `GOOGLE_API_KEY`), and any other provider comes from an install extra. The profile leaves
+# every provider host commented for the user to choose, and a bundle may only carry what its
+# profile declares. The consuming app therefore opens its OWN provider host (and supplies the key).
+# What is here is the install lane, which is the same whatever model you point it at.
+#
+# The upstream installer (`curl -LsSf https://langch.in/dcode | bash`) is NOT used: it is a
+# host-mutating wrapper around `uv tool install deepagents-code`, which is exactly what mise's
+# `pipx` backend already does inside the cage — same package, same PyPI wheels, no PATH edits to
+# your shell profiles. `sbx upgrade mise` rolls it forward.
+#
+# `rg` is NOT provisioned here: sbx's base toolset already puts ripgrep on the cage PATH, and
+# `dcode` takes a system `rg` when no managed copy exists under `~/.deepagents/bin`, so its
+# self-download path is never entered.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.deepagents-code]
+allow = [
+    # Install-time (mise's pipx backend runs `uv tool install deepagents-code`): the Python
+    # wheels and the package index, resolved from PyPI on first launch — the shared `@pypi`
+    # group. The same host serves the CLI's own update check, which GETs
+    # `pypi.org/pypi/deepagents-code/json` and caches the answer under its state dir.
+    "@pypi",
+]
+
+[bundle.deepagents-code.packages]
+deepagents-code = "mise:pipx:deepagents-code"  # the tool itself, from PyPI via uv (binary: `dcode`)
+uv = "nix:uv"                                  # mise's pipx backend runs `uv tool install`
+python = "nix:python312"                       # puts an interpreter uv can use on PATH (the project asks for `>=3.11,<4.0`)

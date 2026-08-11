@@ -139,7 +139,7 @@ A bundle may itself reference shared egress groups with `@name` (its header then
 `examples/net-groups/`,
 with `sbx net groups import`.
 
-The 38 shipped bundles, and what each carries:
+The 39 shipped bundles, and what each carries:
 
 | Bundle | Packages | Also carries | Requires groups |
 |---|---|---|---|
@@ -155,6 +155,7 @@ The 38 shipped bundles, and what each carries:
 | `command-code` | 2 (`mise:`, `nix:`) | 12 egress entries | `github-install`, `npm-registry` |
 | `copilot` | 1 (`mise:`) | 6 egress entries | — |
 | `crush` | 1 (`mise:`) | 4 egress entries, 2 env vars | `github-install` |
+| `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `dirac` | 3 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-registry` |
 | `freebuff` | 2 (`mise:`, `nix:`) | 8 egress entries | `npm-audit`, `npm-registry` |
