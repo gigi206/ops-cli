@@ -93,8 +93,10 @@ flowchart LR
 ```
 
 The two layers compose freely: any source with any broker. Resolvers are the
-open-ended, pluggable half (see [Resolver plugins](plugins)); the broker touches the
-security boundary, so it stays first-party.
+open-ended, pluggable half (see [Resolver plugins](plugins)); the broker that puts a
+secret on the wire touches the security boundary, so it stays first-party. A broker
+that terminates nothing and only stands in front of a host socket is pluggable under
+its own contract, described in [The broker type](plugins#the-broker-type).
 
 ## Injection is effective only under a filtering network
 

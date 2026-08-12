@@ -4,8 +4,11 @@ The secret-source space is open-ended: any well-known secret-manager backend,
 a cloud KMS, a third-party vault app, a
 keyring, so `sbx` keeps the **resolver** (SOURCE) layer *pluggable*. A resolver
 plugin adds a new `scheme://` that a secret's `from` reference can route to. The
-**broker** (SINK) layer, which terminates TLS and injects on the wire, stays
-first-party: a broker bug is a boundary breach, so it is never a plugin.
+**broker** (SINK) layer of a secret, which terminates TLS and injects on the wire,
+stays first-party: a bug where a request is decrypted and decided is a boundary
+breach, so that one is never a plugin. A broker that terminates nothing, and
+stands in front of a host socket instead, is a second plugin type under a contract
+that leaves `sbx` holding the socket: see [The broker type](#the-broker-type).
 
 A resolver plugin still obeys the invariant: it runs **host-side, sandboxed under
 bubblewrap, never in the cage**, and returns the plaintext to `sbx`'s host
@@ -25,7 +28,7 @@ its owner-only data directory (`<data>/plugins/<name>/`) and builds a
 
 ```toml
 name        = "vault"          # optional; defaults to the directory name
-type        = "resolver"       # required; only "resolver" is supported today
+type        = "resolver"       # required; "resolver" or "broker" (see below)
 scheme      = "vault"          # the scheme:// this plugin claims; unique in the registry
 exec        = "bin/resolve"    # directory-relative, traversal-free path to the executable
 version     = "1.2.0"          # optional, display-only
@@ -41,8 +44,9 @@ network     = false                # true = reach the network; false = empty net
 state       = false                # true = a private writable directory that survives the run
 ```
 
-- `type` must be `"resolver"`: the type is an explicit, extensible discriminator
-  so a future plugin type can be added without breaking the registry.
+- `type` is `"resolver"` here. The discriminator is explicit so a second type
+  could be added without breaking the registry, and one has been: see
+  [The broker type](#the-broker-type) below.
 - `scheme` cannot be a built-in (`env`, `file`, `sops`): the built-in always
   wins, and a plugin claiming one is dropped.
 - `exec` is resolved against the plugin directory and must be traversal-free.
@@ -470,6 +474,78 @@ If you write a plugin, keep its tests inside its directory for the same reason, 
 do not rebuild sbx's sandbox in them. A hand-written cage is a second copy of what
 sbx builds, and it stops testing what ships as soon as the two drift. Stand in for
 the service a resolver talks to, not for the tool it runs.
+
+## The broker type
+
+A resolver answers *where a value comes from*. A **broker** answers *how the cage
+uses a host resource without holding it*: the filtering ssh-agent
+([`[ssh_agent]`](../configuration/ssh-agent)) is the first-party example, standing
+between the cage and the user's own agent so a signature is possible and a key is
+never handed over.
+
+`type = "broker"` is the second plugin type, for protocols that will never justify
+first-party code of their own. What makes it admissible is that the plugin holds
+nothing:
+
+- **sbx keeps the cage-facing socket, the connection to the host resource, the
+  framing, the decision record and the timeouts.** The plugin speaks to `sbx`
+  alone, over stdin and stdout, from a host-side cage with an empty network
+  namespace. It sees frames and answers verdicts.
+- **A broker plugin can therefore never grant more than binding the host socket
+  into the cage would have granted.** That bound is the whole reason the type
+  exists in this shape rather than as a plugin that owns the socket.
+
+```toml
+name = "gpg-agent"
+type = "broker"                    # no `scheme`: a broker claims no ref namespace
+exec = "bin/broker"
+
+[broker]
+cage_env  = ["GPG_AGENT_INFO"]     # cage variables pointed at the socket sbx places
+framing   = "line"                 # `line` or `length-u32-be`
+max_frame = 2048                   # the largest frame this protocol admits
+deny_frame = [5]                   # optional: a refusal frame that needs no request context
+host_greets = true                 # the host speaks first, before the cage asks anything
+inspect_replies = true             # also rule on what the host resource answers
+```
+
+Four rules a broker manifest is held to, each refused at load rather than at
+launch:
+
+- **`network` and `state` are refused.** `sbx` opens the connection for the
+  plugin, so network reach on the component brokering a credential would be an
+  exfiltration path for that credential. A broker holds nothing across runs.
+- **The manifest does not name where the socket lands.** `sbx` picks the location,
+  for the reason `state` is a boolean and never a path, and sets every name in
+  `cage_env` to it.
+- **`cage_env` passes the reserved-key barrier** an untrusted project's `[env]`
+  meets. A broker points a client at its socket; names like `LD_PRELOAD` or `PATH`
+  load code in the cage instead.
+- **`framing` is a closed set** implemented in `sbx`: `length-u32-be` (a four-byte
+  big-endian length, then the body, which carries the protocol's own type byte) and
+  `line` (one message per line, the newline being the boundary rather than part of the
+  message). A plugin handed an uncut stream would be the broker rather than rule on its
+  messages. An over-long frame is an error, never a truncation.
+- **`host_greets` and multi-message answers both need `inspect_replies`.** A protocol
+  whose reply is a run of messages needs the plugin to say where the run ends, and a
+  greeting is a frame from the host that must not reach the cage unseen.
+
+`deny_frame` is optional because it does not generalise: it fits a protocol whose
+refusal is the same whatever was refused, and a protocol whose refusal must echo a
+request id has none. The refusal that always works is closing the connection.
+
+:::note What is in place today
+`sbx` reads, validates and lists broker plugins. `sbx plugins install <dir>` places
+one from a local directory, and a `[plugin.<name>] programs` entry provisions its
+package exactly as it would for a resolver.
+
+Two things do not exist yet. **No launch runs a broker plugin**: the relay that
+carries frames between a cage and a host resource is not part of this release, and
+no config activates one. And **a signed store cannot serve one**: a catalogue entry
+names a scheme, so a store install reconciles against a scheme the manifest does
+not claim and is refused. A broker plugin therefore only ever arrives through a
+deliberate local install.
+:::
 
 ## An honest residual: a networked resolver reaches the host network
 

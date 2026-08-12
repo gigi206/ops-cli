@@ -1,0 +1,1925 @@
+//! The wire between sbx and a broker plugin: what sbx asks, what a plugin may answer.
+//!
+//! [`crate::plugins::broker`] declares what a broker *is*; this is the conversation it holds. The
+//! division of labour is the whole security argument, so it is worth restating where the code
+//! implementing it begins: **sbx owns the cage-facing socket, the connection to the host resource,
+//! the framing and the record; the plugin owns nothing and answers verdicts.**
+//!
+//! One line of JSON per message, in both directions, because a line is the framing every other
+//! control plane here already uses and a plugin can be written in any language without a library.
+//! Bytes travel as **hex**, not base64: one canonical spelling, no padding or alphabet variant to
+//! disagree about, and a decoder short enough to be read and tested. A protocol frame is opaque to
+//! sbx, so it must survive the trip byte for byte.
+//!
+//! The exchange, per cage connection:
+//!
+//! 1. sbx writes the [`Hello`]: the protocol version, the broker's name, and the `allow` list the
+//!    config declared. sbx does not interpret `allow` — the plugin knows what its own protocol
+//!    makes of it.
+//! 2. For each frame, sbx writes an [`Ask`] and reads exactly one [`Verdict`], carrying the same
+//!    `seq`. A verdict for another `seq` is a plugin that has lost the thread, and is refused. The
+//!    `seq` identifies **one frame's exchange**, not one message: a query's reply and a host
+//!    reply put back to the plugin carry the `seq` of the frame they belong to, which is what lets
+//!    a plugin tie them together. It advances per frame read from the cage, never per line.
+//! 3. [`Verdict::Query`] is the one answer that does not end the exchange: sbx sends those bytes to
+//!    the host resource and hands the reply back as another [`Ask`], so the plugin can decide on
+//!    what the host says. It exists because the first-party ssh-agent broker cannot be expressed
+//!    without it: its admission is re-derived from the host agent *inside* each decision, never
+//!    cached, so a key removed from the agent stops working at once.
+//!
+//! `Query` grants the plugin no reach it did not already have: a rewritten [`Verdict::Forward`]
+//! could already put arbitrary bytes in front of the host resource. What it adds is *seeing the
+//! answer before deciding*, and sbx still holds the connection throughout.
+//!
+//! Every parse here is fail-closed and every bound is enforced on sbx's side. A plugin that
+//! answers nonsense, answers late, or asks to query forever is refused, and the caller turns that
+//! refusal into the protocol's own (a declared `deny_frame`, or a closed connection).
+
+use std::io::{self, Read, Write};
+
+use serde::Deserialize;
+
+use crate::plugins::broker::{BrokerSpec, Framing};
+
+/// The protocol version sbx speaks. A plugin that cannot handle it should fail its handshake
+/// rather than guess: this number changes only when the meaning of a message changes.
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
+
+/// How many [`Verdict::Query`] answers sbx will serve before refusing the frame outright.
+///
+/// A query is a round trip to the host resource that the *plugin* asked for, so an unbounded chain
+/// is a plugin holding the host resource open on the cage's behalf. Deliberately small: the case
+/// this exists for (re-deriving admission before deciding) takes one, and a second is slack for a
+/// protocol that must ask twice. Reaching the ceiling is a refusal, never a truncation.
+pub(crate) const MAX_QUERIES_PER_FRAME: u32 = 4;
+
+/// How many frames one exchange may take from the host resource before sbx gives up on it.
+///
+/// A protocol like Assuan answers one command with a run of messages ending in a terminator, and
+/// the plugin is what says where that run ends. This is the backstop for a host that never says
+/// so: without it, a chatty or wedged resource holds the cage's connection while sbx reads on. Set
+/// well above any real answer, because reaching it is a refusal and not a truncation.
+pub(crate) const MAX_REPLY_FRAMES: u32 = 1024;
+
+/// Which side of the channel a frame came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    /// From the cage, on its way to the host resource.
+    Up,
+    /// From the host resource, on its way back to the cage. Only ever sent to a plugin whose
+    /// manifest declares `inspect_replies`.
+    Down,
+    /// The host's answer to a [`Verdict::Query`] the plugin asked for. Distinct from `Down`
+    /// because it is not on its way anywhere: it is owed to the plugin, which asked for it, and a
+    /// plugin that does not inspect replies still gets these.
+    QueryReply,
+}
+
+impl Direction {
+    fn token(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+            Direction::QueryReply => "query-reply",
+        }
+    }
+}
+
+/// The opening message: what the plugin is being asked to broker, and under which policy.
+pub(crate) struct Hello<'a> {
+    pub(crate) broker: &'a str,
+    pub(crate) allow: &'a [String],
+    /// Whether this plugin will be shown host replies, so it need not infer it from the manifest
+    /// it cannot read.
+    pub(crate) inspect_replies: bool,
+}
+
+impl Hello<'_> {
+    /// The handshake line, newline included.
+    pub(crate) fn line(&self) -> String {
+        let allow = serde_json::Value::from(self.allow.to_vec());
+        let v = serde_json::json!({
+            "v": PROTOCOL_VERSION,
+            "broker": self.broker,
+            "allow": allow,
+            "inspect_replies": self.inspect_replies,
+        });
+        format!("{v}\n")
+    }
+}
+
+/// The plugin's answer to the handshake, before validation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHelloReply {
+    ok: Option<bool>,
+    error: Option<String>,
+}
+
+/// Read the plugin's answer to [`Hello`]. Anything but an explicit acceptance refuses the
+/// connection **before** the host resource is contacted.
+///
+/// The handshake exists to make an unusable plugin say so at the one moment nothing is at stake
+/// yet: a plugin that cannot speak [`PROTOCOL_VERSION`], that will not broker under the `allow` it
+/// was given, or that failed to start, is a plugin whose first frame must never be asked about. It
+/// also gives the plugin the one place it can explain itself, which a dead pipe cannot.
+pub(crate) fn parse_hello_reply(line: &str) -> Result<(), String> {
+    let raw: RawHelloReply = serde_json::from_str(line.trim_end())
+        .map_err(|e| format!("unreadable answer to the handshake: {e}"))?;
+    match raw.ok {
+        Some(true) => Ok(()),
+        // A refusal carries its reason when the plugin gave one: this is third-party text, so the
+        // caller bounds it before it reaches a terminal.
+        Some(false) => Err(match raw.error {
+            Some(why) if !why.is_empty() => format!("the plugin declined to broker: {why}"),
+            _ => "the plugin declined to broker".to_string(),
+        }),
+        None => Err("the answer to the handshake carries no `ok`".to_string()),
+    }
+}
+
+/// One frame put to the plugin for a verdict.
+pub(crate) struct Ask<'a> {
+    pub(crate) seq: u64,
+    pub(crate) dir: Direction,
+    pub(crate) data: &'a [u8],
+}
+
+impl Ask<'_> {
+    /// The request line, newline included.
+    pub(crate) fn line(&self) -> String {
+        let v = serde_json::json!({
+            "seq": self.seq,
+            "dir": self.dir.token(),
+            "data": to_hex(self.data),
+        });
+        format!("{v}\n")
+    }
+}
+
+/// What a plugin decided about one frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// Send it to the host resource: the frame as it stands, or the rewritten bytes carried here.
+    /// Rewriting is how a broker *narrows* a request rather than refusing it whole.
+    Forward(Option<Vec<u8>>),
+    /// Answer the cage with these bytes and never contact the host resource. What lets a reply be
+    /// rebuilt rather than filtered in place, so nothing withheld is ever spelled toward the cage.
+    Reply(Vec<u8>),
+    /// Refuse. The bytes are the protocol's refusal when the plugin knows one; without them the
+    /// caller falls back to the manifest's `deny_frame`, and failing that, closes the connection.
+    Deny(Option<Vec<u8>>),
+    /// Put these bytes to the host resource and hand the answer back, then ask again.
+    Query(Vec<u8>),
+}
+
+/// A plugin's answer to one [`Ask`]: its verdict, plus the label the decision record will carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Answer {
+    pub(crate) verdict: Verdict,
+    /// On a reply frame: whether the exchange continues, so sbx should take another frame from the
+    /// host and show it too.
+    ///
+    /// Defaults to **false**, which ends the exchange. A protocol that answers one message with a
+    /// run of them needs the plugin to say `more` until it recognises the terminator; a plugin
+    /// that says nothing gets the single-message reading, which is the safe one — sbx stops
+    /// reading rather than waiting on a resource that may have finished speaking.
+    pub(crate) more: bool,
+    /// The plugin's own account of what it decided, for the session's record. Free text from
+    /// third-party code: bounded and stripped of control characters by the record, never trusted
+    /// to be true. sbx logs what it *observed* beside it.
+    pub(crate) label: Option<String>,
+}
+
+/// The raw answer line, before validation. Every field optional so a missing one yields a precise
+/// message; unknown fields are refused, as everywhere a machine reads a declaration here: a
+/// misspelled `data` that was silently dropped would turn a refusal into a forward.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAnswer {
+    seq: Option<u64>,
+    verdict: Option<String>,
+    data: Option<String>,
+    label: Option<String>,
+    #[serde(default)]
+    more: bool,
+}
+
+/// Parse one answer line against the frame it should be answering.
+///
+/// `max_frame` bounds the bytes a plugin may hand back, for the reason it bounds what sbx reads
+/// off the socket: the value ends up on a wire the plugin does not own.
+pub(crate) fn parse_answer(
+    line: &str,
+    expect_seq: u64,
+    max_frame: usize,
+) -> Result<Answer, String> {
+    let raw: RawAnswer =
+        serde_json::from_str(line.trim_end()).map_err(|e| format!("unreadable answer: {e}"))?;
+
+    match raw.seq {
+        Some(seq) if seq == expect_seq => {}
+        // A plugin answering another frame has lost track of the conversation. There is no safe
+        // way to guess which frame it meant, so the exchange ends.
+        Some(seq) => return Err(format!("answer carries seq {seq}, expected {expect_seq}")),
+        None => return Err("answer carries no `seq`".to_string()),
+    }
+
+    let verdict = raw
+        .verdict
+        .as_deref()
+        .ok_or("answer carries no `verdict`")?;
+    let data = match &raw.data {
+        None => None,
+        Some(hex) => {
+            let bytes = from_hex(hex).map_err(|e| format!("`data` is not hex: {e}"))?;
+            if bytes.len() > max_frame {
+                return Err(format!(
+                    "`data` is {} bytes, above this broker's `max_frame` of {max_frame}",
+                    bytes.len()
+                ));
+            }
+            if bytes.is_empty() {
+                // An empty frame is not a frame: the framing writes a length, and a zero-length
+                // one is what a reader treats as a protocol error. Refused here so it cannot be
+                // written toward either side.
+                return Err("`data` is empty".to_string());
+            }
+            Some(bytes)
+        }
+    };
+
+    let verdict = match (verdict, data) {
+        ("forward", data) => Verdict::Forward(data),
+        ("reply", Some(data)) => Verdict::Reply(data),
+        ("reply", None) => return Err("`reply` carries no `data` to answer with".to_string()),
+        ("deny", data) => Verdict::Deny(data),
+        ("query", Some(data)) => Verdict::Query(data),
+        ("query", None) => return Err("`query` carries no `data` to ask with".to_string()),
+        (other, _) => {
+            return Err(format!(
+                "unknown verdict `{other}` (forward, reply, deny, query)"
+            ));
+        }
+    };
+
+    Ok(Answer {
+        verdict,
+        more: raw.more,
+        label: raw.label.filter(|l| !l.is_empty()),
+    })
+}
+
+// -----------------------------------------------------------------------------------
+// Framing: the one part of a protocol sbx must understand.
+// -----------------------------------------------------------------------------------
+
+/// Read one frame, or `Ok(None)` at a clean end of stream.
+///
+/// The declared bound is checked **before** the body is allocated. The cage writes this length, so
+/// a reader that trusted it would turn a four-byte prefix into an allocation of the cage's
+/// choosing. A zero length is refused for the same reason it is refused in an answer: it is not a
+/// frame, and no protocol here has one.
+pub(crate) fn read_frame(
+    r: &mut impl Read,
+    framing: Framing,
+    max: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    match framing {
+        Framing::LengthU32Be => {
+            let mut len = [0u8; 4];
+            match r.read_exact(&mut len) {
+                Ok(()) => {}
+                // Nothing at all is the peer closing between frames, which is ordinary.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e),
+            }
+            let len = u32::from_be_bytes(len) as usize;
+            if len == 0 || len > max {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("frame length {len} out of range (max {max})"),
+                ));
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body)?;
+            Ok(Some(body))
+        }
+        // A line, without its terminator: the frame is what the protocol calls a message, and the
+        // newline is the framing. Read byte by byte rather than through a `BufRead`, because the
+        // caller hands us a stream it also writes to and a buffered reader would swallow bytes the
+        // next read is owed.
+        Framing::Line => {
+            let mut body = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match r.read_exact(&mut byte) {
+                    Ok(()) => {}
+                    // Nothing at all is a clean close between messages; a partial line is not.
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        return if body.is_empty() {
+                            Ok(None)
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "the stream ended mid-line",
+                            ))
+                        };
+                    }
+                    Err(e) => return Err(e),
+                }
+                if byte[0] == b'\n' {
+                    return Ok(Some(body));
+                }
+                body.push(byte[0]);
+                // Checked as it grows, so an endless line is refused rather than read into memory
+                // until something else gives out.
+                if body.len() > max {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("line longer than the {max}-byte bound"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Write one frame, framed as the manifest declared.
+pub(crate) fn write_frame(w: &mut impl Write, framing: Framing, body: &[u8]) -> io::Result<()> {
+    match framing {
+        Framing::LengthU32Be => {
+            let len = u32::try_from(body.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "frame too large to be framed")
+            })?;
+            w.write_all(&len.to_be_bytes())?;
+            w.write_all(body)?;
+            w.flush()
+        }
+        Framing::Line => {
+            // A frame carrying a newline would be read back as two, so it is refused rather than
+            // written: one message in, one message out, or an error saying why not.
+            if body.contains(&b'\n') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a line-framed message cannot contain a newline",
+                ));
+            }
+            w.write_all(body)?;
+            w.write_all(b"\n")?;
+            w.flush()
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------
+// The relay.
+// -----------------------------------------------------------------------------------
+
+/// Whatever answers a frame. The relay is written against this rather than against a child
+/// process, so the decisions below are testable without spawning one — the property the
+/// first-party ssh-agent broker gets from its own fake agent.
+///
+/// **An implementation must bound its own wait.** The deadline is not in this signature because a
+/// test's decider answers from a script and has nothing to wait on; the one that drives a real
+/// plugin sets a read timeout on the socket it holds. A decider that can block forever holds a
+/// cage connection, a host connection and a thread with it, and no ceiling elsewhere bounds that:
+/// [`MAX_QUERIES_PER_FRAME`] bounds a *talkative* plugin, never a silent one.
+pub(crate) trait Decider {
+    /// Put one frame to the decider and read back its answer. An error means no verdict was
+    /// obtained, which every caller treats as a refusal.
+    fn ask(&mut self, ask: &Ask<'_>) -> Result<Answer, String>;
+}
+
+/// What the relay did with one frame, for the caller's record. Reports what sbx **observed**,
+/// which is not the same thing as what the plugin said it decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// Sent to the host resource (rewritten or not) and its reply returned to the cage.
+    Forwarded { rewritten: bool, queries: u32 },
+    /// Answered by the plugin without the host resource being contacted.
+    Answered,
+    /// Refused. The cage got the refusal frame if there was one to give it.
+    Refused { with_frame: bool },
+}
+
+/// What one frame's relay produced: what sbx observed, what the cage is owed, and what the plugin
+/// said about it. Named rather than a tuple because the second field is the one that matters and a
+/// positional reading of three options invites putting the wrong one on the wire.
+#[derive(Debug)]
+pub(crate) struct Relayed {
+    /// What sbx observed happening, which is not the same as what the plugin claims it decided.
+    pub(crate) outcome: Outcome,
+    /// The frames to write back to the cage, in order. Empty when the refusal is a closed
+    /// connection, and more than one where a protocol answers a command with several messages.
+    pub(crate) to_cage: Vec<Vec<u8>>,
+    /// The plugin's own account of the decision, for the record.
+    pub(crate) label: Option<String>,
+}
+
+/// What one exchange's answer amounted to: the frames owed to the cage, the plugin's account, and
+/// whether the plugin refused on the way back — which makes the whole exchange a refusal, however
+/// it started.
+struct Collected {
+    frames: Vec<Vec<u8>>,
+    label: Option<String>,
+    refused: bool,
+}
+
+/// Read one exchange's worth of answer from the host resource.
+///
+/// A single frame where the protocol answers one message with one message; a run of them where it
+/// does not, in which case **the plugin is what says where the run ends** — it sees each frame and
+/// answers `more` until the terminator it recognises. That is why a multi-message protocol needs
+/// `inspect_replies`: without the plugin seeing the replies, nothing here can know when to stop.
+///
+/// `first` is a frame already taken from the host (the greeting), or `None` to read one now.
+fn collect_reply<H: Read + Write>(
+    spec: &BrokerSpec,
+    decider: &mut dyn Decider,
+    host: &mut H,
+    seq: u64,
+    first: Option<Vec<u8>>,
+) -> Result<Collected, String> {
+    let mut out = Vec::new();
+    let mut label = None;
+    let mut taken = 0u32;
+    let mut pending = first;
+    let done = |frames, label| Collected {
+        frames,
+        label,
+        refused: false,
+    };
+    loop {
+        let frame = match pending.take() {
+            Some(f) => f,
+            None => read_frame(host, spec.framing, spec.max_frame)
+                .map_err(|e| format!("cannot read the host resource: {e}"))?
+                .ok_or("the host resource closed mid-exchange")?,
+        };
+        taken += 1;
+        if taken > MAX_REPLY_FRAMES {
+            return Err(format!(
+                "the host resource sent more than {MAX_REPLY_FRAMES} frames for one exchange \
+                 without the broker calling it done"
+            ));
+        }
+        // Without the grant the plugin never sees what the host answered, so one frame is the
+        // whole answer — the only reading available when nothing can say otherwise.
+        if !spec.inspect_replies {
+            out.push(frame);
+            return Ok(done(out, label));
+        }
+        let answer = decider.ask(&Ask {
+            seq,
+            dir: Direction::Down,
+            data: &frame,
+        })?;
+        if answer.label.is_some() {
+            label = answer.label.clone();
+        }
+        match answer.verdict {
+            // Pass it on, as it stands or rebuilt. Rebuilding is what keeps something withheld
+            // from ever being spelled toward the cage.
+            Verdict::Forward(None) => out.push(frame),
+            Verdict::Forward(Some(rewritten)) | Verdict::Reply(rewritten) => out.push(rewritten),
+            // Refused on the way back: what the host said is not delivered because the plugin was
+            // shown it. The caller turns this into the protocol's refusal.
+            // Refused on the way back. The outcome is a refusal, not a forward: what the host
+            // said is not delivered, and a record calling it a forward would be false. The
+            // manifest's constant stands in when the plugin named no bytes, exactly as on the way
+            // up.
+            Verdict::Deny(bytes) => {
+                let frame = bytes.or_else(|| spec.deny_frame.clone());
+                return Ok(Collected {
+                    frames: frame.into_iter().collect(),
+                    label: answer.label,
+                    refused: true,
+                });
+            }
+            Verdict::Query(_) => {
+                return Err(
+                    "the plugin asked to query the host resource about a reply, which ends no \
+                     exchange"
+                        .to_string(),
+                );
+            }
+        }
+        if !answer.more {
+            return Ok(done(out, label));
+        }
+    }
+}
+
+/// One frame's worth of relay: ask, honour the verdict, and say what happened.
+///
+/// `host` is the connection to the host resource, which sbx opened and holds throughout. A
+/// [`Verdict::Query`] round-trips on it and comes back to the plugin; the ceiling on those is
+/// [`MAX_QUERIES_PER_FRAME`], and reaching it refuses the frame rather than truncating the
+/// exchange.
+///
+/// **The caller sets the deadline on `host` before calling.** Every path here that writes to the
+/// host resource then reads its reply would otherwise wait on it forever, and a host resource that
+/// hangs would hang the cage: the socket named in the config is whatever the machine offers, not
+/// something sbx vouches for. A read timeout on the stream turns that into an error, which lands
+/// on the fail-closed path with every other one.
+///
+/// Every error path is fail-closed: whatever goes wrong with the plugin, the frame is refused and
+/// the caller is told, never forwarded on a guess.
+pub(crate) fn relay_one<H: Read + Write>(
+    frame: &[u8],
+    dir: Direction,
+    seq: u64,
+    spec: &BrokerSpec,
+    decider: &mut dyn Decider,
+    host: &mut H,
+) -> Result<Relayed, String> {
+    let mut ask_data = frame.to_vec();
+    let mut ask_dir = dir;
+    let mut queries = 0u32;
+
+    loop {
+        let answer = decider.ask(&Ask {
+            seq,
+            dir: ask_dir,
+            data: &ask_data,
+        })?;
+        match answer.verdict {
+            Verdict::Query(bytes) => {
+                queries += 1;
+                if queries > MAX_QUERIES_PER_FRAME {
+                    return Err(format!(
+                        "the plugin asked the host resource {queries} times for one frame \
+                         (ceiling {MAX_QUERIES_PER_FRAME})"
+                    ));
+                }
+                write_frame(host, spec.framing, &bytes)
+                    .map_err(|e| format!("cannot reach the host resource: {e}"))?;
+                let reply = read_frame(host, spec.framing, spec.max_frame)
+                    .map_err(|e| format!("cannot read the host resource: {e}"))?
+                    .ok_or("the host resource closed mid-exchange")?;
+                ask_data = reply;
+                ask_dir = Direction::QueryReply;
+            }
+            Verdict::Forward(rewritten) => {
+                let out = rewritten.as_deref().unwrap_or(frame);
+                write_frame(host, spec.framing, out)
+                    .map_err(|e| format!("cannot reach the host resource: {e}"))?;
+                let reply = collect_reply(spec, decider, host, seq, None)?;
+                return Ok(Relayed {
+                    outcome: if reply.refused {
+                        Outcome::Refused {
+                            with_frame: !reply.frames.is_empty(),
+                        }
+                    } else {
+                        Outcome::Forwarded {
+                            rewritten: rewritten.is_some(),
+                            queries,
+                        }
+                    },
+                    to_cage: reply.frames,
+                    label: reply.label.or(answer.label),
+                });
+            }
+            Verdict::Reply(bytes) => {
+                return Ok(Relayed {
+                    outcome: Outcome::Answered,
+                    to_cage: vec![bytes],
+                    label: answer.label,
+                });
+            }
+            Verdict::Deny(bytes) => {
+                // The plugin's own refusal if it gave one, the manifest's constant if it declared
+                // one, and otherwise nothing — which the caller turns into a closed connection.
+                let frame = bytes.or_else(|| spec.deny_frame.clone());
+                return Ok(Relayed {
+                    outcome: Outcome::Refused {
+                        with_frame: frame.is_some(),
+                    },
+                    to_cage: frame.into_iter().collect(),
+                    label: answer.label,
+                });
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------
+// The decider that is a real plugin.
+// -----------------------------------------------------------------------------------
+
+/// How long sbx waits for one verdict before treating the plugin as gone.
+///
+/// A decision here is a computation, not a conversation with a human: nothing in this exchange
+/// asks the user anything, so a plugin that has not answered in this long is stuck rather than
+/// slow. The wait must be bounded at all, because a silent plugin otherwise holds a cage
+/// connection, a host connection and a thread for as long as the session lives.
+const PLUGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A broker plugin running in its own host-side cage, spoken to over a socket pair.
+///
+/// A socket rather than a pipe for one reason: a socket takes a read deadline, and a pipe does
+/// not. That deadline is the only thing standing between a wedged plugin and a wedged session.
+pub(crate) struct PluginProcess {
+    child: std::process::Child,
+    /// The protocol's frame bound, applied to what the plugin *hands back* as well as to what the
+    /// cage sends. Those bytes go straight to the host resource or to the cage, so the side that
+    /// does not own the wire does not get to set their size.
+    max_frame: usize,
+    /// Our end of the pair. The plugin has the other as both its stdin and its stdout.
+    reader: io::BufReader<std::os::unix::net::UnixStream>,
+    writer: std::os::unix::net::UnixStream,
+    /// The descriptor the cage's environment was read from, held open for the child's whole life:
+    /// bwrap reads it at startup, and dropping it earlier would race that read.
+    _env: Option<std::fs::File>,
+}
+
+impl PluginProcess {
+    /// Start `plugin` under `bwrap` and complete the handshake. An error here means no broker: the
+    /// caller has not yet accepted anything it would have to refuse.
+    pub(crate) fn start(
+        bwrap: &std::path::Path,
+        plugin: &crate::plugins::broker::BrokerPlugin,
+        allow: &[String],
+    ) -> io::Result<Self> {
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+
+        let (ours, theirs) = UnixStream::pair()?;
+        ours.set_read_timeout(Some(PLUGIN_DEADLINE))?;
+        ours.set_write_timeout(Some(PLUGIN_DEADLINE))?;
+
+        let plan = super::resolver::CagePlan {
+            dir: &plugin.dir,
+            exec: &plugin.exec,
+            grant: &plugin.sandbox,
+            host: &plugin.host,
+            called: &plugin.name,
+            configured_as: &plugin.name,
+            // No arguments: everything this plugin is told arrives on the wire, where it can be
+            // bounded and where a secret would not be world-readable in `/proc`.
+            args: Vec::new(),
+        };
+        let (argv, env) = super::resolver::compose_cage(&plan)?;
+
+        let child = Command::new(bwrap)
+            .args(argv)
+            // The same socket on both: the plugin reads its asks from stdin and writes verdicts to
+            // stdout, and both ends of that are this one connection. Handed over as descriptors,
+            // which is the form `Stdio` takes.
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs.try_clone()?)))
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+            // Discarded rather than piped, and the choice is about liveness: nothing here reads a
+            // plugin's stderr while it runs, and a pipe nobody drains fills and blocks the very
+            // process sbx is waiting on. A plugin's channel for saying what it decided is the
+            // `label` on its verdict, which the session's record carries.
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "could not start the `{}` broker plugin: {e}",
+                    plugin.name
+                ))
+            })?;
+
+        let mut me = Self {
+            child,
+            max_frame: plugin.broker.max_frame,
+            reader: io::BufReader::new(ours.try_clone()?),
+            writer: ours,
+            _env: env,
+        };
+        me.handshake(plugin, allow)?;
+        Ok(me)
+    }
+
+    /// Say what is being brokered and under which policy, and require an acceptance.
+    fn handshake(
+        &mut self,
+        plugin: &crate::plugins::broker::BrokerPlugin,
+        allow: &[String],
+    ) -> io::Result<()> {
+        let hello = Hello {
+            broker: &plugin.name,
+            allow,
+            inspect_replies: plugin.broker.inspect_replies,
+        };
+        self.writer.write_all(hello.line().as_bytes())?;
+        self.writer.flush()?;
+        let line = self.read_line()?;
+        parse_hello_reply(&line).map_err(|why| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the `{}` broker plugin cannot broker: {why}", plugin.name),
+            )
+        })
+    }
+
+    /// One line from the plugin, or an error when it says nothing in time or closes.
+    fn read_line(&mut self) -> io::Result<String> {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the plugin closed its side",
+            ));
+        }
+        Ok(line)
+    }
+}
+
+impl Decider for PluginProcess {
+    fn ask(&mut self, ask: &Ask<'_>) -> Result<Answer, String> {
+        self.writer
+            .write_all(ask.line().as_bytes())
+            .and_then(|()| self.writer.flush())
+            .map_err(|e| format!("cannot reach the plugin: {e}"))?;
+        let line = self
+            .read_line()
+            .map_err(|e| format!("no verdict from the plugin: {e}"))?;
+        parse_answer(&line, ask.seq, self.max_frame)
+    }
+}
+
+impl Drop for PluginProcess {
+    fn drop(&mut self) {
+        // The child dies with sbx by construction (every cage is built that way), but a broker
+        // outlives nothing: the cage connection it served is gone, so it is killed here rather
+        // than left to hold a slot until the session ends. Reaped in the same breath, so a session
+        // that opens many connections does not accumulate zombies.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// -----------------------------------------------------------------------------------
+// Standing the broker up for a launch.
+// -----------------------------------------------------------------------------------
+
+/// Cage connections served at once. Each pins a thread, a plugin process and a connection to the
+/// host resource, so the ceiling bounds all three. Past it a connection is dropped rather than
+/// allowed to take a slot nothing bounds — the rule the ssh-agent broker already applies.
+const MAX_CONCURRENT_CONNS: usize = 32;
+
+/// How long sbx waits on the host resource before giving up on one exchange. The socket is
+/// whatever the machine offers, so a hang there must not become a hang in the cage.
+const HOST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A running broker's host-side resources. The accept loop is detached and dies with sbx; this
+/// guard owns the socket file and unlinks it when the launch ends.
+pub(crate) struct Broker {
+    host_uds: std::path::PathBuf,
+    /// The control socket a reader takes the decision record from. Never bound into the cage: the
+    /// agent must not read — or amend — the record of what it asked for.
+    control_uds: std::path::PathBuf,
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.host_uds);
+        let _ = std::fs::remove_file(&self.control_uds);
+    }
+}
+
+/// What the launcher must add to the cage for one broker to be reachable.
+pub(crate) struct Wiring {
+    pub(crate) binds: Vec<super::binds::ExtraBind>,
+    pub(crate) env: Vec<(String, String)>,
+}
+
+/// Where a broker's cage-facing socket lands. sbx picks it, and a manifest never does: one per
+/// broker name, so two brokers in one cage cannot collide, and under `/tmp` (a tmpfs the cage
+/// owns) so it can shadow nothing the cage needs.
+fn cage_socket(name: &str) -> String {
+    format!("/tmp/sbx-broker-{name}.sock")
+}
+
+/// Serve one cage connection: start the plugin, open the host resource, and relay frames until
+/// either side is done.
+fn serve_conn(
+    cage: std::os::unix::net::UnixStream,
+    bwrap: &std::path::Path,
+    plugin: &crate::plugins::broker::BrokerPlugin,
+    allow: &[String],
+    host_socket: &std::path::Path,
+    ring: &super::broker_control::BrokerRing,
+) -> Result<(), String> {
+    let mut decider = PluginProcess::start(bwrap, plugin, allow).map_err(|e| e.to_string())?;
+    let mut host = std::os::unix::net::UnixStream::connect(host_socket)
+        .map_err(|e| format!("cannot reach {}: {e}", host_socket.display()))?;
+    // The deadline `relay_one` documents as the caller's to set. Without it a wedged host
+    // resource wedges the cage that is waiting on it.
+    let _ = host.set_read_timeout(Some(HOST_DEADLINE));
+    let _ = host.set_write_timeout(Some(HOST_DEADLINE));
+
+    let spec = &plugin.broker;
+    let mut cage_r = io::BufReader::new(cage.try_clone().map_err(|e| e.to_string())?);
+    let mut cage_w = cage;
+    let mut seq = 0u64;
+
+    // Some protocols have the host speak first. Its greeting belongs to no cage request, so it is
+    // exchange 0: read it, let the plugin rule on it, and pass on what the plugin allows — before
+    // the cage's first message. Skipping this on a greeting protocol would answer every message
+    // with the reply to the one before it.
+    if spec.host_greets {
+        let greeting = read_frame(&mut host, spec.framing, spec.max_frame)
+            .map_err(|e| format!("cannot read the host resource's greeting: {e}"))?
+            .ok_or("the host resource closed before greeting")?;
+        let greeted = collect_reply(spec, &mut decider, &mut host, 0, Some(greeting))?;
+        let to_cage = greeted.frames;
+        for bytes in &to_cage {
+            if write_frame(&mut cage_w, spec.framing, bytes).is_err() {
+                return Ok(());
+            }
+        }
+        if to_cage.is_empty() {
+            // The plugin refused the greeting: there is no exchange to have.
+            return Ok(());
+        }
+    }
+    // Only the first refusal of a connection is announced; see below.
+    let mut said_refusal = false;
+
+    loop {
+        let frame = match read_frame(&mut cage_r, spec.framing, spec.max_frame) {
+            Ok(Some(f)) => f,
+            // A clean end, or a frame that is not one: either way the client is done with us.
+            Ok(None) | Err(_) => return Ok(()),
+        };
+        seq += 1;
+        let answer = match relay_one(&frame, Direction::Up, seq, spec, &mut decider, &mut host) {
+            Ok(relayed) => {
+                // Every decision goes to the record, which is what a reader consults afterwards.
+                // What sbx *observed* decides the kind; the plugin's label is only ever a detail
+                // appended to it.
+                let (kind, observed) = match &relayed.outcome {
+                    Outcome::Forwarded { rewritten, queries } => (
+                        super::broker_control::BrokerKind::Forward,
+                        match (rewritten, queries) {
+                            (false, 0) => "a request".to_string(),
+                            (true, 0) => "a request, narrowed by the broker".to_string(),
+                            (false, n) => format!("a request, after {n} host lookup(s)"),
+                            (true, n) => {
+                                format!(
+                                    "a request, narrowed by the broker, after {n} host lookup(s)"
+                                )
+                            }
+                        },
+                    ),
+                    Outcome::Answered => (
+                        super::broker_control::BrokerKind::Answer,
+                        "a request answered without the host resource".to_string(),
+                    ),
+                    Outcome::Refused { .. } => (
+                        super::broker_control::BrokerKind::Refuse,
+                        "a request".to_string(),
+                    ),
+                };
+                ring.push(kind, &observed, relayed.label.as_deref());
+
+                // A refusal is also worth saying out loud, and only the first of a connection: it
+                // is rare by nature, and a client that hits one usually reports something
+                // unhelpful ("permission denied") with no hint of who decided. A forward is the
+                // norm and stays silent on the terminal — the record above has it either way.
+                if matches!(relayed.outcome, Outcome::Refused { .. }) && !said_refusal {
+                    said_refusal = true;
+                    let why = relayed
+                        .label
+                        .as_deref()
+                        .map(super::lens::sanitize_detail)
+                        .unwrap_or_default();
+                    crate::diag::note(&format!(
+                        "broker `{}` refused a request from the cage{}",
+                        plugin.name,
+                        if why.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {why}")
+                        }
+                    ));
+                }
+                relayed.to_cage
+            }
+            // No verdict was obtained, so nothing is forwarded. The usual cause is a plugin that
+            // died or wedged, and that is not a plugin to keep asking: the refusal goes out (as
+            // the protocol's own frame where the manifest declared one) and the connection ends.
+            // Looping here would answer every further frame from a broker that no longer exists,
+            // in silence, while holding both connections open.
+            Err(why) => {
+                ring.push(
+                    super::broker_control::BrokerKind::Refuse,
+                    "a request no verdict could be obtained for",
+                    Some(&why),
+                );
+                crate::diag::warn(&format!(
+                    "broker `{}`: no verdict, so the request was refused and the connection ended \
+                     — {}",
+                    plugin.name,
+                    super::lens::sanitize_detail(&why)
+                ));
+                if let Some(deny) = &spec.deny_frame {
+                    let _ = write_frame(&mut cage_w, spec.framing, deny);
+                }
+                return Ok(());
+            }
+        };
+        if answer.is_empty() {
+            // A refusal with nothing to say: closing is the refusal that needs no protocol.
+            return Ok(());
+        }
+        for bytes in &answer {
+            if write_frame(&mut cage_w, spec.framing, bytes).is_err() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Stand up one broker: bind its socket under the data directory, serve it, and return what the
+/// cage needs to reach it.
+pub(crate) fn start(
+    layout: &crate::store::Layout,
+    binding: &crate::config::BrokerBinding,
+    plugin: &crate::plugins::broker::BrokerPlugin,
+    bwrap: &std::path::Path,
+) -> io::Result<(Broker, Wiring)> {
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The data directory is owner-only, and this socket is a reason it must be: whatever connects
+    // to it is brokered through to a host resource.
+    crate::store::ensure(layout)?;
+    let dir = layout.data_dir().join("broker");
+    super::lens::ensure_control_dir(&dir)?;
+
+    // Keyed by the launcher pid, like the agent and egress sockets, so a crashed predecessor's
+    // residue is identifiable — and cleared here, since a stale file would block the bind.
+    let host_uds = dir.join(format!("{}-{}.sock", binding.name, std::process::id()));
+    let _ = std::fs::remove_file(&host_uds);
+    let listener = UnixListener::bind(&host_uds)?;
+
+    // The session's decision record, and the socket a reader reaches it through. Bound before the
+    // broker serves, so the first decision cannot beat the reader to it. In the same `0700`
+    // directory as the broker socket and, like every other lens, **never** bound into the cage.
+    // A failure to stand it up is not a reason to refuse the broker: the relay is the fence, the
+    // record is the witness — so it degrades to a broker with no reader rather than to no broker.
+    let ring = Arc::new(super::broker_control::BrokerRing::new(
+        super::broker_control::BROKER_RING_CAP,
+        &binding.name,
+    ));
+    let control_uds =
+        super::broker_control::broker_control_socket(layout.data_dir(), std::process::id());
+    let served = ring.clone();
+    if let Err(e) = super::lens::bind_and_serve(&control_uds, move |control| {
+        super::broker_control::serve(control, served)
+    }) {
+        crate::diag::warn(&format!(
+            "the `{}` broker is running, but its decisions cannot be read (`{}`: {e}) — \
+             `sbx logs --feed broker` will report no broker for this session",
+            binding.name,
+            control_uds.display()
+        ));
+    }
+
+    let bwrap = bwrap.to_path_buf();
+    let allow = binding.allow.clone();
+    let host_socket = binding.socket.clone();
+    // The accept loop's own copy: the wiring returned below reads the manifest again, and the
+    // launcher's `plugin` outlives neither.
+    let serving = plugin.clone();
+    let serving_ring = ring.clone();
+    std::thread::spawn(move || {
+        let plugin = serving;
+        let ring = serving_ring;
+        let live = Arc::new(AtomicUsize::new(0));
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNS {
+                live.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
+            let (bwrap, plugin, allow, host_socket, live, ring) = (
+                bwrap.clone(),
+                plugin.clone(),
+                allow.clone(),
+                host_socket.clone(),
+                live.clone(),
+                ring.clone(),
+            );
+            std::thread::spawn(move || {
+                if let Err(why) = serve_conn(conn, &bwrap, &plugin, &allow, &host_socket, &ring) {
+                    // A connection that could not be served at all is a fact about the session,
+                    // not about any one frame: without this the client just sees a closed socket.
+                    crate::diag::warn(&format!(
+                        "broker `{}`: a connection was refused — {why}",
+                        plugin.name
+                    ));
+                }
+                live.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+
+    let cage_path = cage_socket(&binding.name);
+    Ok((
+        Broker {
+            host_uds: host_uds.clone(),
+            control_uds,
+        },
+        Wiring {
+            // Read-only: the cage runs same-uid, and a read-only bind is enough to `connect()` —
+            // the property the Wayland and ssh-agent sockets already rely on. Only the socket file
+            // crosses, never the directory that holds every other launch's.
+            binds: vec![super::binds::ExtraBind {
+                src: host_uds,
+                dest: std::path::PathBuf::from(&cage_path),
+                writable: false,
+            }],
+            env: plugin
+                .broker
+                .cage_env
+                .iter()
+                .map(|k| (k.clone(), cage_path.clone()))
+                .collect(),
+        },
+    ))
+}
+
+/// Lowercase hex, the spelling every `data` field uses.
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Decode a `data` field. Strict on purpose: an odd length or a stray character is a plugin
+/// mis-encoding a frame, and a lenient decoder would put *almost* the right bytes on the wire.
+fn from_hex(s: &str) -> Result<Vec<u8>, String> {
+    if !s.len().is_multiple_of(2) {
+        return Err(format!("odd length ({})", s.len()));
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = hex_digit(pair[0])?;
+        let lo = hex_digit(pair[1])?;
+        out.push(hi << 4 | lo);
+    }
+    Ok(out)
+}
+
+fn hex_digit(c: u8) -> Result<u8, String> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        // Uppercase is refused rather than accepted: one spelling means a test that pins a line
+        // pins it exactly, and a plugin author is told at once instead of on the one input whose
+        // round trip differs.
+        b'A'..=b'F' => Err(format!("uppercase digit `{}`", c as char)),
+        _ => Err(format!("`{}` is not a hex digit", c as char)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(verdict: &str, extra: &str) -> String {
+        format!("{{\"seq\":7,\"verdict\":\"{verdict}\"{extra}}}")
+    }
+
+    /// A stand-in for the host resource: replies are queued, frames are recorded. Lets every
+    /// decision below be tested without a socket, a plugin or a protocol.
+    struct FakeHost {
+        /// Canned answers, one **run** per whole frame received: a protocol may answer one command
+        /// with several messages, which is the case this fake exists to reproduce faithfully.
+        replies: Vec<Vec<Vec<u8>>>,
+        /// Every frame the relay put to the host: the record a test asserts *absence* against.
+        seen: Vec<Vec<u8>>,
+        /// Bytes written by the relay that do not yet form a whole frame.
+        pending: Vec<u8>,
+        /// Framed replies waiting to be read back, and how far the relay has read.
+        outbox: Vec<u8>,
+        read_at: usize,
+    }
+
+    impl FakeHost {
+        /// One frame answered by one frame, the common case.
+        fn with(replies: Vec<Vec<u8>>) -> Self {
+            Self::with_runs(replies.into_iter().map(|r| vec![r]).collect())
+        }
+
+        /// One frame answered by a run of frames.
+        fn with_runs(replies: Vec<Vec<Vec<u8>>>) -> Self {
+            Self {
+                replies,
+                seen: Vec::new(),
+                pending: Vec::new(),
+                outbox: Vec::new(),
+                read_at: 0,
+            }
+        }
+    }
+
+    impl Read for FakeHost {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = (self.outbox.len() - self.read_at).min(buf.len());
+            buf[..n].copy_from_slice(&self.outbox[self.read_at..self.read_at + n]);
+            self.read_at += n;
+            Ok(n)
+        }
+    }
+
+    impl Write for FakeHost {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.pending.extend_from_slice(buf);
+            // Drain every whole frame the write completed, answering each with the next canned
+            // reply. Two separate buffers, because one buffer holding both directions cannot say
+            // where the relay's writes end and the host's answers begin.
+            loop {
+                let mut cur = std::io::Cursor::new(&self.pending[..]);
+                let Ok(Some(frame)) = read_frame(&mut cur, Framing::LengthU32Be, 4096) else {
+                    break;
+                };
+                let consumed = cur.position() as usize;
+                self.pending.drain(..consumed);
+                self.seen.push(frame);
+                // A frame with no canned reply is a test that under-specified its host: say so
+                // here rather than let the relay block on a read that will never answer.
+                for reply in self.replies.remove(0) {
+                    write_frame(&mut self.outbox, Framing::LengthU32Be, &reply).unwrap();
+                }
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A plugin that answers from a script, and records what it was shown.
+    struct ScriptedPlugin {
+        answers: Vec<Answer>,
+        shown: Vec<(Direction, Vec<u8>)>,
+    }
+
+    impl ScriptedPlugin {
+        fn new(answers: Vec<Answer>) -> Self {
+            Self {
+                answers,
+                shown: Vec::new(),
+            }
+        }
+        fn forward() -> Answer {
+            Answer {
+                verdict: Verdict::Forward(None),
+                more: false,
+                label: None,
+            }
+        }
+    }
+
+    impl Decider for ScriptedPlugin {
+        fn ask(&mut self, ask: &Ask<'_>) -> Result<Answer, String> {
+            self.shown.push((ask.dir, ask.data.to_vec()));
+            if self.answers.is_empty() {
+                return Err("the plugin ran out of answers".to_string());
+            }
+            Ok(self.answers.remove(0))
+        }
+    }
+
+    fn spec(deny_frame: Option<Vec<u8>>) -> BrokerSpec {
+        BrokerSpec {
+            cage_env: vec!["X_SOCK".to_string()],
+            host_greets: false,
+            framing: Framing::LengthU32Be,
+            max_frame: 4096,
+            deny_frame,
+            inspect_replies: false,
+        }
+    }
+
+    fn relay(
+        frame: &[u8],
+        plugin: &mut ScriptedPlugin,
+        host: &mut FakeHost,
+        spec: &BrokerSpec,
+    ) -> Result<Relayed, String> {
+        relay_one(frame, Direction::Up, 7, spec, plugin, host)
+    }
+
+    #[test]
+    fn a_forwarded_frame_reaches_the_host_unchanged_and_its_reply_returns() {
+        let mut host = FakeHost::with(vec![vec![0xaa]]);
+        let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward()]);
+        let Relayed {
+            outcome,
+            to_cage: out,
+            ..
+        } = relay(&[0x0b], &mut plugin, &mut host, &spec(None)).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Forwarded {
+                rewritten: false,
+                queries: 0
+            }
+        );
+        assert_eq!(out, vec![vec![0xaa]]);
+        assert_eq!(host.seen, vec![vec![0x0b]]);
+    }
+
+    /// Rewriting is how a broker narrows a request instead of refusing it whole, so what reaches
+    /// the host must be the plugin's bytes and not the cage's.
+    #[test]
+    fn a_rewritten_forward_puts_the_plugins_bytes_on_the_wire() {
+        let mut host = FakeHost::with(vec![vec![0xaa]]);
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Forward(Some(vec![0x0c, 0x0d])),
+            more: false,
+            label: None,
+        }]);
+        let Relayed { outcome, .. } = relay(&[0x0b], &mut plugin, &mut host, &spec(None)).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Forwarded {
+                rewritten: true,
+                queries: 0
+            }
+        );
+        assert_eq!(host.seen, vec![vec![0x0c, 0x0d]]);
+    }
+
+    /// The property the whole type exists for: a refused frame must leave no trace of having been
+    /// attempted at the host resource.
+    #[test]
+    fn a_refused_frame_never_reaches_the_host() {
+        for (declared, plugin_bytes, expect) in [
+            (None, None, None),
+            (Some(vec![5u8]), None, Some(vec![5u8])),
+            (Some(vec![5u8]), Some(vec![9u8]), Some(vec![9u8])),
+        ] {
+            let mut host = FakeHost::with(Vec::new());
+            let mut plugin = ScriptedPlugin::new(vec![Answer {
+                verdict: Verdict::Deny(plugin_bytes),
+                more: false,
+                label: Some("not allowed".to_string()),
+            }]);
+            let Relayed {
+                outcome,
+                to_cage: out,
+                label,
+            } = relay(&[0x0b], &mut plugin, &mut host, &spec(declared)).unwrap();
+            assert_eq!(
+                outcome,
+                Outcome::Refused {
+                    with_frame: expect.is_some()
+                }
+            );
+            assert_eq!(out, expect.into_iter().collect::<Vec<_>>());
+            assert_eq!(label.as_deref(), Some("not allowed"));
+            assert!(host.seen.is_empty(), "a refusal must not touch the host");
+        }
+    }
+
+    /// A plugin's own refusal outranks the manifest's constant: the constant exists for the case
+    /// where nothing is there to answer, not to override an answer that is.
+    #[test]
+    fn a_reply_answers_the_cage_without_the_host() {
+        let mut host = FakeHost::with(Vec::new());
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Reply(vec![0x0c]),
+            more: false,
+            label: None,
+        }]);
+        let Relayed {
+            outcome,
+            to_cage: out,
+            ..
+        } = relay(&[0x0b], &mut plugin, &mut host, &spec(None)).unwrap();
+        assert_eq!(outcome, Outcome::Answered);
+        assert_eq!(out, vec![vec![0x0c]]);
+        assert!(host.seen.is_empty());
+    }
+
+    /// The verdict the ssh-agent broker cannot be expressed without: ask the host, see the answer,
+    /// then decide. The reply comes back to the plugin marked as owed to it, not as a frame on its
+    /// way to the cage.
+    #[test]
+    fn a_query_round_trips_to_the_host_and_the_plugin_decides_after() {
+        let mut host = FakeHost::with(vec![vec![0x0e], vec![0xaa]]);
+        let mut plugin = ScriptedPlugin::new(vec![
+            Answer {
+                verdict: Verdict::Query(vec![0x0b]),
+                more: false,
+                label: None,
+            },
+            ScriptedPlugin::forward(),
+        ]);
+        let Relayed {
+            outcome,
+            to_cage: out,
+            ..
+        } = relay(&[0x0d], &mut plugin, &mut host, &spec(None)).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Forwarded {
+                rewritten: false,
+                queries: 1
+            }
+        );
+        assert_eq!(out, vec![vec![0xaa]]);
+        // The host saw the query first, then the frame itself.
+        assert_eq!(host.seen, vec![vec![0x0b], vec![0x0d]]);
+        // And the plugin was shown the host's answer, marked as the query's.
+        assert_eq!(
+            plugin.shown,
+            vec![
+                (Direction::Up, vec![0x0d]),
+                (Direction::QueryReply, vec![0x0e]),
+            ]
+        );
+    }
+
+    /// An unbounded query chain is a plugin holding the host resource open on the cage's behalf.
+    /// Reaching the ceiling refuses the frame; it never truncates the exchange and forwards.
+    #[test]
+    fn a_query_loop_is_refused_at_the_ceiling() {
+        // The bound is written out rather than derived from the constant: a test that recomputes
+        // what it is checking goes green again the moment the constant moves.
+        assert_eq!(MAX_QUERIES_PER_FRAME, 4, "the ceiling this test pins");
+        let mut host = FakeHost::with(vec![vec![0x0e]; 6]);
+        let mut plugin = ScriptedPlugin::new(
+            (0..6)
+                .map(|_| Answer {
+                    verdict: Verdict::Query(vec![0x0b]),
+                    more: false,
+                    label: None,
+                })
+                .collect(),
+        );
+        let err = relay(&[0x0d], &mut plugin, &mut host, &spec(None)).expect_err("must be refused");
+        assert!(err.contains("ceiling"), "{err}");
+        assert_eq!(
+            host.seen.len(),
+            4,
+            "the ceiling bounds what actually reached the host"
+        );
+    }
+
+    /// Whatever goes wrong with the plugin, the frame is refused rather than forwarded on a guess.
+    #[test]
+    fn a_plugin_that_fails_refuses_the_frame_and_never_forwards() {
+        let mut host = FakeHost::with(Vec::new());
+        let mut plugin = ScriptedPlugin::new(Vec::new());
+        let err = relay(&[0x0b], &mut plugin, &mut host, &spec(None)).expect_err("must fail");
+        assert!(err.contains("ran out of answers"), "{err}");
+        assert!(host.seen.is_empty(), "nothing may reach the host");
+    }
+
+    /// Stage an executable broker plugin whose body is a shell loop over stdin.
+    fn staged_broker(
+        body: &str,
+    ) -> (
+        crate::testutil::TmpDir,
+        crate::plugins::broker::BrokerPlugin,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::testutil::TmpDir::new();
+        let dir = root.join("plugins").join("fake-broker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exec = dir.join("broker");
+        std::fs::write(&exec, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plugin = crate::plugins::broker::BrokerPlugin {
+            name: "fake-broker".to_string(),
+            dir,
+            exec,
+            sandbox: crate::plugins::SandboxGrant::default(),
+            broker: spec(None),
+            version: None,
+            description: None,
+            host: Default::default(),
+        };
+        (root, plugin)
+    }
+
+    /// The whole chain, for real: a plugin started in its own cage, a handshake it must accept,
+    /// and a verdict read back off the socket. Every layer above this is tested against a fake
+    /// decider, so this is the one place the spawn, the socket deadline and the line protocol are
+    /// exercised as they ship.
+    #[test]
+    fn a_real_plugin_starts_in_its_cage_and_answers_a_verdict() {
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            eprintln!("skipping broker plugin run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        // Accept the handshake, then deny every frame with a reason. `read` per line is all a
+        // plugin needs of the protocol, which is the point of a line of JSON.
+        let (_root, plugin) = staged_broker(
+            r#"read -r hello
+printf '{"ok":true}\n'
+while read -r line; do
+  seq=$(printf '%s' "$line" | sed 's/.*"seq":\([0-9]*\).*/\1/')
+  printf '{"seq":%s,"verdict":"deny","label":"nothing is allowed"}\n' "$seq"
+done"#,
+        );
+        let mut proc = PluginProcess::start(&bwrap, &plugin, &["a-key".to_string()])
+            .expect("the plugin starts and accepts the handshake");
+        let answer = proc
+            .ask(&Ask {
+                seq: 1,
+                dir: Direction::Up,
+                data: &[0x0b],
+            })
+            .expect("a verdict");
+        assert_eq!(answer.verdict, Verdict::Deny(None));
+        assert_eq!(answer.label.as_deref(), Some("nothing is allowed"));
+    }
+
+    /// The bound applies to what the plugin *hands back*, not only to what the cage sends. Driven
+    /// through the real process, because that is where the parameter was once passed as
+    /// `usize::MAX` while a test against the fake decider proved the bound worked.
+    #[test]
+    fn a_plugins_own_answer_is_bounded_by_its_declared_max_frame() {
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            eprintln!("skipping broker plugin run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        // Answers with 8 bytes of `data`, under a manifest that declares a 4-byte protocol.
+        let (_root, mut plugin) = staged_broker(
+            r#"read -r hello
+printf '{"ok":true}\n'
+while read -r line; do
+  seq=$(printf '%s' "$line" | sed 's/.*"seq":\([0-9]*\).*/\1/')
+  printf '{"seq":%s,"verdict":"reply","data":"0102030405060708"}\n' "$seq"
+done"#,
+        );
+        plugin.broker.max_frame = 4;
+        let mut proc = PluginProcess::start(&bwrap, &plugin, &[]).expect("the plugin starts");
+        let err = proc
+            .ask(&Ask {
+                seq: 1,
+                dir: Direction::Up,
+                data: &[0x0b],
+            })
+            .expect_err("an oversized answer must be refused");
+        assert!(err.contains("max_frame"), "{err}");
+    }
+
+    /// A plugin that will not broker says so at the one moment nothing is at stake, and sbx never
+    /// reaches the point of asking it about a frame.
+    #[test]
+    fn a_plugin_that_declines_the_handshake_never_becomes_a_broker() {
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            eprintln!("skipping broker plugin run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let (_root, plugin) = staged_broker(
+            r#"read -r hello
+printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
+        );
+        match PluginProcess::start(&bwrap, &plugin, &[]) {
+            Ok(_) => panic!("a plugin that declined must not become a broker"),
+            Err(err) => assert!(
+                err.to_string().contains("this build brokers nothing"),
+                "{err}"
+            ),
+        }
+    }
+
+    /// The shape a real protocol forced: gpg-agent answers one command with a run of lines
+    /// (`D 2.4.8` then `OK`), so one frame out is not one frame back. The plugin says where the run
+    /// ends, because only it knows the terminator.
+    #[test]
+    fn a_multi_frame_answer_is_collected_until_the_plugin_calls_it_done() {
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            ..spec(None)
+        };
+        // One command, two lines back — exactly what `gpg-connect-agent 'GETINFO version'` shows.
+        let mut host = FakeHost::with_runs(vec![vec![b"D 2.4.8".to_vec(), b"OK".to_vec()]]);
+        let mut plugin = ScriptedPlugin::new(vec![
+            ScriptedPlugin::forward(),
+            Answer {
+                verdict: Verdict::Forward(None),
+                more: true,
+                label: None,
+            },
+            Answer {
+                verdict: Verdict::Forward(None),
+                more: false,
+                label: Some("done".to_string()),
+            },
+        ]);
+        let Relayed {
+            outcome,
+            to_cage: out,
+            label,
+        } = relay(b"GETINFO version", &mut plugin, &mut host, &inspecting).unwrap();
+        assert!(matches!(outcome, Outcome::Forwarded { .. }));
+        assert_eq!(
+            out,
+            vec![b"D 2.4.8".to_vec(), b"OK".to_vec()],
+            "both lines reach the cage, in order"
+        );
+        assert_eq!(label.as_deref(), Some("done"));
+    }
+
+    /// A plugin that keeps saying `more` while the host keeps talking would hold the cage's
+    /// connection open indefinitely. The ceiling ends the exchange as a refusal, never as a
+    /// truncated answer.
+    #[test]
+    fn an_endless_answer_is_refused_at_the_ceiling() {
+        assert_eq!(MAX_REPLY_FRAMES, 1024, "the ceiling this test pins");
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            ..spec(None)
+        };
+        let mut host = FakeHost::with_runs(vec![
+            (0..MAX_REPLY_FRAMES + 2)
+                .map(|_| b"D chunk".to_vec())
+                .collect(),
+        ]);
+        let answers = std::iter::once(ScriptedPlugin::forward())
+            .chain((0..MAX_REPLY_FRAMES + 2).map(|_| Answer {
+                verdict: Verdict::Forward(None),
+                more: true,
+                label: None,
+            }))
+            .collect();
+        let mut plugin = ScriptedPlugin::new(answers);
+        let err = relay(b"GO", &mut plugin, &mut host, &inspecting).expect_err("must be refused");
+        assert!(err.contains("without the broker calling it done"), "{err}");
+    }
+
+    /// The grant `inspect_replies` buys: what the host answered goes back to the plugin, which may
+    /// rebuild it. Rebuilding is how a broker keeps something withheld from ever being spelled
+    /// toward the cage, rather than filtering it out of an answer it already sent.
+    #[test]
+    fn a_reply_is_rebuilt_when_the_manifest_asks_to_inspect_replies() {
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            ..spec(None)
+        };
+        let mut host = FakeHost::with(vec![vec![0xaa, 0xbb]]);
+        let mut plugin = ScriptedPlugin::new(vec![
+            ScriptedPlugin::forward(),
+            Answer {
+                verdict: Verdict::Reply(vec![0xaa]),
+                more: false,
+                label: Some("second key withheld".to_string()),
+            },
+        ]);
+        let Relayed {
+            outcome,
+            to_cage: out,
+            label,
+        } = relay(&[0x0b], &mut plugin, &mut host, &inspecting).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Forwarded {
+                rewritten: false,
+                queries: 0
+            }
+        );
+        assert_eq!(out, vec![vec![0xaa]], "the cage gets the rebuilt answer");
+        assert_eq!(label.as_deref(), Some("second key withheld"));
+        assert_eq!(
+            plugin.shown,
+            vec![
+                (Direction::Up, vec![0x0b]),
+                (Direction::Down, vec![0xaa, 0xbb]),
+            ]
+        );
+    }
+
+    /// Without the grant the plugin never sees what the host answered, and the answer reaches the
+    /// cage untouched.
+    #[test]
+    fn a_reply_is_not_shown_to_a_plugin_that_did_not_ask_for_it() {
+        let mut host = FakeHost::with(vec![vec![0xaa, 0xbb]]);
+        let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward()]);
+        let Relayed { to_cage: out, .. } =
+            relay(&[0x0b], &mut plugin, &mut host, &spec(None)).unwrap();
+        assert_eq!(out, vec![vec![0xaa, 0xbb]]);
+        assert_eq!(plugin.shown, vec![(Direction::Up, vec![0x0b])]);
+    }
+
+    /// A refusal on the way back still refuses: what the host said is not delivered because the
+    /// plugin was shown it.
+    #[test]
+    fn a_reply_the_plugin_refuses_is_not_delivered() {
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            ..spec(Some(vec![5]))
+        };
+        let mut host = FakeHost::with(vec![vec![0xaa]]);
+        let mut plugin = ScriptedPlugin::new(vec![
+            ScriptedPlugin::forward(),
+            Answer {
+                verdict: Verdict::Deny(None),
+                more: false,
+                label: None,
+            },
+        ]);
+        let Relayed {
+            outcome,
+            to_cage: out,
+            ..
+        } = relay(&[0x0b], &mut plugin, &mut host, &inspecting).unwrap();
+        assert_eq!(outcome, Outcome::Refused { with_frame: true });
+        assert_eq!(out, vec![vec![5]], "the manifest's refusal, not the answer");
+    }
+
+    /// The framing of Assuan and of most text protocols: the newline is the frame boundary, not
+    /// part of the message.
+    #[test]
+    fn a_line_framed_message_travels_without_its_terminator() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, Framing::Line, b"OK Pleased to meet you").unwrap();
+        assert_eq!(buf, b"OK Pleased to meet you\n");
+        let mut cur = std::io::Cursor::new(buf);
+        assert_eq!(
+            read_frame(&mut cur, Framing::Line, 4096).unwrap(),
+            Some(b"OK Pleased to meet you".to_vec())
+        );
+        assert_eq!(read_frame(&mut cur, Framing::Line, 4096).unwrap(), None);
+    }
+
+    /// Two messages in one stream must come back as two, which is the whole of what a framing has
+    /// to guarantee.
+    #[test]
+    fn consecutive_lines_are_two_frames() {
+        let mut cur = std::io::Cursor::new(b"D 2.4.8\nOK\n".to_vec());
+        assert_eq!(
+            read_frame(&mut cur, Framing::Line, 4096).unwrap(),
+            Some(b"D 2.4.8".to_vec())
+        );
+        assert_eq!(
+            read_frame(&mut cur, Framing::Line, 4096).unwrap(),
+            Some(b"OK".to_vec())
+        );
+        assert_eq!(read_frame(&mut cur, Framing::Line, 4096).unwrap(), None);
+    }
+
+    /// An over-long line is an error, not a truncation: half a message on a wire is worse than
+    /// none, and the bound is checked as the line grows rather than after it is all in memory.
+    #[test]
+    fn an_over_long_line_is_refused_rather_than_cut() {
+        let mut cur = std::io::Cursor::new(b"aaaaaaaaaa\n".to_vec());
+        let err = read_frame(&mut cur, Framing::Line, 4).expect_err("over the bound");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A stream that stops mid-line is not a clean close: reporting it as one would hand the
+    /// caller a truncated message as if the peer had meant it.
+    #[test]
+    fn a_stream_that_ends_mid_line_is_an_error_not_an_end() {
+        let mut cur = std::io::Cursor::new(b"OK no newline".to_vec());
+        let err = read_frame(&mut cur, Framing::Line, 4096).expect_err("truncated");
+        assert!(err.to_string().contains("mid-line"), "{err}");
+    }
+
+    /// A message carrying a newline would be read back as two, so writing one is refused.
+    #[test]
+    fn a_line_framed_message_may_not_contain_a_newline() {
+        let mut buf = Vec::new();
+        let err = write_frame(&mut buf, Framing::Line, b"OK\nERR forged").expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(buf.is_empty(), "nothing may reach the wire: {buf:?}");
+    }
+
+    #[test]
+    fn a_frame_survives_the_framing_round_trip() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, Framing::LengthU32Be, &[0x0b, 0xff]).unwrap();
+        assert_eq!(buf, vec![0, 0, 0, 2, 0x0b, 0xff]);
+        let mut cur = std::io::Cursor::new(buf);
+        let got = read_frame(&mut cur, Framing::LengthU32Be, 4096).unwrap();
+        assert_eq!(got, Some(vec![0x0b, 0xff]));
+        // And a clean end of stream is not an error.
+        assert_eq!(
+            read_frame(&mut cur, Framing::LengthU32Be, 4096).unwrap(),
+            None
+        );
+    }
+
+    /// The length prefix is written by the cage, so it is checked before it is believed.
+    #[test]
+    fn an_oversized_or_empty_length_prefix_is_refused_before_allocating() {
+        for prefix in [u32::MAX, 5, 0] {
+            let mut bytes = prefix.to_be_bytes().to_vec();
+            bytes.extend_from_slice(&[0u8; 4]);
+            let mut cur = std::io::Cursor::new(bytes);
+            let err = read_frame(&mut cur, Framing::LengthU32Be, 4).expect_err("out of range");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "prefix {prefix}");
+        }
+    }
+
+    #[test]
+    fn the_handshake_carries_the_version_the_name_and_the_policy() {
+        let allow = vec!["SHA256:abc".to_string()];
+        let line = Hello {
+            broker: "gpg-agent",
+            allow: &allow,
+            inspect_replies: true,
+        }
+        .line();
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(v["v"], PROTOCOL_VERSION);
+        assert_eq!(v["broker"], "gpg-agent");
+        assert_eq!(v["allow"][0], "SHA256:abc");
+        assert_eq!(v["inspect_replies"], true);
+    }
+
+    #[test]
+    fn a_frame_travels_as_lowercase_hex_and_names_its_direction() {
+        let line = Ask {
+            seq: 3,
+            dir: Direction::Up,
+            data: &[0x0b, 0xff, 0x00],
+        }
+        .line();
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(v["seq"], 3);
+        assert_eq!(v["dir"], "up");
+        assert_eq!(v["data"], "0bff00");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &Ask {
+                    seq: 4,
+                    dir: Direction::QueryReply,
+                    data: &[1]
+                }
+                .line()
+            )
+            .unwrap()["dir"],
+            "query-reply"
+        );
+    }
+
+    /// A frame is opaque to sbx, so the one thing the encoding must never do is change it.
+    #[test]
+    fn every_byte_survives_the_round_trip() {
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(from_hex(&to_hex(&all)).expect("decodes"), all);
+    }
+
+    #[test]
+    fn the_four_verdicts_parse() {
+        assert_eq!(
+            parse_answer(&answer("forward", ""), 7, 64).unwrap().verdict,
+            Verdict::Forward(None)
+        );
+        assert_eq!(
+            parse_answer(&answer("forward", ",\"data\":\"0b\""), 7, 64)
+                .unwrap()
+                .verdict,
+            Verdict::Forward(Some(vec![0x0b]))
+        );
+        assert_eq!(
+            parse_answer(&answer("reply", ",\"data\":\"0c\""), 7, 64)
+                .unwrap()
+                .verdict,
+            Verdict::Reply(vec![0x0c])
+        );
+        assert_eq!(
+            parse_answer(&answer("deny", ""), 7, 64).unwrap().verdict,
+            Verdict::Deny(None)
+        );
+        assert_eq!(
+            parse_answer(&answer("deny", ",\"data\":\"05\""), 7, 64)
+                .unwrap()
+                .verdict,
+            Verdict::Deny(Some(vec![5]))
+        );
+        assert_eq!(
+            parse_answer(&answer("query", ",\"data\":\"0b\""), 7, 64)
+                .unwrap()
+                .verdict,
+            Verdict::Query(vec![0x0b])
+        );
+    }
+
+    /// The two verdicts whose whole content is the bytes they carry cannot be spelled without
+    /// them: silently treating one as a close would answer a request the plugin meant to answer.
+    #[test]
+    fn reply_and_query_without_data_are_refused() {
+        for verdict in ["reply", "query"] {
+            let err = parse_answer(&answer(verdict, ""), 7, 64).expect_err("must be refused");
+            assert!(err.contains("carries no `data`"), "{err}");
+        }
+    }
+
+    /// The exchange is strictly one answer per frame. A mismatched sequence means the plugin and
+    /// sbx no longer agree on what is being decided, and no guess about it is safe.
+    #[test]
+    fn an_answer_to_another_frame_is_refused() {
+        let err = parse_answer(&answer("forward", ""), 9, 64).expect_err("seq 7 answers seq 9");
+        assert!(err.contains("expected 9"), "{err}");
+        let err = parse_answer("{\"verdict\":\"forward\"}", 9, 64).expect_err("no seq");
+        assert!(err.contains("no `seq`"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_verdict_names_the_four_that_exist() {
+        let err = parse_answer(&answer("maybe", ""), 7, 64).expect_err("unknown verdict");
+        assert!(
+            err.contains("forward") && err.contains("reply") && err.contains("deny"),
+            "{err}"
+        );
+    }
+
+    /// A key nothing reads is never a harmless extra in a declaration a machine acts on: a
+    /// misspelled `data` accepted in silence would turn a refusal into a bare forward.
+    #[test]
+    fn an_unknown_field_is_refused_rather_than_ignored() {
+        let err = parse_answer(&answer("deny", ",\"dat\":\"05\""), 7, 64)
+            .expect_err("a misspelled field is refused");
+        assert!(err.contains("unreadable answer"), "{err}");
+    }
+
+    #[test]
+    fn data_is_bounded_by_the_brokers_own_max_frame() {
+        let err = parse_answer(&answer("reply", ",\"data\":\"0b0c0d\""), 7, 2)
+            .expect_err("3 bytes into a 2-byte protocol");
+        assert!(err.contains("max_frame"), "{err}");
+        parse_answer(&answer("reply", ",\"data\":\"0b0c\""), 7, 2).expect("the bound itself fits");
+    }
+
+    #[test]
+    fn an_empty_frame_is_refused() {
+        let err = parse_answer(&answer("reply", ",\"data\":\"\""), 7, 64).expect_err("empty");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    /// A lenient hex decoder would put almost the right bytes on a wire sbx cannot inspect.
+    #[test]
+    fn malformed_hex_is_refused_with_the_reason() {
+        for (hex, needle) in [
+            ("0", "odd length"),
+            ("0g", "not a hex digit"),
+            ("0B", "uppercase"),
+        ] {
+            let err = parse_answer(&answer("reply", &format!(",\"data\":\"{hex}\"")), 7, 64)
+                .expect_err("malformed hex");
+            assert!(err.contains(needle), "{hex}: {err}");
+        }
+    }
+
+    /// A plugin is written in whatever language its author reached for, and those disagree about
+    /// line endings: `print()` and `echo` end a line differently from a writer that adds `\r\n`.
+    /// Tolerating the trailing whitespace is deliberate, not incidental — the alternative is a
+    /// contract that refuses a correct plugin over an invisible byte.
+    #[test]
+    fn a_line_is_accepted_however_the_plugins_language_ends_it() {
+        for tail in ["", "\n", "\r\n", "  \n", "\t"] {
+            let line = format!("{}{tail}", answer("forward", ""));
+            assert_eq!(
+                parse_answer(&line, 7, 64).expect("accepted").verdict,
+                Verdict::Forward(None),
+                "tail {tail:?}"
+            );
+        }
+        parse_hello_reply("{\"ok\":true}\r\n").expect("the handshake tolerates it too");
+    }
+
+    /// sbx must not speak and then never listen: a plugin that cannot broker has to be able to say
+    /// so at the one moment nothing is at stake yet.
+    #[test]
+    fn the_handshake_is_answered_or_the_connection_is_refused() {
+        parse_hello_reply("{\"ok\":true}").expect("an acceptance");
+        let err = parse_hello_reply("{\"ok\":false,\"error\":\"unsupported version\"}")
+            .expect_err("a refusal");
+        assert!(err.contains("unsupported version"), "{err}");
+        let err = parse_hello_reply("{\"ok\":false}").expect_err("a bare refusal");
+        assert!(err.contains("declined to broker"), "{err}");
+        for line in ["", "not json", "{}", "{\"ok\":\"yes\"}"] {
+            parse_hello_reply(line).expect_err("anything but an acceptance is a refusal");
+        }
+    }
+
+    /// The label is the plugin's account of its own decision, and an empty one is no account: it
+    /// would otherwise put a blank column in the record where a reader expects a reason.
+    #[test]
+    fn a_label_is_carried_and_an_empty_one_is_not() {
+        let a = parse_answer(&answer("deny", ",\"label\":\"no such key\""), 7, 64).unwrap();
+        assert_eq!(a.label.as_deref(), Some("no such key"));
+        let a = parse_answer(&answer("deny", ",\"label\":\"\""), 7, 64).unwrap();
+        assert_eq!(a.label, None);
+    }
+}

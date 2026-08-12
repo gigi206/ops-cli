@@ -637,7 +637,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--feed <a,b,...>",
-                "only these feeds: proc, net, fs, ssh, task",
+                "only these feeds: proc, net, fs, ssh, broker, task",
             ),
             ("-n, --lines <N>", "show only the last N events"),
             (

@@ -935,6 +935,7 @@ mod tests {
             devices_origin: Default::default(),
             ssh_agent: vec![],
             ssh_agent_origin: Default::default(),
+            brokers: Vec::new(),
             declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],

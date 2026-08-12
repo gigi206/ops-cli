@@ -297,6 +297,24 @@ fn read_ssh_rows(
     Ok((rows, Some(snap.head), snap.dropped))
 }
 
+fn read_broker_rows(
+    socket: &Path,
+    after: Option<u64>,
+) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+    let snap = crate::sandbox::broker_control::read_broker_log(socket, after)?;
+    let rows = snap
+        .events
+        .into_iter()
+        .map(|e| Row {
+            at_epoch_ms: e.at_epoch_ms,
+            feed: "broker",
+            token: e.kind.token().to_string(),
+            subject: e.detail,
+        })
+        .collect();
+    Ok((rows, Some(snap.head), snap.dropped))
+}
+
 fn read_net_rows(
     socket: &Path,
     after: Option<u64>,
@@ -365,7 +383,7 @@ fn read_task_rows(
 /// carries a socket path, which takes a data directory and a pid that a shell completing a flag
 /// has neither of. `feeds_and_names_agree` pins the two together, so a sixth feed cannot become a
 /// value the CLI accepts and the completion never offers.
-pub(crate) const FEED_NAMES: &[&str] = &["proc", "net", "fs", "ssh", "task"];
+pub(crate) const FEED_NAMES: &[&str] = &["proc", "net", "fs", "ssh", "broker", "task"];
 
 /// Every feed of one session, in the order their columns read best when two events share a
 /// millisecond: what the agent reached for, then what was decided about it.
@@ -397,6 +415,13 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::sshagent_control::agent_control_socket(data_dir, pid),
             absent: "no ssh-agent broker — this config has no `[ssh_agent] allow`",
             read: read_ssh_rows,
+            cursor: Some(0),
+        },
+        Feed {
+            name: "broker",
+            socket: crate::sandbox::broker_control::broker_control_socket(data_dir, pid),
+            absent: "no broker plugin — this config has no `[broker.<name>]`",
+            read: read_broker_rows,
             cursor: Some(0),
         },
         Feed {

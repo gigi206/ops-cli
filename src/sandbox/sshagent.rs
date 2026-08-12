@@ -52,6 +52,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// busy) and cannot reach the host agent's own socket, which is in no mount it holds.
 const CAGE_UDS: &str = "/tmp/sbx-ssh-agent.sock";
 
+/// The variable that points a client at [`CAGE_UDS`]. Named rather than spelled inline because a
+/// second thing now depends on it: a broker plugin's manifest may not claim this name, which would
+/// put its own socket where the agent's belongs.
+pub(crate) const AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
+
 /// The generic refusal. Every message the allowlist does not name is answered with this and goes no
 /// further; a client reads it as "the agent will not do that", which is exactly true.
 const FAILURE: u8 = 5;
@@ -747,7 +752,7 @@ pub(crate) fn start(
             // keys need none: an untrusted `[env]` overriding it can only point an in-cage client at
             // a socket that is not this one — self-DoS, never a redirect of the bind, whose source
             // path is sbx's. The host agent's own socket is in no mount the cage holds.
-            env: vec![("SSH_AUTH_SOCK".to_string(), CAGE_UDS.to_string())],
+            env: vec![(AUTH_SOCK_ENV.to_string(), CAGE_UDS.to_string())],
         },
     ))
 }

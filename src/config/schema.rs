@@ -189,6 +189,16 @@ pub(crate) struct RawConfig {
     /// binary that runs host-side on the plaintext path.
     #[serde(default)]
     pub(crate) plugin: BTreeMap<String, RawPluginConfig>,
+    /// Which installed broker plugins stand in front of a host resource for this cage, as
+    /// `[broker.<name>]` tables, keyed by the plugin's name.
+    ///
+    /// Split deliberately across the layers, and the split is the security property: `socket`
+    /// names the **host resource**, which is a fact about this machine, and is read from the
+    /// global config only. `allow` is the **policy**, which is a fact about the work, and a
+    /// trusted project may set it. A manifest names neither: a plugin that could choose the socket
+    /// it stands in front of would be choosing the hole it is compared against.
+    #[serde(default)]
+    pub(crate) broker: BTreeMap<String, RawBrokerConfig>,
     /// Resource limits for the cage's cgroup scope (anti-DoS), overriding sbx's built-in
     /// defaults. A security field — honored from the global config or a trusted project,
     /// ignored from an untrusted one: loosening a limit (a higher `tasks_max`, an unbounded
@@ -551,6 +561,33 @@ pub(crate) struct RawPluginConfig {
     /// from the global config or a trusted project only.
     #[serde(default)]
     pub(crate) programs: BTreeMap<String, String>,
+}
+
+/// One `[broker.<name>]` table: the host resource an installed broker plugin stands in front of,
+/// and the policy it brokers under.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawBrokerConfig {
+    /// The host resource's Unix socket, e.g. `"$XDG_RUNTIME_DIR/gnupg/S.gpg-agent"`. sbx connects
+    /// to it and holds that connection; the plugin never receives it.
+    ///
+    /// **Global config only.** Which socket exists is a property of the machine, and pointing a
+    /// broker at a different one changes what is being brokered — a decision that belongs beside
+    /// the plugin's installation, not inside a project tree. A `socket` in a project config is
+    /// dropped, named rather than silently ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) socket: Option<String>,
+    /// The policy handed to the plugin at the start of every connection, verbatim.
+    ///
+    /// sbx does not interpret these: what an entry means belongs to the protocol the plugin
+    /// speaks, the way `[ssh_agent] allow` names keys. A trusted project may set them, since it
+    /// narrows or widens what the cage may do with a resource the *global* config already agreed
+    /// to expose. An untrusted project's table is dropped whole.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allow: Vec<String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

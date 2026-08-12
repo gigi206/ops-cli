@@ -130,7 +130,7 @@ pub(crate) fn render_app_exported(name: &str, path: &Path, pal: &style::Palette)
 /// so a captured stream is byte-for-byte the plain text the integration tests pin.
 pub(crate) fn render_plugin_installed(
     name: &str,
-    scheme: &str,
+    scheme: Option<&str>,
     from_store: Option<&str>,
     pal: &style::Palette,
 ) -> String {
@@ -139,8 +139,15 @@ pub(crate) fn render_plugin_installed(
         Some(s) => format!(" from store '{n}{s}{r}'"),
         None => String::new(),
     };
+    // A resolver is placed under the namespace it answers for, so that is what the line shows. A
+    // broker claims none and is reached by its name, which the line already carries — so it is
+    // named by its type instead of by a namespace it does not have.
+    let what = match scheme {
+        Some(scheme) => format!("{scheme}://"),
+        None => "broker".to_string(),
+    };
     format!(
-        "{ok}installed{r} '{n}{name}{r}' {dim}({scheme}://){r}{from} \
+        "{ok}installed{r} '{n}{name}{r}' {dim}({what}){r}{from} \
          {dim}— remove with: sbx plugins rm {name}{r}"
     )
 }
@@ -310,8 +317,11 @@ pub(crate) fn render_store_configured(
         "{ok}configured store{r} '{n}{name}{r}' {dim}(rev {rev}, {} plugin{plural}):{r}",
         plugins.len()
     );
-    for (pname, scheme, version) in plugins {
-        let _ = write!(o, "  {n}{pname}{r}  {dim}({scheme}://){r}");
+    for (pname, what, version) in plugins {
+        // Already the whole label the caller wants shown — `pass://` for a resolver, `broker` for
+        // a plugin that claims no namespace. Composed by the caller, because only it knows which
+        // kind it holds.
+        let _ = write!(o, "  {n}{pname}{r}  {dim}({what}){r}");
         if !version.is_empty() {
             let _ = write!(o, "  {dim}v{version}{r}");
         }
@@ -395,11 +405,11 @@ mod tests {
         // empty spans, byte-identical plain text. Each line of the original wording is preserved.
         let p = style::Palette::plain();
         assert_eq!(
-            render_plugin_installed("pass", "pass", None, &p),
+            render_plugin_installed("pass", Some("pass"), None, &p),
             "installed 'pass' (pass://) — remove with: sbx plugins rm pass"
         );
         assert_eq!(
-            render_plugin_installed("vault", "vault", Some("hub"), &p),
+            render_plugin_installed("vault", Some("vault"), Some("hub"), &p),
             "installed 'vault' (vault://) from store 'hub' — remove with: sbx plugins rm vault"
         );
         assert_eq!(render_removed(None, "pass", &p), "removed 'pass'");
@@ -465,7 +475,7 @@ mod tests {
             render_store_configured(
                 "hub",
                 3,
-                &[("vault", "vault", "1.0"), ("pass", "pass", "")],
+                &[("vault", "vault://", "1.0"), ("pass", "pass://", "")],
                 &p
             ),
             "configured store 'hub' (rev 3, 2 plugins):\n  vault  (vault://)  v1.0\n  pass  (pass://)\n"
@@ -529,7 +539,7 @@ mod tests {
         // assertions above) only shows here.
         let p = style::Palette::colored();
 
-        let installed = render_plugin_installed("pass", "pass", None, &p);
+        let installed = render_plugin_installed("pass", Some("pass"), None, &p);
         assert!(installed.contains(&format!("{}installed{}", p.ok, p.reset)));
         assert!(installed.contains(&format!("'{}pass{}'", p.name, p.reset)));
 
@@ -570,7 +580,7 @@ mod tests {
         let rekeyed = render_store_rekeyed("hub", "ab12", "cd34", false, 7, 2, &p);
         assert!(rekeyed.contains(&format!("{}rotated{}", p.ok, p.reset)));
 
-        let configured = render_store_configured("hub", 3, &[("vault", "vault", "1.0")], &p);
+        let configured = render_store_configured("hub", 3, &[("vault", "vault://", "1.0")], &p);
         assert!(configured.contains(&format!("{}configured store{}", p.ok, p.reset)));
         assert!(configured.contains(&format!("{}vault{}", p.name, p.reset)));
 

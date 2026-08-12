@@ -529,7 +529,7 @@ fn the_merged_view_narrows_by_feed_and_refuses_a_name_no_feed_answers_to() {
     let err = String::from_utf8_lossy(&bad.stderr);
     assert!(err.contains("no feed named `netwrok`"), "{err}");
     assert!(
-        err.contains("proc, net, fs, ssh, task"),
+        err.contains("proc, net, fs, ssh, broker, task"),
         "and the error lists what there is: {err}"
     );
 }

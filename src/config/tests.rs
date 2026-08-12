@@ -78,6 +78,7 @@ fn validate_network(
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
         plugin: Default::default(),
+        broker: Default::default(),
         fs: None,
         redact: None,
         notify: None,
@@ -1865,6 +1866,106 @@ fn an_app_ssh_agent_grant_is_its_own_and_unions_onto_the_baseline() {
     let mut merged = r.clone();
     merged.merge_app(merged.apps["deployer"].clone());
     assert_eq!(merged.ssh_agent, vec!["deploy@example", "work@example"]);
+}
+
+/// A `[broker.<name>]` table with a socket, as the global config alone may write it.
+fn raw_broker(socket: Option<&str>, allow: &[&str]) -> crate::config::schema::RawBrokerConfig {
+    crate::config::schema::RawBrokerConfig {
+        socket: socket.map(str::to_string),
+        allow: allow.iter().map(|s| (*s).to_string()).collect(),
+        rest: Default::default(),
+    }
+}
+
+fn with_broker(
+    mut cfg: RawConfig,
+    name: &str,
+    table: crate::config::schema::RawBrokerConfig,
+) -> RawConfig {
+    cfg.broker.insert(name.to_string(), table);
+    cfg
+}
+
+/// The split that carries the security property: the global config says *which host resource* is
+/// exposed, a trusted project says only *what may be done with it*.
+#[test]
+fn a_project_may_set_a_brokers_policy_but_never_the_resource_it_brokers() {
+    let global = with_broker(
+        raw(&[], &[]),
+        "gpg-agent",
+        raw_broker(Some("/run/host/S.gpg-agent"), &["sign"]),
+    );
+    let project = with_broker(
+        raw(&[], &[]),
+        "gpg-agent",
+        raw_broker(Some("/tmp/attacker.sock"), &["sign", "decrypt"]),
+    );
+    let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+    assert_eq!(r.brokers.len(), 1);
+    assert_eq!(
+        r.brokers[0].socket,
+        std::path::PathBuf::from("/run/host/S.gpg-agent"),
+        "a project may not repoint a broker at another host resource"
+    );
+    assert_eq!(
+        r.brokers[0].allow,
+        vec!["sign".to_string(), "decrypt".to_string()],
+        "but its policy is honored"
+    );
+    assert_eq!(r.brokers[0].origin, Provenance::Project);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("socket")),
+        "the dropped socket is named: {:?}",
+        r.warnings
+    );
+}
+
+/// An untrusted project's whole section is dropped, and named — so "not configured" and "not
+/// trusted" never look alike.
+#[test]
+fn an_untrusted_projects_broker_section_is_dropped_whole() {
+    let global = raw(&[], &[]);
+    let project = with_broker(
+        raw(&[], &[]),
+        "gpg-agent",
+        raw_broker(Some("/tmp/attacker.sock"), &["everything"]),
+    );
+    let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+    assert!(r.brokers.is_empty());
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("[broker.*]") && w.contains("gpg-agent")),
+        "{:?}",
+        r.warnings
+    );
+}
+
+/// A project cannot introduce a broker the global config never bound: without a global socket
+/// there is nothing to broker, and the table is reported rather than half-honored.
+#[test]
+fn a_trusted_project_cannot_introduce_a_broker_the_global_config_never_bound() {
+    let project = with_broker(raw(&[], &[]), "gpg-agent", raw_broker(None, &["sign"]));
+    let r = resolve_no_plugins(raw(&[], &[]), Some((project, TrustState::Trusted)));
+    assert!(r.brokers.is_empty());
+    assert!(
+        r.warnings.iter().any(|w| w.contains("gpg-agent")),
+        "{:?}",
+        r.warnings
+    );
+}
+
+/// A table that binds nothing is not a binding: it is dropped, named, and nothing is started.
+#[test]
+fn a_broker_table_without_a_socket_binds_nothing() {
+    let global = with_broker(raw(&[], &[]), "gpg-agent", raw_broker(None, &["sign"]));
+    let r = resolve_no_plugins(global, None);
+    assert!(r.brokers.is_empty());
+    assert!(
+        r.warnings.iter().any(|w| w.contains("no `socket`")),
+        "{:?}",
+        r.warnings
+    );
 }
 
 #[test]

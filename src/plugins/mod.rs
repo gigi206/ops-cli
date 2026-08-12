@@ -27,6 +27,9 @@
 /// offline Ed25519 trust core, and [`stores`] is the impure git-driven fetch/verify/cache
 /// shell around it. [`origin`] records where each installed plugin came from, which a manifest
 /// (identical whatever the source) cannot say.
+/// [`broker`] holds the second plugin type: a filter in front of a host resource, which the
+/// registry indexes by name rather than by scheme because a broker claims no ref namespace.
+pub(crate) mod broker;
 pub(crate) mod catalogue;
 pub(crate) mod origin;
 pub(crate) mod programs;
@@ -45,6 +48,44 @@ const BUILTIN_SCHEMES: &[&str] = &["env", "file", "sops"];
 /// namespace and why these can never be a plugin.
 pub(crate) fn builtin_schemes() -> &'static [&'static str] {
     BUILTIN_SCHEMES
+}
+
+/// What kind of plugin something is, wherever that has to be said: a `plugin.toml` manifest, a
+/// signed store catalogue, or a listing. One vocabulary, so a manifest and a catalogue cannot
+/// disagree about how a type is spelled, and a new type is added in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PluginKind {
+    /// Turns a `scheme://locator` reference into a secret's plaintext, host-side.
+    Resolver,
+    /// Stands between the cage and a host resource, ruling on the protocol's messages.
+    Broker,
+}
+
+impl PluginKind {
+    /// The token a manifest and a catalogue both write.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            PluginKind::Resolver => "resolver",
+            PluginKind::Broker => "broker",
+        }
+    }
+
+    /// Whether this kind claims a `scheme://` namespace. A resolver is *reached* through one; a
+    /// broker is reached by name, so a scheme on one would be read by nothing.
+    pub(crate) fn claims_a_scheme(self) -> bool {
+        matches!(self, PluginKind::Resolver)
+    }
+
+    /// Parse a declared type, naming every kind that exists when it is not one of them.
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "resolver" => Ok(PluginKind::Resolver),
+            "broker" => Ok(PluginKind::Broker),
+            other => Err(format!(
+                "unsupported plugin type `{other}` (supported: \"resolver\", \"broker\")"
+            )),
+        }
+    }
 }
 
 /// Render names as `` `a`, `b`, `c` `` — the one shape every conflict message uses, so a listing
@@ -117,10 +158,7 @@ impl ResolverPlugin {
     /// command must use this, never `name`. Falls back to `name` only if the directory name is
     /// not UTF-8, which discovery would already have had to walk past.
     pub(crate) fn dir_name(&self) -> &str {
-        self.dir
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or(&self.name)
+        dir_name_of(&self.dir, &self.name)
     }
 
     /// Whether the executable would be accepted by the runner at launch: a regular file owned by
@@ -128,13 +166,29 @@ impl ResolverPlugin {
     /// manifest is well-formed) yet fail this — so `sbx plugins` surfaces the gap, using the very
     /// check the runner enforces. Returns the refusal reason on failure.
     pub(crate) fn check_exec(&self) -> Result<(), String> {
-        use std::os::unix::fs::MetadataExt;
-        // The reason carries no path: callers (`sbx plugins`, the runner) already name the plugin
-        // or its executable, so prefixing it here would print the path twice.
-        let meta = std::fs::metadata(&self.exec).map_err(|e| e.to_string())?;
-        let euid = unsafe { libc::geteuid() };
-        verdict_exec(meta.mode(), meta.uid(), euid)
+        check_exec_at(&self.exec)
     }
+}
+
+/// A plugin's on-disk identity: the directory name, falling back to the manifest `name` only if
+/// it is not UTF-8, which discovery would already have had to walk past. Shared by both plugin
+/// types, because every message whose remedy is a `sbx plugins rm` must spell the token that
+/// command takes — the manifest `name` may differ from it.
+fn dir_name_of<'a>(dir: &'a Path, name: &'a str) -> &'a str {
+    dir.file_name().and_then(OsStr::to_str).unwrap_or(name)
+}
+
+/// Whether an executable would be accepted by a runner: a regular file owned by us and not
+/// writable by group or other. Shared by both plugin types and by `sbx plugins`, so what a
+/// listing flags and what a runner refuses can never disagree.
+///
+/// The reason carries no path: callers already name the plugin or its executable, so prefixing it
+/// here would print the path twice.
+pub(crate) fn check_exec_at(exec: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(exec).map_err(|e| e.to_string())?;
+    let euid = unsafe { libc::geteuid() };
+    verdict_exec(meta.mode(), meta.uid(), euid)
 }
 
 /// Whether a *source* executable may be copied in: a regular file we own and that no other user
@@ -274,16 +328,71 @@ pub(crate) struct SandboxGrant {
     pub(crate) state: bool,
 }
 
-/// The installed resolver plugins, keyed by the scheme each claims, plus the schemes no plugin
-/// gets to claim because more than one does.
+/// The installed plugins under two indexes, plus, for each, the keys no plugin gets to claim
+/// because more than one does.
+///
+/// Two indexes rather than one widened map, because the two types are named by different things:
+/// a resolver is reached through the `scheme://` it claims, a broker through its name. A scheme
+/// and a broker name cannot collide with one another, and neither should have to be spelled in
+/// the other's namespace to be found.
 #[derive(Debug, Default)]
 pub(crate) struct PluginRegistry {
     resolvers: BTreeMap<String, ResolverPlugin>,
+    brokers: BTreeMap<String, broker::BrokerPlugin>,
     /// Every ambiguous scheme → the directory names claiming it, in discovery order. A scheme
     /// listed here is claimed by no one: all of its claimants are disabled until exactly one
     /// remains. Recorded rather than merely warned about, so every surface can *show* the
     /// conflict and name the plugins to remove.
     conflicts: BTreeMap<String, Vec<String>>,
+    /// The same, for broker names.
+    broker_conflicts: BTreeMap<String, Vec<String>>,
+}
+
+/// What the claim rule needs of a plugin: the token `sbx plugins rm` takes for it.
+trait Claimant {
+    fn claimant_name(&self) -> &str;
+}
+
+impl Claimant for ResolverPlugin {
+    fn claimant_name(&self) -> &str {
+        self.dir_name()
+    }
+}
+
+impl Claimant for broker::BrokerPlugin {
+    fn claimant_name(&self) -> &str {
+        self.dir_name()
+    }
+}
+
+/// File one plugin under `key`, or record the ambiguity if something already claims it.
+///
+/// One rule for both indexes: the second claimant unseats the first, so an ambiguous key resolves
+/// to **nothing** and every claimant is disabled until one remains. A key already known to be
+/// ambiguous records this claimant too, so the conflict names every plugin that has to be dealt
+/// with, not just the first two. The claimants are directory names, because that is what
+/// `plugins rm` takes — a conflict whose remedy names something else is a remedy that fails.
+fn claim<T: Claimant>(
+    index: &mut BTreeMap<String, T>,
+    conflicts: &mut BTreeMap<String, Vec<String>>,
+    key: String,
+    plugin: T,
+) {
+    if let Some(claimants) = conflicts.get_mut(&key) {
+        claimants.push(plugin.claimant_name().to_string());
+        return;
+    }
+    if let Some(prev) = index.remove(&key) {
+        conflicts.insert(
+            key,
+            vec![
+                prev.claimant_name().to_string(),
+                plugin.claimant_name().to_string(),
+            ],
+        );
+        return;
+    }
+    index.insert(key, plugin);
 }
 
 impl PluginRegistry {
@@ -322,7 +431,9 @@ impl PluginRegistry {
         dirs.sort();
 
         let mut resolvers: BTreeMap<String, ResolverPlugin> = BTreeMap::new();
+        let mut brokers: BTreeMap<String, broker::BrokerPlugin> = BTreeMap::new();
         let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut broker_conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for dir in dirs {
             let plugin = match load_one(&dir, exp) {
                 Ok(Some(plugin)) => plugin,
@@ -334,28 +445,25 @@ impl PluginRegistry {
                     continue;
                 }
             };
-            let scheme = plugin.scheme.clone();
-            // A scheme already known to be ambiguous stays ambiguous: record this claimant too, so
-            // the conflict names every plugin that has to be dealt with, not just the first two.
-            if let Some(claimants) = conflicts.get_mut(&scheme) {
-                claimants.push(plugin.dir_name().to_string());
-                continue;
+            match plugin {
+                Plugin::Resolver(plugin) => {
+                    let scheme = plugin.scheme.clone();
+                    claim(&mut resolvers, &mut conflicts, scheme, *plugin);
+                }
+                // A broker claims its **name**: that is the key `[broker.<name>]` answers under
+                // and the one a launch names, so two brokers sharing a name are as ambiguous as
+                // two resolvers sharing a scheme, and are disabled on the same rule.
+                Plugin::Broker(plugin) => {
+                    let name = plugin.name.clone();
+                    claim(&mut brokers, &mut broker_conflicts, name, *plugin);
+                }
             }
-            // The second claimant unseats the first: the scheme becomes ambiguous and *neither*
-            // resolves. The claimants are the directory names, because that is what `plugins rm`
-            // takes — a conflict whose remedy names something else is a remedy that fails.
-            if let Some(prev) = resolvers.remove(&scheme) {
-                conflicts.insert(
-                    scheme,
-                    vec![prev.dir_name().to_string(), plugin.dir_name().to_string()],
-                );
-                continue;
-            }
-            resolvers.insert(scheme, plugin);
         }
         Self {
             resolvers,
+            brokers,
             conflicts,
+            broker_conflicts,
         }
     }
 
@@ -377,7 +485,7 @@ impl PluginRegistry {
             .map(|(scheme, claimants)| (scheme.as_str(), claimants.as_slice()))
     }
 
-    /// One line per ambiguous scheme, for a caller that relays diagnostics as text.
+    /// One line per ambiguous key, for a caller that relays diagnostics as text.
     pub(crate) fn conflict_warnings(&self) -> Vec<String> {
         self.conflicts
             .iter()
@@ -388,7 +496,32 @@ impl PluginRegistry {
                     quoted_list(claimants)
                 )
             })
+            .chain(self.broker_conflicts.iter().map(|(name, claimants)| {
+                format!(
+                    "plugins: broker name `{name}` is claimed by more than one plugin ({}) — all \
+                     are disabled until one remains (a broker's name is how a config names it, so \
+                     it must be unique)",
+                    quoted_list(claimants)
+                )
+            }))
             .collect()
+    }
+
+    /// The broker plugin called `name`, if any. A name claimed by more than one plugin has no
+    /// broker — ask [`broker_conflict`](Self::broker_conflict) to tell that apart from nothing
+    /// claiming it.
+    pub(crate) fn broker(&self, name: &str) -> Option<&broker::BrokerPlugin> {
+        self.brokers.get(name)
+    }
+
+    /// The directory names claiming the broker name `name` when more than one does.
+    pub(crate) fn broker_conflict(&self, name: &str) -> Option<&[String]> {
+        self.broker_conflicts.get(name).map(Vec::as_slice)
+    }
+
+    /// The installed broker plugins, ordered by name — for `sbx plugins`.
+    pub(crate) fn brokers(&self) -> impl Iterator<Item = &broker::BrokerPlugin> {
+        self.brokers.values()
     }
 
     /// The installed resolver plugins, ordered by scheme (the `BTreeMap` key) — for `sbx plugins`.
@@ -396,7 +529,9 @@ impl PluginRegistry {
         self.resolvers.values()
     }
 
-    /// Whether any resolver plugin is installed.
+    /// Whether any **resolver** plugin is installed. Deliberately not a claim about the registry
+    /// as a whole: the broker index is separate, and a caller asking this is asking whether a
+    /// `scheme://` can resolve.
     pub(crate) fn is_empty(&self) -> bool {
         self.resolvers.is_empty()
     }
@@ -407,7 +542,7 @@ impl PluginRegistry {
     pub(crate) fn with(plugins: impl IntoIterator<Item = ResolverPlugin>) -> Self {
         Self {
             resolvers: plugins.into_iter().map(|p| (p.scheme.clone(), p)).collect(),
-            conflicts: BTreeMap::new(),
+            ..Self::default()
         }
     }
 }
@@ -431,6 +566,8 @@ struct RawManifest {
     description: Option<String>,
     #[serde(default)]
     sandbox: RawSandbox,
+    /// The `[broker]` table, required by (and only by) `type = "broker"`.
+    broker: Option<broker::RawBroker>,
 }
 
 /// The raw `[sandbox]` table, before path expansion and key validation.
@@ -453,10 +590,69 @@ struct RawSandbox {
     state: bool,
 }
 
+/// What a signed store claims about a plugin, reconciled against its manifest before anything is
+/// placed. A claim, never an authority: the manifest is what a launch reads, so a listing that
+/// disagrees with it is refused rather than followed.
+pub(crate) struct StoreClaim<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: PluginKind,
+    /// The scheme the listing advertises, for a resolver. `None` for a broker.
+    pub(crate) scheme: Option<&'a str>,
+}
+
+/// A validated plugin of either type. The two are indexed differently (a resolver by the scheme
+/// it claims, a broker by its name) and run under different contracts, so discovery hands back
+/// which one it read rather than a single widened struct that would have to carry both.
+#[derive(Debug)]
+enum Plugin {
+    Resolver(Box<ResolverPlugin>),
+    Broker(Box<broker::BrokerPlugin>),
+}
+
+impl Plugin {
+    /// The manifest's name — the install key, and what a store catalogue is reconciled against.
+    fn name(&self) -> &str {
+        match self {
+            Plugin::Resolver(p) => &p.name,
+            Plugin::Broker(p) => &p.name,
+        }
+    }
+
+    /// The scheme this plugin claims, or `None` for a broker, which claims none.
+    fn scheme(&self) -> Option<&str> {
+        match self {
+            Plugin::Resolver(p) => Some(&p.scheme),
+            Plugin::Broker(_) => None,
+        }
+    }
+
+    /// The executable a runner would launch.
+    fn exec(&self) -> &Path {
+        match self {
+            Plugin::Resolver(p) => &p.exec,
+            Plugin::Broker(p) => &p.exec,
+        }
+    }
+
+    /// Whether the executable would be accepted by a runner. Applied to the *staged* copy during
+    /// an install, so what lands is held to the rule the runner enforces.
+    fn check_exec(&self) -> Result<(), String> {
+        check_exec_at(self.exec())
+    }
+
+    /// The manifest's `type`, for a message that has to say what was read.
+    fn type_token(&self) -> &'static str {
+        match self {
+            Plugin::Resolver(_) => "resolver",
+            Plugin::Broker(_) => "broker",
+        }
+    }
+}
+
 /// Load and validate one plugin directory. `Ok(None)` when the directory holds no
 /// `plugin.toml` (skip it); `Ok(Some)` for a valid plugin; `Err` (with a reason) for a
 /// present-but-invalid manifest, which the caller turns into a warning.
-fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, String> {
+fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
     let manifest_path = dir.join("plugin.toml");
     let bytes = match std::fs::read(&manifest_path) {
         Ok(bytes) => bytes,
@@ -469,18 +665,32 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
     let dir_name = dir.file_name().and_then(OsStr::to_str).unwrap_or("?");
     let name = raw.name.unwrap_or_else(|| dir_name.to_string());
 
-    match raw.plugin_type.as_deref() {
-        Some("resolver") => {}
-        Some(other) => {
-            return Err(format!(
-                "unsupported plugin type `{other}` (only \"resolver\" is supported)"
-            ));
-        }
-        None => return Err("missing `type` (only \"resolver\" is supported)".to_string()),
-    }
+    // The discriminator is what makes a second type possible without widening the first: each
+    // arm below validates the fields its own type reads, and refuses the other type's.
+    let kind = match raw.plugin_type.as_deref() {
+        Some(raw) => PluginKind::parse(raw)?,
+        None => return Err("missing `type` (supported: \"resolver\", \"broker\")".to_string()),
+    };
+    let is_broker = !kind.claims_a_scheme();
 
-    let scheme = raw.scheme.ok_or("missing `scheme`")?;
-    validate_scheme(&scheme)?;
+    // A scheme is the resolver's namespace and a broker claims none: accepting one from a broker
+    // would leave an author believing a `scheme://` ref routed to their plugin, when nothing reads
+    // it. The reverse is the long-standing requirement.
+    let scheme = match (is_broker, raw.scheme) {
+        (false, Some(scheme)) => {
+            validate_scheme(&scheme)?;
+            Some(scheme)
+        }
+        (false, None) => return Err("missing `scheme`".to_string()),
+        (true, None) => None,
+        (true, Some(_)) => {
+            return Err(
+                "a broker plugin declares no `scheme` — it stands in front of a host resource \
+                 rather than claiming a `scheme://` a secret's `from` can name"
+                    .to_string(),
+            );
+        }
+    };
 
     let exec = raw.exec.ok_or("missing `exec`")?;
     let exec = resolve_exec(dir, &exec)?;
@@ -522,26 +732,58 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<ResolverPlugin>, Strin
         }
     }
 
-    Ok(Some(ResolverPlugin {
+    let sandbox = SandboxGrant {
+        programs: raw.sandbox.programs,
+        allow_paths,
+        mask_paths,
+        allow_env: raw.sandbox.allow_env,
+        allow_env_paths: raw.sandbox.allow_env_paths,
+        network: raw.sandbox.network,
+        state: raw.sandbox.state,
+    };
+
+    // `host` is filled in by the config layer once `[plugin.<name>]` has been layered and gated: a
+    // manifest is loaded from disk with no notion of what this host answers.
+    if is_broker {
+        let raw_broker = raw
+            .broker
+            .ok_or("missing the `[broker]` table, which a broker plugin is defined by")?;
+        broker::check_sandbox(&sandbox)?;
+        let spec = broker::validate(
+            raw_broker,
+            is_valid_env_key,
+            crate::config::is_reserved_env_key,
+        )?;
+        return Ok(Some(Plugin::Broker(Box::new(broker::BrokerPlugin {
+            name,
+            dir: dir.to_path_buf(),
+            exec,
+            sandbox,
+            broker: spec,
+            version: raw.version,
+            description: raw.description,
+            host: HostConfig::default(),
+        }))));
+    }
+
+    if raw.broker.is_some() {
+        return Err(
+            "a `[broker]` table on a resolver plugin declares a protocol nothing reads — the \
+             table belongs to `type = \"broker\"`"
+                .to_string(),
+        );
+    }
+
+    Ok(Some(Plugin::Resolver(Box::new(ResolverPlugin {
         name,
-        scheme,
+        scheme: scheme.expect("a resolver's scheme is required above"),
         dir: dir.to_path_buf(),
         exec,
-        sandbox: SandboxGrant {
-            programs: raw.sandbox.programs,
-            allow_paths,
-            mask_paths,
-            allow_env: raw.sandbox.allow_env,
-            allow_env_paths: raw.sandbox.allow_env_paths,
-            network: raw.sandbox.network,
-            state: raw.sandbox.state,
-        },
+        sandbox,
         version: raw.version,
         description: raw.description,
-        // Filled in by the config layer once `[plugin.<name>]` has been layered and gated: a
-        // manifest is loaded from disk with no notion of what this host answers.
         host: HostConfig::default(),
-    }))
+    }))))
 }
 
 /// Validate a ref scheme: a lowercase URI scheme (`[a-z][a-z0-9+.-]*`) that is not one of the
@@ -723,7 +965,10 @@ fn is_valid_env_key(key: &str) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Installed {
     pub(crate) name: String,
-    pub(crate) scheme: String,
+    /// The scheme the plugin claims, or `None` for a broker, which claims none. What a caller
+    /// renders differs accordingly: a resolver is named by the namespace it answers for, a broker
+    /// by the name a config reaches it through.
+    pub(crate) scheme: Option<String>,
 }
 
 /// Install a resolver plugin from a local source directory into `<data>/plugins/<name>/`, where it
@@ -764,17 +1009,10 @@ pub(crate) fn install(layout: &crate::store::Layout, source: &Path) -> Result<In
 pub(crate) fn install_from_store(
     layout: &crate::store::Layout,
     source: &Path,
-    expected_name: &str,
-    expected_scheme: &str,
+    claim: StoreClaim<'_>,
     origin: origin::Origin,
 ) -> Result<Installed, String> {
-    install_inner(
-        layout,
-        source,
-        Some((expected_name, expected_scheme)),
-        origin,
-        Placement::Fresh,
-    )
+    install_inner(layout, source, Some(claim), origin, Placement::Fresh)
 }
 
 /// Replace an installed plugin with a newer tree from the same signed store — the placement behind
@@ -785,17 +1023,10 @@ pub(crate) fn install_from_store(
 pub(crate) fn replace_from_store(
     layout: &crate::store::Layout,
     source: &Path,
-    expected_name: &str,
-    expected_scheme: &str,
+    claim: StoreClaim<'_>,
     origin: origin::Origin,
 ) -> Result<Installed, String> {
-    install_inner(
-        layout,
-        source,
-        Some((expected_name, expected_scheme)),
-        origin,
-        Placement::Replace,
-    )
+    install_inner(layout, source, Some(claim), origin, Placement::Replace)
 }
 
 /// The shared body of [`install`] and [`install_from_store`]. `expect` is `Some((name, scheme))`
@@ -819,7 +1050,7 @@ enum Placement {
 fn install_inner(
     layout: &crate::store::Layout,
     source: &Path,
-    expect: Option<(&str, &str)>,
+    expect: Option<StoreClaim<'_>>,
     origin: origin::Origin,
     placement: Placement,
 ) -> Result<Installed, String> {
@@ -835,20 +1066,43 @@ fn install_inner(
     // anything else: a divergence means the listing does not describe what would be installed, so
     // refuse it by name rather than silently placing a different plugin (or one claiming a different
     // scheme than was browsed).
-    if let Some((want_name, want_scheme)) = expect {
-        if probe.name != want_name {
+    if let Some(claim) = &expect {
+        if probe.name() != claim.name {
             return Err(format!(
-                "the store lists this plugin as `{want_name}`, but its manifest declares \
-                 `name = \"{}\"` — refusing the mismatch",
-                probe.name
+                "the store lists this plugin as `{}`, but its manifest declares `name = \"{}\"` \
+                 — refusing the mismatch",
+                claim.name,
+                probe.name()
             ));
         }
-        if probe.scheme != want_scheme {
+        // The type is reconciled before the scheme, because it decides whether a scheme is even
+        // the right question. A listing that describes one kind and a manifest that is another is
+        // not the plugin that was browsed, whatever its name says.
+        if probe.type_token() != claim.kind.token() {
             return Err(format!(
-                "the store advertises scheme `{want_scheme}://`, but the plugin's manifest claims \
-                 `{}://` — refusing the mismatch",
-                probe.scheme
+                "the store lists this plugin as a `{}`, but its manifest declares `type = \"{}\"` \
+                 — refusing the mismatch",
+                claim.kind.token(),
+                probe.type_token()
             ));
+        }
+        match (probe.scheme(), claim.scheme) {
+            (Some(scheme), Some(want)) if scheme == want => {}
+            (Some(scheme), Some(want)) => {
+                return Err(format!(
+                    "the store advertises scheme `{want}://`, but the plugin's manifest claims \
+                     `{scheme}://` — refusing the mismatch"
+                ));
+            }
+            (None, None) => {}
+            // Unreachable through a parsed catalogue, which holds a listing to the same rule the
+            // manifest is held to. Refused rather than assumed, since `expect` is a caller's claim.
+            (probe_scheme, want) => {
+                return Err(format!(
+                    "the store's listing and the plugin's manifest disagree about a scheme \
+                     ({want:?} vs {probe_scheme:?}) — refusing the mismatch"
+                ));
+            }
         }
     }
 
@@ -861,10 +1115,10 @@ fn install_inner(
     // out of its own repository. What stays refused is the case that is actually dangerous —
     // an executable *anyone* on the machine can rewrite between reading it and installing it.
     if expect.is_none() {
-        verdict_source(&probe.exec)?;
+        verdict_source(probe.exec())?;
     }
 
-    let name = probe.name.clone();
+    let name = probe.name().to_string();
     validate_install_name(&name).map_err(|e| {
         format!("{e}; set a `name = \"...\"` in plugin.toml to choose the install name")
     })?;
@@ -902,25 +1156,49 @@ fn install_inner(
     // install never adds a claimant to a namespace that is broken or about to be.
     let mut warnings = Vec::new();
     let installed = PluginRegistry::load_with(&plugins_dir, &exp, &mut warnings);
-    if let Some(claimants) = installed.conflict(&probe.scheme) {
-        return Err(format!(
-            "scheme `{}://` is claimed by more than one installed plugin ({}) — they are all \
-             disabled; remove all but one with `sbx plugins rm <name>` first",
-            probe.scheme,
-            quoted_list(claimants)
-        ));
-    }
-    if let Some(other) = installed.resolver(&probe.scheme)
-        && other.dir != dest
-    {
-        let holder = other.dir_name();
-        return Err(format!(
-            "scheme `{}://` is already claimed by the installed plugin `{}` (from {}) — \
-                 remove it first with `sbx plugins rm {holder}`",
-            probe.scheme,
-            other.name,
-            origin::read(layout, holder).short()
-        ));
+    match probe.scheme() {
+        Some(scheme) => {
+            if let Some(claimants) = installed.conflict(scheme) {
+                return Err(format!(
+                    "scheme `{scheme}://` is claimed by more than one installed plugin ({}) — \
+                     they are all disabled; remove all but one with `sbx plugins rm <name>` first",
+                    quoted_list(claimants)
+                ));
+            }
+            if let Some(other) = installed.resolver(scheme)
+                && other.dir != dest
+            {
+                let holder = other.dir_name();
+                return Err(format!(
+                    "scheme `{scheme}://` is already claimed by the installed plugin `{}` (from \
+                     {}) — remove it first with `sbx plugins rm {holder}`",
+                    other.name,
+                    origin::read(layout, holder).short()
+                ));
+            }
+        }
+        // A broker's namespace is its name, and the same two states are refused for the same
+        // reason: a name already ambiguous, and a name another installed broker holds.
+        None => {
+            if let Some(claimants) = installed.broker_conflict(&name) {
+                return Err(format!(
+                    "the broker name `{name}` is claimed by more than one installed plugin ({}) \
+                     — they are all disabled; remove all but one with `sbx plugins rm <name>` \
+                     first",
+                    quoted_list(claimants)
+                ));
+            }
+            if let Some(other) = installed.broker(&name)
+                && other.dir != dest
+            {
+                let holder = other.dir_name();
+                return Err(format!(
+                    "the broker name `{name}` is already taken by the installed plugin from {} — \
+                     remove it first with `sbx plugins rm {holder}`",
+                    origin::read(layout, holder).short()
+                ));
+            }
+        }
     }
 
     // Stage into a temp sibling *outside* the plugins directory (so a concurrent `list` never scans
@@ -1000,7 +1278,7 @@ fn install_inner(
             }
             Ok(Installed {
                 name,
-                scheme: probe.scheme,
+                scheme: probe.scheme().map(str::to_string),
             })
         }
         Err(e) => {
@@ -1256,6 +1534,246 @@ mod tests {
         (reg, warnings)
     }
 
+    /// The broker manifest a `[broker]` table is read from, for the tests that vary one field.
+    fn broker_manifest(extra: &str) -> String {
+        format!(
+            r#"
+                name   = "gpg-agent"
+                type   = "broker"
+                exec   = "broker"
+                [broker]
+                cage_env  = ["GPG_AGENT_SOCK"]
+                framing   = "length-u32-be"
+                max_frame = 4096
+                {extra}
+            "#
+        )
+    }
+
+    #[test]
+    fn loads_a_valid_broker_under_its_name() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(root.path(), "gpg-agent", &broker_manifest(""));
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let p = reg.broker("gpg-agent").expect("the broker is registered");
+        assert_eq!(p.broker.cage_env, vec!["GPG_AGENT_SOCK".to_string()]);
+        assert_eq!(p.broker.max_frame, 4096);
+        assert!(
+            !p.broker.inspect_replies,
+            "the wider grant stays off unless the manifest asks"
+        );
+    }
+
+    /// The two indexes are separate namespaces: a broker is not reachable as a scheme, and a
+    /// resolver is not reachable as a broker name.
+    #[test]
+    fn a_broker_and_a_resolver_do_not_share_a_namespace() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(root.path(), "gpg-agent", &broker_manifest(""));
+        write_plugin(
+            root.path(),
+            "pass",
+            r#"
+                name   = "pass"
+                type   = "resolver"
+                scheme = "pass"
+                exec   = "resolve"
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(reg.resolver("gpg-agent").is_none());
+        assert!(reg.broker("pass").is_none());
+        assert!(reg.resolver("pass").is_some());
+        assert!(reg.broker("gpg-agent").is_some());
+    }
+
+    /// A name is how a config reaches a broker, so two claimants make it ambiguous — the rule the
+    /// scheme index has always applied, on the key this index is built from.
+    #[test]
+    fn two_brokers_claiming_one_name_are_both_disabled() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(root.path(), "first", &broker_manifest(""));
+        write_plugin(root.path(), "second", &broker_manifest(""));
+        let (reg, _) = load(root.path());
+        assert!(
+            reg.broker("gpg-agent").is_none(),
+            "an ambiguous name must resolve to nothing"
+        );
+        let claimants = reg
+            .broker_conflict("gpg-agent")
+            .expect("the conflict is recorded");
+        assert_eq!(claimants, ["first", "second"]);
+        // Recorded *and* rendered: a caller that only relays text must still be able to name both
+        // plugins to remove.
+        let rendered = reg.conflict_warnings();
+        assert!(
+            rendered
+                .iter()
+                .any(|w| w.contains("broker name `gpg-agent`")
+                    && w.contains("`first`")
+                    && w.contains("`second`")),
+            "{rendered:?}"
+        );
+    }
+
+    /// Each type reads its own fields and refuses the other's, so a manifest cannot appear to
+    /// declare something nothing will read.
+    #[test]
+    fn the_two_types_refuse_each_others_fields() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "schemed-broker",
+            r#"
+                name   = "schemed-broker"
+                type   = "broker"
+                scheme = "gpg"
+                exec   = "broker"
+                [broker]
+                cage_env  = ["GPG_AGENT_SOCK"]
+                framing   = "length-u32-be"
+                max_frame = 4096
+            "#,
+        );
+        write_plugin(
+            root.path(),
+            "brokered-resolver",
+            r#"
+                name   = "brokered-resolver"
+                type   = "resolver"
+                scheme = "brk"
+                exec   = "resolve"
+                [broker]
+                cage_env  = ["X_SOCK"]
+                framing   = "length-u32-be"
+                max_frame = 4096
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.broker("schemed-broker").is_none());
+        assert!(reg.resolver("brk").is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("schemed-broker") && w.contains("no `scheme`")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("brokered-resolver") && w.contains("`[broker]` table")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A broker with no `[broker]` table is not a broker, and the refusal says which table.
+    #[test]
+    fn a_broker_without_its_table_is_refused() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "bare",
+            r#"
+                name = "bare"
+                type = "broker"
+                exec = "broker"
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.broker("bare").is_none());
+        assert!(
+            warnings.iter().any(|w| w.contains("[broker]")),
+            "{warnings:?}"
+        );
+    }
+
+    /// The two grants a broker never gets, refused at load rather than at launch: a manifest that
+    /// asked for them must not be installable and merely inert.
+    #[test]
+    fn a_broker_may_not_ask_for_network_or_state() {
+        for (grant, needle) in [("network = true", "network"), ("state = true", "state")] {
+            let root = crate::testutil::TmpDir::new();
+            write_plugin(
+                root.path(),
+                "greedy",
+                &format!(
+                    r#"
+                        name   = "greedy"
+                        type   = "broker"
+                        exec   = "broker"
+                        [broker]
+                        cage_env  = ["X_SOCK"]
+                        framing   = "length-u32-be"
+                        max_frame = 4096
+                        [sandbox]
+                        {grant}
+                    "#
+                ),
+            );
+            let (reg, warnings) = load(root.path());
+            assert!(reg.broker("greedy").is_none(), "grant: {grant}");
+            assert!(
+                warnings.iter().any(|w| w.contains(needle)),
+                "grant: {grant}, warnings: {warnings:?}"
+            );
+        }
+    }
+
+    /// The reserved-key barrier is the config layer's own, not a copy of it: a name that loads
+    /// code in the cage is refused here exactly as an untrusted project's `[env]` is.
+    #[test]
+    fn a_broker_may_not_point_a_code_loading_variable_at_its_socket() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "sneaky",
+            r#"
+                name   = "sneaky"
+                type   = "broker"
+                exec   = "broker"
+                [broker]
+                cage_env  = ["LD_PRELOAD"]
+                framing   = "length-u32-be"
+                max_frame = 4096
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.broker("sneaky").is_none());
+        assert!(
+            warnings.iter().any(|w| w.contains("LD_PRELOAD")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A type nothing implements is refused, and the refusal names every type that *is* — the
+    /// list a manifest author has to choose from.
+    #[test]
+    fn an_unknown_type_names_both_supported_ones() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "future",
+            r#"
+                name   = "future"
+                type   = "transport"
+                scheme = "x"
+                exec   = "run"
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.resolver("x").is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unsupported plugin type")
+                    && w.contains("resolver")
+                    && w.contains("broker")),
+            "{warnings:?}"
+        );
+    }
+
     #[test]
     fn loads_a_valid_resolver_and_expands_its_paths() {
         let root = crate::testutil::TmpDir::new();
@@ -1380,24 +1898,6 @@ mod tests {
         assert!(reg.resolver("env").is_none());
         assert!(
             warnings.iter().any(|w| w.contains("built in")),
-            "{warnings:?}"
-        );
-    }
-
-    #[test]
-    fn a_non_resolver_type_is_refused() {
-        let root = crate::testutil::TmpDir::new();
-        write_plugin(
-            root.path(),
-            "broker",
-            "type = \"broker\"\nscheme = \"x\"\nexec = \"resolve\"\n",
-        );
-        let (reg, warnings) = load(root.path());
-        assert!(reg.resolver("x").is_none());
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("unsupported plugin type")),
             "{warnings:?}"
         );
     }
@@ -1805,6 +2305,15 @@ mod tests {
     /// `mode`) under `root`, returning its path — the kind of directory `sbx plugins install` takes.
     /// The provenance a store install carries, for the tests that exercise the store path. The
     /// store subsystem builds the real one from the configured store and the catalogue entry.
+    /// The claim a store makes about a resolver, as its catalogue would carry it.
+    fn resolver_claim<'a>(name: &'a str, scheme: &'a str) -> StoreClaim<'a> {
+        StoreClaim {
+            name,
+            kind: PluginKind::Resolver,
+            scheme: Some(scheme),
+        }
+    }
+
     fn store_origin() -> origin::Origin {
         origin::Origin::Store {
             store: "mine".to_string(),
@@ -1839,7 +2348,7 @@ mod tests {
 
         let installed = install(&layout, &source).expect("install the plugin");
         assert_eq!(installed.name, "pass");
-        assert_eq!(installed.scheme, "pass");
+        assert_eq!(installed.scheme.as_deref(), Some("pass"));
 
         // placed under the manifest name, not the source directory name, with its files intact
         let dest = layout.plugins_dir().join("pass");
@@ -2017,8 +2526,7 @@ mod tests {
         install_from_store(
             &layout,
             &from_store,
-            "vault",
-            "secret-store",
+            resolver_claim("vault", "secret-store"),
             store_origin(),
         )
         .expect("install from the store");
@@ -2120,11 +2628,15 @@ mod tests {
             "name=\"pass\"\ntype=\"resolver\"\nscheme=\"secret-store\"\nexec=\"resolve\"\n",
             0o755,
         );
-        let installed =
-            install_from_store(&layout, &source, "pass", "secret-store", store_origin())
-                .expect("install");
+        let installed = install_from_store(
+            &layout,
+            &source,
+            resolver_claim("pass", "secret-store"),
+            store_origin(),
+        )
+        .expect("install");
         assert_eq!(installed.name, "pass");
-        assert_eq!(installed.scheme, "secret-store");
+        assert_eq!(installed.scheme.as_deref(), Some("secret-store"));
         assert!(layout.plugins_dir().join("pass").exists());
     }
 
@@ -2140,8 +2652,13 @@ mod tests {
             0o755,
         );
         // the catalogue listed this as `other`, but the manifest declares `pass`
-        let err = install_from_store(&layout, &source, "other", "secret-store", store_origin())
-            .unwrap_err();
+        let err = install_from_store(
+            &layout,
+            &source,
+            resolver_claim("other", "secret-store"),
+            store_origin(),
+        )
+        .unwrap_err();
         assert!(err.contains("lists this plugin as `other`"), "{err}");
         assert!(!layout.plugins_dir().join("pass").exists());
         assert!(!layout.plugins_dir().join("other").exists());
@@ -2159,10 +2676,139 @@ mod tests {
             0o755,
         );
         // the catalogue advertised `vault://`, but the plugin's manifest claims `secret-store://`
-        let err =
-            install_from_store(&layout, &source, "pass", "vault", store_origin()).unwrap_err();
+        let err = install_from_store(
+            &layout,
+            &source,
+            resolver_claim("pass", "vault"),
+            store_origin(),
+        )
+        .unwrap_err();
         assert!(err.contains("advertises scheme `vault://`"), "{err}");
         assert!(!layout.plugins_dir().join("pass").exists());
+    }
+
+    /// A broker source tree: the same shape as [`source_plugin`], with an executable named for
+    /// what it is.
+    fn source_broker(root: &Path, dirname: &str, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join(dirname);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("plugin.toml"),
+            format!(
+                "name=\"{name}\"\ntype=\"broker\"\nexec=\"broker\"\n\
+                 [broker]\ncage_env=[\"GPG_AGENT_SOCK\"]\n\
+                 framing=\"length-u32-be\"\nmax_frame=4096\n"
+            ),
+        )
+        .unwrap();
+        let exec = dir.join("broker");
+        fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    /// A local install is the one path a broker arrives by, so it is the path that has to place it
+    /// under its manifest name and leave the registry able to find it.
+    #[test]
+    fn install_places_a_broker_and_the_registry_finds_it_by_name() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        // the source directory name differs from the manifest name on purpose
+        let source = source_broker(src_root.path(), "checkout", "gpg-agent");
+        let installed = install(&layout, &source).expect("install");
+        assert_eq!(installed.name, "gpg-agent");
+        assert_eq!(
+            installed.scheme, None,
+            "a broker claims no scheme, and the install must say so rather than invent one"
+        );
+        let (reg, warnings) = load(&layout.plugins_dir());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(reg.broker("gpg-agent").is_some());
+        assert!(
+            reg.is_empty(),
+            "a broker is not a resolver: the scheme index stays empty"
+        );
+    }
+
+    /// The name is a broker's whole namespace, so a second claimant is refused at install for the
+    /// reason a contested scheme is: placing it would make the registry drop both, and call that
+    /// success. The holder here sits in a directory of another name (a hand-placed tree, or one
+    /// whose manifest renames it), which is what puts the two on different paths and takes the
+    /// question past the plain "already installed" guard.
+    #[test]
+    fn install_refuses_a_broker_name_another_plugin_already_claims() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        fs::create_dir_all(layout.plugins_dir()).unwrap();
+        let holder = source_broker(&layout.plugins_dir(), "hand-placed", "gpg-agent");
+        assert!(holder.exists());
+
+        let source = source_broker(src_root.path(), "checkout", "gpg-agent");
+        let err = install(&layout, &source).unwrap_err();
+        assert!(
+            err.contains("broker name `gpg-agent`") && err.contains("hand-placed"),
+            "the refusal must name the key and the holder to remove: {err}"
+        );
+        assert!(err.contains("sbx plugins rm"), "{err}");
+
+        // Teeth: the holder still resolves cleanly and the rejected one was never placed.
+        let (reg, warnings) = load(&layout.plugins_dir());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(reg.broker("gpg-agent").is_some());
+        assert!(reg.broker_conflict("gpg-agent").is_none());
+        assert!(!layout.plugins_dir().join("gpg-agent").exists());
+    }
+
+    /// One store serves both kinds. The store is not the boundary a broker is fenced by —
+    /// installing one grants nothing until a global `[broker.<name>] socket` binds it to a host
+    /// resource — so a second store would put a trust ritual where nothing is decided.
+    #[test]
+    fn a_store_serves_a_broker_under_the_kind_it_advertises() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_broker(src_root.path(), "checkout", "gpg-agent");
+        let installed = install_from_store(
+            &layout,
+            &source,
+            StoreClaim {
+                name: "gpg-agent",
+                kind: PluginKind::Broker,
+                scheme: None,
+            },
+            store_origin(),
+        )
+        .expect("a store may serve a broker");
+        assert_eq!(installed.name, "gpg-agent");
+        assert_eq!(installed.scheme, None);
+        let (reg, _) = load(&layout.plugins_dir());
+        assert!(reg.broker("gpg-agent").is_some());
+    }
+
+    /// The type is reconciled before the scheme, because it decides whether a scheme is even the
+    /// right question. A listing describing one kind over a manifest that is another is not the
+    /// plugin that was browsed, and nothing is placed.
+    #[test]
+    fn a_kind_the_catalogue_misadvertised_is_refused() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_broker(src_root.path(), "checkout", "gpg-agent");
+        let err = install_from_store(
+            &layout,
+            &source,
+            resolver_claim("gpg-agent", "gpg"),
+            store_origin(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("as a `resolver`") && err.contains("type = \"broker\""),
+            "the refusal names both sides of the mismatch: {err}"
+        );
+        assert!(!layout.plugins_dir().join("gpg-agent").exists());
     }
 
     #[test]
@@ -2232,8 +2878,13 @@ mod tests {
             "name=\"pass\"\ntype=\"resolver\"\nscheme=\"secret-store\"\nexec=\"resolve\"\n",
             0o755,
         );
-        install_from_store(&layout, &from_store, "pass", "secret-store", store_origin())
-            .expect("install");
+        install_from_store(
+            &layout,
+            &from_store,
+            resolver_claim("pass", "secret-store"),
+            store_origin(),
+        )
+        .expect("install");
         let recorded = origin::read(&layout, "pass");
         assert!(recorded.is_store("mine"), "{recorded:?}");
         assert_eq!(
@@ -2254,16 +2905,19 @@ mod tests {
         let layout = crate::store::Layout::under(data.path());
         let manifest = "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n";
         let first = source_plugin(src_root.path(), "v1", manifest, 0o755);
-        install_from_store(&layout, &first, "kp", "kp", store_origin()).expect("install");
+        install_from_store(&layout, &first, resolver_claim("kp", "kp"), store_origin())
+            .expect("install");
         assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
 
         // A second tree under the same name: a fresh install refuses it, a replacement is what the
         // upgrade verb needs.
         let second = source_plugin(src_root.path(), "v2", manifest, 0o755);
         fs::write(second.join("resolve"), "#!/bin/sh\necho newer\n").unwrap();
-        let err = install_from_store(&layout, &second, "kp", "kp", store_origin()).unwrap_err();
+        let err = install_from_store(&layout, &second, resolver_claim("kp", "kp"), store_origin())
+            .unwrap_err();
         assert!(err.contains("already installed"), "{err}");
-        replace_from_store(&layout, &second, "kp", "kp", store_origin()).expect("replace");
+        replace_from_store(&layout, &second, resolver_claim("kp", "kp"), store_origin())
+            .expect("replace");
 
         // The placed tree is the new one, and the record follows it — otherwise the next `verify`
         // would call a correctly-upgraded plugin modified.
@@ -2295,7 +2949,8 @@ mod tests {
             "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
             0o755,
         );
-        install_from_store(&layout, &good, "kp", "kp", store_origin()).expect("install");
+        install_from_store(&layout, &good, resolver_claim("kp", "kp"), store_origin())
+            .expect("install");
 
         // A candidate whose manifest disagrees with the catalogue's advertised identity — the same
         // reconciliation an install runs, refused just as hard.
@@ -2305,7 +2960,8 @@ mod tests {
             "name=\"impostor\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
             0o755,
         );
-        let err = replace_from_store(&layout, &bad, "kp", "kp", store_origin()).unwrap_err();
+        let err = replace_from_store(&layout, &bad, resolver_claim("kp", "kp"), store_origin())
+            .unwrap_err();
         assert!(err.contains("refusing the mismatch"), "{err}");
 
         // Still installed, still the tree that was there, still matching its record.

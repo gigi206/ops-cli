@@ -7958,3 +7958,108 @@ fn a_one_shot_config_mask_closes_the_path_and_unions_with_the_project() {
     // The host file is untouched by any of it.
     assert_eq!(std::fs::read(p.join(".env")).unwrap(), b"SECRET=hunter2\n");
 }
+
+/// The `[broker.*]` block in the launcher had never run: its failure branches were prose. This
+/// exercises the two a user meets first, and the rule that holds them together — **a broker that
+/// cannot be provided is a warning, never a failed launch**, because a cage without a broker is a
+/// cage that cannot reach that resource, which is the safe direction.
+#[test]
+fn a_broker_that_cannot_be_provided_warns_and_the_launch_still_succeeds() {
+    let project = TmpDir::new("brk");
+    let data = TmpDir::new("brkd");
+    let config = TmpDir::new("brkc");
+    std::fs::write(project.path().join(".sbx.toml"), "").unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping broker launch e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    let sbx_cfg = config.path().join("sbx");
+    std::fs::create_dir_all(&sbx_cfg).unwrap();
+
+    // Case 1: the table names a broker no installed plugin claims.
+    std::fs::write(
+        sbx_cfg.join("sbx.toml"),
+        "[broker.nosuch]\nsocket = \"/dev/null\"\n",
+    )
+    .unwrap();
+    let out = sbx()
+        .args(["run", "--", "true"])
+        .current_dir(project.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx run");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "a broker that cannot be provided must not fail the launch: {stderr}"
+    );
+    assert!(
+        stderr.contains("nosuch") && stderr.contains("no installed broker plugin"),
+        "the launch must name what it could not provide: {stderr}"
+    );
+
+    // Case 2: an installed plugin, pointed at a host resource that is not there. The socket is
+    // checked before anything is stood up, so this is a warning too — a broker in front of nothing
+    // would accept the cage's connections and fail every message.
+    let src = project.path().join("fake-broker");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("plugin.toml"),
+        "name = \"fake-broker\"\ntype = \"broker\"\nexec = \"broker\"\n\
+         [broker]\ncage_env = [\"FAKE_SOCK\"]\nframing = \"length-u32-be\"\nmax_frame = 4096\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("broker"), "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(src.join("broker"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let install = sbx()
+        .args(["plugins", "install", "fake-broker"])
+        .current_dir(project.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx plugins install");
+    assert!(
+        install.status.success(),
+        "installing a broker plugin failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&install.stdout).contains("broker"),
+        "the confirmation names the type rather than a namespace it has none of: {}",
+        String::from_utf8_lossy(&install.stdout)
+    );
+
+    let missing = data.path().join("no-such-agent.sock");
+    std::fs::write(
+        sbx_cfg.join("sbx.toml"),
+        format!("[broker.fake-broker]\nsocket = \"{}\"\n", missing.display()),
+    )
+    .unwrap();
+    let out = sbx()
+        .args(["run", "--", "true"])
+        .current_dir(project.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx run");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "a missing host resource must not fail the launch: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not exist"),
+        "the launch must say the host resource is not there: {stderr}"
+    );
+}

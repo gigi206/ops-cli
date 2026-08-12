@@ -332,21 +332,54 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
             skipped.join(", ")
         ));
     }
-    let resolvers: Vec<_> = registry.resolvers().collect();
-    if resolvers.is_empty() {
-        return Err("refusing to publish — no resolver plugins found under `plugins/`".to_string());
+    // Both kinds are published from one tree and one key. The store is not the boundary a broker
+    // is fenced by — installing one grants nothing until a global `[broker.<name>] socket` binds
+    // it to a host resource — so a second store would add a trust ritual where nothing is decided,
+    // and a second catalogue to keep in step for no property gained.
+    struct Listed<'a> {
+        name: &'a str,
+        dir: &'a Path,
+        exec: &'a Path,
+        kind: crate::plugins::PluginKind,
+        scheme: Option<String>,
+        version: Option<&'a String>,
+        description: Option<&'a String>,
+    }
+    let listed: Vec<Listed<'_>> = registry
+        .resolvers()
+        .map(|p| Listed {
+            name: &p.name,
+            dir: &p.dir,
+            exec: &p.exec,
+            kind: crate::plugins::PluginKind::Resolver,
+            scheme: Some(p.scheme.clone()),
+            version: p.version.as_ref(),
+            description: p.description.as_ref(),
+        })
+        .chain(registry.brokers().map(|p| Listed {
+            name: &p.name,
+            dir: &p.dir,
+            exec: &p.exec,
+            kind: crate::plugins::PluginKind::Broker,
+            scheme: None,
+            version: p.version.as_ref(),
+            description: p.description.as_ref(),
+        }))
+        .collect();
+    if listed.is_empty() {
+        return Err("refusing to publish — no plugins found under `plugins/`".to_string());
     }
 
     // Build the catalogue: each plugin pinned by the digest of its own subdirectory (`dir_digest`,
     // the exact function a consumer reproduces at install time).
     let mut entries = std::collections::BTreeMap::new();
     let mut listing = Vec::new();
-    for p in &resolvers {
+    for p in &listed {
         // The name becomes the catalogue key and, on a consumer, the install directory. The loader
         // does not constrain a manifest's `name`, so hold it here to the installer's safe
         // single-component rule — named at its source rather than surfaced only as a downstream
         // parse failure of the catalogue we are about to write.
-        crate::plugins::validate_install_name(&p.name)
+        crate::plugins::validate_install_name(p.name)
             .map_err(|e| format!("plugin in `{}`: {e}", p.dir.display()))?;
         if !p.exec.is_file() {
             return Err(format!(
@@ -364,14 +397,23 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
             .ok_or_else(|| format!("plugin `{}` has a non-UTF-8 path", p.name))?
             .replace(std::path::MAIN_SEPARATOR, "/");
         let sha256 =
-            crate::plugins::catalogue::to_hex(&crate::plugins::catalogue::dir_digest(&p.dir)?);
-        listing.push((p.name.clone(), p.scheme.clone()));
+            crate::plugins::catalogue::to_hex(&crate::plugins::catalogue::dir_digest(p.dir)?);
+        // What the publish confirmation shows: a resolver by the namespace it answers for, a
+        // broker by its type, since it has no namespace to name.
+        listing.push((
+            p.name.to_string(),
+            match &p.scheme {
+                Some(scheme) => scheme.clone(),
+                None => p.kind.token().to_string(),
+            },
+        ));
         entries.insert(
-            p.name.clone(),
+            p.name.to_string(),
             crate::plugins::catalogue::CatalogueEntry {
+                kind: p.kind,
                 scheme: p.scheme.clone(),
-                version: p.version.clone().unwrap_or_default(),
-                description: p.description.clone().unwrap_or_default(),
+                version: p.version.cloned().unwrap_or_default(),
+                description: p.description.cloned().unwrap_or_default(),
                 path,
                 sha256,
             },
@@ -723,9 +765,27 @@ fn place_plugin(
         sha256: Some(entry.sha256.clone()),
     };
     if replace {
-        crate::plugins::replace_from_store(layout, &plugin_dir, plugin_name, &entry.scheme, origin)
+        crate::plugins::replace_from_store(
+            layout,
+            &plugin_dir,
+            crate::plugins::StoreClaim {
+                name: plugin_name,
+                kind: entry.kind,
+                scheme: entry.scheme.as_deref(),
+            },
+            origin,
+        )
     } else {
-        crate::plugins::install_from_store(layout, &plugin_dir, plugin_name, &entry.scheme, origin)
+        crate::plugins::install_from_store(
+            layout,
+            &plugin_dir,
+            crate::plugins::StoreClaim {
+                name: plugin_name,
+                kind: entry.kind,
+                scheme: entry.scheme.as_deref(),
+            },
+            origin,
+        )
     }
 }
 
@@ -1878,7 +1938,7 @@ mod tests {
         // the catalogue's *advertised* scheme, which differs from the plugin's name — a swapped
         // argument in the call would refuse the install (a name/scheme mismatch) instead of landing
         // here with the right scheme.
-        assert_eq!(installed.scheme, "secret-store");
+        assert_eq!(installed.scheme.as_deref(), Some("secret-store"));
 
         // placed under the manifest name, and the live registry resolves it under its scheme
         let dest = layout.plugins_dir().join("pass");
@@ -2339,7 +2399,7 @@ mod tests {
         let key = repo.path().join("store.key");
 
         let err = publish(repo.path(), &key, Some(1)).unwrap_err();
-        assert!(err.contains("no resolver plugins"), "{err}");
+        assert!(err.contains("no plugins found"), "{err}");
     }
 
     #[test]

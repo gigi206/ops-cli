@@ -206,6 +206,7 @@ pub(crate) fn resolved(
         devices: Vec::new(),
         devices_origin: Default::default(),
         ssh_agent: vec![],
+        brokers: Vec::new(),
         ssh_agent_origin: Default::default(),
         declared_secrets: vec![],
         apps: apps.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),

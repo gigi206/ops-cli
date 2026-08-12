@@ -4,7 +4,7 @@
 sbx logs [<id>] [--feed <a,b,...>] [-n <N>] [-f|--follow] [--json]
 ```
 
-One running session's **five feeds in one column of time**: what it execs, where it goes, what it
+One running session's **six feeds in one column of time**: what it execs, where it goes, what it
 writes, what it asked your keys to sign, and the declared operations it invoked. `sbx log` is an
 accepted alias.
 
@@ -32,7 +32,7 @@ feeds — session 4019373 [demo-app] ~/dev/demo-app
 | Column | Meaning |
 |---|---|
 | time | local time of day, to the millisecond, of when the event happened |
-| feed | which feed saw it: `proc`, `net`, `fs`, `ssh`, `task` |
+| feed | which feed saw it: `proc`, `net`, `fs`, `ssh`, `broker`, `task` |
 | token | that feed's own verdict or kind, unchanged |
 | subject | that feed's own free-text field: a command, a host, a path, a key, an operation |
 
@@ -44,6 +44,7 @@ The tokens are each feed's own, not a vocabulary invented here:
 | `net` | `allow`, `deny`, `blocked`, `error` |
 | `fs` | `write`, `create`, `remove`, `rename` |
 | `ssh` | `list`, `sign`, `refuse` |
+| `broker` | `forward`, `answer`, `refuse` — what `sbx` observed, with the plugin's own reason appended |
 | `task` | `exit=<n>`, or `refused` |
 
 ## A feed that is not recording says so
@@ -58,6 +59,7 @@ Most sessions record two or three. Each feed needs something to have been decide
 | `proc`, `fs` | observation on: [`sbx run --observe`](run#observing-a-run---observe) |
 | `net` | a filtering [`[network] mode`](../configuration/network) (`deny`, `allow` or `ask`) |
 | `ssh` | an [`[ssh_agent] allow`](../configuration/ssh-agent) grant |
+| `broker` | a [`[broker.<name>]`](../configuration/broker) binding that started |
 | `task` | a [`[task]`](../configuration/task) table declaring operations |
 
 If none of them is recording, the command says so and exits non-zero rather than printing an empty

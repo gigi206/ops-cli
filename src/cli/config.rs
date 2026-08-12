@@ -896,6 +896,25 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         );
     }
 
+    // Broker plugins — shown only when one is bound. The **socket** leads each line: it is the
+    // whole of what is exposed, and a reader auditing a broker is auditing that path. The policy
+    // follows, and its provenance tag is the policy's — the socket is always the global config's,
+    // which is what makes the tag readable rather than ambiguous.
+    for b in &view.brokers {
+        let _ = writeln!(
+            o,
+            "  {h}broker:{r} {} {dim}→{r} {} {dim}({}){r}{}",
+            b.socket,
+            b.name,
+            if b.allow.is_empty() {
+                "brokered by this plugin, no policy entries".to_string()
+            } else {
+                format!("brokered by this plugin: {}", b.allow.join(", "))
+            },
+            provenance_tag(b.origin, pal)
+        );
+    }
+
     // Credentials the egress proxy injects — by destination and source locator, never the value.
     if !view.secrets.is_empty() {
         let _ = writeln!(
@@ -2515,6 +2534,7 @@ mod tests {
             devices: vec![],
             devices_origin: ProvenanceView::Default,
             ssh_agent: vec![],
+            brokers: Vec::new(),
             ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
@@ -2569,6 +2589,45 @@ mod tests {
             out.contains("    /data (rw)  (global)"),
             "a writable bind must be marked (rw) before its provenance tag:\n{out}"
         );
+    }
+
+    /// A broker is a host resource put in front of a cage, so the view leads with the **socket**:
+    /// that path is the whole of what is exposed, and it is what a reader auditing the config is
+    /// checking. The provenance tag is the policy's, since the socket is always the global
+    /// config's.
+    #[test]
+    fn config_render_leads_a_broker_with_the_host_resource_it_exposes() {
+        let mut view = sample_config_view();
+        view.brokers = vec![config::view::BrokerView {
+            name: "gpg-agent".into(),
+            socket: "/run/user/1000/gnupg/S.gpg-agent".into(),
+            allow: vec!["sign".into()],
+            origin: config::view::ProvenanceView::Project,
+        }];
+        let out = render_config(&view, &style::Palette::plain(), false);
+        let line = out
+            .lines()
+            .find(|l| l.contains("broker:"))
+            .expect("the broker is shown");
+        let socket_at = line
+            .find("/run/user/1000/gnupg/S.gpg-agent")
+            .expect("the socket is shown");
+        let arrow_at = line
+            .find('→')
+            .expect("the socket is followed by the plugin it feeds");
+        assert!(
+            socket_at < arrow_at,
+            "the socket leads, the plugin follows: {line}"
+        );
+        assert!(line.contains("sign"), "the policy is shown: {line}");
+        assert!(line.contains("(project)"), "the policy's layer: {line}");
+    }
+
+    /// A config with no broker says nothing about brokers — the common case stays uncluttered.
+    #[test]
+    fn config_render_says_nothing_when_no_broker_is_bound() {
+        let out = render_config(&sample_config_view(), &style::Palette::plain(), false);
+        assert!(!out.contains("broker:"), "{out}");
     }
 
     #[test]
@@ -3154,6 +3213,7 @@ mod tests {
             devices: vec![],
             devices_origin: ProvenanceView::Default,
             ssh_agent: vec![],
+            brokers: Vec::new(),
             ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
@@ -3264,6 +3324,7 @@ mod tests {
             devices: vec![],
             devices_origin: ProvenanceView::Default,
             ssh_agent: vec![],
+            brokers: Vec::new(),
             ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
@@ -3411,6 +3472,7 @@ mod tests {
             devices: vec![],
             devices_origin: ProvenanceView::Default,
             ssh_agent: vec![],
+            brokers: Vec::new(),
             ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
@@ -3493,6 +3555,7 @@ mod tests {
             devices: vec![],
             devices_origin: ProvenanceView::Default,
             ssh_agent: vec![],
+            brokers: Vec::new(),
             ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
@@ -3614,6 +3677,7 @@ mod tests {
             devices: vec![],
             devices_origin: ProvenanceView::Default,
             ssh_agent: vec![],
+            brokers: Vec::new(),
             ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],
@@ -3735,6 +3799,7 @@ mod tests {
             devices: vec![],
             devices_origin: ProvenanceView::Default,
             ssh_agent: vec![],
+            brokers: Vec::new(),
             ssh_agent_origin: Default::default(),
             limits: Default::default(),
             secrets: vec![],

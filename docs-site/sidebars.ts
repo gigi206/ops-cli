@@ -88,6 +88,7 @@ const sidebars: SidebarsConfig = {
             'configuration/network',
             'configuration/secret',
             'configuration/ssh-agent',
+            'configuration/broker',
             'configuration/task',
           ],
         },

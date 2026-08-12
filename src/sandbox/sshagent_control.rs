@@ -30,10 +30,6 @@ use std::sync::Arc;
 /// because these events are rare and each one matters.
 pub(crate) const AGENT_RING_CAP: usize = 500;
 
-/// The longest `detail` an event carries. A key comment comes from the user's own agent and is
-/// free-form, so it is capped as well as sanitised.
-const DETAIL_MAX: usize = 200;
-
 /// What the broker did. A closed enum with a fixed one-word wire token, so it is a safe field ahead
 /// of the verbatim `detail=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,22 +116,6 @@ impl super::lens::Event for AgentEvent {
 /// The result of a `LOG` query over this lens. See [`super::lens::Snapshot`].
 pub(crate) type AgentSnapshot = super::lens::Snapshot<AgentEvent>;
 
-/// Strip a detail of anything that could forge a second wire line or a terminal escape, and cap its
-/// length. A key comment is free-form text from the user's own agent; a refusal reason is one of a
-/// closed set of literals. Neither is cage-controlled, but the record of a credential channel is
-/// exactly the wrong place to trust that and be wrong: an event line whose `detail` could contain a
-/// newline would let one entry write another.
-fn sanitize_detail(s: &str) -> String {
-    let mut out: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if out.chars().count() > DETAIL_MAX {
-        out = out.chars().take(DETAIL_MAX - 1).collect::<String>() + "…";
-    }
-    out
-}
-
 /// A bounded ring of recent broker decisions. Shared (via `Arc`) between the broker's per-connection
 /// threads (which [`push`](AgentRing::push)) and the control serve thread (which
 /// [`snapshot`](super::lens::Ring::snapshot)s for `sbx ssh-agent log`). The sequencing and eviction are
@@ -195,7 +175,7 @@ impl AgentRing {
             seq,
             at_epoch_ms,
             kind,
-            detail: sanitize_detail(detail),
+            detail: super::lens::sanitize_detail(detail),
         })
     }
 }
@@ -282,7 +262,10 @@ mod tests {
         // And a long comment is capped rather than allowed to fill the ring's whole line budget.
         let ring = AgentRing::new(8);
         ring.push(AgentKind::List, &"x".repeat(10_000));
-        assert!(ring.snapshot(None).events[0].detail.chars().count() <= DETAIL_MAX);
+        assert!(
+            ring.snapshot(None).events[0].detail.chars().count()
+                <= crate::sandbox::lens::DETAIL_MAX
+        );
     }
 
     #[test]

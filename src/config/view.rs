@@ -126,6 +126,9 @@ pub(crate) struct ConfigView {
     pub(crate) ssh_agent_origin: ProvenanceView,
     /// Whether every signature must be confirmed on the host desktop first (`[ssh_agent] confirm`).
     pub(crate) ssh_agent_confirm: bool,
+    /// The broker plugins this cage would stand up (`[broker.<name>]`), each pairing a host
+    /// resource with the policy it is brokered under. Empty when none is bound.
+    pub(crate) brokers: Vec<BrokerView>,
     /// The cage's effective cgroup resource limits (anti-DoS), each a config override or the default.
     pub(crate) limits: LimitsView,
     /// Credentials the egress proxy injects (by destination and source locator, never the value).
@@ -542,6 +545,18 @@ pub(crate) struct LimitView {
     pub(crate) origin: ProvenanceView,
 }
 
+/// One `[broker.<name>]` binding, as the config views show it: what is brokered, and under which
+/// policy. The socket is shown because it is the whole of what is exposed — a reader checking a
+/// broker is checking that path, not the plugin's name.
+#[derive(Serialize)]
+pub(crate) struct BrokerView {
+    pub(crate) name: String,
+    pub(crate) socket: String,
+    pub(crate) allow: Vec<String>,
+    /// Which layer supplied the policy. The socket is always the global config's.
+    pub(crate) origin: ProvenanceView,
+}
+
 /// One declared operation, as the static view shows it: what it is called, what it says it does,
 /// and which layer declared it. The command is deliberately absent — an operation is a *fixed*
 /// command plus a credential the caller never holds, and `sbx task show` is where the whole
@@ -950,6 +965,16 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         tasks: task_views(&resolved.tasks),
         ssh_agent: resolved.ssh_agent.clone(),
         ssh_agent_origin: resolved.ssh_agent_origin.into(),
+        brokers: resolved
+            .brokers
+            .iter()
+            .map(|b| BrokerView {
+                name: b.name.clone(),
+                socket: b.socket.display().to_string(),
+                allow: b.allow.clone(),
+                origin: b.origin.into(),
+            })
+            .collect(),
         ssh_agent_confirm: resolved.ssh_agent_confirm,
         limits,
         secrets,
@@ -1665,6 +1690,7 @@ mod tests {
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
+            brokers: Vec::new(),
             cwd: "/proj".into(),
             env: vec![EnvVar {
                 key: "A".into(),
@@ -2004,6 +2030,7 @@ mod tests {
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
             plugin: Default::default(),
+            brokers: Vec::new(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: Default::default(),

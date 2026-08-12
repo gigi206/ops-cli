@@ -510,6 +510,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         appimage: _,
         task: _,
         plugin: _,
+        // Not carried, like `plugin`: a broker's `socket` names a host resource to stand in front
+        // of, which is declared where it can be read and reviewed rather than overlaid for a run.
+        broker: _,
         rest: _,
     } = higher;
 

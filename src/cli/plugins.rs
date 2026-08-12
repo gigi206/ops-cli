@@ -253,7 +253,7 @@ impl InstalledIndex {
     fn marker(
         &self,
         name: &str,
-        scheme: &str,
+        scheme: Option<&str>,
         listed_version: Option<&str>,
         listed_sha256: Option<&str>,
         store: &str,
@@ -300,6 +300,11 @@ impl InstalledIndex {
         }
         // The name is free, but a scheme is claimed by exactly one plugin — an install would be
         // refused for the scheme instead, which is far from obvious from a listing.
+        // A broker claims no scheme, so neither of the two scheme collisions below can apply to
+        // one: its namespace is its name, which the `by_name` check above already answered.
+        let Some(scheme) = scheme else {
+            return String::new();
+        };
         if let Some(other) = self.by_scheme.get(scheme) {
             return format!(
                 "  {}[scheme {scheme}:// taken by the installed plugin '{other}']{r}",
@@ -390,6 +395,48 @@ fn plugins_list() -> ExitCode {
         }
         println!("{dim}(remove one with: sbx plugins rm <name>){r}");
     }
+    // Brokers are listed apart from resolvers, and named by what reaches them. The two answer
+    // different questions — a resolver is asked for a value, a broker stands in front of a host
+    // resource — and folding them into one list would suggest a `scheme://` reaches a broker.
+    if registry.brokers().next().is_some() {
+        println!("{h}installed broker plugins:{r}");
+        for p in registry.brokers() {
+            print!("  {n}{}{r}", p.name);
+            if let Some(v) = &p.version {
+                print!("  v{v}");
+            }
+            print!(
+                "  {dim}{} frames, max {} bytes{r}",
+                p.broker.framing.token(),
+                p.broker.max_frame
+            );
+            if p.broker.inspect_replies {
+                print!("  {dim}rules on replies{r}");
+            }
+            if let Err(why) = p.check_exec() {
+                print!("  {err}[not runnable: {why}]{r}");
+            }
+            match plugins::integrity(&layout, p.dir_name()) {
+                plugins::Integrity::Modified => print!("  {err}[modified since install]{r}"),
+                plugins::Integrity::Unreadable(_) => {
+                    print!("  {err}[cannot be hashed]{r}");
+                }
+                plugins::Integrity::Intact | plugins::Integrity::Unrecorded => {}
+            }
+            println!();
+            if let Some(desc) = &p.description {
+                println!("    {dim}{desc}{r}");
+            }
+            println!(
+                "    {dim}sets in the cage: {}{r}",
+                p.broker.cage_env.join(", ")
+            );
+            println!(
+                "    {dim}from: {}{r}",
+                plugins::origin::read(&layout, p.dir_name()).label()
+            );
+        }
+    }
     print_scheme_conflicts(&layout, &registry, None, &pal);
     println!("{dim}(browse the configured stores with: sbx plugins store list){r}");
     for w in &warnings {
@@ -461,9 +508,9 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
                 "{}",
-                render_plugin_installed(&installed.name, &installed.scheme, None, &pal)
+                render_plugin_installed(&installed.name, installed.scheme.as_deref(), None, &pal)
             );
-            provision_configured_programs(&layout, &installed.scheme)
+            provision_configured_programs(&layout, &installed.name)
         }
         Err(why) => {
             diag::error(&format!("sbx: cannot install plugin: {why}"));
@@ -487,21 +534,35 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
 /// plugin is there, and what could not be built is named so the user can fix the attribute and run
 /// the install again. Reporting success over a program the plugin cannot start would only move the
 /// failure to the first secret.
-fn provision_configured_programs(layout: &store::Layout, scheme: &str) -> ExitCode {
+fn provision_configured_programs(layout: &store::Layout, plugin_name: &str) -> ExitCode {
     let mut load_warnings = Vec::new();
     let registry = plugins::PluginRegistry::load_quiet(&layout.plugins_dir(), &mut load_warnings);
-    let Some(plugin) = registry.resolver(scheme) else {
+    // Looked up by *name*, which is the key `[plugin.<name>]` answers under — and the one key both
+    // plugin types share. A resolver is indexed by its scheme and a broker by its name, but what
+    // is being provisioned here is the manifest's `programs`, which neither index is about.
+    let Some((programs, dir_name)) = registry
+        .resolvers()
+        .find(|p| p.name == plugin_name)
+        .map(|p| (&p.sandbox.programs, p.dir_name()))
+        .or_else(|| {
+            registry
+                .brokers()
+                .find(|p| p.name == plugin_name)
+                .map(|p| (&p.sandbox.programs, p.dir_name()))
+        })
+    else {
         return ExitCode::SUCCESS;
     };
     let Ok(cwd) = std::env::current_dir() else {
         return ExitCode::SUCCESS;
     };
     let resolved = crate::config::load(&cwd);
-    let Some(raw) = resolved.plugin.get(&plugin.name) else {
+    let Some(raw) = resolved.plugin.get(plugin_name) else {
         return ExitCode::SUCCESS;
     };
     let mut warnings = Vec::new();
-    let wanted = crate::config::validated_programs(plugin, &raw.programs, &mut warnings);
+    let wanted =
+        crate::config::validated_programs(plugin_name, programs, &raw.programs, &mut warnings);
     for w in &warnings {
         diag::warn(w);
     }
@@ -512,7 +573,7 @@ fn provision_configured_programs(layout: &store::Layout, scheme: &str) -> ExitCo
         diag::error(&format!(
             "sbx: `[plugin.{}] programs` names a package to provision, but there is no nix to \
              build it with",
-            plugin.name
+            plugin_name
         ));
         return ExitCode::FAILURE;
     };
@@ -528,18 +589,18 @@ fn provision_configured_programs(layout: &store::Layout, scheme: &str) -> ExitCo
             return ExitCode::FAILURE;
         }
     };
-    match plugins::programs::provision(layout, &nix, &nixpkgs, plugin.dir_name(), &wanted) {
+    match plugins::programs::provision(layout, &nix, &nixpkgs, dir_name, &wanted) {
         Ok(done) => {
             for one in &done {
                 match one {
                     plugins::programs::Provisioned::OnPath { path } => println!(
                         "  {}: already on PATH at {} (the configured package is unused)",
-                        plugin.name,
+                        plugin_name,
                         path.display()
                     ),
                     plugins::programs::Provisioned::Built { program, path } => println!(
                         "  {}: provisioned `{program}` at {}",
-                        plugin.name,
+                        plugin_name,
                         path.display()
                     ),
                 }
@@ -690,10 +751,16 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
                 );
             }
             let cat = &added.catalogue;
+            let labels: Vec<(String, String)> = cat
+                .plugins
+                .values()
+                .map(|e| (catalogue_label(e), e.version.clone()))
+                .collect();
             let plugins: Vec<(&str, &str, &str)> = cat
                 .plugins
-                .iter()
-                .map(|(p, e)| (p.as_str(), e.scheme.as_str(), e.version.as_str()))
+                .keys()
+                .zip(labels.iter())
+                .map(|(p, (what, version))| (p.as_str(), what.as_str(), version.as_str()))
                 .collect();
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             print!(
@@ -984,9 +1051,14 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
                 "{}",
-                render_plugin_installed(&installed.name, &installed.scheme, Some(store_name), &pal)
+                render_plugin_installed(
+                    &installed.name,
+                    installed.scheme.as_deref(),
+                    Some(store_name),
+                    &pal,
+                )
             );
-            provision_configured_programs(&layout, &installed.scheme)
+            provision_configured_programs(&layout, &installed.name)
         }
         Err(why) => {
             diag::error(&format!("sbx: cannot install plugin: {why}"));
@@ -1333,7 +1405,11 @@ fn parse_store_list_args(args: &[OsString]) -> Result<(bool, Option<String>), St
 /// what `--installed` means.
 struct Listed<'a> {
     name: &'a str,
-    scheme: &'a str,
+    /// What kind of plugin the source lists. It decides how the entry names itself, since only one
+    /// kind has a namespace to name.
+    kind: crate::plugins::PluginKind,
+    /// The scheme, for a resolver. `None` for a broker, which claims none.
+    scheme: Option<&'a str>,
     version: Option<&'a str>,
     description: Option<&'a str>,
     /// The digest the catalogue pins for this entry, when it comes from one. It is the exact
@@ -1361,7 +1437,14 @@ fn print_listed(
             continue;
         }
         shown += 1;
-        print!("{indent}{n}{}{r}  {dim}({}://){r}", e.name, e.scheme);
+        print!(
+            "{indent}{n}{}{r}  {dim}({}){r}",
+            e.name,
+            match e.scheme {
+                Some(scheme) => format!("{scheme}://"),
+                None => e.kind.token().to_string(),
+            }
+        );
         if let Some(v) = e.version.filter(|v| !v.is_empty()) {
             print!("  v{v}");
         }
@@ -1398,13 +1481,23 @@ fn print_source_footer(
     }
 }
 
+/// How a catalogue entry names its namespace: the scheme a resolver answers for, or the type of a
+/// plugin that claims none. One place, so a listing and a confirmation never spell it differently.
+fn catalogue_label(e: &catalogue::CatalogueEntry) -> String {
+    match &e.scheme {
+        Some(scheme) => format!("{scheme}://"),
+        None => e.kind.token().to_string(),
+    }
+}
+
 /// The entries a remote catalogue lists, in the shared shape.
 fn listed_from_catalogue(cat: &catalogue::Catalogue) -> Vec<Listed<'_>> {
     cat.plugins
         .iter()
         .map(|(name, e)| Listed {
             name,
-            scheme: &e.scheme,
+            kind: e.kind,
+            scheme: e.scheme.as_deref(),
             version: Some(&e.version),
             description: Some(&e.description),
             sha256: Some(&e.sha256),
@@ -2022,9 +2115,14 @@ fn print_grant_programs(
         .and_then(|c| c.plugin.get(&plugin.name).cloned())
         .map(|raw| {
             let mut ignored = Vec::new();
-            crate::config::validated_programs(plugin, &raw.programs, &mut ignored)
-                .into_iter()
-                .collect()
+            crate::config::validated_programs(
+                &plugin.name,
+                &plugin.sandbox.programs,
+                &raw.programs,
+                &mut ignored,
+            )
+            .into_iter()
+            .collect()
         })
         .unwrap_or_default();
 
@@ -2229,7 +2327,7 @@ mod tests {
             Some("1.0.0"),
         )]);
         assert_eq!(
-            idx.marker("kp", "kp", Some("1.0.0"), None, "mine", &plain()),
+            idx.marker("kp", Some("kp"), Some("1.0.0"), None, "mine", &plain()),
             "  [installed]"
         );
     }
@@ -2249,7 +2347,7 @@ mod tests {
             None,
         )]);
         assert_eq!(
-            idx.marker("kp", "kp", None, None, "other", &plain()),
+            idx.marker("kp", Some("kp"), None, None, "other", &plain()),
             "  [name taken by store 'mine']"
         );
         // The same rule across sources: a local install shadows a store's entry, and a built-in
@@ -2264,13 +2362,13 @@ mod tests {
             None,
         )]);
         assert_eq!(
-            idx.marker("kp", "kp", None, None, "mine", &plain()),
+            idx.marker("kp", Some("kp"), None, None, "mine", &plain()),
             "  [name taken by a local install]"
         );
         // A plugin installed before origins were recorded holds the name just as firmly.
         let idx = index(&[("kp", "kp", Origin::Unknown, None)]);
         assert_eq!(
-            idx.marker("kp", "kp", None, None, "mine", &plain()),
+            idx.marker("kp", Some("kp"), None, None, "mine", &plain()),
             "  [name taken by an unknown source]"
         );
     }
@@ -2288,7 +2386,7 @@ mod tests {
             None,
         )]);
         assert_eq!(
-            idx.marker("kp", "kp", None, None, "mine", &plain()),
+            idx.marker("kp", Some("kp"), None, None, "mine", &plain()),
             "  [scheme kp:// taken by the installed plugin 'other']"
         );
     }
@@ -2306,7 +2404,7 @@ mod tests {
             },
         );
         assert_eq!(
-            idx.marker("kp", "kp", None, None, "mine", &plain()),
+            idx.marker("kp", Some("kp"), None, None, "mine", &plain()),
             "  [scheme kp:// in conflict between `one`, `two`]"
         );
     }
@@ -2322,7 +2420,7 @@ mod tests {
         };
         let idx = conflicted_index("kp", &["kp", "kp-fork"], store);
         assert_eq!(
-            idx.marker("kp", "kp", Some("1.0.0"), None, "mine", &plain()),
+            idx.marker("kp", Some("kp"), Some("1.0.0"), None, "mine", &plain()),
             "  [installed, disabled: scheme kp:// in conflict]"
         );
     }
@@ -2339,7 +2437,7 @@ mod tests {
             None,
         )]);
         assert_eq!(
-            idx.marker("kp", "kp", Some("1.0.0"), None, "mine", &plain()),
+            idx.marker("kp", Some("kp"), Some("1.0.0"), None, "mine", &plain()),
             ""
         );
     }
@@ -2361,12 +2459,12 @@ mod tests {
             )])
         };
         assert_eq!(
-            store(Some("1.0.0")).marker("kp", "kp", Some("2.0.0"), None, "mine", &plain()),
+            store(Some("1.0.0")).marker("kp", Some("kp"), Some("2.0.0"), None, "mine", &plain()),
             "  [installed v1.0.0, listed v2.0.0]"
         );
         // A version missing on either side is not a drift, just less to say.
         assert_eq!(
-            store(None).marker("kp", "kp", Some("2.0.0"), None, "mine", &plain()),
+            store(None).marker("kp", Some("kp"), Some("2.0.0"), None, "mine", &plain()),
             "  [installed]"
         );
     }
@@ -2392,7 +2490,7 @@ mod tests {
         assert_eq!(
             idx.marker(
                 "kp",
-                "kp",
+                Some("kp"),
                 Some("1.0.0"),
                 Some(&"a".repeat(64)),
                 "mine",
@@ -2404,7 +2502,7 @@ mod tests {
         assert_eq!(
             idx.marker(
                 "kp",
-                "kp",
+                Some("kp"),
                 Some("1.1.0"),
                 Some(&"b".repeat(64)),
                 "mine",
@@ -2416,7 +2514,7 @@ mod tests {
         assert_eq!(
             idx.marker(
                 "kp",
-                "kp",
+                Some("kp"),
                 Some("1.0.0"),
                 Some(&"b".repeat(64)),
                 "mine",
@@ -2428,7 +2526,7 @@ mod tests {
         assert_eq!(
             idx.marker(
                 "kp",
-                "kp",
+                Some("kp"),
                 Some("0.9.0"),
                 Some(&"b".repeat(64)),
                 "mine",

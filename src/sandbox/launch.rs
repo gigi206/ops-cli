@@ -27,6 +27,7 @@
 //!   shares the limitation; a split-direction or non-blocking relay is the fix.
 
 use super::binds::{self, Userland};
+use super::broker;
 use super::egress;
 use super::forward;
 use super::pty::{RawMode, WinchRelay, copy_winsize, pump};
@@ -3441,6 +3442,11 @@ pub(crate) struct LaunchGuard {
     /// a detached host thread that must outlive the cage; this owns the socket file, unlinked when
     /// the launch ends.
     pub(crate) ssh_agent: Option<sshagent::SshAgent>,
+    /// The broker plugins standing in front of a host resource (`[broker.<name>]`), one guard per
+    /// binding. Same reason as the agent's: each owns a socket file and a detached accept loop that
+    /// must outlive the cage, and dropping it unlinks the socket. Holding these in a local would
+    /// unlink them before the cage is even built.
+    pub(crate) brokers: Vec<broker::Broker>,
     pub(crate) forward: Option<forward::Forwarder>,
     /// The in-cage desktop-notifications relay (`dbus = true`), when one is running. It runs on a
     /// host thread bridging the private bus to the host notifications daemon, so it must outlive the
@@ -3503,6 +3509,12 @@ impl Drop for LaunchGuard {
         }
         if let Some(ssh_agent) = self.ssh_agent.take() {
             drop(ssh_agent);
+        }
+        // Beside the agent, and for the same reason: each unlinks its socket and its control
+        // socket, and closing the listener ends the detached accept loop. Taken as a whole so a
+        // launch running several brokers tears them all down.
+        for broker in std::mem::take(&mut self.brokers) {
+            drop(broker);
         }
         // Before the portal directory: the relay must disconnect from the private bus before its
         // socket is removed.
@@ -4394,6 +4406,87 @@ fn build(
         }
     }
 
+    // Broker plugins: the same shape as the ssh-agent broker above, for a protocol sbx does not
+    // implement itself. Each `[broker.<name>]` pairs an installed plugin with the host resource
+    // the global config bound it to; sbx serves the socket, holds the host connection, and the
+    // plugin only ever answers verdicts about frames.
+    //
+    // Every failure here degrades to *no broker* rather than to an unfenced one, and says so: a
+    // cage without a broker is a cage that cannot reach that resource, which is the fail-closed
+    // direction. Only standing up a broker the config did ask for and could otherwise have is
+    // fatal, like the egress proxy's and the agent's.
+    let mut broker_guards: Vec<broker::Broker> = Vec::new();
+    let mut broker_binds: Vec<binds::ExtraBind> = Vec::new();
+    let mut broker_env: Vec<(String, String)> = Vec::new();
+    if !prep.cfg.brokers.is_empty() {
+        let mut plugin_warnings = Vec::new();
+        let registry =
+            crate::plugins::PluginRegistry::load(&prep.layout.plugins_dir(), &mut plugin_warnings);
+        for w in &plugin_warnings {
+            crate::diag::warn(w);
+        }
+        for binding in &prep.cfg.brokers {
+            let name = &binding.name;
+            let Some(plugin) = registry.broker(name) else {
+                // Told apart, because the remedy differs: an ambiguous name is fixed by removing a
+                // plugin, a missing one by installing it.
+                match registry.broker_conflict(name) {
+                    Some(claimants) => crate::diag::warn(&format!(
+                        "`[broker.{name}]` names a broker claimed by more than one installed \
+                         plugin ({}) — they are all disabled, so the cage gets no broker",
+                        crate::plugins::quoted_list(claimants)
+                    )),
+                    None => crate::diag::warn(&format!(
+                        "`[broker.{name}]` names no installed broker plugin — install one with \
+                         `sbx plugins install`, or drop the table. The cage gets no broker."
+                    )),
+                }
+                continue;
+            };
+            // The host resource has to be there *now*: a broker in front of nothing would accept
+            // the cage's connections and fail every frame, which reads as the resource misbehaving
+            // rather than as a configuration that does not hold.
+            if !binding.socket.exists() {
+                crate::diag::warn(&format!(
+                    "`[broker.{name}] socket` names {}, which does not exist — the cage gets no \
+                     broker",
+                    binding.socket.display()
+                ));
+                continue;
+            }
+            match broker::start(&prep.layout, binding, plugin, &prep.bwrap) {
+                Ok((guard, wiring)) => {
+                    crate::diag::note(&format!(
+                        "broker: `{name}` stands in front of {}{}",
+                        binding.socket.display(),
+                        match binding.allow.len() {
+                            0 => String::new(),
+                            n => format!(" ({n} allow entr{})", if n == 1 { "y" } else { "ies" }),
+                        }
+                    ));
+                    // Two brokers claiming one variable would silently last-wins, leaving a client
+                    // pointed at whichever was stood up second and a broker serving nobody. Named
+                    // instead, like the secrets layer names a duplicated destination header.
+                    for (key, _) in &wiring.env {
+                        if broker_env.iter().any(|(k, _)| k == key) {
+                            crate::diag::warn(&format!(
+                                "broker `{name}` and an earlier broker both set ${key} in the cage \
+                                 — the later one wins, so one of them is unreachable"
+                            ));
+                        }
+                    }
+                    broker_binds.extend(wiring.binds);
+                    broker_env.extend(wiring.env);
+                    broker_guards.push(guard);
+                }
+                Err(e) => {
+                    eprintln!("sbx: cannot start the `{name}` broker: {e}");
+                    return Err(ExitCode::FAILURE);
+                }
+            }
+        }
+    }
+
     // GUI hole: under `gui = "wayland"`, bind the host's Wayland compositor socket read-only so a
     // graphical app can map a window. The cage runs same-uid, so a read-only bind suffices to
     // connect(). Only the socket *file* is bound, never `$XDG_RUNTIME_DIR` itself — that directory
@@ -4595,6 +4688,7 @@ fn build(
     // project path, so they neither shadow nor are shadowed by a structural mount.
     let mut extra_binds = egress_binds;
     extra_binds.extend(sshagent_binds);
+    extra_binds.extend(broker_binds);
     extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
     extra_binds.extend(inline_flake_binds);
@@ -4730,6 +4824,7 @@ fn build(
         (EnvLayer::Mise, mise_env(prep)?),
         (EnvLayer::Egress, egress_env),
         (EnvLayer::SshAgent, sshagent_env),
+        (EnvLayer::Broker, broker_env),
         (EnvLayer::Task, task_env),
         (EnvLayer::Config, prep.cfg.env.clone()),
     ]);
@@ -4891,6 +4986,7 @@ fn build(
 
     let guard = if egress_guard.is_some()
         || sshagent_guard.is_some()
+        || !broker_guards.is_empty()
         || forward_guard.is_some()
         || portal_host.is_some()
         || proc_enforce_guard.is_some()
@@ -4900,6 +4996,7 @@ fn build(
             notify_sink: Some(Arc::clone(&notify_wiring)),
             egress: egress_guard,
             ssh_agent: sshagent_guard,
+            brokers: broker_guards,
             forward: forward_guard,
             notify: notify_relay,
             theme: theme_relay,
@@ -5677,6 +5774,10 @@ enum EnvLayer {
     Egress,
     /// The ssh-agent broker's socket.
     SshAgent,
+    /// A broker plugin's socket, under whichever names its manifest declared. Beside the
+    /// first-party broker above, and after it: the two never name the same variable, since a
+    /// manifest cannot claim a reserved key and `SSH_AUTH_SOCK` is sbx's to set.
+    Broker,
     /// The task plane's discovery handles.
     Task,
     /// The `.sbx.toml` `[env]`: the sbx-native config has the final say. An untrusted one has

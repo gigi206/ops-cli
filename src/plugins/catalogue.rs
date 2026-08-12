@@ -31,7 +31,13 @@ use std::path::{Component, Path};
 /// trusted blindly here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogueEntry {
-    pub scheme: String,
+    /// What kind of plugin this is. A store lists both kinds, because the decision a user makes
+    /// about a broker is not made here: installing one grants nothing until a global
+    /// `[broker.<name>] socket` binds it to a host resource.
+    pub kind: crate::plugins::PluginKind,
+    /// The `scheme://` this plugin claims, for a resolver. `None` for a broker, which claims no
+    /// ref namespace and is reached by its name.
+    pub scheme: Option<String>,
     pub version: String,
     pub description: String,
     pub path: String,
@@ -60,7 +66,11 @@ struct RawCatalogue {
 
 #[derive(Debug, Deserialize)]
 struct RawEntry {
-    scheme: String,
+    /// Absent means `resolver`: the kind every catalogue listed before there was a second one,
+    /// and the one a store author need not spell to publish what they always published.
+    #[serde(rename = "type")]
+    plugin_type: Option<String>,
+    scheme: Option<String>,
     version: String,
     #[serde(default)]
     description: String,
@@ -83,7 +93,26 @@ impl Catalogue {
         for (name, entry) in raw.plugin {
             let here = |e: String| format!("catalogue entry `{name}`: {e}");
             crate::plugins::validate_install_name(&name).map_err(here)?;
-            crate::plugins::validate_scheme(&entry.scheme).map_err(here)?;
+            let kind = match entry.plugin_type.as_deref() {
+                Some(raw) => crate::plugins::PluginKind::parse(raw).map_err(here)?,
+                None => crate::plugins::PluginKind::Resolver,
+            };
+            // The same rule the manifest is held to, so a listing cannot advertise something no
+            // install could reconcile: a resolver is reached through a scheme, a broker by name.
+            let scheme = match (kind.claims_a_scheme(), entry.scheme) {
+                (true, Some(scheme)) => {
+                    crate::plugins::validate_scheme(&scheme).map_err(here)?;
+                    Some(scheme)
+                }
+                (true, None) => return Err(here("missing `scheme`".to_string())),
+                (false, None) => None,
+                (false, Some(_)) => {
+                    return Err(here(format!(
+                        "a `{}` plugin declares no `scheme`",
+                        kind.token()
+                    )));
+                }
+            };
             validate_repo_path(&entry.path).map_err(here)?;
             validate_sha256(&entry.sha256).map_err(here)?;
             // The free-text fields are displayed verbatim (`sbx plugins store list/info`), and a
@@ -95,7 +124,8 @@ impl Catalogue {
             plugins.insert(
                 name,
                 CatalogueEntry {
-                    scheme: entry.scheme,
+                    kind,
+                    scheme,
                     version: entry.version,
                     description: entry.description,
                     path: entry.path,
@@ -319,7 +349,13 @@ pub(crate) fn serialize_catalogue(cat: &Catalogue) -> Result<String, String> {
     for (name, entry) in &cat.plugins {
         out.push('\n');
         out.push_str(&format!("[plugin.{}]\n", toml_quoted(name)?));
-        out.push_str(&format!("scheme = {}\n", toml_quoted(&entry.scheme)?));
+        // The type is always written, even for a resolver: a signed listing should say what it
+        // lists rather than leave a reader to infer it from which fields are present. The scheme
+        // is written only where there is one, which is what keeps the bytes deterministic.
+        out.push_str(&format!("type = {}\n", toml_quoted(entry.kind.token())?));
+        if let Some(scheme) = &entry.scheme {
+            out.push_str(&format!("scheme = {}\n", toml_quoted(scheme)?));
+        }
         out.push_str(&format!("version = {}\n", toml_quoted(&entry.version)?));
         out.push_str(&format!(
             "description = {}\n",
@@ -517,7 +553,8 @@ mod tests {
         let root = crate::testutil::TmpDir::new();
         write(&root.path().join("plugin.toml"), b"hello", false);
         let entry = CatalogueEntry {
-            scheme: "pass".into(),
+            kind: crate::plugins::PluginKind::Resolver,
+            scheme: Some("pass".into()),
             version: "0.1.0".into(),
             description: String::new(),
             path: "plugins/pass".into(),
@@ -587,7 +624,7 @@ mod tests {
         assert_eq!(cat.rev, 0);
         assert_eq!(cat.plugins.len(), 2);
         let vault = &cat.plugins["vault"];
-        assert_eq!(vault.scheme, "vault");
+        assert_eq!(vault.scheme.as_deref(), Some("vault"));
         assert_eq!(vault.version, "0.2.0");
         assert_eq!(vault.description, "the HashiCorp Vault resolver");
         assert_eq!(vault.path, "plugins/vault");
@@ -632,7 +669,8 @@ mod tests {
         plugins.insert(
             "pass.v2".to_string(),
             CatalogueEntry {
-                scheme: "secret-store".into(),
+                kind: crate::plugins::PluginKind::Resolver,
+                scheme: Some("secret-store".into()),
                 version: "0.1.0".into(),
                 description: r#"a "quoted" \back\slash"#.into(),
                 path: "plugins/pass".into(),
@@ -642,7 +680,8 @@ mod tests {
         plugins.insert(
             "vault".to_string(),
             CatalogueEntry {
-                scheme: "vault".into(),
+                kind: crate::plugins::PluginKind::Resolver,
+                scheme: Some("vault".into()),
                 version: String::new(),
                 description: String::new(),
                 path: "plugins/vault".into(),
@@ -660,7 +699,8 @@ mod tests {
         plugins.insert(
             "pass".to_string(),
             CatalogueEntry {
-                scheme: "pass".into(),
+                kind: crate::plugins::PluginKind::Resolver,
+                scheme: Some("pass".into()),
                 version: "0.1.0".into(),
                 // A newline in the description would otherwise smuggle a second TOML line into the
                 // signed catalogue.
@@ -689,6 +729,94 @@ mod tests {
             "[plugin.pass]\nscheme = \"{scheme}\"\nversion = \"{version}\"\n\
              path = \"{path}\"\nsha256 = \"{sha256}\"\n"
         )
+    }
+
+    /// A listing carries the same rule the manifest does: a resolver is reached through a scheme,
+    /// a broker by its name. A catalogue that broke it would advertise something no install could
+    /// reconcile, which is a listing that lies.
+    #[test]
+    fn a_listing_is_held_to_the_rule_the_manifest_is_held_to() {
+        let broker = "[plugin.gpg-agent]\ntype = \"broker\"\nversion = \"0.1.0\"\n\
+                      path = \"plugins/gpg-agent\"\nsha256 = \"";
+        let ok = format!("{broker}{}\"\n", "a".repeat(64));
+        let cat = Catalogue::parse(ok.as_bytes()).expect("a broker needs no scheme");
+        let entry = &cat.plugins["gpg-agent"];
+        assert_eq!(entry.kind, crate::plugins::PluginKind::Broker);
+        assert_eq!(entry.scheme, None);
+
+        let schemed = format!(
+            "[plugin.gpg-agent]\ntype = \"broker\"\nscheme = \"gpg\"\nversion = \"0\"\n\
+             path = \"p\"\nsha256 = \"{}\"\n",
+            "a".repeat(64)
+        );
+        let err = Catalogue::parse(schemed.as_bytes()).expect_err("a broker claims no scheme");
+        assert!(err.contains("no `scheme`"), "{err}");
+
+        let bare = format!(
+            "[plugin.pass]\ntype = \"resolver\"\nversion = \"0\"\npath = \"p\"\nsha256 = \"{}\"\n",
+            "a".repeat(64)
+        );
+        let err = Catalogue::parse(bare.as_bytes()).expect_err("a resolver needs one");
+        assert!(err.contains("missing `scheme`"), "{err}");
+    }
+
+    /// An entry with no `type` is the shape every catalogue had before there were two kinds, and
+    /// it still means what it meant then.
+    #[test]
+    fn an_entry_without_a_type_is_a_resolver() {
+        let cat = Catalogue::parse(one_entry("version", "1.0.0").as_bytes()).expect("parses");
+        assert_eq!(
+            cat.plugins["pass"].kind,
+            crate::plugins::PluginKind::Resolver
+        );
+    }
+
+    /// The signed bytes must say what they list rather than leave a reader to infer it, and they
+    /// must be reproducible: the same catalogue serialises to the same bytes, which is what a
+    /// signature is taken over.
+    #[test]
+    fn the_signed_bytes_name_each_kind_and_round_trip() {
+        let mut plugins = BTreeMap::new();
+        plugins.insert(
+            "gpg-agent".to_string(),
+            CatalogueEntry {
+                kind: crate::plugins::PluginKind::Broker,
+                scheme: None,
+                version: "0.1.0".into(),
+                description: String::new(),
+                path: "plugins/gpg-agent".into(),
+                sha256: "b".repeat(64),
+            },
+        );
+        plugins.insert(
+            "pass".to_string(),
+            CatalogueEntry {
+                kind: crate::plugins::PluginKind::Resolver,
+                scheme: Some("pass".into()),
+                version: "0.2.0".into(),
+                description: String::new(),
+                path: "plugins/pass".into(),
+                sha256: "a".repeat(64),
+            },
+        );
+        let cat = Catalogue {
+            rev: 9,
+            plugins: plugins.clone(),
+        };
+        let text = serialize_catalogue(&cat).expect("serialises");
+        assert!(text.contains("type = \"broker\""), "{text}");
+        assert!(text.contains("type = \"resolver\""), "{text}");
+        assert_eq!(
+            text.matches("scheme = ").count(),
+            1,
+            "only the kind that has one carries a scheme: {text}"
+        );
+        assert_eq!(Catalogue::parse(text.as_bytes()).expect("parses back"), cat);
+        assert_eq!(
+            serialize_catalogue(&cat).expect("again"),
+            text,
+            "the bytes a signature covers are reproducible"
+        );
     }
 
     #[test]

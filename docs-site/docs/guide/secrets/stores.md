@@ -7,8 +7,12 @@ changes; for the plugins themselves, and for installing one from a local directo
 See also: [Resolver plugins](plugins) · [`sbx plugins store`](../cli/plugins#stores) ·
 [Resolvers](resolvers) · [The trust gate](../concepts/trust).
 
-A **remote plugin store** is a git repository of resolver plugins that `sbx`
-fetches on your behalf. Because you do not inspect what is fetched, authenticity
+A **remote plugin store** is a git repository of plugins that `sbx` fetches on your
+behalf. One store serves **both kinds** ([resolvers](plugins) and
+[brokers](plugins#the-broker-type)), under one key and one catalogue: the store is not
+what fences a broker, since installing one grants nothing until a global
+[`[broker.<name>] socket`](../configuration/broker) binds it to a host resource. A second
+store would ask you to pin a second key where nothing is decided. Because you do not inspect what is fetched, authenticity
 cannot come from the transport: git moves bytes and checks their *integrity*,
 never their *origin*. It comes from a signature.
 
@@ -109,7 +113,7 @@ sbx plugins upgrade [name]        # every store-installed plugin, or one
 
 `upgrade` runs **every gate an install runs**: the checkout must be a real
 directory, its content must reproduce the signed `sha256`, and its manifest must
-agree with the catalogue's advertised name and scheme: then stages the new tree
+agree with the catalogue's advertised name, **kind** and scheme: then stages the new tree
 and swaps it in. **The installed plugin is kept until that succeeds**, so an
 upgrade that cannot complete leaves what you had. Doing it by hand with
 `sbx plugins rm` followed by a fresh install deletes first: if the install then

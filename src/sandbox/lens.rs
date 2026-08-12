@@ -32,6 +32,30 @@
 //! as a field separator. Each lens sanitises that field of control characters before it ever reaches
 //! the ring, which is what stops one event from writing a second one.
 
+/// The longest free-text detail an event carries. Long enough for a key comment or a command
+/// line, short enough that one event cannot fill a reader's screen.
+pub(crate) const DETAIL_MAX: usize = 200;
+
+/// Strip a detail of anything that could forge a second wire line or a terminal escape, and cap
+/// its length.
+///
+/// Every lens has one field of free text, and none of them can vouch for it: a key comment comes
+/// from the user's own agent, a path from the cage, a broker plugin's label from third-party code.
+/// The record of a credential channel is exactly the wrong place to trust that and be wrong, and
+/// an event line whose `detail` could contain a newline would let one entry write another. The
+/// same treatment serves a detail on its way to a *terminal*, which is why this lives here rather
+/// than inside any one lens.
+pub(crate) fn sanitize_detail(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if out.chars().count() > DETAIL_MAX {
+        out = out.chars().take(DETAIL_MAX - 1).collect::<String>() + "…";
+    }
+    out
+}
+
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

@@ -74,27 +74,63 @@ pub(crate) fn state_dir(plugin: &ResolverPlugin) -> Option<PathBuf> {
 /// Run `plugin` to resolve `reff`, returning its raw stdout on success (the caller classifies
 /// empty-as-absent). Fails closed: a non-zero exit, a runner that cannot spawn, or non-UTF-8
 /// output is a hard error naming the resolver — never the secret, and never the resolver's stdout.
-pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Result<String> {
+/// One plugin's cage, described independently of which *kind* of plugin asked for it.
+///
+/// A resolver and a broker differ in what they are run for, never in what a cage owes them: the
+/// same grant fields, the same host answers, the same vetting of the executable. Naming that
+/// overlap once is what keeps a broker from growing a second, drifting copy of this file.
+pub(super) struct CagePlan<'a> {
+    /// The plugin's installed directory, bound read-only at its real path.
+    pub(super) dir: &'a Path,
+    /// The executable to run, inside that directory.
+    pub(super) exec: &'a Path,
+    /// The least-privilege grant its manifest declared.
+    pub(super) grant: &'a crate::plugins::SandboxGrant,
+    /// What this host answers to what the manifest asked for.
+    pub(super) host: &'a crate::plugins::HostConfig,
+    /// How the plugin is named in a diagnostic. The scheme for a resolver, the name for a broker:
+    /// each is what its own user would search for.
+    pub(super) called: &'a str,
+    /// The manifest `name`, which is the key a `[plugin.<name>]` table answers under. Distinct
+    /// from `called` because a resolver is spoken of by the scheme it claims, while the table that
+    /// configures it is keyed by its name, and a remedy naming the wrong one does not work.
+    pub(super) configured_as: &'a str,
+    /// What follows the executable in its argument list.
+    pub(super) args: Vec<OsString>,
+}
+
+/// The private state directory for a plugin installed at `dir`, by the rule [`state_dir`] applies.
+fn state_dir_of(dir: &Path) -> Option<PathBuf> {
+    let name = dir.file_name()?;
+    Some(dir.parent()?.parent()?.join("plugin-state").join(name))
+}
+
+/// Vet the executable, resolve everything the grant asks of this host, and build the argv that
+/// runs the plugin under it. Everything up to the point where a caller decides *how* to run it:
+/// a resolver waits for its output, a broker keeps talking to it.
+///
+/// The returned `File` is the descriptor the cage's environment is read from. It must stay open
+/// until bwrap has read it — which for a long-running child means for as long as the child lives.
+pub(super) fn compose_cage(
+    plan: &CagePlan<'_>,
+) -> io::Result<(Vec<OsString>, Option<std::fs::File>)> {
     // The executable is in the trusted computing base. The perimeter is the data directory's
     // owner-only permissions (a project cannot write there), but defend the thing we actually
     // exec directly: refuse it unless it is a regular file owned by us and not writable by group
     // or other. An attacker can only create files owned by *their* uid, so the owner check is the
     // load-bearing one against a planted executable. (`sbx plugins` surfaces the same verdict.)
-    plugin.check_exec().map_err(|why| {
+    crate::plugins::check_exec_at(plan.exec).map_err(|why| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing to run the resolver plugin {}: {why}",
-                plugin.exec.display()
-            ),
+            format!("refusing to run the plugin {}: {why}", plan.exec.display()),
         )
     })?;
 
     // The private state directory has to exist before bwrap binds it, and owner-only from the
     // start: it will hold a refresh token, and a directory created world-readable and tightened
     // afterwards is readable in between.
-    if plugin.sandbox.state
-        && let Some(dir) = state_dir(plugin)
+    if plan.grant.state
+        && let Some(dir) = state_dir_of(plan.dir)
     {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
@@ -103,19 +139,20 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
             .create(&dir)
             .map_err(|e| {
                 io::Error::other(format!(
-                    "could not create the state directory for the `{}` resolver plugin at {}: {e}",
-                    plugin.scheme,
+                    "could not create the state directory for the `{}` plugin at {}: {e}",
+                    plan.called,
                     dir.display()
                 ))
             })?;
     }
 
-    let mut allow_env = resolve_allow_env(&plugin.sandbox.allow_env);
+    let plugin = plan;
+    let mut allow_env = resolve_allow_env(&plugin.grant.allow_env);
     // The path-valued variables resolve the same way, and their values are additionally bound.
     // They join `allow_env` because naming one in `allow_env_paths` *is* the pass-through: binding
     // the path without handing the tool the variable pointing at it would leave the tool reading
     // its default, with the grant paid for nothing.
-    let mut env_paths = resolve_env_paths(&plugin.sandbox.allow_env_paths);
+    let mut env_paths = resolve_env_paths(&plugin.grant.allow_env_paths);
     allow_env.extend(env_paths.iter().cloned());
     // What the host's `[plugin.<name>]` table answers, applied last so it WINS over the same name
     // in sbx's environment: a config that names a value is more deliberate than whatever the
@@ -127,15 +164,15 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
         // A path-valued one is bound as well as passed, exactly as when it comes from the
         // environment — otherwise configuring a relocated store would aim the tool at a path the
         // cage does not have, the failure `allow_env_paths` exists to remove.
-        if plugin.sandbox.allow_env_paths.iter().any(|k| k == key) {
+        if plugin.grant.allow_env_paths.iter().any(|k| k == key) {
             env_paths.retain(|(k, _)| k != key);
             if Path::new(value).is_absolute() {
                 env_paths.push((key.clone(), value.clone()));
             } else {
                 crate::diag::warn(&format!(
-                    "not binding ${key} for the `{}` resolver plugin — the value `{value}` \
-                     configured for it is not an absolute path",
-                    plugin.scheme
+                    "not binding ${key} for the `{}` plugin — the value `{value}` configured for \
+                     it is not an absolute path",
+                    plugin.called
                 ));
             }
         }
@@ -147,21 +184,36 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
     for program in &programs {
         binds.push((program.name.clone(), program.bind_src()?));
     }
-    let spec = cage_spec(plugin, reff, &allow_env, &env_paths, &binds, &closure).map_err(|e| {
+    let spec = cage_spec(plugin, &allow_env, &env_paths, &binds, &closure).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "cannot build the resolver sandbox for `{}`: {e:?}",
-                plugin.scheme
+                "cannot build the plugin sandbox for `{}`: {e:?}",
+                plugin.called
             ),
         )
     })?;
 
-    // `_env` holds the descriptor the cage's environment is read from open until bwrap has run —
-    // and the reason it is a descriptor is this cage in particular: a plugin's `allow_env` is how a
-    // resolver is handed its *own* credential (a vault token, an age key), and an argument list is
-    // world-readable.
-    let (argv, _env) = super::argv::compose(&spec)?;
+    // The returned descriptor is where the cage's environment is read from, and the reason it is a
+    // descriptor is this cage in particular: a plugin's `allow_env` is how it is handed its *own*
+    // credential (a vault token, an age key), and an argument list is world-readable.
+    super::argv::compose(&spec)
+}
+
+/// Run `plugin` to resolve `reff`, returning its raw stdout on success (the caller classifies
+/// empty-as-absent).
+pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Result<String> {
+    let plan = CagePlan {
+        dir: &plugin.dir,
+        exec: &plugin.exec,
+        grant: &plugin.sandbox,
+        host: &plugin.host,
+        called: &plugin.scheme,
+        configured_as: &plugin.name,
+        args: vec![OsString::from(reff)],
+    };
+    // `_env` holds the environment descriptor open until bwrap has run.
+    let (argv, _env) = compose_cage(&plan)?;
     let out = Command::new(bwrap)
         .args(argv)
         // No stdin: a resolver must not read or block on sbx's stdin.
@@ -317,9 +369,9 @@ fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
 /// Where `PATH` has no answer, a program the host configured under `[plugin.<name>] programs` and
 /// `sbx plugins install` already built is used instead. Only the out-link is read here — a launch
 /// never builds — so the fallback costs one `readlink` and never stalls a secret on a nix build.
-fn resolve_programs(plugin: &ResolverPlugin) -> io::Result<Vec<Program>> {
-    let mut out = Vec::with_capacity(plugin.sandbox.programs.len());
-    for name in &plugin.sandbox.programs {
+fn resolve_programs(plugin: &CagePlan<'_>) -> io::Result<Vec<Program>> {
+    let mut out = Vec::with_capacity(plugin.grant.programs.len());
+    for name in &plugin.grant.programs {
         if let Some(path) = locate_program(name) {
             out.push(Program {
                 name: name.clone(),
@@ -328,9 +380,14 @@ fn resolve_programs(plugin: &ResolverPlugin) -> io::Result<Vec<Program>> {
             });
             continue;
         }
-        if let Some(path) = crate::store::Layout::from_env()
-            .and_then(|l| crate::plugins::programs::provisioned(&l, plugin.dir_name(), name))
-        {
+        if let Some(path) = crate::store::Layout::from_env().and_then(|l| {
+            let dir_name = plugin
+                .dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            crate::plugins::programs::provisioned(&l, dir_name, name)
+        }) {
             out.push(Program {
                 name: name.clone(),
                 path,
@@ -345,11 +402,11 @@ fn resolve_programs(plugin: &ResolverPlugin) -> io::Result<Vec<Program>> {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "the `{}` resolver plugin needs the program `{name}`, which is not on sbx's PATH \
-                 and has not been provisioned — install it (or add its directory to PATH), or name \
-                 it in `[plugin.{}] programs` as `{name} = \"nix:<attribute>\"` and re-run \
+                "the `{}` plugin needs the program `{name}`, which is not on sbx's PATH and has \
+                 not been provisioned — install it (or add its directory to PATH), or name it in \
+                 `[plugin.{}] programs` as `{name} = \"nix:<attribute>\"` and re-run \
                  `sbx plugins install`",
-                plugin.scheme, plugin.name
+                plugin.called, plugin.configured_as
             ),
         ));
     }
@@ -590,8 +647,7 @@ pub(crate) fn locate_program(name: &str) -> Option<PathBuf> {
 /// values and the already-located `programs` in, a [`SandboxSpec`] out, so the bind/env/network
 /// shape is testable without launching bubblewrap.
 fn cage_spec(
-    plugin: &ResolverPlugin,
-    reff: &str,
+    plugin: &CagePlan<'_>,
     allow_env: &[(String, String)],
     env_paths: &[(String, String)],
     programs: &[(String, PathBuf)],
@@ -621,8 +677,8 @@ fn cage_spec(
         // The plugin itself, read-only at its real path so `exec` resolves and any sibling helper
         // it ships is reachable; a same-uid write cannot tamper with it through a read-only bind.
         Mount::RoBind {
-            src: plugin.dir.clone(),
-            dest: plugin.dir.clone(),
+            src: plugin.dir.to_path_buf(),
+            dest: plugin.dir.to_path_buf(),
         },
     ];
 
@@ -646,7 +702,7 @@ fn cage_spec(
     // literal here, not an injection. `try` keeps a manifest portable: a path that names a runtime
     // artifact (e.g. the gpg-agent socket directory under `$XDG_RUNTIME_DIR`) is skipped where it is
     // absent, and the resolver fails closed inside if it genuinely needs what is missing.
-    for p in &plugin.sandbox.allow_paths {
+    for p in &plugin.grant.allow_paths {
         mounts.push(Mount::RoBindTry {
             src: p.clone(),
             dest: p.clone(),
@@ -695,8 +751,8 @@ fn cage_spec(
     // The private state directory, writable, for a plugin that declared it. Bound rather than
     // created inside the cage so it outlives the run: what a rotating credential's resolver writes
     // here is the only copy of the token that buys the next one.
-    if plugin.sandbox.state
-        && let Some(src) = state_dir(plugin)
+    if plugin.grant.state
+        && let Some(src) = state_dir_of(plugin.dir)
     {
         mounts.push(Mount::Bind {
             src,
@@ -704,7 +760,7 @@ fn cage_spec(
         });
     }
 
-    let net = if plugin.sandbox.network {
+    let net = if plugin.grant.network {
         for f in [
             "/etc/resolv.conf",
             "/etc/nsswitch.conf",
@@ -723,7 +779,7 @@ fn cage_spec(
     // unbind because bwrap has no unbind — an empty filesystem is how a path is made to hold
     // nothing, and it is what makes a wide grant survivable (`~/.gnupg` whole, minus its private
     // keys).
-    for p in &plugin.sandbox.mask_paths {
+    for p in &plugin.grant.mask_paths {
         mounts.push(Mount::Tmpfs { dest: p.clone() });
     }
 
@@ -733,7 +789,7 @@ fn cage_spec(
     env.push(("HOME".to_string(), CAGE_HOME.to_string()));
     // Where the private state landed, for a plugin that asked for it. Named rather than assumed, so
     // a plugin never hardcodes the path and sbx stays free to move it.
-    if plugin.sandbox.state {
+    if plugin.grant.state {
         env.push(("SBX_PLUGIN_STATE".to_string(), CAGE_STATE.to_string()));
     }
     // The programs directory leads the cage's `PATH` when the manifest declares any, so a
@@ -751,7 +807,9 @@ fn cage_spec(
         mounts,
         env,
         net,
-        vec![plugin.exec.as_os_str().to_os_string(), OsString::from(reff)],
+        std::iter::once(plugin.exec.as_os_str().to_os_string())
+            .chain(plugin.args.iter().cloned())
+            .collect(),
     )
 }
 
@@ -761,6 +819,20 @@ mod tests {
     use crate::plugins::{ResolverPlugin, SandboxGrant};
     use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
+
+    /// The plan `cage_spec` takes, built from a resolver the way `run` builds it — so a test
+    /// exercises the very composition a launch does.
+    fn plan_for<'a>(p: &'a ResolverPlugin, reff: &str) -> CagePlan<'a> {
+        CagePlan {
+            dir: &p.dir,
+            exec: &p.exec,
+            grant: &p.sandbox,
+            host: &p.host,
+            called: &p.scheme,
+            configured_as: &p.name,
+            args: vec![OsString::from(reff)],
+        }
+    }
 
     fn plugin_in(dir: &Path, grant: SandboxGrant) -> ResolverPlugin {
         ResolverPlugin {
@@ -789,8 +861,7 @@ mod tests {
         };
         let p = plugin_in(dir.path(), grant);
         let spec = cage_spec(
-            &p,
-            "test://secret",
+            &plan_for(&p, "test://secret"),
             &[("GNUPGHOME".into(), "/home/u/.gnupg".into())],
             &[],
             &[],
@@ -843,15 +914,9 @@ mod tests {
             mask_paths: vec![],
             network: true,
         };
-        let spec = cage_spec(
-            &plugin_in(dir.path(), grant),
-            "vault://x",
-            &[],
-            &[],
-            &[],
-            &[],
-        )
-        .expect("valid spec");
+        let staged = plugin_in(dir.path(), grant);
+        let spec =
+            cage_spec(&plan_for(&staged, "vault://x"), &[], &[], &[], &[]).expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
@@ -874,8 +939,7 @@ mod tests {
         // must see it under its own name, not under that one.
         let resolved = PathBuf::from("/nix/store/abc-vault-1.2.3/bin/vault");
         let spec = cage_spec(
-            &p,
-            "test://x",
+            &plan_for(&p, "test://x"),
             &[],
             &[],
             &[("vault".to_string(), resolved.clone())],
@@ -907,15 +971,9 @@ mod tests {
     #[test]
     fn cage_spec_leaves_the_path_alone_when_no_program_is_declared() {
         let dir = TmpDir::new();
-        let spec = cage_spec(
-            &plugin_in(dir.path(), SandboxGrant::default()),
-            "test://x",
-            &[],
-            &[],
-            &[],
-            &[],
-        )
-        .expect("valid spec");
+        let staged = plugin_in(dir.path(), SandboxGrant::default());
+        let spec =
+            cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &[]).expect("valid spec");
         let env = super::super::argv::env_args(&spec);
         assert!(contains_setenv(&env, "PATH", "/usr/bin:/bin"), "{env:?}");
         assert!(
@@ -949,15 +1007,9 @@ mod tests {
             mask_paths: vec![PathBuf::from("/home/u/.gnupg/private-keys-v1.d")],
             ..SandboxGrant::default()
         };
-        let spec = cage_spec(
-            &plugin_in(dir.path(), grant),
-            "test://x",
-            &[],
-            &[],
-            &[],
-            &[],
-        )
-        .expect("valid spec");
+        let staged = plugin_in(dir.path(), grant);
+        let spec =
+            cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &[]).expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         let bind = argv
             .iter()
@@ -991,15 +1043,9 @@ mod tests {
                 PathBuf::from("/nix/store/bbb-pass-1.7.4"),
             ),
         ];
-        let spec = cage_spec(
-            &plugin_in(dir.path(), SandboxGrant::default()),
-            "test://x",
-            &[],
-            &[],
-            &[],
-            &closure,
-        )
-        .expect("valid spec");
+        let staged = plugin_in(dir.path(), SandboxGrant::default());
+        let spec =
+            cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &closure).expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         for (_, dest) in &closure {
             let p = dest.to_string_lossy().to_string();
@@ -1020,9 +1066,9 @@ mod tests {
         // start, with nothing in the failure pointing at why.
         let physical = PathBuf::from("/data/sbx/store/nix/store/aaa-bash-5.3");
         let logical = PathBuf::from("/nix/store/aaa-bash-5.3");
+        let staged = plugin_in(dir.path(), SandboxGrant::default());
         let spec = cage_spec(
-            &plugin_in(dir.path(), SandboxGrant::default()),
-            "test://x",
+            &plan_for(&staged, "test://x"),
             &[],
             &[],
             &[],
@@ -1086,9 +1132,9 @@ mod tests {
     #[test]
     fn cage_spec_binds_an_env_path_at_its_own_location() {
         let dir = TmpDir::new();
+        let staged = plugin_in(dir.path(), SandboxGrant::default());
         let spec = cage_spec(
-            &plugin_in(dir.path(), SandboxGrant::default()),
-            "test://x",
+            &plan_for(&staged, "test://x"),
             &[("PASSWORD_STORE_DIR".into(), "/data/secrets".into())],
             &[("PASSWORD_STORE_DIR".into(), "/data/secrets".into())],
             &[],
@@ -1190,7 +1236,7 @@ mod tests {
                     ..SandboxGrant::default()
                 },
             );
-            let spec = cage_spec(&p, "test://x", &[], &[], &[], &[]).unwrap();
+            let spec = cage_spec(&plan_for(&p, "test://x"), &[], &[], &[], &[]).unwrap();
             let env = super::super::argv::env_args(&spec);
             let argv: Vec<String> = super::super::argv::to_argv(&spec)
                 .iter()

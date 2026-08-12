@@ -111,7 +111,9 @@ const PROFILES_DIR: &str = "apps";
 /// reserved for the same reason. In-cage a redirected proxy or a swapped CA only
 /// fails closed (empty netns, sbx-minted certs), but the same Mode-A protection as
 /// `NIX_CONFIG` applies, and the keys sbx *sets* are exactly the keys it protects.
-fn is_reserved_env_key(key: &str) -> bool {
+/// Also the barrier a broker plugin's `cage_env` passes, so the list of names that load code in
+/// the cage is written once and both callers refuse exactly the same set.
+pub(crate) fn is_reserved_env_key(key: &str) -> bool {
     key.starts_with("LD_")
         || is_proxy_env_key(key)
         // The CA-bundle keys are matched case-insensitively: env names are case-sensitive, but a
@@ -163,6 +165,25 @@ fn is_proxy_env_key(key: &str) -> bool {
         key.to_ascii_lowercase().as_str(),
         "http_proxy" | "https_proxy" | "all_proxy" | "no_proxy" | "ws_proxy" | "wss_proxy"
     )
+}
+
+/// One broker plugin's binding: the host resource it stands in front of, and the policy it
+/// brokers under.
+///
+/// The two halves come from different layers on purpose. `socket` is a fact about the machine and
+/// is read from the global config alone; `allow` is a fact about the work and a trusted project
+/// may set it. A project that could name the socket would be choosing which host resource a plugin
+/// is put in front of, which is the one decision that must sit beside the plugin's installation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrokerBinding {
+    /// The installed broker plugin's name, which is the table's key.
+    pub(crate) name: String,
+    /// The host resource's socket, expanded. sbx connects to it and holds the connection.
+    pub(crate) socket: PathBuf,
+    /// The policy, passed to the plugin verbatim at the start of every connection.
+    pub(crate) allow: Vec<String>,
+    /// Which layer supplied the policy, for `sbx config`.
+    pub(crate) origin: Provenance,
 }
 
 /// The resolved configuration the launcher applies: the layered environment and
@@ -310,6 +331,9 @@ pub(crate) struct Resolved {
     /// (`Default` when neither config did), like `devices_origin`. A display affordance for
     /// `sbx config`; the launcher ignores it.
     pub(crate) ssh_agent_origin: Provenance,
+    /// The broker plugins to stand up for this cage, from `[broker.<name>]`, ordered by name.
+    /// Empty is the common case and means no broker plugin runs.
+    pub(crate) brokers: Vec<BrokerBinding>,
     /// Whether every signature must be confirmed on the host desktop before the broker forwards it
     /// (`[ssh_agent] confirm`). ORs across layers: a layer may ask for the prompt, none may remove
     /// it. With no askpass helper on the host the launch gives the cage no agent at all, rather than
@@ -700,6 +724,10 @@ impl Resolved {
             // plaintext path. That is declared in a config someone reads, not assembled on a
             // command line for one launch.
             plugin: _,
+            // `[broker.*]` joins them, for the same reason and one more: its `socket` names a host
+            // resource sbx will connect to and hold, which is a standing fact about the machine —
+            // not something a single launch gets to assert on a command line.
+            broker: _,
             flakes: _,
             tarball: _,
             deb: _,
@@ -1182,7 +1210,12 @@ fn apply_to_sources(
                 ));
             }
         }
-        let programs = validated_programs(plugin, &raw.programs, warnings);
+        let programs = validated_programs(
+            &plugin.name,
+            &plugin.sandbox.programs,
+            &raw.programs,
+            warnings,
+        );
         plugin.host = crate::plugins::HostConfig { env, programs };
     }
 }
@@ -1200,30 +1233,29 @@ fn apply_to_sources(
 ///   cage and the prebuilt backends are pinned per project. Refusing the others by name is what
 ///   keeps this from reading as a general backend selector that happens to support one backend.
 pub(crate) fn validated_programs(
-    plugin: &crate::plugins::ResolverPlugin,
+    plugin_name: &str,
+    manifest_programs: &[String],
     raw: &BTreeMap<String, String>,
     warnings: &mut Vec<String>,
 ) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(raw.len());
     for (program, locator) in raw {
-        if !plugin.sandbox.programs.iter().any(|p| p == program) {
-            let declared = if plugin.sandbox.programs.is_empty() {
+        if !manifest_programs.iter().any(|p| p == program) {
+            let declared = if manifest_programs.is_empty() {
                 "none".to_string()
             } else {
-                plugin.sandbox.programs.join(", ")
+                manifest_programs.join(", ")
             };
             warnings.push(format!(
-                "`[plugin.{}] programs`: ignoring `{program}` — the plugin's manifest does not run \
-                 it (it declares: {declared})",
-                plugin.name
+                "`[plugin.{plugin_name}] programs`: ignoring `{program}` — the plugin's manifest \
+                 does not run it (it declares: {declared})"
             ));
             continue;
         }
         let Some(attr) = locator.strip_prefix("nix:").filter(|a| !a.is_empty()) else {
             warnings.push(format!(
-                "`[plugin.{}] programs`: ignoring `{program} = \"{locator}\"` — only a \
-                 `nix:<attribute>` value can be provisioned for a plugin",
-                plugin.name
+                "`[plugin.{plugin_name}] programs`: ignoring `{program} = \"{locator}\"` — only a \
+                 `nix:<attribute>` value can be provisioned for a plugin"
             ));
             continue;
         };
@@ -1332,6 +1364,13 @@ fn resolve(
     // Per-plugin settings, global layer: trusted by location, so taken in full.
     let mut plugin_cfg: BTreeMap<String, crate::config::schema::RawPluginConfig> =
         std::mem::take(&mut global.plugin);
+    // Broker bindings, global layer: the only layer that may name a host resource.
+    let mut broker_cfg: BTreeMap<String, crate::config::schema::RawBrokerConfig> =
+        std::mem::take(&mut global.broker);
+    let mut broker_origin: BTreeMap<String, Provenance> = broker_cfg
+        .keys()
+        .map(|name| (name.clone(), Provenance::Global))
+        .collect();
     apply_tools(
         &mut packages,
         &mut warnings,
@@ -1606,6 +1645,43 @@ fn resolve(
         // over the global ones by plugin name; an untrusted one is dropped, named rather than
         // silently ignored so the difference between "not configured" and "not trusted" is
         // visible.
+        // `[broker.*]` is a security field: it decides which host resource the cage may reach
+        // through a plugin. A trusted project may set the **policy** for a broker the global
+        // config already bound; it may not name a socket, and it may not introduce a broker the
+        // global config never bound — either would let a project choose what is exposed.
+        if !proj.broker.is_empty() {
+            if trusted {
+                for (name, table) in proj.broker.clone() {
+                    if table.socket.is_some() {
+                        warnings.push(format!(
+                            "{PROJECT_CONFIG}: ignoring `[broker.{name}] socket` — which host \
+                             resource a broker stands in front of is declared in the global \
+                             config, beside the plugin's installation"
+                        ));
+                    }
+                    match broker_cfg.get_mut(&name) {
+                        Some(bound) => {
+                            bound.allow = table.allow;
+                            broker_origin.insert(name, Provenance::Project);
+                        }
+                        None => warnings.push(format!(
+                            "{PROJECT_CONFIG}: ignoring `[broker.{name}]` — no `[broker.{name}] \
+                             socket` in the global config, so nothing binds that broker to a host \
+                             resource"
+                        )),
+                    }
+                }
+            } else {
+                let mut names: Vec<&str> = proj.broker.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                warnings.push(format!(
+                    "{PROJECT_CONFIG}: ignoring `[broker.*]` ({}) — it decides what a cage may \
+                     reach through a broker plugin, so it is honored only from a trusted project \
+                     (`sbx trust`)",
+                    names.join(", ")
+                ));
+            }
+        }
         if !proj.plugin.is_empty() {
             if trusted {
                 plugin_cfg.extend(proj.plugin.clone());
@@ -1988,6 +2064,7 @@ fn resolve(
         ssh_agent,
         ssh_agent_origin,
         ssh_agent_confirm,
+        brokers: resolve_brokers(broker_cfg, &broker_origin, &mut warnings),
         secrets,
         declared_secrets,
         tasks,
@@ -3322,6 +3399,63 @@ fn apply_binds(
             warnings.push(format!("{source}: ignoring non-absolute bind `{raw_path}`"));
         }
     }
+}
+
+/// Turn the layered `[broker.<name>]` tables into the bindings a launch acts on.
+///
+/// Fail-closed and named at every step: a table that binds no socket, one whose socket does not
+/// expand or is not absolute, and one carrying an unknown key are each dropped with the reason.
+/// Dropping is the safe direction here — a broker that does not start is a cage without that host
+/// resource, while a broker started against the wrong path is one pointed somewhere nobody chose.
+fn resolve_brokers(
+    tables: BTreeMap<String, crate::config::schema::RawBrokerConfig>,
+    origins: &BTreeMap<String, Provenance>,
+    warnings: &mut Vec<String>,
+) -> Vec<BrokerBinding> {
+    // Read once, like the bind expander's: a portable config should not have to spell an absolute
+    // runtime directory.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let mut out = Vec::new();
+    for (name, table) in tables {
+        for key in table.rest.keys() {
+            warnings.push(format!(
+                "{GLOBAL_CONFIG}: ignoring unknown key `{key}` in `[broker.{name}]`"
+            ));
+        }
+        let Some(raw) = table.socket else {
+            warnings.push(format!(
+                "`[broker.{name}]` names no `socket`, so nothing says which host resource it \
+                 brokers — the broker is not started"
+            ));
+            continue;
+        };
+        let socket = match expand_bind_path(&raw, home.as_deref(), runtime.as_deref()) {
+            Ok(p) if p.is_absolute() => p,
+            Ok(p) => {
+                warnings.push(format!(
+                    "`[broker.{name}] socket` is `{}`, which is not an absolute path — the broker \
+                     is not started",
+                    p.display()
+                ));
+                continue;
+            }
+            Err(why) => {
+                warnings.push(format!(
+                    "`[broker.{name}] socket` cannot be resolved ({why}) — the broker is not \
+                     started"
+                ));
+                continue;
+            }
+        };
+        out.push(BrokerBinding {
+            origin: origins.get(&name).copied().unwrap_or(Provenance::Global),
+            name,
+            socket,
+            allow: table.allow,
+        });
+    }
+    out
 }
 
 /// Expand a leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` in a `binds` source to an absolute host
