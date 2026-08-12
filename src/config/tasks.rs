@@ -780,7 +780,7 @@ fn secret_sources(
             if one.contains("://") {
                 Ok(vec![parse_secret_ref(one, plugins)?])
             } else {
-                expand_key(one, defaults)
+                expand_key(one, defaults, plugins)
             }
         }
         (None, Some(SecretFrom::One(one))) => Ok(vec![parse_secret_ref(one, plugins)?]),

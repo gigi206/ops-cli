@@ -192,7 +192,7 @@ fn resolve_host_sources(
                  or `from = \"env://VAR\"`)"
                 .to_string(),
         ),
-        (Some(key), None) => expand_key(key, defaults),
+        (Some(key), None) => expand_key(key, defaults, plugins),
         (None, Some(from)) => {
             let refs: &[String] = match from {
                 SecretFrom::One(one) => std::slice::from_ref(one),
@@ -229,7 +229,13 @@ pub(super) struct SecretDefaults {
     header: Option<String>,
     /// The default value type for an entry that omits `type`.
     value_type: Option<String>,
+    /// One locator template per plugin scheme, `{key}` standing for the terse key. A scheme with
+    /// a table but no template holds the identity, so the entry says the same thing either way.
+    resolver_locators: BTreeMap<String, String>,
 }
+
+/// What a scheme with no declared template expands to: the key, unchanged.
+const IDENTITY_LOCATOR: &str = "{key}";
 
 impl SecretDefaults {
     /// The defaults declared in one `[secret.defaults]` table.
@@ -241,6 +247,7 @@ impl SecretDefaults {
             file_dir: raw.file.as_ref().map(|f| f.dir.clone()),
             header: raw.header.clone(),
             value_type: raw.value_type.clone(),
+            resolver_locators: resolver_locators(raw),
         }
     }
 
@@ -270,8 +277,71 @@ impl SecretDefaults {
                 .or_else(|| self.file_dir.clone()),
             header: raw.header.clone().or_else(|| self.header.clone()),
             value_type: raw.value_type.clone().or_else(|| self.value_type.clone()),
+            // Per scheme, like every other binding: the project's table for a scheme replaces the
+            // global one for that scheme alone, and a scheme it never names keeps what the global
+            // config bound. Replacing the whole map would make declaring one plugin's template
+            // silently unbind every other.
+            resolver_locators: {
+                let mut merged = self.resolver_locators.clone();
+                merged.extend(resolver_locators(raw));
+                merged
+            },
         }
     }
+
+    /// The locator template bound to `scheme`, or the identity for a scheme that declared none.
+    fn resolver_locator(&self, scheme: &str) -> &str {
+        self.resolver_locators
+            .get(scheme)
+            .map_or(IDENTITY_LOCATOR, String::as_str)
+    }
+}
+
+/// Warn about a `[secret.defaults.resolver.<scheme>]` table that binds nothing, per layer, so a
+/// misspelled scheme is reported where it was written rather than sitting inert.
+///
+/// A binding is not itself a source: nothing resolves until some entry names the scheme in `order`
+/// or in a `key@scheme` pin, and that path already fails closed on an unknown name. What this
+/// catches is the table nobody ever reaches — the same gap `[plugin.<name>]` reports for a name no
+/// secret uses, and reported the same way.
+pub(super) fn warn_resolver_bindings(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: &RawSecretDefaults,
+    plugins: &PluginRegistry,
+) {
+    for scheme in raw.resolver.keys() {
+        // A built-in has a binding table of its own, with a shape this one cannot express. Two
+        // mechanisms for one expansion is the ambiguity; say which table is the real one.
+        if matches!(scheme.as_str(), "env" | "file" | "sops") {
+            warnings.push(format!(
+                "{source}: ignoring `[secret.defaults.resolver.{scheme}]` — `{scheme}` is a \
+                 built-in resolver, bound by `[secret.defaults.{scheme}]`"
+            ));
+        } else if plugins.resolver(scheme).is_none() {
+            warnings.push(format!(
+                "`[secret.defaults.resolver.{scheme}]`: no installed resolver plugin claims \
+                 `{scheme}://` — check the spelling against `sbx plugins list` (the table is \
+                 otherwise inert)"
+            ));
+        }
+    }
+}
+
+/// The `[secret.defaults.resolver.<scheme>]` tables as templates, a scheme that set no `locator`
+/// holding the identity — so a declared scheme is present in the map either way, and a caller
+/// listing what a layer bound sees the table that was written.
+fn resolver_locators(raw: &RawSecretDefaults) -> BTreeMap<String, String> {
+    raw.resolver
+        .iter()
+        .map(|(scheme, binding)| {
+            let template = binding
+                .locator
+                .clone()
+                .unwrap_or_else(|| IDENTITY_LOCATOR.to_string());
+            (scheme.clone(), template)
+        })
+        .collect()
 }
 
 /// Expand a terse `key` spec into a resolver chain. The spec is `name[@resolver[,resolver…]]`:
@@ -283,6 +353,7 @@ impl SecretDefaults {
 pub(super) fn expand_key(
     spec: &str,
     defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
 ) -> Result<Vec<SecretSource>, String> {
     let (name, resolvers) = match spec.rsplit_once('@') {
         Some((name, pin)) => {
@@ -303,21 +374,27 @@ pub(super) fn expand_key(
              `{name}@env`)"
         ));
     }
-    // A terse `key` only ever expands to a built-in resolver ref (`build_ref` emits `env://`,
-    // `sops://`, or `file://`), so the registry is intentionally empty here: terse plugin
-    // bindings (`key@<plugin>`) are a deliberate later addition, not silently in scope.
-    let builtins_only = PluginRegistry::default();
+    // A resolver name is a built-in or a scheme an installed plugin claims, so the registry is the
+    // same one an explicit `from` ref is parsed against: whichever form names a source, it names
+    // the same set of sources.
     resolvers
         .iter()
-        .map(|r| parse_secret_ref(&build_ref(r, name, defaults)?, &builtins_only))
+        .map(|r| parse_secret_ref(&build_ref(r, name, defaults, plugins)?, plugins))
         .collect()
 }
 
 /// Build a `scheme://locator` ref for one resolver from a terse `key`, applying that resolver's
 /// binding: `env` cases the key into a variable name; `sops` joins the key onto the bound file
-/// (`<file>#<key>`); `file` joins it onto the bound base directory (`<dir>/<key>`). A resolver
-/// whose binding is unset, or an unknown resolver name, fails closed.
-fn build_ref(resolver: &str, key: &str, defaults: &SecretDefaults) -> Result<String, String> {
+/// (`<file>#<key>`); `file` joins it onto the bound base directory (`<dir>/<key>`); a plugin
+/// scheme writes the key into its `locator` template, which defaults to the key alone. A resolver
+/// whose binding is unset, or a name neither built in nor claimed by an installed plugin, fails
+/// closed.
+fn build_ref(
+    resolver: &str,
+    key: &str,
+    defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
+) -> Result<String, String> {
     match resolver {
         "env" => {
             let name = match defaults.env_case.as_deref() {
@@ -359,10 +436,56 @@ fn build_ref(resolver: &str, key: &str, defaults: &SecretDefaults) -> Result<Str
             let sep = if dir.ends_with('/') { "" } else { "/" };
             Ok(format!("file://{dir}{sep}{key}"))
         }
+        // Any other name is a scheme an installed plugin claims. The plugin is not run here and its
+        // registry entry is not carried either: this only decides that the scheme exists, so the
+        // ref it builds fails on a misspelling instead of reaching `parse_secret_ref` as an
+        // unknown scheme with a locator already shaped for it.
+        other if plugins.resolver(other).is_some() => Ok(format!(
+            "{other}://{}",
+            expand_locator(defaults.resolver_locator(other), other, key)?
+        )),
         other => Err(format!(
-            "unknown resolver `{other}` for key `{key}` (built-in: env, file, sops)"
+            "unknown resolver `{other}` for key `{key}` (built-in: env, file, sops; or a scheme \
+             an installed resolver plugin claims — see `sbx plugins list`)"
         )),
     }
+}
+
+/// Write `key` into a plugin scheme's `locator` template, `{key}` being the one placeholder.
+///
+/// Two refusals, both fail-closed. A template that never writes `{key}` would give every terse key
+/// the same locator, so one entry's secret would answer for another's. An unknown placeholder is
+/// refused rather than passed through, because a `{`…`}` reaching the plugin's `argv[1]` is a
+/// locator the user believes carries a value and that the plugin will look up literally.
+fn expand_locator(template: &str, scheme: &str, key: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len() + key.len());
+    let mut rest = template;
+    let mut wrote_key = false;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            break;
+        };
+        let name = &after[..close];
+        if name != "key" {
+            return Err(format!(
+                "the `[secret.defaults.resolver.{scheme}] locator` names `{{{name}}}`, and the \
+                 only placeholder a locator takes is `{{key}}`"
+            ));
+        }
+        out.push_str(&rest[..open]);
+        out.push_str(key);
+        wrote_key = true;
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    if !wrote_key {
+        return Err(format!(
+            "the `[secret.defaults.resolver.{scheme}] locator` `{template}` never writes `{{key}}`, \
+             so every terse key would resolve the same secret"
+        ));
+    }
+    Ok(out)
 }
 
 /// Validate a terse `key`: dot-separated segments, each non-empty and made of letters, digits,

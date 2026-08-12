@@ -107,6 +107,7 @@ per-scheme binding says how the bare key becomes a locator:
 | `env` | `[secret.defaults.env] case = "upper" \| "lower" \| "asis"` | `env://<case(k)>` |
 | `sops` | `[secret.defaults.sops] file = "…"` | `sops://<file>#k` |
 | `file` | `[secret.defaults.file] dir = "…"` | `file://<dir>/k` |
+| a plugin scheme | `[secret.defaults.resolver.<scheme>] locator = "…{key}…"` | `<scheme>://<locator>` |
 
 `case` defaults to `"asis"` (the key is used unchanged): set `"upper"` or
 `"lower"` to normalize it into a conventional variable name.
@@ -115,6 +116,58 @@ The `header`/`type` defaults under `[secret.defaults]` apply to **every** entry,
 verbose or terse, a `from` entry that omits `header` inherits the default just
 as a `key` entry does. Only the resolver order and per-scheme bindings are
 terse-only. A per-entry `header`/`type` always overrides the default.
+
+### Binding a resolver plugin
+
+A [resolver plugin](plugins) is named in `order` and pinned with `@` exactly as a
+built-in is, under the **scheme** it claims. That is what a `from` ref writes
+before `://`, and it is not always the plugin's name: a plugin whose name says
+what it is may claim a scheme that says what it addresses.
+
+```toml
+[secret.defaults]
+order  = ["vault-demo"]
+header = "Authorization"
+type   = "bearer"
+[secret.defaults.resolver.vault-demo]
+locator = "agents/{key}"
+
+[secret."api.example.com"]
+key = "api-example"                # → vault-demo://agents/api-example
+[secret."api.demo-app.test"]
+key = "api-demo-app"               # → vault-demo://agents/api-demo-app
+```
+
+`locator` takes one placeholder, `{key}`. With no template (or no table at all)
+the key is the whole locator, `vault-demo://api-example`, which is what a vault
+addressed by host or by entry name already wants. A template that never writes
+`{key}` is refused: every terse key would resolve the same locator, so one
+entry's credential would answer for another's.
+
+This is what the terse form buys over a per-entry `from`: the vault is named
+once. Moving these secrets to a different one is a single edit, not one per
+entry.
+
+:::warning An unavailable vault in `order` reaches secrets that do not live in it
+A resolver reports two different outcomes, and the difference decides what a
+chain does next. Finding nothing is a clean **absent**: the chain falls through
+to the next source. Failing is a **hard error**: the chain stops there, the
+sources behind it are deliberately not tried, and the launch aborts. That is
+what keeps a broken resolver from quietly downgrading a credential to a weaker
+source.
+
+A vault that is locked, unreachable, or unauthenticated is the second kind. Put
+it first in `order` and **every** terse key in the config runs through it,
+including the ones whose value is sitting in `env`: the vault errors before the
+fallback is reached, so secrets that have nothing to do with it fail with it.
+Pinning those that do live there with `key@scheme` confines the dependency to
+them.
+
+What pinning does not do is keep the launch alive. Every declared secret must
+resolve or the launch aborts, so an entry that needs an unavailable vault stops
+it either way. The difference is whether that entry is the only one that
+needed it.
+:::
 
 ## Fallback chains
 

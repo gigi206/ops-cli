@@ -93,6 +93,29 @@ key = "github_token"       # → env://GITHUB_TOKEN, else sops://secrets/prod.ya
 
 Because `defaults` is reserved, a host cannot be named `defaults`.
 
+A [resolver plugin](../secrets/plugins) is bound the same way, under `resolver`, keyed by the
+**scheme** it claims rather than by its name (the two differ for a plugin whose name says what it
+is while its scheme says what it addresses):
+
+```toml
+[secret.defaults]
+order  = ["vault-demo"]
+header = "Authorization"
+type   = "bearer"
+[secret.defaults.resolver.vault-demo]
+locator = "agents/{key}"   # a terse key `k` → vault-demo://agents/k
+
+[secret."api.example.com"]
+key = "api-example"        # → vault-demo://agents/api-example
+```
+
+`locator` takes one placeholder, `{key}`. Unset, or with no table at all, the key is the whole
+locator (`vault-demo://k`), which is what a vault addressed by host or by entry name already
+wants. A template that never writes `{key}` is refused, since every terse key would then resolve
+the same secret.
+
+
+
 ## The source: `key` vs `from`
 
 - **`from`** is explicit: one resolver ref (`from = "env://VAR"`) or a fallback chain

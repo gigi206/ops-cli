@@ -840,6 +840,21 @@ pub(crate) struct RawSecretDefaults {
     pub(crate) env: Option<RawEnvDefaults>,
     /// The `file` binding: the base directory a terse file key reads from.
     pub(crate) file: Option<RawFileDefaults>,
+    /// The bindings for resolver **plugins**, one table per scheme:
+    /// `[secret.defaults.resolver.<scheme>]`.
+    ///
+    /// Keyed by the scheme a plugin claims (what `order` names and what a `from` ref writes before
+    /// `://`), never by the plugin's name: the two differ for a plugin whose name says what it is
+    /// while its scheme says what it addresses (`anthropic-oauth` claims `anthropic://`). A
+    /// separate namespace rather than a table named directly after the scheme, for the reason
+    /// `[task.<name>.exec.<program>]` has one: a bare `[secret.defaults.anthropic]` would sit
+    /// beside `order`, `header` and `type`, and a scheme colliding with one of those names would
+    /// be swallowed by it.
+    ///
+    /// The three built-in resolvers keep their own tables above; naming one here is refused,
+    /// rather than leaving two mechanisms to disagree over the same expansion.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) resolver: BTreeMap<String, RawResolverDefaults>,
 }
 
 /// The `sops` resolver binding: a terse key `k` expands to `sops://<file>#k`.
@@ -860,6 +875,19 @@ pub(crate) struct RawEnvDefaults {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawFileDefaults {
     pub(crate) dir: String,
+}
+
+/// A resolver **plugin**'s binding: the locator a terse key expands to for that scheme.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawResolverDefaults {
+    /// The locator a terse key `k` expands to, with `{key}` standing for the key:
+    /// `locator = "agents.kdbx/{key}"` makes `k` resolve `keepassxc://agents.kdbx/k`. Unset (or
+    /// no table at all) is the identity, `<scheme>://k`, which is what a source addressed by host
+    /// or by name already wants.
+    ///
+    /// A template that never writes `{key}` is refused: it would hand every terse key the same
+    /// locator, so one entry's secret would silently answer for another's.
+    pub(crate) locator: Option<String>,
 }
 
 /// The `[task]` section: a reserved `defaults` table plus one entry per named task. Mirrors

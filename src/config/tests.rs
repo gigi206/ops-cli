@@ -1,4 +1,6 @@
-use super::schema::{RawEnvDefaults, RawFileDefaults, RawSecretSection, RawSopsDefaults};
+use super::schema::{
+    RawEnvDefaults, RawFileDefaults, RawResolverDefaults, RawSecretSection, RawSopsDefaults,
+};
 use super::*;
 use crate::testutil::TmpDir;
 use std::collections::BTreeMap;
@@ -6183,6 +6185,23 @@ fn raw_defaults(
             case: Some(c.into()),
         }),
         file: file_dir.map(|d| RawFileDefaults { dir: d.into() }),
+        resolver: BTreeMap::new(),
+    }
+}
+
+/// A raw `[secret.defaults]` table binding one plugin scheme, `locator` unset meaning the
+/// identity — for the plugin-expansion tests.
+fn raw_plugin_defaults(order: &[&str], scheme: &str, locator: Option<&str>) -> RawSecretDefaults {
+    let mut resolver = BTreeMap::new();
+    resolver.insert(
+        scheme.to_string(),
+        RawResolverDefaults {
+            locator: locator.map(str::to_string),
+        },
+    );
+    RawSecretDefaults {
+        resolver,
+        ..raw_defaults(order, None, None, None)
     }
 }
 
@@ -6489,6 +6508,16 @@ fn vhs_with(secret: RawHostSecret, plugins: &PluginRegistry) -> Result<HeaderSec
         &SecretDefaults::default(),
         plugins,
     )
+}
+
+/// [`validate_host_secret`] against both a registry and a defaults table, for the terse plugin
+/// expansions (where the binding and the installed plugin have to meet).
+fn vhs_with_defaults(
+    secret: RawHostSecret,
+    defaults: &SecretDefaults,
+    plugins: &PluginRegistry,
+) -> Result<HeaderSecret, String> {
+    validate_host_secret("api.github.com", secret, defaults, plugins)
 }
 
 /// A plugin declaring the variables it reads, so the `[plugin.<name>]` validation has something
@@ -6806,18 +6835,316 @@ fn an_empty_plugin_locator_is_rejected() {
 }
 
 #[test]
-fn a_terse_key_never_resolves_a_plugin_scheme() {
-    // a terse `key` pinned to a plugin name is not a plugin binding — it is an unknown
-    // resolver binding (terse plugin bindings are deliberately out of scope)
+fn a_terse_key_pinned_to_a_plugin_scheme_resolves_through_it() {
+    // With no binding declared, a plugin scheme expands to the key alone: `pass://tok`. That is
+    // what a source addressed by host or by name wants, and it needs no table at all.
     let reg = PluginRegistry::with([plugin("pass")]);
-    let err = validate_host_secret(
+    let s = validate_host_secret(
         "api.github.com",
         terse("tok@pass"),
         &SecretDefaults::default(),
         &reg,
     )
+    .unwrap();
+    match &s.sources[..] {
+        [SecretSource::Plugin { plugin, locator }] => {
+            assert_eq!(plugin.scheme, "pass");
+            assert_eq!(locator, "tok");
+        }
+        other => panic!("expected one pass:// source, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_terse_key_expands_through_a_plugin_locator_template() {
+    // The template is what lets a source whose locator has a fixed part — a vault file, a folder —
+    // be named once instead of in every entry.
+    let reg = PluginRegistry::with([plugin("keepassxc")]);
+    let d = SecretDefaults::from_raw(&raw_plugin_defaults(
+        &["keepassxc"],
+        "keepassxc",
+        Some("agents.kdbx/{key}#password"),
+    ));
+    let s = vhs_with_defaults(terse("github"), &d, &reg).unwrap();
+    match &s.sources[..] {
+        [SecretSource::Plugin { locator, .. }] => {
+            assert_eq!(locator, "agents.kdbx/github#password");
+        }
+        other => panic!("expected one keepassxc:// source, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_plugin_locator_template_that_never_writes_the_key_is_rejected() {
+    // Every terse key would resolve the same secret, so one entry's credential would answer for
+    // another's — silently, and only on the wire.
+    let reg = PluginRegistry::with([plugin("keepassxc")]);
+    let d = SecretDefaults::from_raw(&raw_plugin_defaults(
+        &["keepassxc"],
+        "keepassxc",
+        Some("agents.kdbx/shared"),
+    ));
+    let err = vhs_with_defaults(terse("github"), &d, &reg).unwrap_err();
+    assert!(err.contains("never writes `{key}`"), "{err}");
+}
+
+#[test]
+fn a_plugin_locator_template_with_an_unknown_placeholder_is_rejected() {
+    // Passed through, it would reach the plugin's `argv[1]` as literal braces: a locator the user
+    // believes carries a value and the plugin looks up verbatim.
+    let reg = PluginRegistry::with([plugin("keepassxc")]);
+    let d = SecretDefaults::from_raw(&raw_plugin_defaults(
+        &["keepassxc"],
+        "keepassxc",
+        Some("{host}/{key}"),
+    ));
+    let err = vhs_with_defaults(terse("github"), &d, &reg).unwrap_err();
+    assert!(err.contains("{host}") && err.contains("{key}"), "{err}");
+}
+
+#[test]
+fn a_plugin_locator_template_carrying_a_control_character_is_rejected() {
+    // The expansion is not a shortcut around the ref validation: what a template builds is checked
+    // exactly as a hand-written `from` ref is, so a newline from the config file cannot reach the
+    // plugin's `argv[1]`.
+    let reg = PluginRegistry::with([plugin("keepassxc")]);
+    let d = SecretDefaults::from_raw(&raw_plugin_defaults(
+        &["keepassxc"],
+        "keepassxc",
+        Some("agents.kdbx\n/{key}"),
+    ));
+    let err = vhs_with_defaults(terse("github"), &d, &reg).unwrap_err();
+    assert!(err.contains("control character"), "{err}");
+}
+
+#[test]
+fn a_terse_key_naming_no_installed_plugin_is_rejected() {
+    // The registry is the same one an explicit `from` ref is parsed against, so a misspelled
+    // scheme fails closed here exactly as it would there.
+    let reg = PluginRegistry::with([plugin("pass")]);
+    let err = validate_host_secret(
+        "api.github.com",
+        terse("tok@pas"),
+        &SecretDefaults::default(),
+        &reg,
+    )
     .unwrap_err();
-    assert!(err.contains("pass"), "{err}");
+    assert!(err.contains("pas") && err.contains("plugins list"), "{err}");
+}
+
+#[test]
+fn a_plugin_scheme_in_the_default_order_serves_every_terse_key() {
+    // The point of the binding: the vault is named once, and switching to another one is a single
+    // edit rather than one per entry.
+    let reg = PluginRegistry::with([plugin("keepassxc-browser")]);
+    let d = SecretDefaults::from_raw(&raw_plugin_defaults(
+        &["keepassxc-browser"],
+        "keepassxc-browser",
+        None,
+    ));
+    for key in ["api.github.com", "api.npmjs.org"] {
+        let s = vhs_with_defaults(terse(key), &d, &reg).unwrap();
+        match &s.sources[..] {
+            [SecretSource::Plugin { plugin, locator }] => {
+                assert_eq!(plugin.scheme, "keepassxc-browser");
+                assert_eq!(locator, key);
+            }
+            other => panic!("expected one keepassxc-browser:// source, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_plugin_scheme_falls_back_to_a_builtin_in_the_default_order() {
+    // A terse chain crossing the plugin boundary: the vault first, the environment behind it.
+    let reg = PluginRegistry::with([plugin("keepassxc-browser")]);
+    let d = SecretDefaults::from_raw(&RawSecretDefaults {
+        env: Some(RawEnvDefaults {
+            case: Some("upper".into()),
+        }),
+        ..raw_plugin_defaults(&["keepassxc-browser", "env"], "keepassxc-browser", None)
+    });
+    let s = vhs_with_defaults(terse("gh_token"), &d, &reg).unwrap();
+    match &s.sources[..] {
+        [SecretSource::Plugin { locator, .. }, SecretSource::Env(var)] => {
+            assert_eq!(locator, "gh_token");
+            assert_eq!(var, "GH_TOKEN");
+        }
+        other => panic!("expected a plugin source then an env one, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_project_binds_one_scheme_without_unbinding_the_others() {
+    // The bindings merge per scheme, like every other default: a project that retemplates one
+    // vault keeps the global template for the vault it never mentions.
+    let global = SecretDefaults::from_raw(&RawSecretDefaults {
+        resolver: BTreeMap::from([
+            (
+                "keepassxc".to_string(),
+                RawResolverDefaults {
+                    locator: Some("shared.kdbx/{key}".into()),
+                },
+            ),
+            (
+                "pass".to_string(),
+                RawResolverDefaults {
+                    locator: Some("team/{key}".into()),
+                },
+            ),
+        ]),
+        ..raw_defaults(&["keepassxc"], None, None, None)
+    });
+    let merged = global.merged_with(&raw_plugin_defaults(
+        &[],
+        "keepassxc",
+        Some("mine.kdbx/{key}"),
+    ));
+    let reg = PluginRegistry::with([plugin("keepassxc"), plugin("pass")]);
+
+    let s = vhs_with_defaults(terse("gh@keepassxc"), &merged, &reg).unwrap();
+    match &s.sources[..] {
+        [SecretSource::Plugin { locator, .. }] => assert_eq!(locator, "mine.kdbx/gh"),
+        other => panic!("expected the project's template, got {other:?}"),
+    }
+    let s = vhs_with_defaults(terse("gh@pass"), &merged, &reg).unwrap();
+    match &s.sources[..] {
+        [SecretSource::Plugin { locator, .. }] => assert_eq!(locator, "team/gh"),
+        other => panic!("expected the global template, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_task_credential_expands_a_terse_key_through_a_plugin() {
+    // A declared operation resolves through the same chain, so the binding serves it too.
+    let reg = PluginRegistry::with([plugin("keepassxc")]);
+    let mut task = RawTask {
+        cmd: vec!["/bin/true".into()],
+        ..RawTask::default()
+    };
+    task.secret
+        .insert("PGPASSWORD".into(), RawTaskSecret::Ref("db".into()));
+    let cfg = RawConfig {
+        secret: Some(RawSecretSection {
+            defaults: Some(raw_plugin_defaults(
+                &["keepassxc"],
+                "keepassxc",
+                Some("agents.kdbx/{key}"),
+            )),
+            hosts: BTreeMap::new(),
+        }),
+        task: Some(RawTaskSection {
+            defaults: None,
+            tasks: BTreeMap::from([("q".to_string(), task)]),
+        }),
+        ..RawConfig::default()
+    };
+
+    let resolved = super::resolve(cfg, None, &reg);
+    let spec = resolved
+        .tasks
+        .iter()
+        .find(|t| t.name == "q")
+        .expect("the task resolves");
+    match &spec.secrets[0].sources[..] {
+        [SecretSource::Plugin { locator, .. }] => assert_eq!(locator, "agents.kdbx/db"),
+        other => panic!("expected the bound keepassxc locator, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_task_terse_key_reaches_a_template_that_itself_carries_a_scheme() {
+    // A task's one-liner accepts both a bare key and a full ref, and it tells them apart by the
+    // `://` in what the *config* wrote. A template like `https://{key}` puts a `://` in the
+    // expansion but not in the key, so the two consumers must still agree: the host path and the
+    // task path both expand, neither reads the key as a ref.
+    let reg = PluginRegistry::with([plugin("keepassxc-browser")]);
+    let mut task = RawTask {
+        cmd: vec!["/bin/true".into()],
+        ..RawTask::default()
+    };
+    task.secret.insert(
+        "API_TOKEN".into(),
+        RawTaskSecret::Ref("api.example.com".into()),
+    );
+    let defaults = raw_plugin_defaults(
+        &["keepassxc-browser"],
+        "keepassxc-browser",
+        Some("https://{key}"),
+    );
+    let cfg = RawConfig {
+        secret: Some(RawSecretSection {
+            defaults: Some(defaults.clone()),
+            hosts: BTreeMap::from([(
+                "api.example.com".to_string(),
+                RawHostSecrets::One(terse("api.example.com")),
+            )]),
+        }),
+        task: Some(RawTaskSection {
+            defaults: None,
+            tasks: BTreeMap::from([("q".to_string(), task)]),
+        }),
+        network: allowlist_net(&["api.example.com"]),
+        ..RawConfig::default()
+    };
+
+    let resolved = super::resolve(cfg, None, &reg);
+    let task_locator = match &resolved.tasks[0].secrets[0].sources[..] {
+        [SecretSource::Plugin { locator, .. }] => locator.clone(),
+        other => panic!("expected an expanded plugin source on the task path, got {other:?}"),
+    };
+    let host_locator = match &resolved.secrets[0].sources[..] {
+        [SecretSource::Plugin { locator, .. }] => locator.clone(),
+        other => panic!("expected an expanded plugin source on the host path, got {other:?}"),
+    };
+    assert_eq!(task_locator, "https://api.example.com");
+    assert_eq!(host_locator, task_locator);
+}
+
+#[test]
+fn a_resolver_binding_naming_no_installed_plugin_warns() {
+    // The table binds nothing and nothing will ever reach it: the same gap `[plugin.<name>]`
+    // reports for a name no secret uses.
+    let reg = PluginRegistry::with([plugin("keepassxc")]);
+    let global = RawConfig {
+        secret: Some(RawSecretSection {
+            defaults: Some(raw_plugin_defaults(&[], "keepasxc", Some("db/{key}"))),
+            hosts: BTreeMap::new(),
+        }),
+        ..RawConfig::default()
+    };
+    let resolved = super::resolve(global, None, &reg);
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|w| w.contains("keepasxc") && w.contains("no installed resolver plugin")),
+        "a misspelled scheme must be named: {:?}",
+        resolved.warnings
+    );
+}
+
+#[test]
+fn a_resolver_binding_naming_a_builtin_is_refused() {
+    // `env`, `file` and `sops` have binding tables of their own, with a shape this one cannot
+    // express. Two mechanisms for one expansion is the ambiguity worth naming.
+    let reg = PluginRegistry::with([plugin("keepassxc")]);
+    let global = RawConfig {
+        secret: Some(RawSecretSection {
+            defaults: Some(raw_plugin_defaults(&["env"], "env", Some("{key}_TOKEN"))),
+            hosts: BTreeMap::new(),
+        }),
+        ..RawConfig::default()
+    };
+    let resolved = super::resolve(global, None, &reg);
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|w| w.contains("[secret.defaults.env]") && w.contains("built-in")),
+        "the built-in's own table must be named: {:?}",
+        resolved.warnings
+    );
 }
 
 #[test]

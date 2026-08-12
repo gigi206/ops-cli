@@ -37,7 +37,9 @@ pub(crate) use schema::RawBundle;
 // Consumed by the resolution engine that stays in this file (and `global_path` by `manage`).
 use load::{canonicalize_binds, global_path, read_global, sbx_control_plane_roots};
 // The secret source/validation machinery the resolution engine folds into the resolved set.
-use secrets::{SecretDefaults, apply_secret_section, count_host_secrets, upsert_secret};
+use secrets::{
+    SecretDefaults, apply_secret_section, count_host_secrets, upsert_secret, warn_resolver_bindings,
+};
 // The two leaf checks the task engine re-runs at invocation time: a caller's value against its
 // declared bound, and the `{param}` placeholders in one argv element. They live with the validator
 // so the check a task is accepted under and the check its invocation enforces cannot drift.
@@ -909,6 +911,9 @@ impl Resolved {
                 Some(layout) => PluginRegistry::load(&layout.plugins_dir(), &mut self.warnings),
                 None => PluginRegistry::default(),
             };
+            if let Some(raw_defaults) = &section.defaults {
+                warn_resolver_bindings(&mut self.warnings, OVERRIDE_SOURCE, raw_defaults, &plugins);
+            }
             apply_secret_section(
                 &mut self.secrets,
                 &mut self.warnings,
@@ -1512,6 +1517,7 @@ fn resolve(
     if let Some(section) = global.secret {
         if let Some(raw_defaults) = &section.defaults {
             secret_defaults = SecretDefaults::from_raw(raw_defaults);
+            warn_resolver_bindings(&mut warnings, GLOBAL_CONFIG, raw_defaults, plugins);
         }
         apply_secret_section(
             &mut secrets,
@@ -1841,7 +1847,15 @@ fn resolve(
         if let Some(section) = proj.secret {
             if trusted {
                 let effective = match &section.defaults {
-                    Some(raw_defaults) => secret_defaults.merged_with(raw_defaults),
+                    Some(raw_defaults) => {
+                        warn_resolver_bindings(
+                            &mut warnings,
+                            PROJECT_CONFIG,
+                            raw_defaults,
+                            plugins,
+                        );
+                        secret_defaults.merged_with(raw_defaults)
+                    }
                     None => secret_defaults.clone(),
                 };
                 // Carry these merged defaults to the project's own apps (below).
@@ -3175,7 +3189,10 @@ fn apply_app_secret(
     plugins: &PluginRegistry,
 ) {
     let effective = match &section.defaults {
-        Some(raw) => base_defaults.merged_with(raw),
+        Some(raw) => {
+            warn_resolver_bindings(warnings, source, raw, plugins);
+            base_defaults.merged_with(raw)
+        }
         None => base_defaults.clone(),
     };
     apply_secret_section(out, warnings, source, section.hosts, &effective, plugins);
