@@ -975,7 +975,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
             .iter()
             .map(|b| BrokerView {
                 name: b.name.clone(),
-                socket: b.socket.display().to_string(),
+                socket: b.socket.describe(),
                 allow: b.allow.clone(),
                 secret: b.secret.iter().map(|s| s.describe()).collect(),
                 origin: b.origin.into(),

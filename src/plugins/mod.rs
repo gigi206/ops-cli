@@ -751,6 +751,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
         broker::check_sandbox(&sandbox)?;
         let spec = broker::validate(
             raw_broker,
+            &name,
             is_valid_env_key,
             crate::config::is_reserved_env_key,
         )?;

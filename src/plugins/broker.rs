@@ -77,6 +77,19 @@ pub(crate) enum Framing {
     /// same posture the length prefix takes, for the same reason — half a message put on a wire is
     /// worse than none.
     Line,
+    /// PostgreSQL's frontend/backend framing, and the shape of several protocols built the same
+    /// way: a one-byte message type, then a four-byte big-endian length **that counts itself**,
+    /// then the body.
+    ///
+    /// With one exception that no formula covers: the connection's **first** message from the
+    /// client (the startup packet) carries **no type byte** — it is length-then-body alone. So the
+    /// reader is stateful, and the state is per direction: the first frame read from the cage has
+    /// no type, every later one does, and everything from the server has one from the start.
+    ///
+    /// A frame is handed to the plugin **whole**, type byte included where there is one, and put
+    /// back on the wire exactly as it came. sbx reads the length to know where a message ends; it
+    /// reads nothing else.
+    PgWire,
 }
 
 impl Framing {
@@ -85,6 +98,7 @@ impl Framing {
         match self {
             Framing::LengthU32Be => "length-u32-be",
             Framing::Line => "line",
+            Framing::PgWire => "pgwire",
         }
     }
 
@@ -93,8 +107,9 @@ impl Framing {
         match raw {
             "length-u32-be" => Ok(Framing::LengthU32Be),
             "line" => Ok(Framing::Line),
+            "pgwire" => Ok(Framing::PgWire),
             other => Err(format!(
-                "unsupported `framing` `{other}` (supported: `length-u32-be`, `line`)"
+                "unsupported `framing` `{other}` (supported: `length-u32-be`, `line`, `pgwire`)"
             )),
         }
     }
@@ -104,12 +119,22 @@ impl Framing {
 /// between the cage and the host resource without understanding what the messages mean.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BrokerSpec {
-    /// The cage environment variables that must point at the broker's socket. sbx picks the path
-    /// and sets every name here to it.
-    ///
-    /// Non-empty by construction: sbx chooses the socket's location, so a broker that named no
-    /// variable would serve a socket nothing in the cage could find.
+    /// The cage environment variables that must point at the broker's socket **file**.
     pub(crate) cage_env: Vec<String>,
+    /// The cage environment variables that must point at the **directory** holding it.
+    ///
+    /// Some clients take a directory and derive the file name themselves: libpq reads `PGHOST` and
+    /// looks for `.s.PGSQL.<port>` inside it. Without this a broker could serve PostgreSQL only if
+    /// the user linked the socket into a directory by hand, which is the difference between a
+    /// mechanism that works and one that works for whoever knows the trick.
+    pub(crate) cage_env_dir: Vec<String>,
+    /// The socket's file name inside the directory sbx chose, for a client that expects a
+    /// particular one. Defaults to `<plugin>.sock`.
+    ///
+    /// A **name, never a path**: the directory stays sbx's to choose, which is what keeps a
+    /// manifest from placing a socket over something the cage needs, and keeps two brokers from
+    /// colliding. The same rule `programs` entries are held to, for the same reason.
+    pub(crate) socket_name: String,
     /// How the byte stream is cut into messages.
     pub(crate) framing: Framing,
     /// The largest frame this protocol admits, capped at [`MAX_FRAME_CEILING`]. Required, never
@@ -207,6 +232,9 @@ impl BrokerPlugin {
 pub(super) struct RawBroker {
     #[serde(default)]
     cage_env: Vec<String>,
+    #[serde(default)]
+    cage_env_dir: Vec<String>,
+    socket_name: Option<String>,
     framing: Option<String>,
     max_frame: Option<i64>,
     deny_frame: Option<Vec<i64>>,
@@ -223,17 +251,39 @@ pub(super) struct RawBroker {
 /// one list of reserved keys in the tree.
 pub(super) fn validate(
     raw: RawBroker,
+    name: &str,
     is_valid_env_key: impl Fn(&str) -> bool,
     is_reserved: impl Fn(&str) -> bool,
 ) -> Result<BrokerSpec, String> {
-    if raw.cage_env.is_empty() {
+    if raw.cage_env.is_empty() && raw.cage_env_dir.is_empty() {
         return Err(
             "missing `cage_env` — sbx picks where the broker's socket lands, so a broker must \
-             name at least one cage variable to point at it"
+             name at least one cage variable to point at it (`cage_env` for the socket itself, \
+             `cage_env_dir` for the directory holding it)"
                 .to_string(),
         );
     }
-    for (i, key) in raw.cage_env.iter().enumerate() {
+    let socket_name = match raw.socket_name {
+        None => format!("{name}.sock"),
+        Some(named) => {
+            // A name, never a path: a separator or a `.`/`..` component would let a manifest place
+            // its socket somewhere sbx did not choose.
+            if named.is_empty()
+                || named.contains('/')
+                || named == "."
+                || named == ".."
+                || named.contains('\0')
+            {
+                return Err(format!(
+                    "`socket_name` is `{named}`, which is not a plain file name — the directory is \
+                     sbx's to choose"
+                ));
+            }
+            named
+        }
+    };
+    let all_env: Vec<&String> = raw.cage_env.iter().chain(raw.cage_env_dir.iter()).collect();
+    for (i, key) in all_env.iter().enumerate() {
         if !is_valid_env_key(key) {
             return Err(format!("`cage_env` has an invalid variable name `{key}`"));
         }
@@ -259,7 +309,7 @@ pub(super) fn validate(
                  broker — a plugin cannot stand in for one the config granted"
             ));
         }
-        if raw.cage_env[..i].contains(key) {
+        if all_env[..i].contains(key) {
             return Err(format!(
                 "`cage_env` names `{key}` twice — one variable, one declaration"
             ));
@@ -325,6 +375,8 @@ pub(super) fn validate(
 
     Ok(BrokerSpec {
         cage_env: raw.cage_env,
+        cage_env_dir: raw.cage_env_dir,
+        socket_name,
         framing,
         max_frame,
         deny_frame,
@@ -373,6 +425,8 @@ mod tests {
     fn raw() -> RawBroker {
         RawBroker {
             cage_env: vec!["GPG_AGENT_SOCK".to_string()],
+            cage_env_dir: Vec::new(),
+            socket_name: None,
             framing: Some("length-u32-be".to_string()),
             max_frame: Some(4096),
             deny_frame: Some(vec![5]),
@@ -384,7 +438,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_broker_table_validates() {
-        let spec = validate(raw(), valid_key, reserved).expect("valid");
+        let spec = validate(raw(), "fake", valid_key, reserved).expect("valid");
         assert_eq!(spec.cage_env, vec!["GPG_AGENT_SOCK".to_string()]);
         assert_eq!(spec.framing, Framing::LengthU32Be);
         assert_eq!(spec.max_frame, 4096);
@@ -399,6 +453,7 @@ mod tests {
                 inspect_replies: false,
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -420,6 +475,7 @@ mod tests {
                 inspect_replies: false,
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -432,6 +488,7 @@ mod tests {
                 inspect_replies: true,
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -446,10 +503,63 @@ mod tests {
                 cage_env: Vec::new(),
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
         .expect_err("a socket nothing can find is not a broker");
+        assert!(err.contains("cage_env"), "{err}");
+    }
+
+    /// A client that derives the socket's file name (libpq reads `PGHOST` as a directory and looks
+    /// for `.s.PGSQL.<port>` inside) needs the manifest to name the file. The directory stays
+    /// sbx's, which is the part that matters.
+    #[test]
+    fn a_manifest_may_name_the_socket_file_but_never_its_directory() {
+        let spec = validate(
+            RawBroker {
+                cage_env: Vec::new(),
+                cage_env_dir: vec!["PGHOST".to_string()],
+                socket_name: Some(".s.PGSQL.5432".to_string()),
+                ..raw()
+            },
+            "postgres",
+            valid_key,
+            reserved,
+        )
+        .expect("a file name is admissible");
+        assert_eq!(spec.socket_name, ".s.PGSQL.5432");
+        assert_eq!(spec.cage_env_dir, vec!["PGHOST".to_string()]);
+
+        // Anything with a path in it is refused: the directory is not the manifest's to pick.
+        for bad in ["/etc/passwd", "../escape", "sub/dir.sock", "..", ""] {
+            validate(
+                RawBroker {
+                    socket_name: Some(bad.to_string()),
+                    ..raw()
+                },
+                "postgres",
+                valid_key,
+                reserved,
+            )
+            .expect_err(&format!("`{bad}` is not a plain file name"));
+        }
+    }
+
+    /// Naming neither form of variable leaves a socket nothing in the cage can find.
+    #[test]
+    fn a_broker_must_name_a_variable_of_one_form_or_the_other() {
+        let err = validate(
+            RawBroker {
+                cage_env: Vec::new(),
+                cage_env_dir: Vec::new(),
+                ..raw()
+            },
+            "fake",
+            valid_key,
+            reserved,
+        )
+        .expect_err("neither form named");
         assert!(err.contains("cage_env"), "{err}");
     }
 
@@ -462,6 +572,7 @@ mod tests {
                 cage_env: vec![crate::sandbox::sshagent::AUTH_SOCK_ENV.to_string()],
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -478,6 +589,7 @@ mod tests {
                     cage_env: vec![key.to_string()],
                     ..raw()
                 },
+                "fake",
                 valid_key,
                 reserved,
             )
@@ -493,6 +605,7 @@ mod tests {
                 cage_env: vec!["GPG_AGENT_SOCK".to_string(), "GPG_AGENT_SOCK".to_string()],
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -507,6 +620,7 @@ mod tests {
                 framing: Some("netstring".to_string()),
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -521,6 +635,7 @@ mod tests {
                 framing: None,
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -531,6 +646,7 @@ mod tests {
                 max_frame: None,
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -546,6 +662,7 @@ mod tests {
                 max_frame: Some(MAX_FRAME_CEILING as i64 + 1),
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -556,6 +673,7 @@ mod tests {
                 max_frame: Some(MAX_FRAME_CEILING as i64),
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -571,6 +689,7 @@ mod tests {
                     max_frame: Some(value),
                     ..raw()
                 },
+                "fake",
                 valid_key,
                 reserved,
             )
@@ -586,6 +705,7 @@ mod tests {
                 deny_frame: Some(vec![256]),
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -598,6 +718,7 @@ mod tests {
                 deny_frame: Some(vec![1, 2, 3]),
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -614,6 +735,7 @@ mod tests {
                 deny_frame: Some(Vec::new()),
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )
@@ -625,6 +747,7 @@ mod tests {
                 deny_frame: None,
                 ..raw()
             },
+            "fake",
             valid_key,
             reserved,
         )

@@ -502,6 +502,8 @@ exec = "bin/broker"
 
 [broker]
 cage_env  = ["GPG_AGENT_INFO"]     # cage variables pointed at the socket sbx places
+cage_env_dir = []                  # …or at the directory holding it (libpq's PGHOST)
+socket_name  = "agent.sock"        # the file name inside it; the directory is sbx's
 framing   = "line"                 # `line` or `length-u32-be`
 max_frame = 2048                   # the largest frame this protocol admits
 deny_frame = [5]                   # optional: a refusal frame that needs no request context
@@ -523,9 +525,10 @@ launch:
   meets. A broker points a client at its socket; names like `LD_PRELOAD` or `PATH`
   load code in the cage instead.
 - **`framing` is a closed set** implemented in `sbx`: `length-u32-be` (a four-byte
-  big-endian length, then the body, which carries the protocol's own type byte) and
+  big-endian length, then the body, which carries the protocol's own type byte),
   `line` (one message per line, the newline being the boundary rather than part of the
-  message). A plugin handed an uncut stream would be the broker rather than rule on its
+  message), and `pgwire` (PostgreSQL's: a type byte, then a length that **counts itself**,
+  except for the startup packet which has no type byte at all — so the reader is stateful). A plugin handed an uncut stream would be the broker rather than rule on its
   messages. An over-long frame is an error, never a truncation.
 - **`uses_secret` is what lets a broker place a credential it never sees.** The plugin is
   handed a random marker and `sbx` substitutes the value on the way to the host resource;

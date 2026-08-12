@@ -4443,16 +4443,43 @@ fn build(
                 }
                 continue;
             };
-            // The host resource has to be there *now*: a broker in front of nothing would accept
-            // the cage's connections and fail every frame, which reads as the resource misbehaving
-            // rather than as a configuration that does not hold.
-            if !binding.socket.exists() {
-                crate::diag::warn(&format!(
-                    "`[broker.{name}] socket` names {}, which does not exist — the cage gets no \
-                     broker",
-                    binding.socket.display()
-                ));
-                continue;
+            // Two checks, and the second is the one that keeps a single answer to "where may this
+            // cage go".
+            match &binding.socket {
+                // A Unix socket has to be there *now*: a broker in front of nothing would accept
+                // the cage's connections and fail every frame, which reads as the resource
+                // misbehaving rather than as a configuration that does not hold.
+                crate::config::BrokerTarget::Unix(path) if !path.exists() => {
+                    crate::diag::warn(&format!(
+                        "`[broker.{name}] socket` names {}, which does not exist — the cage gets \
+                         no broker",
+                        path.display()
+                    ));
+                    continue;
+                }
+                crate::config::BrokerTarget::Unix(_) => {}
+                // A TCP target is a way out of the cage, so it is admitted only where the network
+                // allowlist already admits it — decided by the very function the proxy and
+                // `sbx test net` decide through, so the three cannot drift apart. Without this
+                // there would be two different answers to what the cage may reach, and the one a
+                // reader checks would not be the one that decides.
+                crate::config::BrokerTarget::Tcp { host, port } => {
+                    let admitted = match &prep.cfg.network {
+                        crate::config::NetworkPolicy::Allowlist(policy) => matches!(
+                            policy.l4_decision(host, *port),
+                            crate::allowlist::L4Decision::Splice(_)
+                        ),
+                        _ => false,
+                    };
+                    if !admitted {
+                        crate::diag::warn(&format!(
+                            "`[broker.{name}] socket` names tcp://{host}:{port}, which the \
+                             network allowlist does not admit — add `tcp://{host}:{port}` to \
+                             `[network] allow`, or the cage gets no broker"
+                        ));
+                        continue;
+                    }
+                }
             }
             // The credential is resolved host-side, here, before anything is stood up: a broker
             // that was promised one and cannot get it must not run, or it would put an
@@ -4496,7 +4523,7 @@ fn build(
                 Ok((guard, wiring)) => {
                     crate::diag::note(&format!(
                         "broker: `{name}` stands in front of {}{}",
-                        binding.socket.display(),
+                        binding.socket.describe(),
                         match binding.allow.len() {
                             0 => String::new(),
                             n => format!(" ({n} allow entr{})", if n == 1 { "y" } else { "ies" }),

@@ -261,6 +261,13 @@ pub(crate) enum Verdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Answer {
     pub(crate) verdict: Verdict,
+    /// On a forwarded frame: whether the host resource will answer at all.
+    ///
+    /// Most messages get a reply, so this defaults to **true**. Some protocols have messages that
+    /// get none — PostgreSQL's `Terminate`, and the close of many others — and waiting for one
+    /// would end the connection on a read that can only fail. Worse, it would be *recorded* as a
+    /// refusal, which is a record saying something that did not happen.
+    pub(crate) expect_reply: bool,
     /// On a reply frame: whether the exchange continues, so sbx should take another frame from the
     /// host and show it too.
     ///
@@ -287,6 +294,14 @@ struct RawAnswer {
     label: Option<String>,
     #[serde(default)]
     more: bool,
+    #[serde(default = "yes")]
+    expect_reply: bool,
+}
+
+/// `expect_reply` defaults to true: a message with no answer is the exception, and a plugin that
+/// says nothing should get the common case.
+fn yes() -> bool {
+    true
 }
 
 /// Parse one answer line against the frame it should be answering.
@@ -350,6 +365,7 @@ pub(crate) fn parse_answer(
     Ok(Answer {
         verdict,
         more: raw.more,
+        expect_reply: raw.expect_reply,
         label: raw.label.filter(|l| !l.is_empty()),
     })
 }
@@ -368,6 +384,7 @@ pub(crate) fn read_frame(
     r: &mut impl Read,
     framing: Framing,
     max: usize,
+    typed: bool,
 ) -> io::Result<Option<Vec<u8>>> {
     match framing {
         Framing::LengthU32Be => {
@@ -388,6 +405,54 @@ pub(crate) fn read_frame(
             let mut body = vec![0u8; len];
             r.read_exact(&mut body)?;
             Ok(Some(body))
+        }
+        // PostgreSQL's framing: an optional one-byte type, then a length that counts itself, then
+        // the body. What the plugin is handed is the type byte (where there is one) and the body,
+        // **without** the length — because a plugin that rewrites a body must not also have to fix
+        // a byte count. sbx put the framing on, so sbx recomputes it.
+        Framing::PgWire => {
+            let mut head = Vec::new();
+            if typed {
+                let mut ty = [0u8; 1];
+                match r.read_exact(&mut ty) {
+                    Ok(()) => head.push(ty[0]),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            }
+            let mut len = [0u8; 4];
+            match r.read_exact(&mut len) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return if head.is_empty() {
+                        Ok(None)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the stream ended after a message type",
+                        ))
+                    };
+                }
+                Err(e) => return Err(e),
+            }
+            // The length counts its own four bytes, so anything below that is not a length.
+            let len = u32::from_be_bytes(len) as usize;
+            let body_len = len.checked_sub(4).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("pgwire length {len} is below its own four bytes"),
+                )
+            })?;
+            if body_len > max {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("pgwire body of {body_len} bytes, above the {max}-byte bound"),
+                ));
+            }
+            let mut body = vec![0u8; body_len];
+            r.read_exact(&mut body)?;
+            head.extend_from_slice(&body);
+            Ok(Some(head))
         }
         // A line, without its terminator: the frame is what the protocol calls a message, and the
         // newline is the framing. Read byte by byte rather than through a `BufRead`, because the
@@ -430,12 +495,44 @@ pub(crate) fn read_frame(
 }
 
 /// Write one frame, framed as the manifest declared.
-pub(crate) fn write_frame(w: &mut impl Write, framing: Framing, body: &[u8]) -> io::Result<()> {
+pub(crate) fn write_frame(
+    w: &mut impl Write,
+    framing: Framing,
+    body: &[u8],
+    typed: bool,
+) -> io::Result<()> {
     match framing {
         Framing::LengthU32Be => {
             let len = u32::try_from(body.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "frame too large to be framed")
             })?;
+            w.write_all(&len.to_be_bytes())?;
+            w.write_all(body)?;
+            w.flush()
+        }
+        Framing::PgWire => {
+            // The length is recomputed here, from the body as it now stands: a plugin that
+            // rewrote it changed its size, and the count on the wire has to say so.
+            let (ty, body) = if typed {
+                let (first, rest) = body.split_first().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a typed pgwire message needs its type byte",
+                    )
+                })?;
+                (Some(*first), rest)
+            } else {
+                (None, body)
+            };
+            let len = u32::try_from(body.len() + 4).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pgwire message too large to frame",
+                )
+            })?;
+            if let Some(ty) = ty {
+                w.write_all(&[ty])?;
+            }
             w.write_all(&len.to_be_bytes())?;
             w.write_all(body)?;
             w.flush()
@@ -542,7 +639,7 @@ fn collect_reply<H: Read + Write>(
     loop {
         let frame = match pending.take() {
             Some(f) => f,
-            None => read_frame(host, spec.framing, spec.max_frame)
+            None => read_frame(host, spec.framing, spec.max_frame, true)
                 .map_err(|e| format!("cannot read the host resource: {e}"))?
                 .ok_or("the host resource closed mid-exchange")?,
         };
@@ -602,6 +699,13 @@ fn collect_reply<H: Read + Write>(
             // up.
             Verdict::Deny(bytes) => {
                 let frame = bytes.or_else(|| spec.deny_frame.clone());
+                if let (Some(marker), Some(frame)) = (marker, frame.as_deref())
+                    && marker.present_in(frame)
+                {
+                    return Err(
+                        "the plugin put the secret marker in the frame it refused with".to_string(),
+                    );
+                }
                 return Ok(Collected {
                     frames: frame.into_iter().collect(),
                     label: answer.label,
@@ -639,15 +743,17 @@ fn collect_reply<H: Read + Write>(
 /// the caller is told, never forwarded on a guess.
 pub(crate) fn relay_one<H: Read + Write>(
     frame: &[u8],
-    dir: Direction,
     seq: u64,
     spec: &BrokerSpec,
     decider: &mut dyn Decider,
     host: &mut H,
     marker: Option<&SecretMarker>,
+    typed: bool,
 ) -> Result<Relayed, String> {
     let mut ask_data = frame.to_vec();
-    let mut ask_dir = dir;
+    // Always a frame on its way *up*, from the cage: a frame coming back is `collect_reply`'s, and
+    // the only thing that changes direction inside one exchange is a query's answer, below.
+    let mut ask_dir = Direction::Up;
     let mut queries = 0u32;
 
     loop {
@@ -676,9 +782,9 @@ pub(crate) fn relay_one<H: Read + Write>(
                          (ceiling {MAX_QUERIES_PER_FRAME})"
                     ));
                 }
-                write_frame(host, spec.framing, &bytes)
+                write_frame(host, spec.framing, &bytes, true)
                     .map_err(|e| format!("cannot reach the host resource: {e}"))?;
-                let reply = read_frame(host, spec.framing, spec.max_frame)
+                let reply = read_frame(host, spec.framing, spec.max_frame, true)
                     .map_err(|e| format!("cannot read the host resource: {e}"))?
                     .ok_or("the host resource closed mid-exchange")?;
                 ask_data = reply;
@@ -699,8 +805,22 @@ pub(crate) fn relay_one<H: Read + Write>(
                     .as_deref()
                     .or(rewritten.as_deref())
                     .unwrap_or(frame);
-                write_frame(host, spec.framing, out)
+                write_frame(host, spec.framing, out, typed)
                     .map_err(|e| format!("cannot reach the host resource: {e}"))?;
+                // A message the protocol answers with nothing: sent, and that is the whole
+                // exchange. Reading here would fail on a close the client asked for, and the
+                // record would call a normal goodbye a refusal.
+                if !answer.expect_reply {
+                    return Ok(Relayed {
+                        outcome: Outcome::Forwarded {
+                            rewritten: rewritten.is_some(),
+                            queries,
+                        },
+                        to_cage: Vec::new(),
+                        label: answer.label,
+                        secret_placed: substituted.is_some(),
+                    });
+                }
                 let reply = collect_reply(spec, decider, host, seq, None, marker)?;
                 return Ok(Relayed {
                     secret_placed: substituted.is_some(),
@@ -741,6 +861,15 @@ pub(crate) fn relay_one<H: Read + Write>(
                 // The plugin's own refusal if it gave one, the manifest's constant if it declared
                 // one, and otherwise nothing — which the caller turns into a closed connection.
                 let frame = bytes.or_else(|| spec.deny_frame.clone());
+                // A refusal reaches the cage like any other answer, so it is held to the same
+                // rule: a plugin cannot smuggle the marker out inside the frame it refuses with.
+                if let (Some(marker), Some(frame)) = (marker, frame.as_deref())
+                    && marker.present_in(frame)
+                {
+                    return Err(
+                        "the plugin put the secret marker in the frame it refused with".to_string(),
+                    );
+                }
                 return Ok(Relayed {
                     outcome: Outcome::Refused {
                         with_frame: frame.is_some(),
@@ -911,6 +1040,11 @@ impl Drop for PluginProcess {
 // Standing the broker up for a launch.
 // -----------------------------------------------------------------------------------
 
+/// The two kinds of stream a broker's host side can be, behind one type so the relay stays written
+/// against `Read + Write` and knows nothing of which was named.
+trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}
+
 /// Cage connections served at once. Each pins a thread, a plugin process and a connection to the
 /// host resource, so the ceiling bounds all three. Past it a connection is dropped rather than
 /// allowed to take a slot nothing bounds — the rule the ssh-agent broker already applies.
@@ -945,8 +1079,10 @@ pub(crate) struct Wiring {
 /// Where a broker's cage-facing socket lands. sbx picks it, and a manifest never does: one per
 /// broker name, so two brokers in one cage cannot collide, and under `/tmp` (a tmpfs the cage
 /// owns) so it can shadow nothing the cage needs.
-fn cage_socket(name: &str) -> String {
-    format!("/tmp/sbx-broker-{name}.sock")
+fn cage_socket(name: &str, file: &str) -> (String, String) {
+    let dir = format!("/tmp/sbx-broker-{name}");
+    let path = format!("{dir}/{file}");
+    (dir, path)
 }
 
 /// Serve one cage connection: start the plugin, open the host resource, and relay frames until
@@ -956,7 +1092,7 @@ fn serve_conn(
     bwrap: &std::path::Path,
     plugin: &crate::plugins::broker::BrokerPlugin,
     allow: &[String],
-    host_socket: &std::path::Path,
+    host_socket: &crate::config::BrokerTarget,
     ring: &super::broker_control::BrokerRing,
     secret: Option<(&str, usize)>,
 ) -> Result<(), String> {
@@ -971,12 +1107,28 @@ fn serve_conn(
     let marker = marker.as_ref();
     let mut decider =
         PluginProcess::start(bwrap, plugin, allow, marker).map_err(|e| e.to_string())?;
-    let mut host = std::os::unix::net::UnixStream::connect(host_socket)
-        .map_err(|e| format!("cannot reach {}: {e}", host_socket.display()))?;
-    // The deadline `relay_one` documents as the caller's to set. Without it a wedged host
-    // resource wedges the cage that is waiting on it.
-    let _ = host.set_read_timeout(Some(HOST_DEADLINE));
-    let _ = host.set_write_timeout(Some(HOST_DEADLINE));
+    // One connection, whichever kind of endpoint was named. Both carry the deadline `relay_one`
+    // documents as the caller's to set: without it a wedged host resource wedges the cage waiting
+    // on it.
+    let mut host: Box<dyn ReadWrite> = match host_socket {
+        crate::config::BrokerTarget::Unix(path) => {
+            let stream = std::os::unix::net::UnixStream::connect(path)
+                .map_err(|e| format!("cannot reach {}: {e}", path.display()))?;
+            let _ = stream.set_read_timeout(Some(HOST_DEADLINE));
+            let _ = stream.set_write_timeout(Some(HOST_DEADLINE));
+            Box::new(stream)
+        }
+        crate::config::BrokerTarget::Tcp { host, port } => {
+            let stream = std::net::TcpStream::connect((host.as_str(), *port))
+                .map_err(|e| format!("cannot reach tcp://{host}:{port}: {e}"))?;
+            let _ = stream.set_read_timeout(Some(HOST_DEADLINE));
+            let _ = stream.set_write_timeout(Some(HOST_DEADLINE));
+            // Nagle would hold a small frame back waiting for more, which on a request/response
+            // protocol is a delay measured in tens of milliseconds per exchange.
+            let _ = stream.set_nodelay(true);
+            Box::new(stream)
+        }
+    };
 
     let spec = &plugin.broker;
     let mut cage_r = io::BufReader::new(cage.try_clone().map_err(|e| e.to_string())?);
@@ -988,13 +1140,13 @@ fn serve_conn(
     // the cage's first message. Skipping this on a greeting protocol would answer every message
     // with the reply to the one before it.
     if spec.host_greets {
-        let greeting = read_frame(&mut host, spec.framing, spec.max_frame)
+        let greeting = read_frame(&mut host, spec.framing, spec.max_frame, true)
             .map_err(|e| format!("cannot read the host resource's greeting: {e}"))?
             .ok_or("the host resource closed before greeting")?;
         let greeted = collect_reply(spec, &mut decider, &mut host, 0, Some(greeting), marker)?;
         let to_cage = greeted.frames;
         for bytes in &to_cage {
-            if write_frame(&mut cage_w, spec.framing, bytes).is_err() {
+            if write_frame(&mut cage_w, spec.framing, bytes, true).is_err() {
                 return Ok(());
             }
         }
@@ -1005,9 +1157,12 @@ fn serve_conn(
     }
     // Only the first refusal of a connection is announced; see below.
     let mut said_refusal = false;
+    // Under `pgwire` the connection's first message from the client carries no type byte (the
+    // startup packet); every later one does. Ignored by the other framings.
+    let mut cage_typed = false;
 
     loop {
-        let frame = match read_frame(&mut cage_r, spec.framing, spec.max_frame) {
+        let frame = match read_frame(&mut cage_r, spec.framing, spec.max_frame, cage_typed) {
             Ok(Some(f)) => f,
             // A clean end, or a frame that is not one: either way the client is done with us.
             Ok(None) | Err(_) => return Ok(()),
@@ -1015,12 +1170,12 @@ fn serve_conn(
         seq += 1;
         let answer = match relay_one(
             &frame,
-            Direction::Up,
             seq,
             spec,
             &mut decider,
             &mut host,
             marker,
+            cage_typed,
         ) {
             Ok(relayed) => {
                 // Every decision goes to the record, which is what a reader consults afterwards.
@@ -1099,7 +1254,7 @@ fn serve_conn(
                     super::lens::sanitize_detail(&why)
                 ));
                 if let Some(deny) = &spec.deny_frame {
-                    let _ = write_frame(&mut cage_w, spec.framing, deny);
+                    let _ = write_frame(&mut cage_w, spec.framing, deny, true);
                 }
                 return Ok(());
             }
@@ -1108,8 +1263,28 @@ fn serve_conn(
             // A refusal with nothing to say: closing is the refusal that needs no protocol.
             return Ok(());
         }
+        cage_typed = true;
         for bytes in &answer {
-            if write_frame(&mut cage_w, spec.framing, bytes).is_err() {
+            // The last place bytes can reach the cage, and therefore the right place to hold the
+            // rule that they must never carry the marker. The verdict paths refuse it earlier and
+            // with a better message; this is the net under them, so a path added later cannot
+            // quietly become the one that leaks it.
+            if let Some(marker) = marker
+                && marker.present_in(bytes)
+            {
+                ring.push(
+                    super::broker_control::BrokerKind::Refuse,
+                    "a frame that would have taught the cage the credential's marker",
+                    None,
+                );
+                crate::diag::warn(&format!(
+                    "broker `{}`: a frame bound for the cage carried the secret marker — refused \
+                     and the connection ended",
+                    plugin.name
+                ));
+                return Ok(());
+            }
+            if write_frame(&mut cage_w, spec.framing, bytes, true).is_err() {
                 return Ok(());
             }
         }
@@ -1212,7 +1387,7 @@ pub(crate) fn start(
         }
     });
 
-    let cage_path = cage_socket(&binding.name);
+    let (cage_dir, cage_path) = cage_socket(&binding.name, &plugin.broker.socket_name);
     Ok((
         Broker {
             host_uds: host_uds.clone(),
@@ -1227,11 +1402,20 @@ pub(crate) fn start(
                 dest: std::path::PathBuf::from(&cage_path),
                 writable: false,
             }],
+            // Each name gets the form its client expects: the socket itself, or the directory
+            // holding it (libpq derives `.s.PGSQL.<port>` from `PGHOST`).
             env: plugin
                 .broker
                 .cage_env
                 .iter()
                 .map(|k| (k.clone(), cage_path.clone()))
+                .chain(
+                    plugin
+                        .broker
+                        .cage_env_dir
+                        .iter()
+                        .map(|k| (k.clone(), cage_dir.clone())),
+                )
                 .collect(),
         },
     ))
@@ -1333,7 +1517,8 @@ mod tests {
             // where the relay's writes end and the host's answers begin.
             loop {
                 let mut cur = std::io::Cursor::new(&self.pending[..]);
-                let Ok(Some(frame)) = read_frame(&mut cur, Framing::LengthU32Be, 4096) else {
+                let Ok(Some(frame)) = read_frame(&mut cur, Framing::LengthU32Be, 4096, false)
+                else {
                     break;
                 };
                 let consumed = cur.position() as usize;
@@ -1341,8 +1526,14 @@ mod tests {
                 self.seen.push(frame);
                 // A frame with no canned reply is a test that under-specified its host: say so
                 // here rather than let the relay block on a read that will never answer.
+                if self.replies.is_empty() {
+                    // A host that answers nothing: legitimate, for a message the protocol defines
+                    // no reply to. A test that meant otherwise sees the relay report a closed
+                    // exchange, which is what a real silent host looks like.
+                    continue;
+                }
                 for reply in self.replies.remove(0) {
-                    write_frame(&mut self.outbox, Framing::LengthU32Be, &reply).unwrap();
+                    write_frame(&mut self.outbox, Framing::LengthU32Be, &reply, false).unwrap();
                 }
             }
             Ok(buf.len())
@@ -1368,6 +1559,7 @@ mod tests {
         fn forward() -> Answer {
             Answer {
                 verdict: Verdict::Forward(None),
+                expect_reply: true,
                 more: false,
                 label: None,
             }
@@ -1387,6 +1579,8 @@ mod tests {
     fn spec(deny_frame: Option<Vec<u8>>) -> BrokerSpec {
         BrokerSpec {
             cage_env: vec!["X_SOCK".to_string()],
+            cage_env_dir: Vec::new(),
+            socket_name: "x.sock".to_string(),
             host_greets: false,
             uses_secret: false,
             framing: Framing::LengthU32Be,
@@ -1402,7 +1596,7 @@ mod tests {
         host: &mut FakeHost,
         spec: &BrokerSpec,
     ) -> Result<Relayed, String> {
-        relay_one(frame, Direction::Up, 7, spec, plugin, host, None)
+        relay_one(frame, 7, spec, plugin, host, None, false)
     }
 
     #[test]
@@ -1432,6 +1626,7 @@ mod tests {
         let mut host = FakeHost::with(vec![vec![0xaa]]);
         let mut plugin = ScriptedPlugin::new(vec![Answer {
             verdict: Verdict::Forward(Some(vec![0x0c, 0x0d])),
+            expect_reply: true,
             more: false,
             label: None,
         }]);
@@ -1458,6 +1653,7 @@ mod tests {
             let mut host = FakeHost::with(Vec::new());
             let mut plugin = ScriptedPlugin::new(vec![Answer {
                 verdict: Verdict::Deny(plugin_bytes),
+                expect_reply: true,
                 more: false,
                 label: Some("not allowed".to_string()),
             }]);
@@ -1486,6 +1682,7 @@ mod tests {
         let mut host = FakeHost::with(Vec::new());
         let mut plugin = ScriptedPlugin::new(vec![Answer {
             verdict: Verdict::Reply(vec![0x0c]),
+            expect_reply: true,
             more: false,
             label: None,
         }]);
@@ -1508,6 +1705,7 @@ mod tests {
         let mut plugin = ScriptedPlugin::new(vec![
             Answer {
                 verdict: Verdict::Query(vec![0x0b]),
+                expect_reply: true,
                 more: false,
                 label: None,
             },
@@ -1550,6 +1748,7 @@ mod tests {
             (0..6)
                 .map(|_| Answer {
                     verdict: Verdict::Query(vec![0x0b]),
+                    expect_reply: true,
                     more: false,
                     label: None,
                 })
@@ -1702,7 +1901,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         spec: &BrokerSpec,
         marker: &SecretMarker,
     ) -> Result<Relayed, String> {
-        relay_one(frame, Direction::Up, 7, spec, plugin, host, Some(marker))
+        relay_one(frame, 7, spec, plugin, host, Some(marker), false)
     }
 
     /// What the capability is for: the plugin places a marker, and the bytes that reach the host
@@ -1714,6 +1913,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let mut host = FakeHost::with(vec![b"R".to_vec()]);
         let mut plugin = ScriptedPlugin::new(vec![Answer {
             verdict: Verdict::Forward(Some(format!("PASSWORD {token}").into_bytes())),
+            expect_reply: true,
             more: false,
             label: None,
         }]);
@@ -1740,6 +1940,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let mut host = FakeHost::with(vec![b"R".to_vec()]);
         let mut plugin = ScriptedPlugin::new(vec![Answer {
             verdict: Verdict::Forward(Some(format!("AUTH {}", marker.token()).into_bytes())),
+            expect_reply: true,
             more: false,
             label: None,
         }]);
@@ -1750,6 +1951,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let mut host = FakeHost::with(vec![b"R".to_vec()]);
         let mut plugin = ScriptedPlugin::new(vec![Answer {
             verdict: Verdict::Forward(Some(b"PLAIN".to_vec())),
+            expect_reply: true,
             more: false,
             label: None,
         }]);
@@ -1781,6 +1983,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let mut host = FakeHost::with(vec![b"R".to_vec()]);
         let mut plugin = ScriptedPlugin::new(vec![Answer {
             verdict: Verdict::Query(format!("ECHO {}", marker.token()).into_bytes()),
+            expect_reply: true,
             more: false,
             label: None,
         }]);
@@ -1798,12 +2001,32 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let mut host = FakeHost::with(Vec::new());
         let mut plugin = ScriptedPlugin::new(vec![Answer {
             verdict: Verdict::Reply(format!("HERE {}", marker.token()).into_bytes()),
+            expect_reply: true,
             more: false,
             label: None,
         }]);
         let err = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker)
             .expect_err("must be refused");
         assert!(err.contains("answer the cage"), "{err}");
+    }
+
+    /// A refusal reaches the cage like any other answer, so it is held to the same rule. This was
+    /// the path the guard first missed: it covered `reply` and not `deny`, and a plugin could have
+    /// taught the cage the marker inside the very frame it refused with.
+    #[test]
+    fn the_marker_is_refused_in_the_frame_a_plugin_denies_with() {
+        let marker = marker_for("hunter2");
+        let mut host = FakeHost::with(Vec::new());
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Deny(Some(format!("NO {}", marker.token()).into_bytes())),
+            expect_reply: true,
+            more: false,
+            label: None,
+        }]);
+        let err = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker)
+            .expect_err("must be refused");
+        assert!(err.contains("refused with"), "{err}");
+        assert!(host.seen.is_empty(), "nothing reached the host either");
     }
 
     /// The same guard on the way back, where a plugin that inspects replies could rebuild one.
@@ -1819,6 +2042,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             ScriptedPlugin::forward(),
             Answer {
                 verdict: Verdict::Forward(Some(format!("R {}", marker.token()).into_bytes())),
+                expect_reply: true,
                 more: false,
                 label: None,
             },
@@ -1879,11 +2103,13 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             ScriptedPlugin::forward(),
             Answer {
                 verdict: Verdict::Forward(None),
+                expect_reply: true,
                 more: true,
                 label: None,
             },
             Answer {
                 verdict: Verdict::Forward(None),
+                expect_reply: true,
                 more: false,
                 label: Some("done".to_string()),
             },
@@ -1901,6 +2127,32 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             "both lines reach the cage, in order"
         );
         assert_eq!(label.as_deref(), Some("done"));
+    }
+
+    /// Some messages get no answer — PostgreSQL's `Terminate`, and the close of many protocols.
+    /// Waiting for one would end the connection on a read that can only fail, and would be
+    /// recorded as a refusal: a record saying something that did not happen.
+    #[test]
+    fn a_message_the_protocol_never_answers_is_not_a_refusal() {
+        // The host is given no reply to hand out: reading would fail if the relay tried.
+        let mut host = FakeHost::with(Vec::new());
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Forward(None),
+            expect_reply: false,
+            more: false,
+            label: Some("goodbye".to_string()),
+        }]);
+        let out = relay(b"X", &mut plugin, &mut host, &spec(None)).expect("not an error");
+        assert!(
+            matches!(out.outcome, Outcome::Forwarded { .. }),
+            "a goodbye is a forward, not a refusal: {:?}",
+            out.outcome
+        );
+        assert!(
+            out.to_cage.is_empty(),
+            "and there is nothing to answer with"
+        );
+        assert_eq!(host.seen, vec![b"X".to_vec()], "the message did go out");
     }
 
     /// A plugin that keeps saying `more` while the host keeps talking would hold the cage's
@@ -1921,6 +2173,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let answers = std::iter::once(ScriptedPlugin::forward())
             .chain((0..MAX_REPLY_FRAMES + 2).map(|_| Answer {
                 verdict: Verdict::Forward(None),
+                expect_reply: true,
                 more: true,
                 label: None,
             }))
@@ -1944,6 +2197,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             ScriptedPlugin::forward(),
             Answer {
                 verdict: Verdict::Reply(vec![0xaa]),
+                expect_reply: true,
                 more: false,
                 label: Some("second key withheld".to_string()),
             },
@@ -1997,6 +2251,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             ScriptedPlugin::forward(),
             Answer {
                 verdict: Verdict::Deny(None),
+                expect_reply: true,
                 more: false,
                 label: None,
             },
@@ -2010,19 +2265,92 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         assert_eq!(out, vec![vec![5]], "the manifest's refusal, not the answer");
     }
 
+    /// PostgreSQL's framing, on the bytes the protocol actually puts on a wire. The length counts
+    /// itself, which is the part a formula gets wrong: a body of 4 bytes is a length of 8.
+    #[test]
+    fn a_pgwire_message_carries_its_type_and_a_length_that_counts_itself() {
+        // `p` (PasswordMessage) with a 6-byte body: 1 + 4 + 6 on the wire, length field = 10.
+        let wire = b"p\x00\x00\x00\x0Asecret".to_vec();
+        let mut cur = std::io::Cursor::new(wire.clone());
+        let frame = read_frame(&mut cur, Framing::PgWire, 4096, true)
+            .unwrap()
+            .expect("a message");
+        assert_eq!(
+            frame,
+            b"psecret".to_vec(),
+            "the plugin sees the type and the body, never the byte count"
+        );
+
+        let mut back = Vec::new();
+        write_frame(&mut back, Framing::PgWire, &frame, true).unwrap();
+        assert_eq!(back, wire, "and it goes back on the wire byte for byte");
+    }
+
+    /// The exception no formula covers: the client's first message has no type byte at all.
+    #[test]
+    fn the_startup_packet_has_no_type_byte() {
+        // Length 8, then a 4-byte protocol version. Nothing before the length.
+        let wire = b"\x00\x00\x00\x08\x00\x03\x00\x00".to_vec();
+        let mut cur = std::io::Cursor::new(wire.clone());
+        let frame = read_frame(&mut cur, Framing::PgWire, 4096, false)
+            .unwrap()
+            .expect("a startup packet");
+        assert_eq!(frame, b"\x00\x03\x00\x00".to_vec());
+
+        let mut back = Vec::new();
+        write_frame(&mut back, Framing::PgWire, &frame, false).unwrap();
+        assert_eq!(back, wire);
+    }
+
+    /// The reason sbx owns the framing: a plugin that rewrites a body must not also have to fix a
+    /// byte count, and a stale count would corrupt every message after it.
+    #[test]
+    fn a_rewritten_pgwire_body_is_reframed_with_the_new_length() {
+        let mut out = Vec::new();
+        write_frame(&mut out, Framing::PgWire, b"pmuch-longer-secret", true).unwrap();
+        assert_eq!(&out[..1], b"p");
+        assert_eq!(
+            u32::from_be_bytes(out[1..5].try_into().unwrap()) as usize,
+            "much-longer-secret".len() + 4,
+            "the count on the wire follows the body it now describes"
+        );
+        // And it reads back as one message.
+        let mut cur = std::io::Cursor::new(out);
+        assert_eq!(
+            read_frame(&mut cur, Framing::PgWire, 4096, true).unwrap(),
+            Some(b"pmuch-longer-secret".to_vec())
+        );
+    }
+
+    /// A length below its own four bytes is not a length. The cage writes this field, so it is
+    /// checked rather than trusted.
+    #[test]
+    fn a_pgwire_length_below_its_own_header_is_refused() {
+        for len in [0u32, 3] {
+            let mut wire = b"p".to_vec();
+            wire.extend_from_slice(&len.to_be_bytes());
+            let mut cur = std::io::Cursor::new(wire);
+            let err = read_frame(&mut cur, Framing::PgWire, 4096, true).expect_err("not a length");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "len {len}");
+        }
+    }
+
     /// The framing of Assuan and of most text protocols: the newline is the frame boundary, not
     /// part of the message.
     #[test]
     fn a_line_framed_message_travels_without_its_terminator() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, Framing::Line, b"OK Pleased to meet you").unwrap();
+        write_frame(&mut buf, Framing::Line, b"OK Pleased to meet you", false).unwrap();
         assert_eq!(buf, b"OK Pleased to meet you\n");
         let mut cur = std::io::Cursor::new(buf);
         assert_eq!(
-            read_frame(&mut cur, Framing::Line, 4096).unwrap(),
+            read_frame(&mut cur, Framing::Line, 4096, false).unwrap(),
             Some(b"OK Pleased to meet you".to_vec())
         );
-        assert_eq!(read_frame(&mut cur, Framing::Line, 4096).unwrap(), None);
+        assert_eq!(
+            read_frame(&mut cur, Framing::Line, 4096, false).unwrap(),
+            None
+        );
     }
 
     /// Two messages in one stream must come back as two, which is the whole of what a framing has
@@ -2031,14 +2359,17 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
     fn consecutive_lines_are_two_frames() {
         let mut cur = std::io::Cursor::new(b"D 2.4.8\nOK\n".to_vec());
         assert_eq!(
-            read_frame(&mut cur, Framing::Line, 4096).unwrap(),
+            read_frame(&mut cur, Framing::Line, 4096, false).unwrap(),
             Some(b"D 2.4.8".to_vec())
         );
         assert_eq!(
-            read_frame(&mut cur, Framing::Line, 4096).unwrap(),
+            read_frame(&mut cur, Framing::Line, 4096, false).unwrap(),
             Some(b"OK".to_vec())
         );
-        assert_eq!(read_frame(&mut cur, Framing::Line, 4096).unwrap(), None);
+        assert_eq!(
+            read_frame(&mut cur, Framing::Line, 4096, false).unwrap(),
+            None
+        );
     }
 
     /// An over-long line is an error, not a truncation: half a message on a wire is worse than
@@ -2046,7 +2377,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
     #[test]
     fn an_over_long_line_is_refused_rather_than_cut() {
         let mut cur = std::io::Cursor::new(b"aaaaaaaaaa\n".to_vec());
-        let err = read_frame(&mut cur, Framing::Line, 4).expect_err("over the bound");
+        let err = read_frame(&mut cur, Framing::Line, 4, false).expect_err("over the bound");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -2055,7 +2386,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
     #[test]
     fn a_stream_that_ends_mid_line_is_an_error_not_an_end() {
         let mut cur = std::io::Cursor::new(b"OK no newline".to_vec());
-        let err = read_frame(&mut cur, Framing::Line, 4096).expect_err("truncated");
+        let err = read_frame(&mut cur, Framing::Line, 4096, false).expect_err("truncated");
         assert!(err.to_string().contains("mid-line"), "{err}");
     }
 
@@ -2063,7 +2394,8 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
     #[test]
     fn a_line_framed_message_may_not_contain_a_newline() {
         let mut buf = Vec::new();
-        let err = write_frame(&mut buf, Framing::Line, b"OK\nERR forged").expect_err("refused");
+        let err =
+            write_frame(&mut buf, Framing::Line, b"OK\nERR forged", false).expect_err("refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(buf.is_empty(), "nothing may reach the wire: {buf:?}");
     }
@@ -2071,14 +2403,14 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
     #[test]
     fn a_frame_survives_the_framing_round_trip() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, Framing::LengthU32Be, &[0x0b, 0xff]).unwrap();
+        write_frame(&mut buf, Framing::LengthU32Be, &[0x0b, 0xff], false).unwrap();
         assert_eq!(buf, vec![0, 0, 0, 2, 0x0b, 0xff]);
         let mut cur = std::io::Cursor::new(buf);
-        let got = read_frame(&mut cur, Framing::LengthU32Be, 4096).unwrap();
+        let got = read_frame(&mut cur, Framing::LengthU32Be, 4096, false).unwrap();
         assert_eq!(got, Some(vec![0x0b, 0xff]));
         // And a clean end of stream is not an error.
         assert_eq!(
-            read_frame(&mut cur, Framing::LengthU32Be, 4096).unwrap(),
+            read_frame(&mut cur, Framing::LengthU32Be, 4096, false).unwrap(),
             None
         );
     }
@@ -2090,7 +2422,8 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             let mut bytes = prefix.to_be_bytes().to_vec();
             bytes.extend_from_slice(&[0u8; 4]);
             let mut cur = std::io::Cursor::new(bytes);
-            let err = read_frame(&mut cur, Framing::LengthU32Be, 4).expect_err("out of range");
+            let err =
+                read_frame(&mut cur, Framing::LengthU32Be, 4, false).expect_err("out of range");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "prefix {prefix}");
         }
     }

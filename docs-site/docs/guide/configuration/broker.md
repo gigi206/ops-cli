@@ -26,6 +26,28 @@ See also: [Broker plugins](../secrets/plugins#the-broker-type) ·
 [`[ssh_agent]`](ssh-agent) · [The trust gate](../concepts/trust) ·
 [Secrets](../secrets/).
 
+## The host resource: a Unix socket, or a TCP endpoint
+
+```toml
+[broker.gpg-agent]
+socket = "$XDG_RUNTIME_DIR/gnupg/S.gpg-agent"   # a socket on this machine
+
+[broker.pg]
+socket = "tcp://db.internal:5432"               # an endpoint, subject to the allowlist
+```
+
+A Unix socket is a resource of this machine. A **TCP endpoint is a way out of the cage**, so
+it is admitted only where [`[network]`](network) already admits it: `sbx` asks the very
+function the filtering proxy and `sbx test net` decide through, so the three cannot drift
+apart. A broker pointed at an endpoint the allowlist does not carry is not started, and the
+message names the rule to add.
+
+Without that rule there would be two different answers to *where may this cage go* — and the
+one a reader checks would not be the one that decides.
+
+The cage still reaches nothing itself: it connects to a socket `sbx` serves, and `sbx` opens
+the connection on the host side. The empty network namespace is untouched.
+
 ## Why the table is split across two layers
 
 The two halves answer different questions, and they are gated differently on purpose.
@@ -137,6 +159,17 @@ consequences a manifest has to live with:
   never stops talking ends the exchange as a refusal rather than holding the cage's
   connection open.
 
+Two other shapes a protocol may have, each declared by the plugin rather than guessed:
+
+- **A message the host never answers** — PostgreSQL's `Terminate`, the close of many
+  protocols. The plugin says so on the verdict, and `sbx` sends it without waiting.
+  Waiting would end the connection on a read that can only fail, and the session record
+  would call a normal goodbye a refusal.
+- **A framing whose length counts itself**, and whose first message has no type byte:
+  that is `pgwire`. A plugin is handed the type byte and the body, never the byte count —
+  because a plugin that rewrites a body must not have to fix a count, so `sbx` recomputes
+  it.
+
 Some protocols also have the **host speak first**: gpg-agent greets every connection with
 `OK Pleased to meet you` before the cage has said anything. A manifest declares that with
 `host_greets`, and without it `sbx` would read the greeting as the answer to the cage's first
@@ -145,10 +178,24 @@ the greeting reaches the cage, so the broker has to be able to rule on it.
 
 ## What the cage sees
 
-The plugin's manifest names the variables that must point at the broker's socket, and
-`sbx` sets each of them to the path it chose. A manifest cannot name that path, and it
-cannot name a variable that loads code (`LD_*`, `PATH`, and the rest of the reserved set):
-a broker points a client at its socket, it does not arrange for something to be executed.
+The plugin's manifest names the variables that must point at the broker, and `sbx` sets
+each of them. Two forms, because clients differ:
+
+- `cage_env` — the variable takes the **socket file** (`SSH_AUTH_SOCK`, `GPG_AGENT_SOCK`);
+- `cage_env_dir` — it takes the **directory holding it**, for a client that derives the
+  file name itself. libpq reads `PGHOST` as a directory and looks for `.s.PGSQL.<port>`
+  inside, so a broker for PostgreSQL uses this form and names the file with `socket_name`.
+
+`socket_name` is a **file name, never a path**: the directory stays `sbx`'s to choose, which
+is what keeps a manifest from placing a socket over something the cage needs and keeps two
+brokers from colliding. Without these two, a client with its own naming convention could
+only be served by linking the socket into place by hand — the difference between a
+mechanism that works and one that works for whoever knows the trick.
+
+A manifest also cannot name a variable that loads code (`LD_*`, `PATH`, and the rest of the
+reserved set), nor one `sbx` sets for a broker of its own: a broker points a client at its
+socket, it does not arrange for something to be executed, and it does not stand in for
+another broker.
 
 ## Seeing what is bound
 

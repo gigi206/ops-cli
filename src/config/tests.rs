@@ -1905,7 +1905,7 @@ fn a_project_may_set_a_brokers_policy_but_never_the_resource_it_brokers() {
     assert_eq!(r.brokers.len(), 1);
     assert_eq!(
         r.brokers[0].socket,
-        std::path::PathBuf::from("/run/host/S.gpg-agent"),
+        crate::config::BrokerTarget::Unix(std::path::PathBuf::from("/run/host/S.gpg-agent")),
         "a project may not repoint a broker at another host resource"
     );
     assert_eq!(
@@ -1919,6 +1919,46 @@ fn a_project_may_set_a_brokers_policy_but_never_the_resource_it_brokers() {
         "the dropped socket is named: {:?}",
         r.warnings
     );
+}
+
+/// A broker may stand in front of a TCP endpoint, not only a Unix socket. The endpoint is parsed
+/// here; whether the cage may reach it is the allowlist's answer, given at launch.
+#[test]
+fn a_broker_target_may_be_a_tcp_endpoint() {
+    let global = with_broker(
+        raw(&[], &[]),
+        "pg",
+        raw_broker(Some("tcp://db.internal:5432"), &[]),
+    );
+    let r = resolve_no_plugins(global, None);
+    assert_eq!(
+        r.brokers[0].socket,
+        crate::config::BrokerTarget::Tcp {
+            host: "db.internal".to_string(),
+            port: 5432
+        }
+    );
+}
+
+/// A malformed endpoint is refused rather than half-read: a missing port would leave sbx guessing
+/// which service a broker stands in front of.
+#[test]
+fn a_tcp_endpoint_without_a_usable_port_is_refused() {
+    for bad in [
+        "tcp://db.internal",
+        "tcp://db.internal:0",
+        "tcp://db:http",
+        "tcp://:5432",
+    ] {
+        let global = with_broker(raw(&[], &[]), "pg", raw_broker(Some(bad), &[]));
+        let r = resolve_no_plugins(global, None);
+        assert!(r.brokers.is_empty(), "{bad} must not bind a broker");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("not started")),
+            "{bad}: {:?}",
+            r.warnings
+        );
+    }
 }
 
 /// An untrusted project's whole section is dropped, and named — so "not configured" and "not

@@ -167,6 +167,30 @@ fn is_proxy_env_key(key: &str) -> bool {
     )
 }
 
+/// Where a broker's host resource lives: a Unix socket on this machine, or a TCP endpoint.
+///
+/// A TCP target is a **way out of the cage**, unlike a Unix socket, so it is admitted only where
+/// the network allowlist already admits it. Without that there would be two different answers to
+/// "where may this cage go", and the one a reader checks (`[network]`) would not be the one that
+/// decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BrokerTarget {
+    /// A Unix socket path on this machine.
+    Unix(PathBuf),
+    /// A TCP endpoint, subject to the egress allowlist.
+    Tcp { host: String, port: u16 },
+}
+
+impl BrokerTarget {
+    /// How the target is shown in a note, a warning, or `sbx config`.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            BrokerTarget::Unix(path) => path.display().to_string(),
+            BrokerTarget::Tcp { host, port } => format!("tcp://{host}:{port}"),
+        }
+    }
+}
+
 /// One broker plugin's binding: the host resource it stands in front of, and the policy it
 /// brokers under.
 ///
@@ -178,8 +202,8 @@ fn is_proxy_env_key(key: &str) -> bool {
 pub(crate) struct BrokerBinding {
     /// The installed broker plugin's name, which is the table's key.
     pub(crate) name: String,
-    /// The host resource's socket, expanded. sbx connects to it and holds the connection.
-    pub(crate) socket: PathBuf,
+    /// The host resource sbx connects to and holds the connection to.
+    pub(crate) socket: BrokerTarget,
     /// The policy, passed to the plugin verbatim at the start of every connection.
     pub(crate) allow: Vec<String>,
     /// Where the credential this broker places comes from, when the global config named one and
@@ -3405,6 +3429,27 @@ fn apply_binds(
     }
 }
 
+/// Parse a `tcp://host:port` endpoint. The port is required: a broker stands in front of one
+/// service, and guessing a default would put it in front of something nobody named.
+fn parse_tcp_endpoint(endpoint: &str) -> Result<BrokerTarget, String> {
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .ok_or("needs a port, e.g. `tcp://localhost:5432`")?;
+    if host.is_empty() {
+        return Err("needs a host".to_string());
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("has `{port}` where a port number belongs"))?;
+    if port == 0 {
+        return Err("has port 0, which names no service".to_string());
+    }
+    Ok(BrokerTarget::Tcp {
+        host: host.to_string(),
+        port,
+    })
+}
+
 /// Turn the layered `[broker.<name>]` tables into the bindings a launch acts on.
 ///
 /// Fail-closed and named at every step: a table that binds no socket, one whose socket does not
@@ -3435,23 +3480,36 @@ fn resolve_brokers(
             ));
             continue;
         };
-        let socket = match expand_bind_path(&raw, home.as_deref(), runtime.as_deref()) {
-            Ok(p) if p.is_absolute() => p,
-            Ok(p) => {
-                warnings.push(format!(
-                    "`[broker.{name}] socket` is `{}`, which is not an absolute path — the broker \
-                     is not started",
-                    p.display()
-                ));
-                continue;
-            }
-            Err(why) => {
-                warnings.push(format!(
-                    "`[broker.{name}] socket` cannot be resolved ({why}) — the broker is not \
-                     started"
-                ));
-                continue;
-            }
+        // `tcp://host:port` names an endpoint; anything else is a path on this machine.
+        let socket = match raw.strip_prefix("tcp://") {
+            Some(endpoint) => match parse_tcp_endpoint(endpoint) {
+                Ok(target) => target,
+                Err(why) => {
+                    warnings.push(format!(
+                        "`[broker.{name}] socket` is `{raw}`, which {why} — the broker is not \
+                         started"
+                    ));
+                    continue;
+                }
+            },
+            None => match expand_bind_path(&raw, home.as_deref(), runtime.as_deref()) {
+                Ok(p) if p.is_absolute() => BrokerTarget::Unix(p),
+                Ok(p) => {
+                    warnings.push(format!(
+                        "`[broker.{name}] socket` is `{}`, which is neither an absolute path nor \
+                         a `tcp://host:port` endpoint — the broker is not started",
+                        p.display()
+                    ));
+                    continue;
+                }
+                Err(why) => {
+                    warnings.push(format!(
+                        "`[broker.{name}] socket` cannot be resolved ({why}) — the broker is not \
+                         started"
+                    ));
+                    continue;
+                }
+            },
         };
         // The secret's sources are parsed here, where a bad reference is still a configuration
         // error rather than something that surfaces at the first frame. A broker whose secret does
