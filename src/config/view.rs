@@ -66,6 +66,10 @@ pub(crate) struct ConfigView {
     /// Whether the egress proxy records `sbx net stats` (on by default; off via `[network] stats =
     /// false`). Only meaningful under a filtering posture (the proxy runs only then).
     pub(crate) egress_stats: bool,
+    /// The shortest credential this launch scans for, in bytes (`[redact] min_len`).
+    pub(crate) redact_min_len: usize,
+    /// Which layer supplied the redaction floor (`Default` when no config set it).
+    pub(crate) redact_min_len_origin: ProvenanceView,
     /// The resolved process/exec posture.
     pub(crate) proc: ProcView,
     /// Which layer supplied the proc posture (`Default` when neither config set it).
@@ -920,6 +924,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         network,
         network_origin: resolved.network_origin.into(),
         egress_stats: resolved.egress_stats,
+        redact_min_len: resolved.redact_min_len,
+        redact_min_len_origin: resolved.redact_min_len_origin.into(),
         proc: proc_view(&resolved.proc),
         proc_origin: resolved.proc_origin.into(),
         notify: notify_view(&resolved.notify),
@@ -1712,6 +1718,8 @@ mod tests {
             },
             network_origin: ProvenanceView::Project,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::Wayland,
@@ -2023,6 +2031,8 @@ mod tests {
             network: NetworkPolicy::Shared,
             network_origin: Provenance::Default,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
             gpu: false,

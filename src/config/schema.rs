@@ -219,6 +219,11 @@ pub(crate) struct RawConfig {
     /// files off is not a capability it could abuse. Empty or absent leaves the project tree as the
     /// launch mounts it.
     pub(crate) fs: Option<RawFs>,
+    /// How short a credential may be and still be scanned for, declared as the `[redact]` table. A
+    /// security field — honored from the global config or a trusted project, ignored from an
+    /// untrusted one: raising the floor drops credentials out of the leak tripwires, a choice an
+    /// untrusted project may not make. Absent leaves the built-in floor.
+    pub(crate) redact: Option<RawRedact>,
     /// Network-scoped config that is not itself a posture — currently the reusable egress
     /// groups (`[net.groups]`). A group is a named list of egress entries that any `[network]`
     /// `allow`/`deny` list may reference with `@<name>`, so a set of hosts is declared once and
@@ -453,6 +458,29 @@ pub(crate) struct RawFs {
     /// Project paths the cage may read but not write, in an otherwise writable tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) readonly: Vec<String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// The `[redact]` table: how short a credential may be and still be scanned for.
+///
+/// The floor exists because a needle is a byte substring with no notion of what it is inside: a
+/// short value matches benign traffic, where it refuses legitimate egress on the way out and
+/// peppers a task's output with placeholders on the way back — and those placeholders leak the
+/// value through their positions. Below the floor a credential is still injected and still used;
+/// only the scanning is skipped, and the launch says so.
+///
+/// The table exists because the right floor depends on the credentials at hand: a deployment whose
+/// tokens are all long can raise it and stop scanning for accidental matches, one holding a short
+/// legitimate key can lower it and accept the noise. Baseline-only: the floor is a property of the
+/// launch, so an `[app.<name>]` profile does not carry one.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawRedact {
+    /// The shortest credential, in bytes, that is still scanned for. Unset leaves the built-in
+    /// floor; `0` is refused (a zero-length needle matches at every offset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) min_len: Option<u64>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,

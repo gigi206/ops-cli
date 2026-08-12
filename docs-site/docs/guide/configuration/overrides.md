@@ -205,8 +205,8 @@ a collection is **unioned** (see below).
 
 One uniform rule across all four tiers:
 
-- **Scalars** (`nixpkgs`, `network`, `gui`, `proc`, `notify`) are **replaced** by the highest
-  tier that sets them.
+- **Scalars** (`nixpkgs`, `network`, `gui`, `proc`, `notify`, `[redact] min_len`) are
+  **replaced** by the highest tier that sets them.
 - **Collections** (`env`, `packages`, `binds`, `forward`, `limits`, `seccomp`,
   `devices`, `[fs]`) are **unioned**, the higher tier winning per key/entry: so `--bind` *adds*
   to whatever the blobs bound, and `--limit tasks_max=…` tunes one limit without dropping
@@ -223,7 +223,8 @@ An override is the final word, so a mistake must never silently launch a *differ
 posture:
 
 - A **set-but-invalid** security value (a `--net nonee` typo, a `--gui bogus`, a
-  `--proc enfroce`, a `--notify alwyas`, a bad `[limits]` value, a bad `nixpkgs`) is a
+  `--proc enfroce`, a `--notify alwyas`, a bad `[limits]` value, a `[redact] min_len = 0`,
+  a bad `nixpkgs`) is a
   **hard error, exit 2, no launch**. Silently keeping the baseline could leave a *wider*
   posture, or, for `--notify`, a *quieter* one, than the mistyped intent.
 - A **structural** error (a `--limit` with no `=`, a `--bind` with an empty path, a bad

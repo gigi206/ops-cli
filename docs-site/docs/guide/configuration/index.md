@@ -87,6 +87,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `forward` | security | [forward](../networking/forward) |
 | `[notify]` | security | [notify](notify) |
 | `[secret]` | security | [secret](secret) |
+| `[redact]` | security | [redaction](../secrets/redaction#the-length-floor) |
 | `[task.<name>]` | security | [task](task), and [Declared operations](../tasks/) |
 | `[app.<name>]` | security overlay | [apps](apps) |
 | `[plugin.<name>]` | security | [resolver plugins](../secrets/plugins#configuring-a-plugin-from-your-own-config) |

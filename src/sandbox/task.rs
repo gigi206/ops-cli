@@ -231,6 +231,10 @@ pub(crate) struct TaskEngine {
     /// The session's `[fs]` masks and the decoys they mount, when the config declared any. Every
     /// task cage re-emits them over its own project bind, minus what that task's `unmask` lifts.
     fs_masks: Option<(super::fsmask::Expanded, super::fsmask::Decoys)>,
+    /// The session's `[redact] min_len`: the shortest credential an invocation builds a needle for.
+    /// Held by the engine rather than read per invocation so a task's output and the session's own
+    /// egress are watched to the same depth — they are the two renderings of one floor.
+    redact_min_len: usize,
 }
 
 /// The two cage programs a task's egress forwarder is built from, named rather than passed as a pair
@@ -353,6 +357,7 @@ impl TaskEngine {
         slug: &str,
         ca_bundle: Option<&Path>,
         forwarder: CageForwarder,
+        redact_min_len: usize,
     ) -> Self {
         Self {
             bwrap: bwrap.to_path_buf(),
@@ -371,6 +376,7 @@ impl TaskEngine {
             running: Arc::new(Mutex::new(BTreeMap::new())),
             notify: None,
             fs_masks: None,
+            redact_min_len,
         }
     }
 
@@ -617,9 +623,7 @@ impl TaskEngine {
         for secret in &task.secrets {
             let plaintext = resolve_secret(secret, &self.config_root, &self.bwrap)
                 .map_err(TaskError::Credential)?;
-            for bytes in secret.encode.variants(&plaintext) {
-                needles.push(SecretNeedle::named(&secret.var, bytes));
-            }
+            needles.extend(credential_needles(secret, &plaintext, self.redact_min_len));
             secret_env.push((secret.var.clone(), secret.encode.render(&plaintext)));
         }
         for (k, v) in &task.env {
@@ -706,6 +710,7 @@ impl TaskEngine {
                 // A task's refusals reach the session's notifier, whose needle set this proxy's own
                 // resolved credentials are added to.
                 self.notify.as_deref(),
+                self.redact_min_len,
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;
@@ -2110,6 +2115,7 @@ impl TaskEngine {
         Self {
             fs_masks: None,
             notify: None,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             bwrap: PathBuf::from("/nonexistent/bwrap"),
             forwarder: CageForwarder {
                 socat: PathBuf::from("/nonexistent/socat"),
@@ -2149,6 +2155,42 @@ impl TaskEngine {
         self.project = project;
         self
     }
+}
+
+/// The needles one resolved task credential contributes: every spelling of it — the plaintext and
+/// whatever encoding the declaration asks for — that clears the launch's redaction floor.
+///
+/// The floor is the launch's own ([`crate::sandbox::redact::MIN_LEN_DEFAULT`], moved by `[redact]
+/// min_len`) — the same value a wire injection is held to — and it is here for the same two
+/// reasons: a short value peppers the output with placeholders whose positions give it away, and it
+/// matches text the command legitimately printed. A spelling below the floor is declined out loud:
+/// the command still receives the credential, and output that carries one while looking substituted
+/// is the trap this warning exists to prevent.
+///
+/// Applied per spelling, where a wire injection applies it to the credential as a whole. An
+/// encoding can be longer than what it encodes, so a plaintext under the floor can still have a
+/// spelling worth watching for, and here that spelling is kept.
+pub(super) fn credential_needles(
+    secret: &crate::config::TaskSecret,
+    plaintext: &str,
+    min_len: usize,
+) -> Vec<SecretNeedle> {
+    let mut needles = Vec::new();
+    for bytes in secret.encode.variants(plaintext) {
+        if bytes.len() < min_len {
+            crate::diag::warn(&format!(
+                "one spelling of the credential for `{}` is too short ({} bytes, under the \
+                 {min_len}-byte `[redact] min_len` floor) to substitute out of this task's output \
+                 safely; the command still receives it, and that spelling is not substituted if it \
+                 reaches the output",
+                secret.var,
+                bytes.len()
+            ));
+            continue;
+        }
+        needles.push(SecretNeedle::named(&secret.var, bytes));
+    }
+    needles
 }
 
 /// Read one credential host-side, trying its sources in order. The first that yields a non-empty
@@ -2265,6 +2307,7 @@ mod smoke {
                 shell: crate::pathfind::find_on_path("bash")
                     .unwrap_or_else(|| PathBuf::from("/nonexistent/bash")),
             },
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
         );
         Some((engine, data))
     }
@@ -3116,6 +3159,7 @@ mod tests {
         TaskEngine {
             fs_masks: None,
             notify: None,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             forwarder: CageForwarder {
                 socat: PathBuf::from("/nix/store/base/bin/socat"),

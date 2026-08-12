@@ -5100,7 +5100,11 @@ fn run_with_refresh(
     let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
     let proxy_ca_der = proxy_ca.ca_cert_der();
 
-    let credentials = Arc::new(Credentials::new(injections, Vec::new()));
+    let credentials = Arc::new(Credentials::new(
+        injections,
+        Vec::new(),
+        crate::sandbox::redact::MIN_LEN_DEFAULT,
+    ));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = calls.clone();
     let refresh = Arc::new(CredentialRefresh::new(

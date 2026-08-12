@@ -16,12 +16,23 @@
 
 use crate::sandbox::proxy::SecretNeedle;
 
-/// A value shorter than this many bytes is never substituted. Two independent reasons, both
-/// pointing the same way: on the wire such a needle matches benign traffic and would refuse
-/// legitimate egress (a self-inflicted denial), and on a text sink it would pepper the output with
-/// placeholders and *leak the value* through their positions and frequency. Below the threshold the
-/// credential is still used — only the substitution is skipped, and loudly.
-pub(crate) const REDACT_MIN_LEN: usize = 8;
+/// The floor a launch that configures none runs under: a value shorter than this many bytes is
+/// never scanned for. Two independent reasons, both pointing the same way: on the wire such a
+/// needle matches benign traffic and would refuse legitimate egress (a self-inflicted denial), and
+/// on a text sink it would pepper the output with placeholders and *leak the value* through their
+/// positions and frequency. Below the floor the credential is still used — only the scanning is
+/// skipped, and loudly. `[redact] min_len` moves it.
+///
+/// The floor is enforced where a needle is **built** — the three places a credential becomes one —
+/// rather than where it is applied. So a needle that exists is one *both* renderings scan for:
+/// there is no second threshold here for a caller to pass a different value to, and none for the
+/// wire and a text sink to disagree over.
+///
+/// What the two do decide separately is *granularity*, and the floor value does not change it: a
+/// wire injection admits or declines a credential as a whole (on its plaintext length), while a
+/// task credential is judged per spelling, so an encoding longer than what it encodes can be
+/// admitted where the plaintext was not.
+pub(crate) const MIN_LEN_DEFAULT: usize = 8;
 
 /// How a substituted value is named in the output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,38 +67,40 @@ impl Placeholder {
 ///
 /// Needles are applied **longest first**, so a value that contains another (a plaintext and an
 /// encoding of it that share a prefix, two credentials where one is a substring of the other) is
-/// named after the longest match rather than being broken up by a shorter one. A needle below
-/// [`REDACT_MIN_LEN`] is skipped — see the constant.
+/// named after the longest match rather than being broken up by a shorter one.
+///
+/// Every needle handed in is substituted: the length floor is applied where a needle is built (see
+/// [`MIN_LEN_DEFAULT`]), so a set that reached here is one this sink and the wire agree on.
+///
+/// The search is the needle's own [`SecretNeedle::find_in`], the same one the wire path masks
+/// with — so both renderings find an occurrence by the identical rule, and an empty needle (which
+/// would otherwise match at every offset while consuming nothing, and so never terminate) is
+/// declined there rather than by a condition each caller could forget.
 pub(crate) fn redact_named(
     buf: &[u8],
     needles: &[SecretNeedle],
     placeholder: &Placeholder,
 ) -> (Vec<u8>, usize) {
-    // Longest first, and skip what is too short to substitute safely. Sorting indices keeps the
-    // caller's needle set untouched.
-    let mut order: Vec<&SecretNeedle> = needles
-        .iter()
-        .filter(|n| n.as_bytes().len() >= REDACT_MIN_LEN)
-        .collect();
+    // Longest first. Sorting borrowed references keeps the caller's needle set untouched.
+    let mut order: Vec<&SecretNeedle> = needles.iter().collect();
     order.sort_by_key(|n| std::cmp::Reverse(n.as_bytes().len()));
 
     let mut out = buf.to_vec();
     let mut count = 0;
     for needle in order {
-        let bytes = needle.as_bytes();
+        let len = needle.as_bytes().len();
         let replacement = placeholder.render(needle.name()).into_bytes();
         let mut next = Vec::with_capacity(out.len());
+        // Left to right, non-overlapping: a match is replaced and the search resumes past it, so a
+        // needle cannot match inside the placeholder its own occurrence just produced.
         let mut i = 0;
-        while i < out.len() {
-            if i + bytes.len() <= out.len() && &out[i..i + bytes.len()] == bytes {
-                next.extend_from_slice(&replacement);
-                i += bytes.len();
-                count += 1;
-            } else {
-                next.push(out[i]);
-                i += 1;
-            }
+        while let Some(at) = needle.find_in(&out, i) {
+            next.extend_from_slice(&out[i..at]);
+            next.extend_from_slice(&replacement);
+            i = at + len;
+            count += 1;
         }
+        next.extend_from_slice(&out[i..]);
         out = next;
     }
     (out, count)
@@ -158,14 +171,29 @@ mod tests {
         );
     }
 
-    // Below the threshold nothing is substituted: such a value would match benign text and its
-    // placeholders would leak the value through their positions.
+    // The length floor belongs to the builders, not here: a short needle that was admitted (a
+    // launch that lowered `[redact] min_len`) is substituted like any other, rather than being
+    // silently declined by a second threshold this sink would apply on its own.
     #[test]
-    fn a_needle_below_the_minimum_length_is_not_substituted() {
-        let needles = vec![needle("tiny", "abc")];
-        let (out, count) = redact_named(b"abc appears in abcdef", &needles, &Placeholder::Plain);
-        assert_eq!(out, b"abc appears in abcdef", "the output is untouched");
-        assert_eq!(count, 0);
+    fn a_short_needle_that_was_admitted_is_substituted() {
+        let needles = vec![needle("tiny", "abcd")];
+        let (out, count) = redact_named(b"v=abcd", &needles, &Placeholder::Plain);
+        assert_eq!(out, b"v=${tiny}");
+        assert_eq!(count, 1);
+    }
+
+    // An empty needle matches at every offset while consuming nothing. It cannot arise from a
+    // resolved credential (an empty source never yields one), so this pins the termination
+    // property rather than a policy: the walk declines it and returns.
+    #[test]
+    fn an_empty_needle_is_declined_rather_than_matching_everywhere() {
+        let needles = vec![needle("empty", ""), needle("gh_token", "ghp-abcdefgh")];
+        let (out, count) = redact_named(b"tok=ghp-abcdefgh", &needles, &Placeholder::Plain);
+        assert_eq!(
+            out, b"tok=${gh_token}",
+            "only the real needle is substituted"
+        );
+        assert_eq!(count, 1);
     }
 
     // The nonce form is what makes a placeholder unforgeable for *this* output: the producer cannot

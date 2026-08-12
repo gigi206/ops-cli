@@ -544,6 +544,9 @@ pub(crate) fn start(
     // against. `None` on the paths that raise no notifications (a task's per-invocation proxy runs
     // under the session's notifier, attached by the engine).
     notify: Option<&super::notify_sink::NotifyWiring>,
+    // The launch's `[redact] min_len`: the shortest credential this proxy scans for, on the way out
+    // and on the way back.
+    redact_min_len: usize,
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -559,13 +562,19 @@ pub(crate) fn start(
     // come from the same resolved values, so they cannot disagree with the injections. A
     // relative `sops` file resolves against the project root (the `.sbx.toml`'s directory). A
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
-    let (injections, redactions) = resolve_injections(secrets, project_root, bwrap)?;
+    let (injections, redactions) =
+        resolve_injections(secrets, project_root, bwrap, redact_min_len)?;
 
     // The credential state the proxy will read, built here so the refresher can hold the same one
     // and swap it in place. Re-resolution repeats exactly this call, which is why the inputs are
-    // cloned rather than re-derived: a refresh that consulted different sources than the launch did
-    // would silently change what the cage authenticates as.
-    let credentials = std::sync::Arc::new(super::proxy::Credentials::new(injections, redactions));
+    // cloned rather than re-derived — the floor among them: a refresh that consulted different
+    // sources, or scanned to a different depth, than the launch did would silently change what the
+    // cage authenticates as and what it is watched for.
+    let credentials = std::sync::Arc::new(super::proxy::Credentials::new(
+        injections,
+        redactions,
+        redact_min_len,
+    ));
     let refresh = (!secrets.is_empty()).then(|| {
         let (secrets, root, bwrap) = (
             secrets.to_vec(),
@@ -574,7 +583,7 @@ pub(crate) fn start(
         );
         std::sync::Arc::new(super::proxy::CredentialRefresh::new(
             credentials.clone(),
-            Box::new(move || resolve_injections(&secrets, &root, &bwrap)),
+            Box::new(move || resolve_injections(&secrets, &root, &bwrap, redact_min_len)),
         ))
     });
 
@@ -829,25 +838,25 @@ pub(crate) fn start(
     ))
 }
 
-/// The shortest value worth substituting, shared with the text-sink substituter so the wire and a
-/// task's output can never disagree on the threshold. Below it the injection still applies — only
-/// the leak tripwire is skipped, and loudly (a silent skip would be a false-confidence trap).
-use super::redact::REDACT_MIN_LEN;
-
 /// Resolve each declared header secret into a proxy injection plus the outbound-redaction needles,
 /// reading every source host-side. Fail-closed: a missing or empty source, or one carrying a
 /// header-splitting byte, aborts the whole launch (so a partially-resolved set is never used). The
 /// needles derive from the same resolved values as the injections, so a launch with no secrets
 /// yields no needles (and can never raise a surprise `outbound-secret` refusal).
+///
+/// `min_len` is the launch's redaction floor (`[redact] min_len`): a shorter value is injected but
+/// not scanned for. Below it the injection still applies — only the leak tripwire is skipped, and
+/// loudly (a silent skip would be a false-confidence trap).
 fn resolve_injections(
     secrets: &[HeaderSecret],
     project_root: &Path,
     bwrap: &Path,
+    min_len: usize,
 ) -> io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)> {
     let mut injections = Vec::with_capacity(secrets.len());
     let mut redactions = Vec::new();
     for secret in secrets {
-        let (injection, needles) = resolve_one(secret, project_root, bwrap)?;
+        let (injection, needles) = resolve_one(secret, project_root, bwrap, min_len)?;
         injections.push(injection);
         redactions.extend(needles);
     }
@@ -859,20 +868,22 @@ fn resolve_injections(
 /// and into the needles, and dropped — it never reaches the cage. Every error names the **source**,
 /// never the value: an unset variable, an unreadable or empty file, or a value with an embedded
 /// CR/LF/NUL (which would split the request head and inject arbitrary headers upstream — the common
-/// trip is a file's trailing newline, stripped here before the check). A value below
-/// [`REDACT_MIN_LEN`] is injected but not redacted (warned, never silently).
+/// trip is a file's trailing newline, stripped here before the check). A value below `min_len` is
+/// injected but not redacted (warned, never silently).
 fn resolve_one(
     secret: &HeaderSecret,
     project_root: &Path,
     bwrap: &Path,
+    min_len: usize,
 ) -> io::Result<(HeaderInjection, Vec<SecretNeedle>)> {
     let trimmed = resolve_chain(&secret.sources, &secret.header, project_root, bwrap)?;
     let trimmed = trimmed.as_str();
 
-    let needles = if trimmed.len() < REDACT_MIN_LEN {
+    let needles = if trimmed.len() < min_len {
         crate::diag::warn(&format!(
-            "the secret for `{}` is too short ({} bytes) to redact from outbound \
-             requests safely; outbound leak-blocking is disabled for it (the injection still applies)",
+            "the secret for `{}` is too short ({} bytes, under the {min_len}-byte `[redact] \
+             min_len` floor) to redact from outbound requests safely; outbound leak-blocking is \
+             disabled for it (the injection still applies)",
             secret.header,
             trimmed.len()
         ));
@@ -1140,6 +1151,7 @@ mod tests {
             Some(roots.as_path()),
             "-1",
             None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
         )
         .expect("start the egress proxy");
 
@@ -1286,6 +1298,7 @@ mod tests {
                 Some(roots.as_path()),
                 instance,
                 None,
+                crate::sandbox::redact::MIN_LEN_DEFAULT,
             )
             .expect("start the egress proxy");
 
@@ -1648,6 +1661,7 @@ mod tests {
             None,
             "-2",
             None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
         )
         .expect("start the ask egress proxy");
 
@@ -1716,6 +1730,7 @@ mod tests {
             None,
             "-3",
             None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
         )
         .expect("start with stats off");
         drop(guard);
@@ -1739,6 +1754,7 @@ mod tests {
             None,
             "-4",
             None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
         )
         .expect("start with stats on");
         drop(guard);
@@ -1783,7 +1799,12 @@ mod tests {
     fn resolve_injections_at_root(
         secrets: &[HeaderSecret],
     ) -> io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)> {
-        resolve_injections(secrets, Path::new("/"), Path::new(UNUSED_BWRAP))
+        resolve_injections(
+            secrets,
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+        )
     }
 
     /// Write an executable fake `sops` to `dir/sops` that runs `body` (a bash script with the
@@ -1921,6 +1942,7 @@ mod tests {
             )],
             dir.path(),
             Path::new(UNUSED_BWRAP),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
         )
         .unwrap();
         assert_eq!(injs[0].value, "Bearer fallback-token-value");
@@ -2177,7 +2199,13 @@ mod tests {
             "Authorization",
             crate::config::HeaderShape::new("Bearer ", false),
         );
-        let (injs, needles) = resolve_injections(&[s], Path::new("/"), &bwrap).unwrap();
+        let (injs, needles) = resolve_injections(
+            &[s],
+            Path::new("/"),
+            &bwrap,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+        )
+        .unwrap();
         assert_eq!(injs[0].value, "Bearer ghp-from-the-plugin");
         assert_eq!(needles.len(), 1);
         assert_eq!(needles[0].as_bytes(), b"ghp-from-the-plugin");
@@ -2229,10 +2257,101 @@ mod tests {
         assert_eq!(value.unwrap(), "from-the-next-source");
     }
 
+    /// One floor value, both renderings: lowering `[redact] min_len` widens the wire tripwire and
+    /// the `${name}` substitution over a task's output by the same step — a value refused on the
+    /// way out while printing verbatim into a task's stdout is the split this pins shut. Both sides
+    /// are asserted against the same literal length, never against the setting.
+    ///
+    /// What the two decide separately is granularity, pinned by its own test below.
+    #[test]
+    fn the_floor_moves_the_wire_and_a_tasks_output_in_step() {
+        let _lock = env_lock();
+        // 5 bytes: over a floor of 5, under the built-in 8.
+        let _var = EnvVar::set("SBX_TEST_EGRESS_FLOOR", "abcde");
+        let wire = secret(
+            SecretSource::Env("SBX_TEST_EGRESS_FLOOR".into()),
+            "h.test",
+            "Authorization",
+            crate::config::HeaderShape::new("Bearer ", false),
+        );
+        let task = crate::config::TaskSecret {
+            var: "TOKEN".into(),
+            sources: Vec::new(),
+            encode: crate::config::Encoding::Raw,
+            description: None,
+        };
+
+        // At the built-in floor neither side scans for it.
+        let (_, at_default) = resolve_injections(
+            std::slice::from_ref(&wire),
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            8,
+        )
+        .unwrap();
+        assert!(
+            at_default.is_empty(),
+            "the wire declines a 5-byte value at 8"
+        );
+        assert!(
+            crate::sandbox::task::credential_needles(&task, "abcde", 8).is_empty(),
+            "and so does a task's output"
+        );
+
+        // Lowered to 5, both sides admit it — the same value, the same step.
+        let (_, lowered) =
+            resolve_injections(&[wire], Path::new("/"), Path::new(UNUSED_BWRAP), 5).unwrap();
+        assert_eq!(lowered.len(), 1, "the wire now scans for it");
+        assert_eq!(lowered[0].as_bytes(), b"abcde");
+        let task_needles = crate::sandbox::task::credential_needles(&task, "abcde", 5);
+        assert_eq!(task_needles.len(), 1, "and so does a task's output");
+        assert_eq!(task_needles[0].as_bytes(), b"abcde");
+    }
+
+    /// The floor value is shared; how it is applied to a credential with more than one spelling is
+    /// not. A wire injection judges the credential as a whole, on its plaintext, so a short secret
+    /// takes its encoded form down with it; a task credential is judged per spelling, so the longer
+    /// encoding survives. Stated here because the difference is invisible from either side alone,
+    /// and because the encodings are exactly where the two paths could be assumed to agree.
+    #[test]
+    fn the_wire_judges_a_credential_whole_where_a_task_judges_each_spelling() {
+        let _lock = env_lock();
+        // 6 bytes, whose base64 is 8 — under the floor, encoding over it.
+        let _var = EnvVar::set("SBX_TEST_EGRESS_B64", "abcdef");
+        let wire = secret(
+            SecretSource::Env("SBX_TEST_EGRESS_B64".into()),
+            "h.test",
+            "Authorization",
+            // `basic`: the wire carries the base64 form, so both spellings are needle candidates.
+            crate::config::HeaderShape::new("Basic ", true),
+        );
+        let task = crate::config::TaskSecret {
+            var: "TOKEN".into(),
+            sources: Vec::new(),
+            encode: crate::config::Encoding::Base64,
+            description: None,
+        };
+
+        let (_, wire_needles) =
+            resolve_injections(&[wire], Path::new("/"), Path::new(UNUSED_BWRAP), 8).unwrap();
+        assert!(
+            wire_needles.is_empty(),
+            "the plaintext is under the floor, so neither spelling is scanned for"
+        );
+
+        let task_needles = crate::sandbox::task::credential_needles(&task, "abcdef", 8);
+        assert_eq!(
+            task_needles.len(),
+            1,
+            "the encoding clears the floor on its own and is kept"
+        );
+        assert_eq!(task_needles[0].as_bytes(), b"YWJjZGVm");
+    }
+
     #[test]
     fn a_short_secret_is_injected_but_not_redacted() {
         let _lock = env_lock();
-        // 3 bytes, below REDACT_MIN_LEN
+        // 3 bytes, below the built-in redaction floor
         let _var = EnvVar::set("SBX_TEST_EGRESS_SHORT", "abc");
         let s = secret(
             SecretSource::Env("SBX_TEST_EGRESS_SHORT".into()),

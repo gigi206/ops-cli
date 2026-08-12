@@ -911,6 +911,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         }
     }
 
+    // The redaction floor, shown only when a layer moved it. It governs credentials this section
+    // may not list — a task's, and one the cage obtained for itself — so it gets its own line
+    // rather than a note under the secrets above; at the built-in floor there is nothing to report.
+    if view.redact_min_len_origin != config::view::ProvenanceView::Default {
+        let _ = writeln!(
+            o,
+            "  {h}redact:{r} a secret under {n}{}{r} bytes is not scanned for{}",
+            view.redact_min_len,
+            provenance_tag(view.redact_min_len_origin, pal)
+        );
+    }
+
     // What the host answers to a resolver plugin. Values are shown: a `[plugin.<name>]` table
     // carries configuration, never a credential — a secret is declared in `[secret]`, which the
     // block above prints by locator and never by value.
@@ -2484,6 +2496,8 @@ mod tests {
             },
             network_origin: ProvenanceView::Project,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::None,
@@ -2988,6 +3002,30 @@ mod tests {
     }
 
     #[test]
+    fn config_render_shows_the_redaction_floor_only_when_a_layer_moved_it() {
+        let p = style::Palette::colored();
+        // At the built-in floor there is nothing to report: the line would say what every launch
+        // already does, and this section exists to surface what someone changed.
+        let out = render_config(&sample_config_view(), &p, false);
+        assert!(
+            !out.contains("redact:"),
+            "the default floor prints no line:\n{out}"
+        );
+
+        let mut view = sample_config_view();
+        view.redact_min_len = 4;
+        view.redact_min_len_origin = config::view::ProvenanceView::Project;
+        let out = render_config(&view, &p, false);
+        assert!(
+            out.contains(&format!(
+                "a secret under {}4{} bytes is not scanned for  {}(project){}",
+                p.name, p.reset, p.ok, p.reset
+            )),
+            "the moved floor names the length and the layer it came from:\n{out}"
+        );
+    }
+
+    #[test]
     fn config_render_shows_an_app_limits_override() {
         use config::view::*;
         let p = style::Palette::plain();
@@ -3097,6 +3135,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::None,
@@ -3205,6 +3245,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::None,
@@ -3350,6 +3392,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::None,
@@ -3430,6 +3474,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::None,
@@ -3549,6 +3595,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::None,
@@ -3668,6 +3716,8 @@ mod tests {
             network: NetworkView::Shared,
             network_origin: ProvenanceView::Default,
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             proc: Default::default(),
             proc_origin: Default::default(),
             gui: GuiView::None,

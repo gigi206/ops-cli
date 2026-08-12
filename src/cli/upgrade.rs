@@ -911,6 +911,8 @@ mod tests {
             network: config::NetworkPolicy::Shared,
             network_origin: Default::default(),
             egress_stats: true,
+            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
+            redact_min_len_origin: Default::default(),
             gui: config::GuiPolicy::default(),
             gui_origin: Default::default(),
             proc: Default::default(),

@@ -11,8 +11,12 @@ See also: [Declared operations](./) · [Parameters](parameters) · [Credentials]
 Every credential value found in a returned stream, in an error message sbx composes, in a log line, or
 in the paths an exec refusal names is replaced by **`${NAME}`**: the credential's own name, so the
 output stays readable and says what was withheld. It covers the plaintext *and* each registered
-encoding of it. Values shorter than 8 bytes are not substituted: such a needle would match benign text
-and leak the value through the positions of its own placeholders.
+encoding of it. Values shorter than the redaction floor are not substituted: such a needle would match
+benign text and leak the value through the positions of its own placeholders. The floor is 8 bytes
+unless a trusted layer set [`[redact] min_len`](../secrets/redaction#the-length-floor), and it is the
+same one the egress tripwires use, so a value watched for on the wire is watched for here too. A
+spelling left below the floor is named at launch: the command still receives the credential, and it
+would otherwise look substituted without being.
 
 The refusal paths are on that list because they are text the **command** composed rather than text it
 printed: a program name is chosen by whoever calls `execve`, so a command that built one out of its

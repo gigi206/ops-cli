@@ -77,6 +77,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
         plugin: Default::default(),
         fs: None,
+        redact: None,
         notify: None,
         rest: Default::default(),
         task: None,
@@ -5564,6 +5565,35 @@ fn a_set_but_invalid_override_security_value_is_a_hard_error_and_mutates_nothing
     assert_eq!(resolved.network_origin, Provenance::Global);
 }
 
+/// A `--config` blob may move the redaction floor for one launch (trusted by invocation), and an
+/// unusable value is fatal rather than a silent revert: an override that meant to move the floor
+/// and instead left the baseline's would watch the launch to a depth nobody chose.
+#[test]
+fn an_override_redaction_floor_applies_and_a_zero_is_a_hard_error() {
+    let redact = |min_len: u64| RawConfig {
+        redact: Some(schema::RawRedact {
+            min_len: Some(min_len),
+            rest: Default::default(),
+        }),
+        ..RawConfig::default()
+    };
+
+    let applied = with_override(resolve_no_plugins(redact(16), None), redact(4));
+    assert_eq!(applied.redact_min_len, 4);
+    assert_eq!(applied.redact_min_len_origin, Provenance::Override);
+
+    let mut resolved = resolve_no_plugins(redact(16), None);
+    let errs = resolved
+        .apply_override(Override::for_test(redact(0)))
+        .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("redact.min_len")),
+        "the error names the offending field: {errs:?}"
+    );
+    assert_eq!(resolved.redact_min_len, 16, "and nothing was applied");
+    assert_eq!(resolved.redact_min_len_origin, Provenance::Global);
+}
+
 #[test]
 fn an_override_dbus_flag_applies_the_bool() {
     // `--dbus` (bare = true) stands up the in-cage portal for one launch (trusted by invocation).
@@ -5972,6 +6002,95 @@ fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
             Some((net(Some(true)), TrustState::Trusted))
         )
         .egress_stats
+    );
+}
+
+/// The floor a needle must clear, its default, and the gate: raising it drops credentials out of
+/// the tripwires, so an untrusted project may not touch it.
+#[test]
+fn the_redaction_floor_defaults_to_eight_and_is_gated_trusted_only() {
+    let redact = |min_len: u64| RawConfig {
+        redact: Some(schema::RawRedact {
+            min_len: Some(min_len),
+            rest: Default::default(),
+        }),
+        ..RawConfig::default()
+    };
+
+    // Nothing set → the built-in floor, and `sbx config` says so rather than naming a layer.
+    let base = resolve_no_plugins(RawConfig::default(), None);
+    assert_eq!(base.redact_min_len, 8);
+    assert_eq!(base.redact_min_len_origin, Provenance::Default);
+
+    // Global (trusted by location) → honored, in both directions.
+    let lowered = resolve_no_plugins(redact(4), None);
+    assert_eq!(lowered.redact_min_len, 4);
+    assert_eq!(lowered.redact_min_len_origin, Provenance::Global);
+    assert_eq!(resolve_no_plugins(redact(32), None).redact_min_len, 32);
+
+    // A TRUSTED project may set its own floor, and it replaces the global one.
+    let project = resolve_no_plugins(redact(4), Some((redact(20), TrustState::Trusted)));
+    assert_eq!(project.redact_min_len, 20);
+    assert_eq!(project.redact_min_len_origin, Provenance::Project);
+
+    // An UNTRUSTED project's floor is dropped: raising it is how a project would stop sbx watching
+    // its own egress for the credentials sbx injects on its behalf.
+    let untrusted = resolve_no_plugins(redact(4), Some((redact(64), TrustState::Untrusted)));
+    assert_eq!(untrusted.redact_min_len, 4, "the global floor stands");
+    assert!(
+        untrusted.warnings.iter().any(|w| w.contains("[redact]")),
+        "the drop is named, never silent: {:?}",
+        untrusted.warnings
+    );
+}
+
+/// Zero is not a stricter floor but a meaningless one — a zero-length needle matches at every
+/// offset — so it is refused and the floor in effect stands.
+#[test]
+fn a_zero_redaction_floor_is_refused_and_the_layer_below_stands() {
+    let redact = |min_len: u64| RawConfig {
+        redact: Some(schema::RawRedact {
+            min_len: Some(min_len),
+            rest: Default::default(),
+        }),
+        ..RawConfig::default()
+    };
+
+    let global = resolve_no_plugins(redact(0), None);
+    assert_eq!(global.redact_min_len, 8, "the built-in floor is kept");
+    assert_eq!(global.redact_min_len_origin, Provenance::Default);
+    assert!(
+        global.warnings.iter().any(|w| w.contains("min_len")),
+        "and the refusal is stated: {:?}",
+        global.warnings
+    );
+
+    // A trusted project's zero leaves the global floor in place, not the built-in one.
+    let over_global = resolve_no_plugins(redact(16), Some((redact(0), TrustState::Trusted)));
+    assert_eq!(over_global.redact_min_len, 16);
+    assert_eq!(over_global.redact_min_len_origin, Provenance::Global);
+}
+
+/// A misspelled key inside `[redact]` is a floor the author asked for and did not get, which is the
+/// case where silence costs the most.
+#[test]
+fn an_unknown_key_under_redact_is_named() {
+    let raw = RawConfig {
+        redact: Some(schema::RawRedact {
+            min_len: None,
+            rest: [("min_length".to_string(), schema::RawIgnored)]
+                .into_iter()
+                .collect(),
+        }),
+        ..RawConfig::default()
+    };
+    let r = resolve_no_plugins(raw, None);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("min_length") && w.contains("[redact]")),
+        "the unknown key is named under its table: {:?}",
+        r.warnings
     );
 }
 

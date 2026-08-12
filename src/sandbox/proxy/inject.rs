@@ -120,17 +120,33 @@ pub(crate) struct CredentialSet {
 /// and a reader keeps a coherent set for the whole exchange even if a refresh lands mid-flight.
 pub(crate) struct Credentials {
     current: std::sync::RwLock<std::sync::Arc<CredentialSet>>,
+    /// The launch's `[redact] min_len`. Held because [`Credentials::observe`] builds needles of its
+    /// own after the launch resolved its declared ones, and a needle it adds must clear the same
+    /// floor as those — see [`OBSERVE_MIN_LEN`].
+    min_len: usize,
 }
 
 impl Credentials {
     /// The state as first resolved, host-side, before the cage started.
-    pub(crate) fn new(injections: Vec<HeaderInjection>, needles: Vec<SecretNeedle>) -> Self {
+    pub(crate) fn new(
+        injections: Vec<HeaderInjection>,
+        needles: Vec<SecretNeedle>,
+        min_len: usize,
+    ) -> Self {
         Self {
             current: std::sync::RwLock::new(std::sync::Arc::new(CredentialSet {
                 injections,
                 needles,
             })),
+            min_len,
         }
+    }
+
+    /// The floor this state was built with, so a caller that rebuilds one side of it (the test-only
+    /// half-replacements) carries the same floor rather than silently reverting to the built-in one.
+    #[cfg(test)]
+    pub(crate) fn min_len(&self) -> usize {
+        self.min_len
     }
 
     /// The set to use for one exchange. Take it once and keep it: re-reading mid-exchange could
@@ -171,7 +187,11 @@ impl Credentials {
     /// observing can change what is scanned but never what the cage authenticates as.
     pub(crate) fn observe(&self, header: &str, value: &str) -> bool {
         let credential = credential_in(value);
-        if credential.len() < OBSERVE_MIN_LEN {
+        // The higher of the two floors. `OBSERVE_MIN_LEN` is not itself configurable: it states a
+        // *relation* — an inferred credential is held to a stricter floor than a declared one — and
+        // that relation is what breaks the moment a launch raises `[redact] min_len` above it. Take
+        // the maximum and it holds at every setting.
+        if credential.len() < OBSERVE_MIN_LEN.max(self.min_len) {
             return false;
         }
         let bytes = credential.as_bytes();
@@ -243,10 +263,15 @@ const OBSERVED_AUTH_HEADERS: &[&str] = &[
     "x-goog-api-key",
 ];
 
-/// The shortest observed value kept. Higher than the floor for a *declared* secret, because that one
-/// was named by a human who accepted the consequence, while this one is inferred: a short value is
-/// far likelier to occur by chance in unrelated traffic, and a false needle blocks requests and
-/// mutates responses.
+/// The shortest observed value kept. Higher than the built-in floor for a *declared* secret, because
+/// that one was named by a human who accepted the consequence, while this one is inferred: a short
+/// value is far likelier to occur by chance in unrelated traffic, and a false needle blocks requests
+/// and mutates responses.
+///
+/// It is a floor of its own rather than a configurable setting, and what it states is a *relation*:
+/// an inferred credential is held at least as strictly as a declared one. A launch that raises
+/// `[redact] min_len` past this value therefore raises this one with it — see
+/// [`Credentials::observe`], which takes the higher of the two.
 const OBSERVE_MIN_LEN: usize = 16;
 
 /// The most observed credentials kept. A cage rotating through many values must not grow the scan
@@ -378,6 +403,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::sandbox::redact::MIN_LEN_DEFAULT;
+
+    /// A credential state on the built-in redaction floor — what a launch that configures none runs
+    /// with. The tests that care about the floor itself call [`Credentials::new`] directly.
+    fn default_creds(injections: Vec<HeaderInjection>, needles: Vec<SecretNeedle>) -> Credentials {
+        Credentials::new(injections, needles, MIN_LEN_DEFAULT)
+    }
 
     // The formed header value carries the plaintext secret, so its `Debug` must never leak it — the
     // redacted `Debug` is the guard that keeps a secret out of a log line or a panic message.
@@ -409,7 +441,7 @@ mod tests {
     // reader already took stays whole, and only the next reader sees the new state.
     #[test]
     fn a_snapshot_survives_a_replacement_and_the_next_reader_sees_the_new_state() {
-        let creds = Credentials::new(
+        let creds = default_creds(
             vec![HeaderInjection {
                 rule: crate::allowlist::classify("api.example.com").unwrap(),
                 header: "authorization".to_string(),
@@ -456,7 +488,7 @@ mod tests {
     /// gets the re-resolved one on the following request.
     #[test]
     fn a_refusal_re_resolves_and_the_next_snapshot_carries_the_new_value() {
-        let creds = Arc::new(Credentials::new(
+        let creds = Arc::new(default_creds(
             vec![injection("Bearer old")],
             vec![SecretNeedle::named("tok", b"old".to_vec())],
         ));
@@ -486,7 +518,7 @@ mod tests {
     fn a_second_refusal_inside_the_gap_does_not_consult_the_source() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
-        let creds = Arc::new(Credentials::new(vec![injection("Bearer old")], Vec::new()));
+        let creds = Arc::new(default_creds(vec![injection("Bearer old")], Vec::new()));
         let refresh = CredentialRefresh::new(
             creds.clone(),
             Box::new(move || {
@@ -510,7 +542,7 @@ mod tests {
     fn an_unchanged_value_stops_the_mechanism_for_good() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
-        let creds = Arc::new(Credentials::new(vec![injection("Bearer same")], Vec::new()));
+        let creds = Arc::new(default_creds(vec![injection("Bearer same")], Vec::new()));
         let refresh = CredentialRefresh::new(
             creds,
             Box::new(move || {
@@ -530,7 +562,7 @@ mod tests {
     fn a_failing_source_stops_the_mechanism_for_good() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
-        let creds = Arc::new(Credentials::new(vec![injection("Bearer old")], Vec::new()));
+        let creds = Arc::new(default_creds(vec![injection("Bearer old")], Vec::new()));
         let refresh = CredentialRefresh::new(
             creds.clone(),
             Box::new(move || {
@@ -553,7 +585,7 @@ mod tests {
     /// token, so that is the spelling the tripwires have to match.
     #[test]
     fn an_observed_credential_is_kept_without_its_scheme_prefix() {
-        let creds = Credentials::new(Vec::new(), Vec::new());
+        let creds = default_creds(Vec::new(), Vec::new());
         assert!(creds.observe("authorization", "Bearer tok-0123456789abcdef"));
         let set = creds.snapshot();
         assert_eq!(set.needles.len(), 1);
@@ -568,16 +600,39 @@ mod tests {
     /// mutates responses. The floor is higher than for a declared secret, which a human accepted.
     #[test]
     fn a_short_observed_value_is_not_kept() {
-        let creds = Credentials::new(Vec::new(), Vec::new());
+        let creds = default_creds(Vec::new(), Vec::new());
         assert!(!creds.observe("authorization", "Bearer short"));
         assert!(creds.snapshot().needles.is_empty());
+    }
+
+    /// Lowering the declared floor must not lower this one: an observed credential was inferred
+    /// rather than named by a human, so it stays on the stricter of the two.
+    #[test]
+    fn a_lowered_declared_floor_does_not_lower_the_observed_one() {
+        let creds = Credentials::new(Vec::new(), Vec::new(), 4);
+        // 12 bytes: over the launch's floor, under the inferred one.
+        assert!(!creds.observe("authorization", "Bearer tok-01234567"));
+        assert!(creds.snapshot().needles.is_empty());
+    }
+
+    /// Raising it past the inferred floor does raise this one: a launch that says a credential is
+    /// only worth scanning for above 24 bytes means it for the ones it did not declare too.
+    #[test]
+    fn a_raised_declared_floor_raises_the_observed_one() {
+        let creds = Credentials::new(Vec::new(), Vec::new(), 24);
+        // 20 bytes: over the inferred floor, under the launch's.
+        assert!(!creds.observe("authorization", "Bearer tok-0123456789abcdef"));
+        assert!(creds.snapshot().needles.is_empty());
+        // 26 bytes clears both.
+        assert!(creds.observe("authorization", "Bearer tok-0123456789abcdefghijkl"));
+        assert_eq!(creds.snapshot().needles.len(), 1);
     }
 
     /// Every needle is scanned against every request head and every response chunk, so the same
     /// credential seen on a thousand requests must cost one needle, not a thousand.
     #[test]
     fn the_same_credential_is_kept_once_and_the_set_is_capped() {
-        let creds = Credentials::new(Vec::new(), Vec::new());
+        let creds = default_creds(Vec::new(), Vec::new());
         assert!(creds.observe("authorization", "Bearer tok-0123456789abcdef"));
         assert!(!creds.observe("authorization", "Bearer tok-0123456789abcdef"));
         assert_eq!(creds.snapshot().needles.len(), 1);
@@ -596,7 +651,7 @@ mod tests {
     /// traffic and mask ordinary responses.
     #[test]
     fn only_the_named_auth_headers_are_observed() {
-        let creds = Credentials::new(Vec::new(), Vec::new());
+        let creds = default_creds(Vec::new(), Vec::new());
         let kept = creds.observe_head(
             &[
                 ("X-Request-Id".into(), "req-0123456789abcdef".into()),
@@ -621,7 +676,7 @@ mod tests {
     /// string, refusing traffic sbx itself arranged. Found by running a real agent, not by reading.
     #[test]
     fn a_header_that_will_be_injected_is_never_observed() {
-        let creds = Credentials::new(Vec::new(), Vec::new());
+        let creds = default_creds(Vec::new(), Vec::new());
         let kept = creds.observe_head(
             &[(
                 "Authorization".into(),

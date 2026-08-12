@@ -23,13 +23,47 @@ Blocking (rather than stripping) is deliberate: a request that is trying to carr
 a secret out is not a request to quietly clean up and forward. The agent gets a
 clear `403` refusal.
 
-### The 8-byte floor
+### The length floor
 
-The scan has a minimum length: **`REDACT_MIN_LEN = 8`**. A secret shorter than 8
-bytes is still injected, but it is **not** added to the outbound scan set, and
+The scan has a minimum length, **8 bytes by default**. A secret shorter than the
+floor is still injected, but it is **not** added to the outbound scan set, and
 `sbx` **warns loudly**. A very short value produces too many false-positive
 matches against ordinary request bytes to scan safely. The lesson is practical:
 use secrets of reasonable length (real tokens already are).
+
+The floor is one setting for the whole launch, in the `[redact]` table:
+
+```toml
+[redact]
+min_len = 4
+```
+
+Lower it when a legitimate credential is short and you accept the noise; raise it
+to scan only for values long enough to be unmistakable. The value must be at
+least `1`, since a zero-length needle matches at every offset and so names
+nothing.
+
+One floor governs every place a credential is watched for, so moving it moves
+them together:
+
+- the outbound refusal and the inbound mask described on this page;
+- the `${NAME}` substitution over [a task's output](../tasks/output);
+- a credential the cage obtained by its own sign-in, which `sbx` remembers so the
+  tripwires cover it too. That one is held to the stricter of the configured
+  floor and its own built-in minimum, since it was inferred rather than declared
+  by a person.
+
+What each place decides for itself is how the floor is applied to a credential
+with more than one spelling. A wire injection is judged as a whole, on the
+plaintext, so a short secret is left unscanned along with its encoded form; a
+task credential is judged per spelling, so a `base64` encoding that clears the
+floor is still substituted out of the output even when its plaintext does not.
+
+`[redact]` is a security field: it is honored from the global config or a trusted
+project, and dropped from an untrusted one. Raising the floor is how a project
+would stop `sbx` watching for the very credentials it injects on that project's
+behalf. `sbx config` shows the floor whenever a layer moved it, with the layer it
+came from.
 
 ### Head-only, by design
 

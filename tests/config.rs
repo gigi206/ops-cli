@@ -1105,6 +1105,41 @@ fn the_egress_stats_toggle_is_shown_and_trust_gated() {
 }
 
 #[test]
+fn the_redaction_floor_is_shown_and_trust_gated() {
+    // A trusted project may move the floor its own credentials are watched from, and `config show`
+    // reports it with the layer it came from.
+    let fx = Fixture::new();
+    fx.write_project("[redact]\nmin_len = 4\n");
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("redact:") && stdout.contains("under 4 bytes"),
+        "a trusted floor is shown with its length:\n{stdout}"
+    );
+
+    // The gate: an untrusted project's `[redact]` is dropped, so the built-in floor stands. Raising
+    // it is how a project would stop sbx watching for the credentials sbx injects on its behalf,
+    // and the drop is explained rather than silent.
+    let fx = Fixture::new();
+    fx.write_project("[redact]\nmin_len = 64\n");
+    // deliberately NOT trusting the project
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "untrusted config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("redact:"),
+        "a dropped floor leaves the built-in one, which prints no line:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("[redact]") && stderr.contains("untrusted"),
+        "and the drop is explained:\n{stderr}"
+    );
+}
+
+#[test]
 fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
     let fx = Fixture::new();
     // Allow-by-default (a denylist) with one deny carve-out, in the table form.

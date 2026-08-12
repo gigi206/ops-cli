@@ -428,6 +428,11 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
             env_side.secret.is_some(),
             cli_side.secret.is_some(),
         ),
+        (
+            "redact",
+            env_side.redact.is_some(),
+            cli_side.redact.is_some(),
+        ),
     ] {
         if env_has && !cli_has {
             note(field);
@@ -480,6 +485,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         devices,
         ssh_agent,
         fs,
+        redact,
         net,
         bundle,
         // Carried no further on purpose: `apply_override` refuses each of these outright, so folding
@@ -526,6 +532,12 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     }
     if secret.is_some() {
         base.secret = secret;
+    }
+    // A scalar table: the higher blob's floor replaces the lower's outright. There is nothing to
+    // union — two floors are not additive, and taking the stricter of the two would make the answer
+    // depend on which blob was written first rather than on which one ranks higher.
+    if redact.is_some() {
+        base.redact = redact;
     }
     base.forward = union_forward_opt(base.forward, forward);
     base.fs = union_fs_opt(base.fs, fs);

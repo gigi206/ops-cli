@@ -1282,6 +1282,7 @@ fn roll_task_pool(
             socat: prep.userland.socat_bin.clone(),
             shell: prep.userland.shell_bin.clone(),
         },
+        cfg.redact_min_len,
     )
     .with_pool(
         super::taskpool::pool_dir(prep.layout.data_dir(), &id),
@@ -4202,6 +4203,7 @@ fn build(
             // The session's own proxy: a launch stands up exactly one, so the pid already names it.
             "",
             Some(&notify_wiring),
+            prep.cfg.redact_min_len,
         )
         .map_err(|e| {
             eprintln!("sbx: cannot start the egress filtering proxy: {e}");
@@ -4772,6 +4774,7 @@ fn build(
                     socat: prep.userland.socat_bin.clone(),
                     shell: prep.userland.shell_bin.clone(),
                 },
+                prep.cfg.redact_min_len,
             )
             .with_notifier(Arc::clone(&notify_wiring));
             // Carry the session's `[fs]` masks into every task cage, so a denied path is closed

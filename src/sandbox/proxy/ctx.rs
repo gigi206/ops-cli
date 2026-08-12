@@ -188,7 +188,13 @@ impl ProxyCtx {
             policy,
             resolve,
             timeout: Duration::from_secs(30),
-            credentials: Arc::new(Credentials::new(Vec::new(), Vec::new())),
+            // Empty, and on the built-in floor: a launch with credentials replaces this wholesale
+            // with the set it resolved (and that set's own floor) through `with_shared_credentials`.
+            credentials: Arc::new(Credentials::new(
+                Vec::new(),
+                Vec::new(),
+                crate::sandbox::redact::MIN_LEN_DEFAULT,
+            )),
             refresh: None,
             pending: Arc::new(crate::sandbox::control::PendingState::new()),
             manual: Arc::new(crate::sandbox::control::ManualRules::new()),
@@ -567,14 +573,19 @@ impl ProxyCtx {
     #[cfg(test)]
     pub(crate) fn with_injections(self, injections: Vec<HeaderInjection>) -> Self {
         let needles = self.credentials.snapshot().needles.clone();
-        self.with_shared_credentials(Arc::new(Credentials::new(injections, needles)))
+        let min_len = self.credentials.min_len();
+        self.with_shared_credentials(Arc::new(Credentials::new(injections, needles, min_len)))
     }
 
     /// Set the needles alone, keeping the injections. **Tests only** — see [`Self::with_injections`].
+    ///
+    /// The needles are taken as given: this stands in for a launch that already admitted them, so a
+    /// test may hand over a short one to exercise the scan itself.
     #[cfg(test)]
     pub(crate) fn with_redactions(self, needles: Vec<SecretNeedle>) -> Self {
         let injections = self.credentials.snapshot().injections.clone();
-        self.with_shared_credentials(Arc::new(Credentials::new(injections, needles)))
+        let min_len = self.credentials.min_len();
+        self.with_shared_credentials(Arc::new(Credentials::new(injections, needles, min_len)))
     }
 
     /// The CA certificate (PEM) a launch injects into the cage trust store so in-cage tools accept

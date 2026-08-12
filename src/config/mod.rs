@@ -313,6 +313,15 @@ pub(crate) struct Resolved {
     /// it. With no askpass helper on the host the launch gives the cage no agent at all, rather than
     /// a grant whose promised confirmation never appears.
     pub(crate) ssh_agent_confirm: bool,
+    /// The shortest credential, in bytes, this launch scans for — `[redact] min_len`, defaulting to
+    /// [`crate::sandbox::redact::MIN_LEN_DEFAULT`]. One floor for both renderings of a needle set:
+    /// the proxy's outbound refusal and inbound mask, and the `${name}` substitution over a task's
+    /// output. A security field, gated like `network`/`limits` — raising it drops credentials out of
+    /// the tripwires, so an untrusted project may not set it.
+    pub(crate) redact_min_len: usize,
+    /// Which layer supplied the winning `redact_min_len` (`Default` when neither config set it).
+    /// A display affordance for `sbx config`; the launcher ignores it.
+    pub(crate) redact_min_len_origin: Provenance,
     /// Credentials the egress proxy injects into matching requests (the plaintext never
     /// enters the cage). A security field, gated like `binds`; cleared with a warning
     /// unless the posture is an allowlist, since the filtering proxy is what injects them.
@@ -669,6 +678,7 @@ impl Resolved {
             fs,
             proc,
             notify,
+            redact,
             // The channel is applied earlier (before the lock is chosen); groups/apps/bundles are
             // not launch-shaping and were noticed and dropped at collection time (a bundle is only
             // ever reached through an app's `use`, and an override declares no app). An override's
@@ -710,6 +720,7 @@ impl Resolved {
             proc,
             notify,
             limits,
+            redact,
             &mut notes,
         );
         if !fatal.is_empty() {
@@ -721,6 +732,7 @@ impl Resolved {
             proc: new_proc,
             notify: new_notify,
             limits: new_limits,
+            redact_min_len: new_redact_min_len,
         } = scalars;
 
         // No fatal — apply. Promote the (non-fatal) validation notes to the resolved warnings.
@@ -823,6 +835,12 @@ impl Resolved {
             mark_limit_origins(&mut self.limits_origin, &over, Provenance::Override);
             overlay_limits(&mut self.limits, over);
         }
+        // `[redact] min_len` — a scalar, validated above. Trusted by invocation and the final word,
+        // so it may move the floor for this launch whatever the config layers set.
+        if let Some(floor) = new_redact_min_len {
+            self.redact_min_len = floor;
+            self.redact_min_len_origin = Provenance::Override;
+        }
 
         // `forward` — trusted by invocation; the ports add to the effective set (a collection, so a
         // bad port — only `0` is possible after parse — is warned and skipped, not fatal). The
@@ -921,6 +939,7 @@ impl Resolved {
             ov.raw.proc.clone(),
             ov.raw.notify.clone(),
             ov.raw.limits.clone(),
+            ov.raw.redact.clone(),
             &mut notes,
         );
         if fatal.is_empty() {
@@ -945,6 +964,8 @@ struct OverrideScalars {
     /// The resolved notification policy (`Some` only when the override set `notify` and it validated).
     notify: Option<crate::notify::NotifyPolicy>,
     limits: Option<crate::sandbox::cgroup::Limits>,
+    /// The redaction floor (`Some` only when the override set `[redact] min_len` and it validated).
+    redact_min_len: Option<usize>,
 }
 
 /// Validate an override's scalar security postures (`network`/`gui`/`[limits]`) against `baseline`
@@ -961,6 +982,7 @@ fn build_override_scalars(
     proc: Option<schema::ProcField>,
     notify: Option<schema::NotifyField>,
     limits: Option<schema::RawLimits>,
+    redact: Option<schema::RawRedact>,
     notes: &mut Vec<String>,
 ) -> (OverrideScalars, Vec<String>) {
     let mut fatal = Vec::new();
@@ -1019,6 +1041,15 @@ fn build_override_scalars(
             fatal.push("limits.tasks_max".to_string());
         }
         scalars.limits = Some(over);
+    }
+    // `[redact] min_len` — a set-but-unusable value is fatal, like a limit: an override that meant
+    // to move the floor and instead left the baseline's would watch this launch to a depth its
+    // invoker did not choose.
+    if let Some(value) = redact.and_then(|r| r.min_len) {
+        match validate_redact_min_len(notes, OVERRIDE_SOURCE, value) {
+            Some(floor) => scalars.redact_min_len = Some(floor),
+            None => fatal.push("redact.min_len".to_string()),
+        }
     }
     (scalars, fatal)
 }
@@ -1425,6 +1456,16 @@ fn resolve(
     if !forward.is_empty() {
         forward_origin = Provenance::Global;
     }
+    // The redaction floor is trusted by location at the global layer; an unusable value is dropped
+    // (warned) and the built-in floor kept.
+    let mut redact_min_len = crate::sandbox::redact::MIN_LEN_DEFAULT;
+    let mut redact_min_len_origin = Provenance::Default;
+    if let Some(value) = global.redact.as_ref().and_then(|r| r.min_len)
+        && let Some(floor) = validate_redact_min_len(&mut warnings, GLOBAL_CONFIG, value)
+    {
+        redact_min_len = floor;
+        redact_min_len_origin = Provenance::Global;
+    }
     // Resource limits are trusted by location at the global layer; each invalid field is dropped
     // (warned) and the built-in default kept. The origin is recorded per field that the layer set.
     let mut limits = validate_limits(&mut warnings, GLOBAL_CONFIG, global.limits);
@@ -1702,6 +1743,23 @@ fn resolve(
                 union_forward,
             );
         }
+        // `[redact]` is a security field — a trusted project may move the floor its own credentials
+        // are watched from; an untrusted or changed one may not, since raising it would drop those
+        // credentials out of the tripwires that are watching *its* egress. A scalar: a trusted
+        // project's value replaces the global one.
+        if let Some(raw) = proj.redact {
+            if trusted {
+                if let Some(value) = raw.min_len
+                    && let Some(floor) =
+                        validate_redact_min_len(&mut warnings, PROJECT_CONFIG, value)
+                {
+                    redact_min_len = floor;
+                    redact_min_len_origin = Provenance::Project;
+                }
+            } else {
+                gate.refuse("`[redact]`", &mut warnings);
+            }
+        }
         // `[limits]` is a security field — a trusted project may tune the cgroup limits; an
         // untrusted or changed one may not (loosening them weakens the anti-DoS control). The
         // three fields layer independently: a project's set field overrides the global one, an
@@ -1887,6 +1945,8 @@ fn resolve(
         network,
         network_origin,
         egress_stats,
+        redact_min_len,
+        redact_min_len_origin,
         proc,
         proc_origin,
         notify,
@@ -2033,6 +2093,26 @@ fn overlay_limits(base: &mut crate::sandbox::cgroup::Limits, over: crate::sandbo
     if over.tasks_max.is_some() {
         base.tasks_max = over.tasks_max;
     }
+}
+
+/// Validate a `[redact] min_len` into the floor it denotes, or `None` when the value is unusable
+/// (warned) and the layer below stands.
+///
+/// The only refusal is `0`. It is not a stricter setting but a meaningless one: a zero-length needle
+/// matches at every offset of every byte stream, so it names nothing and bounds nothing. Everything
+/// above it is honored as written, including a floor high enough that few credentials clear it —
+/// that is a legitimate choice (scan only for values long enough to be unmistakable), and it does
+/// not pass in silence: each declared secret left below the floor says so at launch.
+fn validate_redact_min_len(warnings: &mut Vec<String>, source: &str, value: u64) -> Option<usize> {
+    let floor = usize::try_from(value).ok().filter(|n| *n > 0);
+    if floor.is_none() {
+        warnings.push(format!(
+            "{source}: ignoring `[redact] min_len = {value}` — the floor must be at least 1 byte \
+             (a zero-length value matches everywhere, so it names nothing); the floor in effect is \
+             unchanged"
+        ));
+    }
+    floor
 }
 
 /// Resolve a `[seccomp] allow` table into a [`SeccompPolicy`](crate::sandbox::seccomp::SeccompPolicy): split each string on commas, trim,
@@ -2221,6 +2301,9 @@ fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::Raw
     }
     if let Some(ssh_agent) = &raw.ssh_agent {
         report(" under `[ssh_agent]`", &ssh_agent.rest);
+    }
+    if let Some(redact) = &raw.redact {
+        report(" under `[redact]`", &redact.rest);
     }
 }
 

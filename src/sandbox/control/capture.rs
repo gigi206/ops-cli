@@ -351,7 +351,11 @@ impl CaptureRing {
     pub(crate) fn with_needles(caps: CaptureCaps, needles: Vec<SecretNeedle>) -> Self {
         Self::new(
             caps,
-            std::sync::Arc::new(crate::sandbox::proxy::Credentials::new(Vec::new(), needles)),
+            std::sync::Arc::new(crate::sandbox::proxy::Credentials::new(
+                Vec::new(),
+                needles,
+                crate::sandbox::redact::MIN_LEN_DEFAULT,
+            )),
         )
     }
 
