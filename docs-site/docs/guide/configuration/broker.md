@@ -66,6 +66,61 @@ The one fatal case is a broker that was asked for, could be provided, and still 
 be stood up: the socket cannot be bound. That fails the launch rather than silently
 running without the fence the config asked for.
 
+## Placing a credential the cage does not have
+
+A broker holds no secret, and that is what bounds it. To let one **authenticate** on the
+cage's behalf without breaking that, `sbx` hands the plugin a **marker** and substitutes the
+real value itself:
+
+```toml
+# global config only, like the socket
+[broker.pg]
+socket = "$XDG_RUNTIME_DIR/postgres/.s.PGSQL.5432"
+secret = "env://PGPASSWORD"        # or a fallback chain, like a [secret] `from`
+```
+
+The plugin's manifest must declare `uses_secret` for this to apply: which plugin may be
+handed a credential is a property of the code that was installed, not of the machine that
+configures it. A `secret` named for a plugin that does not declare it is reported and
+dropped.
+
+At the start of every connection the plugin receives a **random marker**, places it where
+the protocol wants the value, and `sbx` replaces it on the way to the host resource. The
+plugin can decide *where* the credential goes; it can never read it.
+
+Four rules make that true, and each closes a specific hole:
+
+| Rule | What it prevents |
+|---|---|
+| substitution only toward the host resource | the secret entering the cage, which is the invariant itself |
+| never inside a `query` | the plugin reading its own answer from a service that echoes |
+| only in bytes the plugin **wrote** | the cage's own bytes being scanned for a marker |
+| the marker never travels toward the cage | the cage learning the marker, which the other rules rest on |
+
+Both surfaces say so. `sbx config show` lists the credential's **locator** under the broker
+that places it (the variable name or file path, never the value), and the session's
+[`broker` feed](../cli/logs) marks the frames that carried it — a frame bearing a
+credential is not the same event as one merely rewritten, and an audit should not have to
+guess which was which.
+
+On the way back, a reply carrying the credential is **refused, not stripped**: a partial
+strip gives false confidence, and an encoded value defeats it anyway. It is a tripwire, not
+a wall, exactly as on the [egress side](../secrets/redaction). A credential shorter than the
+[`[redact] min_len`](../configuration/network) floor is placed but **not** watched, and the
+launch says so: a scan that short refuses innocent traffic more often than it catches a leak.
+
+### What this does and does not cover
+
+It covers secrets that are **transmitted**: a password sent in the clear under TLS, a token,
+an API key. It does **not** cover a challenge-response exchange, where nothing is
+transmitted and everything is computed.
+
+For PostgreSQL specifically, that line falls where `pg_hba.conf` does. The documentation is
+explicit that a password stored as a SCRAM verifier can still be used by the `password`
+method (`"but password transmission will be in plain text in the latter case"`), so this
+works wherever the server is configured for `password` — and not where it requires
+`scram-sha-256`, which is the recommended setting.
+
 ## Protocols that answer in several messages
 
 `sbx` transmits one message and reads the answer, but "the answer" is not always one message.

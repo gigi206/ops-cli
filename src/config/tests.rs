@@ -1873,6 +1873,7 @@ fn raw_broker(socket: Option<&str>, allow: &[&str]) -> crate::config::schema::Ra
     crate::config::schema::RawBrokerConfig {
         socket: socket.map(str::to_string),
         allow: allow.iter().map(|s| (*s).to_string()).collect(),
+        secret: None,
         rest: Default::default(),
     }
 }

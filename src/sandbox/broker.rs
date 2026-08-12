@@ -85,10 +85,91 @@ impl Direction {
     }
 }
 
+/// What stands in for a secret in the frames a plugin builds.
+///
+/// The plugin never receives the credential. It receives this marker, places it where the protocol
+/// wants the value, and sbx substitutes the real bytes on their way to the host resource — the
+/// same shape the egress proxy already uses for HTTP, where an application carries a placeholder
+/// and the proxy puts the value on the wire.
+///
+/// **Random, and drawn per connection.** A fixed marker would be guessable by the cage, which
+/// could then place it in a command whose service echoes it back and read the secret in the
+/// answer. This one the cage never sees — and sbx refuses to write it toward the cage, which is
+/// what keeps that true.
+pub(crate) struct SecretMarker {
+    /// The bytes a plugin writes to mean "the secret goes here".
+    marker: Vec<u8>,
+    /// The value they are replaced with, host-side, on the way to the host resource only.
+    secret: Vec<u8>,
+    /// Whether the way back is watched for this value. Off for a secret shorter than the
+    /// `[redact] min_len` floor, where a byte-substring scan would refuse innocent traffic more
+    /// often than it would catch a leak — the same trade the egress proxy makes, and the caller
+    /// says so out loud when it applies.
+    watch: bool,
+}
+
+impl SecretMarker {
+    /// Draw a marker for one connection. The randomness comes from the same source the rest of
+    /// sbx's per-session identifiers do.
+    pub(crate) fn new(secret: &str, min_len: usize) -> io::Result<Self> {
+        let mut raw = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+        Ok(Self {
+            marker: format!("SBX-SECRET-{}", to_hex(&raw)).into_bytes(),
+            secret: secret.as_bytes().to_vec(),
+            watch: secret.len() >= min_len,
+        })
+    }
+
+    /// What the plugin is told to place.
+    fn token(&self) -> String {
+        String::from_utf8_lossy(&self.marker).into_owned()
+    }
+
+    /// Whether these bytes carry the marker.
+    fn present_in(&self, frame: &[u8]) -> bool {
+        contains(frame, &self.marker)
+    }
+
+    /// Replace every occurrence with the secret. Applied only to bytes on their way to the host
+    /// resource, and only to bytes the plugin itself produced.
+    fn substitute(&self, frame: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(frame.len());
+        let mut at = 0;
+        while at < frame.len() {
+            if frame[at..].starts_with(&self.marker) {
+                out.extend_from_slice(&self.secret);
+                at += self.marker.len();
+            } else {
+                out.push(frame[at]);
+                at += 1;
+            }
+        }
+        out
+    }
+
+    /// Whether these bytes carry the secret itself — the tripwire for the way back.
+    fn leaks_in(&self, frame: &[u8]) -> bool {
+        self.watch && contains(frame, &self.secret)
+    }
+}
+
+/// Whether `haystack` contains `needle`. The same byte-substring search the egress proxy's
+/// outbound scan uses, kept simple on purpose: it runs on frames, not on streams.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
 /// The opening message: what the plugin is being asked to broker, and under which policy.
 pub(crate) struct Hello<'a> {
     pub(crate) broker: &'a str,
     pub(crate) allow: &'a [String],
+    /// The marker standing in for the secret, when this broker was given one.
+    pub(crate) secret_marker: Option<String>,
     /// Whether this plugin will be shown host replies, so it need not infer it from the manifest
     /// it cannot read.
     pub(crate) inspect_replies: bool,
@@ -98,12 +179,15 @@ impl Hello<'_> {
     /// The handshake line, newline included.
     pub(crate) fn line(&self) -> String {
         let allow = serde_json::Value::from(self.allow.to_vec());
-        let v = serde_json::json!({
+        let mut v = serde_json::json!({
             "v": PROTOCOL_VERSION,
             "broker": self.broker,
             "allow": allow,
             "inspect_replies": self.inspect_replies,
         });
+        if let Some(marker) = &self.secret_marker {
+            v["secret_marker"] = serde_json::Value::from(marker.clone());
+        }
         format!("{v}\n")
     }
 }
@@ -415,6 +499,10 @@ pub(crate) struct Relayed {
     pub(crate) to_cage: Vec<Vec<u8>>,
     /// The plugin's own account of the decision, for the record.
     pub(crate) label: Option<String>,
+    /// Whether a credential was placed into what reached the host resource. Recorded because a
+    /// frame carrying a credential is not the same event as one that was merely rewritten, and an
+    /// audit of a session should be able to tell them apart. Never accompanied by the value.
+    pub(crate) secret_placed: bool,
 }
 
 /// What one exchange's answer amounted to: the frames owed to the cage, the plugin's account, and
@@ -440,6 +528,7 @@ fn collect_reply<H: Read + Write>(
     host: &mut H,
     seq: u64,
     first: Option<Vec<u8>>,
+    marker: Option<&SecretMarker>,
 ) -> Result<Collected, String> {
     let mut out = Vec::new();
     let mut label = None;
@@ -457,6 +546,16 @@ fn collect_reply<H: Read + Write>(
                 .map_err(|e| format!("cannot read the host resource: {e}"))?
                 .ok_or("the host resource closed mid-exchange")?,
         };
+        // The tripwire. A host resource that reflects the credential would put it in the cage,
+        // which is the one thing this whole design exists to prevent. Block, never strip: a
+        // partial strip gives false confidence, and an encoded value defeats it anyway — this is
+        // a tripwire, not a wall, exactly as on the egress side.
+        if let Some(marker) = marker
+            && marker.leaks_in(&frame)
+        {
+            // The caller appends what was done about it, so this says only what happened.
+            return Err("the host resource sent the credential back toward the cage".to_string());
+        }
         taken += 1;
         if taken > MAX_REPLY_FRAMES {
             return Err(format!(
@@ -482,7 +581,19 @@ fn collect_reply<H: Read + Write>(
             // Pass it on, as it stands or rebuilt. Rebuilding is what keeps something withheld
             // from ever being spelled toward the cage.
             Verdict::Forward(None) => out.push(frame),
-            Verdict::Forward(Some(rewritten)) | Verdict::Reply(rewritten) => out.push(rewritten),
+            Verdict::Forward(Some(rewritten)) | Verdict::Reply(rewritten) => {
+                // Guard: neither the marker nor the secret may travel toward the cage. The first
+                // would teach the cage the marker; the second is the invariant itself.
+                if let Some(marker) = marker
+                    && marker.present_in(&rewritten)
+                {
+                    return Err(
+                        "the plugin put the secret marker in a frame bound for the cage"
+                            .to_string(),
+                    );
+                }
+                out.push(rewritten);
+            }
             // Refused on the way back: what the host said is not delivered because the plugin was
             // shown it. The caller turns this into the protocol's refusal.
             // Refused on the way back. The outcome is a refusal, not a forward: what the host
@@ -533,6 +644,7 @@ pub(crate) fn relay_one<H: Read + Write>(
     spec: &BrokerSpec,
     decider: &mut dyn Decider,
     host: &mut H,
+    marker: Option<&SecretMarker>,
 ) -> Result<Relayed, String> {
     let mut ask_data = frame.to_vec();
     let mut ask_dir = dir;
@@ -546,6 +658,17 @@ pub(crate) fn relay_one<H: Read + Write>(
         })?;
         match answer.verdict {
             Verdict::Query(bytes) => {
+                // Guard: never in a query. The plugin reads what comes back, so a service that
+                // echoes would hand it the secret — the one path where placing the value would
+                // let the plugin read it.
+                if let Some(marker) = marker
+                    && marker.present_in(&bytes)
+                {
+                    return Err(
+                        "the plugin put the secret marker in a query, whose answer it reads"
+                            .to_string(),
+                    );
+                }
                 queries += 1;
                 if queries > MAX_QUERIES_PER_FRAME {
                     return Err(format!(
@@ -562,11 +685,25 @@ pub(crate) fn relay_one<H: Read + Write>(
                 ask_dir = Direction::QueryReply;
             }
             Verdict::Forward(rewritten) => {
-                let out = rewritten.as_deref().unwrap_or(frame);
+                // Guard: only in what the plugin produced. A frame passed through untouched is
+                // never scanned, so the cage's own bytes can never carry a marker into a
+                // substitution. What stops the cage from *choosing* where the secret lands is the
+                // marker being random and never shown to it.
+                let substituted = match (marker, rewritten.as_deref()) {
+                    (Some(marker), Some(written)) if marker.present_in(written) => {
+                        Some(marker.substitute(written))
+                    }
+                    _ => None,
+                };
+                let out = substituted
+                    .as_deref()
+                    .or(rewritten.as_deref())
+                    .unwrap_or(frame);
                 write_frame(host, spec.framing, out)
                     .map_err(|e| format!("cannot reach the host resource: {e}"))?;
-                let reply = collect_reply(spec, decider, host, seq, None)?;
+                let reply = collect_reply(spec, decider, host, seq, None, marker)?;
                 return Ok(Relayed {
+                    secret_placed: substituted.is_some(),
                     outcome: if reply.refused {
                         Outcome::Refused {
                             with_frame: !reply.frames.is_empty(),
@@ -582,10 +719,22 @@ pub(crate) fn relay_one<H: Read + Write>(
                 });
             }
             Verdict::Reply(bytes) => {
+                // Guard: the marker never goes toward the cage. Letting it through would teach the
+                // cage this connection's marker and undo the randomness the other guards rest on.
+                // A plugin doing this is broken or hostile, and saying so is the only way to tell
+                // them apart.
+                if let Some(marker) = marker
+                    && marker.present_in(&bytes)
+                {
+                    return Err(
+                        "the plugin tried to answer the cage with the secret marker".to_string()
+                    );
+                }
                 return Ok(Relayed {
                     outcome: Outcome::Answered,
                     to_cage: vec![bytes],
                     label: answer.label,
+                    secret_placed: false,
                 });
             }
             Verdict::Deny(bytes) => {
@@ -598,6 +747,7 @@ pub(crate) fn relay_one<H: Read + Write>(
                     },
                     to_cage: frame.into_iter().collect(),
                     label: answer.label,
+                    secret_placed: false,
                 });
             }
         }
@@ -641,6 +791,7 @@ impl PluginProcess {
         bwrap: &std::path::Path,
         plugin: &crate::plugins::broker::BrokerPlugin,
         allow: &[String],
+        marker: Option<&SecretMarker>,
     ) -> io::Result<Self> {
         use std::os::unix::net::UnixStream;
         use std::process::{Command, Stdio};
@@ -689,7 +840,7 @@ impl PluginProcess {
             writer: ours,
             _env: env,
         };
-        me.handshake(plugin, allow)?;
+        me.handshake(plugin, allow, marker)?;
         Ok(me)
     }
 
@@ -698,10 +849,12 @@ impl PluginProcess {
         &mut self,
         plugin: &crate::plugins::broker::BrokerPlugin,
         allow: &[String],
+        marker: Option<&SecretMarker>,
     ) -> io::Result<()> {
         let hello = Hello {
             broker: &plugin.name,
             allow,
+            secret_marker: marker.map(SecretMarker::token),
             inspect_replies: plugin.broker.inspect_replies,
         };
         self.writer.write_all(hello.line().as_bytes())?;
@@ -805,8 +958,19 @@ fn serve_conn(
     allow: &[String],
     host_socket: &std::path::Path,
     ring: &super::broker_control::BrokerRing,
+    secret: Option<(&str, usize)>,
 ) -> Result<(), String> {
-    let mut decider = PluginProcess::start(bwrap, plugin, allow).map_err(|e| e.to_string())?;
+    // Drawn per connection: two cages, or two connections of one cage, never share a marker.
+    let marker = match secret {
+        Some((secret, min_len)) => Some(
+            SecretMarker::new(secret, min_len)
+                .map_err(|e| format!("cannot draw a secret marker: {e}"))?,
+        ),
+        None => None,
+    };
+    let marker = marker.as_ref();
+    let mut decider =
+        PluginProcess::start(bwrap, plugin, allow, marker).map_err(|e| e.to_string())?;
     let mut host = std::os::unix::net::UnixStream::connect(host_socket)
         .map_err(|e| format!("cannot reach {}: {e}", host_socket.display()))?;
     // The deadline `relay_one` documents as the caller's to set. Without it a wedged host
@@ -827,7 +991,7 @@ fn serve_conn(
         let greeting = read_frame(&mut host, spec.framing, spec.max_frame)
             .map_err(|e| format!("cannot read the host resource's greeting: {e}"))?
             .ok_or("the host resource closed before greeting")?;
-        let greeted = collect_reply(spec, &mut decider, &mut host, 0, Some(greeting))?;
+        let greeted = collect_reply(spec, &mut decider, &mut host, 0, Some(greeting), marker)?;
         let to_cage = greeted.frames;
         for bytes in &to_cage {
             if write_frame(&mut cage_w, spec.framing, bytes).is_err() {
@@ -849,7 +1013,15 @@ fn serve_conn(
             Ok(None) | Err(_) => return Ok(()),
         };
         seq += 1;
-        let answer = match relay_one(&frame, Direction::Up, seq, spec, &mut decider, &mut host) {
+        let answer = match relay_one(
+            &frame,
+            Direction::Up,
+            seq,
+            spec,
+            &mut decider,
+            &mut host,
+            marker,
+        ) {
             Ok(relayed) => {
                 // Every decision goes to the record, which is what a reader consults afterwards.
                 // What sbx *observed* decides the kind; the plugin's label is only ever a detail
@@ -876,6 +1048,11 @@ fn serve_conn(
                         super::broker_control::BrokerKind::Refuse,
                         "a request".to_string(),
                     ),
+                };
+                let observed = if relayed.secret_placed {
+                    format!("{observed}, carrying the configured credential")
+                } else {
+                    observed
                 };
                 ring.push(kind, &observed, relayed.label.as_deref());
 
@@ -910,12 +1087,14 @@ fn serve_conn(
             Err(why) => {
                 ring.push(
                     super::broker_control::BrokerKind::Refuse,
-                    "a request no verdict could be obtained for",
+                    "an exchange that could not be completed",
                     Some(&why),
                 );
+                // The reason leads, because it is not always the same one: a plugin that died or
+                // wedged, and a reply the tripwire stopped, both end the exchange here. Saying
+                // "no verdict" for the second would name the wrong cause.
                 crate::diag::warn(&format!(
-                    "broker `{}`: no verdict, so the request was refused and the connection ended \
-                     — {}",
+                    "broker `{}`: {} — the request was refused and the connection ended",
                     plugin.name,
                     super::lens::sanitize_detail(&why)
                 ));
@@ -944,6 +1123,7 @@ pub(crate) fn start(
     binding: &crate::config::BrokerBinding,
     plugin: &crate::plugins::broker::BrokerPlugin,
     bwrap: &std::path::Path,
+    secret: Option<(String, usize)>,
 ) -> io::Result<(Broker, Wiring)> {
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
@@ -1001,16 +1181,25 @@ pub(crate) fn start(
                 live.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
-            let (bwrap, plugin, allow, host_socket, live, ring) = (
+            let (bwrap, plugin, allow, host_socket, live, ring, secret) = (
                 bwrap.clone(),
                 plugin.clone(),
                 allow.clone(),
                 host_socket.clone(),
                 live.clone(),
                 ring.clone(),
+                secret.clone(),
             );
             std::thread::spawn(move || {
-                if let Err(why) = serve_conn(conn, &bwrap, &plugin, &allow, &host_socket, &ring) {
+                if let Err(why) = serve_conn(
+                    conn,
+                    &bwrap,
+                    &plugin,
+                    &allow,
+                    &host_socket,
+                    &ring,
+                    secret.as_ref().map(|(v, n)| (v.as_str(), *n)),
+                ) {
                     // A connection that could not be served at all is a fact about the session,
                     // not about any one frame: without this the client just sees a closed socket.
                     crate::diag::warn(&format!(
@@ -1199,6 +1388,7 @@ mod tests {
         BrokerSpec {
             cage_env: vec!["X_SOCK".to_string()],
             host_greets: false,
+            uses_secret: false,
             framing: Framing::LengthU32Be,
             max_frame: 4096,
             deny_frame,
@@ -1212,7 +1402,7 @@ mod tests {
         host: &mut FakeHost,
         spec: &BrokerSpec,
     ) -> Result<Relayed, String> {
-        relay_one(frame, Direction::Up, 7, spec, plugin, host)
+        relay_one(frame, Direction::Up, 7, spec, plugin, host, None)
     }
 
     #[test]
@@ -1275,6 +1465,7 @@ mod tests {
                 outcome,
                 to_cage: out,
                 label,
+                ..
             } = relay(&[0x0b], &mut plugin, &mut host, &spec(declared)).unwrap();
             assert_eq!(
                 outcome,
@@ -1432,7 +1623,7 @@ while read -r line; do
   printf '{"seq":%s,"verdict":"deny","label":"nothing is allowed"}\n' "$seq"
 done"#,
         );
-        let mut proc = PluginProcess::start(&bwrap, &plugin, &["a-key".to_string()])
+        let mut proc = PluginProcess::start(&bwrap, &plugin, &["a-key".to_string()], None)
             .expect("the plugin starts and accepts the handshake");
         let answer = proc
             .ask(&Ask {
@@ -1466,7 +1657,7 @@ while read -r line; do
 done"#,
         );
         plugin.broker.max_frame = 4;
-        let mut proc = PluginProcess::start(&bwrap, &plugin, &[]).expect("the plugin starts");
+        let mut proc = PluginProcess::start(&bwrap, &plugin, &[], None).expect("the plugin starts");
         let err = proc
             .ask(&Ask {
                 seq: 1,
@@ -1491,13 +1682,186 @@ done"#,
             r#"read -r hello
 printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         );
-        match PluginProcess::start(&bwrap, &plugin, &[]) {
+        match PluginProcess::start(&bwrap, &plugin, &[], None) {
             Ok(_) => panic!("a plugin that declined must not become a broker"),
             Err(err) => assert!(
                 err.to_string().contains("this build brokers nothing"),
                 "{err}"
             ),
         }
+    }
+
+    fn marker_for(secret: &str) -> SecretMarker {
+        SecretMarker::new(secret, 4).expect("a marker is drawn")
+    }
+
+    fn relay_with(
+        frame: &[u8],
+        plugin: &mut ScriptedPlugin,
+        host: &mut FakeHost,
+        spec: &BrokerSpec,
+        marker: &SecretMarker,
+    ) -> Result<Relayed, String> {
+        relay_one(frame, Direction::Up, 7, spec, plugin, host, Some(marker))
+    }
+
+    /// What the capability is for: the plugin places a marker, and the bytes that reach the host
+    /// carry the credential the plugin never saw.
+    #[test]
+    fn the_secret_reaches_the_host_and_the_plugin_only_ever_held_a_marker() {
+        let marker = marker_for("hunter2");
+        let token = marker.token();
+        let mut host = FakeHost::with(vec![b"R".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Forward(Some(format!("PASSWORD {token}").into_bytes())),
+            more: false,
+            label: None,
+        }]);
+        let out = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker).unwrap();
+        assert!(matches!(out.outcome, Outcome::Forwarded { .. }));
+        assert_eq!(
+            host.seen,
+            vec![b"PASSWORD hunter2".to_vec()],
+            "the wire carries the credential"
+        );
+        assert!(
+            !host.seen[0]
+                .windows(token.len())
+                .any(|w| w == token.as_bytes()),
+            "and not the marker"
+        );
+    }
+
+    /// A frame carrying a credential is not the same event as one merely rewritten, and a session
+    /// audit has to be able to tell them apart — without the value ever appearing.
+    #[test]
+    fn the_relay_reports_that_a_credential_was_placed() {
+        let marker = marker_for("hunter2");
+        let mut host = FakeHost::with(vec![b"R".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Forward(Some(format!("AUTH {}", marker.token()).into_bytes())),
+            more: false,
+            label: None,
+        }]);
+        let out = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker).unwrap();
+        assert!(out.secret_placed, "a placed credential is reported");
+
+        // A rewrite that places nothing is not reported as carrying one.
+        let mut host = FakeHost::with(vec![b"R".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Forward(Some(b"PLAIN".to_vec())),
+            more: false,
+            label: None,
+        }]);
+        let out = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker).unwrap();
+        assert!(!out.secret_placed);
+    }
+
+    /// Guard: the cage's own bytes are never scanned. A frame passed through untouched carries no
+    /// substitution, whatever it contains.
+    #[test]
+    fn a_pass_through_frame_is_never_substituted() {
+        let marker = marker_for("hunter2");
+        let cage_frame = format!("ECHO {}", marker.token()).into_bytes();
+        let mut host = FakeHost::with(vec![b"R".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward()]);
+        relay_with(&cage_frame, &mut plugin, &mut host, &spec(None), &marker).unwrap();
+        assert_eq!(
+            host.seen,
+            vec![cage_frame],
+            "the cage's bytes reach the host unchanged, marker text and all"
+        );
+    }
+
+    /// Guard: never in a query. The plugin reads a query's answer, so a service that echoes would
+    /// hand it the secret — the one path where placing the value would let it be read.
+    #[test]
+    fn the_marker_is_refused_in_a_query() {
+        let marker = marker_for("hunter2");
+        let mut host = FakeHost::with(vec![b"R".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Query(format!("ECHO {}", marker.token()).into_bytes()),
+            more: false,
+            label: None,
+        }]);
+        let err = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker)
+            .expect_err("must be refused");
+        assert!(err.contains("query"), "{err}");
+        assert!(host.seen.is_empty(), "nothing reaches the host");
+    }
+
+    /// Guard: the marker never travels toward the cage. Letting it through would teach the cage
+    /// this connection's marker, and every other guard rests on the cage not knowing it.
+    #[test]
+    fn the_marker_is_refused_on_its_way_to_the_cage() {
+        let marker = marker_for("hunter2");
+        let mut host = FakeHost::with(Vec::new());
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Reply(format!("HERE {}", marker.token()).into_bytes()),
+            more: false,
+            label: None,
+        }]);
+        let err = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker)
+            .expect_err("must be refused");
+        assert!(err.contains("answer the cage"), "{err}");
+    }
+
+    /// The same guard on the way back, where a plugin that inspects replies could rebuild one.
+    #[test]
+    fn the_marker_is_refused_in_a_rebuilt_reply() {
+        let marker = marker_for("hunter2");
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            ..spec(None)
+        };
+        let mut host = FakeHost::with(vec![b"R".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![
+            ScriptedPlugin::forward(),
+            Answer {
+                verdict: Verdict::Forward(Some(format!("R {}", marker.token()).into_bytes())),
+                more: false,
+                label: None,
+            },
+        ]);
+        let err = relay_with(b"p", &mut plugin, &mut host, &inspecting, &marker)
+            .expect_err("must be refused");
+        assert!(err.contains("bound for the cage"), "{err}");
+    }
+
+    /// The tripwire on the way back: a host resource that reflects the credential would put it in
+    /// the cage, which is the one outcome this design exists to prevent. Blocked, never stripped.
+    #[test]
+    fn a_reply_carrying_the_credential_back_is_refused() {
+        let marker = marker_for("hunter2");
+        let inspecting = BrokerSpec {
+            inspect_replies: true,
+            ..spec(None)
+        };
+        let mut host = FakeHost::with(vec![b"YOU SENT hunter2".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward()]);
+        let err = relay_with(b"p", &mut plugin, &mut host, &inspecting, &marker)
+            .expect_err("a reflected credential must be refused");
+        assert!(err.contains("back toward the cage"), "{err}");
+    }
+
+    /// Under the floor the scan is off, and deliberately: a two-byte secret would match innocent
+    /// traffic constantly. The launch says so once rather than silently doing nothing.
+    #[test]
+    fn a_secret_under_the_floor_is_placed_but_not_watched() {
+        let short = SecretMarker::new("ab", 8).expect("drawn");
+        assert!(!short.leaks_in(b"xx ab xx"), "no scan under the floor");
+        let long = SecretMarker::new("hunter2!", 8).expect("drawn");
+        assert!(long.leaks_in(b"xx hunter2! xx"), "watched at the floor");
+    }
+
+    /// Two connections never share a marker: one drawn per connection is what keeps a cage that
+    /// learned one (somehow) from using it on the next.
+    #[test]
+    fn every_connection_draws_its_own_marker() {
+        let a = marker_for("hunter2");
+        let b = marker_for("hunter2");
+        assert_ne!(a.token(), b.token());
+        assert!(a.token().starts_with("SBX-SECRET-"));
     }
 
     /// The shape a real protocol forced: gpg-agent answers one command with a run of lines
@@ -1528,6 +1892,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             outcome,
             to_cage: out,
             label,
+            ..
         } = relay(b"GETINFO version", &mut plugin, &mut host, &inspecting).unwrap();
         assert!(matches!(outcome, Outcome::Forwarded { .. }));
         assert_eq!(
@@ -1587,6 +1952,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             outcome,
             to_cage: out,
             label,
+            ..
         } = relay(&[0x0b], &mut plugin, &mut host, &inspecting).unwrap();
         assert_eq!(
             outcome,
@@ -1735,6 +2101,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         let line = Hello {
             broker: "gpg-agent",
             allow: &allow,
+            secret_marker: None,
             inspect_replies: true,
         }
         .line();

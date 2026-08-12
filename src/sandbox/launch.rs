@@ -4454,7 +4454,45 @@ fn build(
                 ));
                 continue;
             }
-            match broker::start(&prep.layout, binding, plugin, &prep.bwrap) {
+            // The credential is resolved host-side, here, before anything is stood up: a broker
+            // that was promised one and cannot get it must not run, or it would put an
+            // unauthenticated connection in front of the cage and look like the resource refusing
+            // it. The plugin never receives this value — only a marker standing in for it.
+            let secret = if binding.secret.is_empty() {
+                None
+            } else if !plugin.broker.uses_secret {
+                // The grant is the manifest's to make: a credential is not handed to a plugin that
+                // was not written to place one, whatever the config says.
+                crate::diag::warn(&format!(
+                    "`[broker.{name}] secret` names a credential, but the plugin's manifest does \
+                     not declare `uses_secret` — the broker runs without it"
+                ));
+                None
+            } else {
+                match egress::resolve_chain(&binding.secret, name, &prep.cwd, &prep.bwrap) {
+                    Ok(value) => {
+                        // Said once, at the launch that decided it, rather than per connection: a
+                        // credential under the redaction floor is placed on the wire but not
+                        // watched on the way back, and that is a fact about this config.
+                        if value.len() < prep.cfg.redact_min_len {
+                            crate::diag::warn(&format!(
+                                "the credential for the `{name}` broker is {} bytes, under the \
+                                 {}-byte `[redact] min_len` floor — it is placed on the wire, but \
+                                 a reply carrying it back is not blocked (a scan that short \
+                                 refuses innocent traffic more often than it catches a leak)",
+                                value.len(),
+                                prep.cfg.redact_min_len
+                            ));
+                        }
+                        Some((value, prep.cfg.redact_min_len))
+                    }
+                    Err(e) => {
+                        eprintln!("sbx: cannot resolve the secret for the `{name}` broker: {e}");
+                        return Err(ExitCode::FAILURE);
+                    }
+                }
+            };
+            match broker::start(&prep.layout, binding, plugin, &prep.bwrap, secret) {
                 Ok((guard, wiring)) => {
                     crate::diag::note(&format!(
                         "broker: `{name}` stands in front of {}{}",

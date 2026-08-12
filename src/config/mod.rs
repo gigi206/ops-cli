@@ -182,6 +182,10 @@ pub(crate) struct BrokerBinding {
     pub(crate) socket: PathBuf,
     /// The policy, passed to the plugin verbatim at the start of every connection.
     pub(crate) allow: Vec<String>,
+    /// Where the credential this broker places comes from, when the global config named one and
+    /// the plugin's manifest declares `uses_secret`. Resolved host-side at launch; the plugin is
+    /// handed a marker, never the value.
+    pub(crate) secret: Vec<SecretSource>,
     /// Which layer supplied the policy, for `sbx config`.
     pub(crate) origin: Provenance,
 }
@@ -2064,7 +2068,7 @@ fn resolve(
         ssh_agent,
         ssh_agent_origin,
         ssh_agent_confirm,
-        brokers: resolve_brokers(broker_cfg, &broker_origin, &mut warnings),
+        brokers: resolve_brokers(broker_cfg, &broker_origin, plugins, &mut warnings),
         secrets,
         declared_secrets,
         tasks,
@@ -3410,6 +3414,7 @@ fn apply_binds(
 fn resolve_brokers(
     tables: BTreeMap<String, crate::config::schema::RawBrokerConfig>,
     origins: &BTreeMap<String, Provenance>,
+    plugins: &crate::plugins::PluginRegistry,
     warnings: &mut Vec<String>,
 ) -> Vec<BrokerBinding> {
     // Read once, like the bind expander's: a portable config should not have to spell an absolute
@@ -3448,11 +3453,40 @@ fn resolve_brokers(
                 continue;
             }
         };
+        // The secret's sources are parsed here, where a bad reference is still a configuration
+        // error rather than something that surfaces at the first frame. A broker whose secret does
+        // not parse is not started: it would otherwise put an unauthenticated connection in front
+        // of the cage, which reads as the resource refusing it.
+        let mut secret = Vec::new();
+        let mut unresolved = false;
+        if let Some(from) = &table.secret {
+            // The same two shapes a `[secret] from` takes: one ref, or a fallback chain tried in
+            // order.
+            let refs: &[String] = match from {
+                crate::config::schema::SecretFrom::One(one) => std::slice::from_ref(one),
+                crate::config::schema::SecretFrom::Many(list) => list,
+            };
+            for reff in refs {
+                match crate::config::secrets::parse_secret_ref(reff, plugins) {
+                    Ok(source) => secret.push(source),
+                    Err(why) => {
+                        warnings.push(format!(
+                            "`[broker.{name}] secret`: {why} — the broker is not started"
+                        ));
+                        unresolved = true;
+                    }
+                }
+            }
+        }
+        if unresolved {
+            continue;
+        }
         out.push(BrokerBinding {
             origin: origins.get(&name).copied().unwrap_or(Provenance::Global),
             name,
             socket,
             allow: table.allow,
+            secret,
         });
     }
     out

@@ -585,6 +585,16 @@ pub(crate) struct RawBrokerConfig {
     /// to expose. An untrusted project's table is dropped whole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allow: Vec<String>,
+    /// Where the credential this broker puts on the wire comes from: one `scheme://locator`
+    /// resolver reference, or a fallback chain tried in order — the same sources a `[secret]`
+    /// declaration takes.
+    ///
+    /// **Global config only**, like `socket`, and for a sharper version of the same reason: this
+    /// names a secret sbx will read host-side and place on a wire. The plugin never receives it.
+    /// It is answered only for a broker whose manifest declares `uses_secret`, so a credential
+    /// cannot be handed to a plugin that was not written to place one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) secret: Option<SecretFrom>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,

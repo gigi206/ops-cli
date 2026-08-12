@@ -127,6 +127,17 @@ pub(crate) struct BrokerSpec {
     /// Closing is the refusal that always works, because it needs no knowledge of the protocol.
     /// This field only buys the client a clean protocol-level refusal instead of a cut socket.
     pub(crate) deny_frame: Option<Vec<u8>>,
+    /// Whether this broker is handed a **marker** to stand in for a secret it never sees.
+    ///
+    /// A broker holds no secret — that is what bounds it to the hole it replaces. This grant does
+    /// not change that: what the plugin receives is a random per-connection marker, and sbx
+    /// substitutes the real value into the plugin's own bytes on their way to the host resource.
+    /// The plugin can place the secret; it can never read it.
+    ///
+    /// Declared here, and not only in the config, for the reason every grant is: which plugin may
+    /// be handed one is a property of the code that was installed and reviewed, not of the machine
+    /// that configures it. Without it a plugin gets no marker and any substitution is refused.
+    pub(crate) uses_secret: bool,
     /// Whether the host resource speaks first: it sends a frame on connection, before the cage has
     /// asked anything.
     ///
@@ -199,6 +210,8 @@ pub(super) struct RawBroker {
     framing: Option<String>,
     max_frame: Option<i64>,
     deny_frame: Option<Vec<i64>>,
+    #[serde(default)]
+    uses_secret: bool,
     #[serde(default)]
     host_greets: bool,
     #[serde(default)]
@@ -315,6 +328,7 @@ pub(super) fn validate(
         framing,
         max_frame,
         deny_frame,
+        uses_secret: raw.uses_secret,
         host_greets: raw.host_greets,
         inspect_replies: raw.inspect_replies,
     })
@@ -362,6 +376,7 @@ mod tests {
             framing: Some("length-u32-be".to_string()),
             max_frame: Some(4096),
             deny_frame: Some(vec![5]),
+            uses_secret: false,
             host_greets: false,
             inspect_replies: true,
         }

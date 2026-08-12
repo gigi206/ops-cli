@@ -913,6 +913,15 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             },
             provenance_tag(b.origin, pal)
         );
+        // The credential, by locator. On its own line rather than folded into the one above: a
+        // broker that authenticates on the cage's behalf is the thing an audit stops at.
+        if !b.secret.is_empty() {
+            let _ = writeln!(
+                o,
+                "    {dim}places the credential from:{r} {}",
+                b.secret.join(", ")
+            );
+        }
     }
 
     // Credentials the egress proxy injects — by destination and source locator, never the value.
@@ -2602,6 +2611,7 @@ mod tests {
             name: "gpg-agent".into(),
             socket: "/run/user/1000/gnupg/S.gpg-agent".into(),
             allow: vec!["sign".into()],
+            secret: Vec::new(),
             origin: config::view::ProvenanceView::Project,
         }];
         let out = render_config(&view, &style::Palette::plain(), false);

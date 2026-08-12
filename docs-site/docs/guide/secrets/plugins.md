@@ -505,6 +505,7 @@ cage_env  = ["GPG_AGENT_INFO"]     # cage variables pointed at the socket sbx pl
 framing   = "line"                 # `line` or `length-u32-be`
 max_frame = 2048                   # the largest frame this protocol admits
 deny_frame = [5]                   # optional: a refusal frame that needs no request context
+uses_secret = true                 # may be handed a marker standing in for a credential
 host_greets = true                 # the host speaks first, before the cage asks anything
 inspect_replies = true             # also rule on what the host resource answers
 ```
@@ -526,6 +527,11 @@ launch:
   `line` (one message per line, the newline being the boundary rather than part of the
   message). A plugin handed an uncut stream would be the broker rather than rule on its
   messages. An over-long frame is an error, never a truncation.
+- **`uses_secret` is what lets a broker place a credential it never sees.** The plugin is
+  handed a random marker and `sbx` substitutes the value on the way to the host resource;
+  see [`[broker]`](../configuration/broker#placing-a-credential-the-cage-does-not-have).
+  Declared here rather than only in the config, because which plugin may be handed one is a
+  property of the code that was installed and reviewed.
 - **`host_greets` and multi-message answers both need `inspect_replies`.** A protocol
   whose reply is a run of messages needs the plugin to say where the run ends, and a
   greeting is a frame from the host that must not reach the cage unseen.

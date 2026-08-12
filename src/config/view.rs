@@ -553,6 +553,11 @@ pub(crate) struct BrokerView {
     pub(crate) name: String,
     pub(crate) socket: String,
     pub(crate) allow: Vec<String>,
+    /// Where the credential this broker places comes from, by **locator** — the variable name or
+    /// file path, never the value. Empty when it places none. Shown because a reader auditing a
+    /// config is auditing what reaches a wire, and a broker that authenticates on the cage's
+    /// behalf is the sharpest case of that.
+    pub(crate) secret: Vec<String>,
     /// Which layer supplied the policy. The socket is always the global config's.
     pub(crate) origin: ProvenanceView,
 }
@@ -972,6 +977,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
                 name: b.name.clone(),
                 socket: b.socket.display().to_string(),
                 allow: b.allow.clone(),
+                secret: b.secret.iter().map(|s| s.describe()).collect(),
                 origin: b.origin.into(),
             })
             .collect(),
