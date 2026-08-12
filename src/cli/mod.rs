@@ -317,6 +317,10 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "ssh-agent" => sshagent::ssh_agent_cmd(rest),
         "proc" => proc::proc_cmd(rest),
         "fs" => fs::fs_cmd(rest),
+        "logs" | "log" => match crate::help::maybe_help("logs", &rest) {
+            Some(code) => code,
+            None => logs::run_merged(&rest),
+        },
         "task" | "tasks" => task::task_cmd(rest),
         "secret" | "secrets" => secret::secret_cmd(rest),
         "plugins" => plugins::plugins_cmd(rest),

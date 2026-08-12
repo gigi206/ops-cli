@@ -1,6 +1,13 @@
-//! The `sbx <lens> logs` view, once for the three observation lenses: the files a session writes
-//! (`sbx fs logs`), the processes it execs (`sbx proc logs`), and what its ssh-agent broker decided
-//! (`sbx ssh-agent logs`).
+//! The `sbx <lens> logs` views, and the merged `sbx logs` that reads them all at once.
+//!
+//! Two things live here. [`run`] is the per-lens view, once for the three observation lenses: the
+//! files a session writes (`sbx fs logs`), the processes it execs (`sbx proc logs`), and what its
+//! ssh-agent broker decided (`sbx ssh-agent logs`). [`run_merged`] is `sbx logs`, which reads those
+//! three plus the egress decisions and the task invocations of one session and interleaves them in
+//! time.
+//!
+//! They share this module for the output discipline described below, and because the merged view is
+//! the same read loop with five cursors instead of one.
 //!
 //! All three read a bounded ring host-side over a per-session control socket — see
 //! [`crate::sandbox::lens`] for the substrate under them — and all three present it the same way: a
@@ -185,5 +192,476 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         cursor = snap.head;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The merged view: `sbx logs`
+// ---------------------------------------------------------------------------------------------
+
+/// One event of one session, flattened out of whichever feed saw it.
+///
+/// The five feeds record different things and none of them is reshaped here: what they share is
+/// already the same shape — a stamp, a short fixed token, and one field of free text — because each
+/// was built to put its verbatim field last on the wire. This is that shape named, so five feeds can
+/// be sorted into one column of time.
+struct Row {
+    /// When the event **happened**, in epoch milliseconds. The merge key, and the reason every feed
+    /// was brought to one unit first: sorting a second-resolution stamp against millisecond ones
+    /// misplaces rows silently. For a task invocation this is when it *began*, not when its entry
+    /// was written — an invocation is recorded at its end, and filing it there would put a slow one
+    /// after everything that ran while it was still going.
+    at_epoch_ms: u128,
+    /// Which feed saw it, as the column prints it.
+    feed: &'static str,
+    /// The feed's own short verdict/kind token, unchanged: `deny`, `exec`, `write`, `sign`, `exit=0`.
+    token: String,
+    /// The feed's verbatim field: a host, a command, a path, a key comment, an operation name.
+    subject: String,
+}
+
+/// Read one feed past a cursor: its new rows, the head to come back with, and how many events it
+/// evicted before this read could see them.
+///
+/// The head is `None` when this feed cannot be followed — it answered, and its rows are good, but it
+/// handed back no cursor to come back with. Reading that as zero would re-ask for everything on
+/// every poll and print the same rows again; declining to follow shows them once and says the feed
+/// ended, which is the honest reading of a source that cannot tell us what is new.
+type FeedRead = fn(&Path, Option<u64>) -> std::io::Result<(Vec<Row>, Option<u64>, u64)>;
+
+/// One feed of the merged view, and where it stands.
+struct Feed {
+    name: &'static str,
+    socket: PathBuf,
+    /// Why this feed might not be there — the sentence that separates "nothing happened" from
+    /// "nothing was ever watching", which is the single most misleading thing a merged view can get
+    /// wrong. Each feed keeps its own wording, because the remedy differs.
+    absent: &'static str,
+    read: FeedRead,
+    /// The cursor to read past, or `None` once this feed is gone: either it was never stood up, or
+    /// it ended while the others ran on. A gone feed is never polled again.
+    cursor: Option<u64>,
+}
+
+fn read_fs_rows(
+    socket: &Path,
+    after: Option<u64>,
+) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+    let snap = crate::sandbox::fs_control::read_fs_log(socket, after)?;
+    let rows = snap
+        .events
+        .into_iter()
+        .map(|e| Row {
+            at_epoch_ms: e.at_epoch_ms,
+            feed: "fs",
+            token: e.kind.token().to_string(),
+            subject: e.path,
+        })
+        .collect();
+    Ok((rows, Some(snap.head), snap.dropped))
+}
+
+fn read_proc_rows(
+    socket: &Path,
+    after: Option<u64>,
+) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+    let snap = crate::sandbox::proc_control::read_exec_log(socket, after)?;
+    let rows = snap
+        .events
+        .into_iter()
+        .map(|e| Row {
+            at_epoch_ms: e.at_epoch_ms,
+            feed: "proc",
+            token: e.verdict,
+            subject: e.command,
+        })
+        .collect();
+    Ok((rows, Some(snap.head), snap.dropped))
+}
+
+fn read_ssh_rows(
+    socket: &Path,
+    after: Option<u64>,
+) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+    let snap = crate::sandbox::sshagent_control::read_agent_log(socket, after)?;
+    let rows = snap
+        .events
+        .into_iter()
+        .map(|e| Row {
+            at_epoch_ms: e.at_epoch_ms,
+            feed: "ssh",
+            token: e.kind.token().to_string(),
+            subject: e.detail,
+        })
+        .collect();
+    Ok((rows, Some(snap.head), snap.dropped))
+}
+
+fn read_net_rows(
+    socket: &Path,
+    after: Option<u64>,
+) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+    // Muted refusals and captured traffic stay out: this view is the shape of a session's activity,
+    // and `sbx net logs --all --with-body` is where one request is opened up. Asking for neither
+    // keeps the read cheap and the column honest about what the default egress view shows.
+    let snap = crate::sandbox::control::read_log(socket, after, None, false, false)?;
+    let rows = snap
+        .events
+        .into_iter()
+        .map(|e| {
+            let mut subject = format!("{}:{}", e.host, e.port);
+            if let (Some(method), Some(path)) = (&e.method, &e.path) {
+                subject.push_str(&format!("  {method} {path}"));
+            }
+            // The reason is a stable category token, never a rule's text or a secret's name — and it
+            // is the whole value of a refusal line: `deny` alone does not say what to change.
+            if e.verdict != crate::sandbox::control::LogVerdict::Allow {
+                subject.push_str(&format!("  ({})", e.reason));
+            }
+            Row {
+                at_epoch_ms: e.at_epoch_ms,
+                feed: "net",
+                token: e.verdict.as_str().to_string(),
+                subject,
+            }
+        })
+        .collect();
+    Ok((rows, Some(snap.head), snap.dropped))
+}
+
+fn read_task_rows(
+    socket: &Path,
+    after: Option<u64>,
+) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+    let (entries, head, dropped) = crate::sandbox::task_control::read_entries(socket, after)?;
+    let rows: Vec<Row> = entries
+        .into_iter()
+        .map(|e| Row {
+            at_epoch_ms: e.started_epoch_ms,
+            feed: "task",
+            token: match e.refused.is_some() {
+                true => "refused".to_string(),
+                false => format!("exit={}", e.exit),
+            },
+            subject: match e.refused {
+                Some(reason) => format!("{}  ({reason})", e.task),
+                None => e.task,
+            },
+        })
+        .collect();
+    // A plane that predates the append cursor answers with no `head=`, and rows all the same. Zero
+    // with nothing to show is simply an empty log and follows fine; zero *with* rows is that older
+    // plane, which has no way to say what is new — so it is read once and not followed.
+    let head = match head == 0 && !rows.is_empty() {
+        true => None,
+        false => Some(head),
+    };
+    Ok((rows, head, dropped))
+}
+
+/// Every feed of one session, in the order their columns read best when two events share a
+/// millisecond: what the agent reached for, then what was decided about it.
+fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
+    vec![
+        Feed {
+            name: "proc",
+            socket: crate::sandbox::proc_control::proc_control_socket(data_dir, pid),
+            absent: "not observed — relaunch with `--observe` to record what it execs",
+            read: read_proc_rows,
+            cursor: Some(0),
+        },
+        Feed {
+            name: "net",
+            socket: crate::sandbox::control::control_socket(data_dir, pid),
+            absent: "no filtering egress posture — `[network] mode` decides nothing to record",
+            read: read_net_rows,
+            cursor: Some(0),
+        },
+        Feed {
+            name: "fs",
+            socket: crate::sandbox::fs_control::fs_control_socket(data_dir, pid),
+            absent: "not observed — relaunch with `--observe` to record what it writes",
+            read: read_fs_rows,
+            cursor: Some(0),
+        },
+        Feed {
+            name: "ssh",
+            socket: crate::sandbox::sshagent_control::agent_control_socket(data_dir, pid),
+            absent: "no ssh-agent broker — this config has no `[ssh_agent] allow`",
+            read: read_ssh_rows,
+            cursor: Some(0),
+        },
+        Feed {
+            name: "task",
+            socket: crate::sandbox::task_control::log_socket(data_dir, pid),
+            absent: "no declared operations — this config has no `[task]`",
+            read: read_task_rows,
+            cursor: Some(0),
+        },
+    ]
+}
+
+/// Width of the token column: the widest token any feed emits (`blocked`, `observe`, `exit=-1`),
+/// so the verbatim subjects line up whatever mix of feeds a session has.
+const TOKEN_WIDTH: usize = 8;
+
+/// Write one merged row: a JSON object per line (so a `--follow` stream is valid NDJSON), or the
+/// human row. Returns the write result so the caller ends cleanly on a closed pipe.
+fn write_row(
+    out: &mut dyn Write,
+    session_pid: u32,
+    row: &Row,
+    json: bool,
+    pal: &style::Palette,
+) -> std::io::Result<()> {
+    if json {
+        let obj = serde_json::json!({
+            "session_pid": session_pid,
+            "at_epoch_ms": row.at_epoch_ms as u64,
+            "feed": row.feed,
+            "token": row.token,
+            "subject": row.subject,
+        });
+        writeln!(out, "{obj}")
+    } else {
+        let (dim, r) = (pal.dim, pal.reset);
+        let time = crate::format_log_time(row.at_epoch_ms);
+        // The verdict tokens the four decision feeds share, coloured the same way each of them
+        // colours its own: a refusal must read as one at a glance in a column mixing five sources.
+        let hue = match row.token.as_str() {
+            "allow" => pal.ok,
+            "deny" | "blocked" | "error" | "refuse" | "refused" => pal.err,
+            "ask" => pal.warn,
+            _ => pal.dim,
+        };
+        writeln!(
+            out,
+            "  {dim}{time}{r}  {dim}{:<4}{r}  {hue}{:<TOKEN_WIDTH$}{r}  {}",
+            row.feed, row.token, row.subject
+        )
+    }
+}
+
+/// `sbx logs [<id>] [--feed <a,b,…>] [-n <N>] [-f|--follow] [--json]`: one session's five feeds,
+/// interleaved in time.
+///
+/// This reads; it stands nothing up. Every feed it shows is one a launch already decided to run, and
+/// a feed that is not running is *named* rather than passed over — an empty column and an absent one
+/// look identical, and telling them apart is most of what this view is for.
+pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
+    let mut json = false;
+    let mut follow = false;
+    let mut id: Option<&str> = None;
+    let mut limit: Option<usize> = None;
+    let mut only: Option<Vec<String>> = None;
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        match a.to_str() {
+            Some("--json") => json = true,
+            Some("-f") | Some("--follow") => follow = true,
+            Some("-n") | Some("--lines") => match rest.next().and_then(|v| v.to_str()) {
+                Some(v) => match v.parse() {
+                    Ok(n) => limit = Some(n),
+                    Err(_) => {
+                        diag::error(&format!("sbx: logs: -n takes a count, not {v:?}"));
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    diag::error("sbx: logs: -n takes a count");
+                    return ExitCode::from(2);
+                }
+            },
+            Some("--feed") => match rest.next().and_then(|v| v.to_str()) {
+                Some(v) => only = Some(v.split(',').map(|s| s.trim().to_string()).collect()),
+                None => {
+                    diag::error("sbx: logs: --feed takes a comma-separated list of feed names");
+                    return ExitCode::from(2);
+                }
+            },
+            Some(s) if !s.starts_with('-') => {
+                if id.is_some() {
+                    diag::error("sbx: logs: at most one session id");
+                    return ExitCode::from(2);
+                }
+                id = Some(s);
+            }
+            other => {
+                diag::error(&format!(
+                    "sbx: logs: unexpected argument {:?}",
+                    other.unwrap_or_default()
+                ));
+                eprint!("{}", help::page_usage(&["logs"]).unwrap_or_default());
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(layout) = store::Layout::from_env() else {
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
+        );
+        return ExitCode::FAILURE;
+    };
+    let sessions = match session::Registry::at(layout.data_dir()).list() {
+        Ok(s) => s,
+        Err(e) => {
+            diag::error(&format!("sbx: cannot read the session registry: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let target = match resolve_session_target(&sessions, id, "logs") {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+
+    let mut feeds = feeds_for(layout.data_dir(), target.pid);
+    if let Some(names) = &only {
+        // A name nobody answers to is a typo, and silently showing fewer feeds than asked for is the
+        // one failure this view cannot afford — the reader would read absence as quiet.
+        let known: Vec<&str> = feeds.iter().map(|f| f.name).collect();
+        if let Some(bad) = names.iter().find(|n| !known.contains(&n.as_str())) {
+            diag::error(&format!("sbx: logs: no feed named `{bad}`"));
+            diag::hint(&format!("       the feeds are: {}.", known.join(", ")));
+            return ExitCode::from(2);
+        }
+        feeds.retain(|f| names.contains(&f.name.to_string()));
+    }
+
+    // The first read is the whole retained window of every feed. A connect failure here means that
+    // feed was never stood up for this session, which each feed says in its own words below.
+    let mut rows = Vec::new();
+    let mut absent: Vec<(&str, &str)> = Vec::new();
+    // Feeds that answered but handed back no cursor: shown once, then not polled again.
+    let mut unfollowable: Vec<&str> = Vec::new();
+    for feed in &mut feeds {
+        match (feed.read)(&feed.socket, None) {
+            Ok((batch, head, _)) => {
+                rows.extend(batch);
+                feed.cursor = head;
+                if head.is_none() {
+                    unfollowable.push(feed.name);
+                }
+            }
+            Err(_) => {
+                absent.push((feed.name, feed.absent));
+                feed.cursor = None;
+            }
+        }
+    }
+    if feeds.iter().all(|f| f.cursor.is_none()) {
+        diag::error(&format!(
+            "sbx: logs: session {} is recording nothing.",
+            target.pid
+        ));
+        for (name, why) in &absent {
+            diag::hint(&format!("       {name}: {why}"));
+        }
+        return ExitCode::from(2);
+    }
+
+    // Stable, so two events sharing a millisecond keep the order `feeds_for` puts them in — what the
+    // agent reached for before what was decided about it.
+    rows.sort_by_key(|r| r.at_epoch_ms);
+    if let Some(n) = limit {
+        let from = rows.len().saturating_sub(n);
+        rows.drain(..from);
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    {
+        let mut out = std::io::stdout().lock();
+        let wrote = (|| -> std::io::Result<()> {
+            if !json {
+                let (h, d, r) = (pal.head, pal.dim, pal.reset);
+                let live: Vec<&str> = feeds
+                    .iter()
+                    .filter(|f| f.cursor.is_some())
+                    .map(|f| f.name)
+                    .collect();
+                writeln!(
+                    out,
+                    "{h}feeds — session {} [{}] {}{r}",
+                    target.pid,
+                    target.label(),
+                    target.project.display()
+                )?;
+                writeln!(out, "  {d}recording: {}{r}", live.join(", "))?;
+                for (name, why) in &absent {
+                    writeln!(out, "  {d}{name}: {why}{r}")?;
+                }
+                // Said out loud rather than left to look like a quiet feed: this one answered, and
+                // what it showed is the whole of what it has to say here.
+                for name in &unfollowable {
+                    writeln!(
+                        out,
+                        "  {d}{name}: shown once, not followed — this session's plane predates the \
+                         cursor `--follow` needs (it was launched by an earlier sbx){r}"
+                    )?;
+                }
+            }
+            for row in &rows {
+                write_row(&mut out, target.pid, row, json, &pal)?;
+            }
+            out.flush()
+        })();
+        if wrote.is_err() {
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    if !follow {
+        return ExitCode::SUCCESS;
+    }
+
+    // Follow: poll every live feed past its own cursor, sort each round together, and stop when the
+    // last one ends. The feeds are independent by construction — each owns its ring and its socket —
+    // so one ending is not the session ending, and dropping it while the others run on is the whole
+    // reason a cursor can go `None` here rather than the loop returning.
+    loop {
+        std::thread::sleep(FOLLOW_INTERVAL);
+        let mut batch = Vec::new();
+        let mut evicted = 0;
+        for feed in &mut feeds {
+            let Some(cursor) = feed.cursor else { continue };
+            match (feed.read)(&feed.socket, Some(cursor)) {
+                Ok((rows, head, dropped)) => {
+                    batch.extend(rows);
+                    evicted += dropped;
+                    feed.cursor = head;
+                }
+                // Whoever stood the feed up unlinks its socket on drop, so a connect failure after a
+                // successful read is that feed ending, not a transient (a local UDS connect does not
+                // fail transiently).
+                Err(_) => feed.cursor = None,
+            }
+        }
+        if feeds.iter().all(|f| f.cursor.is_none()) {
+            if !json {
+                let mut out = std::io::stdout().lock();
+                let (dim, r) = (pal.dim, pal.reset);
+                let _ = writeln!(out, "  {dim}(session {} ended){r}", target.pid);
+            }
+            return ExitCode::SUCCESS;
+        }
+        batch.sort_by_key(|r| r.at_epoch_ms);
+        let mut out = std::io::stdout().lock();
+        let wrote = (|| -> std::io::Result<()> {
+            if evicted > 0 && !json {
+                let (dim, r) = (pal.dim, pal.reset);
+                writeln!(
+                    out,
+                    "  {dim}({evicted} earlier event(s) evicted from a ring before this poll){r}"
+                )?;
+            }
+            for row in &batch {
+                write_row(&mut out, target.pid, row, json, &pal)?;
+            }
+            out.flush()
+        })();
+        drop(out);
+        if wrote.is_err() {
+            return ExitCode::SUCCESS;
+        }
     }
 }

@@ -29,6 +29,15 @@ sbx net  logs        -f                # where it went
 sbx ssh-agent logs 12345 -f            # what it signed
 ```
 
+Each of those shows the most of its own lens. When the question is what happened in what **order**,
+read them together instead: [`sbx logs`](../cli/logs) interleaves all four by time, plus the
+declared operations the session invoked, and names any feed that is not recording so an empty
+column is never mistaken for a quiet one.
+
+```sh
+sbx logs 12345 -f                      # all of it, in one column of time
+```
+
 Three properties hold across all four. Each lives in the **supervisor's or the
 proxy's memory**, never on disk, and is gone when the session exits (the one exception
 is [`sbx net stats`](../cli/net#sbx-net-stats), a durable per-host counter). Each is

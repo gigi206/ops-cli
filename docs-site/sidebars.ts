@@ -114,6 +114,7 @@ const sidebars: SidebarsConfig = {
         'cli/doctor',
         'cli/fs',
         'cli/gc',
+        'cli/logs',
         'cli/mise',
         'cli/net',
         'cli/path',

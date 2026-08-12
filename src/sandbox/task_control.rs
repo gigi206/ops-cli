@@ -41,7 +41,11 @@
 //! And on the host-only socket:
 //!
 //! ```text
-//! → LOG [after=<seq>]             ← [dropped=<n>], event seq=<id> …… then `ok`
+//! → LOG [after=<cursor>]          ← [dropped=<n>], head=<cursor>, event seq=<id> cur=<cursor> ……
+//!                                    then `ok`. `after`/`head` are **append order**, never an
+//!                                    invocation id — see `TaskLog::since` for why the two must not
+//!                                    be confused. A reply with no `head=` is a plane that predates
+//!                                    the cursor and must not be followed.
 //! → STATUS                        ← running <id>\ttask=<name>\telapsed_ms=<n>…  then `ok`
 //! → STOP <id>                     ← stopped <id> | stopping <id> | finished <id>, then `ok`
 //! → DETACH <name>                 ← id <n>, then `ok` — or `err <reason>`
@@ -114,8 +118,24 @@ pub(crate) struct LogEntry {
     /// therefore read out of order. `0` marks an entry no invocation stands behind: a request
     /// refused before it was admitted at all.
     pub(crate) seq: u64,
-    /// Unix seconds when the invocation finished.
-    pub(crate) at: u64,
+    /// Where this entry sits in **append order**, stamped by [`TaskLog::push`]. This — not
+    /// [`seq`](LogEntry::seq) — is what a `--follow` cursor compares against, and the two must not be
+    /// confused: an id is drawn when an invocation is *admitted* and its entry lands when it
+    /// *finishes*, so a long invocation admitted before a short one is recorded after it. A cursor
+    /// over ids would step past the short one and never show the long one. A cursor over append
+    /// order cannot, because it is assigned at the moment of the append.
+    pub(crate) cursor: u64,
+    /// Wall-clock time in epoch **milliseconds** when the invocation finished. Milliseconds, and
+    /// named like the other feeds' stamp ([`crate::sandbox::fs_control::FsEvent::at_epoch_ms`] and
+    /// its peers), because these records are read side by side with them: one unit and one name
+    /// across the feeds is what keeps a merged, time-ordered view from quietly misplacing a row.
+    pub(crate) at_epoch_ms: u128,
+    /// Wall-clock epoch milliseconds when the invocation *began* — [`at_epoch_ms`](LogEntry::at_epoch_ms)
+    /// less its duration, settled by [`TaskLog::push`]. Recorded rather than derived by each reader
+    /// because it is what orders this record against the other feeds: an entry is written when an
+    /// invocation ends, so sorting on the finish would file a slow invocation after everything that
+    /// ran during it. Equal to the finish for a refusal, which never ran.
+    pub(crate) started_epoch_ms: u128,
     pub(crate) task: String,
     pub(crate) exit: i32,
     /// Substitutions across **both** streams, including one the declaration withheld from the
@@ -143,10 +163,12 @@ impl LogEntry {
     /// **last** and taken verbatim by the reader, since it is the only free-text field.
     fn to_line(&self) -> String {
         let mut line = format!(
-            "event seq={} at={} exit={} redacted={} truncated={} timed_out={} stopped={} \
-             detached={} elapsed_ms={} task={}",
+            "event seq={} cur={} at={} started={} exit={} redacted={} truncated={} timed_out={} \
+             stopped={} detached={} elapsed_ms={} task={}",
             self.seq,
-            self.at,
+            self.cursor,
+            self.at_epoch_ms,
+            self.started_epoch_ms,
             self.exit,
             self.redacted,
             u8::from(self.truncated),
@@ -160,6 +182,77 @@ impl LogEntry {
             line.push_str(&format!(" refused={}", sanitize(reason)));
         }
         line
+    }
+
+    /// Read one `event …` line back, or `None` for anything else (the `ok`, a `head=`, a line from a
+    /// plane that predates a field).
+    ///
+    /// Placed beside [`to_line`](LogEntry::to_line) deliberately, the way each observation lens keeps
+    /// its own pair together: the two halves share one format, and a change to the writer that the
+    /// reader does not follow does not fail loudly — it drops entries, or files them at the wrong
+    /// time, in the record whose whole job is to miss nothing. A round-trip test pins them.
+    ///
+    /// The refusal reason is split off **first**, exactly as the writer appends it last: it is the
+    /// one free-text field, so everything after ` refused=` is its value, spaces and `=` included.
+    pub(crate) fn from_line(line: &str) -> Option<LogEntry> {
+        let event = line.strip_prefix("event ")?;
+        let (head, refused) = match event.split_once(" refused=") {
+            Some((head, reason)) => (head, Some(reason.to_string())),
+            None => (event, None),
+        };
+        let fields: std::collections::BTreeMap<&str, &str> = head
+            .split_whitespace()
+            .filter_map(|f| f.split_once('='))
+            .collect();
+        // Generic over the field's own type: these are four different integers (a `u128` stamp, a
+        // `u64` id, an `i32` exit, a `usize` count) and each must parse as what it is.
+        fn num<T: std::str::FromStr>(
+            fields: &std::collections::BTreeMap<&str, &str>,
+            key: &str,
+        ) -> Option<T> {
+            fields.get(key)?.parse().ok()
+        }
+        let flag = |key: &str| fields.get(key).copied() == Some("1");
+        let at_epoch_ms = epoch_ms(num(&fields, "at")?);
+        Some(LogEntry {
+            seq: num(&fields, "seq")?,
+            // Zero for a plane that predates the append cursor. The entry is still worth showing —
+            // it has a stamp, so it can be placed — and it is the *reader* that must then decline to
+            // follow, since a cursor of zero asks such a plane for everything, every poll.
+            cursor: num(&fields, "cur").unwrap_or(0),
+            at_epoch_ms,
+            // A plane that predates the start stamp sends no `started=`; falling back to the finish
+            // is the honest reading — it is where such an entry has always been placed — and it
+            // keeps one missing field from dropping the whole entry.
+            started_epoch_ms: num(&fields, "started").map(epoch_ms).unwrap_or(at_epoch_ms),
+            task: fields.get("task").copied().unwrap_or_default().to_string(),
+            exit: num(&fields, "exit")?,
+            redacted: num(&fields, "redacted").unwrap_or(0),
+            truncated: flag("truncated"),
+            timed_out: flag("timed_out"),
+            stopped: flag("stopped"),
+            elapsed_ms: num(&fields, "elapsed_ms").unwrap_or(0),
+            refused,
+            detached: flag("detached"),
+        })
+    }
+}
+
+/// Read a wire stamp as epoch milliseconds, accepting the seconds an older plane sends.
+///
+/// The `at=` field carried Unix **seconds** before the feeds were brought to one unit. Both halves of
+/// this wire ship in the same binary, so they normally agree — but a session outlives the binary that
+/// launched it, and rebuilding sbx while one is running leaves a new reader asking an old plane.
+/// Without this it would render a 2026 stamp as a day in 1970: not a crash, just a wrong answer, in
+/// the field a merged view sorts on.
+///
+/// The boundary is unambiguous and stays so: epoch milliseconds passed 10^12 in 2001, and epoch
+/// seconds do not reach it until the year 33658.
+pub(crate) fn epoch_ms(value: u128) -> u128 {
+    const MILLIS_SINCE_2001: u128 = 1_000_000_000_000;
+    match value < MILLIS_SINCE_2001 {
+        true => value * 1000,
+        false => value,
     }
 }
 
@@ -182,6 +275,10 @@ pub(crate) struct TaskLog {
 struct Inner {
     entries: std::collections::VecDeque<LogEntry>,
     dropped: u64,
+    /// How many entries have ever been appended — the source of every entry's
+    /// [`cursor`](LogEntry::cursor), and therefore the head a reader is handed to come back with.
+    /// Counted rather than read off the last entry so that an eviction cannot walk it backwards.
+    appended: u64,
 }
 
 impl TaskLog {
@@ -192,14 +289,25 @@ impl TaskLog {
     /// Record one invocation, evicting the oldest when the ring is full.
     ///
     /// The entry arrives carrying its own id — the invocation's, drawn when it was admitted. The log
-    /// stamps only the time, which is the one field it is the authority on: an invocation that ran
-    /// under a credential does not get to say when it finished.
+    /// stamps the times and the append order, the fields it is the authority on: an invocation that
+    /// ran under a credential does not get to say when it finished, nor where it sits in the record
+    /// of what finished before it.
+    ///
+    /// `started_epoch_ms` is settled here too, once, rather than left for each reader to work out
+    /// from the finish and the duration. It is the stamp a time-ordered view sorts on — an
+    /// invocation belongs where it *began*, not where it happened to end, or a slow one reads as
+    /// having been provoked by whatever ran while it was still going.
     fn push(&self, mut entry: LogEntry) {
         let mut inner = self.inner.lock().expect("task log");
-        entry.at = SystemTime::now()
+        entry.at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_millis())
             .unwrap_or(0);
+        entry.started_epoch_ms = entry
+            .at_epoch_ms
+            .saturating_sub(u128::from(entry.elapsed_ms));
+        inner.appended += 1;
+        entry.cursor = inner.appended;
         if inner.entries.len() == LOG_CAPACITY {
             inner.entries.pop_front();
             inner.dropped += 1;
@@ -207,22 +315,26 @@ impl TaskLog {
         inner.entries.push_back(entry);
     }
 
-    /// The retained entries past `after`, plus how many fell out of the ring.
+    /// The retained entries past `after`, how many fell out of the ring, and the head to come back
+    /// with.
     ///
-    /// `after` is a cursor over invocation ids, and an id is drawn when its invocation is *admitted*
-    /// while its entry lands when it *finishes* — so a long invocation admitted before a short one
-    /// can be recorded after it, and a reader that has already moved its cursor past the short one
-    /// will not see it. Which is why nothing follows this log: `read_log` asks for all of it.
-    fn since(&self, after: u64) -> (Vec<LogEntry>, u64) {
+    /// `after` is a cursor over **append order**, not over invocation ids. The distinction is the
+    /// whole correctness of following this log: an id is drawn when its invocation is *admitted*
+    /// while its entry lands when it *finishes*, so a long invocation admitted before a short one is
+    /// recorded after it — and a cursor over ids, already moved past the short one's higher id,
+    /// would never yield the long one. Append order is assigned at the append itself and so cannot
+    /// run backwards.
+    fn since(&self, after: u64) -> (Vec<LogEntry>, u64, u64) {
         let inner = self.inner.lock().expect("task log");
         (
             inner
                 .entries
                 .iter()
-                .filter(|e| e.seq > after)
+                .filter(|e| e.cursor > after)
                 .cloned()
                 .collect(),
             inner.dropped,
+            inner.appended,
         )
     }
 
@@ -591,7 +703,10 @@ fn admit_quota(
 fn finished(id: u64, name: &str, outcome: &TaskOutcome, detached: bool) -> LogEntry {
     LogEntry {
         seq: id,
-        at: 0,
+        // Both stamped by `TaskLog::push`, which is their authority; zero until it runs.
+        cursor: 0,
+        at_epoch_ms: 0,
+        started_epoch_ms: 0,
         task: name.to_string(),
         exit: outcome.exit,
         redacted: outcome.redacted + outcome.redacted_withheld,
@@ -756,7 +871,7 @@ fn finished_fields(
                     _ => "finished".to_string(),
                 },
             ),
-            ("finished_at".to_string(), entry.at.to_string()),
+            ("finished_at".to_string(), entry.at_epoch_ms.to_string()),
             ("elapsed_ms".to_string(), entry.elapsed_ms.to_string()),
         ];
         // Beside the state rather than folded into it: detaching is orthogonal to how an invocation
@@ -787,7 +902,10 @@ fn finished_fields(
 fn refusal(id: u64, task: &str, reason: &str) -> LogEntry {
     LogEntry {
         seq: id,
-        at: 0,
+        // Both stamped by `TaskLog::push`, which is their authority; zero until it runs.
+        cursor: 0,
+        at_epoch_ms: 0,
+        started_epoch_ms: 0,
         task: task.to_string(),
         exit: -1,
         redacted: 0,
@@ -956,10 +1074,14 @@ fn serve_host(
             .and_then(|n| n.trim().parse::<u64>().ok())
             .unwrap_or(0),
     };
-    let (entries, dropped) = log.since(after);
+    let (entries, dropped, head) = log.since(after);
     if dropped > 0 {
         writeln!(writer, "dropped={dropped}")?;
     }
+    // The head goes out before the events, the way the observation lenses send theirs: a reader that
+    // stops mid-stream still has a cursor it can come back with, and one that sees no `head=` at all
+    // is talking to a plane that predates this and must not try to follow.
+    writeln!(writer, "head={head}")?;
     for entry in &entries {
         writeln!(writer, "{}", entry.to_line())?;
     }
@@ -979,6 +1101,36 @@ fn ask_host(socket: &Path, command: &str) -> io::Result<Vec<String>> {
 /// Read one session's invocation log, host-side. The counterpart of [`serve_host`]; it only reads.
 pub(crate) fn read_log(socket: &Path) -> io::Result<Vec<String>> {
     ask_host(socket, "LOG")
+}
+
+/// One read of the invocation log as parsed entries: what is past `after`, how many fell out of the
+/// ring, and the head to come back with.
+///
+/// `after` is **append order**, never an invocation id (see [`TaskLog::since`]), and a caller only
+/// ever gets one from a previous read — so a plane too old to send `head=` yields head `0` and is
+/// simply never followed, rather than followed wrongly.
+pub(crate) fn read_entries(
+    socket: &Path,
+    after: Option<u64>,
+) -> io::Result<(Vec<LogEntry>, u64, u64)> {
+    let command = match after {
+        Some(cursor) => format!("LOG after={cursor}"),
+        None => "LOG".to_string(),
+    };
+    let lines = ask_host(socket, &command)?;
+    let mut entries = Vec::new();
+    let mut dropped = 0;
+    let mut head = 0;
+    for line in &lines {
+        if let Some(n) = line.strip_prefix("dropped=") {
+            dropped = n.trim().parse().unwrap_or(0);
+        } else if let Some(n) = line.strip_prefix("head=") {
+            head = n.trim().parse().unwrap_or(0);
+        } else if let Some(entry) = LogEntry::from_line(line) {
+            entries.push(entry);
+        }
+    }
+    Ok((entries, head, dropped))
 }
 
 /// One invocation running right now, as the host-side verb prints it.
@@ -2528,7 +2680,9 @@ mod tests {
     fn entry(id: u64, task: &str, exit: i32) -> LogEntry {
         LogEntry {
             seq: id,
-            at: 0,
+            cursor: 0,
+            at_epoch_ms: 0,
+            started_epoch_ms: 0,
             task: task.to_string(),
             exit,
             redacted: 2,
@@ -2549,7 +2703,7 @@ mod tests {
         let log = TaskLog::new();
         log.push(entry(4, "db-query", 0));
         log.push(entry(5, "db-query", 1));
-        let (entries, dropped) = log.since(0);
+        let (entries, dropped, head) = log.since(0);
         assert_eq!(entries.len(), 2);
         assert_eq!(
             entries[0].seq, 4,
@@ -2557,11 +2711,152 @@ mod tests {
         );
         assert_eq!(entries[1].seq, 5);
         assert_eq!(dropped, 0);
-        assert!(entries[0].at > 0, "the timestamp is stamped host-side");
+        assert!(
+            entries[0].at_epoch_ms > 1_600_000_000_000,
+            "the timestamp is stamped host-side, in epoch milliseconds"
+        );
+        assert_eq!(
+            head, 2,
+            "the head counts the appends, whatever the ids were"
+        );
 
-        let (tail, _) = log.since(4);
+        let (tail, _, _) = log.since(1);
         assert_eq!(tail.len(), 1, "a cursor returns only what is past it");
         assert_eq!(tail[0].seq, 5);
+    }
+
+    // The trap the append-order cursor exists to avoid, and the reason a cursor over ids was never
+    // followable: an id is drawn when an invocation is *admitted*, its entry lands when it
+    // *finishes*. So a long invocation admitted first can be recorded after a short one admitted
+    // later, and a reader whose cursor had already passed the short one's higher id would never be
+    // shown the long one at all. Silent loss, in the record whose job is to miss nothing.
+    #[test]
+    fn the_log_cursor_follows_append_order_not_invocation_ids() {
+        let log = TaskLog::new();
+        // Admitted second (id 5), finished first.
+        log.push(entry(5, "quick", 0));
+        let (first, _, head) = log.since(0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].seq, 5);
+        assert_eq!(head, 1);
+
+        // Admitted first (id 4), finished second — the lower id lands later.
+        log.push(entry(4, "slow", 0));
+        let (next, _, head) = log.since(head);
+        assert_eq!(
+            next.len(),
+            1,
+            "an append past the cursor must be yielded even though its id is lower"
+        );
+        assert_eq!(next[0].seq, 4);
+        assert_eq!(head, 2);
+
+        let (nothing, _, _) = log.since(head);
+        assert!(
+            nothing.is_empty(),
+            "a cursor at the head yields nothing until something else is appended"
+        );
+    }
+
+    // The writer and the reader are one format, and a drift between them does not fail loudly: it
+    // drops entries or files them at the wrong time. So this drives the real writer and parses what
+    // it actually emitted — over a value carrying the two things that break a naive split, a space
+    // and an `=`.
+    #[test]
+    fn an_entry_survives_the_round_trip_through_its_own_wire_line() {
+        let mut written = entry(7, "db-query", 137);
+        written.cursor = 3;
+        written.at_epoch_ms = 1_785_445_489_250;
+        written.started_epoch_ms = 1_785_445_486_229;
+        written.elapsed_ms = 3021;
+        written.stopped = true;
+        written.detached = true;
+        written.refused = Some("parameter `sql` does not match a=b".to_string());
+
+        let read = LogEntry::from_line(&written.to_line()).expect("the written line must parse");
+        assert_eq!(read, written, "every field must survive the wire");
+
+        assert!(
+            LogEntry::from_line("ok").is_none(),
+            "only events are entries"
+        );
+        assert!(
+            LogEntry::from_line("head=4").is_none(),
+            "the cursor line is not an entry"
+        );
+    }
+
+    // A plane that predates the start stamp still has entries worth reading. Losing them entirely
+    // would be the worse failure, so a missing `started=` falls back to the finish — where such an
+    // entry was always placed — rather than dropping the line.
+    #[test]
+    fn an_entry_without_a_start_stamp_falls_back_to_its_finish() {
+        let read = LogEntry::from_line(
+            "event seq=4 cur=1 at=1785445489250 exit=0 redacted=0 truncated=0 timed_out=0 \
+             stopped=0 detached=0 elapsed_ms=3021 task=slow",
+        )
+        .expect("an entry missing only the start stamp still parses");
+        assert_eq!(read.started_epoch_ms, 1_785_445_489_250);
+        assert_eq!(read.at_epoch_ms, read.started_epoch_ms);
+    }
+
+    // A session outlives the binary that launched it, so rebuilding sbx mid-session leaves a new
+    // reader asking a plane that still stamps in seconds. Rendered as milliseconds that is a day in
+    // 1970 — no crash, just a wrong answer in the field a merged view sorts on.
+    #[test]
+    fn a_stamp_in_seconds_from_an_older_plane_is_read_as_the_same_moment() {
+        // No `cur=` and no `started=` either: an entry from before any of this. It still reads,
+        // because it still has everything needed to be *placed* — dropping it would lose the record
+        // rather than protect it. Only following such a plane is declined, by its reader.
+        let read = LogEntry::from_line(
+            "event seq=4 at=1785445489 exit=0 redacted=0 truncated=0 timed_out=0 stopped=0 \
+             detached=0 elapsed_ms=0 task=slow",
+        )
+        .expect("an older plane's entry is still worth reading");
+        assert_eq!(
+            read.at_epoch_ms, 1_785_445_489_000,
+            "its seconds stamp names the same moment in milliseconds"
+        );
+        assert_eq!(read.started_epoch_ms, read.at_epoch_ms);
+        assert_eq!(read.cursor, 0, "and it carries no append cursor");
+
+        assert_eq!(
+            epoch_ms(1_785_445_489_250),
+            1_785_445_489_250,
+            "a stamp already in milliseconds is left alone"
+        );
+    }
+
+    // Why an entry carries two stamps. It is written when an invocation *ends*, so a view that
+    // ordered on the finish would file a slow invocation after everything that ran while it was
+    // still going — reading as though it came last when it came first. The start is what a
+    // time-ordered view sorts on, and these two must therefore disagree for a slow invocation.
+    #[test]
+    fn an_invocation_is_stamped_where_it_began_not_only_where_it_ended() {
+        let log = TaskLog::new();
+        let mut slow = entry(1, "slow", 0);
+        slow.elapsed_ms = 5_000;
+        let mut instant = entry(2, "instant", 0);
+        instant.elapsed_ms = 0;
+        log.push(slow);
+        log.push(instant);
+
+        let (entries, _, _) = log.since(0);
+        let (slow, instant) = (&entries[0], &entries[1]);
+        assert!(
+            slow.started_epoch_ms < instant.started_epoch_ms,
+            "the slow invocation began first: {} vs {}",
+            slow.started_epoch_ms,
+            instant.started_epoch_ms
+        );
+        assert!(
+            slow.at_epoch_ms <= instant.at_epoch_ms,
+            "while ending no later — which is exactly why one stamp cannot serve for both"
+        );
+        assert_eq!(
+            instant.started_epoch_ms, instant.at_epoch_ms,
+            "something that took no time began when it ended"
+        );
     }
 
     // The caller and the log answer different questions, so they carry different numbers: the
@@ -2601,7 +2896,7 @@ mod tests {
     fn a_refusal_is_recorded_with_its_reason() {
         let log = TaskLog::new();
         log.push(refusal(1, "db-query", "parameter `sql` does not match"));
-        let (entries, _) = log.since(0);
+        let (entries, _, _) = log.since(0);
         let line = entries[0].to_line();
         assert!(line.contains("task=db-query"), "{line}");
         assert!(line.contains("refused=parameter"), "{line}");
@@ -2617,7 +2912,7 @@ mod tests {
             "db-query",
             "bad\nevent seq=99 exit=0 task=forged",
         ));
-        let (entries, _) = log.since(0);
+        let (entries, _, _) = log.since(0);
         let line = entries[0].to_line();
         assert_eq!(line.lines().count(), 1, "one entry is one line: {line}");
         assert!(!line.contains("\nevent"), "{line}");
@@ -2629,7 +2924,7 @@ mod tests {
         for _ in 0..LOG_CAPACITY + 3 {
             log.push(entry(1, "t", 0));
         }
-        let (entries, dropped) = log.since(0);
+        let (entries, dropped, _) = log.since(0);
         assert_eq!(entries.len(), LOG_CAPACITY);
         assert_eq!(dropped, 3);
     }

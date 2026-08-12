@@ -386,3 +386,174 @@ fn each_view_refuses_a_bad_argument_in_its_own_name() {
         "{err}"
     );
 }
+
+/// Bind `<data>/sbx/tasks/<pid>/log.sock` — the task plane's host-only socket, which does not follow
+/// the `control-<pid>.sock` shape the four lenses share.
+fn serve_task(data: &Path, pid: u32, events: &[&str]) {
+    let dir = data.join("sbx").join("tasks").join(pid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let listener = UnixListener::bind(dir.join("log.sock")).expect("bind the task log socket");
+    let reply = frame(events);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let _ = (&stream).write_all(reply.as_bytes());
+            let _ = (&stream).flush();
+        }
+    });
+}
+
+/// The merged view is the only one that can be wrong about *order*, and the only one that can lie by
+/// omission. Both are checked here, over four feeds served at once and a fifth left unbound.
+///
+/// The stamps are chosen so that every feed contributes exactly one row and the correct order is not
+/// the order the feeds are read in — a view that concatenated its feeds, or sorted by anything but
+/// the event's own time, produces a different sequence.
+///
+/// The task row is the load-bearing one. Its invocation *began* at .200 and its record was written
+/// when it *ended* at .500: filed at the finish it would sort last, after the write it preceded.
+#[test]
+fn the_merged_view_orders_every_feed_by_when_it_happened() {
+    let dir = TmpDir::new();
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+
+    serve_lens(
+        data,
+        "proc",
+        pid,
+        &[
+            "event seq=1 at=1700000000100 pid=4242 verdict=observe cmd=curl -s https://api.example.com",
+        ],
+    );
+    serve_task(
+        data,
+        pid,
+        &[
+            "event seq=1 cur=1 at=1700000000500 started=1700000000200 exit=0 redacted=0 \
+           truncated=0 timed_out=0 stopped=0 detached=0 elapsed_ms=300 task=db-query",
+        ],
+    );
+    serve_lens(
+        data,
+        "egress",
+        pid,
+        &[
+            "event seq=1 at=1700000000300 port=443 verdict=deny proto=https reason=no-rule \
+           host=api.example.com",
+        ],
+    );
+    serve_lens(
+        data,
+        "fs",
+        pid,
+        &["event seq=1 at=1700000000400 kind=write path=./retry.sh"],
+    );
+    // ssh-agent is deliberately not bound: an absent feed must be named, not passed over.
+
+    let out = read_feed(data, &["logs", &pid.to_string()]);
+
+    let lenses: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .filter(|w| ["proc", "task", "net", "fs", "ssh"].contains(w))
+        .collect();
+    assert_eq!(
+        lenses,
+        ["proc", "task", "net", "fs"],
+        "every feed sorted by when its event happened, not by feed: {out}"
+    );
+
+    assert!(
+        out.contains("curl -s https://api.example.com"),
+        "each feed's verbatim field survives: {out}"
+    );
+    assert!(
+        out.contains("api.example.com:443") && out.contains("(no-rule)"),
+        "a refusal carries the category that says what to change: {out}"
+    );
+    assert!(out.contains("./retry.sh"), "{out}");
+    assert!(out.contains("db-query"), "{out}");
+
+    assert!(
+        out.contains("recording: proc, net, fs, task"),
+        "the live feeds are named: {out}"
+    );
+    assert!(
+        out.contains("ssh: no ssh-agent broker"),
+        "and so is the one that is not, with the reason: {out}"
+    );
+}
+
+/// `--feed` narrows, and a name no feed answers to is refused rather than silently dropped: a view
+/// that showed fewer feeds than asked for would read as a quiet session.
+#[test]
+fn the_merged_view_narrows_by_feed_and_refuses_a_name_no_feed_answers_to() {
+    let dir = TmpDir::new();
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    serve_lens(
+        data,
+        "fs",
+        pid,
+        &["event seq=1 at=1700000000400 kind=write path=./kept.rs"],
+    );
+    serve_lens(
+        data,
+        "proc",
+        pid,
+        &["event seq=1 at=1700000000100 pid=4242 verdict=observe cmd=dropped-command"],
+    );
+
+    let out = read_feed(data, &["logs", &pid.to_string(), "--feed", "fs"]);
+    assert!(out.contains("./kept.rs"), "{out}");
+    assert!(
+        !out.contains("dropped-command"),
+        "a feed left out of --feed is not read: {out}"
+    );
+
+    let bad = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["logs", &pid.to_string(), "--feed", "netwrok"])
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("run the merged view");
+    assert_eq!(bad.status.code(), Some(2), "a typo is an error");
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(err.contains("no feed named `netwrok`"), "{err}");
+    assert!(
+        err.contains("proc, net, fs, ssh, task"),
+        "and the error lists what there is: {err}"
+    );
+}
+
+/// A session recording nothing at all is said so, not shown as an empty view — which would read as
+/// an agent that did nothing rather than one nobody was watching.
+#[test]
+fn the_merged_view_refuses_a_session_that_records_nothing() {
+    let dir = TmpDir::new();
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["logs", &pid.to_string()])
+        .env("XDG_DATA_HOME", data)
+        .output()
+        .expect("run the merged view");
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is recording nothing"), "{err}");
+    assert!(
+        err.contains("--observe") && err.contains("[ssh_agent] allow"),
+        "each feed says why it in particular is not there: {err}"
+    );
+}

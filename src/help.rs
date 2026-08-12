@@ -626,6 +626,54 @@ const PAGES: &[Page] = &[
             current project by default; `-a <app>`/`--all` widen it.",
     },
     Page {
+        path: &["logs"],
+        synopsis: "sbx logs [<id>] [--feed <a,b,...>] [-n <N>] [-f|--follow] [--json]  \
+                   (alias: sbx log)",
+        summary: "every feed of one running session, interleaved in time",
+        options: &[
+            (
+                "<id>",
+                "the PID `sbx session ls` shows; omit it when only one session is live",
+            ),
+            (
+                "--feed <a,b,...>",
+                "only these feeds: proc, net, fs, ssh, task",
+            ),
+            ("-n, --lines <N>", "show only the last N events"),
+            (
+                "-f, --follow",
+                "keep streaming until the last feed ends (Ctrl+C stops)",
+            ),
+            (
+                "--json",
+                "one JSON object per line (NDJSON), with a `feed` field",
+            ),
+        ],
+        details: "One session's five feeds in one column of time: what it execs (`proc`), where it goes\n\
+            (`net`), what it writes (`fs`), what it asked your keys to sign (`ssh`), and the declared\n\
+            operations it invoked (`task`). Each is also readable on its own — `sbx proc logs`,\n\
+            `sbx net logs`, `sbx fs logs`, `sbx ssh-agent logs`, `sbx task logs` — and those show\n\
+            more of their own detail; this one answers the question none of them can, which is what\n\
+            happened in what order.\n\
+            \n\
+            A feed that is not recording is **named, with the reason**, before the events. That is\n\
+            the point: a feed nothing stood up and a feed with nothing to say both come back empty,\n\
+            and only that line tells them apart. Most sessions record two or three — `proc` and `fs`\n\
+            need `--observe`, `net` a filtering `[network] mode`, `ssh` an `[ssh_agent] allow`,\n\
+            `task` a `[task]` table.\n\
+            \n\
+            Rows are ordered by when each event **happened**. A task invocation is therefore placed\n\
+            where it began, not where its record was written when it ended — otherwise a slow\n\
+            operation would read as having followed everything that ran while it was still going.\n\
+            \n\
+            Host-side and read-only: it stands nothing up, and reaches the same owner-only control\n\
+            sockets the per-feed verbs use. None of them is ever bound into the cage, so what is\n\
+            recorded here is out of reach of what is recorded.\n\
+            \n\
+            This is not `sbx session logs`, which is a different thing: that one is the agent's own\n\
+            stdout and stderr, held on disk for a detached session. This one is what sbx observed.",
+    },
+    Page {
         path: &["fs"],
         synopsis: "sbx fs <subcommand> [args...]",
         summary: "observe the files a running sandbox writes in its project",
@@ -1103,11 +1151,16 @@ const PAGES: &[Page] = &[
             a running one; `--follow` on an exited session prints and returns rather than waiting\n\
             for output that will never come.\n\
             \n\
-            The log's bytes go to stdout unchanged, so redirecting captures exactly what the\n\
-            agent wrote; the context line goes to stderr. Logs are keyed by PID and appended to,\n\
-            so a PID the kernel later reuses writes into the same file — a header line separates\n\
-            them and only the most recent session is shown unless you pass --all. Host-side:\n\
-            reads a file, launches nothing. Nothing prunes `<data>/logs` yet.",
+            The log's bytes go to stdout unchanged, so redirecting captures the agent's output as\n\
+            it wrote it; the context line goes to stderr. Two lines are sbx's own, both marked\n\
+            `=== … ===` and both written before the agent's first byte: a header naming the\n\
+            session, and one `=== sbx trust-drop: … ===` per security field the trust gate dropped\n\
+            from this launch. That note is here because a detached session states its dropped\n\
+            fields on the terminal it is about to lose — this is the only record that outlives it.\n\
+            Logs are keyed by PID and appended to, so a PID the kernel later reuses writes into\n\
+            the same file — the header line separates them and only the most recent session is\n\
+            shown unless you pass --all. Host-side: reads a file, launches nothing. Nothing prunes\n\
+            `<data>/logs` yet.",
     },
     Page {
         path: &["session", "attach"],
@@ -2861,6 +2914,7 @@ const PAGES: &[Page] = &[
 /// option-value alias (`--source session`/`manual`) names no command path, so it is
 /// documented on the page that accepts it and nothing resolves it.
 const ALIASES: &[(&[&str], &str, &str)] = &[
+    (&[], "log", "logs"),
     (&[], "project", "projects"),
     (&[], "secrets", "secret"),
     (&[], "sessions", "session"),

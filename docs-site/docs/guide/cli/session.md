@@ -78,16 +78,41 @@ sbx app run claude --detach
 
 sbx session logs 12345 -f      # follow it live; returns when the session exits
 sbx session logs 12345 -n 50   # just the tail
-sbx session logs 12345 > run.txt   # the agent's bytes, exactly as written
+sbx session logs 12345 > run.txt   # the agent's bytes, as it wrote them
 ```
 
-The log's bytes go to **stdout** unchanged, so redirecting captures exactly what the agent
-wrote; the context line goes to stderr. `--follow` on a session that has already exited prints
+The log's bytes go to **stdout** unchanged, so redirecting captures the agent's output as it
+wrote it; the context line goes to stderr. `--follow` on a session that has already exited prints
 what is there and returns rather than waiting for output that will never come.
 
 Logs are keyed by PID and appended to, so a PID the kernel later reuses writes into the same
 file. A header line separates the sessions and only the most recent one is shown; pass `--all`
 for the whole file.
+
+### The two lines sbx writes itself
+
+Everything in the file is the agent's, except two kinds of line. Both are marked `=== … ===`
+and both are written before the agent's first byte:
+
+```
+=== sbx session 12345 started=1786539487 ===
+=== sbx trust-drop: .sbx.toml: ignoring `gpu` posture (untrusted — run `sbx trust`) ===
+```
+
+The first is the session header described above. The second appears once per security field
+[the trust gate](../concepts/trust) dropped from that launch, and it is there because
+otherwise nothing would keep it: sbx states its dropped fields on the terminal that started the
+session, before redirecting to this file, so a session detached overnight announces them to a
+terminal nobody is watching. This note is the only record that outlives it. A foreground
+session needs none of this, its warnings go to a stderr you own.
+
+Both are written before the agent's first byte, so `-n <N>` will not show them once the
+agent has printed more than N lines: it is a tail, and the notes are at the head. Read
+without `-n` when you want them.
+
+The honest limit: the agent writes into this same file and can print a line that looks like
+either marker. That hides its own earlier output from the default view, which `--all` still
+shows; it is not a boundary the agent can cross.
 
 > **Note.** Nothing prunes `<data>/logs` yet: neither [`sbx gc`](gc) nor session teardown.
 > A long-lived install accumulates one small file per detached launch; remove them by hand if
@@ -194,10 +219,11 @@ sbx session attach 12345 -- ps aux           # …or just ask it one question
 sbx session stop 12345                       # SIGTERM, then SIGKILL after 10s
 ```
 
-Two things worth separating: `logs` reads what the agent *printed*, which survives on
-disk for a detached session; `fs`/`proc`/`net logs` read what it *did*, which lives in
-the supervisor's memory and is gone when the session exits. If a run needs a durable
-record of its actions, pipe the `--json` feed to a file while it runs.
+Two things worth separating: `logs` reads what the agent *printed* (plus [the two lines sbx
+writes itself](#the-two-lines-sbx-writes-itself)), which survives on disk for a detached
+session; `fs`/`proc`/`net logs` read what it *did*, which lives in the supervisor's memory
+and is gone when the session exits. If a run needs a durable record of its actions, pipe the
+`--json` feed to a file while it runs.
 
 Ending everything at once, for instance before a machine goes to sleep:
 

@@ -406,6 +406,15 @@ fn detached_child(
         }
     };
 
+    // What the trust gate dropped went to the launching terminal, which this session is about to
+    // lose. Note it in the log while the warnings are still in hand and before the agent's own
+    // output starts, so the record survives the terminal that carried the announcement.
+    note_trust_drops(
+        &log,
+        &prep.cfg.warnings,
+        guard.as_ref().and_then(|g| g.notify_sink.as_deref()),
+    );
+
     // Ready: tell the parent, then hand stdout/stderr to the log and drop the pipe.
     signal_detach_ready(write_fd);
     redirect_to_log(&log);
@@ -507,6 +516,14 @@ pub(crate) fn detach_log_path(data_dir: &Path, pid: u32) -> PathBuf {
 const SESSION_LOG_HEADER_OPEN: &str = "=== sbx session ";
 const SESSION_LOG_HEADER_CLOSE: &str = " ===";
 
+/// The opening text of a trust-drop note, written into a detached session's log once per security
+/// field the trust gate dropped: `=== sbx trust-drop: <warning> ===`.
+///
+/// It closes on [`SESSION_LOG_HEADER_CLOSE`] and opens on something a session header can never
+/// start with, so [`parse_session_header`] rejects it and a note can never be mistaken for the line
+/// that splits one session's output from the next.
+const SESSION_LOG_TRUST_DROP_OPEN: &str = "=== sbx trust-drop: ";
+
 /// One session header line, as [`open_detach_log`] writes it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionHeader {
@@ -573,6 +590,48 @@ fn open_detach_log(path: &Path) -> io::Result<File> {
         std::process::id()
     );
     Ok(file)
+}
+
+/// Note in a detached session's log what the trust gate dropped from its launch.
+///
+/// [`build`] already put these warnings on the launching terminal, and that ordering is deliberate:
+/// stdout/stderr stay there through build and register so provisioning progress and any startup
+/// error are seen live, and [`redirect_to_log`] only runs afterwards. The cost is that a detached
+/// launch states its dropped security fields to a terminal it is about to lose, and keeps no record
+/// — which is the one warning whose symptom arrives much later and in disguise, as a cage that is
+/// not shaped the way its config plainly reads. A foreground launch needs none of this: its
+/// warnings go to a stderr its invoker owns.
+///
+/// `needles` redacts the note the way [`super::notify_sink`] redacts the very same string on its way
+/// to the desktop. No producer of a trust-drop warning interpolates agent-chosen text today — they
+/// carry a layer label, a caller-spelled field phrase, a bind count, plugin table names and a nix
+/// tool name — so this is a no-op on every string it currently sees. It is here for the producer
+/// added later: [`crate::config::is_trust_drop`] matches on the remedy rather than on any one
+/// reason's wording, so a new one flows into this writer without anyone revisiting it. A launch that
+/// needs no guard carries no needle set, and then the note goes out as the terminal already had it.
+///
+/// Best-effort, like the header above it: a note that cannot be written costs a reader context,
+/// never a session that is otherwise ready to run.
+fn note_trust_drops(
+    log: &File,
+    warnings: &[String],
+    wiring: Option<&super::notify_sink::NotifyWiring>,
+) {
+    use std::io::Write as _;
+    let needles = wiring.and_then(|w| w.needles.read().ok());
+    let mut sink = log;
+    for warning in warnings.iter().filter(|w| crate::config::is_trust_drop(w)) {
+        let note = match needles.as_deref() {
+            Some(n) => {
+                super::redact::redact_string(warning, n, &super::redact::Placeholder::Plain).0
+            }
+            None => warning.clone(),
+        };
+        let _ = writeln!(
+            sink,
+            "{SESSION_LOG_TRUST_DROP_OPEN}{note}{SESSION_LOG_HEADER_CLOSE}"
+        );
+    }
 }
 
 /// Close the readiness pipe without a success byte and exit non-zero — the daemon failed to set
@@ -6930,6 +6989,81 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             .filter_map(parse_session_header)
             .count();
         assert_eq!(headers, 2, "each open must mark its own session");
+    }
+
+    #[test]
+    fn a_detached_log_notes_the_trust_drops_and_nothing_else() {
+        // The record that outlives the launching terminal a detached session is about to lose.
+        // Three properties hold it up, and each fails silently if it breaks: only a trust drop is
+        // noted, the warning survives verbatim (a reader has to be able to act on it), and a note
+        // can never be read as a session boundary — which would hide every line before it.
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.join("logs").join("notes.log");
+        let file = open_detach_log(&path).expect("open the session log");
+        note_trust_drops(
+            &file,
+            &[
+                ".sbx.toml: ignoring `gpu` posture (untrusted — run `sbx trust`)".to_string(),
+                ".sbx.toml: ignoring malformed nixpkgs source `nope`".to_string(),
+            ],
+            None,
+        );
+        drop(file);
+
+        let text = std::fs::read_to_string(&path).expect("read the session log back");
+        assert!(
+            text.contains(
+                "=== sbx trust-drop: .sbx.toml: ignoring `gpu` posture \
+                 (untrusted — run `sbx trust`) ==="
+            ),
+            "the dropped security field must survive the terminal that announced it: {text}"
+        );
+        assert!(
+            !text.contains("malformed nixpkgs"),
+            "a warning that is not a trust drop is not this record's business: {text}"
+        );
+
+        let notes: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("=== sbx trust-drop: "))
+            .collect();
+        assert_eq!(notes.len(), 1, "one note per dropped field: {text}");
+        for note in notes {
+            assert!(
+                parse_session_header(note.as_bytes()).is_none(),
+                "a note must not read as a session boundary: {note}"
+            );
+        }
+
+        // A pid the kernel reuses appends a second session to this same file, and each note must
+        // land on its own session's side of the boundary. A reader shows only what follows the
+        // last header, so a note written before it would be attributed to the session that ended.
+        let file = open_detach_log(&path).expect("reopen the session log");
+        note_trust_drops(
+            &file,
+            &[".sbx.toml: ignoring `forward` ports (untrusted — run `sbx trust`)".to_string()],
+            None,
+        );
+        drop(file);
+
+        let text = std::fs::read_to_string(&path).expect("read back after the second open");
+        let shape: Vec<&str> = text
+            .lines()
+            .map(|l| {
+                if parse_session_header(l.as_bytes()).is_some() {
+                    "header"
+                } else if l.starts_with("=== sbx trust-drop: ") {
+                    "note"
+                } else {
+                    "other"
+                }
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            ["header", "note", "header", "note"],
+            "each note must follow its own session's header: {text}"
+        );
     }
 
     #[test]

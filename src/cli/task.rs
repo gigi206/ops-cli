@@ -1287,9 +1287,10 @@ fn task_show(args: &[OsString]) -> ExitCode {
         .filter(|(key, _)| !key.ends_with("_from"))
         .map(|(key, value)| {
             let (label, text) = match (key.as_str(), value.parse::<u128>()) {
-                ("finished_at", Ok(secs)) => {
-                    ("finished".into(), crate::format_log_time(secs * 1000))
-                }
+                ("finished_at", Ok(v)) => (
+                    "finished".into(),
+                    crate::format_log_time(sandbox::task_control::epoch_ms(v)),
+                ),
                 ("elapsed_ms", Ok(ms)) => ("elapsed".into(), format_elapsed(ms as u64)),
                 ("timeout_s", Ok(s)) => ("timeout".into(), format_elapsed(s as u64 * 1000)),
                 _ => (key.clone(), value.clone()),
@@ -1546,7 +1547,7 @@ fn log_row(line: &str) -> Option<Vec<String>> {
         },
         get("at")
             .parse::<u128>()
-            .map(|secs| crate::format_log_time(secs * 1000))
+            .map(|v| crate::format_log_time(sandbox::task_control::epoch_ms(v)))
             .unwrap_or_else(|_| NONE.to_string()),
         get("task").to_string(),
         match refused.is_some() {
@@ -1895,11 +1896,16 @@ mod tests {
     #[test]
     fn a_log_line_becomes_a_row_and_its_reason_survives_its_spaces() {
         let ran = log_row(
-            "event seq=4 at=1785445489 exit=137 redacted=2 truncated=0 timed_out=0 stopped=1 \
-             elapsed_ms=3021 task=slow-count",
+            "event seq=4 cur=1 at=1785445489000 exit=137 redacted=2 truncated=0 timed_out=0 \
+             stopped=1 elapsed_ms=3021 task=slow-count",
         )
         .expect("an event is a row");
         assert_eq!(ran[0], "4");
+        // `at=` is epoch milliseconds, as every feed's stamp is. Read as seconds it would land tens
+        // of thousands of years out, so pinning that it renders a time of day at all is what keeps
+        // the two sides of this wire on one unit.
+        assert_eq!(ran[1].len(), 8, "a local HH:MM:SS: {}", ran[1]);
+        assert_eq!(ran[1].matches(':').count(), 2, "{}", ran[1]);
         assert_eq!(ran[2], "slow-count");
         assert_eq!(ran[3], "137");
         assert_eq!(ran[4], "3.0s");
@@ -1909,8 +1915,9 @@ mod tests {
         );
 
         let refused = log_row(
-            "event seq=0 at=1785445489 exit=-1 redacted=0 truncated=0 timed_out=0 stopped=0 \
-             elapsed_ms=0 task=db-query refused=parameter `sql` does not match its declared pattern",
+            "event seq=0 cur=2 at=1785445489000 exit=-1 redacted=0 truncated=0 timed_out=0 \
+             stopped=0 elapsed_ms=0 task=db-query refused=parameter `sql` does not match its \
+             declared pattern",
         )
         .expect("a refusal is a row too");
         assert_eq!(ran.len(), refused.len(), "one shape for every row");
