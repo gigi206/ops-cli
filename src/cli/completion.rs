@@ -878,6 +878,11 @@ fn flag_literals(path: &[&str], flag: &str) -> Option<Vec<String>> {
     let cells: &[&str] = match (path, flag) {
         (["run"], "--net") => &["none", "shared", "ask", "allow", "deny", "allow=", "deny="],
         (["net", "logs"], "--verdict") => &["allow", "deny", "blocked", "error"],
+        // `logs --feed` takes a comma-joined subset of a closed set. The names come from the feed
+        // table itself rather than a second copy of it, so a feed added there is offered here.
+        // What is completed is one name: a shell splits on whitespace, so the value after a comma
+        // is inside a single word and is the caller's to type.
+        (["logs"], "--feed") => super::logs::FEED_NAMES,
         _ => return None,
     };
     Some(cells.iter().map(|c| (*c).to_string()).collect())

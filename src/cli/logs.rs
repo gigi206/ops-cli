@@ -359,6 +359,14 @@ fn read_task_rows(
     Ok((rows, head, dropped))
 }
 
+/// The feed names `--feed` selects from, in the order [`feeds_for`] builds them.
+///
+/// Named separately because completion needs the vocabulary without a session to read: a feed
+/// carries a socket path, which takes a data directory and a pid that a shell completing a flag
+/// has neither of. `feeds_and_names_agree` pins the two together, so a sixth feed cannot become a
+/// value the CLI accepts and the completion never offers.
+pub(crate) const FEED_NAMES: &[&str] = &["proc", "net", "fs", "ssh", "task"];
+
 /// Every feed of one session, in the order their columns read best when two events share a
 /// millisecond: what the agent reached for, then what was decided about it.
 fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
@@ -663,5 +671,23 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         if wrote.is_err() {
             return ExitCode::SUCCESS;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The vocabulary completion offers and the feeds this command actually reads are one list.
+    /// Held together here because they cannot be one expression: a feed carries a socket path,
+    /// and completion has no session to derive one from. A sixth feed added to `feeds_for` and
+    /// not to `FEED_NAMES` would be accepted by the CLI and offered by nothing.
+    #[test]
+    fn feeds_and_names_agree() {
+        let built: Vec<&str> = feeds_for(Path::new("/nonexistent"), 1)
+            .iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(built, FEED_NAMES);
     }
 }
