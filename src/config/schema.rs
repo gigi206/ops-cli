@@ -322,6 +322,12 @@ pub(crate) struct RawNet {
     /// A `[network]` list references a group by `@<name>`; the reference expands to these entries.
     #[serde(default)]
     pub(crate) groups: BTreeMap<String, Vec<String>>,
+    /// Unknown keys in this table, kept so they can be reported. This one earns the capture more
+    /// than most: `[net]` and `[network]` both exist and mean different things, so a posture
+    /// written under `[net]` lands here rather than in the top-level catch-all, and the reader
+    /// gets no hint that the mode and the allowlist they wrote govern nothing.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// One `binds` entry: a bare path string (bound **read-only**, the default) or a table

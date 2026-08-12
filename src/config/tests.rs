@@ -8063,6 +8063,35 @@ fn an_unknown_key_is_named_rather_than_passed_over_in_silence() {
 }
 
 #[test]
+fn a_posture_written_under_net_instead_of_network_is_named() {
+    // `[net]` and `[network]` both exist and mean different things: the first holds the egress
+    // groups, the second the posture. So a posture written under `[net]` is not an unknown section
+    // the top-level catch-all would name — it is an unknown key inside a section that exists, and
+    // the mode and allowlist it carries govern nothing at all.
+    let raw = RawConfig {
+        net: schema::RawNet {
+            rest: [
+                ("mode".to_string(), schema::RawIgnored),
+                ("allow".to_string(), schema::RawIgnored),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+        ..RawConfig::default()
+    };
+    let r = resolve_no_plugins(raw, None);
+    for key in ["`mode`", "`allow`"] {
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.contains(key))
+            .unwrap_or_else(|| panic!("{key} must be named: {:?}", r.warnings));
+        assert!(w.contains("[net]"), "and placed in its table: {w}");
+    }
+}
+
+#[test]
 fn an_untrusted_projects_unknown_key_is_reported_too() {
     // A spelling question is not a capability, so withholding the answer from an untrusted project
     // would only leave its author guessing.

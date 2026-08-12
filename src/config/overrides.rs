@@ -290,9 +290,19 @@ fn env_nonempty(key: &str) -> Option<String> {
 /// tiers (`SBX_CONFIG` blob, `SBX_*` typed, `--config` blob, `--*` typed), folds each into one
 /// overlay per the uniform merge rule, and records the one-time notices.
 fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Override, String> {
+    // An unknown key is reported per blob, here, because it does not survive far enough to be
+    // reported anywhere else: `overlay_into` carries the fields it understands and drops the
+    // unknown-key bag with them. Reported rather than refused, for the reason a file's are —
+    // that is what lets a blob written for a newer sbx run on an older one.
+    let mut unknown = Vec::new();
+
     // Tier 0 — the environment blob.
     let t0 = match &ambient.config {
-        Some(s) => parse_blob(s).map_err(|e| format!("{SBX_CONFIG}: {e}"))?,
+        Some(s) => {
+            let parsed = parse_blob(s).map_err(|e| format!("{SBX_CONFIG}: {e}"))?;
+            super::warn_unknown_keys(&mut unknown, SBX_CONFIG, &parsed);
+            parsed
+        }
         None => RawConfig::default(),
     };
     // Tier 1 — the environment's typed fragments.
@@ -318,6 +328,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
     let mut t2 = RawConfig::default();
     for (i, c) in cli.config.iter().enumerate() {
         let parsed = parse_blob(c).map_err(|e| format!("--config (#{}): {e}", i + 1))?;
+        super::warn_unknown_keys(&mut unknown, &format!("--config (#{})", i + 1), &parsed);
         t2 = overlay_into(t2, parsed);
     }
     // Tier 3 — the CLI's typed fragments.
@@ -348,7 +359,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
     let env_side = overlay_into(t0, t1);
     let cli_side = overlay_into(t2, t3);
 
-    let mut notices = Vec::new();
+    let mut notices = unknown;
     push_ignored_field_notices(&env_side, &cli_side, &mut notices);
     push_env_source_notices(&env_side, &cli_side, &mut notices);
 
@@ -491,8 +502,8 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         // Carried no further on purpose: `apply_override` refuses each of these outright, so folding
         // them would only move the drop to a later line. An inline `flake.nix`, an auto-upgrade
         // resolver command, and a declared operation are all vetted where they are read and listed,
-        // not assembled on a command line for one launch. `rest` is the unknown-key bag, which each
-        // blob reports at parse time, before any of this.
+        // not assembled on a command line for one launch. `rest` is the unknown-key bag, reported
+        // per blob in `collect_from` before this merge, since nothing downstream would see it.
         flakes: _,
         tarball: _,
         deb: _,
@@ -1249,6 +1260,62 @@ mod tests {
         .unwrap();
         assert_eq!(ov.raw.network, Some(posture("none")));
         assert!(ov.notices().is_empty(), "{:?}", ov.notices());
+    }
+
+    #[test]
+    fn a_blobs_unknown_key_is_named_against_the_blob_that_wrote_it() {
+        // A blob is written in one shot on a command line, with no file to re-read, so a
+        // misspelling is likelier here than in a config someone keeps — and it fails the same way,
+        // by governing nothing. It has to be caught here: the merge below carries the fields it
+        // understands and drops the unknown-key bag with them, so nothing downstream sees it.
+        let ov = collect_cli(Cli {
+            config: &["netowrk = \"none\""],
+            ..Default::default()
+        })
+        .unwrap();
+        let n = ov
+            .notices()
+            .iter()
+            .find(|n| n.contains("`netowrk`"))
+            .unwrap_or_else(|| panic!("{:?}", ov.notices()));
+        assert!(n.contains("--config"), "named against its blob: {n}");
+    }
+
+    #[test]
+    fn a_posture_written_under_net_in_a_blob_is_named() {
+        // `[net]` and `[network]` are both real and mean different things, so this one is not an
+        // unknown section but an unknown key inside a section that exists — the shape that reaches
+        // no catch-all and governs nothing.
+        let ov = collect_cli(Cli {
+            config: &["[net]\nmode = \"deny\"\nallow = [\"demo.test\"]"],
+            ..Default::default()
+        })
+        .unwrap();
+        for key in ["`mode`", "`allow`"] {
+            let n = ov
+                .notices()
+                .iter()
+                .find(|n| n.contains(key))
+                .unwrap_or_else(|| panic!("{key} must be named: {:?}", ov.notices()));
+            assert!(n.contains("[net]"), "and placed in its table: {n}");
+        }
+    }
+
+    #[test]
+    fn an_ambient_blobs_unknown_key_is_named_against_the_variable() {
+        // The ambient blob is the one nobody is looking at while they type the command, so naming
+        // the variable rather than the launch is what sends the reader to the right place.
+        let ov = ambient(AmbientOverrides {
+            config: Some("bindz = []".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let n = ov
+            .notices()
+            .iter()
+            .find(|n| n.contains("`bindz`"))
+            .unwrap_or_else(|| panic!("{:?}", ov.notices()));
+        assert!(n.contains(SBX_CONFIG), "named against the variable: {n}");
     }
 
     #[test]

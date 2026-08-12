@@ -704,7 +704,9 @@ impl Resolved {
             tarball: _,
             deb: _,
             appimage: _,
-            // An override blob's unknown keys are reported where every layer's are, before this.
+            // Reported per blob when the override was collected, which is the only place it can
+            // be: the merge that builds this overlay carries the fields it understands and drops
+            // the bag with them, so by here there is nothing left to name.
             rest: _,
         } = raw;
 
@@ -2294,7 +2296,7 @@ fn union_forward(base: &mut Vec<u16>, extra: Vec<u16>) {
 /// Covers the top level and the tables where the silence costs the most: a limit that is not in
 /// effect, and a grant that is not granted. A `[task.<name>]`/`[app.<name>]` entry's own fields are
 /// not walked here — those carry a `cmd` whose absence already fails loudly.
-fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::RawConfig) {
+pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::RawConfig) {
     let mut report = |section: &str, keys: &BTreeMap<String, schema::RawIgnored>| {
         for key in keys.keys() {
             warnings.push(format!(
@@ -2319,6 +2321,14 @@ fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::Raw
     if let Some(redact) = &raw.redact {
         report(" under `[redact]`", &redact.rest);
     }
+    if let Some(fs) = &raw.fs {
+        report(" under `[fs]`", &fs.rest);
+    }
+    // `[net]` holds the egress groups and nothing else, while the posture lives under `[network]`.
+    // Both names are real, so a posture written under the shorter one is not an unknown *section*
+    // the catch-all above would name — it is an unknown key inside a section that exists, and
+    // without this the mode and the allowlist are dropped in silence.
+    report(" under `[net]`", &raw.net.rest);
 }
 
 /// Validate a `[ssh_agent] allow` list into the entries the broker will match on, dropping a
