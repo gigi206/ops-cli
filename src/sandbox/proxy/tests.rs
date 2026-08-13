@@ -5108,7 +5108,7 @@ fn run_with_refresh(
     let seen = calls.clone();
     let refresh = Arc::new(CredentialRefresh::new(
         credentials.clone(),
-        Box::new(move || {
+        Box::new(move |_| {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok((
                 vec![injection(

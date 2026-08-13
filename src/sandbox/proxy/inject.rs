@@ -534,8 +534,18 @@ fn credential_in(value: &str) -> &str {
 /// longer good. A closure rather than a call into the resolver because *what* a credential resolves
 /// from belongs to the launch (sources, project root, the `bwrap` to sandbox a plugin with) and
 /// *when* to ask again belongs to the proxy — this is the seam between the two.
-pub(crate) type Refresher =
-    Box<dyn Fn() -> std::io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)> + Send + Sync>;
+///
+/// It is handed the state it is replacing, because part of that state is *running*: a signed
+/// injection holds a plugin process, started once at launch and told its credential at a handshake.
+/// A re-resolution that could not see it would have to start a new one for every declared signer on
+/// every refresh — a sandbox spawn per `401`, for credentials a `401` says nothing about (see
+/// [`HeaderInjection::refreshable`]). What the launch does with it is reuse the process where the
+/// credential behind it came back unchanged.
+pub(crate) type Refresher = Box<
+    dyn Fn(&[HeaderInjection]) -> std::io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)>
+        + Send
+        + Sync,
+>;
 
 /// The minimum wall-clock gap between two refresh attempts. A refresh is a resolver run, which for a
 /// plugin source is a bwrap spawn plus whatever the plugin itself does, so an upstream answering
@@ -599,7 +609,10 @@ impl CredentialRefresh {
             state.last_attempt = Some(std::time::Instant::now());
         }
 
-        let (injections, needles) = match (self.refresher)() {
+        // Taken before the re-resolution, and handed to it: it is both what the answer is compared
+        // against and what the answer may reuse.
+        let current = self.credentials.snapshot();
+        let (injections, needles) = match (self.refresher)(&current.injections) {
             Ok(resolved) => resolved,
             // A source that errors is broken rather than stale; retrying on a timer would only
             // repeat it. Stop, and let the launch's own error path be what the user sees.
@@ -611,7 +624,6 @@ impl CredentialRefresh {
             }
         };
 
-        let current = self.credentials.snapshot();
         if same_values(&current.injections, &injections) {
             if let Ok(mut state) = self.state.lock() {
                 state.stopped = true;
@@ -737,7 +749,7 @@ mod tests {
         ));
         let refresh = CredentialRefresh::new(
             creds.clone(),
-            Box::new(|| {
+            Box::new(|_| {
                 Ok((
                     vec![injection("Bearer new")],
                     vec![SecretNeedle::named("tok", b"new".to_vec())],
@@ -755,6 +767,34 @@ mod tests {
         );
     }
 
+    /// The re-resolution is handed the state it replaces, which is what lets the launch keep the
+    /// part of it that is *running*: a signed injection holds a plugin process, and re-resolving
+    /// blind would start a new one for every declared signer on every refresh — a sandbox spawn per
+    /// `401`, for credentials a `401` says nothing about.
+    #[test]
+    fn the_re_resolution_is_shown_the_state_it_replaces() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let creds = Arc::new(default_creds(vec![injection("Bearer old")], Vec::new()));
+        let refresh = CredentialRefresh::new(
+            creds,
+            Box::new(move |standing| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .extend(standing.iter().map(|i| i.value().to_string()));
+                Ok((vec![injection("Bearer new")], Vec::new()))
+            }),
+        );
+
+        assert!(refresh.on_refusal());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Bearer old".to_string()],
+            "the credential being replaced, as it stands at the moment of the refusal"
+        );
+    }
+
     /// An upstream answering `401` to every request must not turn each one into a resolver run. The
     /// second refusal inside the gap is a no-op, and the source is not consulted again.
     #[test]
@@ -764,7 +804,7 @@ mod tests {
         let creds = Arc::new(default_creds(vec![injection("Bearer old")], Vec::new()));
         let refresh = CredentialRefresh::new(
             creds.clone(),
-            Box::new(move || {
+            Box::new(move |_| {
                 let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok((vec![injection(&format!("Bearer v{n}"))], Vec::new()))
             }),
@@ -788,7 +828,7 @@ mod tests {
         let creds = Arc::new(default_creds(vec![injection("Bearer same")], Vec::new()));
         let refresh = CredentialRefresh::new(
             creds,
-            Box::new(move || {
+            Box::new(move |_| {
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok((vec![injection("Bearer same")], Vec::new()))
             }),
@@ -808,7 +848,7 @@ mod tests {
         let creds = Arc::new(default_creds(vec![injection("Bearer old")], Vec::new()));
         let refresh = CredentialRefresh::new(
             creds.clone(),
-            Box::new(move || {
+            Box::new(move |_| {
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(std::io::Error::other("the vault is unreachable"))
             }),

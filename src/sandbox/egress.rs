@@ -567,7 +567,7 @@ pub(crate) fn start(
     // relative `sops` file resolves against the project root (the `.sbx.toml`'s directory). A
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
     let (injections, redactions) =
-        resolve_injections(secrets, project_root, bwrap, redact_min_len, brokers)?;
+        resolve_injections(secrets, project_root, bwrap, redact_min_len, brokers, &[])?;
 
     // The credential state the proxy will read, built here so the refresher can hold the same one
     // and swap it in place. Re-resolution repeats exactly this call, which is why the inputs are
@@ -592,7 +592,9 @@ pub(crate) fn start(
         );
         std::sync::Arc::new(super::proxy::CredentialRefresh::new(
             credentials.clone(),
-            Box::new(move || resolve_injections(&secrets, &root, &bwrap, redact_min_len, &brokers)),
+            Box::new(move |standing| {
+                resolve_injections(&secrets, &root, &bwrap, redact_min_len, &brokers, standing)
+            }),
         ))
     });
 
@@ -894,17 +896,32 @@ pub(crate) fn start(
 /// `min_len` is the launch's redaction floor (`[redact] min_len`): a shorter value is injected but
 /// not scanned for. Below it the injection still applies — only the leak tripwire is skipped, and
 /// loudly (a silent skip would be a false-confidence trap).
+///
+/// `standing` is the set this one replaces, empty at launch and the live one on a refresh. It is the
+/// only thing here that is *running* rather than resolved: see [`resolve_one`] for what is reused
+/// out of it and on what condition.
 fn resolve_injections(
     secrets: &[HeaderSecret],
     project_root: &Path,
     bwrap: &Path,
     min_len: usize,
     brokers: &[super::broker::Reachable],
+    standing: &[HeaderInjection],
 ) -> io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)> {
     let mut injections = Vec::with_capacity(secrets.len());
     let mut redactions = Vec::new();
-    for secret in secrets {
-        let (injection, needles) = resolve_one(secret, project_root, bwrap, min_len, brokers)?;
+    for (i, secret) in secrets.iter().enumerate() {
+        // Positional, because both sets are built from the same `secrets` in the same order by this
+        // very loop — and checked rather than trusted: `resolve_one` reuses nothing whose plugin
+        // name and key do not also match.
+        let (injection, needles) = resolve_one(
+            secret,
+            project_root,
+            bwrap,
+            min_len,
+            brokers,
+            standing.get(i),
+        )?;
         injections.push(injection);
         redactions.extend(needles);
     }
@@ -924,6 +941,7 @@ fn resolve_one(
     bwrap: &Path,
     min_len: usize,
     brokers: &[super::broker::Reachable],
+    standing: Option<&HeaderInjection>,
 ) -> io::Result<(HeaderInjection, Vec<SecretNeedle>)> {
     let trimmed = resolve_chain(
         &secret.sources,
@@ -982,19 +1000,29 @@ fn resolve_one(
             secret.name
         ))
     })?;
-    // The wider grant is the plaintext, and only a manifest that declared `reads_secret` gets it.
-    // Everything else places a marker and never learns the value.
-    let marker = match plugin.signer.reads_secret {
-        true => None,
-        false => Some(std::sync::Arc::new(super::broker::SecretMarker::new(
-            trimmed, min_len,
-        )?)),
+    let (marker, process) = match reusable_signer(standing, &plugin.name, trimmed) {
+        Some(kept) => kept,
+        None => {
+            // The wider grant is the plaintext, and only a manifest that declared `reads_secret`
+            // gets it. Everything else places a marker and never learns the value.
+            let marker = match plugin.signer.reads_secret {
+                true => None,
+                false => Some(std::sync::Arc::new(super::broker::SecretMarker::new(
+                    trimmed, min_len,
+                )?)),
+            };
+            let credential = match &marker {
+                Some(marker) => super::signer::Credential::Marker(marker.token()),
+                None => super::signer::Credential::Plaintext(trimmed.to_string()),
+            };
+            let process = super::signer::SignerProcess::start(bwrap, plugin, host, credential)?;
+            (
+                marker,
+                std::sync::Arc::new(std::sync::Mutex::new(process))
+                    as std::sync::Arc<std::sync::Mutex<dyn super::signer::Signing>>,
+            )
+        }
     };
-    let credential = match &marker {
-        Some(marker) => super::signer::Credential::Marker(marker.token()),
-        None => super::signer::Credential::Plaintext(trimmed.to_string()),
-    };
-    let process = super::signer::SignerProcess::start(bwrap, plugin, host, credential)?;
     Ok((
         HeaderInjection {
             rule: secret.to.clone(),
@@ -1004,11 +1032,49 @@ fn resolve_one(
                 sees: plugin.signer.sees_headers.clone(),
                 key: trimmed.to_string(),
                 marker,
-                process: std::sync::Arc::new(std::sync::Mutex::new(process)),
+                process,
             }),
         },
         needles,
     ))
+}
+
+/// A signer as it exists at runtime: the marker it places, where it was given one, and the process
+/// that answers. Named because the two always travel together — a marker without the process that
+/// learned it is a token nothing will place, and a process without its marker places one sbx no
+/// longer substitutes.
+type RunningSigner = (
+    Option<std::sync::Arc<super::broker::SecretMarker>>,
+    std::sync::Arc<std::sync::Mutex<dyn super::signer::Signing>>,
+);
+
+/// The running signer a re-resolution may keep instead of starting a new one.
+///
+/// A `401` is what brings a refresh here, and a `401` is never about a signed credential — there is
+/// no token to renew, only a key that computes one (see [`HeaderInjection::refreshable`]). So a
+/// declaration whose plugin and whose resolved credential both came back unchanged keeps the plugin
+/// it already has: replacing would kill a live process and pay a sandbox spawn to hand its successor
+/// the identical key, once per refusal, for the life of the session.
+///
+/// Both halves of the condition are load-bearing. A different **key** must start a new plugin,
+/// because a plugin is told its credential once, at its handshake, and cannot be told again. A
+/// different **plugin name** means the declaration is not the one this process was started for at
+/// all. And the marker travels with the process rather than being re-drawn: the plugin places the
+/// token it learned at that handshake, and a fresh one would leave it placing a marker sbx no longer
+/// substitutes.
+fn reusable_signer(
+    standing: Option<&HeaderInjection>,
+    plugin: &str,
+    key: &str,
+) -> Option<RunningSigner> {
+    match standing.map(|i| &i.form) {
+        Some(crate::sandbox::proxy::Form::Signed(prev))
+            if prev.name == plugin && prev.key == key =>
+        {
+            Some((prev.marker.clone(), prev.process.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// Read a credential's source chain host-side and return the first value that resolves, trimmed.
@@ -1904,6 +1970,93 @@ mod tests {
     /// resolver runner — the only consumer of bwrap — never fires.
     const UNUSED_BWRAP: &str = "/nonexistent/bwrap";
 
+    /// A signer that answers nothing, standing in for a running plugin process. What these tests
+    /// ask of it is only that it is *the same one*, which `Arc::ptr_eq` decides.
+    struct InertSigner;
+
+    impl super::super::signer::Signing for InertSigner {
+        fn sign(
+            &mut self,
+            _req: &super::super::signer::SignRequest<'_>,
+        ) -> Result<super::super::signer::Signature, String> {
+            Err("this signer is a stand-in".to_string())
+        }
+    }
+
+    /// A signed injection standing for `plugin` with `key` behind it, as a launch left it.
+    fn standing_signer(plugin: &str, key: &str) -> HeaderInjection {
+        HeaderInjection {
+            rule: crate::allowlist::classify("api.example.com").unwrap(),
+            form: crate::sandbox::proxy::Form::Signed(crate::sandbox::proxy::Signed {
+                name: plugin.to_string(),
+                sets: vec!["Authorization".to_string()],
+                sees: Vec::new(),
+                key: key.to_string(),
+                marker: Some(std::sync::Arc::new(
+                    super::super::broker::SecretMarker::new(key, 8).expect("marker"),
+                )),
+                process: std::sync::Arc::new(std::sync::Mutex::new(InertSigner)),
+            }),
+        }
+    }
+
+    fn process_of(
+        injection: &HeaderInjection,
+    ) -> std::sync::Arc<std::sync::Mutex<dyn super::super::signer::Signing>> {
+        match &injection.form {
+            crate::sandbox::proxy::Form::Signed(signed) => signed.process.clone(),
+            _ => panic!("not a signed injection"),
+        }
+    }
+
+    /// A refresh must not restart a signer that has nothing to renew. A `401` from a *fixed*
+    /// credential's host re-resolves the whole set, and every signed declaration in it would
+    /// otherwise pay a sandbox spawn to hand a brand-new plugin the identical key.
+    #[test]
+    fn a_re_resolution_keeps_a_signer_whose_credential_came_back_unchanged() {
+        let standing = standing_signer("demo-sigv4", "the-key");
+        let (marker, process) =
+            reusable_signer(Some(&standing), "demo-sigv4", "the-key").expect("kept");
+        assert!(
+            std::sync::Arc::ptr_eq(&process, &process_of(&standing)),
+            "the very process, not an equal one"
+        );
+        // The plugin learned this token at its handshake and cannot be told another: a re-drawn
+        // marker would leave it placing one sbx no longer substitutes.
+        let kept = marker.expect("the marker travels with the process");
+        match &standing.form {
+            crate::sandbox::proxy::Form::Signed(signed) => assert!(std::sync::Arc::ptr_eq(
+                &kept,
+                signed.marker.as_ref().expect("the standing marker")
+            )),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Both halves of the condition are load-bearing, and neither is a nicety: a plugin is told its
+    /// credential once, so a rotated key needs a new process, and a differently-named plugin is not
+    /// the one this process was started for.
+    #[test]
+    fn a_rotated_key_or_another_plugin_starts_a_new_signer() {
+        let standing = standing_signer("demo-sigv4", "the-key");
+        assert!(
+            reusable_signer(Some(&standing), "demo-sigv4", "a-rotated-key").is_none(),
+            "a rotated key must reach the plugin, which only a new one can be told"
+        );
+        assert!(
+            reusable_signer(Some(&standing), "other-signer", "the-key").is_none(),
+            "another plugin is another declaration"
+        );
+        // A launch has nothing standing, and a fixed injection holds no process to keep.
+        assert!(reusable_signer(None, "demo-sigv4", "the-key").is_none());
+        let fixed = HeaderInjection::fixed(
+            crate::allowlist::classify("api.example.com").unwrap(),
+            "authorization",
+            "Bearer t",
+        );
+        assert!(reusable_signer(Some(&fixed), "demo-sigv4", "the-key").is_none());
+    }
+
     /// Resolve with a throwaway project root — the env/file tests never read it (only a relative
     /// `sops` source would); the sops tests below pass their own root explicitly.
     fn resolve_injections_at_root(
@@ -1914,6 +2067,7 @@ mod tests {
             Path::new("/"),
             Path::new(UNUSED_BWRAP),
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
             &[],
         )
     }
@@ -2054,6 +2208,7 @@ mod tests {
             dir.path(),
             Path::new(UNUSED_BWRAP),
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
             &[],
         )
         .unwrap();
@@ -2319,6 +2474,7 @@ mod tests {
             &bwrap,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(injs[0].value(), "Bearer ghp-from-the-plugin");
@@ -2404,6 +2560,7 @@ mod tests {
             Path::new(UNUSED_BWRAP),
             8,
             &[],
+            &[],
         )
         .unwrap();
         assert!(
@@ -2416,8 +2573,15 @@ mod tests {
         );
 
         // Lowered to 5, both sides admit it — the same value, the same step.
-        let (_, lowered) =
-            resolve_injections(&[wire], Path::new("/"), Path::new(UNUSED_BWRAP), 5, &[]).unwrap();
+        let (_, lowered) = resolve_injections(
+            &[wire],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            5,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(lowered.len(), 1, "the wire now scans for it");
         assert_eq!(lowered[0].as_bytes(), b"abcde");
         let task_needles = crate::sandbox::task::credential_needles(&task, "abcde", 5);
@@ -2449,8 +2613,15 @@ mod tests {
             description: None,
         };
 
-        let (_, wire_needles) =
-            resolve_injections(&[wire], Path::new("/"), Path::new(UNUSED_BWRAP), 8, &[]).unwrap();
+        let (_, wire_needles) = resolve_injections(
+            &[wire],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            8,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(
             wire_needles.is_empty(),
             "the plaintext is under the floor, so neither spelling is scanned for"

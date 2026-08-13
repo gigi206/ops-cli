@@ -116,8 +116,8 @@ the live, canonicalized destination rather than a once-computed guess.
 
 A credential can stop being accepted while the cage is still running: an access
 token expires, a secret is rotated, a session is revoked elsewhere. When an
-injection target answers **`401`**, `sbx` re-runs the resolver for that
-declaration and injects the newly resolved value from then on.
+injection target answers **`401`**, `sbx` re-resolves the launch's credentials
+and injects the newly resolved values from then on.
 
 The trigger is the refusal, not a declared expiry. An expiry is a claim about a
 clock this process does not own, and it says nothing about a token revoked early;
@@ -140,6 +140,14 @@ mean launching a sandboxed plugin:
 
 A `401` from a host carrying no injection is never a signal. Otherwise any
 allowed destination, including one the agent chose, could drive the resolver.
+
+A credential formed by a [signer plugin](plugins#the-signer-type) is not
+refreshed at all: there is no token to renew, only a key the plugin computes
+with, so a `401` from its destination says nothing a re-resolution could fix. It
+also survives a re-resolution triggered by some *other* declaration's `401`: the
+plugin already running keeps running, as long as the key behind it resolves to
+the same value. A rotated key does start a new one, because a plugin is told its
+credential once, at its handshake, and cannot be told again.
 
 ## Worked example
 
