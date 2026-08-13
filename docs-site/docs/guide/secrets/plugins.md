@@ -758,10 +758,13 @@ instead of signing as though the request had none.
 
 Two consequences worth knowing before you meet them:
 
-- A body larger than the buffer sbx de-chunks into is **refused**, with `413` and the
-  reason `signer-body-too-large`. For a `Content-Length` request the length is read off
-  the head and the refusal comes before the client is invited to send, so an oversized
-  upload is answered rather than received.
+- A body larger than the buffer sbx holds is **refused**, and which refusal depends on
+  how the client framed it. A `Content-Length` above the ceiling is read off the head,
+  so it is refused with `413` and the reason `signer-body-too-large` before the client
+  is invited to send: an oversized upload is answered rather than received. A `chunked`
+  body declares no length, so it is discovered at the ceiling while being read, and gets
+  the `400 bad-request:chunked` that an over-cap chunked body already got before any
+  signer was involved.
 - Below that ceiling, a client's `Expect: 100-continue` is answered before the body is
   read, so the body arrives before the *plugin* can refuse the request. A signer refusal
   then follows an interim `100`, which is what HTTP allows and what the de-chunking path

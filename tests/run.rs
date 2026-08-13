@@ -1554,6 +1554,12 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
 /// before the connect, so a designated h2 host that merely *resolves* is enough, and the request
 /// provably never leaves. What the assertions read is the response the cage's own client received.
 ///
+/// The same launch is where **what this plane can say about a body** is proved, for the same reason
+/// it is cheap: the plugin declares `body_digest` and repeats what it was told before refusing, so
+/// one refusal carries both facts. This plane relays DATA frames as they arrive and an HTTP/2
+/// request half may legitimately never end, so a request that carries one is stated as unheld —
+/// which is the one refusal shape the guide and the plugin README both name.
+///
 /// Skips (never fails) when the host cannot sandbox or the binary cache is unreachable (`curl` will
 /// not provision).
 #[test]
@@ -1590,8 +1596,9 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
         root.path(),
         "demo-h2-refuses",
         true,
-        "",
-        "    print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region\"}), flush=True)",
+        "body_digest = \"sha256\"",
+        "    told = json.dumps(ask.get(\"body\"), sort_keys=True)\n\
+         \x20   print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region (body=\" + told + \")\"}), flush=True)",
     );
     let installed = sbx_in(
         project.path(),
@@ -1616,44 +1623,60 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
         String::from_utf8_lossy(&trusted.stderr)
     );
 
-    let out = sbx()
-        .args([
-            "run",
-            "--",
-            "curl",
-            "-s",
-            "-i",
-            "--http2",
-            "https://cache.nixos.org/nix-cache-info",
-        ])
-        .current_dir(project.path())
-        .env("XDG_DATA_HOME", data.path())
-        .env("XDG_STATE_HOME", state.path())
-        .env("SBX_E2E_SIGNING_KEY", "the-real-signing-key-8f2a-h2")
-        .output()
-        .expect("spawn sbx run");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let ask = |extra: &[&str]| -> String {
+        let mut args = vec!["run", "--", "curl", "-s", "-i", "--http2"];
+        args.extend_from_slice(extra);
+        args.push("https://cache.nixos.org/nix-cache-info");
+        let out = sbx()
+            .args(&args)
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .env("SBX_E2E_SIGNING_KEY", "the-real-signing-key-8f2a-h2")
+            .output()
+            .expect("spawn sbx run");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // The stream is answered on the h2 plane, which is what makes this a different proof from
+        // the HTTP/1.1 one rather than a copy of it.
+        assert!(
+            stdout.contains("HTTP/2 403"),
+            "the refusal must arrive over HTTP/2: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("signer-refused"),
+            "and carry its own reason token: {stdout}"
+        );
+        // The frame this test exists for: the plugin's sentence, which no token encodes.
+        assert!(
+            stdout.contains("`demo-h2-refuses`")
+                && stdout.contains("no credentials for that region")
+                && stdout.contains("so it was not sent"),
+            "the caller must learn which plugin refused, why, and that nothing was sent: {stdout}"
+        );
+        stdout
+    };
 
-    // The stream is answered on the h2 plane, which is what makes this a different proof from the
-    // HTTP/1.1 one rather than a copy of it.
+    // A stream that ends with its headers carries no body, and the digest of nothing is a fact this
+    // plane can state like any other.
+    let bodyless = ask(&[]);
     assert!(
-        stdout.contains("HTTP/2 403"),
-        "the refusal must arrive over HTTP/2: {stdout}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        stdout.contains("signer-refused"),
-        "and carry its own reason token: {stdout}"
-    );
-    // The frame this test exists for: the plugin's sentence, which no token encodes.
-    assert!(
-        stdout.contains("`demo-h2-refuses`")
-            && stdout.contains("no credentials for that region")
-            && stdout.contains("so it was not sent"),
-        "the caller must learn which plugin refused, why, and that nothing was sent: {stdout}"
+        bodyless.contains("\"held\": true")
+            && bodyless
+                .contains("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        "a bodyless h2 stream is stated as held, with the digest of the empty string: {bodyless}"
     );
 
-    // Counted once, as a block: a refusal that answered with a body is still a refusal.
+    // A stream that carries DATA is stated as **unheld**, with the reason. Not a cost sbx declines
+    // to pay: an HTTP/2 request half may legitimately never end, so the digest does not exist at
+    // the moment the request must be signed.
+    let with_body = ask(&["-d", "x"]);
+    assert!(
+        with_body.contains("\"held\": false") && with_body.contains("HTTP/2 DATA frames"),
+        "a body on this plane is stated as unheld, and says why: {with_body}"
+    );
+
+    // Counted once each, as blocks: a refusal that answered with a body is still a refusal.
     let stats = sbx_in(project.path(), data.path(), state.path(), &["net", "stats"]);
     let stats = String::from_utf8_lossy(&stats.stdout).into_owned();
     // Read with the column padding collapsed: the widths follow the host name, and a literal that
@@ -1664,8 +1687,8 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .unwrap_or_default();
     assert_eq!(
-        row, "cache.nixos.org 0 0 1",
-        "one blocked, no allow and no deny — the request never left: {stats}"
+        row, "cache.nixos.org 0 0 2",
+        "two blocked, no allow and no deny — neither request left: {stats}"
     );
 }
 

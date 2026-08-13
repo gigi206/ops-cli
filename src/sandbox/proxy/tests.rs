@@ -1658,6 +1658,96 @@ fn an_absolute_form_https_request_is_forwarded_over_a_validated_tls_upstream() {
     );
 }
 
+/// The **absolute-form** plane holds and digests a body on the same terms as the tunneled one.
+///
+/// Its own test rather than a parameter of the tunneled one, because the two planes are siblings
+/// written out separately: they got the held-body edits by hand, and a property proved on one says
+/// nothing about the other. What is asserted is the same triple, read off the head the upstream
+/// received, plus the ceiling refusal this plane writes with its own refusal writer.
+#[test]
+fn the_absolute_form_plane_holds_a_body_to_digest_it_on_the_same_terms() {
+    let forwarded = |request: String| -> (String, String) {
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["host.test:*"]).with_pool(false),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_injections(vec![digesting_injection()])
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            request
+                .replace("{port}", &addr.port().to_string())
+                .as_bytes(),
+        )
+        .unwrap();
+        let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        (resp, head)
+    };
+    let lengths = |head: &str| {
+        head.lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .count()
+    };
+    let hello = "X-Body: 11/b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+    let (resp, head) = forwarded(
+        "POST https://host.test:{port}/ HTTP/1.1\r\nHost: host.test\r\n\
+         Content-Length: 11\r\n\r\nhello world"
+            .to_string(),
+    );
+    assert!(resp.contains("200"), "{resp:?}");
+    assert!(head.contains(hello), "{head:?}");
+    assert_eq!(lengths(&head), 1, "{head:?}");
+
+    let (resp, head) = forwarded(
+        "POST https://host.test:{port}/ HTTP/1.1\r\nHost: host.test\r\n\
+         Transfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n"
+            .to_string(),
+    );
+    assert!(resp.contains("200"), "{resp:?}");
+    assert!(head.contains(hello), "{head:?}");
+    assert!(
+        !head.to_ascii_lowercase().contains("transfer-encoding:"),
+        "{head:?}"
+    );
+
+    let (resp, head) =
+        forwarded("GET https://host.test:{port}/ HTTP/1.1\r\nHost: host.test\r\n\r\n".to_string());
+    assert!(resp.contains("200"), "{resp:?}");
+    assert!(
+        head.contains("X-Body: 0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        "{head:?}"
+    );
+    assert_eq!(
+        lengths(&head),
+        0,
+        "a bodyless request gains no framing on this plane either: {head:?}"
+    );
+
+    let (resp, _) = forwarded(format!(
+        "POST https://host.test:{{port}}/ HTTP/1.1\r\nHost: host.test\r\nContent-Length: {}\r\n\r\n",
+        CHUNKED_REQUEST_CAP + 1
+    ));
+    assert!(
+        resp.contains("413") && resp.contains("signer-body-too-large"),
+        "the ceiling is refused with this plane's own writer: {resp:?}"
+    );
+}
+
 /// An absolute-form `https://` forward to a host with no allow rule is refused `403 denied-default`
 /// (the same allowlist verdict a `CONNECT` to that host would get), and never reaches an upstream.
 #[test]

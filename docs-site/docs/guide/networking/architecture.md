@@ -358,7 +358,10 @@ say who refused leaves every declaration to audit.
 
 `signer-body-too-large` is its neighbour, and no plugin refused it: a signer whose
 manifest asks to be told a digest over the request body needs sbx to hold that body,
-and this one is larger than the buffer it holds. It answers `413`. See
+and this request declares a `Content-Length` larger than the buffer it holds. It
+answers `413`, from the head, before the client is invited to send. An over-cap
+`chunked` body declares no length and is discovered while being read, so it keeps the
+`bad-request:chunked` above. See
 [what a signer is told about the body](../secrets/plugins#what-a-signer-is-told-about-the-body).
 
 `upstream-closed` is the one that names a server that accepted the request and then
