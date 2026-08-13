@@ -3895,39 +3895,94 @@ fn read_chunked_body_bounds_a_no_newline_size_line_flood() {
     assert!(err.to_string().contains("too long"), "{err}");
 }
 
+/// Every request-framing vector the proxy claims to refuse, each pinned to **its own** reason.
+///
+/// The sub-categories exist so a reader can tell one desync vector from another, and the module
+/// doc's status table names each: a test asserting only `bad-request` would let them collapse into
+/// one another, or into nothing, and still pass. So each case asserts the token the table promises.
+///
+/// All three are refused **before** policy and resolution — the resolver panics if reached — because
+/// a request whose framing is ambiguous has no single meaning to apply a policy to.
+///
+/// `Transfer-Encoding: chunked` is deliberately absent: it is de-chunked and re-framed rather than
+/// refused (see `a_chunked_request_body_is_dechunked_and_reframed_with_content_length`), which is
+/// what makes the *other* codings a refusal rather than a blanket rule.
 #[test]
 fn duplicated_framing_headers_are_refused_with_400_before_the_policy_check() {
-    // A duplicated Content-Length or Host is a classic request-desync vector — refused
-    // fail-closed at the proxy, before policy/resolve (the resolver panics if reached, so the
-    // guard is proven to precede it). (`Transfer-Encoding: chunked` is NOT refused here — it is
-    // de-chunked and re-framed; see `a_chunked_request_body_is_dechunked_and_reframed`.)
-    for req in [
-            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".to_vec(),
-            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nHost: evil.test\r\nConnection: close\r\n\r\n".to_vec(),
-        ] {
-            let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
-            let proxy_ca_der = proxy_ca.ca_cert_der();
-            let ctx = Arc::new(
-                ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
-                    .unwrap()
-                    .with_resolver(Box::new(|_| {
-                        panic!("resolve must not run for a framing refusal")
-                    })),
-            );
-            let resp = through_proxy(
-                ctx,
-                proxy_ca_der,
-                "allowed.test",
-                "allowed.test",
-                8443,
-                &req,
-            )
-            .unwrap();
-            assert!(
-                resp.contains("400") && resp.contains("bad-request"),
-                "expected a 400 bad-request framing refusal: {resp:?}"
-            );
-        }
+    for (reason, req) in [
+        (
+            "bad-request:dup-content-length",
+            &b"GET / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"[..],
+        ),
+        (
+            "bad-request:dup-host",
+            &b"GET / HTTP/1.1\r\nHost: allowed.test\r\nHost: evil.test\r\nConnection: close\r\n\r\n"[..],
+        ),
+        (
+            "bad-request:invalid-content-length",
+            &b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0x10\r\nConnection: close\r\n\r\n"[..],
+        ),
+        (
+            "bad-request:transfer-encoding",
+            &b"POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n"[..],
+        ),
+    ] {
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["allowed.test:*"]))
+                .unwrap()
+                .with_resolver(Box::new(|_| {
+                    panic!("resolve must not run for a framing refusal")
+                })),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "allowed.test",
+            "allowed.test",
+            8443,
+            req,
+        )
+        .unwrap();
+        assert!(
+            resp.contains("400") && resp.contains(reason),
+            "expected `{reason}`: {resp:?}"
+        );
+    }
+}
+
+/// The one framing asymmetry between the planes, pinned so it stays a decision rather than drift.
+///
+/// The tunneled and absolute-form planes accept `Transfer-Encoding: chunked` and re-frame it. The
+/// **cleartext** `http://` plane refuses every `Transfer-Encoding`, chunked included: it does no
+/// de-chunking, so accepting the coding would mean forwarding a framing it does not read. Refusing
+/// is what keeps a CL/TE ambiguity from reaching an upstream through the one plane that would pass
+/// it along unexamined.
+#[test]
+fn the_cleartext_plane_refuses_even_a_chunked_transfer_encoding() {
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            policy(&["http://upstream.test:*"]),
+        )
+        .unwrap()
+        .with_resolver(Box::new(|_| {
+            panic!("resolve must not run for a framing refusal")
+        })),
+    );
+    let resp = through_cleartext(
+        ctx,
+        // The head alone: the refusal comes before any body is read, and a client still writing
+        // one would meet the close as a reset rather than as the `400` under test.
+        b"POST http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
+          Transfer-Encoding: chunked\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        resp.contains("400") && resp.contains("bad-request"),
+        "the plane that does not de-chunk must not forward the coding: {resp:?}"
+    );
 }
 
 #[test]
