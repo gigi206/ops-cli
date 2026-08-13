@@ -77,7 +77,7 @@ unknown secret resolver scheme
 
 Either the built-in scheme is mistyped (`env://`, `file://`, `sops://`) or a resolver
 plugin that provides the scheme is not installed. See
-[Resolvers](../secrets/resolvers) and [Resolver plugins](../secrets/plugins).
+[Resolvers](../secrets/resolvers) and [Plugins](../secrets/plugins).
 
 ## A program will not run / exec is blocked
 

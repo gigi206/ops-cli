@@ -122,7 +122,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [Resolvers](secrets/resolvers): the source layer: `env://` / `file://` / `sops://`.
 - [Injection](secrets/injection): the http-header broker.
 - [Redaction](secrets/redaction): the outbound and inbound tripwires.
-- [Resolver plugins](secrets/plugins): third-party resolver schemes.
+- [Plugins](secrets/plugins): third-party resolvers, brokers and signers.
 - [Signed plugin stores](secrets/stores): distributing and installing them from a verified remote.
 
 ## Housekeeping

@@ -93,7 +93,7 @@ flowchart LR
 ```
 
 The two layers compose freely: any source with any broker. Resolvers are the
-open-ended, pluggable half (see [Resolver plugins](plugins)); the broker that puts a
+open-ended, pluggable half (see [Plugins](plugins)); the broker that puts a
 secret on the wire touches the security boundary, so it stays first-party. A broker
 that terminates nothing and only stands in front of a host socket is pluggable under
 its own contract, described in [The broker type](plugins#the-broker-type).
@@ -153,7 +153,7 @@ that a credential is bound to *one* destination host. See
 - [Injection](injection): the HTTP-header broker: how a credential lands
   on the wire.
 - [Redaction](redaction): the outbound and inbound secret tripwires.
-- [Resolver plugins](plugins): resolver plugins and signed plugin stores.
+- [Plugins](plugins): the three plugin kinds, and signed plugin stores.
 
 ## See also
 

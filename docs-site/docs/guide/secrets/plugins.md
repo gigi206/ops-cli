@@ -1,4 +1,12 @@
-# Resolver plugins
+# Plugins
+
+`sbx` takes **three kinds of plugin**, and this page is all three. A
+[resolver](#what-a-resolver-plugin-is) adds a `scheme://` that a secret's `from`
+can route to. A [broker](#the-broker-type) stands in front of a host socket the
+sandbox must use without ever holding. A [signer](#the-signer-type) forms a
+credential that depends on the request being made. Resolvers came first and are
+the bulk of what follows; each of the other two states what its own contract adds,
+and every rule below that is not marked otherwise holds for all three.
 
 The secret-source space is open-ended: any well-known secret-manager backend,
 a cloud KMS, a third-party vault app, a
@@ -8,7 +16,7 @@ plugin adds a new `scheme://` that a secret's `from` reference can route to. The
 stays first-party: a bug where a request is decrypted and decided is a boundary
 breach, so that one is never a plugin. A broker that terminates nothing, and
 stands in front of a host socket instead, is a second plugin type under a contract
-that leaves `sbx` holding the socket: see [The broker type](#the-broker-type).
+that leaves `sbx` holding the socket.
 
 A resolver plugin still obeys the invariant: it runs **host-side, sandboxed under
 bubblewrap, never in the cage**, and returns the plaintext to `sbx`'s host

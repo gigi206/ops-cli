@@ -384,7 +384,7 @@ exit with output is a resolved secret, a clean exit with none is an *absent* val
 falls through to the next source in a chain, and a failure is hard and fail-closed, so a
 broken resolver can never silently downgrade to a weaker source.
 
-The full manifest reference is in [Resolver plugins](../secrets/plugins), and the store
+The full manifest reference is in [Plugins](../secrets/plugins), and the store
 workflow in [Signed plugin stores](../secrets/stores).
 
 ## Declared operations

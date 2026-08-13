@@ -9,7 +9,7 @@ Inspect and manage **resolver plugins** and **plugin stores**. Host-level: reads
 data directory, not a project's config. A resolver plugin declares a `scheme://`
 `sbx` can route a secret [`from`](../configuration/secret) reference to.
 
-See also: [Resolver plugins](../secrets/plugins) · [Signed plugin stores](../secrets/stores) · [Resolvers](../secrets/resolvers) · [Secrets architecture](../secrets/).
+See also: [Plugins](../secrets/plugins) · [Signed plugin stores](../secrets/stores) · [Resolvers](../secrets/resolvers) · [Secrets architecture](../secrets/).
 
 ## Plugins
 
@@ -47,7 +47,7 @@ reads as unknown.
 Every install records the **digest of the tree it placed**. `verify` re-hashes and
 compares, `list` marks a changed plugin `[modified since install]`, and `info` states
 it on an `integrity:` line. This is **drift detection, not a security control**: see
-[Resolver plugins](../secrets/plugins#a-plugin-edited-after-it-was-installed).
+[Plugins](../secrets/plugins#a-plugin-edited-after-it-was-installed).
 
 A `scheme://` belongs to **one** plugin. Every install path refuses a scheme that is
 already claimed, so the only way to two claimants is to place a plugin directory by

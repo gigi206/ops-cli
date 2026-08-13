@@ -2,9 +2,9 @@
 
 This page covers configuring a store, installing from it, and what happens when it
 changes; for the plugins themselves, and for installing one from a local directory, see
-[Resolver plugins](plugins).
+[Plugins](plugins).
 
-See also: [Resolver plugins](plugins) · [`sbx plugins store`](../cli/plugins#stores) ·
+See also: [Plugins](plugins) · [`sbx plugins store`](../cli/plugins#stores) ·
 [Resolvers](resolvers) · [The trust gate](../concepts/trust).
 
 A **remote plugin store** is a git repository of plugins that `sbx` fetches on your
@@ -218,7 +218,7 @@ step still to come. Until then, a store you add today uses **trust-on-first-use*
 
 ## See also
 
-- [Resolver plugins](plugins): what a store distributes, and the manifest each
+- [Plugins](plugins): what a store distributes, and the manifest each
   plugin carries.
 - [`sbx plugins`](../cli/plugins): the command reference, including every `store`
   subcommand.
