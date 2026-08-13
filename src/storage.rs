@@ -863,7 +863,12 @@ pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
 }
 
 /// Build the command that formats `image`, taking its root's ownership from `seed`.
-fn mkfs_command(mkfs: &Mkfs, image: &Path, seed: &Path, label: &str) -> Command {
+fn mkfs_command(
+    mkfs: &Mkfs,
+    image: &Path,
+    seed: &Path,
+    label: &str,
+) -> (Command, Vec<std::fs::File>) {
     let args = |c: &mut Command| {
         c.arg("-q")
             .arg("-L")
@@ -873,10 +878,11 @@ fn mkfs_command(mkfs: &Mkfs, image: &Path, seed: &Path, label: &str) -> Command 
             .arg(image);
     };
     match mkfs {
+        // The host's own tool, run as the user runs it: there is no cage here to harden.
         Mkfs::Host(path) => {
             let mut c = Command::new(path);
             args(&mut c);
-            c
+            (c, Vec::new())
         }
         Mkfs::Owned {
             bwrap,
@@ -884,6 +890,12 @@ fn mkfs_command(mkfs: &Mkfs, image: &Path, seed: &Path, label: &str) -> Command 
             bin,
         } => {
             let mut c = Command::new(bwrap);
+            // The mandatory syscall denylist, which "as everywhere else" below has to include or
+            // the claim is not true: this argv is assembled by hand rather than through the
+            // `SandboxSpec` keystone, and had the namespaces and the capabilities without it.
+            let seccomp = crate::sandbox::seccomp::memfds(&Default::default())
+                .expect("the statically-defined filters compile");
+            c.args(crate::sandbox::seccomp::argv_prefix(&seccomp));
             // Every namespace unshared and every capability dropped, as everywhere else sbx
             // runs a helper. The network included: formatting needs none.
             for ns in [
@@ -912,7 +924,9 @@ fn mkfs_command(mkfs: &Mkfs, image: &Path, seed: &Path, label: &str) -> Command 
             }
             c.arg("--").arg(bin);
             args(&mut c);
-            c
+            // Handed back rather than dropped here: the filters' descriptors are not
+            // close-on-exec, and bwrap reads them at the exec.
+            (c, seccomp)
         }
     }
 }
@@ -966,7 +980,8 @@ pub(crate) fn init(image: &Path, size_bytes: u64, label: &str, mkfs: &Mkfs) -> R
         f.set_len(size_bytes)
             .map_err(|e| format!("cannot size image: {e}"))?;
         drop(f);
-        run(&mut mkfs_command(mkfs, image, &seed, label)).map(|_| ())
+        let (mut cmd, _seccomp) = mkfs_command(mkfs, image, &seed, label);
+        run(&mut cmd).map(|_| ())
     })();
     let _ = std::fs::remove_dir_all(&seed);
     if made.is_err() {
@@ -1846,11 +1861,15 @@ this line has no separator at all
         let image = Path::new("/data/vol/sbx-storage.btrfs");
         let seed = Path::new("/data/vol/sbx-storage.seed");
 
-        let host = mkfs_command(
+        let (host, host_fds) = mkfs_command(
             &Mkfs::Host(PathBuf::from("/usr/bin/mkfs.btrfs")),
             image,
             seed,
             "l",
+        );
+        assert!(
+            host_fds.is_empty(),
+            "the host's own tool runs uncaged, so there is nothing to keep open"
         );
         assert_eq!(
             args(&host),
@@ -1865,7 +1884,7 @@ this line has no separator at all
             ]
         );
 
-        let owned = mkfs_command(
+        let (owned, owned_fds) = mkfs_command(
             &Mkfs::Owned {
                 bwrap: PathBuf::from("/e/bwrap"),
                 store_nix: PathBuf::from("/d/store/nix"),
@@ -1877,6 +1896,15 @@ this line has no separator at all
         );
         let a = args(&owned);
         assert_eq!(a[0], "/e/bwrap");
+        // The mandatory syscall denylist, ahead of everything: this argv is built by hand rather
+        // than through the `SandboxSpec` keystone, so "hardened like every other helper" below is
+        // only true if the filters are here too.
+        assert_eq!(
+            (a[1].as_str(), a[3].as_str()),
+            ("--add-seccomp-fd", "--add-seccomp-fd"),
+            "{a:?}"
+        );
+        assert_eq!(owned_fds.len(), 2, "one descriptor per filter, held open");
         // Hardened like every other helper sbx runs, the network included: formatting an
         // image reaches nothing.
         for expected in [

@@ -104,18 +104,28 @@ fn command(
     mise_bin: &Path,
     project_binds: &[ProjectBind],
     args: &[OsString],
-) -> io::Result<Command> {
+) -> io::Result<(Command, Vec<std::fs::File>)> {
     let home_src = ensure_home(layout)?;
     let store_nix = store::physical_path(layout, Path::new("/nix"));
     let mut cmd = Command::new(bwrap);
-    cmd.args(bwrap_argv(
+    // The mandatory syscall denylist, as every other cage sbx builds carries it. This one is
+    // assembled by hand rather than through the `SandboxSpec` keystone, which is how it came to have
+    // the namespaces and the dropped capabilities but not the filters — and this is the cage that
+    // runs tool installation, the part of provisioning most shaped by what a project asks for.
+    // Nothing relaxes it: `[seccomp] allow` is a launch's grant to its own cage, not to a helper.
+    let seccomp = super::seccomp::memfds(&super::seccomp::SeccompPolicy::default())?;
+    let mut argv = super::seccomp::argv_prefix(&seccomp);
+    argv.extend(bwrap_argv(
         &store_nix,
         &home_src,
         project_binds,
         mise_bin,
         args,
     ));
-    Ok(cmd)
+    cmd.args(argv);
+    // Returned alongside, never dropped here: the descriptors are not close-on-exec and bwrap reads
+    // them at the exec, so closing one before the caller runs the command turns into `Invalid fd`.
+    Ok((cmd, seccomp))
 }
 
 /// Resolve a trusted project's mise `[env]` into sandbox environment variables.
@@ -139,7 +149,8 @@ pub(crate) fn resolve_env(
 ) -> io::Result<Vec<(String, String)>> {
     let binds = stage_files(stage_dir, files)?;
     let args = [OsString::from("env"), OsString::from("--json-extended")];
-    let out = command(bwrap, layout, mise_bin, &binds, &args)?.output()?;
+    let (mut cmd, _seccomp) = command(bwrap, layout, mise_bin, &binds, &args)?;
+    let out = cmd.output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "mise env failed: {}",
@@ -374,6 +385,52 @@ mod tests {
         argv.windows(3)
             .find(|w| w[0] == "--setenv" && w[1] == key)
             .map(|w| &w[2])
+    }
+
+    /// The cage carries the mandatory syscall denylist, like every other cage sbx builds.
+    ///
+    /// It is assembled here by hand rather than through the `SandboxSpec` keystone, which is how it
+    /// came to have the namespaces and the dropped capabilities but not the filters. Asserted on
+    /// what [`command`] hands to bwrap, since the filters are descriptors prefixed at that step and
+    /// are not part of [`bwrap_argv`] at all.
+    #[test]
+    fn the_cage_carries_the_mandatory_seccomp_denylist() {
+        let dir = crate::testutil::TmpDir::new();
+        let layout = Layout::under(&dir.path().join("sbx"));
+        let (cmd, keep_open) = command(
+            Path::new("/nix/store/abc-bwrap/bin/bwrap"),
+            &layout,
+            Path::new("/nix/store/abc-mise/bin/mise"),
+            &[],
+            &[OsString::from("--version")],
+        )
+        .expect("a cage command");
+
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let fds: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--add-seccomp-fd")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(fds, vec![0, 2], "{argv:?}");
+        assert_eq!(
+            keep_open.len(),
+            2,
+            "each filter's descriptor is held open until bwrap has read it"
+        );
+        // ...and the hardening this cage already had is still behind them.
+        for flag in [
+            "--unshare-user",
+            "--unshare-net",
+            "--cap-drop",
+            "--clearenv",
+        ] {
+            assert!(argv.iter().any(|a| a == flag), "missing {flag}: {argv:?}");
+        }
     }
 
     #[test]
@@ -633,16 +690,15 @@ mod run_tests {
         assert!(rev_root.is_dir(), "per-revision mise gcroot missing");
 
         // run `mise --version` from sbx's store, hermetic and offline
-        let out = command(
+        let (mut cmd, _seccomp) = command(
             &bwrap,
             &layout,
             &mise_bin,
             &[],
             &[OsString::from("--version")],
         )
-        .expect("build the mise command")
-        .output()
-        .expect("run mise");
+        .expect("build the mise command");
+        let out = cmd.output().expect("run mise");
         assert!(
             out.status.success(),
             "mise --version failed: {}",
