@@ -287,9 +287,10 @@ the **policy's** layer, since the socket is always the global config's.
   a credential resolved through one: `[task.<name>.secret]` runs the same resolver layer a
   wire injection does, host-side, so a `pass://` credential means the same thing in both.
 - **The record says what `sbx` observed, not what the plugin claims.** Every decision goes
-  to the session's log, readable with [`sbx logs --feed broker`](../cli/logs). The verdict
-  (`forward`, `answer`, `refuse`) is `sbx`'s own account and leads each line; the plugin's
-  reason is appended after it, sanitised. A plugin cannot make a forward *read* as a
+  to the session's log, readable with [`sbx logs --feed broker`](../cli/logs). One record
+  holds every broker of a session, and each line names the one that decided. The verdict
+  (`forward`, `answer`, `refuse`) is `sbx`'s own account and leads each line, after that
+  name; the plugin's reason is appended after it, sanitised. A plugin cannot make a forward *read* as a
   refusal by choosing its words. On top of that, the **first** refusal of a connection is
   printed at the terminal, and a plugin that stops answering has its request refused and
   its connection ended, since a broker that stopped deciding is not one to keep asking.

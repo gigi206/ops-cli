@@ -1065,14 +1065,27 @@ const MAX_CONCURRENT_CONNS: usize = 32;
 /// guard owns the socket file and unlinks it when the launch ends.
 pub(crate) struct Broker {
     host_uds: std::path::PathBuf,
-    /// The control socket a reader takes the decision record from. Never bound into the cage: the
-    /// agent must not read — or amend — the record of what it asked for.
-    control_uds: std::path::PathBuf,
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.host_uds);
+    }
+}
+
+/// The session's broker feed: the socket a reader takes the decision record from, unlinked when the
+/// launch ends. Never bound into the cage — the agent must not read, or amend, the record of what it
+/// asked for.
+///
+/// Held apart from [`Broker`] because it belongs to the *session*, not to any one broker: several
+/// brokers share one record, and unlinking it when the first of them goes would end a reader's
+/// `--follow` while the rest were still deciding.
+pub(crate) struct BrokerFeed {
+    control_uds: std::path::PathBuf,
+}
+
+impl Drop for BrokerFeed {
+    fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.control_uds);
     }
 }
@@ -1277,7 +1290,7 @@ fn serve_exchanges(
                 } else {
                     observed
                 };
-                ring.push(kind, &observed, relayed.label.as_deref());
+                ring.push(kind, name, &observed, relayed.label.as_deref());
 
                 // A refusal is also worth saying out loud, and only the first of a connection: it
                 // is rare by nature, and a client that hits one usually reports something
@@ -1314,6 +1327,7 @@ fn serve_exchanges(
             Err(why) => {
                 ring.push(
                     super::broker_control::BrokerKind::Refuse,
+                    name,
                     "an exchange that could not be completed",
                     Some(&why),
                 );
@@ -1350,6 +1364,7 @@ fn serve_exchanges(
             {
                 ring.push(
                     super::broker_control::BrokerKind::Refuse,
+                    name,
                     "a frame that would have taught the cage the credential's marker",
                     None,
                 );
@@ -1366,6 +1381,60 @@ fn serve_exchanges(
     }
 }
 
+/// Where one broker's host socket lives, keyed by the launcher pid like the agent and egress
+/// sockets, so a crashed predecessor's residue is identifiable.
+///
+/// The `broker-` prefix is what keeps this namespace clear of the lens's own `control-<pid>.sock`
+/// in the same directory. Without it a broker plugin named `control` would name the very file the
+/// reader connects to, and standing it up would unlink the session's record and answer in its
+/// place. A plugin name is a name, not a reserved word: the layout is what has to keep them apart.
+fn host_socket(dir: &std::path::Path, name: &str, pid: u32) -> std::path::PathBuf {
+    dir.join(format!("broker-{name}-{pid}.sock"))
+}
+
+/// Stand up the session's broker feed: the shared decision ring, and the socket
+/// `sbx logs --feed broker` reads it through.
+///
+/// Called once per launch that declares any `[broker.<name>]`, before the first broker is started,
+/// so the first decision cannot beat the reader to it. The ring is returned whatever happens to the
+/// socket: the relay is the fence and the record is its witness, so a reader that cannot be stood up
+/// degrades to brokers with no reader rather than to no brokers. The guard is `None` then, and the
+/// warning says which it was.
+///
+/// The socket exists for a launch that *declared* a broker, not for one whose broker started: a
+/// declaration that could not be honoured leaves a feed with no events, which is the truthful
+/// reading, while an absent socket would have `sbx logs` say the config declares no broker when it
+/// does.
+pub(crate) fn stand_up_feed(
+    layout: &crate::store::Layout,
+) -> (
+    std::sync::Arc<super::broker_control::BrokerRing>,
+    Option<BrokerFeed>,
+) {
+    let ring = std::sync::Arc::new(super::broker_control::BrokerRing::new(
+        super::broker_control::BROKER_RING_CAP,
+    ));
+    let control_uds =
+        super::broker_control::broker_control_socket(layout.data_dir(), std::process::id());
+    let served = ring.clone();
+    let bound = super::lens::ensure_control_dir(&layout.data_dir().join("broker")).and_then(|()| {
+        super::lens::bind_and_serve(&control_uds, move |control| {
+            super::broker_control::serve(control, served)
+        })
+    });
+    match bound {
+        Ok(()) => (ring, Some(BrokerFeed { control_uds })),
+        Err(e) => {
+            crate::diag::warn(&format!(
+                "the brokers this config declares will run, but their decisions cannot be read \
+                 (`{}`: {e}) — `sbx logs --feed broker` will report no broker for this session",
+                control_uds.display()
+            ));
+            (ring, None)
+        }
+    }
+}
+
 /// Stand up one broker: bind its socket under the data directory, serve it, and return what the
 /// cage needs to reach it.
 pub(crate) fn start(
@@ -1374,6 +1443,9 @@ pub(crate) fn start(
     plugin: &crate::plugins::broker::BrokerPlugin,
     bwrap: &std::path::Path,
     secret: Option<(String, usize)>,
+    // The session's decision record, stood up once by the launch and shared by every broker it
+    // starts — see [`super::broker_control`] for why it is one ring and not one per broker.
+    ring: std::sync::Arc<super::broker_control::BrokerRing>,
 ) -> io::Result<(Broker, Reachable)> {
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
@@ -1385,34 +1457,10 @@ pub(crate) fn start(
     let dir = layout.data_dir().join("broker");
     super::lens::ensure_control_dir(&dir)?;
 
-    // Keyed by the launcher pid, like the agent and egress sockets, so a crashed predecessor's
-    // residue is identifiable — and cleared here, since a stale file would block the bind.
-    let host_uds = dir.join(format!("{}-{}.sock", binding.name, std::process::id()));
+    // Cleared before the bind, since a stale file from a crashed predecessor would block it.
+    let host_uds = host_socket(&dir, &binding.name, std::process::id());
     let _ = std::fs::remove_file(&host_uds);
     let listener = UnixListener::bind(&host_uds)?;
-
-    // The session's decision record, and the socket a reader reaches it through. Bound before the
-    // broker serves, so the first decision cannot beat the reader to it. In the same `0700`
-    // directory as the broker socket and, like every other lens, **never** bound into the cage.
-    // A failure to stand it up is not a reason to refuse the broker: the relay is the fence, the
-    // record is the witness — so it degrades to a broker with no reader rather than to no broker.
-    let ring = Arc::new(super::broker_control::BrokerRing::new(
-        super::broker_control::BROKER_RING_CAP,
-        &binding.name,
-    ));
-    let control_uds =
-        super::broker_control::broker_control_socket(layout.data_dir(), std::process::id());
-    let served = ring.clone();
-    if let Err(e) = super::lens::bind_and_serve(&control_uds, move |control| {
-        super::broker_control::serve(control, served)
-    }) {
-        crate::diag::warn(&format!(
-            "the `{}` broker is running, but its decisions cannot be read (`{}`: {e}) — \
-             `sbx logs --feed broker` will report no broker for this session",
-            binding.name,
-            control_uds.display()
-        ));
-    }
 
     let bwrap = bwrap.to_path_buf();
     let allow = binding.allow.clone();
@@ -1466,7 +1514,6 @@ pub(crate) fn start(
     Ok((
         Broker {
             host_uds: host_uds.clone(),
-            control_uds,
         },
         Reachable {
             name: binding.name.clone(),
@@ -2723,7 +2770,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             ScriptedPlugin::forward(),
         ]);
         let mut host = FakeHost::with_runs(vec![vec![], vec![b"answered".to_vec()]]);
-        let ring = super::super::broker_control::BrokerRing::new(8, "x");
+        let ring = super::super::broker_control::BrokerRing::new(8);
         serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x").expect("served");
 
         assert_eq!(
@@ -2744,6 +2791,27 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
     /// A protocol whose clients compute the socket path is stood at the address of the resource it
     /// fences — the only placement a GnuPG client can find, since it derives the path from the uid
     /// and the home rather than reading any variable.
+    /// A broker's socket and the session's record share one `0700` directory, and a plugin name is
+    /// whatever a plugin was installed as. Without a namespace of its own, a broker named `control`
+    /// would bind the very path `sbx logs --feed broker` connects to — and `start` unlinks before
+    /// it binds, so it would take the record's place and answer a reader in it.
+    #[test]
+    fn a_brokers_socket_can_never_be_the_one_a_reader_connects_to() {
+        let dir = std::path::Path::new("/data/broker");
+        let lens = super::super::broker_control::broker_control_socket(
+            std::path::Path::new("/data"),
+            4242,
+        );
+        assert_eq!(lens, dir.join("control-4242.sock"), "the reader's end");
+        for name in ["gpg-agent", "control", "control-4242.sock"] {
+            assert_ne!(
+                host_socket(dir, name, 4242),
+                lens,
+                "a broker named `{name}` must not name the record's socket"
+            );
+        }
+    }
+
     #[test]
     fn a_broker_stands_where_its_protocols_clients_look_for_it() {
         let mut spec = crate::plugins::broker::BrokerSpec {

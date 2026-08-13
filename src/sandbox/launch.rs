@@ -3447,6 +3447,10 @@ pub(crate) struct LaunchGuard {
     /// must outlive the cage, and dropping it unlinks the socket. Holding these in a local would
     /// unlink them before the cage is even built.
     pub(crate) brokers: Vec<broker::Broker>,
+    /// The reader's end of the brokers' shared decision record, when this launch declared any. Held
+    /// here for the same reason the brokers themselves are, and one more: it belongs to the session
+    /// rather than to any one broker, so it must outlive the first of them to be torn down.
+    pub(crate) broker_feed: Option<broker::BrokerFeed>,
     pub(crate) forward: Option<forward::Forwarder>,
     /// The in-cage desktop-notifications relay (`dbus = true`), when one is running. It runs on a
     /// host thread bridging the private bus to the host notifications daemon, so it must outlive the
@@ -3510,11 +3514,16 @@ impl Drop for LaunchGuard {
         if let Some(ssh_agent) = self.ssh_agent.take() {
             drop(ssh_agent);
         }
-        // Beside the agent, and for the same reason: each unlinks its socket and its control
-        // socket, and closing the listener ends the detached accept loop. Taken as a whole so a
-        // launch running several brokers tears them all down.
+        // Beside the agent, and for the same reason: each unlinks its socket, and closing the
+        // listener ends the detached accept loop. Taken as a whole so a launch running several
+        // brokers tears them all down.
         for broker in std::mem::take(&mut self.brokers) {
             drop(broker);
+        }
+        // Then the record they shared, which outlives every one of them: a reader following it
+        // sees the last decision of the last broker before the socket goes.
+        if let Some(feed) = self.broker_feed.take() {
+            drop(feed);
         }
         // Before the portal directory: the relay must disconnect from the private bus before its
         // socket is removed.
@@ -4229,6 +4238,9 @@ fn build(
     // fatal, like the egress proxy's and the agent's.
     let mut broker_guards: Vec<broker::Broker> = Vec::new();
     let mut brokers: Vec<broker::Reachable> = Vec::new();
+    // The reader's end of the shared record, held for the launch's lifetime. `None` until a config
+    // that declares a broker stands it up, and `None` too when that could not be done.
+    let mut broker_feed: Option<broker::BrokerFeed> = None;
     if !prep.cfg.brokers.is_empty() {
         // The perimeter every plugin's trust rests on, established before the first plugin runs —
         // a resolver is run only because it sits under `<data>/plugins`, a tree a project cannot
@@ -4245,6 +4257,12 @@ fn build(
         for w in &plugin_warnings {
             crate::diag::warn(w);
         }
+        // The session's decision record, stood up once and shared by every broker below — one ring
+        // and one socket, whatever the config declares. The guard lives as long as the brokers do,
+        // so a reader's `--follow` ends with the launch rather than with whichever broker was torn
+        // down first.
+        let (ring, feed) = broker::stand_up_feed(&prep.layout);
+        broker_feed = feed;
         for binding in &prep.cfg.brokers {
             let name = &binding.name;
             let Some(plugin) = registry.broker(name) else {
@@ -4373,7 +4391,14 @@ fn build(
             // validated the table against this very manifest, and the copy is what runs.
             let mut plugin = plugin.clone();
             plugin.host = binding.host.clone();
-            match broker::start(&prep.layout, binding, &plugin, &prep.bwrap, secret) {
+            match broker::start(
+                &prep.layout,
+                binding,
+                &plugin,
+                &prep.bwrap,
+                secret,
+                ring.clone(),
+            ) {
                 Ok((guard, reachable)) => {
                     crate::diag::note(&format!(
                         "broker: `{name}` stands in front of {}{}",
@@ -5106,6 +5131,7 @@ fn build(
     let guard = if egress_guard.is_some()
         || sshagent_guard.is_some()
         || !broker_guards.is_empty()
+        || broker_feed.is_some()
         || forward_guard.is_some()
         || portal_host.is_some()
         || proc_enforce_guard.is_some()
@@ -5116,6 +5142,7 @@ fn build(
             egress: egress_guard,
             ssh_agent: sshagent_guard,
             brokers: broker_guards,
+            broker_feed,
             forward: forward_guard,
             notify: notify_relay,
             theme: theme_relay,

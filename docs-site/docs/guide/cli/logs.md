@@ -82,7 +82,7 @@ Most sessions record two or three. Each feed needs something to have been decide
 | `proc`, `fs` | observation on: [`sbx run --observe`](run#observing-a-run---observe) |
 | `net` | a filtering [`[network] mode`](../configuration/network) (`deny`, `allow` or `ask`) |
 | `ssh` | an [`[ssh_agent] allow`](../configuration/ssh-agent) grant |
-| `broker` | a [`[broker.<name>]`](../configuration/broker) binding that started |
+| `broker` | a [`[broker.<name>]`](../configuration/broker) table in this config |
 | `signer` | a [credential](../configuration/secret) declaring `sign = "<plugin>"` |
 | `task` | a [`[task]`](../configuration/task) table declaring operations |
 

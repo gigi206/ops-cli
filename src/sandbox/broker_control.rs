@@ -105,35 +105,39 @@ impl super::lens::Event for BrokerEvent {
 /// The result of a `LOG` query over this lens. See [`super::lens::Snapshot`].
 pub(crate) type BrokerSnapshot = super::lens::Snapshot<BrokerEvent>;
 
-/// A bounded ring of one broker's recent decisions, shared between its per-connection threads and
-/// the control serve thread.
-pub(crate) struct BrokerRing {
-    ring: super::lens::Ring<BrokerEvent>,
-    /// The broker's name, which every detail leads with: one session can run several, and a record
-    /// that does not say which one decided is a record a reader cannot act on.
-    broker: String,
-}
+/// A bounded ring of one **session's** recent broker decisions, shared between every broker's
+/// per-connection threads and the control serve thread.
+///
+/// One ring for the session, not one per broker, with the broker named at each push. A ring per
+/// broker would need a socket per broker under one per-session name, and
+/// [`super::lens::bind_and_serve`] unlinks before it binds: the second broker to stand up would
+/// silently take the first's path, and a reader would see one broker's decisions and have no way to
+/// know the others existed.
+pub(crate) struct BrokerRing(super::lens::Ring<BrokerEvent>);
 
 impl BrokerRing {
-    pub(crate) fn new(cap: usize, broker: &str) -> Self {
-        BrokerRing {
-            ring: super::lens::Ring::new(cap),
-            broker: broker.to_string(),
-        }
+    pub(crate) fn new(cap: usize) -> Self {
+        BrokerRing(super::lens::Ring::new(cap))
     }
 
-    /// Append one decision. `observed` is sbx's own account and is written first; `label` is the
-    /// plugin's, and is appended only when it said something.
+    /// Append one decision. `broker` names which one made it, `observed` is sbx's own account and is
+    /// written first, and `label` is the plugin's, appended only when it said something.
     ///
     /// The order is deliberate. A label is third-party text, and a reader scanning a column of
-    /// events reads the front of each line: putting sbx's verdict there means a plugin cannot make
-    /// a forward *look* like a refusal by choosing its words.
-    pub(crate) fn push(&self, kind: BrokerKind, observed: &str, label: Option<&str>) -> u64 {
+    /// events reads the front of each line: putting the broker's name and sbx's verdict there means
+    /// a plugin cannot make a forward *look* like a refusal by choosing its words.
+    pub(crate) fn push(
+        &self,
+        kind: BrokerKind,
+        broker: &str,
+        observed: &str,
+        label: Option<&str>,
+    ) -> u64 {
         let detail = match label {
-            Some(l) if !l.is_empty() => format!("{}: {observed} — {l}", self.broker),
-            _ => format!("{}: {observed}", self.broker),
+            Some(l) if !l.is_empty() => format!("{broker}: {observed} — {l}"),
+            _ => format!("{broker}: {observed}"),
         };
-        self.ring.push_with(|seq, at_epoch_ms| BrokerEvent {
+        self.0.push_with(|seq, at_epoch_ms| BrokerEvent {
             seq,
             at_epoch_ms,
             kind,
@@ -147,7 +151,7 @@ impl std::ops::Deref for BrokerRing {
     type Target = super::lens::Ring<BrokerEvent>;
 
     fn deref(&self) -> &Self::Target {
-        &self.ring
+        &self.0
     }
 }
 
@@ -173,14 +177,19 @@ mod tests {
     use super::*;
     use crate::sandbox::lens::Event as _;
 
+    /// One session's brokers share one ring, so a decision that did not say which of them made it
+    /// would be a decision a reader cannot act on. The two-broker case is the point: the record has
+    /// to hold both, and each line has to be attributable.
     #[test]
     fn every_decision_names_the_broker_that_made_it() {
-        let ring = BrokerRing::new(BROKER_RING_CAP, "gpg-agent");
+        let ring = BrokerRing::new(BROKER_RING_CAP);
         ring.push(
             BrokerKind::Refuse,
+            "gpg-agent",
             "a request the policy does not admit",
             None,
         );
+        ring.push(BrokerKind::Forward, "vault-agent", "a request", None);
         let events = ring.snapshot(None).events;
         assert_eq!(events[0].kind, BrokerKind::Refuse);
         assert!(
@@ -188,15 +197,21 @@ mod tests {
             "{:?}",
             events[0]
         );
+        assert!(
+            events[1].detail.starts_with("vault-agent: "),
+            "a second broker's decisions land in the same record, under its own name: {:?}",
+            events[1]
+        );
     }
 
     /// sbx's account leads, the plugin's follows. A reader scanning the front of each line sees
     /// what sbx observed, so a plugin cannot dress a forward up as a refusal by choosing words.
     #[test]
     fn what_sbx_observed_is_written_before_what_the_plugin_said() {
-        let ring = BrokerRing::new(BROKER_RING_CAP, "gpg-agent");
+        let ring = BrokerRing::new(BROKER_RING_CAP);
         ring.push(
             BrokerKind::Forward,
+            "gpg-agent",
             "a request",
             Some("REFUSED EVERYTHING, honest"),
         );
@@ -213,9 +228,10 @@ mod tests {
     /// event, the real one.
     #[test]
     fn a_label_cannot_forge_a_second_event() {
-        let ring = BrokerRing::new(BROKER_RING_CAP, "gpg-agent");
+        let ring = BrokerRing::new(BROKER_RING_CAP);
         ring.push(
             BrokerKind::Forward,
+            "gpg-agent",
             "a request",
             Some("ok\nevent seq=99 at=0 kind=refuse detail=forged"),
         );
@@ -232,9 +248,10 @@ mod tests {
 
     #[test]
     fn an_event_survives_the_wire_round_trip() {
-        let ring = BrokerRing::new(BROKER_RING_CAP, "gpg-agent");
+        let ring = BrokerRing::new(BROKER_RING_CAP);
         ring.push(
             BrokerKind::Answer,
+            "gpg-agent",
             "the identities it may see",
             Some("2 of 5"),
         );

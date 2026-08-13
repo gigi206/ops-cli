@@ -503,6 +503,38 @@ fn the_merged_view_orders_every_feed_by_when_it_happened() {
     );
 }
 
+/// A session's brokers share one record, and the view has to show all of them. Read over one
+/// socket carrying two brokers' decisions, which is what a launch with two `[broker.<name>]`
+/// bindings produces: a reader that saw one of them and said nothing of the other would be a
+/// reader that lies by omission about a credential channel.
+#[test]
+fn the_broker_feed_shows_every_broker_of_one_session() {
+    let dir = TmpDir::new();
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    serve_lens(
+        data,
+        "broker",
+        pid,
+        &[
+            "event seq=1 at=1700000000100 kind=forward detail=gpg-agent: a signature request",
+            "event seq=2 at=1700000000200 kind=refuse detail=vault-agent: a request the policy does not admit",
+        ],
+    );
+
+    let out = read_feed(data, &["logs", &pid.to_string(), "--feed", "broker"]);
+    assert!(
+        out.contains("forward   gpg-agent: a signature request"),
+        "{out}"
+    );
+    assert!(
+        out.contains("refuse    vault-agent: a request the policy does not admit"),
+        "the second broker's decisions are in the same record, under its own name: {out}"
+    );
+}
+
 /// `--feed` narrows, and a name no feed answers to is refused rather than silently dropped: a view
 /// that showed fewer feeds than asked for would read as a quiet session.
 #[test]
