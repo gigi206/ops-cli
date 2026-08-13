@@ -930,3 +930,259 @@ fn bulk_throughput() {
         report_rate_bytes("raw L4 splice (tcp://), no inspection", elapsed, BULK_BYTES);
     }
 }
+
+/// A loopback HTTP/2 TLS upstream for the measurement: every stream on every connection gets the
+/// same one-message answer with a `grpc-status` trailer, and nothing is recorded.
+///
+/// Its own OS thread and its own runtime, deliberately. The proxy runs each h2 tunnel on a
+/// current-thread runtime, and an upstream sharing that runtime would be one blocking call away
+/// from starving the timers meant to bound the exchange — which is not a hypothetical, it is what
+/// made the first attempt at this measurement stall.
+fn spawn_h2_bench_upstream(
+    conns: usize,
+    body: Arc<Vec<u8>>,
+) -> (SocketAddr, CertificateDer<'static>) {
+    use bytes::Bytes;
+    use http::Response;
+
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(CertResolver::new(ca)));
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let mut live = Vec::new();
+            for _ in 0..conns {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                let body = body.clone();
+                live.push(tokio::spawn(async move {
+                    // Nagle off, as the proxy sets it on its own side: this upstream writes a head,
+                    // a DATA frame and trailers, and a test upstream that lets the second write
+                    // wait on a delayed ACK measures Linux, not the proxy.
+                    let _ = sock.set_nodelay(true);
+                    let Ok(tls) = acceptor.accept(sock).await else {
+                        return;
+                    };
+                    let Ok(mut conn) = h2::server::handshake(tls).await else {
+                        return;
+                    };
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        let head = Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .body(())
+                            .unwrap();
+                        let Ok(mut send) = respond.send_response(head, false) else {
+                            continue;
+                        };
+                        send.reserve_capacity(body.len());
+                        if send
+                            .send_data(Bytes::from(body.as_ref().clone()), false)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert("grpc-status", "0".parse().unwrap());
+                        let _ = send.send_trailers(trailers);
+                    }
+                }));
+            }
+            for task in live {
+                let _ = task.await;
+            }
+        });
+    });
+    (addr, ca_der)
+}
+
+/// A TLS client config trusting exactly `ca` and offering ALPN `h2`, for both legs of this plane:
+/// without the offer the proxy refuses the tunnel, and refuses the upstream, HTTP/2 being the only
+/// thing it speaks here.
+fn h2_tls_config(ca: CertificateDer<'static>) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots.add(ca).unwrap();
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    cfg.resumption = rustls::client::Resumption::disabled();
+    Arc::new(cfg)
+}
+
+/// Finish an h2 connection over `io`: TLS, then the h2 handshake. Returns the request sender; the
+/// connection is driven by a task that ends with the runtime.
+async fn h2_over<S>(
+    io: S,
+    cfg: Arc<ClientConfig>,
+    host: &str,
+) -> h2::client::SendRequest<bytes::Bytes>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let name = ServerName::try_from(host.to_string()).unwrap();
+    let tls = tokio_rustls::TlsConnector::from(cfg)
+        .connect(name, io)
+        .await
+        .unwrap();
+    let (send, conn) = h2::client::handshake(tls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    send
+}
+
+/// Open one h2 tunnel through the proxy: `CONNECT`, then TLS against the minted leaf.
+async fn h2_tunnel(
+    sock_path: &std::path::Path,
+    cfg: Arc<ClientConfig>,
+    host: &str,
+    port: u16,
+) -> h2::client::SendRequest<bytes::Bytes> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut sock = tokio::net::UnixStream::connect(sock_path).await.unwrap();
+    sock.write_all(format!("CONNECT {host}:{port} HTTP/1.1\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    // Read the cleartext reply one byte at a time up to the blank line: what follows it is the
+    // client's own TLS, and reading a byte of that here would take it out of the handshake.
+    let mut established = Vec::new();
+    let mut byte = [0u8; 1];
+    while !established.ends_with(b"\r\n\r\n") {
+        assert!(sock.read(&mut byte).await.unwrap() > 0, "tunnel closed");
+        established.push(byte[0]);
+    }
+    assert!(
+        String::from_utf8_lossy(&established).contains("200 Connection established"),
+        "CONNECT not accepted"
+    );
+    h2_over(sock, cfg, host).await
+}
+
+/// One h2 connection straight to the upstream, nothing in the middle.
+async fn h2_direct(
+    addr: SocketAddr,
+    cfg: Arc<ClientConfig>,
+    host: &str,
+) -> h2::client::SendRequest<bytes::Bytes> {
+    let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let _ = sock.set_nodelay(true);
+    h2_over(sock, cfg, host).await
+}
+
+/// One gRPC-shaped stream, read to its trailers. Returns the message bytes received.
+async fn one_h2_stream(send: &mut h2::client::SendRequest<bytes::Bytes>, host: &str) -> usize {
+    let req = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("https://{host}/pkg.Svc/Method"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let ready = send.clone().ready().await.unwrap();
+    *send = ready;
+    let (resp, _body) = send.send_request(req, true).unwrap();
+    let (_parts, mut body) = resp.await.unwrap().into_parts();
+    let mut got = 0;
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        got += chunk.len();
+        // Return the window as it is consumed, or a response past the initial one stalls halfway.
+        let _ = body.flow_control().release_capacity(chunk.len());
+    }
+    let _ = body.trailers().await;
+    got
+}
+
+/// What one gRPC stream costs on the HTTP/2 plane, and what multiplexing does and does not buy.
+///
+/// This plane had nothing measuring it because, until its harness existed, nothing here could reach
+/// an upstream at all. The axis is not bytes: a gRPC message is small and the relay copies it once.
+/// It is **connection setup**, and there are two per stream — the client's tunnel and the upstream's.
+///
+/// The four rows are the same work with those two removed one at a time. Direct means no proxy, so
+/// the pair of direct rows prices an h2 connection on this machine and shows what multiplexing is
+/// worth when nothing is in the middle. Through the proxy, reusing the tunnel removes the client
+/// leg — and only the client leg. This plane opens a TCP connection, a TLS handshake and an h2
+/// handshake **for every stream it relays**, multiplexed or not, because it has no upstream pool
+/// (the HTTP/1.1 path does, which is what its own pooled row prices). What stays in the last row is
+/// therefore that per-stream upstream connection, which no amount of client-side multiplexing folds
+/// away.
+#[test]
+#[ignore = "a measurement, not an assertion: run explicitly, in release"]
+fn h2_stream_cost() {
+    println!(
+        "\nHTTP/2 stream cost ({REQUESTS} streams, {} B message, loopback upstream — no RTT)",
+        SMALL_BODY.len()
+    );
+    let body = Arc::new(SMALL_BODY.as_bytes().to_vec());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    for (label, via_proxy, streams_per_connection) in [
+        ("direct h2, one connection per stream", false, 1),
+        ("direct h2, all streams on one connection", false, REQUESTS),
+        ("through the proxy, one tunnel per stream", true, 1),
+        (
+            "through the proxy, all streams on one tunnel",
+            true,
+            REQUESTS,
+        ),
+    ] {
+        // One upstream connection per stream through the proxy, whichever way the client groups
+        // them; direct, the client's own grouping is the upstream's.
+        let (addr, up_ca) = spawn_h2_bench_upstream(REQUESTS + 4, body.clone());
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut ctx = ProxyCtx::new(
+            proxy_ca,
+            policy(&["grpc.test:*"]).with_http2(vec![
+                crate::allowlist::Http2Host::parse("grpc.test").unwrap(),
+            ]),
+        )
+        .unwrap()
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        ctx.upstream_h2 = h2_tls_config(up_ca.clone());
+        let (_dir, sock) = serve_on_uds(Arc::new(ctx));
+        let cfg = match via_proxy {
+            true => h2_tls_config(proxy_ca_der),
+            false => h2_tls_config(up_ca),
+        };
+
+        let started = Instant::now();
+        rt.block_on(async {
+            let mut done = 0;
+            while done < REQUESTS {
+                let mut send = match via_proxy {
+                    true => h2_tunnel(&sock, cfg.clone(), "grpc.test", addr.port()).await,
+                    false => h2_direct(addr, cfg.clone(), "grpc.test").await,
+                };
+                for _ in 0..streams_per_connection.min(REQUESTS - done) {
+                    assert_eq!(
+                        one_h2_stream(&mut send, "grpc.test").await,
+                        SMALL_BODY.len()
+                    );
+                    done += 1;
+                }
+            }
+        });
+        report_rate(label, started.elapsed(), REQUESTS);
+    }
+}
