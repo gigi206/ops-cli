@@ -919,7 +919,7 @@ pub(crate) struct PluginProcess {
     writer: std::os::unix::net::UnixStream,
     /// The descriptor the cage's environment was read from, held open for the child's whole life:
     /// bwrap reads it at startup, and dropping it earlier would race that read.
-    _env: Option<std::fs::File>,
+    _env: Vec<std::fs::File>,
 }
 
 impl PluginProcess {

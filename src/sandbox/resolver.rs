@@ -114,11 +114,18 @@ fn state_dir_of(dir: &Path) -> Option<PathBuf> {
 /// runs the plugin under it. Everything up to the point where a caller decides *how* to run it:
 /// a resolver waits for its output, a broker keeps talking to it.
 ///
-/// The returned `File` is the descriptor the cage's environment is read from. It must stay open
-/// until bwrap has read it — which for a long-running child means for as long as the child lives.
-pub(super) fn compose_cage(
-    plan: &CagePlan<'_>,
-) -> io::Result<(Vec<OsString>, Option<std::fs::File>)> {
+/// The returned files are descriptors bwrap is told to read: the cage's environment, and the
+/// compiled seccomp filters. They must stay open until bwrap has read them — which for a
+/// long-running child means for as long as the child lives.
+///
+/// The filters are the same mandatory denylist every agent cage carries, and they are here because
+/// this cage is the one running code sbx did not write. Until they were, a plugin from a store had
+/// the `ptrace`/`bpf`/`perf_event_open`/`userfaultfd`/keyring set and the whole mount-and-namespace
+/// family available to it, while the agent's own cage refused them: the wrong way round, since the
+/// plugin is also the process that may be told a credential. A plugin has no config of its own, so
+/// nothing relaxes them here — [`SandboxSpec`] carries the unrelaxed policy by default and this path
+/// never sets another.
+pub(super) fn compose_cage(plan: &CagePlan<'_>) -> io::Result<(Vec<OsString>, Vec<std::fs::File>)> {
     // The executable is in the trusted computing base. The perimeter is the data directory's
     // owner-only permissions (a project cannot write there), but defend the thing we actually
     // exec directly: refuse it unless it is a regular file owned by us and not writable by group
@@ -204,7 +211,7 @@ pub(super) fn compose_cage(
     // The returned descriptor is where the cage's environment is read from, and the reason it is a
     // descriptor is this cage in particular: a plugin's `allow_env` is how it is handed its *own*
     // credential (a vault token, an age key), and an argument list is world-readable.
-    super::argv::compose(&spec)
+    super::launch::seccomp_argv(&spec)
 }
 
 /// Run `plugin` to resolve `reff`, returning its raw stdout on success (the caller classifies
@@ -892,6 +899,54 @@ mod tests {
 
     /// The plan `cage_spec` takes, built from a resolver the way `run` builds it — so a test
     /// exercises the very composition a launch does.
+    /// A plugin's cage carries the same mandatory syscall denylist an agent's cage does.
+    ///
+    /// It did not, and the asymmetry ran the wrong way. This is the cage that runs code sbx did not
+    /// write, fetched from a store, and it is also the process a signer's credential is handed to;
+    /// the agent's own cage, running the user's own agent, was the hardened one. A plugin had
+    /// `ptrace`, `bpf`, `perf_event_open`, `userfaultfd`, the keyring calls and the whole
+    /// mount-and-namespace family available to it.
+    ///
+    /// Read off the composed argv rather than the spec, because the filters are not in the spec's
+    /// argv at all: they are descriptors prefixed at the invocation, which is exactly the step this
+    /// path was skipping.
+    #[test]
+    fn a_plugin_cage_carries_the_mandatory_seccomp_denylist() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::testutil::TmpDir::new();
+        let exec = dir.path().join("resolve");
+        std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let p = plugin_in(dir.path(), SandboxGrant::default());
+        let (argv, keep_open) = compose_cage(&plan_for(&p, "test://x")).expect("a cage argv");
+
+        // Two filters, each on its own descriptor, ahead of everything else — the same shape the
+        // agent's launch emits.
+        let fds: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--add-seccomp-fd")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(fds, vec![0, 2], "{argv:?}");
+        assert!(
+            keep_open.len() >= 2,
+            "the descriptors bwrap is told to read are held open by the caller"
+        );
+        // ...and the namespace hardening is still there behind them.
+        for flag in [
+            "--unshare-user",
+            "--unshare-net",
+            "--cap-drop",
+            "--clearenv",
+        ] {
+            assert!(argv.iter().any(|a| a == flag), "missing {flag}: {argv:?}");
+        }
+    }
+
     fn plan_for<'a>(p: &'a ResolverPlugin, reff: &str) -> CagePlan<'a> {
         CagePlan {
             dir: &p.dir,

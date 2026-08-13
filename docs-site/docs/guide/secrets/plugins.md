@@ -253,6 +253,14 @@ exit status and the output streams:
 `stdin` is closed, so a resolver can never prompt for anything: everything it
 needs must come from its `[sandbox]` grant.
 
+A plugin runs in its own cage, built the same way an agent's is: its own user,
+pid, ipc, uts and cgroup namespaces, every capability dropped, a cleared
+environment, and no network unless the manifest asks for one. It carries the
+same mandatory **syscall denylist** too, and for the same reason it exists at
+all: this is the process running code you did not write, and it is also the
+process a signer's credential is handed to. Nothing relaxes that denylist for a
+plugin, since a plugin brings no config of its own.
+
 **stderr is the diagnostic channel, and must never carry the value.** It is
 folded into the error of a failed run, and relayed as an `sbx: warning:` line
 when a run resolves *nothing*: so a plugin can explain a misspelled locator or
