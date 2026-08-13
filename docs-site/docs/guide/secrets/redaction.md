@@ -197,6 +197,13 @@ Four bounds keep this narrow:
 - the number kept is capped, because every needle is scanned against every request
   head and every response chunk.
 
+Once remembered, a value stays remembered for the life of the session. That matters
+because a declared credential can be **re-resolved** mid-session, when the destination
+answers `401` and says the value it was given is no longer accepted. A re-resolution
+speaks for every declaration and replaces what they produced; it speaks for nothing the
+cage obtained on its own, so what was learned is carried across rather than discarded
+with the value it had nothing to do with.
+
 It changes what is *scanned*, never what is *sent*: observing never creates an
 injection, so it cannot alter what the cage authenticates as.
 

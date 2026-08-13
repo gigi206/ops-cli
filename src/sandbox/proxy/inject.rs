@@ -326,17 +326,38 @@ pub(crate) struct SecretNeedle {
     /// magnitude, which is the difference between the scan being invisible next to the relay's own
     /// copy and being the thing that caps its throughput.
     finder: memchr::memmem::Finder<'static>,
+    /// Whether this needle was **learned from traffic** rather than derived from a declaration.
+    ///
+    /// It decides what survives a re-resolution. A declared needle is replaced by the re-resolved
+    /// value of the same declaration; an observed one has no declaration behind it, so nothing
+    /// replaces it and dropping it is simply losing it — see [`Credentials::replace`].
+    observed: bool,
 }
 
 impl SecretNeedle {
-    /// A needle whose name is the credential's logical name.
+    /// A needle whose name is the credential's logical name — for a value a declaration produced.
     pub(crate) fn named(name: impl Into<String>, bytes: Vec<u8>) -> Self {
         let finder = memchr::memmem::Finder::new(&bytes).into_owned();
         Self {
             name: name.into(),
             bytes,
             finder,
+            observed: false,
         }
+    }
+
+    /// A needle for a credential sbx **saw** rather than issued: an app's own sign-in, remembered by
+    /// [`Credentials::observe`] so the tripwires cover it too.
+    fn learned(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            observed: true,
+            ..Self::named(name, bytes)
+        }
+    }
+
+    /// Whether this needle was learned from traffic rather than declared.
+    fn is_observed(&self) -> bool {
+        self.observed
     }
 
     /// The needle bytes — used by the scan, and by the egress tests to confirm a needle was
@@ -458,9 +479,28 @@ impl Credentials {
     /// Install a newly resolved state. Exchanges already in flight keep the snapshot they took, so
     /// a refresh never changes what a running request injects halfway through.
     pub(crate) fn replace(&self, set: CredentialSet) {
-        if let Ok(mut current) = self.current.write() {
-            *current = std::sync::Arc::new(set);
-        }
+        let Ok(mut current) = self.current.write() else {
+            return;
+        };
+        // What the re-resolution produced is the whole of the *declared* state, and replaces it.
+        // What it cannot speak for is what was **learned**: an app's own credential belongs to no
+        // declaration, so a re-resolution has nothing to offer in its place and taking the answer
+        // wholesale would simply drop it — leaving the value the cage actually authenticates with
+        // un-tripwired on the way out, unmasked on the way back, and unmasked in the capture. It is
+        // carried across, minus anything the new declared set already covers.
+        let mut needles = set.needles;
+        let learned: Vec<SecretNeedle> = current
+            .needles
+            .iter()
+            .filter(|n| n.is_observed())
+            .filter(|n| !needles.iter().any(|kept| kept.as_bytes() == n.as_bytes()))
+            .cloned()
+            .collect();
+        needles.extend(learned);
+        *current = std::sync::Arc::new(CredentialSet {
+            injections: set.injections,
+            needles,
+        });
     }
 
     /// Remember a credential the cage sent for itself, so the tripwires cover it too. Reports
@@ -503,7 +543,7 @@ impl Credentials {
             return false;
         }
         let mut needles = current.needles.clone();
-        needles.push(SecretNeedle::named(
+        needles.push(SecretNeedle::learned(
             format!("observed:{header}"),
             bytes.to_vec(),
         ));
@@ -714,6 +754,91 @@ mod tests {
     /// with. The tests that care about the floor itself call [`Credentials::new`] directly.
     fn default_creds(injections: Vec<HeaderInjection>, needles: Vec<SecretNeedle>) -> Credentials {
         Credentials::new(injections, needles, MIN_LEN_DEFAULT)
+    }
+
+    /// A credential sbx **learned** survives a re-resolution; a declared one is replaced by it.
+    ///
+    /// The two are not symmetric, and the asymmetry is the whole point. A re-resolution answers for
+    /// every declaration, so taking its needles wholesale is right for those. It answers for nothing
+    /// an app obtained by its own sign-in, which sbx keeps only because it saw it — so taking the
+    /// answer wholesale dropped it, and with it every protection that value had: the outbound
+    /// tripwire stopped refusing it on the way out, the response masking stopped masking it on the
+    /// way back, and the capture stopped masking it at filing. One `401` from any host carrying a
+    /// refreshable declared credential was enough to trigger it.
+    ///
+    /// Residual, stated rather than fixed: the *previous* declared value is gone the moment the new
+    /// one lands, so an exchange still in flight that is filed after a re-resolution has its
+    /// reflected copy of the old value masked against the new needles. Keeping a generation of
+    /// superseded values alive to close that would mean masking values that are no longer
+    /// credentials, and holding them for a window nothing can pick correctly.
+    #[test]
+    fn a_learned_credential_survives_a_re_resolution_and_a_declared_one_is_replaced() {
+        let creds = default_creds(
+            Vec::new(),
+            vec![SecretNeedle::named(
+                "declared",
+                b"declared-value-v1".to_vec(),
+            )],
+        );
+        assert!(
+            creds.observe("authorization", "Bearer app-own-token-abcdefgh"),
+            "the app's own credential is remembered"
+        );
+
+        // What the launch's refresher produces on a `401`: every declaration re-resolved, and
+        // nothing else — it knows nothing of what was learned from traffic.
+        creds.replace(CredentialSet {
+            injections: Vec::new(),
+            needles: vec![SecretNeedle::named(
+                "declared",
+                b"declared-value-v2".to_vec(),
+            )],
+        });
+
+        let values: Vec<Vec<u8>> = creds
+            .snapshot()
+            .needles
+            .iter()
+            .map(|n| n.as_bytes().to_vec())
+            .collect();
+        assert!(
+            values.contains(&b"app-own-token-abcdefgh".to_vec()),
+            "the learned credential still has a needle: {:?}",
+            values
+                .iter()
+                .map(|v| String::from_utf8_lossy(v))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            values.contains(&b"declared-value-v2".to_vec()),
+            "the re-resolved declared value is in force"
+        );
+        assert!(
+            !values.contains(&b"declared-value-v1".to_vec()),
+            "and it replaced the value it re-resolved, rather than piling up beside it"
+        );
+        assert_eq!(values.len(), 2);
+
+        // A second re-resolution does not duplicate what it carried across.
+        creds.replace(CredentialSet {
+            injections: Vec::new(),
+            needles: vec![SecretNeedle::named(
+                "declared",
+                b"declared-value-v3".to_vec(),
+            )],
+        });
+        assert_eq!(creds.snapshot().needles.len(), 2, "carried once, not twice");
+
+        // ...and a re-resolution that happens to produce the same bytes as a learned needle keeps
+        // one of them, not two scanning for the same value.
+        creds.replace(CredentialSet {
+            injections: Vec::new(),
+            needles: vec![SecretNeedle::named(
+                "declared",
+                b"app-own-token-abcdefgh".to_vec(),
+            )],
+        });
+        assert_eq!(creds.snapshot().needles.len(), 1);
     }
 
     // The formed header value carries the plaintext secret, so its `Debug` must never leak it — the
