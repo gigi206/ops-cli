@@ -7749,3 +7749,98 @@ fn a_request_head_carrying_a_control_byte_is_refused_on_every_plane() {
     .unwrap();
     refused(&resp, "the absolute-form https plane");
 }
+
+/// A body too large to hold is refused **permanently**, at every declared size — including the sizes
+/// that used to meet the budget's *transient* refusal instead.
+///
+/// The two refusals say opposite things to a caller. `signer-body-too-large` says this request will
+/// never be taken, whatever happens next; `body-buffer-cap` says the proxy is full at this instant
+/// and the very same request goes through once something in flight completes. A declared length
+/// above the per-request ceiling is the first at every size, so a client is never told to retry what
+/// cannot succeed. It was told exactly that above the shared budget: the reservation ran first, and
+/// a length no budget could ever admit produced the transient answer for a permanent condition.
+///
+/// The three sizes are the three regions: over the per-request ceiling, over the whole shared
+/// budget, and the largest a `Content-Length` can declare.
+#[test]
+fn a_declared_body_above_the_ceiling_is_permanently_refused_at_every_size() {
+    let refused = |resp: &str, plane: &str, len: u64| {
+        assert!(
+            resp.contains("413") && resp.contains(SIGNER_BODY_TOO_LARGE),
+            "{plane}, {len} bytes: {resp:?}"
+        );
+        assert!(
+            !resp.contains(BODY_BUFFER_CAP),
+            "{plane}, {len} bytes: a permanent refusal must not arrive as the transient one: \
+             {resp:?}"
+        );
+        assert!(
+            !resp.contains("100 Continue"),
+            "{plane}, {len} bytes: a body already refused must never be invited: {resp:?}"
+        );
+    };
+
+    for len in [CHUNKED_REQUEST_CAP + 1, HELD_BODY_BUDGET + 1, u64::MAX] {
+        // The tunnelled MITM plane.
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(ca, policy(&["host.test:*"]))
+                .unwrap()
+                .with_injections(vec![digesting_injection()])
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_proxy(
+            ctx,
+            der,
+            "host.test",
+            "host.test",
+            8443,
+            format!(
+                "POST / HTTP/1.1\r\nHost: host.test\r\nExpect: 100-continue\r\n\
+                 Content-Length: {len}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        refused(&resp, "the tunnelled plane", len);
+
+        // The absolute-form `https://` plane, which reads its head in its own place.
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_injections(vec![digesting_injection()])
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_cleartext(
+            ctx,
+            format!(
+                "POST https://host.test:8443/ HTTP/1.1\r\nHost: host.test\r\n\
+                 Expect: 100-continue\r\nContent-Length: {len}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        refused(&resp, "the absolute-form https plane", len);
+    }
+}
+
+/// The reservation refuses rather than wraps.
+///
+/// Its callers now settle an over-ceiling length before it is reached, so nothing can currently
+/// reach it with a length large enough to overflow the running total. That is exactly why this is
+/// pinned: a guard whose arithmetic is safe only because its callers checked something first holds
+/// by coincidence, and a wrapped total would admit the request the ceiling exists to refuse.
+#[test]
+fn the_body_budget_refuses_a_length_that_would_overflow_its_total() {
+    let budget = std::sync::atomic::AtomicU64::new(1);
+    assert!(
+        reserve_body_buffer(&budget, false, u64::MAX).is_none(),
+        "a length that overflows the running total is refused, never wrapped into a small one"
+    );
+    assert_eq!(
+        budget.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a refused reservation moves nothing"
+    );
+}

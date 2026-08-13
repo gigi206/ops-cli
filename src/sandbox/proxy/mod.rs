@@ -704,6 +704,27 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     it sees one — so this reads a body the request may still be refused over, which is the
     //     price of a signature that covers it.
     let digest_wanted = creds.wants_body_digest(&injected_ids);
+    // A body already larger than the proxy will hold is refused here, before the reservation below
+    // and before the client is invited to send. The order carries the meaning: this refusal is
+    // **permanent** and the budget's is **transient**, so a request turned away by the budget for a
+    // length no budget could ever admit would be told to retry something that will never succeed.
+    if digest_wanted.is_some() && body_exceeds_hold(chunked, body_len) {
+        ctx.outcome(
+            super::control::Proto::Https,
+            &connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            StatKind::Blocked,
+            SIGNER_BODY_TOO_LARGE,
+        );
+        return respond_refusal_tls(
+            &mut br,
+            "413 Payload Too Large",
+            SIGNER_BODY_TOO_LARGE,
+            &body_too_large_message(body_len),
+        );
+    }
     // Whether the proxy will read this request's body into memory rather than stream it: a chunked
     // request, which it de-chunks and re-frames whatever any signer wanted, or one a signer will be
     // told a digest of. One reservation covers both, taken here — before the allow is recorded and
@@ -737,25 +758,6 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let held: Option<Vec<u8>> = match digest_wanted {
         None => None,
         Some(_) => {
-            // Refused before the client is invited to send, so an oversized upload is answered
-            // rather than received.
-            if body_exceeds_hold(chunked, body_len) {
-                ctx.outcome(
-                    super::control::Proto::Https,
-                    &connect_host,
-                    port,
-                    Some(&imethod),
-                    Some(&itarget),
-                    StatKind::Blocked,
-                    SIGNER_BODY_TOO_LARGE,
-                );
-                return respond_refusal_tls(
-                    &mut br,
-                    "413 Payload Too Large",
-                    SIGNER_BODY_TOO_LARGE,
-                    &body_too_large_message(body_len),
-                );
-            }
             // Only where there is a body to invite. A request that declares none is answered by the
             // response itself, and an interim `100` for a body that will never come is noise.
             if (chunked || body_len > 0) && head_expects_continue(&inner) {
@@ -2100,6 +2102,25 @@ fn handle_https_forward(
     // 7'. As on the tunneled path: a signer that asks for a digest over the body needs the body held
     //     before the question is put, so it is read here rather than streamed at step 9.
     let digest_wanted = creds.wants_body_digest(&injected_ids);
+    // Ahead of the reservation, for the reason the tunneled path states: a permanent refusal must
+    // not be delivered as the budget's transient one.
+    if digest_wanted.is_some() && body_exceeds_hold(chunked, body_len) {
+        ctx.outcome(
+            super::control::Proto::Https,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            SIGNER_BODY_TOO_LARGE,
+        );
+        return write_refusal(
+            &mut client,
+            "413 Payload Too Large",
+            SIGNER_BODY_TOO_LARGE,
+            &body_too_large_message(body_len),
+        );
+    }
     // Whether the proxy will read this request's body into memory rather than stream it: a chunked
     // request, which it de-chunks and re-frames whatever any signer wanted, or one a signer will be
     // told a digest of. One reservation covers both, taken here — before the allow is recorded and
@@ -2133,24 +2154,6 @@ fn handle_https_forward(
     let held: Option<Vec<u8>> = match digest_wanted {
         None => None,
         Some(_) => {
-            // Refused before the client is invited to send, as on the tunneled path.
-            if body_exceeds_hold(chunked, body_len) {
-                ctx.outcome(
-                    super::control::Proto::Https,
-                    &host,
-                    port,
-                    Some(method),
-                    Some(&path),
-                    StatKind::Blocked,
-                    SIGNER_BODY_TOO_LARGE,
-                );
-                return write_refusal(
-                    &mut client,
-                    "413 Payload Too Large",
-                    SIGNER_BODY_TOO_LARGE,
-                    &body_too_large_message(body_len),
-                );
-            }
             if (chunked || body_len > 0) && head_expects_continue(head) {
                 let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
                 let _ = client.flush();
@@ -2961,11 +2964,16 @@ fn reserve_body_buffer(
     };
     let mut seen = budget.load(Ordering::Relaxed);
     loop {
-        if seen + bytes > HELD_BODY_BUDGET {
+        // Checked, not because the callers can currently overflow it — a body above the per-request
+        // ceiling is refused before this is reached — but because a guard whose arithmetic depends
+        // on its callers having checked something first is a guard that holds by coincidence. An
+        // overflow here would wrap to a small total and admit exactly what the ceiling exists to
+        // refuse.
+        let total = seen.checked_add(bytes)?;
+        if total > HELD_BODY_BUDGET {
             return None;
         }
-        match budget.compare_exchange_weak(seen, seen + bytes, Ordering::Relaxed, Ordering::Relaxed)
-        {
+        match budget.compare_exchange_weak(seen, total, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return Some(BodyBudget { budget, bytes }),
             Err(now) => seen = now,
         }

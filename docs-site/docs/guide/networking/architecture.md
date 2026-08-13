@@ -397,6 +397,12 @@ the *sum* of them is bounded too. When that shared ceiling is reached a further 
 is answered `503` and is not sent; it succeeds once one in flight completes. A request whose
 body streams through is never affected.
 
+That makes it the opposite of its neighbour above, and the two are decided in that order.
+`signer-body-too-large` is permanent: no amount of waiting makes a body larger than the
+per-request buffer fit. `body-buffer-cap` is transient by definition. So a declared length
+above the per-request ceiling is answered `413` at every size, including sizes far past the
+shared budget, rather than being turned away with a retry that could never succeed.
+
 `upstream-closed` is the one that names a server that accepted the request and then
 went away without answering. Saying so is deliberate: an empty relay would be
 indistinguishable from a genuine zero-byte response, and it is also where the one
