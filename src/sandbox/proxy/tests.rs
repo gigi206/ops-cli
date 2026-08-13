@@ -3424,8 +3424,12 @@ impl crate::sandbox::signer::Signing for DigestEcho {
 }
 
 fn digesting_injection() -> HeaderInjection {
+    digesting_injection_for("host.test:*")
+}
+
+fn digesting_injection_for(to: &str) -> HeaderInjection {
     HeaderInjection {
-        rule: classify("host.test:*").unwrap(),
+        rule: classify(to).unwrap(),
         form: super::Form::Signed(super::Signed {
             name: "digest-echo".to_string(),
             sets: vec!["X-Body".to_string()],
@@ -3500,6 +3504,142 @@ fn holding_a_body_to_digest_it_reframes_only_a_request_that_has_one() {
         lengths(&head),
         0,
         "a bodyless request gains no framing because a signer asked for a digest: {head:?}"
+    );
+}
+
+/// A body held to be digested still reaches the **capture**.
+///
+/// The tee that fills the request-body sink lives on the streaming relay, and a held body never
+/// goes through it: the held path has to hand the bytes over itself. Nothing about signing would
+/// fail if it did not, which is exactly why this is asserted — `sbx net capture` would quietly lose
+/// the request body of every request a signer touched, and every signer test would stay green.
+#[test]
+fn a_body_held_to_be_digested_still_reaches_the_capture() {
+    use crate::sandbox::control::{CaptureLevel, LOG_RING_CAP, LogRing};
+
+    for framing in [
+        "Content-Length: 7\r\n\r\npayload",
+        "Transfer-Encoding: chunked\r\n\r\n7\r\npayload\r\n0\r\n\r\n",
+    ] {
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = capturing_ctx(
+            proxy_ca,
+            upstream_cfg,
+            log.clone(),
+            CaptureLevel::Bodies,
+            8,
+            vec![digesting_injection_for("upstream.test:*")],
+            vec![],
+        );
+        let request =
+            format!("POST /p HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n{framing}");
+        let resp = through_proxy(
+            ctx.clone(),
+            proxy_ca_der,
+            "upstream.test",
+            "upstream.test",
+            addr.port(),
+            request.as_bytes(),
+        )
+        .unwrap();
+        assert!(resp.contains("200"), "{framing:?}: {resp:?}");
+        up.join().unwrap();
+
+        let cap = one_capture(&ctx, &log);
+        assert_eq!(
+            String::from_utf8(cap.req_body.bytes.clone()).unwrap(),
+            "payload",
+            "a held body is handed to the capture, not lost with the tee it bypassed ({framing:?})"
+        );
+    }
+}
+
+/// The ceiling is answered **before** the client is invited to send.
+///
+/// A client that announced `Expect: 100-continue` withholds its body until it sees a `100`, so the
+/// order of those two writes is the difference between answering an oversized upload and receiving
+/// one. Asserted on the absence of the interim response, which is the only thing that distinguishes
+/// the two orderings from outside.
+#[test]
+fn an_oversized_body_is_refused_before_the_client_is_invited_to_send_it() {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let der = ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(ca, policy(&["host.test:*"]))
+            .unwrap()
+            .with_injections(vec![digesting_injection()])
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let resp = through_proxy(
+        ctx,
+        der,
+        "host.test",
+        "host.test",
+        8443,
+        format!(
+            "POST / HTTP/1.1\r\nHost: host.test\r\nExpect: 100-continue\r\n\
+             Content-Length: {}\r\n\r\n",
+            CHUNKED_REQUEST_CAP + 1
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        resp.contains("413") && resp.contains("signer-body-too-large"),
+        "{resp:?}"
+    );
+    assert!(
+        !resp.contains("100 Continue"),
+        "a body sbx has already decided to refuse must never be invited: {resp:?}"
+    );
+}
+
+/// A `chunked` body over the ceiling keeps the refusal it always had.
+///
+/// It declares no length, so there is nothing to answer from the head: the de-chunker meets the
+/// ceiling while reading and fails closed, which is `400 bad-request:chunked` — the same answer an
+/// over-cap chunked body got before any signer was involved. The guide says so, and this is what
+/// makes the sentence checkable; a `413` here would mean the two framings had drifted apart.
+#[test]
+fn a_chunked_body_over_the_ceiling_keeps_its_own_refusal() {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let der = ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(ca, policy(&["host.test:*"]))
+            .unwrap()
+            .with_injections(vec![digesting_injection()])
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    // One chunk declaring 4 GiB. The size line alone trips the cap, so the bytes are never sent.
+    let resp = through_proxy(
+        ctx,
+        der,
+        "host.test",
+        "host.test",
+        8443,
+        b"POST / HTTP/1.1\r\nHost: host.test\r\nTransfer-Encoding: chunked\r\n\r\nffffffff\r\n",
+    )
+    .unwrap();
+    assert!(
+        resp.contains("400") && resp.contains("bad-request:chunked"),
+        "an over-cap chunked body is discovered while reading, not read off the head: {resp:?}"
+    );
+    assert!(
+        !resp.contains("signer-body-too-large"),
+        "and it is not the declared-length refusal wearing another framing: {resp:?}"
     );
 }
 
