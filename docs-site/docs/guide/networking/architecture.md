@@ -347,9 +347,22 @@ per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text
 never disclosed, so a global-config rule the cage cannot read does not leak),
 `denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,
 `outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`, and the
-transport-side `dns-failure`, `upstream-unreachable`, `upstream-cert-rejected`, and
-`upstream-closed`. A genuine upstream status (a real `404`) is relayed verbatim with no
-such header.
+transport-side `dns-failure`, `upstream-unreachable`, `upstream-cert-rejected`,
+`upstream-http2-unsupported`, and `upstream-closed`. A genuine upstream status (a real
+`404`) is relayed verbatim with no such header.
+
+`upstream-http2-unsupported` belongs to a host designated
+[`http2`](../configuration/network#http2-and-grpc) alone: gRPC is HTTP/2 end to end and the
+proxy does not translate, so a host that will not speak it fails closed rather than
+being downgraded. A server says so in either of two ways, by refusing the protocol
+offer during the handshake or by ignoring it and negotiating nothing, and both arrive
+under this reason. Neither is a certificate problem, and reading one as
+`upstream-cert-rejected` would send you after the one thing that is not wrong.
+
+A refusal on this path is also *recorded*, not only answered: a stream that the policy
+allowed but that never reached its host appears in
+[`sbx net logs`](observability#sbx-net-logs) as an `error` carrying the same reason, and
+is not counted as an allow, since nothing was allowed to leave.
 
 `signer-refused` is the one that is not a policy verdict: the policy allowed the host,
 and the request was refused because its credential could not be formed. See

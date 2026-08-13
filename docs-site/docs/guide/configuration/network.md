@@ -268,6 +268,9 @@ Notes:
   port). HTTP/2 is negotiated per `host:port` at the TLS handshake, so it is always whole-endpoint: there is no per-path HTTP/2.
 - **Designated hosts are HTTP/2-only.** The proxy offers only `h2` to an `http2` host, so an
   HTTP/1.1-only client reaching it fails the handshake (deliberate: designate only gRPC endpoints).
+  The same holds on the far side: a host designated here that turns out not to speak HTTP/2 is
+  refused `502 upstream-http2-unsupported` rather than quietly downgraded, whether it declines the
+  protocol offer or ignores it. That reason means the designation is wrong, not the certificate.
 - **Secrets work on HTTP/2 too.** A [`[secret]`](secret) scoped to a gRPC host is injected into the
   request (host-side, never in the cage), the outbound tripwire refuses a request that carries a secret
   value verbatim, and a reflected secret is masked out of the response: exactly like the HTTP/1.1 path.

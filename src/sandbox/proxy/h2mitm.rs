@@ -403,14 +403,30 @@ async fn relay(
                 t
             }
             _ => {
-                let _ = refuse(respond, StatusCode::BAD_GATEWAY, "upstream-unreachable");
+                refuse_upstream(
+                    respond,
+                    ctx,
+                    host,
+                    port,
+                    method,
+                    path,
+                    "upstream-unreachable",
+                );
                 return;
             }
         };
     let name = match upstream_server_name(host) {
         Ok(n) => n,
         Err(_) => {
-            let _ = refuse(respond, StatusCode::BAD_GATEWAY, "upstream-cert-rejected");
+            refuse_upstream(
+                respond,
+                ctx,
+                host,
+                port,
+                method,
+                path,
+                "upstream-cert-rejected",
+            );
             return;
         }
     };
@@ -418,17 +434,34 @@ async fn relay(
     let upstream_tls = match tokio::time::timeout(ctx.timeout, connector.connect(name, tcp)).await {
         Ok(Ok(t)) => t,
         // A forged / self-signed / otherwise-untrusted upstream fails validation here — never
-        // downgraded, exactly like the HTTP/1.1 `connect_upstream`.
-        _ => {
-            let _ = refuse(respond, StatusCode::BAD_GATEWAY, "upstream-cert-rejected");
+        // downgraded, exactly like the HTTP/1.1 `connect_upstream`. One failure among these is not
+        // about the certificate at all, so it is not reported as one: see [`handshake_reason`].
+        Ok(Err(e)) => {
+            refuse_upstream(respond, ctx, host, port, method, path, handshake_reason(&e));
+            return;
+        }
+        Err(_) => {
+            refuse_upstream(
+                respond,
+                ctx,
+                host,
+                port,
+                method,
+                path,
+                "upstream-cert-rejected",
+            );
             return;
         }
     };
     if upstream_tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
         // gRPC is HTTP/2 end-to-end; the proxy does not translate to HTTP/1.1. Fail closed.
-        let _ = refuse(
+        refuse_upstream(
             respond,
-            StatusCode::BAD_GATEWAY,
+            ctx,
+            host,
+            port,
+            method,
+            path,
             "upstream-http2-unsupported",
         );
         return;
@@ -436,9 +469,13 @@ async fn relay(
     let (send_req, connection) = match h2::client::handshake(upstream_tls).await {
         Ok(x) => x,
         Err(_) => {
-            let _ = refuse(
+            refuse_upstream(
                 respond,
-                StatusCode::BAD_GATEWAY,
+                ctx,
+                host,
+                port,
+                method,
+                path,
                 "upstream-http2-unsupported",
             );
             return;
@@ -798,6 +835,51 @@ fn redact_header_map(headers: &mut http::HeaderMap, needles: &[SecretNeedle]) {
         if let Ok(v) = http::HeaderValue::from_bytes(&bytes) {
             *value = v;
         }
+    }
+}
+
+/// Refuse a stream whose validated upstream could not be opened: the client gets the `502` and its
+/// reason, and the exchange leaves an `error` line behind.
+///
+/// The line is the point. Its HTTP/1.1 twin ([`refuse_upstream`](super::refuse_upstream)) writes one
+/// at the same place in its own sequence, and without it a stream that policy allowed but that never
+/// reached its host was reported nowhere at all — neither counted (the allow is recorded only once
+/// the upstream is up) nor logged. Every caller here refuses *before* that allow, so the stream
+/// surfaces exactly once, as the failure it was.
+fn refuse_upstream(
+    respond: h2::server::SendResponse<Bytes>,
+    ctx: &ProxyCtx,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    reason: &str,
+) {
+    ctx.push_log(
+        Proto::Https,
+        host,
+        port,
+        Some(method),
+        Some(path),
+        LogVerdict::Error,
+        reason,
+    );
+    let _ = refuse(respond, StatusCode::BAD_GATEWAY, reason);
+}
+
+/// Which reason a failed upstream TLS handshake carries.
+///
+/// Nearly all of them are what they look like: an untrusted, expired or misnamed certificate. One is
+/// not. This plane offers only `h2`, so a peer that will not speak HTTP/2 has no protocol in common
+/// and ends the handshake with a `no_application_protocol` alert — a working, correctly certified
+/// server that simply does not do gRPC. Reporting that as a rejected certificate points the reader
+/// at the one thing that is not wrong, so it is named for what it is.
+fn handshake_reason(e: &io::Error) -> &'static str {
+    match e.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>()) {
+        Some(rustls::Error::AlertReceived(rustls::AlertDescription::NoApplicationProtocol)) => {
+            "upstream-http2-unsupported"
+        }
+        _ => "upstream-cert-rejected",
     }
 }
 
@@ -1882,5 +1964,125 @@ mod tests {
             trace.seen_one().header("authorization"),
             Some("Bearer topsecret")
         );
+    }
+
+    /// One stream whose upstream cannot be opened, driven for real: what the client was told (status
+    /// and reason token) and what was recorded (the log events, and the allow count). `alpn` is what
+    /// the test upstream offers, `trusted` whether the proxy trusts the CA that signed it, and
+    /// `listening` whether anything is behind the port at all.
+    fn refused_upstream(
+        alpn: Vec<Vec<u8>>,
+        trusted: bool,
+        listening: bool,
+    ) -> (
+        StatusCode,
+        String,
+        Vec<(crate::sandbox::control::LogVerdict, String)>,
+        u64,
+    ) {
+        let trace = Arc::new(H2Trace::default());
+        let (port, upstream_ca) = match listening {
+            true => {
+                let (addr, ca) =
+                    spawn_h2_upstream(1, alpn, UpstreamReply::grpc("PONG"), Arc::clone(&trace));
+                (addr.port(), ca)
+            }
+            // A port held only long enough to be sure nothing is behind it once released.
+            false => {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                (port, super::super::Ca::ephemeral().unwrap().ca_cert_der())
+            }
+        };
+        let trusted_ca = match trusted {
+            true => upstream_ca,
+            // A different CA entirely: the upstream's certificate is real, just not one this
+            // proxy has any reason to accept.
+            false => super::super::Ca::ephemeral().unwrap().ca_cert_der(),
+        };
+        let (ctx, stats, log, _dir) = relaying_ctx(trusted_ca);
+
+        let answer = through_h2_proxy(&ctx, "grpc.test", port, grpc_request(&[]), None, &trace);
+        let events = log
+            .snapshot(None, None, false)
+            .events
+            .into_iter()
+            .map(|e| (e.verdict, e.reason))
+            .collect();
+        let allow = stats
+            .snapshot()
+            .get("grpc.test")
+            .copied()
+            .unwrap_or_default()
+            .allow;
+        (
+            answer.status,
+            answer
+                .header("x-sbx-egress-reason")
+                .unwrap_or_default()
+                .to_string(),
+            events,
+            allow,
+        )
+    }
+
+    /// A stream that policy allowed but that never reached its host must leave a trace. It used to
+    /// leave none: the allow is recorded only once the upstream is up, and these refusals answered
+    /// the client without logging, so the one thing a reader could look for was absent. Each of the
+    /// four failures now surfaces exactly once, as an `error` carrying its own reason.
+    ///
+    /// The two HTTP/2 ones are the reason this matters beyond bookkeeping. A peer that will not
+    /// speak `h2` is a working, correctly certified server that simply does not do gRPC, and it can
+    /// say so in two places — by refusing the ALPN outright (a `no_application_protocol` alert
+    /// during the handshake) or by ignoring ALPN and negotiating nothing. Both are the same fact
+    /// about the upstream, and both now say so; reporting the first as a rejected certificate, as it
+    /// once did, pointed the reader at the one thing that was not wrong.
+    #[test]
+    fn each_way_an_h2_upstream_can_fail_to_open_is_answered_and_recorded_as_itself() {
+        use crate::sandbox::control::LogVerdict;
+
+        for (case, alpn, trusted, listening, expected) in [
+            (
+                "nothing is listening",
+                vec![b"h2".to_vec()],
+                true,
+                false,
+                "upstream-unreachable",
+            ),
+            (
+                "the certificate is not one this proxy trusts",
+                vec![b"h2".to_vec()],
+                false,
+                true,
+                "upstream-cert-rejected",
+            ),
+            (
+                "the upstream refuses the ALPN offer",
+                vec![b"http/1.1".to_vec()],
+                true,
+                true,
+                "upstream-http2-unsupported",
+            ),
+            (
+                "the upstream ignores ALPN and negotiates nothing",
+                vec![],
+                true,
+                true,
+                "upstream-http2-unsupported",
+            ),
+        ] {
+            let (status, reason, events, allow) = refused_upstream(alpn, trusted, listening);
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{case}");
+            assert_eq!(reason, expected, "what the client is told when {case}");
+            assert_eq!(
+                events,
+                vec![(LogVerdict::Error, expected.to_string())],
+                "one error line, carrying the same reason, when {case}"
+            );
+            assert_eq!(
+                allow, 0,
+                "a stream that never reached its host is not an allow ({case})"
+            );
+        }
     }
 }

@@ -95,6 +95,7 @@
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
 //! | `502` | `upstream-cert-rejected` | the upstream TLS certificate failed validation (never downgraded) |
+//! | `502` | `upstream-http2-unsupported` | a `[network] http2` host will not speak HTTP/2. gRPC is HTTP/2 end to end and this plane does not translate, so it fails closed. Reported whether the upstream refuses the ALPN offer or ignores ALPN and negotiates nothing: both are the same fact about the server, and neither is a certificate problem |
 //!
 //! A genuine upstream status (e.g. a `404`) is streamed back unchanged and carries no such
 //! header — save that a reflected secret is masked out of it on the way back (see *Credential
