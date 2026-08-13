@@ -23,8 +23,8 @@ use super::capture::CapBuf;
 use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
 use super::{
     AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, carries_secret, decide_https,
-    matching_injection_ids, redact_in_place, resolve_checked, signer_refusal_message,
-    upstream_server_name,
+    header_name_eq, matching_injection_ids, redact_in_place, resolve_checked,
+    signer_refusal_message, upstream_server_name,
 };
 use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -529,7 +529,12 @@ async fn relay(
         .version(http::Version::HTTP_2);
     for (name, value) in parts.headers.iter() {
         let n = name.as_str();
-        if forbidden_request_header(n) || injected.iter().any(|(h, _)| h.eq_ignore_ascii_case(n)) {
+        // The strip compares names the way the other three serializers do, through
+        // [`header_name_eq`]: case-insensitively **and** treating `_` as `-`. An HTTP/2 name is
+        // lowercase already, so case is not what this is for — `_` is. A server that folds
+        // `x_api_key` onto `x-api-key` would otherwise receive the caller's spelling beside sbx's,
+        // which is the dodge the HTTP/1.1 planes close and this one has to close identically.
+        if forbidden_request_header(n) || injected.iter().any(|(h, _)| header_name_eq(h, n)) {
             continue;
         }
         builder = builder.header(name, value);
@@ -1933,10 +1938,74 @@ mod tests {
             authorizations[0].1, "Bearer sbx-issued",
             "sbx's value is the one that crossed"
         );
+        assert!(
+            !seen.headers.iter().any(|(_, v)| v.contains("client-own")),
+            "no copy of the client's value survives anywhere: {seen:?}"
+        );
         assert_eq!(
             seen.header("content-type"),
             Some("application/grpc"),
             "the client's other headers are carried through untouched"
+        );
+    }
+
+    /// The strip has to cover the *spellings* of the injected header, not just its name, and this
+    /// plane did not: it compared names case-insensitively where the other three fold `_` onto `-`
+    /// as well. HTTP/2 names are lowercase already, so case was never what that rule was for —
+    /// `_` was. A server that folds `x_api_key` onto `x-api-key`, which is why the rule exists at
+    /// all, received the caller's spelling sitting beside sbx's.
+    ///
+    /// Read from what the upstream got: two headers arrived, one of them the caller's.
+    #[test]
+    fn an_alternate_spelling_of_the_injected_header_is_stripped_like_the_plain_one() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::HeaderInjection;
+
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx.with_injections(vec![HeaderInjection::fixed(
+            classify("grpc.test:*").unwrap(),
+            "x-api-key".to_string(),
+            "sbx-issued".to_string(),
+        )]);
+
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[
+                ("x-api-key", "client-plain"),
+                ("x_api_key", "client-underscored"),
+            ]),
+            None,
+            &trace,
+        );
+        assert_eq!(answer.status, StatusCode::OK, "the stream was relayed");
+
+        let seen = trace.seen_one();
+        let credentials: Vec<&(String, String)> = seen
+            .headers
+            .iter()
+            .filter(|(n, _)| n == "x-api-key" || n == "x_api_key")
+            .collect();
+        assert_eq!(
+            credentials.len(),
+            1,
+            "one credential header reaches the upstream, whatever the caller spelled: {seen:?}"
+        );
+        assert_eq!(
+            (credentials[0].0.as_str(), credentials[0].1.as_str()),
+            ("x-api-key", "sbx-issued")
+        );
+        assert!(
+            !seen.headers.iter().any(|(_, v)| v.starts_with("client-")),
+            "neither spelling's value survives: {seen:?}"
         );
     }
 

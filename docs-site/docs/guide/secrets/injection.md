@@ -106,11 +106,15 @@ would collapse to the last, with a warning.)
 ## Strip-and-replace: `sbx`'s value is authoritative
 
 Injection **strips any client-supplied copy of the header and replaces it** with
-`sbx`'s value, matched case-insensitively across all spellings. An agent that
-tries to set its own `Authorization` header cannot smuggle a value past the
-broker or observe interference: the proxy always presents `sbx`'s credential,
-and only that, to the upstream. Injection is re-matched per request, so it tracks
-the live, canonicalized destination rather than a once-computed guess.
+`sbx`'s value. "Copy" is read generously on purpose: names are compared
+case-insensitively and with `_` treated as `-`, because a server that folds
+`X_API_KEY` onto `X-Api-Key` would otherwise receive the caller's spelling
+sitting beside `sbx`'s. The same rule applies on every path a request can take,
+HTTP/1.1, HTTP/2 and a WebSocket upgrade alike. An agent that tries to set its
+own `Authorization` header cannot smuggle a value past the broker or observe
+interference: the proxy always presents `sbx`'s credential, and only that, to the
+upstream. Injection is re-matched per request, so it tracks the live,
+canonicalized destination rather than a once-computed guess.
 
 ## When the upstream refuses the credential
 
