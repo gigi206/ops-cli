@@ -690,6 +690,11 @@ destination the config named, the method, the target and the headers it declared
 `403` and the reason `signer-refused`: a request that could not be signed is never sent
 unsigned.
 
+The plugin's own reason travels in that `403`, so the caller learns what to change, and it
+is **scrubbed of every declared credential on the way**. That body is the one refusal sbx
+writes that repeats a third party's words rather than its own, and it is answered into the
+sandbox, which is the one reader that must never see a key.
+
 What the tripwires watch also changes, and deliberately: for a signed credential the
 [needle](redaction) is the **key**, not the signature. A signature is derived,
 request-bound and single-use, while the key is the thing that must never leave the cage

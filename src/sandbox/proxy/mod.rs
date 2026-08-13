@@ -697,7 +697,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 &mut br,
                 "403 Forbidden",
                 SIGNER_REFUSED,
-                &signer_refusal_message(&refusal),
+                &signer_refusal_message(&refusal, &creds.needles),
             );
         }
     };
@@ -1928,7 +1928,7 @@ fn handle_https_forward(
                 &mut client,
                 "403 Forbidden",
                 SIGNER_REFUSED,
-                &signer_refusal_message(&refusal),
+                &signer_refusal_message(&refusal, &creds.needles),
             );
         }
     };
@@ -2639,11 +2639,22 @@ const SIGNER_REFUSED: &str = "signer-refused";
 /// say who refused leaves the user auditing every declaration, and it says plainly that the request
 /// was not sent: an unsigned request reaching the destination would come back as an authentication
 /// error for a reason that has nothing to do with the credential.
-fn signer_refusal_message(refusal: &SignRefusal) -> String {
-    format!(
+///
+/// **Redacted before it is written, because this one is answered into the cage.** Every other
+/// refusal body is sbx's own words about its own policy; a signer's carries the plugin's, and a
+/// signer whose manifest declares `reads_secret` holds the credential in clear. The feed already
+/// scrubs the same text ([`super::signer_control::SignerRing::push`]); the sink that matters more
+/// is this one, since the cage is the adversary and the log is not. Masked in place rather than
+/// named, matching what the cage already sees where a reflected secret is taken out of a response
+/// body.
+fn signer_refusal_message(refusal: &SignRefusal, needles: &[SecretNeedle]) -> String {
+    let mut body = format!(
         "the `{}` signer plugin did not sign this request ({}), so it was not sent",
         refusal.signer, refusal.why
     )
+    .into_bytes();
+    redact_in_place(&mut body, needles);
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 /// Whether the decrypted client request head carries any configured secret value verbatim — the

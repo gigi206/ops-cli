@@ -6861,3 +6861,41 @@ fn a_declined_websocket_upgrade_is_captured_like_an_ordinary_response() {
         "the declined response's body is captured like any other"
     );
 }
+
+/// A signer plugin's own words are answered *into the cage*, so the credential is taken out of
+/// them first.
+///
+/// Every other refusal body is sbx's account of its own policy. This one repeats a third party's,
+/// and a signer declaring `reads_secret` holds the credential in clear — so a plugin that named it
+/// while explaining why it would not sign would be handing it to the one process that must never
+/// have it. The feed applies the same scrub; this sink is the one where it matters.
+#[test]
+fn a_signer_refusal_answered_into_the_cage_carries_no_credential() {
+    let needles = vec![super::SecretNeedle::named(
+        "aws",
+        b"wJalrXUtnFEMI-the-secret-key".to_vec(),
+    )];
+    let refusal = super::SignRefusal {
+        signer: "aws-sigv4".to_string(),
+        why: "cannot sign with wJalrXUtnFEMI-the-secret-key for that region".to_string(),
+    };
+
+    let body = super::signer_refusal_message(&refusal, &needles);
+    assert!(
+        !body.contains("wJalrXUtnFEMI-the-secret-key"),
+        "the credential reached the cage: {body}"
+    );
+    assert!(
+        body.contains("****************************"),
+        "it is masked in place, as a reflected secret is: {body}"
+    );
+    // What the refusal exists to say survives the scrub.
+    assert!(
+        body.contains("`aws-sigv4`") && body.contains("so it was not sent"),
+        "{body}"
+    );
+
+    // With nothing declared there is nothing to take out, and the plugin's words stand as written.
+    let plain = super::signer_refusal_message(&refusal, &[]);
+    assert!(plain.contains("wJalrXUtnFEMI-the-secret-key"), "{plain}");
+}
