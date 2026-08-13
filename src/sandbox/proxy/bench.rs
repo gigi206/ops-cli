@@ -1186,3 +1186,61 @@ fn h2_stream_cost() {
         report_rate(label, started.elapsed(), REQUESTS);
     }
 }
+
+/// What a **refused** request costs the host, and whether that cost depends on the refusals before
+/// it. Nothing measured a refusal: every figure here prices a request that was forwarded.
+///
+/// It matters because a refusal is the cheapest thing an in-cage caller can ask for. A denied
+/// `http://` request is one plaintext line on a Unix socket: no TLS, no DNS, no upstream. So if the
+/// proxy's own bookkeeping grows with the number of *distinct* hosts refused, the caller sets the
+/// pace and the host pays, outside the cage's memory and CPU limits.
+///
+/// The two columns are the same count of refusals, differing only in whether they name one host or
+/// a new one each time.
+#[test]
+#[ignore = "a measurement, not an assertion: run explicitly, in release"]
+fn refusal_cost() {
+    println!("\nrefused-request cost (default-deny, cleartext, no TLS and no upstream)");
+    for n in [500usize, 2000, 8000] {
+        let mut elapsed = Vec::new();
+        for distinct in [false, true] {
+            let sdir = TmpDir::new();
+            let stats = Arc::new(crate::sandbox::egress_stats::EgressStats::new(
+                sdir.join("stats"),
+                "/t".into(),
+                None,
+            ));
+            let ctx = Arc::new(
+                ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[]))
+                    .unwrap()
+                    .with_stats(Arc::clone(&stats))
+                    .with_resolver(Box::new(|_| {
+                        panic!("a default-deny refusal must not reach a name lookup")
+                    })),
+            );
+            let (_dir, sock) = serve_on_uds(ctx);
+            let started = Instant::now();
+            for i in 0..n {
+                let host = match distinct {
+                    true => format!("h{i}.test"),
+                    false => "one.test".to_string(),
+                };
+                let req = format!(
+                    "GET http://{host}/p HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                );
+                one_http_request(&sock, req.as_bytes()).unwrap();
+            }
+            elapsed.push(started.elapsed());
+            let label = match distinct {
+                true => "a new host each time",
+                false => "the same host each time",
+            };
+            report_rate(&format!("{n} refusals, {label}"), started.elapsed(), n);
+        }
+        println!(
+            "  {:<44} {:>8.1}x",
+            format!("{n} refusals, distinct / same"),
+            elapsed[1].as_secs_f64() / elapsed[0].as_secs_f64()
+        );
+    }
+}
