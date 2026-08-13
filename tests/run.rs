@@ -1454,6 +1454,185 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         feed.contains("signed with ${"),
         "the key is replaced by the credential's name, in the plugin's own words:\n{feed}"
     );
+
+    // 5. A declared operation signs in its own ephemeral cage, through a proxy that lives for one
+    //    invocation — and it lands in the session's record all the same. The signer is declared
+    //    ONLY inside the task here, which is also what stands the feed up.
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[packages]\ncurl = \"nix:curl\"\n\n\
+         [network]\nmode = \"deny\"\nallow = [\"postman-echo.com\"]\n\n\
+         [task.fetch]\n\
+         cmd = [\"curl\", \"-s\", \"https://postman-echo.com/get?a=1&via=task\"]\n\
+         network = [\"postman-echo.com\"]\n\n\
+         [task.fetch.inject.\"postman-echo.com\"]\n\
+         from = \"env://SBX_E2E_SIGNING_KEY\"\nsign = \"demo-feed\"\n",
+    )
+    .unwrap();
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(trusted.status.success());
+
+    let started = sbx()
+        .args(["run", "--detach", "--", "sleep", "60"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("SBX_E2E_SIGNING_KEY", key)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn sbx run --detach");
+    let msg = String::from_utf8_lossy(&started.stderr).into_owned();
+    assert!(started.status.success(), "detached launch failed:\n{msg}");
+    let pid: u32 = msg
+        .split("detached session ")
+        .nth(1)
+        .and_then(|after| {
+            after
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no detached session pid in:\n{msg}"));
+
+    let ran = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["task", "run", "fetch", "--session", &pid.to_string()],
+    );
+    let task_feed = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["logs", &pid.to_string(), "--feed", "signer"],
+    );
+    let task_feed = String::from_utf8_lossy(&task_feed.stdout).into_owned();
+    let _ = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["session", "stop", &pid.to_string()],
+    );
+
+    assert!(
+        ran.status.success(),
+        "the operation must run: {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        task_feed.contains("sign      demo-feed: GET postman-echo.com/get?a=1&via=task"),
+        "an operation's own proxy records into the session's feed, not into one nobody can \
+         read:\n{task_feed}"
+    );
+}
+
+/// What a pid's process is called right now: `sbx` until it execs into the cage, the cage's own
+/// launcher afterwards (`bwrap`, or `systemd-run` where a scope is used).
+fn comm_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Poll until `want` holds of the pid's `comm`, and report whether it ever did.
+fn comm_settles(pid: u32, want: impl Fn(&str) -> bool) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut comm = comm_of(pid);
+    while !want(&comm) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        comm = comm_of(pid);
+    }
+    comm
+}
+
+/// Whether a launch keeps a live parent, and when it must.
+///
+/// A launch with nothing host-side to outlive the cage **execs into it**: the pid stays, the
+/// process becomes `bwrap`, and the command's exit status is sbx's own. One that stands something
+/// up — a filtering proxy, a broker, an observer — has to fork and wait instead, because an exec
+/// would discard the threads and drop the guards that unlink its sockets.
+///
+/// The middle case is the one that has no other witness, and the reason this test exists: a config
+/// that *declares* a broker whose plugin is missing stands nothing up, so it must exec like any
+/// other. Standing the brokers' record up before the loop that starts them made this a supervised
+/// launch for a while, and nothing failed — the cage ran, the exit status was right, and only the
+/// process tree said otherwise.
+///
+/// Skips (never fails) where the host cannot sandbox.
+#[test]
+fn a_launch_execs_into_the_cage_unless_something_host_side_must_outlive_it() {
+    let project = TmpDir::new("sup");
+    let data = TmpDir::new("supd");
+    let state = TmpDir::new("sups");
+    let config = TmpDir::new("supc");
+    // `network = "none"` is what leaves nothing host-side: no filtering proxy, so no guard.
+    std::fs::write(project.path().join(".sbx.toml"), "network = \"none\"\n").unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping supervision e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    // `network` is a trusted-only field: untrusted, the launch would fall back to the filtering
+    // default and stand a proxy up, which is the very thing this test is checking the absence of.
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let sbx_cfg = config.path().join("sbx");
+    std::fs::create_dir_all(&sbx_cfg).unwrap();
+    let launch = |global: &str| -> std::process::Child {
+        std::fs::write(sbx_cfg.join("sbx.toml"), global).unwrap();
+        sbx()
+            .args(["run", "--", "sleep", "30"])
+            .current_dir(project.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            // A terminal on stdin would take the pty path, which supervises whatever the config says.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sbx run")
+    };
+
+    // 1. Nothing declared: the process becomes the cage.
+    let mut plain = launch("");
+    let comm = comm_settles(plain.id(), |c| c != "sbx" && !c.is_empty());
+    let _ = plain.kill();
+    let _ = plain.wait();
+    assert_ne!(
+        comm, "sbx",
+        "a launch with nothing to outlive the cage execs into it"
+    );
+
+    // 2. A broker declared whose plugin is not installed: nothing stands up, so it execs too.
+    let mut declared = launch("[broker.nosuch]\nsocket = \"/dev/null\"\n");
+    let comm = comm_settles(declared.id(), |c| c != "sbx" && !c.is_empty());
+    let _ = declared.kill();
+    let _ = declared.wait();
+    assert_ne!(
+        comm, "sbx",
+        "a broker that could not start leaves nothing behind, so the launch still execs"
+    );
 }
 
 /// Whether a failed build log shows a *transient* upstream-download fault — a truncated tarball,

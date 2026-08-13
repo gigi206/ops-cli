@@ -82,10 +82,6 @@ pub(crate) struct Egress {
     /// The per-session control socket (pending answers + the live egress log), present whenever the
     /// proxy runs — always `Some` here, an `Option` only so the guard's unlink stays uniform.
     control_uds: Option<PathBuf>,
-    /// The signer feed's socket, when this launch declared a signer and could bind one. Owned here
-    /// for the reason every lens socket is owned somewhere: nothing sweeps `<data>/signer`, so a
-    /// path nobody unlinks is a file per session left behind for good.
-    signer_uds: Option<PathBuf>,
     /// The session's per-host decision counters, when stats are on. The guard owns a flush on a
     /// graceful exit — but unlike the socket and CA, the session stat file is **not** removed: it
     /// persists for `sbx net stats` to aggregate after the session ends (cleared by `--reset`).
@@ -113,9 +109,6 @@ impl Drop for Egress {
         let _ = std::fs::remove_file(&self.ca_file);
         if let Some(control) = &self.control_uds {
             let _ = std::fs::remove_file(control);
-        }
-        if let Some(signer) = &self.signer_uds {
-            let _ = std::fs::remove_file(signer);
         }
         // A final flush for a graceful exit; the per-decision flush already keeps the file current
         // for the common case of a killed session, where this Drop never runs.
@@ -557,6 +550,10 @@ pub(crate) fn start(
     // The brokers already standing for this launch, for a resolver plugin whose manifest names one.
     // They are stood up before this call precisely so a credential can be resolved through one.
     brokers: &[super::broker::Reachable],
+    // Where this proxy records what its signer plugins formed, or `None` when the launch declared
+    // none (and in tests). The launch owns it, so a task's per-invocation proxy records into the
+    // same session-wide feed the agent's proxy does.
+    signer_log: Option<Arc<super::signer_control::SignerRing>>,
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -703,42 +700,12 @@ pub(crate) fn start(
         ctx = ctx.with_notifier(Arc::clone(&wiring.notifier));
     }
 
-    // The signer feed: what each declared signer formed, and every request it would not sign. Stood
-    // up only for a launch that declares one, so `sbx logs` names the feed as absent — with the
-    // reason — rather than showing an empty column a reader would take for a quiet one.
-    //
-    // One ring for the session, whatever the declaration count, with each event naming its signer:
-    // a ring per signer would need a socket per signer under one per-session name, which is how a
-    // reader ends up seeing one of them and believing it saw them all.
-    //
-    // The session's own proxy only. A task's per-invocation proxy runs under an `instance` of its
-    // own and no reader globs for one, so a ring there would be a record nothing can ever read —
-    // which is worse than no record, because the forming path would look observed while nothing
-    // observed it. A task's signatures are therefore not recorded today; sharing the session's ring
-    // with its task proxies is the way to change that, and it is the route the notifier already
-    // takes.
-    //
-    // The socket is held by the guard returned below, which unlinks it when the launch ends.
-    let mut signer_uds = None;
-    if instance.is_empty() && secrets.iter().any(|s| s.signer.is_some()) {
-        let ring = Arc::new(super::signer_control::SignerRing::new(
-            super::signer_control::SIGNER_RING_CAP,
-        ));
-        ctx = ctx.with_signer_log(ring.clone());
-        let socket = super::signer_control::signer_control_socket(layout.data_dir(), pid);
-        // A failure to stand the reader up is not a reason to fail the launch: the signer is the
-        // fence, the record is the witness — so it degrades to signing with no reader rather than
-        // to no signing.
-        match super::lens::ensure_control_dir(&layout.data_dir().join("signer")).and_then(|()| {
-            super::lens::bind_and_serve(&socket, move |l| super::signer_control::serve(l, ring))
-        }) {
-            Ok(()) => signer_uds = Some(socket),
-            Err(e) => crate::diag::warn(&format!(
-                "credentials will be signed, but what was signed cannot be read (`{}`: {e}) — \
-                 `sbx logs --feed signer` will report no signer for this session",
-                socket.display()
-            )),
-        }
+    // The session's signer record, when the launch stood one up. Passed in rather than built here
+    // because it is shared: the agent's proxy and every per-invocation proxy a declared operation
+    // stands up push into the one ring a reader can reach, exactly as they share one notifier. A
+    // proxy that built its own would be recording into a ring nothing serves.
+    if let Some(ring) = signer_log {
+        ctx = ctx.with_signer_log(ring);
     }
 
     // Stand up the control socket the host-side `sbx net pending`/`sbx net log`/`sbx net allow
@@ -887,7 +854,6 @@ pub(crate) fn start(
             host_uds,
             ca_file,
             control_uds,
-            signer_uds,
             stats,
             log,
         },
@@ -1331,6 +1297,7 @@ mod tests {
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
+            None,
         )
         .expect("start the egress proxy");
 
@@ -1440,7 +1407,7 @@ mod tests {
     #[test]
     fn the_guard_unlinks_every_path_it_owns() {
         let dir = TmpDir::new();
-        let paths: Vec<PathBuf> = ["proxy.sock", "ca.pem", "control.sock", "signer.sock"]
+        let paths: Vec<PathBuf> = ["proxy.sock", "ca.pem", "control.sock"]
             .iter()
             .map(|name| {
                 let path = dir.path().join(name);
@@ -1452,7 +1419,6 @@ mod tests {
             host_uds: paths[0].clone(),
             ca_file: paths[1].clone(),
             control_uds: Some(paths[2].clone()),
-            signer_uds: Some(paths[3].clone()),
             stats: None,
             log: Arc::new(super::super::control::LogRing::new(
                 super::super::control::LOG_RING_CAP,
@@ -1508,6 +1474,7 @@ mod tests {
                 None,
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
                 &[],
+                None,
             )
             .expect("start the egress proxy");
 
@@ -1872,6 +1839,7 @@ mod tests {
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
+            None,
         )
         .expect("start the ask egress proxy");
 
@@ -1942,6 +1910,7 @@ mod tests {
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
+            None,
         )
         .expect("start with stats off");
         drop(guard);
@@ -1967,6 +1936,7 @@ mod tests {
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
+            None,
         )
         .expect("start with stats on");
         drop(guard);

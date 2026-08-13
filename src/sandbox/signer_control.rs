@@ -159,6 +159,19 @@ impl SignerRing {
     }
 }
 
+// The events are already redacted and capped by `push`, but a `Debug` that dumped a session's
+// whole record would be noise wherever a holder of this ring renders itself. The count is what a
+// reader of such a line actually wants.
+impl std::fmt::Debug for SignerRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SignerRing({} events)",
+            self.0.snapshot(None).events.len()
+        )
+    }
+}
+
 /// The ring underneath, so a snapshot reads the same on this lens as on any other.
 impl std::ops::Deref for SignerRing {
     type Target = super::lens::Ring<SignerEvent>;
@@ -171,6 +184,55 @@ impl std::ops::Deref for SignerRing {
 /// Serve the control socket, answering `LOG` from the ring the proxy pushes to.
 pub(crate) fn serve(listener: UnixListener, ring: Arc<SignerRing>) -> io::Result<()> {
     super::lens::serve(listener, move |cmd| super::lens::dispatch_log(cmd, &ring))
+}
+
+/// The reader's end of the session's signer record, unlinked when the launch ends. Never bound into
+/// any cage — the agent must not read, or amend, the record of what was signed on its behalf.
+///
+/// A guard of its own, like the brokers' [`super::broker::BrokerFeed`], because the record belongs
+/// to the *session*: the proxy that serves the agent and the per-invocation proxies its declared
+/// operations stand up all push into one ring, and unlinking its socket when any one of them goes
+/// would end a reader's `--follow` while the others were still signing.
+pub(crate) struct SignerFeed {
+    control_uds: PathBuf,
+}
+
+impl Drop for SignerFeed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.control_uds);
+    }
+}
+
+/// Stand up the session's signer record: the shared ring, and the socket
+/// `sbx logs --feed signer` reads it through.
+///
+/// Called once per launch that declares a signer anywhere — in a `[[secret]]` or in a
+/// `[task.<name>.inject]` — before the proxy that will push into it exists, so the first signature
+/// cannot beat a reader to the socket.
+///
+/// The ring is returned whatever happens to the socket: signing is the point and the record is its
+/// witness, so a reader that cannot be stood up degrades to signing with no reader rather than to
+/// no signing. The guard is `None` then, and the warning says so.
+pub(crate) fn stand_up_feed(
+    layout: &crate::store::Layout,
+) -> (Arc<SignerRing>, Option<SignerFeed>) {
+    let ring = Arc::new(SignerRing::new(SIGNER_RING_CAP));
+    let control_uds = signer_control_socket(layout.data_dir(), std::process::id());
+    let served = ring.clone();
+    let bound = super::lens::ensure_control_dir(&layout.data_dir().join("signer")).and_then(|()| {
+        super::lens::bind_and_serve(&control_uds, move |control| serve(control, served))
+    });
+    match bound {
+        Ok(()) => (ring, Some(SignerFeed { control_uds })),
+        Err(e) => {
+            crate::diag::warn(&format!(
+                "credentials will be signed, but what was signed cannot be read (`{}`: {e}) — \
+                 `sbx logs --feed signer` will report no signer for this session",
+                control_uds.display()
+            ));
+            (ring, None)
+        }
+    }
 }
 
 /// The control socket path for a session pid, under the lens's own `0700` runtime directory — never

@@ -3451,6 +3451,10 @@ pub(crate) struct LaunchGuard {
     /// here for the same reason the brokers themselves are, and one more: it belongs to the session
     /// rather than to any one broker, so it must outlive the first of them to be torn down.
     pub(crate) broker_feed: Option<broker::BrokerFeed>,
+    /// The reader's end of the signer record, when this launch declared a signer. Shared by the
+    /// agent's proxy and every per-invocation proxy a declared operation stands up, so it outlives
+    /// all of them.
+    pub(crate) signer_feed: Option<super::signer_control::SignerFeed>,
     pub(crate) forward: Option<forward::Forwarder>,
     /// The in-cage desktop-notifications relay (`dbus = true`), when one is running. It runs on a
     /// host thread bridging the private bus to the host notifications daemon, so it must outlive the
@@ -3523,6 +3527,11 @@ impl Drop for LaunchGuard {
         // Then the record they shared, which outlives every one of them: a reader following it
         // sees the last decision of the last broker before the socket goes.
         if let Some(feed) = self.broker_feed.take() {
+            drop(feed);
+        }
+        // The signer record, after the proxy that pushed into it: `egress` above is gone by now, so
+        // nothing can still be signing when the socket goes.
+        if let Some(feed) = self.signer_feed.take() {
             drop(feed);
         }
         // Before the portal directory: the relay must disconnect from the private bus before its
@@ -4479,6 +4488,24 @@ fn build(
             ));
         }
     }
+    // The session's signer record, stood up when a signer is named anywhere this launch will run
+    // one: a `[[secret]]` the agent's own proxy resolves, or a `[task.<name>.inject]` a declared
+    // operation's proxy will. One ring and one socket for all of them, like the notifier — a proxy
+    // that built its own would record where no reader can look.
+    let signs = prep.cfg.secrets.iter().any(|s| s.signer.is_some())
+        || prep
+            .cfg
+            .tasks
+            .iter()
+            .any(|t| t.injections.iter().any(|i| i.signer.is_some()));
+    let (signer_ring, signer_feed) = match signs {
+        true => {
+            let (ring, feed) = super::signer_control::stand_up_feed(&prep.layout);
+            (Some(ring), feed)
+        }
+        false => (None, None),
+    };
+
     if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
         // An `sbx app <name>` launch tags its egress stats with the app, so `sbx net stats --app`
         // can scope to it; a plain `run`/`shell` records under the project with no app tag.
@@ -4503,6 +4530,7 @@ fn build(
             Some(&notify_wiring),
             prep.cfg.redact_min_len,
             &brokers,
+            signer_ring.clone(),
         )
         .map_err(|e| {
             eprintln!("sbx: cannot start the egress filtering proxy: {e}");
@@ -5081,7 +5109,8 @@ fn build(
                 prep.cfg.redact_min_len,
             )
             .with_notifier(Arc::clone(&notify_wiring))
-            .with_brokers(brokers.clone());
+            .with_brokers(brokers.clone())
+            .with_signer_log(signer_ring.clone());
             // Carry the session's `[fs]` masks into every task cage, so a denied path is closed
             // there too unless the task's own `unmask` names it. The decoys are the ones this
             // launch already staged: a task cage is derived from the agent's, and pointing it at a
@@ -5139,6 +5168,7 @@ fn build(
         || sshagent_guard.is_some()
         || !broker_guards.is_empty()
         || broker_feed.is_some()
+        || signer_feed.is_some()
         || forward_guard.is_some()
         || portal_host.is_some()
         || proc_enforce_guard.is_some()
@@ -5150,6 +5180,7 @@ fn build(
             ssh_agent: sshagent_guard,
             brokers: broker_guards,
             broker_feed,
+            signer_feed,
             forward: forward_guard,
             notify: notify_relay,
             theme: theme_relay,

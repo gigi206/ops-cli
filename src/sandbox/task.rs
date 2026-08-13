@@ -240,6 +240,11 @@ pub(crate) struct TaskEngine {
     /// in a wire injection: one resolver layer, one set of grants, no source that works in one place
     /// and fails in the other.
     brokers: Vec<super::broker::Reachable>,
+    /// The session's signer record, shared with every per-invocation proxy this engine stands up.
+    /// A task may declare `sign` in its own `[task.<name>.inject]`, and its proxy is gone when the
+    /// invocation ends: without the session's ring, what its signer formed would be recorded into
+    /// something nothing serves and nothing reads. `None` on an inventory-only or test engine.
+    signer_log: Option<Arc<super::signer_control::SignerRing>>,
 }
 
 /// The two cage programs a task's egress forwarder is built from, named rather than passed as a pair
@@ -383,6 +388,7 @@ impl TaskEngine {
             fs_masks: None,
             redact_min_len,
             brokers: Vec::new(),
+            signer_log: None,
         }
     }
 
@@ -390,6 +396,17 @@ impl TaskEngine {
     /// announced exactly like one the session's own exec policy stops.
     pub(crate) fn with_notifier(mut self, notify: Arc<super::notify_sink::NotifyWiring>) -> Self {
         self.notify = Some(notify);
+        self
+    }
+
+    /// Record what this engine's per-invocation proxies sign into the session's own feed, so
+    /// `sbx logs --feed signer` shows a task's signatures beside the agent's. Left unset (a test
+    /// engine, or a launch that declares no signer) nothing is recorded.
+    pub(crate) fn with_signer_log(
+        mut self,
+        log: Option<Arc<super::signer_control::SignerRing>>,
+    ) -> Self {
+        self.signer_log = log;
         self
     }
 
@@ -726,6 +743,7 @@ impl TaskEngine {
                 self.notify.as_deref(),
                 self.redact_min_len,
                 &self.brokers,
+                self.signer_log.clone(),
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;
@@ -2131,6 +2149,7 @@ impl TaskEngine {
             fs_masks: None,
             notify: None,
             brokers: Vec::new(),
+            signer_log: None,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             bwrap: PathBuf::from("/nonexistent/bwrap"),
             forwarder: CageForwarder {
@@ -3177,6 +3196,7 @@ mod tests {
             fs_masks: None,
             notify: None,
             brokers: Vec::new(),
+            signer_log: None,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             forwarder: CageForwarder {
