@@ -1081,12 +1081,22 @@ impl Drop for Broker {
 /// brokers share one record, and unlinking it when the first of them goes would end a reader's
 /// `--follow` while the rest were still deciding.
 pub(crate) struct BrokerFeed {
-    control_uds: std::path::PathBuf,
+    /// `None` when the socket could not be bound: the directory below still has to be cleaned up,
+    /// and the brokers still run.
+    control_uds: Option<std::path::PathBuf>,
+    /// This launch's own directory of broker sockets. Emptied by the per-broker guards, which drop
+    /// first; removing it here is what keeps `<data>/broker` from growing a directory per launch.
+    sockets_dir: std::path::PathBuf,
 }
 
 impl Drop for BrokerFeed {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.control_uds);
+        if let Some(control) = &self.control_uds {
+            let _ = std::fs::remove_file(control);
+        }
+        // Not recursive, deliberately: an entry still in there is a socket whose guard has not run,
+        // and taking it out from under a live broker is the one thing this must never do.
+        let _ = std::fs::remove_dir(&self.sockets_dir);
     }
 }
 
@@ -1381,15 +1391,23 @@ fn serve_exchanges(
     }
 }
 
-/// Where one broker's host socket lives, keyed by the launcher pid like the agent and egress
-/// sockets, so a crashed predecessor's residue is identifiable.
+/// The directory one launch's broker sockets live in, keyed by the launcher pid like every other
+/// per-launch runtime path — so a crashed predecessor's residue is identifiable, and so
+/// [`super::gc::sweep_runtime_dirs`] can take it away once that pid is gone.
 ///
-/// The `broker-` prefix is what keeps this namespace clear of the lens's own `control-<pid>.sock`
-/// in the same directory. Without it a broker plugin named `control` would name the very file the
-/// reader connects to, and standing it up would unlink the session's record and answer in its
-/// place. A plugin name is a name, not a reserved word: the layout is what has to keep them apart.
-fn host_socket(dir: &std::path::Path, name: &str, pid: u32) -> std::path::PathBuf {
-    dir.join(format!("broker-{name}-{pid}.sock"))
+/// A directory per launch rather than `<name>-<pid>.sock` beside the lens, for two reasons that
+/// point the same way. A broker plugin installed as `control` would otherwise name the very file a
+/// reader connects to (`control-<pid>.sock`), and `start` unlinks before it binds, so it would take
+/// the record's place and answer in it — a plugin name is a name, not a reserved word. And a name
+/// carrying its pid in the middle is a name the sweep cannot read: it recognises a prefix followed
+/// by a pid, which is what makes an abandoned socket collectable at all.
+pub(crate) fn sockets_dir(data_dir: &std::path::Path, pid: u32) -> std::path::PathBuf {
+    data_dir.join("broker").join(pid.to_string())
+}
+
+/// Where one broker's host socket lives, inside its launch's own directory.
+fn host_socket(data_dir: &std::path::Path, name: &str, pid: u32) -> std::path::PathBuf {
+    sockets_dir(data_dir, pid).join(format!("{name}.sock"))
 }
 
 /// Stand up the session's broker feed: the shared decision ring, and the socket
@@ -1409,28 +1427,41 @@ pub(crate) fn stand_up_feed(
     layout: &crate::store::Layout,
 ) -> (
     std::sync::Arc<super::broker_control::BrokerRing>,
-    Option<BrokerFeed>,
+    BrokerFeed,
 ) {
     let ring = std::sync::Arc::new(super::broker_control::BrokerRing::new(
         super::broker_control::BROKER_RING_CAP,
     ));
-    let control_uds =
-        super::broker_control::broker_control_socket(layout.data_dir(), std::process::id());
+    let pid = std::process::id();
+    let control_uds = super::broker_control::broker_control_socket(layout.data_dir(), pid);
     let served = ring.clone();
     let bound = super::lens::ensure_control_dir(&layout.data_dir().join("broker")).and_then(|()| {
         super::lens::bind_and_serve(&control_uds, move |control| {
             super::broker_control::serve(control, served)
         })
     });
+    let sockets_dir = sockets_dir(layout.data_dir(), pid);
     match bound {
-        Ok(()) => (ring, Some(BrokerFeed { control_uds })),
+        Ok(()) => (
+            ring,
+            BrokerFeed {
+                control_uds: Some(control_uds),
+                sockets_dir,
+            },
+        ),
         Err(e) => {
             crate::diag::warn(&format!(
                 "the brokers this config declares will run, but their decisions cannot be read \
                  (`{}`: {e}) — `sbx logs --feed broker` will report no broker for this session",
                 control_uds.display()
             ));
-            (ring, None)
+            (
+                ring,
+                BrokerFeed {
+                    control_uds: None,
+                    sockets_dir,
+                },
+            )
         }
     }
 }
@@ -1454,11 +1485,11 @@ pub(crate) fn start(
     // The data directory is owner-only, and this socket is a reason it must be: whatever connects
     // to it is brokered through to a host resource.
     crate::store::ensure(layout)?;
-    let dir = layout.data_dir().join("broker");
-    super::lens::ensure_control_dir(&dir)?;
+    let pid = std::process::id();
+    super::lens::ensure_control_dir(&sockets_dir(layout.data_dir(), pid))?;
 
     // Cleared before the bind, since a stale file from a crashed predecessor would block it.
-    let host_uds = host_socket(&dir, &binding.name, std::process::id());
+    let host_uds = host_socket(layout.data_dir(), &binding.name, pid);
     let _ = std::fs::remove_file(&host_uds);
     let listener = UnixListener::bind(&host_uds)?;
 
@@ -2797,17 +2828,23 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
     /// it binds, so it would take the record's place and answer a reader in it.
     #[test]
     fn a_brokers_socket_can_never_be_the_one_a_reader_connects_to() {
-        let dir = std::path::Path::new("/data/broker");
-        let lens = super::super::broker_control::broker_control_socket(
-            std::path::Path::new("/data"),
-            4242,
+        let data = std::path::Path::new("/data");
+        let lens = super::super::broker_control::broker_control_socket(data, 4242);
+        assert_eq!(
+            lens,
+            data.join("broker/control-4242.sock"),
+            "the reader's end"
         );
-        assert_eq!(lens, dir.join("control-4242.sock"), "the reader's end");
         for name in ["gpg-agent", "control", "control-4242.sock"] {
+            let socket = host_socket(data, name, 4242);
             assert_ne!(
-                host_socket(dir, name, 4242),
-                lens,
+                socket, lens,
                 "a broker named `{name}` must not name the record's socket"
+            );
+            assert_eq!(
+                socket.parent(),
+                Some(sockets_dir(data, 4242).as_path()),
+                "and it lives in the launch's own directory, which the sweep can read: {socket:?}"
             );
         }
     }

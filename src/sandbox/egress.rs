@@ -82,6 +82,10 @@ pub(crate) struct Egress {
     /// The per-session control socket (pending answers + the live egress log), present whenever the
     /// proxy runs — always `Some` here, an `Option` only so the guard's unlink stays uniform.
     control_uds: Option<PathBuf>,
+    /// The signer feed's socket, when this launch declared a signer and could bind one. Owned here
+    /// for the reason every lens socket is owned somewhere: nothing sweeps `<data>/signer`, so a
+    /// path nobody unlinks is a file per session left behind for good.
+    signer_uds: Option<PathBuf>,
     /// The session's per-host decision counters, when stats are on. The guard owns a flush on a
     /// graceful exit — but unlike the socket and CA, the session stat file is **not** removed: it
     /// persists for `sbx net stats` to aggregate after the session ends (cleared by `--reset`).
@@ -109,6 +113,9 @@ impl Drop for Egress {
         let _ = std::fs::remove_file(&self.ca_file);
         if let Some(control) = &self.control_uds {
             let _ = std::fs::remove_file(control);
+        }
+        if let Some(signer) = &self.signer_uds {
+            let _ = std::fs::remove_file(signer);
         }
         // A final flush for a graceful exit; the per-decision flush already keeps the file current
         // for the common case of a killed session, where this Drop never runs.
@@ -708,6 +715,9 @@ pub(crate) fn start(
     // `instance` of its own, and no reader globs for one: its socket would be a file nothing reads
     // and nothing sweeps. The ring is built either way, so the forming path has no branch of its
     // own and a task's signatures still cost what a session's do.
+    // Held by the guard below, which unlinks it when the launch ends: nothing sweeps `<data>/signer`,
+    // so a socket nobody owns is a file per session left behind for good.
+    let mut signer_uds = None;
     if secrets.iter().any(|s| s.signer.is_some()) {
         let ring = Arc::new(super::signer_control::SignerRing::new(
             super::signer_control::SIGNER_RING_CAP,
@@ -718,18 +728,20 @@ pub(crate) fn start(
             // A failure to stand the reader up is not a reason to fail the launch: the signer is the
             // fence, the record is the witness — so it degrades to signing with no reader rather
             // than to no signing.
-            if let Err(e) = super::lens::ensure_control_dir(&layout.data_dir().join("signer"))
-                .and_then(|()| {
+            match super::lens::ensure_control_dir(&layout.data_dir().join("signer")).and_then(
+                |()| {
+                    let ring = ring.clone();
                     super::lens::bind_and_serve(&socket, move |l| {
                         super::signer_control::serve(l, ring)
                     })
-                })
-            {
-                crate::diag::warn(&format!(
+                },
+            ) {
+                Ok(()) => signer_uds = Some(socket),
+                Err(e) => crate::diag::warn(&format!(
                     "credentials will be signed, but what was signed cannot be read (`{}`: {e}) — \
                      `sbx logs --feed signer` will report no signer for this session",
                     socket.display()
-                ));
+                )),
             }
         }
     }
@@ -880,6 +892,7 @@ pub(crate) fn start(
             host_uds,
             ca_file,
             control_uds,
+            signer_uds,
             stats,
             log,
         },
@@ -1424,6 +1437,35 @@ mod tests {
             !control.exists(),
             "the control socket must be unlinked on drop"
         );
+    }
+
+    /// Every path this guard owns goes when the launch ends. A path it holds but does not unlink is
+    /// a file per session left behind for good: nothing else writes these names, and the runtime
+    /// sweep is a backstop for the sessions that end on a signal, not a substitute for the guard.
+    #[test]
+    fn the_guard_unlinks_every_path_it_owns() {
+        let dir = TmpDir::new();
+        let paths: Vec<PathBuf> = ["proxy.sock", "ca.pem", "control.sock", "signer.sock"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, b"x").unwrap();
+                path
+            })
+            .collect();
+        drop(Egress {
+            host_uds: paths[0].clone(),
+            ca_file: paths[1].clone(),
+            control_uds: Some(paths[2].clone()),
+            signer_uds: Some(paths[3].clone()),
+            stats: None,
+            log: Arc::new(super::super::control::LogRing::new(
+                super::super::control::LOG_RING_CAP,
+            )),
+        });
+        for path in &paths {
+            assert!(!path.exists(), "left behind: {}", path.display());
+        }
     }
 
     /// The load-bearing security property of the `ask` posture: the control socket — over which a

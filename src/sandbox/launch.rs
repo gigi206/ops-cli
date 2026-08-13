@@ -4262,7 +4262,7 @@ fn build(
         // so a reader's `--follow` ends with the launch rather than with whichever broker was torn
         // down first.
         let (ring, feed) = broker::stand_up_feed(&prep.layout);
-        broker_feed = feed;
+        broker_feed = Some(feed);
         for binding in &prep.cfg.brokers {
             let name = &binding.name;
             let Some(plugin) = registry.broker(name) else {

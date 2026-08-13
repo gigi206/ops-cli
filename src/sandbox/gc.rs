@@ -1123,9 +1123,10 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
 /// entries are keyed by the **launcher pid**.
 ///
 /// These hold a launch's live plumbing — the egress MITM CA and its proxy/control sockets, the
-/// ssh-agent broker's socket, the inbound forwarder's socket dir, the in-cage portal's runtime dir,
-/// the process-observation sockets, the declared-operations plane's socket dir — all of which a
-/// clean exit unlinks through an RAII guard. A `Drop` does not run on a
+/// ssh-agent broker's socket, the broker plugins' sockets and their shared record, the signer
+/// feed's socket, the inbound forwarder's socket dir, the in-cage portal's runtime dir, the
+/// process-observation sockets, the declared-operations plane's socket dir — all of which a clean
+/// exit unlinks through an RAII guard. A `Drop` does not run on a
 /// signal, and a cage normally ends on one (Ctrl-C, `sbx session stop`'s SIGTERM→SIGKILL, a
 /// detached launch killed later), so the guard covers the minority case and the rest accumulate.
 /// [`sweep_runtime_dirs`] is the backstop: the same doctrine the session registry already applies
@@ -1149,6 +1150,11 @@ const RUNTIME_DIRS: &[(&str, &[&str])] = &[
         &["ca-", "proxy-", "control-", "hosts-", "sshcfg-"],
     ),
     ("ssh-agent", &["agent-", "control-"]),
+    // The broker plugins' record socket, and the per-launch directory their own sockets live in
+    // (the empty prefix, as for the portal and the task plane).
+    ("broker", &["control-", ""]),
+    // The signer feed's socket. Nothing else is written here.
+    ("signer", &["control-"]),
     ("forward", &["fwd-"]),
     ("portal", &[""]),
     ("proc", &["control-", "notif-"]),
@@ -1391,6 +1397,20 @@ mod tests {
         // …and its decision-log socket beside it, which is left behind the same way.
         std::fs::write(sshagent.join("control-1.sock"), b"x").unwrap();
         std::fs::write(sshagent.join("control-2.sock"), b"x").unwrap();
+        // A launch's brokers: the record socket they share, and the directory their own sockets
+        // live in. A signal-killed session leaves both, which is what this backstop is for.
+        let broker = root.join("broker");
+        std::fs::create_dir_all(broker.join("1")).unwrap();
+        std::fs::create_dir_all(broker.join("2")).unwrap();
+        std::fs::write(broker.join("1").join("gpg-agent.sock"), b"x").unwrap();
+        std::fs::write(broker.join("2").join("gpg-agent.sock"), b"x").unwrap();
+        std::fs::write(broker.join("control-1.sock"), b"x").unwrap();
+        std::fs::write(broker.join("control-2.sock"), b"x").unwrap();
+        // The signer feed's socket, left behind the same way.
+        let signer = root.join("signer");
+        std::fs::create_dir_all(&signer).unwrap();
+        std::fs::write(signer.join("control-1.sock"), b"x").unwrap();
+        std::fs::write(signer.join("control-2.sock"), b"x").unwrap();
         // The filesystem lens's log socket, and the `[fs]` mask decoys — a directory holding a
         // mode-000 file, which the removal has to cope with rather than trip on.
         std::fs::write(fs.join("control-1.sock"), b"x").unwrap();
@@ -1409,9 +1429,9 @@ mod tests {
         let listed = sweep_runtime_dirs_with(root, false, &live);
         assert_eq!(
             listed.len(),
-            8,
-            "ca-2, control-2, fwd-2, portal/2, agent-2, ssh-agent/control-2, fs/control-2, \
-             fs/mask-2: {listed:?}"
+            11,
+            "ca-2, control-2, fwd-2, portal/2, agent-2, ssh-agent/control-2, broker/2, \
+             broker/control-2, signer/control-2, fs/control-2, fs/mask-2: {listed:?}"
         );
         assert!(
             egress.join("ca-2.pem").exists(),
@@ -1421,7 +1441,18 @@ mod tests {
 
         // The sweep removes exactly those four — files and directories alike.
         let removed = sweep_runtime_dirs_with(root, true, &live);
-        assert_eq!(removed.len(), 8);
+        assert_eq!(removed.len(), 11);
+        assert!(
+            !broker.join("2").exists() && !broker.join("control-2.sock").exists(),
+            "a dead launch's broker sockets and their shared record go together"
+        );
+        assert!(
+            broker.join("1").join("gpg-agent.sock").exists()
+                && broker.join("control-1.sock").exists(),
+            "a live launch keeps both"
+        );
+        assert!(!signer.join("control-2.sock").exists());
+        assert!(signer.join("control-1.sock").exists());
         assert!(
             !fs.join("mask-2").exists(),
             "a dead launch's mask decoys go, mode-000 file and all"

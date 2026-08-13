@@ -1436,7 +1436,6 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         state.path(),
         &["session", "stop", &pid.to_string()],
     );
-
     assert!(
         feed.contains("sign      demo-feed: GET postman-echo.com/get?a=1 set Authorization"),
         "the feed names the signer, the request it formed a credential for, and the headers it put \
