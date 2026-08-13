@@ -1378,6 +1378,53 @@ mod tests {
         Arc::new(cfg)
     }
 
+    /// A context that allows `grpc.test` on any port and trusts only the test upstream's CA.
+    ///
+    /// The stats and log handles come back with it because on this plane what was *recorded* is
+    /// half of what a relay has to get right — a forward nothing counted is the refusal's mirror
+    /// image. The [`TmpDir`](crate::testutil::TmpDir) is returned so the stats file outlives it.
+    fn relaying_ctx(
+        upstream_ca: rustls::pki_types::CertificateDer<'static>,
+    ) -> (
+        ProxyCtx,
+        Arc<crate::sandbox::egress_stats::EgressStats>,
+        Arc<crate::sandbox::control::LogRing>,
+        crate::testutil::TmpDir,
+    ) {
+        use crate::allowlist::classify;
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing};
+        use crate::sandbox::egress_stats::EgressStats;
+        use crate::testutil::TmpDir;
+
+        let dir = TmpDir::new();
+        let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let mut ctx = ProxyCtx::new(
+            Arc::new(super::super::Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+        )
+        .unwrap()
+        .with_stats(Arc::clone(&stats))
+        .with_log(Arc::clone(&log))
+        // loopback, permitted only because the deciding rule names this exact host
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        ctx.upstream_h2 = trusting_h2(upstream_ca);
+        (ctx, stats, log, dir)
+    }
+
+    /// A gRPC request to the harness's host, carrying whatever extra headers a test needs.
+    fn grpc_request(extra: &[(&str, &str)]) -> Request<()> {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("https://grpc.test/pkg.Svc/Method")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers");
+        for (name, value) in extra {
+            req = req.header(*name, *value);
+        }
+        req.body(()).unwrap()
+    }
+
     /// Send a body under h2 flow control, ending the stream if asked.
     ///
     /// `reserve_capacity` is a request and `poll_capacity` is the answer: what may be written is
@@ -1644,10 +1691,7 @@ mod tests {
     /// rebuilt from the decoded head, and both body directions under flow control.
     #[test]
     fn an_allowed_h2_stream_is_relayed_to_a_real_upstream_and_the_whole_answer_returns() {
-        use crate::allowlist::classify;
-        use crate::sandbox::control::{HttpVer, LOG_RING_CAP, LogRing, LogVerdict, RpcKind};
-        use crate::sandbox::egress_stats::EgressStats;
-        use crate::testutil::TmpDir;
+        use crate::sandbox::control::{HttpVer, LogVerdict, RpcKind};
         use std::sync::atomic::Ordering;
 
         let trace = Arc::new(H2Trace::default());
@@ -1657,33 +1701,13 @@ mod tests {
             UpstreamReply::grpc("PONG"),
             Arc::clone(&trace),
         );
+        let (ctx, stats, log, _dir) = relaying_ctx(upstream_ca);
 
-        let dir = TmpDir::new();
-        let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
-        let log = Arc::new(LogRing::new(LOG_RING_CAP));
-        let mut ctx = ProxyCtx::new(
-            Arc::new(super::super::Ca::ephemeral().unwrap()),
-            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
-        )
-        .unwrap()
-        .with_stats(Arc::clone(&stats))
-        .with_log(Arc::clone(&log))
-        // loopback, permitted only because the deciding rule names this exact host
-        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
-        ctx.upstream_h2 = trusting_h2(upstream_ca);
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("https://grpc.test/pkg.Svc/Method")
-            .header("content-type", "application/grpc")
-            .header("te", "trailers")
-            .body(())
-            .unwrap();
         let answer = through_h2_proxy(
             &ctx,
             "grpc.test",
             addr.port(),
-            req,
+            grpc_request(&[]),
             Some(b"PING".to_vec()),
             &trace,
         );
@@ -1737,5 +1761,126 @@ mod tests {
         assert_eq!(events[0].http_ver, HttpVer::H2);
         assert_eq!(events[0].rpc, RpcKind::Grpc);
         assert_eq!(events[0].status, Some(200));
+    }
+
+    /// Credential injection is **strip-and-replace** here too, and now proved from the upstream's
+    /// own account of what arrived rather than from the proxy's account of what it sent. The client
+    /// carries its own `authorization`; exactly one reaches the upstream and it is sbx's, so a
+    /// process in the cage cannot smuggle a header of its own past the credential it never held.
+    #[test]
+    fn an_injected_credential_replaces_the_clients_own_copy_on_the_h2_plane() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::HeaderInjection;
+
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx.with_injections(vec![HeaderInjection::fixed(
+            classify("grpc.test:*").unwrap(),
+            "authorization".to_string(),
+            "Bearer sbx-issued".to_string(),
+        )]);
+
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[("authorization", "Bearer client-own")]),
+            None,
+            &trace,
+        );
+        assert_eq!(answer.status, StatusCode::OK, "the stream was relayed");
+
+        let seen = trace.seen_one();
+        let authorizations: Vec<&(String, String)> = seen
+            .headers
+            .iter()
+            .filter(|(n, _)| n == "authorization")
+            .collect();
+        assert_eq!(
+            authorizations.len(),
+            1,
+            "exactly one authorization reaches the upstream: {seen:?}"
+        );
+        assert_eq!(
+            authorizations[0].1, "Bearer sbx-issued",
+            "sbx's value is the one that crossed"
+        );
+        assert_eq!(
+            seen.header("content-type"),
+            Some("application/grpc"),
+            "the client's other headers are carried through untouched"
+        );
+    }
+
+    /// The response-side leak backstop, end to end at last: a host an injection targets reflects the
+    /// credential back in a header, in the DATA, and in a trailer, and all three reach the cage
+    /// masked. Until this harness existed only the header-masking helper could be exercised, in
+    /// isolation; the three sinks are separate code paths, and a response body is masked frame by
+    /// frame as it streams.
+    #[test]
+    fn a_secret_reflected_in_a_header_body_or_trailer_is_masked_before_it_re_enters_the_cage() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::HeaderInjection;
+
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply {
+                status: StatusCode::OK,
+                headers: vec![
+                    ("content-type".into(), "application/grpc".into()),
+                    ("x-echo".into(), "before-topsecret-after".into()),
+                    ("x-clean".into(), "nothing to see".into()),
+                ],
+                body: b"msg:topsecret;".to_vec(),
+                trailers: vec![
+                    ("grpc-status".into(), "0".into()),
+                    ("x-echoed".into(), "topsecret".into()),
+                ],
+            },
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx
+            .with_injections(vec![HeaderInjection::fixed(
+                classify("grpc.test:*").unwrap(),
+                "authorization".to_string(),
+                "Bearer topsecret".to_string(),
+            )])
+            .with_redactions(vec![SecretNeedle::named(
+                "test-secret",
+                b"topsecret".to_vec(),
+            )]);
+
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[]),
+            None,
+            &trace,
+        );
+
+        assert_eq!(answer.status, StatusCode::OK);
+        // Masked in place and at equal length, so every byte count the caller sees stays true.
+        assert_eq!(answer.header("x-echo"), Some("before-*********-after"));
+        assert_eq!(answer.text(), "msg:*********;");
+        assert_eq!(answer.trailer("x-echoed"), Some("*********"));
+        // ...and only the secret: the rest of the response is untouched.
+        assert_eq!(answer.header("x-clean"), Some("nothing to see"));
+        assert_eq!(answer.trailer("grpc-status"), Some("0"));
+        // The upstream did receive the real credential — the masking is on the way back, not a
+        // failure to inject.
+        assert_eq!(
+            trace.seen_one().header("authorization"),
+            Some("Bearer topsecret")
+        );
     }
 }
