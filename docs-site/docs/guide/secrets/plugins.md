@@ -5,8 +5,11 @@
 can route to. A [broker](#the-broker-type) stands in front of a host socket the
 sandbox must use without ever holding. A [signer](#the-signer-type) forms a
 credential that depends on the request being made. Resolvers came first and are
-the bulk of what follows; each of the other two states what its own contract adds,
-and every rule below that is not marked otherwise holds for all three.
+the bulk of what follows, so the sections below are written about them unless they
+say otherwise; each of the other two kinds has its own, stating what its contract
+adds and what it refuses. What all three genuinely share is everything around the
+plugin rather than inside it: how it is installed and trusted, the sandbox it runs
+in, the manifest's `[sandbox]` grant, and the store it can come from.
 
 The secret-source space is open-ended: any well-known secret-manager backend,
 a cloud KMS, a third-party vault app, a
