@@ -266,26 +266,30 @@ shorten the wait; it never shortens a response.
 A chunked response reaches the cage **verbatim**, size lines and trailers included. The
 proxy learns where the body ends without rewriting a byte of it.
 
-### Reusing an upstream connection (`pool`)
+### Reusing a connection (`pool`)
 
 Framing is what makes reuse possible: a proxy that cannot tell the end of a message
 from the end of a socket has to close the socket to know it is done. Once it can, a
-finished connection to the real server is a validated TLS session the next request
-could use instead of paying for another handshake. With
-[`[network] pool = true`](../configuration/network#reusing-upstream-connections-pool)
-it does, and it is on by default. `pool = false` turns it off.
+finished connection is a working session the next request could use instead of paying
+for another handshake. With
+[`[network] pool = true`](../configuration/network#reusing-connections-pool) it does,
+on both of a forwarded request's legs, and it is on by default. `pool = false` turns it
+off.
 
 Reuse never touches the verdict. Every request is checked in full, exactly as it is
 without it: the allowlist, the `Host`/SNI agreement, the address guard, the secret
 tripwires. What is reused is the handshake.
 
-**The two legs are independent, and that is the load-bearing part.** The client leg is
-one request per connection by construction, which is what stops a pipelined second
-request from skipping the check. So when the proxy forwards with keep-alive on the
-upstream leg, it still tells the *client* `Connection: close`. A client told otherwise
-would send its next request into a tunnel already closing.
+**The two legs are independent, and that is the load-bearing part.** Whether the
+connection to the real server is held for another request, and whether the cage's tunnel
+is, are two questions with two answers; the `Connection` header is per-hop precisely so a
+proxy can answer them separately. Passing the upstream's answer through as if it were the
+client's would invite the client to send its next request into a tunnel already closing.
 
-A connection is offered to another request only when all of these hold:
+#### The upstream leg
+
+A connection to the real server is offered to another request only when all of these
+hold:
 
 | Condition | Why |
 |---|---|
@@ -317,6 +321,43 @@ with a length the upstream can trust, so it has always been eligible.
 The residual is a server closing a waiting connection in the microseconds between the
 proxy's check and its write. That request gets a `502 upstream-closed`, never a silent
 empty response.
+
+#### The client leg
+
+An intercepted tunnel carries requests until one of them leaves it unusable. This is what
+an ordinary HTTP client already expects: its connection pool opens one `CONNECT` and sends
+request after request down it. It is also where the larger saving is, because the handshake
+it removes is the one the proxy performs with the cage rather than the one it performs with
+the server.
+
+It is also where the checking has to be exactly right, so the shape of the code is the
+guarantee rather than the discipline. Serving one request is a single function with
+nothing carried in from the request before it: the credential snapshot, the `Host` and SNI
+agreement, the control-byte and framing refusals, the verdict, the resolution, the address
+guard, the outbound tripwire, the injection match, the capture and the counters all start
+again. That function has one exit that says *carry another request*, its last line, and
+every other way out of it closes the tunnel. A refusal closes because its request body was
+never read, so where the client's stream sits is no longer known.
+
+Pipelining follows from that rather than being a feature: a second request the client sent
+before the first response came back is read as its own turn, so it is decided on its own
+`Host`, path and method. Nothing about the first request reaches it.
+
+The tunnel is offered another request only when all of these hold:
+
+| Condition | Why |
+|---|---|
+| the client's own request left it open | an `HTTP/1.0` request, or one carrying `Connection: close`, said this was its last |
+| the response is delimited by a length or by chunks | a body the client finds the end of by watching for the close cannot be followed by anything |
+| the body ended where its framing said, with nothing after it | the same rule as the upstream leg, and for the same reason |
+| the upstream announced no close, and no `NTLM`/`Negotiate` | a response that ends its own leg ends this one |
+
+What the client is told is sbx's own answer, never the upstream's: the `Connection` and
+`Keep-Alive` headers a server sent describe the server's socket, and are replaced rather
+than relayed. A tunnel that has answered a request and is waiting for the next is closed
+after ten idle seconds, the same bound the upstream leg uses and for the same reason: a
+client that has another request to send has already decided to. One that comes back later
+simply opens a tunnel again.
 
 **On the HTTP/2 plane it is sharing rather than take-and-return.** HTTP/2 multiplexes,
 so a connection there is handed to every stream that may use it at once and none of them
@@ -433,7 +474,7 @@ shared budget, rather than being turned away with a retry that could never succe
 `upstream-closed` is the one that names a server that accepted the request and then
 went away without answering. Saying so is deliberate: an empty relay would be
 indistinguishable from a genuine zero-byte response, and it is also where the one
-residual of [connection reuse](#reusing-an-upstream-connection-pool) would surface.
+residual of [connection reuse](#reusing-a-connection-pool) would surface.
 
 Every one of these is a **request-side** category: they describe requests the proxy
 declined to make. No response is ever refused for how it is framed, per the inbound

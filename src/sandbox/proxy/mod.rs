@@ -245,6 +245,14 @@ const MAX_CONCURRENT_CONNS: usize = 512;
 /// The largest request head (CONNECT or the decrypted inner request) the proxy will buffer.
 const HEAD_MAX: usize = 16 * 1024;
 
+/// How long an intercepted tunnel that has already served a request waits for the next one before it
+/// is closed. It answers for the client's leg the question [`pool`]'s `MAX_IDLE` answers for the
+/// upstream's, and lands on the same short bound for the same reason: the workload reuse actually
+/// helps comes back in milliseconds, and waiting longer only widens the window in which the far side
+/// closes first. Here it also bounds a host thread, which is why it is capped rather than left at the
+/// launch's own timeout. A client that comes back later simply opens a tunnel again.
+const CLIENT_IDLE: Duration = Duration::from_secs(10);
+
 /// What a request refused by [`head_carries_control_byte`] is told, on every plane that reads a head.
 /// It names the byte class rather than the attack, because a client sending one by accident needs to
 /// know what to remove and a client sending one on purpose learns nothing it did not already know.
@@ -258,18 +266,14 @@ const CONTROL_BYTE_DETAIL: &str = "a request line or header carries a control by
 /// realistic interactive backlog.
 const ASK_PENDING_CAP: usize = 256;
 
-/// Handle one client connection: parse the CONNECT, man-in-the-middle the tunnel, read exactly
-/// one inner request, decide it against the policy (with the host/SNI/Host triple agreeing and
-/// the SSRF guard applied to the resolved address), and — when permitted — forward it to the
-/// validated upstream and stream the response back. Every failure path is fail-closed, and each
-/// returns a [`write_refusal`] reason (an `X-Sbx-Egress-Reason` category plus a text body) so the
-/// agent can tell an explicit policy refusal from an unreachable host or a name that did not
-/// resolve, instead of an opaque status or a dropped connection.
+/// Handle one client connection: parse the CONNECT, man-in-the-middle the tunnel, and serve the
+/// requests the client sends through it — each one a full turn through [`serve_tunneled_request`],
+/// which is where the policy decision and every check around it live. A connection that is not a
+/// CONNECT is routed here to the cleartext or absolute-form forward instead. Every failure path is
+/// fail-closed, and each returns a [`write_refusal`] reason (an `X-Sbx-Egress-Reason` category plus
+/// a text body) so the agent can tell an explicit policy refusal from an unreachable host or a name
+/// that did not resolve, instead of an opaque status or a dropped connection.
 fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
-    // One credential state for the whole exchange: taken once here so the value injected and
-    // the needle scanned for can never come from two different resolutions, even if a refresh
-    // lands mid-request. A later exchange picks up the newer state.
-    let creds = ctx.credentials.snapshot();
     // 1. The CONNECT head, read byte-by-byte so the stream sits exactly at the TLS ClientHello
     //    (a buffered read would swallow the start of the handshake).
     let head = read_head_raw(&mut client, HEAD_MAX)?;
@@ -393,15 +397,116 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // 3. Accept the tunnel, then terminate TLS with a leaf minted for the SNI host.
     write_all_str(&mut client, "HTTP/1.1 200 Connection established\r\n\r\n")?;
     let server_conn = ServerConnection::new(ctx.server_config.clone()).map_err(io::Error::other)?;
-    let mut br = BufReader::new(StreamOwned::new(server_conn, client));
+    let mut br = Box::new(BufReader::new(StreamOwned::new(server_conn, client)));
 
-    // 4. Read ONE inner request (this drives the handshake to completion, so the SNI is known
-    //    afterwards); keep the SAME buffered reader for the body.
+    // 4. Serve requests off this tunnel until one of them leaves it unusable. Every request is a
+    //    full turn through [`serve_tunneled_request`] — head, framing, control bytes, Host/SNI
+    //    agreement, verdict, SSRF, injection, capture, stats — with nothing carried across turns but
+    //    the tunnel itself. The only exit that returns [`Turn::Continue`] is falling off the end of
+    //    that function, so there is no path on which a later request rides an earlier one's verdict.
+    //
+    //    There is deliberately no ceiling on how many requests one tunnel may carry. A cap would
+    //    bound nothing: these requests are served one after another by the single thread this
+    //    connection already holds, and an in-cage caller that wanted more of sbx's time would get it
+    //    faster by opening connections — which is what [`MAX_CONCURRENT_CONNS`] is for.
+    let mut reused = false;
+    loop {
+        if reused {
+            // A tunnel between requests holds a host thread and nothing else, so bound that wait
+            // well under the in-request timeout: a client with another request to send has already
+            // decided to send it. The turn puts the launch's own timeout back once a byte arrives.
+            let _ = br
+                .get_ref()
+                .sock
+                .set_read_timeout(Some(ctx.timeout.min(CLIENT_IDLE)));
+        }
+        match serve_tunneled_request(br, ctx, &connect_host, port)? {
+            Turn::Continue(tunnel) => {
+                br = tunnel;
+                reused = true;
+            }
+            Turn::Close => break,
+        }
+    }
+    Ok(())
+}
+
+/// Whether the client's tunnel may carry a further request after the turn that just ended.
+///
+/// A turn returns [`Turn::Continue`] from exactly one place — the last line of
+/// [`serve_tunneled_request`] — and every other exit is a [`Turn::Close`]. That is the rule in
+/// structural form: a request is followed by another on the same connection only when the one
+/// before it ran the whole pipeline and left the connection's position known on both legs. A
+/// refusal closes because its request body was never drained, so where the client's stream sits is
+/// unknown; an error closes because it is an error.
+///
+/// The tunnel travels in the variant rather than beside it: a turn that closes has already disposed
+/// of the stream its own way — shut down cleanly, handed to the WebSocket relay, or dropped after a
+/// refusal — so there is no way for the caller to keep reading one that said `Close`.
+enum Turn {
+    /// Read another request off this tunnel, which comes back to be read from. Boxed because the
+    /// interception state is a kilobyte or so and this is a value returned once per request: one
+    /// allocation when the tunnel opens buys a pointer-sized move per turn thereafter.
+    Continue(Box<ClientTls>),
+    /// This tunnel is finished.
+    Close,
+}
+
+impl Turn {
+    /// A helper that finished with the tunnel and reports only whether it worked: whatever it did,
+    /// the connection is over.
+    fn closing(done: io::Result<()>) -> io::Result<Turn> {
+        done.map(|()| Turn::Close)
+    }
+}
+
+/// The client-facing TLS stream of one intercepted CONNECT tunnel, buffered.
+type ClientTls = BufReader<StreamOwned<ServerConnection, UnixStream>>;
+
+/// Serve ONE request off an established tunnel: read its head, decide it against the policy (with
+/// the host/SNI/Host triple agreeing and the SSRF guard applied to the resolved address), and — when
+/// permitted — forward it to the validated upstream and stream the response back. Every failure path
+/// is fail-closed, and each returns a [`write_refusal`] reason (an `X-Sbx-Egress-Reason` category
+/// plus a text body) so the agent can tell an explicit policy refusal from an unreachable host or a
+/// name that did not resolve, instead of an opaque status or a dropped connection.
+///
+/// Everything a request is judged on is read here, per request, with nothing carried in from the
+/// turn before: the credential snapshot, the anti-fronting checks, the verdict, the resolution, the
+/// injection match and the capture all start again. The tunnel's host and port are the only facts
+/// that come from outside, and the CONNECT the client sent fixed those before the first request.
+fn serve_tunneled_request(
+    mut br: Box<ClientTls>,
+    ctx: &ProxyCtx,
+    connect_host: &str,
+    port: u16,
+) -> io::Result<Turn> {
+    // A tunnel the client has finished with ends here rather than inside the head reader: nothing
+    // arriving before the first byte of a head is the client closing, or falling silent past the
+    // idle bound, which is how a persistent connection is meant to end — not a truncated request,
+    // and not something to log. All three shapes are that one event (rustls reports a peer that went
+    // away without a `close_notify` as an unexpected EOF), so all three end the same way, with the
+    // TLS shut down cleanly so a client still watching reads an end-of-stream and not a dropped
+    // socket.
+    if !matches!(br.fill_buf(), Ok([_, ..])) {
+        finish_tls(br.get_mut());
+        return Ok(Turn::Close);
+    }
+    // The idle bound the caller may have set covered the wait for that first byte; the request it
+    // begins gets the launch's own timeout back.
+    let _ = br.get_ref().sock.set_read_timeout(Some(ctx.timeout));
+    // One credential state for the whole request: taken once here so the value injected and the
+    // needle scanned for can never come from two different resolutions, even if a refresh lands
+    // mid-request. The next request on this tunnel takes its own, as a later connection would.
+    let creds = ctx.credentials.snapshot();
+
+    // 4. Read this request's head (on the first turn that also drives the handshake to completion,
+    //    so the SNI is known afterwards); keep the SAME buffered reader for the body.
     let inner_bytes = read_head_buffered(&mut br, HEAD_MAX)?;
     let sni = br.get_ref().conn.server_name().map(|s| s.to_string());
 
     // CONNECT-host == SNI: the leaf was minted for the SNI, so a CONNECT to a different host is a
-    // domain-fronting attempt.
+    // domain-fronting attempt. Re-asked on every turn rather than once per tunnel: it costs a string
+    // compare, and a check that runs per request cannot be the one a later request skipped.
     if sni
         .as_deref()
         .map(|s| allowlist::canonical_host(s) != connect_host)
@@ -410,7 +515,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // Pre-parse: the inner request is not decoded yet, so there is no method/path to log.
         ctx.outcome(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             None,
             None,
@@ -429,7 +534,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let Some((imethod, itarget)) = request_line_parts(&inner.request_line) else {
         ctx.push_log(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             None,
             None,
@@ -460,7 +565,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     if !itarget.starts_with('/') {
         ctx.push_log(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             Some(&imethod),
             Some(&itarget),
@@ -482,7 +587,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     if head_carries_control_byte(&inner) {
         ctx.push_log(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             Some(&imethod),
             Some(&itarget),
@@ -504,7 +609,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Some(_) => {
             ctx.push_log(
                 super::control::Proto::Https,
-                &connect_host,
+                connect_host,
                 port,
                 Some(&imethod),
                 Some(&itarget),
@@ -535,7 +640,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         };
         ctx.push_log(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             Some(&imethod),
             Some(&itarget),
@@ -555,7 +660,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 Err(_) => {
                     ctx.push_log(
                         super::control::Proto::Https,
-                        &connect_host,
+                        connect_host,
                         port,
                         Some(&imethod),
                         Some(&itarget),
@@ -582,7 +687,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     {
         ctx.outcome(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             Some(&imethod),
             Some(&itarget),
@@ -606,7 +711,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     if carries_secret(&inner_bytes, &creds.needles) {
         ctx.outcome(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             Some(&imethod),
             Some(&itarget),
@@ -626,7 +731,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    the client reads a real HTTP response rather than a tunnel that dies without explanation.
     let deciding: Option<Rule> = match decide_https(
         ctx,
-        &connect_host,
+        connect_host,
         port,
         &itarget,
         &imethod,
@@ -638,7 +743,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 &mut br,
                 refusal.status_line(),
                 refusal.tag(),
-                &refusal.message(ctx, &connect_host, port, &imethod),
+                &refusal.message(ctx, connect_host, port, &imethod),
             );
         }
     };
@@ -649,10 +754,10 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     before any egress, so no `allow` is recorded — rather than open an unredactable channel
     //     that carries an injected secret. (Reached only when a `{WS}` rule already permitted the
     //     upgrade to this host; a WS to a non-`{WS}` host was denied by method above.)
-    if ws_upgrade && !matching_injection_ids(&creds, &connect_host, port, &itarget).is_empty() {
+    if ws_upgrade && !matching_injection_ids(&creds, connect_host, port, &itarget).is_empty() {
         ctx.outcome(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             Some(&imethod),
             Some(&itarget),
@@ -674,7 +779,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let ip = match resolve_checked(
         ctx,
         super::control::Proto::Https,
-        &connect_host,
+        connect_host,
         port,
         Some(&imethod),
         Some(&itarget),
@@ -686,7 +791,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 &mut br,
                 refusal.status_line(),
                 refusal.tag(),
-                &refusal.message(&connect_host),
+                &refusal.message(connect_host),
             );
         }
     };
@@ -697,7 +802,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    to. A redirect to another host opens a new tunnel and re-runs this match, so the secret
     //    cannot ride along to an unintended host. It is settled before any connection is taken,
     //    because which credentials a request carries is half of what partitions the pool below.
-    let injected_ids = matching_injection_ids(&creds, &connect_host, port, &itarget);
+    let injected_ids = matching_injection_ids(&creds, connect_host, port, &itarget);
     // 7'. A signer whose manifest asks for a digest over the body is told one, which means the body
     //     has to exist before the question is put: hold it here rather than stream it at step 9. The
     //     `100-continue` a client may be waiting on is answered first — it withholds the body until
@@ -711,7 +816,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     if digest_wanted.is_some() && body_exceeds_hold(chunked, body_len) {
         ctx.outcome(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             Some(&imethod),
             Some(&itarget),
@@ -747,7 +852,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             None => {
                 ctx.outcome(
                     super::control::Proto::Https,
-                    &connect_host,
+                    connect_host,
                     port,
                     Some(&imethod),
                     Some(&itarget),
@@ -789,7 +894,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 Err(e) if chunked => {
                     ctx.push_log(
                         super::control::Proto::Https,
-                        &connect_host,
+                        connect_host,
                         port,
                         Some(&imethod),
                         Some(&itarget),
@@ -818,7 +923,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         &injected_ids,
         &inject::RequestFacts {
             method: &imethod,
-            host: &connect_host,
+            host: connect_host,
             port,
             target: &itarget,
             headers: &inner.headers,
@@ -830,7 +935,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         Err(refusal) => {
             ctx.outcome(
                 super::control::Proto::Https,
-                &connect_host,
+                connect_host,
                 port,
                 Some(&imethod),
                 Some(&itarget),
@@ -865,7 +970,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let keep_alive = ctx.pool.is_some()
         && !ws_upgrade
         && inner.request_line.split_whitespace().nth(2) == Some("HTTP/1.1");
-    let pool_key = keep_alive.then(|| PoolKey::new(&connect_host, port, &injected_ids));
+    let pool_key = keep_alive.then(|| PoolKey::new(connect_host, port, &injected_ids));
     // Taking a parked connection is limited to a request the proxy can send a second time, because a
     // connection the upstream closed while it was parked only shows up after the write. That means a
     // request with no body, a chunked one whose body the de-chunker buffers before forwarding, or one
@@ -882,19 +987,19 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         pool_key.as_ref().filter(|_| replayable),
         ip,
         port,
-        &connect_host,
+        connect_host,
     ) {
         Ok(pair) => pair,
         Err(e) => {
-            return refuse_upstream(
+            return Turn::closing(refuse_upstream(
                 br.get_mut(),
                 ctx,
-                &connect_host,
+                connect_host,
                 port,
                 &imethod,
                 &itarget,
                 e,
-            );
+            ));
         }
     };
 
@@ -909,7 +1014,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         super::control::RpcKind::from_content_type(
             inner.header("content-type").unwrap_or_default(),
         ),
-        &connect_host,
+        connect_host,
         port,
         Some(&imethod),
         Some(&itarget),
@@ -917,11 +1022,13 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         "allowed",
     );
 
-    // The tunnel is now open — register it for `sbx net live` until this connection returns (the
-    // tunnel closes). One guard covers both the one-shot request/response below and a WebSocket
-    // upgrade: a WS over TLS is still inspected TLS, so its proto stays `https`. The relay increments
-    // the guard's byte counters as data flows (application-plaintext bytes on this inspected path).
-    let flow = ctx.register_flow(&connect_host, port, super::control::Proto::Https);
+    // The tunnel is now carrying traffic — register it for `sbx net live` until this turn returns.
+    // One guard covers both the request/response below and a WebSocket upgrade: a WS over TLS is
+    // still inspected TLS, so its proto stays `https`. The relay increments the guard's byte counters
+    // as data flows (application-plaintext bytes on this inspected path). A tunnel serving several
+    // requests registers one flow per request rather than one for its whole life, which is what
+    // keeps the byte counts attributable to the request that moved them.
+    let flow = ctx.register_flow(connect_host, port, super::control::Proto::Https);
 
     // 8a. Open the traffic capture for this exchange, when the launch captures. The request head
     //     recorded is the client's own (`inner_bytes`), taken before the reserialization below adds
@@ -933,8 +1040,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         c.set_request(&inner_bytes, &injected);
     }
 
-    // 8b. A WebSocket upgrade cannot ride the one-shot request/response path below (which forces
-    //     `Connection: close` and relays a single direction). The handshake was inspected by the same
+    // 8b. A WebSocket upgrade cannot ride the request/response path below, which relays a single
+    //     direction and hands the tunnel back. The handshake was inspected by the same
     //     verdict as any request — host, path, method, anti-fronting, SSRF, upstream-cert — and the
     //     outbound-secret tripwire already ran on it above, so the allowlist governs which host/path
     //     may open a WebSocket. Hand it to the upgrade relay, which forwards it with its
@@ -957,8 +1064,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     if ws_upgrade {
         // The capture follows the handshake into the upgrade relay, which files it at the `101` (it
         // cannot wait for a tunnel that may stay open for hours — see [`relay_upgrade`]).
-        return relay_upgrade(
-            br,
+        return Turn::closing(relay_upgrade(
+            *br,
             upstream,
             &inner,
             &injected,
@@ -967,11 +1074,13 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             capture.as_ref(),
             flow.up.clone(),
             flow.down.clone(),
-        );
+        ));
     }
 
-    // 9. Forward this one request and stream the response back — a pipelined second request from the
-    //    client is never forwarded, so it cannot skip the per-request check.
+    // 9. Forward this one request and stream the response back. A second request the client sent
+    //    ahead of this response is still sitting in the buffered reader; it is not forwarded here but
+    //    read as its own turn, which runs this whole function again — so pipelining costs a round of
+    //    latency and skips no check.
     //
     //    The forwarded bytes are materialized whenever the proxy still holds all of them, which is
     //    exactly what `replayable` above decided: that is what lets a connection the upstream closed
@@ -1016,7 +1125,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             Err(e) => {
                 ctx.push_log(
                     super::control::Proto::Https,
-                    &connect_host,
+                    connect_host,
                     port,
                     Some(&imethod),
                     Some(&itarget),
@@ -1074,7 +1183,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             if !idempotent_method(&imethod) {
                 ctx.push_log(
                     super::control::Proto::Https,
-                    &connect_host,
+                    connect_host,
                     port,
                     Some(&imethod),
                     Some(&itarget),
@@ -1091,18 +1200,18 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                     ),
                 );
             }
-            let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &connect_host) {
+            let (fresh, _) = match acquire_upstream(ctx, None, ip, port, connect_host) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    return refuse_upstream(
+                    return Turn::closing(refuse_upstream(
                         br.get_mut(),
                         ctx,
-                        &connect_host,
+                        connect_host,
                         port,
                         &imethod,
                         &itarget,
                         e,
-                    );
+                    ));
                 }
             };
             upstream = fresh;
@@ -1161,7 +1270,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         && creds
             .injections
             .iter()
-            .any(|inj| names_exact_host(&connect_host, Some(&inj.rule)));
+            .any(|inj| names_exact_host(connect_host, Some(&inj.rule)));
     let head_masking: &[SecretNeedle] = if masks_reflection {
         &creds.needles
     } else {
@@ -1175,13 +1284,27 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     `set_status` amends the `allow` event pushed above; on an L4 splice, a refusal, or an
     //     error there is no such amend (no response).
     let mut up_br = BufReader::new(&mut upstream);
-    let (resp_head, complete) = relay_response_head(
+    let RelayedHead {
+        head: resp_head,
+        framing,
+        persistent,
+        ..
+    } = relay_response_head(
         &mut up_br,
         br.get_mut(),
         &flow.down,
         capture.as_ref(),
         head_masking,
-        keep_alive,
+        &imethod,
+        // The client's leg is offered a further request only when the client's own request left it
+        // open to one. Everything else about reuse is decided from the response, but this half of it
+        // belongs to the client and answering keep-alive over a `Connection: close` would be sbx
+        // telling the client something the client did not ask for.
+        if inner.keeps_alive() {
+            ClientLeg::MayReuse
+        } else {
+            ClientLeg::Close
+        },
     )?;
     // An upstream that closed without answering leaves nothing to relay, and saying so is the honest
     // reply: an empty success is indistinguishable from a genuine zero-byte response, and it would
@@ -1190,7 +1313,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     if resp_head.is_empty() {
         ctx.push_log(
             super::control::Proto::Https,
-            &connect_host,
+            connect_host,
             port,
             Some(&imethod),
             Some(&itarget),
@@ -1221,12 +1344,6 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             ctx.credential_refused();
         }
     }
-    // A head the upstream never finished sending delimits nothing — relay the rest until it closes.
-    let framing = if complete {
-        response_framing(&resp_head, &imethod)
-    } else {
-        BodyFraming::ToEof
-    };
 
     // 10. The body is teed on the way through, ahead of the reflection masking: the capture does its
     //     own masking at filing time (over whole buffers), so what is stored is masked either way,
@@ -1247,28 +1364,38 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         }
     }
 
-    // 11. The response is over. Whether its connection may carry another request takes three answers,
-    //     every one of them necessary: the body ended exactly where its framing said (a truncated one
-    //     leaves the connection at an unknown position), nothing the head read pulled ahead is still
-    //     buffered, and the response itself left the connection reusable. The pool settles the one
-    //     remaining question — whether anything is pending on the socket — and closes the connection
-    //     when the answer is no. This sits after the relay's `?`, so a relay that ended early parks
-    //     nothing.
+    // 11. The response is over, and both legs now ask whether they may carry another request. Two
+    //     answers are shared between them: the body ended exactly where its framing said (a
+    //     truncated one leaves the exchange at an unknown position on both sides), and nothing the
+    //     head read pulled ahead is still buffered. Together they are the one thing reuse cannot do
+    //     without — knowing where the message ended. The upstream adds that the response left *its*
+    //     connection reusable, and the pool settles the last question, whether anything is pending on
+    //     the socket. This sits after the relay's `?`, so a relay that ended early reuses nothing.
     let ended_as_framed = framed.ended_as_framed();
     drop(framed);
     let no_residual = up_br.buffer().is_empty();
     drop(up_br);
-    if ended_as_framed
-        && no_residual
+    let position_known = ended_as_framed && no_residual;
+    if position_known
         && response_keeps_alive(&resp_head)
         && let (Some(pool), Some(key)) = (ctx.pool.as_ref(), pool_key)
     {
         pool.park(key, upstream, ctx.timeout);
     }
-    // The response is fully relayed — close the intercepted TLS cleanly so the client sees a proper
-    // end-of-stream, not a bare socket drop (the reported `without sending TLS close_notify`).
+
+    // The client's leg may carry another request only when the head it was sent already said so and
+    // the body then ended exactly where that head promised. The announcement is made before the body
+    // is relayed and cannot wait for it, so it is a necessary condition and never a sufficient one:
+    // announcing a persistent connection and then closing is legal at any point, while announcing it
+    // and reading on with the stream at an unknown position is the desync this guards against.
+    if persistent && position_known {
+        return Ok(Turn::Continue(br));
+    }
+    // The response is fully relayed and this tunnel carries nothing more — close the intercepted TLS
+    // cleanly so the client sees a proper end-of-stream, not a bare socket drop (the reported
+    // `without sending TLS close_notify`).
     finish_tls(br.get_mut());
-    Ok(())
+    Ok(Turn::Close)
 }
 
 /// Parse the numeric HTTP status code from a response's opening bytes (`HTTP/1.1 200 OK\r\n`): the
@@ -1833,24 +1960,24 @@ fn handle_cleartext(
     //    the response is relayed unredacted (there is nothing this path could reflect that the
     //    tripwire above did not already refuse outbound).
     let mut up_br = BufReader::new(upstream);
-    let (resp_head, complete) = relay_response_head(
+    let RelayedHead {
+        head: resp_head,
+        framing,
+        ..
+    } = relay_response_head(
         &mut up_br,
         &mut client,
         &flow.down,
         capture.as_ref(),
         &[],
-        false,
+        method,
+        ClientLeg::Verbatim,
     )?;
     if let Some(code) = parse_status_code(&resp_head)
         && code >= 200
     {
         ctx.set_status(allow_seq, code);
     }
-    let framing = if complete {
-        response_framing(&resp_head, method)
-    } else {
-        BodyFraming::ToEof
-    };
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
     let response = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
     let mut response: Box<dyn Read + '_> = match &capture {
@@ -2474,13 +2601,25 @@ fn handle_https_forward(
         &[]
     };
     let mut up_br = BufReader::new(&mut upstream);
-    let (resp_head, complete) = relay_response_head(
+    let RelayedHead {
+        head: resp_head,
+        framing,
+        ..
+    } = relay_response_head(
         &mut up_br,
         &mut client,
         &flow.down,
         capture.as_ref(),
         head_masking,
-        keep_alive,
+        method,
+        // This plane's client leg is the proxy's own listening socket, spoken in cleartext and
+        // served one request at a time — there is nothing on it to keep alive, whatever the
+        // upstream leg does.
+        if keep_alive {
+            ClientLeg::Close
+        } else {
+            ClientLeg::Verbatim
+        },
     )?;
     // An upstream that closed without answering leaves nothing to relay, and an empty success would
     // be indistinguishable from a genuine zero-byte response — see the tunneled path.
@@ -2515,11 +2654,6 @@ fn handle_https_forward(
             ctx.credential_refused();
         }
     }
-    let framing = if complete {
-        response_framing(&resp_head, method)
-    } else {
-        BodyFraming::ToEof
-    };
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
     // Teed ahead of the reflection masking — the capture masks its own buffers at filing time.
     let mut framed = FramedBody::new(&mut up_br, framing);
@@ -2946,6 +3080,22 @@ impl Head {
             .filter(|(k, _)| k.eq_ignore_ascii_case(name))
             .count()
     }
+
+    /// Whether this **request** leaves the connection it arrived on able to carry another one — the
+    /// client's own statement about the client's leg, the mirror of [`response_keeps_alive`] for the
+    /// upstream's. `HTTP/1.1` is the version whose connections persist by default; a `Connection:
+    /// close` token says outright that this is the last request on the connection. `HTTP/1.0`
+    /// answers no even when it asks to keep alive: that extension carries framing ambiguities of its
+    /// own, and every client this proxy exists for speaks 1.1.
+    fn keeps_alive(&self) -> bool {
+        self.request_line.split_whitespace().nth(2) == Some("HTTP/1.1")
+            && !self
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+                .flat_map(|(_, v)| v.split(','))
+                .any(|t| t.trim().eq_ignore_ascii_case("close"))
+    }
 }
 
 /// The bytes the proxy will hold in request-body buffers at any one moment, **across every
@@ -3293,33 +3443,59 @@ fn begin_response_stream(upstream: &TcpStream) {
 /// error: the caller then delimits the rest by the close, which is what this path did throughout
 /// before it framed anything.
 ///
-/// `close_client_leg` rewrites the final head's `Connection` for the client only ([`force_close_in_head`]),
-/// which is what keeps the two legs' connection lifetimes independent once the upstream leg is
-/// forwarded with keep-alive. Three things stay pinned to the **upstream's own** bytes across that
-/// rewrite: the head returned to the caller, so the body framing is decided from what the server
-/// actually said; the capture, which records the response as it was served; and the equal-length
-/// masking contract, which is applied after the rewrite rather than through it. The byte counter
-/// follows the other side — it measures what crossed to the cage, so it counts what was written.
+/// `client_leg` decides what the relayed head says about the **client's** connection, which the
+/// `Connection` header makes a per-hop question: it is sbx's statement about its own leg, never a
+/// copy of the upstream's about the other one. Three things stay pinned to the **upstream's own**
+/// bytes across any rewrite: the head returned to the caller, so the body framing is decided from
+/// what the server actually said; the capture, which records the response as it was served; and the
+/// equal-length masking contract, which is applied after the rewrite rather than through it. The
+/// byte counter follows the other side — it measures what crossed to the cage, so it counts what was
+/// written.
 fn relay_response_head<R: BufRead, W: Write>(
     up: &mut R,
     client: &mut W,
     down: &AtomicU64,
     capture: Option<&CaptureGuard>,
     redactions: &[SecretNeedle],
-    close_client_leg: bool,
-) -> io::Result<(Vec<u8>, bool)> {
+    request_method: &str,
+    client_leg: ClientLeg,
+) -> io::Result<RelayedHead> {
     loop {
         let (head, complete) = read_response_head(up, HEAD_MAX);
         if head.is_empty() {
-            return Ok((head, false));
+            return Ok(RelayedHead {
+                head,
+                framing: BodyFraming::ToEof,
+                persistent: false,
+            });
         }
         let interim =
             complete && matches!(parse_status_code(&head), Some(c) if (100..200).contains(&c));
-        // An interim `1xx` is not the response, so its framing is not the connection's to state.
-        let mut wire = if close_client_leg && complete && !interim {
-            force_close_in_head(&head)
+        // An interim `1xx` is not the response, so its framing is not the connection's to state —
+        // the head that follows it is the one every question below is about.
+        let final_head = complete && !interim;
+        let framing = if final_head {
+            response_framing(&head, request_method)
         } else {
-            head.clone()
+            BodyFraming::ToEof
+        };
+        let persistent = final_head
+            && matches!(client_leg, ClientLeg::MayReuse)
+            && response_keeps_alive(&head)
+            // A body whose end the client can only find by watching for the close cannot be followed
+            // by anything: announcing a persistent connection would leave it waiting for a boundary
+            // that never comes.
+            && !matches!(framing, BodyFraming::ToEof);
+        // State sbx's own answer whenever this head is one sbx speaks about — `close` when the
+        // connection ends here, the offer of another request when it does not, and in both cases
+        // with the upstream's hop headers dropped rather than passed off as this leg's. `Verbatim`
+        // is the caller that does not speak: it forwards the upstream's framing untouched, having
+        // already forced `Connection: close` onto the request that produced it.
+        let mut wire = match client_leg {
+            _ if !final_head => head.clone(),
+            ClientLeg::Verbatim => head.clone(),
+            ClientLeg::MayReuse if persistent => offer_reuse_in_head(&head),
+            ClientLeg::Close | ClientLeg::MayReuse => force_close_in_head(&head),
         };
         if !redactions.is_empty() {
             redact_in_place(&mut wire, redactions);
@@ -3333,8 +3509,37 @@ fn relay_response_head<R: BufRead, W: Write>(
         if let Some(c) = capture {
             c.push_response(&head);
         }
-        return Ok((head, complete));
+        return Ok(RelayedHead {
+            head,
+            framing,
+            persistent,
+        });
     }
+}
+
+/// What one relayed response head left behind — see [`relay_response_head`].
+struct RelayedHead {
+    /// The upstream's head exactly as it arrived, before any `Connection` rewrite and before any
+    /// redaction. Every decision downstream is read off these bytes rather than off what was written.
+    head: Vec<u8>,
+    /// Where this response's body ends, already resolved against the request's method.
+    framing: BodyFraming,
+    /// Whether the head **as written to the client** announces a connection a further request may
+    /// ride on. False unless the caller asked for [`ClientLeg::MayReuse`] and the head answered yes.
+    persistent: bool,
+}
+
+/// What a relayed head should tell the client about the **client's own** connection.
+enum ClientLeg {
+    /// Rewrite the final head to `Connection: close`: this connection serves one request, and the
+    /// client is told so rather than left to find out when the stream ends.
+    Close,
+    /// Relay the head as the upstream framed it, and close regardless. The request that produced it
+    /// already forced `Connection: close` upstream, so the head being relayed carries that answer.
+    Verbatim,
+    /// Relay the head as the upstream framed it when it leaves the client's connection usable, and
+    /// rewrite it to `Connection: close` when it does not. The only variant that reports back.
+    MayReuse,
 }
 
 /// Cleanly shut down the interception TLS after a response is fully relayed: queue a `close_notify`
@@ -3520,13 +3725,20 @@ fn write_all_str<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
 
 /// Write a refusal to the client through the buffered TLS stream (the in-tunnel error paths,
 /// after the CONNECT tunnel is established and TLS is terminated).
+///
+/// It answers with the tunnel's [`Turn`], and that answer is always [`Turn::Close`]: a refused
+/// request's body was never read, so the client's stream is left somewhere inside a message rather
+/// than at the start of the next one. The refusal says so on the wire too ([`write_refusal`] sends
+/// `Connection: close`). Returning the turn rather than `()` is what makes that a property of the
+/// type instead of a rule each of the ~18 refusal sites has to remember.
 fn respond_refusal_tls<S: Read + Write>(
     br: &mut BufReader<StreamOwned<ServerConnection, S>>,
     status: &str,
     category: &str,
     detail: &str,
-) -> io::Result<()> {
-    write_refusal(br.get_mut(), status, category, detail)
+) -> io::Result<Turn> {
+    write_refusal(br.get_mut(), status, category, detail)?;
+    Ok(Turn::Close)
 }
 
 /// An `InvalidData` error with a static cause, for the proxy's fail-closed paths.

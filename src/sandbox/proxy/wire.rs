@@ -437,19 +437,40 @@ pub(super) fn response_keeps_alive(head: &[u8]) -> bool {
 /// header dropped, and a single `Connection: close` put back before the terminator.
 ///
 /// The two legs of a forwarded request have independent connection lifetimes, and this is what keeps
-/// them from being mistaken for one. The proxy may hold the upstream leg open to serve a later
-/// request, while the client leg is one request per connection by construction — the tunnel is torn
-/// down as soon as this response is relayed. Passing the upstream's keep-alive through would invite
-/// the client to send a second request into a socket already closing: an idempotent one is silently
-/// retried, doubling the very traffic the reuse was meant to save, and a `POST` simply fails.
-/// `Connection` is hop-by-hop, so setting it is the proxy's to do — exactly as it already is on the
-/// request side.
+/// them from being mistaken for one. Whether the upstream leg is held open for a later request and
+/// whether the client's is are separate decisions, and passing the upstream's answer through as if
+/// it were the client's would invite the client to send a second request into a socket already
+/// closing: an idempotent one is silently retried, doubling the very traffic the reuse was meant to
+/// save, and a `POST` simply fails. `Connection` is hop-by-hop, so setting it is the proxy's to do —
+/// exactly as it already is on the request side. This is the writing half of that: the reading half
+/// is [`response_keeps_alive`], and a plane that keeps its client leg calls neither.
 ///
 /// A head with no blank-line terminator comes back untouched: there is nothing well-formed to
 /// rewrite, and synthesizing a terminator would fabricate a head the upstream never sent.
 pub(super) fn force_close_in_head(head: &[u8]) -> Vec<u8> {
-    const CLOSE: &[u8] = b"Connection: close\r\n";
-    let mut out = Vec::with_capacity(head.len() + CLOSE.len());
+    rewrite_client_connection(head, b"Connection: close\r\n")
+}
+
+/// The twin of [`force_close_in_head`] for a client leg that will carry another request: the same
+/// drop of every `Connection` and `Keep-Alive` the upstream sent, with sbx's own answer put back.
+///
+/// Replacing rather than passing through is what keeps the two legs' hop parameters from being
+/// mistaken for one. An upstream's `Keep-Alive: timeout=60` describes the upstream's socket; relayed
+/// unchanged it would tell the client it has a minute on a tunnel sbx holds for
+/// [`CLIENT_IDLE`](super::CLIENT_IDLE), and a client that believed it would send its next request
+/// into a connection already gone.
+pub(super) fn offer_reuse_in_head(head: &[u8]) -> Vec<u8> {
+    let replacement = format!(
+        "Connection: keep-alive\r\nKeep-Alive: timeout={}\r\n",
+        super::CLIENT_IDLE.as_secs()
+    );
+    rewrite_client_connection(head, replacement.as_bytes())
+}
+
+/// Drop every `Connection` and `Keep-Alive` header from a response head and put `replacement` back
+/// in their place, just before the terminator — the shared body of the two rewrites above.
+fn rewrite_client_connection(head: &[u8], replacement: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len() + replacement.len());
     let mut lines = head.split_inclusive(|&b| b == b'\n');
     match lines.next() {
         // The status line is not a header; it is copied through verbatim.
@@ -463,7 +484,7 @@ pub(super) fn force_close_in_head(head: &[u8]) -> Vec<u8> {
     for line in lines {
         let bare = strip_eol(line);
         if bare.is_empty() {
-            out.extend_from_slice(CLOSE);
+            out.extend_from_slice(replacement);
             out.extend_from_slice(line);
             terminated = true;
             break;

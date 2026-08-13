@@ -287,9 +287,9 @@ fn one_https_request(
 }
 
 /// The client half of one inspected HTTPS request, over whatever transport already reaches the
-/// proxy: `CONNECT`, handshake against the minted leaf, send the request, read to EOF. Returns the
-/// number of response bytes read. Split from the socket it rides so the same exchange can be timed
-/// with and without the cage's forwarder in the way.
+/// proxy: `CONNECT`, handshake against the minted leaf, send the request, read the response.
+/// Returns the number of response bytes read. Split from the socket it rides so the same exchange
+/// can be timed with and without the cage's forwarder in the way.
 fn one_https_exchange<S: Read + Write>(
     mut sock: S,
     client_cfg: Arc<ClientConfig>,
@@ -306,10 +306,62 @@ fn one_https_exchange<S: Read + Write>(
     );
     let name = ServerName::try_from(host.to_string()).unwrap();
     let conn = ClientConnection::new(client_cfg, name).map_err(io::Error::other)?;
-    let mut tls = StreamOwned::new(conn, sock);
-    tls.write_all(request)?;
-    tls.flush().ok();
-    drain(&mut tls)
+    let mut br = BufReader::new(StreamOwned::new(conn, sock));
+    br.get_mut().write_all(request)?;
+    br.get_mut().flush().ok();
+    read_framed_response(&mut br)
+}
+
+/// `n` inspected HTTPS requests down **one** tunnel: one `CONNECT` and one interception handshake
+/// for all of them, which is what an ordinary client's connection pool does through a proxy. Returns
+/// the number of response bytes read.
+///
+/// Each response is read to the end of its *message* rather than to the end of the stream — a tunnel
+/// that carries another request never reaches one — which is also the only way the figure this
+/// produces is per-request rather than per-connection.
+fn one_https_session(
+    sock_path: &std::path::Path,
+    client_cfg: Arc<ClientConfig>,
+    host: &str,
+    port: u16,
+    request: &[u8],
+    n: usize,
+) -> io::Result<usize> {
+    let mut sock = UnixStream::connect(sock_path)?;
+    write!(sock, "CONNECT {host}:{port} HTTP/1.1\r\n\r\n")?;
+    sock.flush()?;
+    let established = read_until_blank(&mut sock)?;
+    assert!(
+        established.contains("200 Connection established"),
+        "CONNECT not accepted: {established:?}"
+    );
+    let name = ServerName::try_from(host.to_string()).unwrap();
+    let conn = ClientConnection::new(client_cfg, name).map_err(io::Error::other)?;
+    // One reader for the whole session, so a byte pulled past one response is not dropped before
+    // the next one is read.
+    let mut br = BufReader::new(StreamOwned::new(conn, sock));
+    let mut total = 0;
+    for _ in 0..n {
+        br.get_mut().write_all(request)?;
+        br.get_mut().flush().ok();
+        total += read_framed_response(&mut br)?;
+    }
+    Ok(total)
+}
+
+/// Read one response to the end of its **message** and report its size. The tunnel it came down may
+/// carry another request, so it never reaches an end of stream to read to.
+fn read_framed_response<R: BufRead>(br: &mut R) -> io::Result<usize> {
+    let (head, complete) = read_response_head(br, HEAD_MAX);
+    assert!(!head.is_empty(), "the proxy answered nothing");
+    let framing = if complete {
+        response_framing(&head, "GET")
+    } else {
+        BodyFraming::ToEof
+    };
+    let mut body = Vec::new();
+    FramedBody::new(br, framing).read_to_end(&mut body)?;
+    Ok(head.len() + body.len())
 }
 
 /// Kills a spawned helper when the measurement that needed it ends.
@@ -342,7 +394,12 @@ fn spawn_cage_forwarder(uds: &std::path::Path) -> Option<(SocketAddr, KillOnDrop
         .ok()?
         .port();
     let child = Command::new("socat")
-        .arg(format!("TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr"))
+        // `nodelay`, exactly as `egress::wrap_command` spells it: without it this row measures
+        // Nagle waiting out a delayed ACK between the response head and its body rather than
+        // anything the proxy does.
+        .arg(format!(
+            "TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr,nodelay"
+        ))
         .arg(format!("UNIX-CONNECT:{}", uds.display()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -789,6 +846,25 @@ fn per_request_cost() {
         }
         report_rate(
             "HTTPS through the proxy, upstream reused",
+            started.elapsed(),
+            REQUESTS,
+        );
+
+        // 7. The same requests again, down ONE tunnel: the client leg's handshake is now paid once
+        //    for the whole run instead of once per request, which is the only difference from (5).
+        one_https_session(&path, cfg.clone(), "upstream.test", addr.port(), request, 1).unwrap();
+        let started = Instant::now();
+        one_https_session(
+            &path,
+            cfg.clone(),
+            "upstream.test",
+            addr.port(),
+            request,
+            REQUESTS,
+        )
+        .unwrap();
+        report_rate(
+            "the same, on one reused client tunnel",
             started.elapsed(),
             REQUESTS,
         );

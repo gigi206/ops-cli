@@ -56,7 +56,7 @@ for the full semantics.
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
 | `stats` | `false` turns off the per-host decision counters ([`sbx net stats`](../networking/observability)) |
 | `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
-| `pool` | `false` stops the proxy carrying a request over an upstream connection an earlier request left behind (default `true`): see below |
+| `pool` | `false` stops the proxy carrying a request over a connection an earlier request left behind, on either leg (default `true`): see below |
 | `ca_roots` | `false` hands the cage the session CA alone instead of pairing it with the public roots (default `true`): see below |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
@@ -121,19 +121,27 @@ allow = ["cache.nixos.org"]
 dns_cache_ttl = 60   # seconds (0 = resolve every request)
 ```
 
-## Reusing upstream connections (`pool`)
+## Reusing connections (`pool`)
 
 A request that has finished hands its connection to the next one going to the same place,
-instead of closing it, so that next request pays no TLS handshake. **This is on by
-default.** Without it every permitted request opens and validates its own connection, which
-on a workload of many small fetches (a `nix` build pulling thousands of paths from
-`cache.nixos.org`) is where most of the time goes.
+instead of closing it, so that next request pays no TLS handshake. This covers both legs of
+a forwarded request: the connection to the real server, and the intercepted tunnel the cage
+sent the request down. **This is on by default.** Without it every permitted request opens
+and validates its own connection and gets a tunnel of its own, which on a workload of many
+small fetches (a `nix` build pulling thousands of paths from `cache.nixos.org`) is where
+most of the time goes.
+
+Reuse changes nothing about what is allowed. Every request runs the whole check (the
+allowlist, the `Host`/SNI agreement, the address guard, the secret tripwires) whichever
+connection it arrives on or leaves by; see
+[the architecture guide](../networking/architecture#reusing-a-connection-pool) for how that
+is kept true on a tunnel serving several requests.
 
 ```toml
 [network]
 mode  = "deny"
 allow = ["cache.nixos.org", "api.example.com"]
-pool  = false   # every request opens its own connection
+pool  = false   # every request opens its own connection, on both legs
 ```
 
 Because it is on by default, [`sbx config`](../cli/config) prints a line only for a launch that

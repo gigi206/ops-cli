@@ -1,10 +1,13 @@
 //! Reuse of validated upstream TLS connections across in-cage requests.
 //!
-//! The proxy handles one request per *client* connection by construction — that is what keeps a
-//! pipelined second request from skipping the per-request verdict. The *upstream* leg has no such
-//! constraint: once a response has been read to the end of its message, the connection to the real
-//! server is a working, certificate-validated TLS session that the next request to the same place
-//! could use instead of paying for a fresh handshake. This module is where such a connection waits.
+//! Once a response has been read to the end of its message, the connection to the real server is a
+//! working, certificate-validated TLS session that the next request to the same place could use
+//! instead of paying for a fresh handshake. This module is where such a connection waits.
+//!
+//! It holds *upstream* connections only. The client's leg is reused too — an intercepted tunnel
+//! serves requests until one leaves it unusable — but that connection never leaves the thread
+//! serving it, so it needs no pool: what makes reuse safe there is that every request runs the whole
+//! per-request pipeline, not that a connection was admitted anywhere.
 //!
 //! What it is not: a general-purpose connection cache. Admission is deliberately narrow, and every
 //! rule below exists because getting it wrong would hand one request a connection carrying another

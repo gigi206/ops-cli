@@ -275,14 +275,90 @@ fn through_proxy(
     let mut tls = StreamOwned::new(conn, sock);
     tls.write_all(request)?;
     tls.flush().ok();
-    let mut resp = String::new();
-    // the proxy closes the tunnel after the one response, so read-to-end terminates
-    match tls.read_to_string(&mut resp) {
-        Ok(_) => {}
-        Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
-        Err(e) => return Err(e),
+    let mut br = BufReader::new(&mut tls);
+    let OneResponse {
+        mut text,
+        persistent,
+    } = read_one_response(&mut br, request)?;
+    // Whatever the proxy put on the wire past the message it framed belongs in what this returns.
+    // On a path that sends one request there is nothing legitimate that could be, and appending it
+    // is what keeps a test asserting "nothing follows the head" from asserting the reader's own
+    // framing back at itself: a body wrongly relayed after a `304` arrives in the same read as the
+    // head and would otherwise be silently skipped.
+    //
+    // A tunnel the proxy is closing is read to its end rather than to its buffer, which collects the
+    // same thing and does one more job: it orders this helper against the work the proxy does after
+    // the last relayed byte — recording the status, re-resolving a refused credential, parking the
+    // upstream connection — so a test may assert on that state the moment this returns.
+    if persistent {
+        text.push_str(&String::from_utf8_lossy(br.buffer()));
+    } else {
+        let mut rest = Vec::new();
+        let _ = br.read_to_end(&mut rest);
+        text.push_str(&String::from_utf8_lossy(&rest));
     }
-    Ok(resp)
+    Ok(text)
+}
+
+/// Close an intercepted tunnel from the client's side and read until the proxy closes it back, the
+/// way a client that is done with a persistent connection ends one.
+fn close_and_drain(tls: &mut StreamOwned<ClientConnection, UnixStream>) {
+    tls.conn.send_close_notify();
+    while tls.conn.wants_write() {
+        if tls.conn.write_tls(&mut tls.sock).is_err() {
+            break;
+        }
+    }
+    let _ = tls.sock.flush();
+    let mut rest = Vec::new();
+    let _ = tls.read_to_end(&mut rest);
+}
+
+/// Read exactly one HTTP response off a stream, the way a real client does: the head, then as much
+/// body as that head's framing delimits, with any interim `1xx` collected on the way.
+///
+/// Reading to end of stream instead would work only against a server that closes after answering,
+/// and an intercepted tunnel that may carry a further request does not. What comes back is the same
+/// bytes a read-to-end produced when it did: head, then body.
+///
+/// The reader belongs to the caller because bytes it pulled past one response are the next one: a
+/// fresh reader per response would drop a pipelined response on the floor, and what it left behind
+/// is also how a caller tells whether the proxy sent more than it framed.
+fn read_one_response<R: BufRead>(br: &mut R, request: &[u8]) -> io::Result<OneResponse> {
+    let method = String::from_utf8_lossy(request.split(|&b| b == b' ').next().unwrap_or(b"GET"))
+        .into_owned();
+    let mut out = Vec::new();
+    let (head, complete) = loop {
+        let (head, complete) = read_response_head(br, HEAD_MAX);
+        out.extend_from_slice(&head);
+        let interim =
+            complete && matches!(parse_status_code(&head), Some(c) if (100..200).contains(&c));
+        if !interim {
+            break (head, complete);
+        }
+    };
+    if !head.is_empty() {
+        let framing = if complete {
+            response_framing(&head, &method)
+        } else {
+            BodyFraming::ToEof
+        };
+        match FramedBody::new(&mut *br, framing).read_to_end(&mut out) {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(OneResponse {
+        text: String::from_utf8_lossy(&out).into_owned(),
+        persistent: response_keeps_alive(&head),
+    })
+}
+
+/// One response read off a stream, and whether the head said the connection carries another.
+struct OneResponse {
+    text: String,
+    persistent: bool,
 }
 
 /// Like [`through_proxy`] but does NOT tolerate a missing TLS `close_notify`: the final read must
@@ -2239,13 +2315,24 @@ fn every_relayed_head_is_counted_including_an_interim_one() {
         let mut up = io::BufReader::new(io::Cursor::new(wire.to_vec()));
         let mut client = Vec::new();
         let down = Arc::new(AtomicU64::new(0));
-        let (head, complete) =
-            relay_response_head(&mut up, &mut client, &down, None, &needles, false).unwrap();
-        assert!(complete);
+        let RelayedHead { head, framing, .. } = relay_response_head(
+            &mut up,
+            &mut client,
+            &down,
+            None,
+            &needles,
+            "GET",
+            ClientLeg::Verbatim,
+        )
+        .unwrap();
         assert_eq!(
             parse_status_code(&head),
             Some(200),
             "the FINAL head is returned"
+        );
+        assert!(
+            matches!(framing, BodyFraming::Length(2)),
+            "the framing comes from the final head, not the interim one"
         );
         assert_eq!(
             down.load(Ordering::Relaxed),
@@ -2713,12 +2800,14 @@ fn through_proxy_repeatedly(
         let mut tls = StreamOwned::new(conn, sock);
         tls.write_all(request)?;
         tls.flush().ok();
-        let mut resp = String::new();
-        match tls.read_to_string(&mut resp) {
-            Ok(_) => {}
-            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
-            Err(e) => return Err(e),
-        }
+        let resp = {
+            let mut br = BufReader::new(&mut tls);
+            read_one_response(&mut br, request)?.text
+        };
+        // Then finish with the tunnel and wait for the proxy to let it go. Each request here is
+        // meant to arrive on a connection of its own, and the wait is also what orders the run: the
+        // upstream is back in the pool before the next request goes looking for it.
+        close_and_drain(&mut tls);
         out.push(resp);
     }
     Ok(out)
@@ -2731,6 +2820,17 @@ fn reuse_ctx(
     pool: bool,
     injections: Vec<HeaderInjection>,
 ) -> (Arc<ProxyCtx>, CertificateDer<'static>) {
+    reuse_ctx_allowing(upstream_ca, pool, injections, &["upstream.test:*"])
+}
+
+/// [`reuse_ctx`] with the allowlist spelled out, for a test that needs one request through the
+/// tunnel to pass the verdict and another to fail it.
+fn reuse_ctx_allowing(
+    upstream_ca: CertificateDer<'static>,
+    pool: bool,
+    injections: Vec<HeaderInjection>,
+    entries: &[&str],
+) -> (Arc<ProxyCtx>, CertificateDer<'static>) {
     let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
     let proxy_ca_der = proxy_ca.ca_cert_der();
     let mut roots = RootCertStore::empty();
@@ -2740,7 +2840,7 @@ fn reuse_ctx(
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
-    let ctx = ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]).with_pool(pool))
+    let ctx = ProxyCtx::new(proxy_ca, policy(entries).with_pool(pool))
         .unwrap()
         .with_upstream(upstream_cfg)
         .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
@@ -3070,13 +3170,572 @@ fn without_the_setting_each_request_opens_its_own_upstream_connection() {
     assert!(pool_ctx.pool.is_none(), "and no pool exists to hold one");
 }
 
-/// The trap that makes reuse a regression if it is missed: the upstream's `Connection` describes
-/// the *upstream* leg. The client leg is one request per connection whatever the upstream says,
-/// so a client told `keep-alive` would send its next request into a socket already closing — an
-/// idempotent one silently retried (doubling the traffic reuse was meant to save), a `POST`
-/// simply failed.
+/// Drive several requests down **one** intercepted tunnel — one CONNECT, one client TLS handshake,
+/// several requests — which is what an ordinary HTTP client's connection pool does through a proxy.
+///
+/// `pipelined` decides whether the client waits for each response before sending the next request or
+/// puts them all on the wire at once. The second shape is the one the proxy used to make impossible
+/// by closing after every response, and it is the one a per-request check has to survive.
+///
+/// It stops as soon as the proxy stops answering, so the number of responses is itself the
+/// assertion: a tunnel that carried two requests returns two, and one that closed after refusing
+/// returns one.
+fn through_one_tunnel(
+    ctx: Arc<ProxyCtx>,
+    proxy_ca: CertificateDer<'static>,
+    connect_host: &str,
+    connect_port: u16,
+    requests: &[&[u8]],
+    pipelined: bool,
+) -> io::Result<Vec<String>> {
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let _ = serve(listener, ctx);
+    });
+    let mut sock = UnixStream::connect(&path).unwrap();
+    write!(
+        sock,
+        "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
+    )
+    .unwrap();
+    sock.flush().unwrap();
+    let established = read_until_blank(&mut sock)?;
+    assert!(
+        established.contains("200 Connection established"),
+        "CONNECT not accepted: {established:?}"
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(proxy_ca).unwrap();
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = ServerName::try_from(connect_host.to_string()).unwrap();
+    let conn = ClientConnection::new(Arc::new(client_config), name).map_err(io::Error::other)?;
+    // One reader for the whole session: what it pulls past one response is the next one, and a
+    // reader per response would lose a pipelined one.
+    let mut br = BufReader::new(StreamOwned::new(conn, sock));
+    if pipelined {
+        for request in requests {
+            br.get_mut().write_all(request)?;
+        }
+        br.get_mut().flush().ok();
+    }
+    let mut out = Vec::new();
+    for request in requests {
+        if !pipelined && (br.get_mut().write_all(request).is_err() || br.get_mut().flush().is_err())
+        {
+            break;
+        }
+        let response = read_one_response(&mut br, request)?.text;
+        if response.is_empty() {
+            break;
+        }
+        out.push(response);
+    }
+    Ok(out)
+}
+
+/// The point of the increment: an ordinary client keeps its tunnel and sends its next request down
+/// it, so the CONNECT and the interception handshake are paid once rather than per request.
 #[test]
-fn a_reused_upstream_still_tells_the_client_to_close() {
+fn one_tunnel_carries_several_requests() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /three HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(got.len(), 3, "every request is answered: {got:?}");
+    for response in &got {
+        assert!(response.ends_with("hello"), "in full: {response:?}");
+    }
+    let paths: Vec<String> = upstream
+        .heads()
+        .iter()
+        .filter_map(|h| h.split_whitespace().nth(1).map(str::to_string))
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["/one", "/two", "/three"],
+        "and all three reached the upstream, in order"
+    );
+}
+
+/// The other two framings a tunnel may be held across, which `Content-Length` cannot stand in for.
+///
+/// A **chunked** response is relayed verbatim, so what has to be exactly right is where sbx stops
+/// reading it: the terminal chunk's own CRLF and any trailer are part of the message, and one byte
+/// of either left on the upstream connection makes the position unknown and closes the tunnel. A
+/// **bodiless** response is the textbook keep-alive desync in the other direction: a `304` routinely
+/// declares the length of the entity it is not sending, and a proxy that believed it would wait for
+/// a body that never comes while the client waits for it.
+#[test]
+fn a_tunnel_survives_a_chunked_and_a_bodiless_response() {
+    for (label, response, ends_with) in [
+        (
+            "chunked",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Done: 1\r\n\r\n"
+                .as_slice(),
+            "0\r\nX-Done: 1\r\n\r\n",
+        ),
+        (
+            "bodiless",
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 4096\r\nETag: \"v1\"\r\n\r\n".as_slice(),
+            "\r\n\r\n",
+        ),
+    ] {
+        let (addr, upstream_ca, upstream) = spawn_keepalive_upstream(response);
+        let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+        let port = addr.port();
+        // Both failures are hangs rather than wrong answers — a proxy waiting for a body that will
+        // never arrive, or a client waiting for a response the proxy is not sending — so the
+        // deadline is as much of the assertion as the count is.
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(through_one_tunnel(
+                ctx,
+                proxy_ca_der,
+                "upstream.test",
+                port,
+                &[
+                    b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                    b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                ],
+                false,
+            ));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{label}: neither side may be left waiting"))
+            .unwrap();
+        assert_eq!(got.len(), 2, "{label}: the tunnel carried both: {got:?}");
+        for response in &got {
+            assert!(
+                response.ends_with(ends_with),
+                "{label}: relayed to its last byte and no further: {response:?}"
+            );
+        }
+        assert_eq!(
+            upstream.heads().len(),
+            2,
+            "{label}: and both requests were forwarded"
+        );
+    }
+}
+
+/// The property the whole shape exists to protect: reuse must not let a request inherit the verdict
+/// of the one before it. The tunnel is opened to a host allowed for exactly one path, and the second
+/// request asks for another — so a proxy that decided once per tunnel would serve it.
+#[test]
+fn a_later_request_on_a_tunnel_is_judged_on_its_own_path() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) =
+        reuse_ctx_allowing(upstream_ca, true, vec![], &["upstream.test:*/allowed"]);
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /allowed HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /elsewhere HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+        false,
+    )
+    .unwrap();
+    assert!(got[0].ends_with("hello"), "the first is served: {got:?}");
+    assert!(
+        got[1].contains("403") && got[1].contains("denied-default"),
+        "the second is refused on its own path: {got:?}"
+    );
+    assert_eq!(
+        upstream.heads().len(),
+        1,
+        "and never reached the upstream at all"
+    );
+}
+
+/// The same, for the anti-fronting check rather than the verdict: a client may put a different
+/// `Host` on its second request, and the tunnel it arrived through is still bound to the host the
+/// CONNECT named and the leaf was minted for.
+#[test]
+fn a_later_request_on_a_tunnel_still_has_to_name_the_tunnel_s_host() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: elsewhere.test\r\n\r\n",
+        ],
+        false,
+    )
+    .unwrap();
+    assert!(got[0].ends_with("hello"), "the first is served: {got:?}");
+    assert!(
+        got[1].contains("421") && got[1].contains("host-mismatch"),
+        "the second is refused as domain-fronting: {got:?}"
+    );
+    assert_eq!(upstream.heads().len(), 1, "and never egressed");
+}
+
+/// Pipelining — the client putting its second request on the wire before the first response comes
+/// back — was what the one-request-per-connection rule ruled out. It is admitted now, and the check
+/// it must not skip is the same one: the second request is read as its own turn, and refused.
+#[test]
+fn a_pipelined_second_request_is_judged_rather_than_carried() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) =
+        reuse_ctx_allowing(upstream_ca, true, vec![], &["upstream.test:*/allowed"]);
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /allowed HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /elsewhere HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+        true,
+    )
+    .unwrap();
+    assert!(got[0].ends_with("hello"), "the first is served: {got:?}");
+    assert!(
+        got[1].contains("403") && got[1].contains("denied-default"),
+        "the pipelined second is refused, in order: {got:?}"
+    );
+    assert_eq!(upstream.heads().len(), 1, "and never egressed");
+}
+
+/// A refused request ends the tunnel, and that is not politeness: its body was never read, so where
+/// the client's stream sits is unknown and reading a head from it could frame anything.
+#[test]
+fn a_refusal_ends_the_tunnel_rather_than_reading_on() {
+    let (addr, upstream_ca, _upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) =
+        reuse_ctx_allowing(upstream_ca, true, vec![], &["upstream.test:*/allowed"]);
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            // Refused, and carrying a body the proxy therefore never drains.
+            b"POST /elsewhere HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 4\r\n\r\nbody",
+            b"GET /allowed HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(got.len(), 1, "the tunnel carried nothing after the refusal");
+    assert!(
+        got[0].contains("403") && got[0].to_lowercase().contains("connection: close"),
+        "and the refusal says so on the wire: {got:?}"
+    );
+}
+
+/// A response whose body is delimited by the close cannot be followed by another: the client is
+/// reading until end of stream, so anything after it would be read as part of the body. The proxy
+/// says `close` on such a head and means it.
+#[test]
+fn a_close_delimited_response_ends_the_tunnel() {
+    let (addr, upstream_ca, _upstream) = spawn_upstream(
+        "upstream.test",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello",
+    );
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(got.len(), 1, "nothing follows a close-delimited response");
+    assert!(
+        got[0].to_lowercase().contains("connection: close"),
+        "and the client is told before it waits: {got:?}"
+    );
+}
+
+/// A TCP listener that forwards to the proxy's unix socket and counts the connections it accepts —
+/// the cage's forwarder, with a tally. Counting on this side is the only way to see how many tunnels
+/// a client opened, which is the question a real client has to answer.
+fn spawn_counting_forwarder(uds: &std::path::Path) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let uds = uds.to_path_buf();
+    thread::spawn(move || {
+        while let Ok((client, _)) = listener.accept() {
+            counter.fetch_add(1, Ordering::Relaxed);
+            let Ok(proxy) = UnixStream::connect(&uds) else {
+                return;
+            };
+            let (mut up_in, mut up_out) = (client.try_clone().unwrap(), proxy.try_clone().unwrap());
+            let (mut down_in, mut down_out) = (proxy, client);
+            thread::spawn(move || {
+                let _ = io::copy(&mut up_in, &mut up_out);
+                let _ = up_out.shutdown(std::net::Shutdown::Write);
+            });
+            thread::spawn(move || {
+                let _ = io::copy(&mut down_in, &mut down_out);
+                let _ = down_out.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    (addr, accepted)
+}
+
+/// The claim the whole increment rests on, asked of a real client rather than of sbx: an ordinary
+/// HTTP client fetching two URLs from one host through the proxy opens **one** connection to it.
+///
+/// The tests above prove sbx serves a second request off a tunnel; this proves a client sends one,
+/// which is what turns a capability into a saving. `curl` is the client because it is the one every
+/// agent image has. Skipped where it is not installed.
+#[test]
+fn a_real_client_fetches_twice_down_one_tunnel() {
+    use std::process::{Command, Stdio};
+    if Command::new("curl")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        return;
+    }
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_pem = proxy_ca.ca_cert_pem().to_string();
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]).with_pool(true))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let dir = TmpDir::new();
+    let sock = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    thread::spawn(move || {
+        let _ = serve(listener, ctx);
+    });
+    let ca_file = dir.join("ca.pem");
+    std::fs::write(&ca_file, ca_pem).unwrap();
+    let (forwarder, tunnels) = spawn_counting_forwarder(&sock);
+    let port = addr.port();
+    let out = Command::new("curl")
+        .args(["--silent", "--show-error", "--proxy"])
+        .arg(format!("http://{forwarder}"))
+        .arg("--cacert")
+        .arg(&ca_file)
+        .arg(format!("https://upstream.test:{port}/one"))
+        .arg(format!("https://upstream.test:{port}/two"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "curl failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hellohello",
+        "both fetches returned their body"
+    );
+    let paths: Vec<String> = upstream
+        .heads()
+        .iter()
+        .filter_map(|h| h.split_whitespace().nth(1).map(str::to_string))
+        .collect();
+    assert_eq!(paths, vec!["/one", "/two"], "both requests were forwarded");
+    assert_eq!(
+        tunnels.load(Ordering::Relaxed),
+        1,
+        "and the client opened one tunnel for the pair"
+    );
+}
+
+/// A loopback TLS upstream that serves one request per connection and then closes, accepting as many
+/// connections as it is given — [`spawn_upstream`]'s shape, without the one-shot listener, so a test
+/// can see what a client does *after* a response this one deliberately mis-serves.
+fn spawn_upstream_per_connection(response: &'static [u8]) -> (SocketAddr, CertificateDer<'static>) {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        while let Ok((sock, _)) = listener.accept() {
+            let config = server_config.clone();
+            thread::spawn(move || {
+                let Ok(conn) = ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = StreamOwned::new(conn, sock);
+                let mut br = BufReader::new(&mut tls);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match br.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+                let _ = tls.write_all(response);
+                let _ = tls.flush();
+            });
+        }
+    });
+    (addr, ca_der)
+}
+
+/// The other half of the reuse condition, and the one the head cannot answer: a response that ended
+/// short of the length it declared leaves the exchange at a position nobody knows. The head said
+/// `keep-alive` before the body proved otherwise, which is exactly why the announcement is necessary
+/// and never sufficient — the turn still has to close.
+///
+/// The harm of holding on is what the deadline measures: the client is waiting on a body that will
+/// never arrive, and only the close tells it so. A tunnel kept open makes it wait out the idle bound
+/// instead, which is a hang rather than a truncation.
+#[test]
+fn a_response_that_ends_short_of_its_declared_length_ends_the_tunnel() {
+    let (addr, upstream_ca) =
+        spawn_upstream_per_connection(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let port = addr.port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(through_one_tunnel(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            port,
+            &[
+                b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+                b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            ],
+            false,
+        ));
+    });
+    let got = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the client must be released by the close, not left to wait out the idle bound")
+        .unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "a truncated response ends the tunnel: {got:?}"
+    );
+    assert!(
+        got[0].ends_with("hel"),
+        "what did arrive was relayed: {got:?}"
+    );
+}
+
+/// The same condition read from the other side: an upstream that put bytes on the wire after the
+/// response it framed. The client's leg is perfectly well formed — it can read this response and
+/// send another — but sbx no longer knows what the *upstream* was doing, and a proxy that cannot say
+/// where one message ended has no business starting to read the next one on either leg.
+#[test]
+fn an_upstream_that_says_more_than_it_framed_ends_the_tunnel() {
+    let (addr, upstream_ca) =
+        spawn_upstream_per_connection(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloand more");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(got.len(), 1, "the tunnel ends with the doubt: {got:?}");
+    assert!(
+        got[0].ends_with("hello"),
+        "and only the framed body was relayed: {got:?}"
+    );
+}
+
+/// The client's own `Connection: close` is the client saying this is its last request on the tunnel.
+/// Answering it with an offer of another would be sbx telling the client something it did not ask.
+#[test]
+fn a_client_that_asks_to_close_is_not_offered_another_request() {
+    let (addr, upstream_ca, _upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "the tunnel ended where the client said it would"
+    );
+    assert!(
+        got[0].to_lowercase().contains("connection: close"),
+        "and said so in the response: {got:?}"
+    );
+}
+
+/// The trap that makes reuse a regression if it is missed: the upstream's `Connection` and
+/// `Keep-Alive` describe the *upstream* leg, and both legs are held on terms of their own. Relayed
+/// unchanged, a `Keep-Alive: timeout=60` would tell the client it has a minute on a tunnel sbx holds
+/// for [`CLIENT_IDLE`] — so the client's next request would go into a connection already gone: an
+/// idempotent one silently retried (doubling the traffic reuse was meant to save), a `POST` failed.
+#[test]
+fn the_client_leg_is_held_on_sbx_terms_not_the_upstream_leg_s() {
     let (addr, upstream_ca, _upstream) = spawn_keepalive_upstream(
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\nKeep-Alive: timeout=60\r\n\r\nhello",
         );
@@ -3091,13 +3750,18 @@ fn a_reused_upstream_still_tells_the_client_to_close() {
     .unwrap();
     let head = got[0].split("\r\n\r\n").next().unwrap().to_lowercase();
     assert!(
-        head.contains("connection: close"),
-        "the client leg must be told to close: {:?}",
+        head.contains("connection: keep-alive"),
+        "the tunnel is offered a further request: {:?}",
         got[0]
     );
     assert!(
-        !head.contains("keep-alive"),
-        "and must not see the upstream leg's persistence: {:?}",
+        head.contains(&format!("keep-alive: timeout={}", CLIENT_IDLE.as_secs())),
+        "on sbx's own idle bound: {:?}",
+        got[0]
+    );
+    assert!(
+        !head.contains("timeout=60"),
+        "and never on the upstream leg's: {:?}",
         got[0]
     );
     assert!(

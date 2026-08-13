@@ -334,7 +334,7 @@ Every exchange sbx inspects:
 - **HTTPS** (`https://`, the MITM'd `CONNECT`) and inspected **cleartext**
   (`http://`): the request and response heads exactly as they crossed, plus the
   leading bytes of each body. One header is an exception, and only under
-  [`[network] pool`](../configuration/network#reusing-upstream-connections-pool): the
+  [`[network] pool`](../configuration/network#reusing-connections-pool): the
   capture records the response's `Connection` as the **upstream** sent it, while the
   cage is always told `close`, because the two connections have separate lifetimes. So
   a capture may read `keep-alive` on an exchange whose client was told to close. That
@@ -497,10 +497,11 @@ This is the **open connections**, distinct from [`sbx net logs`](#sbx-net-logs) 
   inspected `https`/`http` flow (the proxy sees the plaintext); **encrypted bytes** on a
   raw `tcp` splice (the tunnel is opaque). A value climbing between two frames is a
   transfer in progress.
-- **What you'll see**: because the proxy closes each inspected request after one
-  response, short API calls flash by in under a second; the durable rows are raw `tcp://`
-  tunnels (SSH, a database wire), WebSockets, and large L7 transfers in progress (a
-  download, a streamed completion). An idle session shows an empty list: that is normal.
+- **What you'll see**: a row is one inspected *request* in flight, not the tunnel carrying
+  it, so short API calls flash by in under a second even when the tunnel that served them
+  stays open for the next one. The durable rows are raw `tcp://` tunnels (SSH, a database
+  wire), WebSockets, and large L7 transfers in progress (a download, a streamed
+  completion). An idle session shows an empty list: that is normal.
 
 Like the log, it is **live-only and never written to disk**, read from the same
 per-session control socket, and only a **filtering** posture (`deny`/`allow`/`ask`) runs a
