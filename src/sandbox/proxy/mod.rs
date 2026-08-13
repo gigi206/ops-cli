@@ -1310,7 +1310,12 @@ fn splice_l4(
     // Open the raw upstream to the checked address (no TLS, no certificate validation — a raw splice
     // is uninspected by design; the empty netns + the allowlist are the boundary).
     let upstream = match TcpStream::connect((ip, port)) {
-        Ok(s) => s,
+        Ok(s) => {
+            // Nagle off. A raw splice carries whatever protocol the cage speaks, including
+            // interactive ones whose small writes are exactly what Nagle holds back.
+            let _ = s.set_nodelay(true);
+            s
+        }
         Err(_) => {
             ctx.push_log(
                 super::control::Proto::Tcp,
@@ -1633,6 +1638,9 @@ fn handle_cleartext(
         Ok(s) => {
             let _ = s.set_read_timeout(Some(ctx.timeout));
             let _ = s.set_write_timeout(Some(ctx.timeout));
+            // Nagle off, for the reason `connect_upstream` states: this path writes a head and
+            // then streams a body, and the second write would wait on a delayed ACK.
+            let _ = s.set_nodelay(true);
             s
         }
         Err(_) => {
@@ -2578,6 +2586,11 @@ fn connect_upstream(
         .map_err(|_| UpstreamError::Unreachable)?;
     sock.set_write_timeout(Some(ctx.timeout))
         .map_err(|_| UpstreamError::Unreachable)?;
+    // Nagle off. Every relay here writes a head and then a body, and on a connection that stays
+    // open the second write waits for the delayed ACK of the first — tens of milliseconds of
+    // latency the proxy adds to every request that carries one. Latency over segment count is the
+    // trade a proxy in a request's path wants, and it is what the broker's socket already takes.
+    let _ = sock.set_nodelay(true);
     let name = upstream_server_name(host).map_err(|_| UpstreamError::CertRejected)?;
     let mut conn = ClientConnection::new(ctx.upstream.clone(), name)
         .map_err(|_| UpstreamError::CertRejected)?;

@@ -396,7 +396,12 @@ async fn relay(
 
     let tcp =
         match tokio::time::timeout(ctx.timeout, tokio::net::TcpStream::connect((ip, port))).await {
-            Ok(Ok(t)) => t,
+            Ok(Ok(t)) => {
+                // Nagle off, as on the HTTP/1.1 paths: h2 writes headers and DATA as separate
+                // frames, so the coalescing Nagle waits for is latency this plane adds per stream.
+                let _ = t.set_nodelay(true);
+                t
+            }
             _ => {
                 let _ = refuse(respond, StatusCode::BAD_GATEWAY, "upstream-unreachable");
                 return;

@@ -99,6 +99,15 @@ fn spawn_keepalive_tls_upstream(
                             break;
                         }
                     }
+                    // Consume a declared request body before replying, or its bytes would be read
+                    // as the head of the next request on a connection that never closes. Absent on
+                    // a bodyless request, which reads zero and is unaffected.
+                    if let Some(n) = declared_length(&seen) {
+                        let mut body = vec![0u8; n];
+                        if tls.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                    }
                     // Head and body in ONE write: two would leave the second held by Nagle on a
                     // connection that never closes, and the delayed ACK that releases it would show
                     // up as ~40 ms of "proxy cost" that belongs to this test upstream.
@@ -112,6 +121,19 @@ fn spawn_keepalive_tls_upstream(
         }
     });
     (addr, ca_der)
+}
+
+/// The `Content-Length` a raw request head declares, if any. Enough parsing for a test upstream:
+/// the proxy forwards exactly one length, having refused anything ambiguous long before here.
+fn declared_length(head: &[u8]) -> Option<usize> {
+    String::from_utf8_lossy(head)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("Content-Length: ")
+                .or(l.strip_prefix("content-length: "))
+        })
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n > 0)
 }
 
 /// A loopback TLS upstream that serves `conns` connections, one request each, replying with
@@ -413,6 +435,100 @@ fn small_head_keepalive() -> String {
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         SMALL_BODY.len()
     )
+}
+
+/// A signer that answers instantly, so what the figures below show is **sbx's** work rather than a
+/// plugin's. What a real plugin costs is a round trip to another process and is its own question.
+struct NullSigner;
+
+impl crate::sandbox::signer::Signing for NullSigner {
+    fn sign(
+        &mut self,
+        _req: &crate::sandbox::signer::SignRequest<'_>,
+    ) -> Result<crate::sandbox::signer::Signature, String> {
+        Ok(crate::sandbox::signer::Signature {
+            headers: vec![("Authorization".to_string(), "SIG".to_string())],
+            label: None,
+        })
+    }
+}
+
+fn signing_injection(digest: bool) -> HeaderInjection {
+    HeaderInjection {
+        rule: classify("upstream.test:*").unwrap(),
+        form: Form::Signed(Signed {
+            name: "bench".to_string(),
+            sets: vec!["Authorization".to_string()],
+            sees: Vec::new(),
+            key: "the-key".to_string(),
+            marker: None,
+            process: Arc::new(std::sync::Mutex::new(NullSigner)),
+            body_digest: digest.then_some(crate::plugins::signer::BodyDigest::Sha256),
+        }),
+    }
+}
+
+/// What holding a request body to digest it costs, and what it buys back.
+///
+/// A signer declaring `body_digest` reverses the order of two things: the body is read into memory
+/// and hashed *before* the request is signed, where it otherwise streams straight to the upstream.
+/// That is work added to the request path, so it is measured rather than assumed — and it is not
+/// only a cost, because a body the proxy holds is one it can send a second time, which is what lets
+/// such a request take a pooled connection at all. Before, a `Content-Length` body opened its own
+/// upstream connection every time.
+///
+/// Three figures, each differing from the one above it by exactly one thing:
+///
+/// 1. **no signer** — the shape before any of this: the body streams, and with reuse on it still
+///    opens its own connection every request, because a streamed body cannot be sent again.
+/// 2. **a signer, no digest** — (1) plus the per-request signer call, which here costs nothing:
+///    this isolates everything the injection machinery does *around* the plugin.
+/// 3. **a signer asking for the digest** — (2) plus reading the body into memory and hashing it,
+///    minus the upstream handshake it no longer pays, because the request is now poolable.
+///
+/// (3) minus (2) is the honest price of the feature. That it can come out **negative** is the
+/// point: on a link with real round trips the saved handshake is worth far more than the hash, and
+/// on loopback it is CPU against CPU.
+#[test]
+#[ignore = "a measurement, not an assertion: run explicitly, in release"]
+fn held_body_cost() {
+    const BODY: usize = 64 * 1024;
+    println!(
+        "\nheld body cost ({REQUESTS} requests, {} KiB body, pool on, loopback upstream — no RTT)",
+        BODY / 1024
+    );
+    let reply = Arc::new(SMALL_BODY.as_bytes().to_vec());
+    let mut request =
+        format!("POST /v1/thing HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: {BODY}\r\n\r\n")
+            .into_bytes();
+    request.extend(std::iter::repeat_n(b'x', BODY));
+
+    for (label, injections) in [
+        ("no signer, body streams", Vec::new()),
+        ("a signer, no digest", vec![signing_injection(false)]),
+        (
+            "a signer asking for the digest",
+            vec![signing_injection(true)],
+        ),
+    ] {
+        let (addr, up_ca) = spawn_keepalive_tls_upstream(small_head_keepalive(), reply.clone());
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]).with_pool(true))
+                .unwrap()
+                .with_upstream(client_config(up_ca))
+                .with_injections(injections)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let (_dir, sock) = serve_on_uds(ctx);
+        let cfg = client_config(proxy_ca_der);
+        let started = Instant::now();
+        for _ in 0..REQUESTS {
+            one_https_request(&sock, cfg.clone(), "upstream.test", addr.port(), &request).unwrap();
+        }
+        report_rate(label, started.elapsed(), REQUESTS);
+    }
 }
 
 /// What one small request costs, and where the cost sits.
