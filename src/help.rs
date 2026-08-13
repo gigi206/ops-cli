@@ -1094,10 +1094,12 @@ const PAGES: &[Page] = &[
     Page {
         path: &["plugins"],
         synopsis: "sbx plugins <subcommand> [args...]",
-        summary: "inspect and manage resolver plugins and plugin stores",
+        summary: "inspect and manage plugins and plugin stores",
         options: &[],
         details: "Host-level — reads the data directory, not a project's config. A resolver plugin\n\
-            declares a `scheme://` sbx can route a secret `from` reference to.",
+            declares a `scheme://` sbx can route a secret `from` reference to; a broker and a\n\
+            signer are named by their own name, the first fencing a host resource and the second\n\
+            forming the credential that authenticates one request.",
     },
     Page {
         path: &["session"],
@@ -2671,13 +2673,16 @@ const PAGES: &[Page] = &[
     Page {
         path: &["plugins", "list"],
         synopsis: "sbx plugins list  (alias: sbx plugins ls)",
-        summary: "list installed resolver plugins and built-in schemes",
+        summary: "list installed plugins and built-in schemes",
         options: &[],
-        details: "Shows the reserved built-in schemes and every installed resolver plugin — its\n\
-            scheme, name, version, network grant, whether it is runnable, and where it came\n\
-            from (a named store, or a local directory by path). A scheme claimed by more than\n\
-            one plugin resolves to nothing: every claimant is listed as disabled, and stays so\n\
-            until all but one are removed.",
+        details: "Shows the reserved built-in schemes and every installed plugin, listed by kind:\n\
+            a resolver by the scheme it claims, a broker by the protocol it fences, a signer\n\
+            by the headers it may set. Each line carries the version, whether it is runnable,\n\
+            and where it came from (a named store, or a local directory by path).\n\
+            \n\
+            A key claimed by more than one plugin resolves to nothing: every claimant is\n\
+            listed as disabled, and stays so until all but one are removed. That holds for a\n\
+            scheme and for a plugin name alike.",
     },
     Page {
         path: &["plugins", "info"],
@@ -2685,12 +2690,14 @@ const PAGES: &[Page] = &[
         summary: "show a plugin's manifest and sandbox grant",
         options: &[(
             "<scheme|name>",
-            "the resolver scheme, or the broker name, to detail",
+            "the resolver scheme, or the plugin name, to detail",
         )],
         details: "Includes where the plugin came from. A resolver is named by the scheme it\n\
-            claims; a broker claims none, so it is named by the name `[broker.<name>]` binds,\n\
-            and its page adds the protocol facts a launch acts on and whether the global\n\
-            config binds it at all.\n\
+            claims; a broker and a signer claim none, so each is named by its own name. A\n\
+            broker's page adds the protocol facts a launch acts on and whether the global\n\
+            config binds it at all; a signer's states its auth point: the headers it may set,\n\
+            what of the request it is shown, and whether it is handed the credential's\n\
+            plaintext or a marker standing in for one.\n\
             \n\
             A built-in scheme is reported as such; a scheme several plugins claim is a\n\
             non-zero miss that names every claimant (all disabled until one remains); any\n\
@@ -2700,7 +2707,7 @@ const PAGES: &[Page] = &[
     Page {
         path: &["plugins", "install"],
         synopsis: "sbx plugins install <dir>",
-        summary: "install a resolver plugin from a local directory",
+        summary: "install a plugin from a local directory",
         options: &[("<dir>", "the plugin directory to copy in")],
         details: "A deliberate user act (an agent in the cage cannot run it). The staged copy is\n\
             validated exactly as the launcher will and refused, fail-closed, on any flaw. The\n\
@@ -2715,7 +2722,7 @@ const PAGES: &[Page] = &[
     Page {
         path: &["plugins", "rm"],
         synopsis: "sbx plugins rm <name>...",
-        summary: "remove installed resolver plugins",
+        summary: "remove installed plugins",
         options: &[(
             "<name>...",
             "the installed plugin(s) to remove (the token `list` shows)",

@@ -131,6 +131,7 @@ pub(crate) fn render_app_exported(name: &str, path: &Path, pal: &style::Palette)
 pub(crate) fn render_plugin_installed(
     name: &str,
     scheme: Option<&str>,
+    kind: crate::plugins::PluginKind,
     from_store: Option<&str>,
     pal: &style::Palette,
 ) -> String {
@@ -139,12 +140,14 @@ pub(crate) fn render_plugin_installed(
         Some(s) => format!(" from store '{n}{s}{r}'"),
         None => String::new(),
     };
-    // A resolver is placed under the namespace it answers for, so that is what the line shows. A
-    // broker claims none and is reached by its name, which the line already carries — so it is
-    // named by its type instead of by a namespace it does not have.
+    // A resolver is placed under the namespace it answers for, so that is what the line shows. The
+    // other kinds claim none and are reached by their name, which the line already carries — so
+    // each is named by its type instead of by a namespace it does not have. The type is passed in
+    // rather than inferred from the missing scheme: more than one kind has none, so "no scheme"
+    // names nothing.
     let what = match scheme {
         Some(scheme) => format!("{scheme}://"),
-        None => "broker".to_string(),
+        None => kind.token().to_string(),
     };
     format!(
         "{ok}installed{r} '{n}{name}{r}' {dim}({what}){r}{from} \
@@ -400,6 +403,7 @@ pub(crate) fn render_store_updated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::PluginKind as Kind;
 
     #[test]
     fn transactional_confirmations_are_plain_text_when_uncolored() {
@@ -407,11 +411,11 @@ mod tests {
         // empty spans, byte-identical plain text. Each line of the original wording is preserved.
         let p = style::Palette::plain();
         assert_eq!(
-            render_plugin_installed("pass", Some("pass"), None, &p),
+            render_plugin_installed("pass", Some("pass"), Kind::Resolver, None, &p),
             "installed 'pass' (pass://) — remove with: sbx plugins rm pass"
         );
         assert_eq!(
-            render_plugin_installed("vault", Some("vault"), Some("hub"), &p),
+            render_plugin_installed("vault", Some("vault"), Kind::Resolver, Some("hub"), &p),
             "installed 'vault' (vault://) from store 'hub' — remove with: sbx plugins rm vault"
         );
         assert_eq!(render_removed(None, "pass", &p), "removed 'pass'");
@@ -541,7 +545,7 @@ mod tests {
         // assertions above) only shows here.
         let p = style::Palette::colored();
 
-        let installed = render_plugin_installed("pass", Some("pass"), None, &p);
+        let installed = render_plugin_installed("pass", Some("pass"), Kind::Resolver, None, &p);
         assert!(installed.contains(&format!("{}installed{}", p.ok, p.reset)));
         assert!(installed.contains(&format!("'{}pass{}'", p.name, p.reset)));
 

@@ -902,3 +902,102 @@ fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
     let info = run(&["plugins", "info", "vault"], home.path());
     assert!(info.contains("scheme:      vault://"), "{info}");
 }
+
+/// A signer plugin source directory: a manifest declaring an auth point, and the executable it
+/// names.
+fn local_signer(root: &Path, name: &str, sets: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        format!(
+            "name=\"{name}\"\ntype=\"signer\"\nexec=\"sign\"\n[signer]\nsets_headers=[\"{sets}\"]\n"
+        ),
+    )
+    .unwrap();
+    let exec = dir.join("sign");
+    std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// The third kind, through the real binary: installed by name, listed as its own section, and
+/// inspected by that name rather than by a scheme it does not claim.
+#[test]
+fn a_signer_installs_under_its_name_and_states_the_auth_point_it_holds() {
+    let home = TmpDir::new();
+    let src = TmpDir::new();
+    let source = local_signer(src.path(), "demo-sigv4", "Authorization");
+    run(
+        &["plugins", "install", source.to_str().unwrap()],
+        home.path(),
+    );
+
+    let list = run(&["plugins", "list"], home.path());
+    assert!(
+        list.contains("installed signer plugins:") && list.contains("sets Authorization"),
+        "the listing names the kind and what the plugin may put on a request:\n{list}"
+    );
+
+    // Named by its name, and by nothing else: a signer claims no `scheme://`.
+    let info = run(&["plugins", "info", "demo-sigv4"], home.path());
+    assert!(info.contains("signer plugin: demo-sigv4"), "{info}");
+    assert!(
+        info.contains("sets:        Authorization"),
+        "the detail view states the bound on what it may write:\n{info}"
+    );
+    assert!(
+        info.contains("the method, the host and the target only"),
+        "and what of the request it is shown:\n{info}"
+    );
+    assert!(
+        info.contains("a marker standing in for it"),
+        "and that the plaintext stays out of it by default:\n{info}"
+    );
+
+    // A plugin's name is one namespace across the kinds reached by it. A broker answering to the
+    // same name is placed by hand under another directory, which is the only way to reach the
+    // state: every install path refuses a name another plugin already holds.
+    let plugins_dir = home.path().join("sbx/plugins");
+    let clash = plugins_dir.join("also-demo");
+    std::fs::create_dir_all(&clash).unwrap();
+    std::fs::write(
+        clash.join("plugin.toml"),
+        "name=\"demo-sigv4\"\ntype=\"broker\"\nexec=\"broker\"\n[broker]\n\
+         cage_env=[\"DEMO_SOCK\"]\nframing=\"line\"\nmax_frame=1024\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exec = clash.join("broker");
+        std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Both are disabled, and the name answers as neither.
+    let (code, out, err) = run_both(&["plugins", "info", "demo-sigv4"], home.path());
+    assert_ne!(code, 0, "stdout:\n{out}stderr:\n{err}");
+    assert!(
+        err.contains("claimed by 2 installed plugins"),
+        "`info` says why the name reaches nothing:\n{err}"
+    );
+    assert!(
+        out.contains("also-demo") && out.contains("sbx plugins rm"),
+        "and names every claimant with the way out:\n{out}"
+    );
+
+    let listing = run(&["plugins", "list"], home.path());
+    assert!(
+        listing.contains("name conflicts") && listing.contains("claimed by 2 plugins"),
+        "the listing reports the conflict as the state it is:\n{listing}"
+    );
+    assert!(
+        listing.contains("also-demo") && listing.contains("demo-sigv4"),
+        "and names every claimant to remove:\n{listing}"
+    );
+    assert!(
+        !listing.contains("installed signer plugins:"),
+        "a contested name resolves to nothing, so nothing lists as a signer:\n{listing}"
+    );
+}

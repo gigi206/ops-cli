@@ -346,9 +346,15 @@ The categories surface in [`sbx net logs`](observability#sbx-net-logs) as the
 per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text is
 never disclosed, so a global-config rule the cage cannot read does not leak),
 `denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,
-`outbound-secret`, and the transport-side `dns-failure`, `upstream-unreachable`,
-`upstream-cert-rejected`, and `upstream-closed`. A genuine upstream status (a real
-`404`) is relayed verbatim with no such header.
+`outbound-secret`, `signer-refused`, and the transport-side `dns-failure`,
+`upstream-unreachable`, `upstream-cert-rejected`, and `upstream-closed`. A genuine
+upstream status (a real `404`) is relayed verbatim with no such header.
+
+`signer-refused` is the one that is not a policy verdict: the policy allowed the host,
+and the request was refused because its credential could not be formed. See
+[`sign`](../configuration/secret#sign-a-credential-computed-from-the-request). Its body
+names the plugin and repeats the plugin's own reason, because a refusal that does not
+say who refused leaves every declaration to audit.
 
 `upstream-closed` is the one that names a server that accepted the request and then
 went away without answering. Saying so is deliberate: an empty relay would be

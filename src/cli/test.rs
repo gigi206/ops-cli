@@ -460,7 +460,7 @@ fn render_injection_note(secret: &config::HeaderSecret, pal: &style::Palette) ->
     let (dim, n, r) = (pal.dim, pal.name, pal.reset);
     format!(
         "  {dim}+ a credential would be injected:{r} {n}{}{r} {dim}(from {}){r}\n",
-        secret.header,
+        secret.headers().join(", "),
         secret.describe_sources()
     )
 }

@@ -99,19 +99,77 @@ pub(super) fn validate_host_secret(
     }
     let sources = resolve_host_sources(&raw, defaults, plugins)?;
     let to = validate_secret_target(host)?;
+    // A signer answers what a fixed value cannot, and it answers *all* of it: which headers this
+    // request carries comes from the plugin's reviewed manifest, so a declaration may not also
+    // state one. Refused rather than ignored, because a `header` that looked honoured and was not
+    // is exactly the silent misconfiguration this layer refuses everywhere else.
+    let signer = match raw.sign.as_deref() {
+        None => None,
+        Some(name) => {
+            for (field, present) in [
+                ("header", raw.header.is_some()),
+                ("type", raw.value_type.is_some()),
+                ("prefix", raw.prefix.is_some()),
+            ] {
+                if present {
+                    return Err(format!(
+                        "`sign` and `{field}` cannot both be set — a signer's manifest says which \
+                         headers it sets and how, so `{field}` here would state a second answer"
+                    ));
+                }
+            }
+            let plugin = plugins
+                .signer(name)
+                .ok_or_else(|| match plugins.name_conflict(name) {
+                    Some(claimants) => format!(
+                        "`sign` names `{name}`, which more than one installed plugin claims ({}) \
+                         — they are all disabled until one remains",
+                        crate::plugins::quoted_list(claimants)
+                    ),
+                    None => format!(
+                        "`sign` names `{name}`, which is not an installed signer plugin (see \
+                         `sbx plugins list`)"
+                    ),
+                })?;
+            Some(Box::new(plugin.clone()))
+        }
+    };
     // `header` and `type` may come from the entry or fall back to `[secret.defaults]`; an entry
     // that names neither (on itself or in the defaults) is the same explicit error as before —
-    // there is no silent built-in default.
-    let header = raw
-        .header
-        .as_deref()
-        .or(defaults.header.as_deref())
-        .ok_or_else(|| {
-            "set `header` (or a `[secret.defaults] header`) — the request header to set".to_string()
-        })?;
-    validate_header_name(header)?;
-    let value_type = raw.value_type.as_deref().or(defaults.value_type.as_deref());
-    let shape = validate_header_shape(value_type, raw.prefix.as_deref())?;
+    // there is no silent built-in default. A signed declaration takes neither: its inventory label
+    // is the first header its plugin declares, and its shape is the plugin.
+    let (header, shape) = match &signer {
+        // The first header the plugin declares. It is also what [`upsert_secret`] dedups on, which
+        // is the intended reading: two signed declarations to one host whose plugins lead with the
+        // same header would set it twice, and last-wins is the same answer an ordinary duplicate
+        // gets. Two plugins leading with different headers are two credentials, and both apply.
+        Some(plugin) => (
+            plugin.signer.sets_headers[0].clone(),
+            // Never read for a signed declaration: the plugin forms every value. Spelled as the
+            // empty transform rather than left unset, so nothing here can be mistaken for a shape
+            // that applies.
+            HeaderShape {
+                prefix: String::new(),
+                base64: false,
+            },
+        ),
+        None => {
+            let header = raw
+                .header
+                .as_deref()
+                .or(defaults.header.as_deref())
+                .ok_or_else(|| {
+                    "set `header` (or a `[secret.defaults] header`) — the request header to set"
+                        .to_string()
+                })?;
+            validate_header_name(header)?;
+            let value_type = raw.value_type.as_deref().or(defaults.value_type.as_deref());
+            (
+                header.to_string(),
+                validate_header_shape(value_type, raw.prefix.as_deref())?,
+            )
+        }
+    };
     let name = match raw.name.as_deref() {
         Some(n) => validate_secret_name(n)?.to_string(),
         None => host.to_string(),
@@ -121,8 +179,9 @@ pub(super) fn validate_host_secret(
         description: raw.description.as_deref().map(sanitize_description),
         sources,
         to,
-        header: header.to_string(),
+        header,
         shape,
+        signer,
     })
 }
 

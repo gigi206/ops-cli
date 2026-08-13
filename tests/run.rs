@@ -1106,6 +1106,267 @@ fn grpcb_in_reachable() -> bool {
     })
 }
 
+/// Whether the public `postman-echo.com` request echo is reachable — the signer e2e depends on it
+/// (it is the only way to see what actually reached the upstream), so an outage skips that test
+/// rather than reddening the suite.
+fn postman_echo_reachable() -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(mut addrs) = ("postman-echo.com", 443).to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|addr| {
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)).is_ok()
+    })
+}
+
+/// Stage a signer plugin: a manifest naming the headers it may set, and a Python executable that
+/// speaks the line-JSON protocol. `body` is the loop that answers each question, so one helper
+/// serves the plugin that signs, the one that refuses, and the one that oversteps its manifest.
+fn stage_signer(root: &Path, name: &str, reads_secret: bool, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = root.join(name);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        format!(
+            "name = \"{name}\"\ntype = \"signer\"\nexec = \"bin/sign\"\n\n\
+             [signer]\nsets_headers = [\"Authorization\", \"X-Demo-Date\"]\n\
+             reads_secret = {reads_secret}\n\n\
+             [sandbox]\nprograms = [\"python3\"]\n"
+        ),
+    )
+    .unwrap();
+    let exec = dir.join("bin/sign");
+    std::fs::write(
+        &exec,
+        format!(
+            "#!/usr/bin/env python3\nimport json, sys\n\
+             hello = json.loads(sys.stdin.readline())\n\
+             cred = hello[\"credential\"]\n\
+             print(json.dumps({{\"ok\": True}}), flush=True)\n\
+             for line in sys.stdin:\n    ask = json.loads(line)\n{body}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// A signer plugin forms the credential of every request to the host its declaration names, and
+/// what it forms reaches the upstream.
+///
+/// The proof needs a server that echoes the request back, because everything else about a signer is
+/// invisible from the cage: `postman-echo.com/get` returns the headers it received, so one round
+/// trip shows what sbx put on the wire. Four properties in one launch:
+///
+///   * **The plugin really runs.** A manifest is installed by the real `sbx plugins install`, and
+///     the launch spawns it under bwrap and completes a handshake before the first request.
+///   * **The value is per request.** Two requests differing only in their query produce two
+///     different signatures, from one process — which is the whole of what a fixed injection
+///     cannot do.
+///   * **A marker is substituted.** The plugin declaring `reads_secret = false` is handed a marker
+///     and says so; the *upstream* receives the real credential, and the reflection comes back
+///     masked, which is the needle for a signed credential being the key rather than the signature.
+///   * **The manifest bounds the answer.** A plugin that answers with a header it never declared,
+///     or that refuses outright, refuses the request with `signer-refused` — and it is not sent.
+///
+/// Skips (never fails) when the host cannot sandbox, the binary cache is unreachable (`curl` will
+/// not provision), or the echo service is down.
+#[test]
+fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds_it() {
+    let root = TmpDir::new("signer-e2e");
+    let project = TmpDir::new("signer-e2e-proj");
+    let data = TmpDir::new("signer-e2e-data");
+    let state = TmpDir::new("signer-e2e-state");
+    let key = "the-real-signing-key-8f2a-e2e";
+
+    let write_config = |signer: &str| {
+        std::fs::write(
+            project.path().join(".sbx.toml"),
+            format!(
+                "[packages]\ncurl = \"nix:curl\"\n\n\
+                 [network]\nmode = \"deny\"\nallow = [\"postman-echo.com\"]\n\n\
+                 [secret.\"postman-echo.com\"]\nfrom = \"env://SBX_E2E_SIGNING_KEY\"\n\
+                 sign = \"{signer}\"\n"
+            ),
+        )
+        .unwrap();
+        let trusted = sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["trust", ".sbx.toml"],
+        );
+        assert!(
+            trusted.status.success(),
+            "sbx trust failed: {}",
+            String::from_utf8_lossy(&trusted.stderr)
+        );
+    };
+
+    write_config("demo-signs");
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping signer e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping signer e2e: the binary cache is unreachable");
+        return;
+    }
+    if !postman_echo_reachable() {
+        eprintln!("skipping signer e2e: postman-echo.com is unreachable");
+        return;
+    }
+
+    // The signature is an HMAC over the request's own canonical form, so two targets cannot share
+    // one — which is what makes it a signature rather than a token.
+    let signs = stage_signer(
+        root.path(),
+        "demo-signs",
+        true,
+        "    import hashlib, hmac\n\
+         \x20   canonical = f\"{ask['method']}\\n{ask['target']}\\n{hello['host']}\"\n\
+         \x20   sig = hmac.new(cred['value'].encode(), canonical.encode(), hashlib.sha256).hexdigest()\n\
+         \x20   print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": f\"DEMO {sig}\", \"X-Demo-Date\": \"20260813T000000Z\"}}), flush=True)",
+    );
+    let marker = stage_signer(
+        root.path(),
+        "demo-marker",
+        false,
+        "    print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": f\"Token {cred['value']}\", \"X-Demo-Date\": f\"kind={cred['kind']}\"}}), flush=True)",
+    );
+    let refuses = stage_signer(
+        root.path(),
+        "demo-refuses",
+        true,
+        "    print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region\"}), flush=True)",
+    );
+    let oversteps = stage_signer(
+        root.path(),
+        "demo-oversteps",
+        true,
+        "    print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": \"ok\", \"Host\": \"evil.example.com\"}}), flush=True)",
+    );
+    for dir in [&signs, &marker, &refuses, &oversteps] {
+        let out = sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["plugins", "install", dir.to_str().unwrap()],
+        );
+        assert!(
+            out.status.success(),
+            "installing {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The install line names what was installed. A scheme-less plugin used to read as a
+        // broker whatever it was, which is the one thing this line exists to say.
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("(signer)"),
+            "the install must name the kind: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    let echo = |sig: &str, query: &str| -> String {
+        let out = sbx()
+            .args([
+                "run",
+                "--",
+                "curl",
+                "-s",
+                &format!("https://postman-echo.com/get{query}"),
+            ])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .env("SBX_E2E_SIGNING_KEY", key)
+            .output()
+            .expect("spawn sbx run");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            stdout.contains("postman-echo.com"),
+            "the {sig} request did not reach the echo: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    };
+
+    // 1. The plugin's headers reach the upstream, and the signature is bound to the request.
+    let first = echo("demo-signs", "?a=1");
+    let second = echo("demo-signs", "?a=2");
+    let of = |body: &str| -> String {
+        let at = body
+            .find("DEMO ")
+            .expect("the signature reached the upstream");
+        body[at + 5..at + 5 + 64].to_string()
+    };
+    assert_ne!(
+        of(&first),
+        of(&second),
+        "a signature is a function of the request: two targets cannot share one"
+    );
+    assert!(
+        first.contains("x-demo-date"),
+        "every header the manifest declares is put on the request: {first}"
+    );
+
+    // 2. The marker path: the plugin places what it never learns, the upstream gets the real
+    //    credential, and the reflection is masked on the way back.
+    write_config("demo-marker");
+    let echoed = echo("demo-marker", "");
+    assert!(
+        echoed.contains("kind=marker"),
+        "the plugin must be handed a marker, and know it: {echoed}"
+    );
+    assert!(
+        !echoed.contains(key),
+        "the credential reflected by the upstream must be masked on the way back: {echoed}"
+    );
+    assert!(
+        echoed.contains(&"*".repeat(key.len())),
+        "and masked length-preservingly, which is what says the real value reached the upstream: \
+         {echoed}"
+    );
+
+    // 3. The manifest bounds the answer, and a refusal is a refusal: neither request is sent.
+    for (signer, expected) in [
+        ("demo-refuses", "no credentials for that region"),
+        ("demo-oversteps", "does not declare in `sets_headers`"),
+    ] {
+        write_config(signer);
+        let out = sbx()
+            .args([
+                "run",
+                "--",
+                "curl",
+                "-s",
+                "-i",
+                "https://postman-echo.com/get",
+            ])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .env("SBX_E2E_SIGNING_KEY", key)
+            .output()
+            .expect("spawn sbx run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("403 Forbidden") && stdout.contains("signer-refused"),
+            "{signer}: the request must be refused with its own reason token: {stdout}"
+        );
+        assert!(
+            stdout.contains(expected) && stdout.contains("so it was not sent"),
+            "{signer}: the refusal must name why, and say the request was not sent: {stdout}"
+        );
+    }
+}
+
 /// Whether a failed build log shows a *transient* upstream-download fault — a truncated tarball,
 /// a reset connection, an upstream stall — rather than a real failure of the code under test. The
 /// heavy `flake:` e2es fetch tens of megabytes of nixpkgs per fresh run, so an occasional

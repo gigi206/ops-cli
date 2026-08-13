@@ -94,7 +94,11 @@ fn secret_list(args: &[OsString]) -> ExitCode {
         any = true;
         let mut line = format!(
             "{}{}{}  wire -> {} ({})",
-            palette.name, secret.name, palette.reset, secret.to, secret.header
+            palette.name,
+            secret.name,
+            palette.reset,
+            secret.to,
+            secret.headers().join(", ")
         );
         if sources {
             line.push_str(&format!("  from {}", secret.describe_sources()));

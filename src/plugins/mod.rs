@@ -27,12 +27,14 @@
 /// offline Ed25519 trust core, and [`stores`] is the impure git-driven fetch/verify/cache
 /// shell around it. [`origin`] records where each installed plugin came from, which a manifest
 /// (identical whatever the source) cannot say.
-/// [`broker`] holds the second plugin type: a filter in front of a host resource, which the
-/// registry indexes by name rather than by scheme because a broker claims no ref namespace.
+/// [`broker`] and [`signer`] hold the two plugin types that are not resolvers: a filter in front
+/// of a host resource, and a value-former at an HTTP request's auth point. The registry indexes
+/// both by name rather than by scheme, because neither claims a ref namespace.
 pub(crate) mod broker;
 pub(crate) mod catalogue;
 pub(crate) mod origin;
 pub(crate) mod programs;
+pub(crate) mod signer;
 pub(crate) mod stores;
 
 use serde::Deserialize;
@@ -50,6 +52,12 @@ pub(crate) fn builtin_schemes() -> &'static [&'static str] {
     BUILTIN_SCHEMES
 }
 
+/// The types a manifest may declare, as an error message spells them. Written once because two
+/// messages name the set — the one for a `type` that is not a type, and the one for a manifest with
+/// no `type` at all — and a list that grew in only one of them would tell half the authors that a
+/// type they can use does not exist.
+const SUPPORTED_TYPES: &str = "\"resolver\", \"broker\", \"signer\"";
+
 /// What kind of plugin something is, wherever that has to be said: a `plugin.toml` manifest, a
 /// signed store catalogue, or a listing. One vocabulary, so a manifest and a catalogue cannot
 /// disagree about how a type is spelled, and a new type is added in one place.
@@ -59,6 +67,9 @@ pub(crate) enum PluginKind {
     Resolver,
     /// Stands between the cage and a host resource, ruling on the protocol's messages.
     Broker,
+    /// Forms the credential that authenticates one outbound request, at the auth point of a
+    /// destination a `[[secret]]` names.
+    Signer,
 }
 
 impl PluginKind {
@@ -67,11 +78,12 @@ impl PluginKind {
         match self {
             PluginKind::Resolver => "resolver",
             PluginKind::Broker => "broker",
+            PluginKind::Signer => "signer",
         }
     }
 
     /// Whether this kind claims a `scheme://` namespace. A resolver is *reached* through one; a
-    /// broker is reached by name, so a scheme on one would be read by nothing.
+    /// broker and a signer are reached by name, so a scheme on either would be read by nothing.
     pub(crate) fn claims_a_scheme(self) -> bool {
         matches!(self, PluginKind::Resolver)
     }
@@ -81,8 +93,9 @@ impl PluginKind {
         match raw {
             "resolver" => Ok(PluginKind::Resolver),
             "broker" => Ok(PluginKind::Broker),
+            "signer" => Ok(PluginKind::Signer),
             other => Err(format!(
-                "unsupported plugin type `{other}` (supported: \"resolver\", \"broker\")"
+                "unsupported plugin type `{other}` (supported: {SUPPORTED_TYPES})"
             )),
         }
     }
@@ -357,13 +370,16 @@ pub(crate) struct SandboxGrant {
 pub(crate) struct PluginRegistry {
     resolvers: BTreeMap<String, ResolverPlugin>,
     brokers: BTreeMap<String, broker::BrokerPlugin>,
+    signers: BTreeMap<String, signer::SignerPlugin>,
     /// Every ambiguous scheme → the directory names claiming it, in discovery order. A scheme
     /// listed here is claimed by no one: all of its claimants are disabled until exactly one
     /// remains. Recorded rather than merely warned about, so every surface can *show* the
     /// conflict and name the plugins to remove.
     conflicts: BTreeMap<String, Vec<String>>,
-    /// The same, for broker names.
-    broker_conflicts: BTreeMap<String, Vec<String>>,
+    /// The same, for a plugin **name** — the key a broker and a signer are each reached by. One
+    /// map for both, because they are one namespace: a name is how a config names a plugin, so two
+    /// plugins answering to one name are ambiguous whether or not they are the same type.
+    name_conflicts: BTreeMap<String, Vec<String>>,
 }
 
 /// What the claim rule needs of a plugin: the token `sbx plugins rm` takes for it.
@@ -378,6 +394,12 @@ impl Claimant for ResolverPlugin {
 }
 
 impl Claimant for broker::BrokerPlugin {
+    fn claimant_name(&self) -> &str {
+        self.dir_name()
+    }
+}
+
+impl Claimant for signer::SignerPlugin {
     fn claimant_name(&self) -> &str {
         self.dir_name()
     }
@@ -450,8 +472,9 @@ impl PluginRegistry {
 
         let mut resolvers: BTreeMap<String, ResolverPlugin> = BTreeMap::new();
         let mut brokers: BTreeMap<String, broker::BrokerPlugin> = BTreeMap::new();
+        let mut signers: BTreeMap<String, signer::SignerPlugin> = BTreeMap::new();
         let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut broker_conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut name_conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for dir in dirs {
             let plugin = match load_one(&dir, exp) {
                 Ok(Some(plugin)) => plugin,
@@ -473,15 +496,47 @@ impl PluginRegistry {
                 // two resolvers sharing a scheme, and are disabled on the same rule.
                 Plugin::Broker(plugin) => {
                     let name = plugin.name.clone();
-                    claim(&mut brokers, &mut broker_conflicts, name, *plugin);
+                    claim(&mut brokers, &mut name_conflicts, name, *plugin);
+                }
+                // A signer claims its **name** for the same reason: that is what a `[[secret]]`
+                // names to be signed by it. Both file into one conflict map, since both are that
+                // one namespace.
+                Plugin::Signer(plugin) => {
+                    let name = plugin.name.clone();
+                    claim(&mut signers, &mut name_conflicts, name, *plugin);
                 }
             }
         }
+
+        // `claim` catches two plugins of one *type* sharing a name, each index knowing only its
+        // own. A broker and a signer sharing one is the case it cannot see, and it is ambiguous for
+        // the same reason: a name is what a config names, and nothing about `[broker.foo]` and
+        // `sign = "foo"` says they are two plugins. Reaching this takes placing directories by hand
+        // — an install refuses a name already installed — but the registry describes it rather than
+        // handing each namespace a different plugin under one name.
+        let shared: Vec<String> = brokers
+            .keys()
+            .filter(|name| signers.contains_key(*name))
+            .cloned()
+            .collect();
+        for name in shared {
+            let mut claimants = Vec::new();
+            if let Some(plugin) = brokers.remove(&name) {
+                claimants.push(plugin.dir_name().to_string());
+            }
+            if let Some(plugin) = signers.remove(&name) {
+                claimants.push(plugin.dir_name().to_string());
+            }
+            claimants.sort();
+            name_conflicts.insert(name, claimants);
+        }
+
         Self {
             resolvers,
             brokers,
+            signers,
             conflicts,
-            broker_conflicts,
+            name_conflicts,
         }
     }
 
@@ -514,11 +569,11 @@ impl PluginRegistry {
                     quoted_list(claimants)
                 )
             })
-            .chain(self.broker_conflicts.iter().map(|(name, claimants)| {
+            .chain(self.name_conflicts.iter().map(|(name, claimants)| {
                 format!(
-                    "plugins: broker name `{name}` is claimed by more than one plugin ({}) — all \
-                     are disabled until one remains (a broker's name is how a config names it, so \
-                     it must be unique)",
+                    "plugins: the name `{name}` is claimed by more than one plugin ({}) — all are \
+                     disabled until one remains (a plugin's name is how a config names it, so it \
+                     must be unique)",
                     quoted_list(claimants)
                 )
             }))
@@ -526,20 +581,38 @@ impl PluginRegistry {
     }
 
     /// The broker plugin called `name`, if any. A name claimed by more than one plugin has no
-    /// broker — ask [`broker_conflict`](Self::broker_conflict) to tell that apart from nothing
+    /// broker — ask [`name_conflict`](Self::name_conflict) to tell that apart from nothing
     /// claiming it.
     pub(crate) fn broker(&self, name: &str) -> Option<&broker::BrokerPlugin> {
         self.brokers.get(name)
     }
 
-    /// The directory names claiming the broker name `name` when more than one does.
-    pub(crate) fn broker_conflict(&self, name: &str) -> Option<&[String]> {
-        self.broker_conflicts.get(name).map(Vec::as_slice)
+    /// The signer plugin called `name`, if any, with the same distinction to draw on `None`.
+    pub(crate) fn signer(&self, name: &str) -> Option<&signer::SignerPlugin> {
+        self.signers.get(name)
+    }
+
+    /// The directory names claiming the plugin name `name` when more than one does — of either
+    /// type, since a name is one namespace.
+    pub(crate) fn name_conflict(&self, name: &str) -> Option<&[String]> {
+        self.name_conflicts.get(name).map(Vec::as_slice)
+    }
+
+    /// Every ambiguous plugin name with its claimants, ordered by name.
+    pub(crate) fn name_conflicts(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.name_conflicts
+            .iter()
+            .map(|(name, claimants)| (name.as_str(), claimants.as_slice()))
     }
 
     /// The installed broker plugins, ordered by name — for `sbx plugins`.
     pub(crate) fn brokers(&self) -> impl Iterator<Item = &broker::BrokerPlugin> {
         self.brokers.values()
+    }
+
+    /// The installed signer plugins, ordered by name — for `sbx plugins`.
+    pub(crate) fn signers(&self) -> impl Iterator<Item = &signer::SignerPlugin> {
+        self.signers.values()
     }
 
     /// The installed resolver plugins, ordered by scheme (the `BTreeMap` key) — for `sbx plugins`.
@@ -560,6 +633,16 @@ impl PluginRegistry {
     pub(crate) fn with(plugins: impl IntoIterator<Item = ResolverPlugin>) -> Self {
         Self {
             resolvers: plugins.into_iter().map(|p| (p.scheme.clone(), p)).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The same for brokers, which the config layer also reads a manifest from — it validates a
+    /// `[plugin.<name>]` table against the grant the registry holds.
+    #[cfg(test)]
+    pub(crate) fn with_brokers(plugins: impl IntoIterator<Item = broker::BrokerPlugin>) -> Self {
+        Self {
+            brokers: plugins.into_iter().map(|p| (p.name.clone(), p)).collect(),
             ..Self::default()
         }
     }
@@ -586,6 +669,8 @@ struct RawManifest {
     sandbox: RawSandbox,
     /// The `[broker]` table, required by (and only by) `type = "broker"`.
     broker: Option<broker::RawBroker>,
+    /// The `[signer]` table, required by (and only by) `type = "signer"`.
+    signer: Option<signer::RawSigner>,
 }
 
 /// The raw `[sandbox]` table, before path expansion and key validation.
@@ -620,13 +705,14 @@ pub(crate) struct StoreClaim<'a> {
     pub(crate) scheme: Option<&'a str>,
 }
 
-/// A validated plugin of either type. The two are indexed differently (a resolver by the scheme
-/// it claims, a broker by its name) and run under different contracts, so discovery hands back
-/// which one it read rather than a single widened struct that would have to carry both.
+/// A validated plugin of any type. They are indexed differently (a resolver by the scheme it
+/// claims, a broker and a signer by their name) and run under different contracts, so discovery
+/// hands back which one it read rather than a single widened struct that would have to carry all.
 #[derive(Debug)]
 enum Plugin {
     Resolver(Box<ResolverPlugin>),
     Broker(Box<broker::BrokerPlugin>),
+    Signer(Box<signer::SignerPlugin>),
 }
 
 impl Plugin {
@@ -635,14 +721,15 @@ impl Plugin {
         match self {
             Plugin::Resolver(p) => &p.name,
             Plugin::Broker(p) => &p.name,
+            Plugin::Signer(p) => &p.name,
         }
     }
 
-    /// The scheme this plugin claims, or `None` for a broker, which claims none.
+    /// The scheme this plugin claims, or `None` for the types reached by name, which claim none.
     fn scheme(&self) -> Option<&str> {
         match self {
             Plugin::Resolver(p) => Some(&p.scheme),
-            Plugin::Broker(_) => None,
+            Plugin::Broker(_) | Plugin::Signer(_) => None,
         }
     }
 
@@ -651,6 +738,7 @@ impl Plugin {
         match self {
             Plugin::Resolver(p) => &p.exec,
             Plugin::Broker(p) => &p.exec,
+            Plugin::Signer(p) => &p.exec,
         }
     }
 
@@ -660,12 +748,19 @@ impl Plugin {
         check_exec_at(self.exec())
     }
 
-    /// The manifest's `type`, for a message that has to say what was read.
-    fn type_token(&self) -> &'static str {
+    /// What kind this is, for a message (or a listing) that has to say what was read.
+    fn kind(&self) -> PluginKind {
         match self {
-            Plugin::Resolver(_) => "resolver",
-            Plugin::Broker(_) => "broker",
+            Plugin::Resolver(_) => PluginKind::Resolver,
+            Plugin::Broker(_) => PluginKind::Broker,
+            Plugin::Signer(_) => PluginKind::Signer,
         }
+    }
+
+    /// The manifest's `type` as a token. Spelled by [`PluginKind`], so a listing and a manifest
+    /// cannot disagree about how a type is written.
+    fn type_token(&self) -> &'static str {
+        self.kind().token()
     }
 }
 
@@ -689,26 +784,25 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
     // arm below validates the fields its own type reads, and refuses the other type's.
     let kind = match raw.plugin_type.as_deref() {
         Some(raw) => PluginKind::parse(raw)?,
-        None => return Err("missing `type` (supported: \"resolver\", \"broker\")".to_string()),
+        None => return Err(format!("missing `type` (supported: {SUPPORTED_TYPES})")),
     };
-    let is_broker = !kind.claims_a_scheme();
 
-    // A scheme is the resolver's namespace and a broker claims none: accepting one from a broker
+    // A scheme is the resolver's namespace and the other types claim none: accepting one from them
     // would leave an author believing a `scheme://` ref routed to their plugin, when nothing reads
     // it. The reverse is the long-standing requirement.
-    let scheme = match (is_broker, raw.scheme) {
-        (false, Some(scheme)) => {
+    let scheme = match (kind.claims_a_scheme(), raw.scheme) {
+        (true, Some(scheme)) => {
             validate_scheme(&scheme)?;
             Some(scheme)
         }
-        (false, None) => return Err("missing `scheme`".to_string()),
-        (true, None) => None,
-        (true, Some(_)) => {
-            return Err(
-                "a broker plugin declares no `scheme` — it stands in front of a host resource \
-                 rather than claiming a `scheme://` a secret's `from` can name"
-                    .to_string(),
-            );
+        (true, None) => return Err("missing `scheme`".to_string()),
+        (false, None) => None,
+        (false, Some(_)) => {
+            return Err(format!(
+                "a {} plugin declares no `scheme` — it is reached by its name rather than by \
+                 claiming a `scheme://` a secret's `from` can name",
+                kind.token()
+            ));
         }
     };
 
@@ -775,49 +869,81 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
         brokers: raw.sandbox.brokers,
     };
 
+    // A table belonging to another type declares something nothing reads, which is the same trap
+    // `deny_unknown_fields` closes one level down: an author who wrote `[signer]` under
+    // `type = "resolver"` has declared an auth point no request will ever reach. Checked for every
+    // type against its own table, so each arm below meets a manifest carrying only what it reads.
+    let foreign = match kind {
+        PluginKind::Broker => raw.signer.is_some().then_some("[signer]"),
+        PluginKind::Signer => raw.broker.is_some().then_some("[broker]"),
+        PluginKind::Resolver => raw
+            .broker
+            .is_some()
+            .then_some("[broker]")
+            .or(raw.signer.is_some().then_some("[signer]")),
+    };
+    if let Some(table) = foreign {
+        return Err(format!(
+            "a `{table}` table on a {} plugin declares something nothing reads — that table \
+             belongs to `type = \"{}\"`",
+            kind.token(),
+            table.trim_matches(['[', ']'])
+        ));
+    }
+
     // `host` is filled in by the config layer once `[plugin.<name>]` has been layered and gated: a
     // manifest is loaded from disk with no notion of what this host answers.
-    if is_broker {
-        let raw_broker = raw
-            .broker
-            .ok_or("missing the `[broker]` table, which a broker plugin is defined by")?;
-        broker::check_sandbox(&sandbox)?;
-        let spec = broker::validate(
-            raw_broker,
-            &name,
-            is_valid_env_key,
-            crate::config::is_reserved_env_key,
-        )?;
-        return Ok(Some(Plugin::Broker(Box::new(broker::BrokerPlugin {
+    match kind {
+        PluginKind::Broker => {
+            let raw_broker = raw
+                .broker
+                .ok_or("missing the `[broker]` table, which a broker plugin is defined by")?;
+            broker::check_sandbox(&sandbox)?;
+            let spec = broker::validate(
+                raw_broker,
+                &name,
+                is_valid_env_key,
+                crate::config::is_reserved_env_key,
+            )?;
+            Ok(Some(Plugin::Broker(Box::new(broker::BrokerPlugin {
+                name,
+                dir: dir.to_path_buf(),
+                exec,
+                sandbox,
+                broker: spec,
+                version: raw.version,
+                description: raw.description,
+                host: HostConfig::default(),
+            }))))
+        }
+        PluginKind::Signer => {
+            let raw_signer = raw
+                .signer
+                .ok_or("missing the `[signer]` table, which a signer plugin is defined by")?;
+            signer::check_sandbox(&sandbox)?;
+            let spec = signer::validate(raw_signer, &name)?;
+            Ok(Some(Plugin::Signer(Box::new(signer::SignerPlugin {
+                name,
+                dir: dir.to_path_buf(),
+                exec,
+                sandbox,
+                signer: spec,
+                version: raw.version,
+                description: raw.description,
+                host: HostConfig::default(),
+            }))))
+        }
+        PluginKind::Resolver => Ok(Some(Plugin::Resolver(Box::new(ResolverPlugin {
             name,
+            scheme: scheme.expect("a resolver's scheme is required above"),
             dir: dir.to_path_buf(),
             exec,
             sandbox,
-            broker: spec,
             version: raw.version,
             description: raw.description,
             host: HostConfig::default(),
-        }))));
+        })))),
     }
-
-    if raw.broker.is_some() {
-        return Err(
-            "a `[broker]` table on a resolver plugin declares a protocol nothing reads — the \
-             table belongs to `type = \"broker\"`"
-                .to_string(),
-        );
-    }
-
-    Ok(Some(Plugin::Resolver(Box::new(ResolverPlugin {
-        name,
-        scheme: scheme.expect("a resolver's scheme is required above"),
-        dir: dir.to_path_buf(),
-        exec,
-        sandbox,
-        version: raw.version,
-        description: raw.description,
-        host: HostConfig::default(),
-    }))))
 }
 
 /// Validate a ref scheme: a lowercase URI scheme (`[a-z][a-z0-9+.-]*`) that is not one of the
@@ -999,10 +1125,13 @@ fn is_valid_env_key(key: &str) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Installed {
     pub(crate) name: String,
-    /// The scheme the plugin claims, or `None` for a broker, which claims none. What a caller
-    /// renders differs accordingly: a resolver is named by the namespace it answers for, a broker
-    /// by the name a config reaches it through.
+    /// The scheme the plugin claims, or `None` for the kinds reached by name, which claim none.
+    /// What a caller renders differs accordingly: a resolver is named by the namespace it answers
+    /// for, the others by their type, which is why [`Self::kind`] travels with it.
     pub(crate) scheme: Option<String>,
+    /// What was installed. Carried rather than inferred from the absence of a scheme: with more
+    /// than one scheme-less kind, "no scheme" no longer names a type.
+    pub(crate) kind: PluginKind,
 }
 
 /// Install a resolver plugin from a local source directory into `<data>/plugins/<name>/`, where it
@@ -1211,23 +1340,31 @@ fn install_inner(
                 ));
             }
         }
-        // A broker's namespace is its name, and the same two states are refused for the same
-        // reason: a name already ambiguous, and a name another installed broker holds.
+        // A broker and a signer share one namespace — their name — and the same two states are
+        // refused for the same reason: a name already ambiguous, and a name another installed
+        // plugin holds. Across both types, not within one: two plugins under one name are what the
+        // registry disables, and installing into that state is what this refusal exists to stop.
         None => {
-            if let Some(claimants) = installed.broker_conflict(&name) {
+            if let Some(claimants) = installed.name_conflict(&name) {
                 return Err(format!(
-                    "the broker name `{name}` is claimed by more than one installed plugin ({}) \
-                     — they are all disabled; remove all but one with `sbx plugins rm <name>` \
-                     first",
+                    "the plugin name `{name}` is claimed by more than one installed plugin ({}) — \
+                     they are all disabled; remove all but one with `sbx plugins rm <name>` first",
                     quoted_list(claimants)
                 ));
             }
-            if let Some(other) = installed.broker(&name)
-                && other.dir != dest
+            let held = installed
+                .broker(&name)
+                .map(|p| (p.dir.as_path(), p.dir_name()))
+                .or_else(|| {
+                    installed
+                        .signer(&name)
+                        .map(|p| (p.dir.as_path(), p.dir_name()))
+                });
+            if let Some((dir, holder)) = held
+                && dir != dest
             {
-                let holder = other.dir_name();
                 return Err(format!(
-                    "the broker name `{name}` is already taken by the installed plugin from {} — \
+                    "the plugin name `{name}` is already taken by the installed plugin from {} — \
                      remove it first with `sbx plugins rm {holder}`",
                     origin::read(layout, holder).short()
                 ));
@@ -1313,6 +1450,7 @@ fn install_inner(
             Ok(Installed {
                 name,
                 scheme: probe.scheme().map(str::to_string),
+                kind: probe.kind(),
             })
         }
         Err(e) => {
@@ -1636,18 +1774,16 @@ mod tests {
             "an ambiguous name must resolve to nothing"
         );
         let claimants = reg
-            .broker_conflict("gpg-agent")
+            .name_conflict("gpg-agent")
             .expect("the conflict is recorded");
         assert_eq!(claimants, ["first", "second"]);
         // Recorded *and* rendered: a caller that only relays text must still be able to name both
         // plugins to remove.
         let rendered = reg.conflict_warnings();
         assert!(
-            rendered
-                .iter()
-                .any(|w| w.contains("broker name `gpg-agent`")
-                    && w.contains("`first`")
-                    && w.contains("`second`")),
+            rendered.iter().any(|w| w.contains("the name `gpg-agent`")
+                && w.contains("`first`")
+                && w.contains("`second`")),
             "{rendered:?}"
         );
     }
@@ -1782,9 +1918,11 @@ mod tests {
     }
 
     /// A type nothing implements is refused, and the refusal names every type that *is* — the
-    /// list a manifest author has to choose from.
+    /// list a manifest author has to choose from. It is also what keeps that list from going
+    /// stale: a type added to the parser and not to the message would tell half the authors that
+    /// a type they can use does not exist.
     #[test]
-    fn an_unknown_type_names_both_supported_ones() {
+    fn an_unknown_type_names_every_supported_one() {
         let root = crate::testutil::TmpDir::new();
         write_plugin(
             root.path(),
@@ -1803,7 +1941,161 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("unsupported plugin type")
                     && w.contains("resolver")
-                    && w.contains("broker")),
+                    && w.contains("broker")
+                    && w.contains("signer")),
+            "{warnings:?}"
+        );
+    }
+
+    /// The signer manifest a `[signer]` table is read from, for the tests that vary one field.
+    fn signer_manifest(extra: &str) -> String {
+        format!(
+            r#"
+                name = "aws-sigv4"
+                type = "signer"
+                exec = "sign"
+                [signer]
+                sets_headers = ["Authorization", "X-Amz-Date"]
+                {extra}
+            "#
+        )
+    }
+
+    #[test]
+    fn loads_a_valid_signer_under_its_name() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(root.path(), "aws-sigv4", &signer_manifest(""));
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let p = reg.signer("aws-sigv4").expect("the signer is registered");
+        assert_eq!(
+            p.signer.sets_headers,
+            vec!["Authorization".to_string(), "X-Amz-Date".to_string()]
+        );
+        assert!(
+            !p.signer.reads_secret,
+            "the plaintext stays out of the plugin unless the manifest asks"
+        );
+        assert!(
+            reg.resolver("aws-sigv4").is_none() && reg.broker("aws-sigv4").is_none(),
+            "a signer is reachable as a signer and as nothing else"
+        );
+    }
+
+    /// A broker and a signer are reached by the same kind of key — a plugin's name — so one name
+    /// held by both is ambiguous, and nothing about `[broker.foo]` and a `[[secret]]` naming `foo`
+    /// says they are two different plugins.
+    #[test]
+    fn a_broker_and_a_signer_claiming_one_name_are_both_disabled() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(root.path(), "as-broker", &broker_manifest(""));
+        write_plugin(
+            root.path(),
+            "as-signer",
+            &signer_manifest("").replace("aws-sigv4", "gpg-agent"),
+        );
+        let (reg, _) = load(root.path());
+        assert!(
+            reg.broker("gpg-agent").is_none() && reg.signer("gpg-agent").is_none(),
+            "one name may not answer as two plugins"
+        );
+        let claimants = reg
+            .name_conflict("gpg-agent")
+            .expect("the conflict is recorded");
+        assert_eq!(claimants, ["as-broker", "as-signer"]);
+    }
+
+    /// A signer with no `[signer]` table is not a signer, and the refusal says which table.
+    #[test]
+    fn a_signer_without_its_table_is_refused() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "bare",
+            r#"
+                name = "bare"
+                type = "signer"
+                exec = "sign"
+            "#,
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.signer("bare").is_none());
+        assert!(
+            warnings.iter().any(|w| w.contains("[signer]")),
+            "{warnings:?}"
+        );
+    }
+
+    /// Every type refuses the tables it does not read, in both directions: a table nothing reads
+    /// leaves an author believing they declared something they did not.
+    #[test]
+    fn a_signer_table_is_refused_on_every_other_type() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "signing-resolver",
+            r#"
+                name   = "signing-resolver"
+                type   = "resolver"
+                scheme = "sgn"
+                exec   = "resolve"
+                [signer]
+                sets_headers = ["Authorization"]
+            "#,
+        );
+        write_plugin(
+            root.path(),
+            "signing-broker",
+            &broker_manifest("\n[signer]\nsets_headers = [\"Authorization\"]"),
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.resolver("sgn").is_none() && reg.broker("gpg-agent").is_none());
+        for who in ["signing-resolver", "signing-broker"] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(who) && w.contains("`[signer]` table")),
+                "{who}: {warnings:?}"
+            );
+        }
+    }
+
+    /// The grants a signer never gets, refused at load rather than at launch: a manifest that asked
+    /// for them must not be installable and merely inert.
+    #[test]
+    fn a_signer_may_not_ask_for_network_or_state() {
+        for (grant, needle) in [("network = true", "network"), ("state = true", "state")] {
+            let root = crate::testutil::TmpDir::new();
+            write_plugin(
+                root.path(),
+                "greedy",
+                &signer_manifest(&format!("[sandbox]\n{grant}")),
+            );
+            let (reg, warnings) = load(root.path());
+            assert!(reg.signer("aws-sigv4").is_none(), "grant: {grant}");
+            assert!(
+                warnings.iter().any(|w| w.contains(needle)),
+                "grant: {grant}, warnings: {warnings:?}"
+            );
+        }
+    }
+
+    /// A signer claims no `scheme://`: accepting one would leave an author believing a secret's
+    /// `from` routed to their plugin, when nothing reads it.
+    #[test]
+    fn a_signer_that_claims_a_scheme_is_refused() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "schemed",
+            &signer_manifest("").replace("exec = \"sign\"", "scheme = \"sig\"\nexec = \"sign\""),
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.signer("aws-sigv4").is_none() && reg.resolver("sig").is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("signer") && w.contains("no `scheme`")),
             "{warnings:?}"
         );
     }
@@ -2827,13 +3119,13 @@ mod tests {
         );
     }
 
-    /// The name is a broker's whole namespace, so a second claimant is refused at install for the
-    /// reason a contested scheme is: placing it would make the registry drop both, and call that
-    /// success. The holder here sits in a directory of another name (a hand-placed tree, or one
-    /// whose manifest renames it), which is what puts the two on different paths and takes the
-    /// question past the plain "already installed" guard.
+    /// The name is the whole namespace of a broker and of a signer alike, so a second claimant is
+    /// refused at install for the reason a contested scheme is: placing it would make the registry
+    /// drop both, and call that success. The holder here sits in a directory of another name (a
+    /// hand-placed tree, or one whose manifest renames it), which is what puts the two on
+    /// different paths and takes the question past the plain "already installed" guard.
     #[test]
-    fn install_refuses_a_broker_name_another_plugin_already_claims() {
+    fn install_refuses_a_plugin_name_another_plugin_already_claims() {
         let data = crate::testutil::TmpDir::new();
         let src_root = crate::testutil::TmpDir::new();
         let layout = crate::store::Layout::under(data.path());
@@ -2844,7 +3136,7 @@ mod tests {
         let source = source_broker(src_root.path(), "checkout", "gpg-agent");
         let err = install(&layout, &source).unwrap_err();
         assert!(
-            err.contains("broker name `gpg-agent`") && err.contains("hand-placed"),
+            err.contains("plugin name `gpg-agent`") && err.contains("hand-placed"),
             "the refusal must name the key and the holder to remove: {err}"
         );
         assert!(err.contains("sbx plugins rm"), "{err}");
@@ -2853,7 +3145,7 @@ mod tests {
         let (reg, warnings) = load(&layout.plugins_dir());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(reg.broker("gpg-agent").is_some());
-        assert!(reg.broker_conflict("gpg-agent").is_none());
+        assert!(reg.name_conflict("gpg-agent").is_none());
         assert!(!layout.plugins_dir().join("gpg-agent").exists());
     }
 

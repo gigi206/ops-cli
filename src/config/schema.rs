@@ -863,6 +863,13 @@ pub(crate) struct RawHostSecret {
     /// An optional prefix overriding the type's default (`Bearer ` for bearer, empty for
     /// raw, `Basic ` for basic).
     pub(crate) prefix: Option<String>,
+    /// The **signer plugin** that forms this credential per request, by name. Names the auth
+    /// points a fixed value cannot express: a signature over the request, a per-request nonce.
+    ///
+    /// Mutually exclusive with `header`, `type` and `prefix`: with a signer, which headers a
+    /// request carries and how they are formed is the plugin's manifest to say, and a declaration
+    /// that stated both would state two answers to one question.
+    pub(crate) sign: Option<String>,
 }
 
 /// The defaults declared once under `[secret.defaults]`: the resolver order and per-resolver

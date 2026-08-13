@@ -905,6 +905,15 @@ fn resolve_one(
             trimmed.len()
         ));
         Vec::new()
+    } else if secret.signer.is_some() {
+        // A signed credential's needle is the **key**, not what goes on the wire: the signature is
+        // derived, single-use and request-bound, while the key is the thing that must never leave
+        // the cage verbatim. Watching the signature instead would watch a value no request repeats
+        // and leave the key unwatched.
+        vec![SecretNeedle::named(
+            &secret.name,
+            trimmed.as_bytes().to_vec(),
+        )]
     } else {
         // Every spelling of one credential carries that credential's logical name: the wire path
         // ignores it (it substitutes length-preserving `*`), a text sink renders `${name}`.
@@ -916,11 +925,49 @@ fn resolve_one(
             .collect()
     };
 
+    let Some(plugin) = &secret.signer else {
+        return Ok((
+            HeaderInjection::fixed(
+                secret.to.clone(),
+                secret.header.clone(),
+                secret.shape.format(trimmed),
+            ),
+            needles,
+        ));
+    };
+
+    // The plugin is started once per launch and asked once per request. It is told the destination
+    // the *config* named, so nothing it is shown depends on what it asked for.
+    let host = secret.to.concrete_host().ok_or_else(|| {
+        io::Error::other(format!(
+            "the secret for `{}` names a signer, but its destination is not one concrete host",
+            secret.name
+        ))
+    })?;
+    // The wider grant is the plaintext, and only a manifest that declared `reads_secret` gets it.
+    // Everything else places a marker and never learns the value.
+    let marker = match plugin.signer.reads_secret {
+        true => None,
+        false => Some(std::sync::Arc::new(super::broker::SecretMarker::new(
+            trimmed, min_len,
+        )?)),
+    };
+    let credential = match &marker {
+        Some(marker) => super::signer::Credential::Marker(marker.token()),
+        None => super::signer::Credential::Plaintext(trimmed.to_string()),
+    };
+    let process = super::signer::SignerProcess::start(bwrap, plugin, host, credential)?;
     Ok((
         HeaderInjection {
             rule: secret.to.clone(),
-            header: secret.header.clone(),
-            value: secret.shape.format(trimmed),
+            form: crate::sandbox::proxy::Form::Signed(crate::sandbox::proxy::Signed {
+                name: plugin.name.clone(),
+                sets: plugin.signer.sets_headers.clone(),
+                sees: plugin.signer.sees_headers.clone(),
+                key: trimmed.to_string(),
+                marker,
+                process: std::sync::Arc::new(std::sync::Mutex::new(process)),
+            }),
         },
         needles,
     ))
@@ -1811,6 +1858,7 @@ mod tests {
             to: crate::allowlist::classify(to).unwrap(),
             header: header.to_string(),
             shape,
+            signer: None,
         }
     }
 
@@ -1971,7 +2019,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(injs[0].value, "Bearer fallback-token-value");
+        assert_eq!(injs[0].value(), "Bearer fallback-token-value");
     }
 
     #[test]
@@ -2016,8 +2064,8 @@ mod tests {
         );
         let (injs, needles) = resolve_injections_at_root(&[s]).unwrap();
         assert_eq!(injs.len(), 1);
-        assert_eq!(injs[0].header, "Authorization");
-        assert_eq!(injs[0].value, "Bearer s3cret-token-value");
+        assert_eq!(injs[0].header_names(), ["Authorization"]);
+        assert_eq!(injs[0].value(), "Bearer s3cret-token-value");
         assert_eq!(
             injs[0].rule,
             crate::allowlist::classify("api.github.com").unwrap()
@@ -2080,7 +2128,7 @@ mod tests {
             crate::config::HeaderShape::new("Bearer ", false),
         )])
         .unwrap();
-        assert_eq!(injs[0].value, "Bearer tok3n-from-the-file");
+        assert_eq!(injs[0].value(), "Bearer tok3n-from-the-file");
 
         // once the first source IS set, it wins — the file fallback is not consulted
         drop(unset);
@@ -2095,7 +2143,7 @@ mod tests {
             crate::config::HeaderShape::new("Bearer ", false),
         )])
         .unwrap();
-        assert_eq!(injs[0].value, "Bearer tok3n-from-the-env");
+        assert_eq!(injs[0].value(), "Bearer tok3n-from-the-env");
     }
 
     #[test]
@@ -2138,7 +2186,8 @@ mod tests {
         )])
         .unwrap();
         assert_eq!(
-            injs[0].value, "Bearer tok3n-from-a-file",
+            injs[0].value(),
+            "Bearer tok3n-from-a-file",
             "a file's trailing newline is stripped"
         );
 
@@ -2174,7 +2223,7 @@ mod tests {
         let raw = b"alice:correct-horse".to_vec();
         // tie the base64 needle to what `format()` actually emits, without re-deriving base64 here
         let wire = injs[0]
-            .value
+            .value()
             .strip_prefix("Basic ")
             .unwrap()
             .as_bytes()
@@ -2234,7 +2283,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(injs[0].value, "Bearer ghp-from-the-plugin");
+        assert_eq!(injs[0].value(), "Bearer ghp-from-the-plugin");
         assert_eq!(needles.len(), 1);
         assert_eq!(needles[0].as_bytes(), b"ghp-from-the-plugin");
     }
@@ -2390,7 +2439,7 @@ mod tests {
             crate::config::HeaderShape::new("Bearer ", false),
         );
         let (injs, needles) = resolve_injections_at_root(&[s]).unwrap();
-        assert_eq!(injs[0].value, "Bearer abc", "the injection still applies");
+        assert_eq!(injs[0].value(), "Bearer abc", "the injection still applies");
         assert!(
             needles.is_empty(),
             "a too-short secret is not redacted — it would refuse benign traffic (self-DoS)"

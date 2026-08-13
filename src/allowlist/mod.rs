@@ -381,6 +381,18 @@ impl Request {
 }
 
 impl Rule {
+    /// The one concrete destination this rule names, when it names one.
+    ///
+    /// `None` for a wildcard or a regex, which name a family rather than a host. A credential's
+    /// `to` is validated to be concrete, so this is what tells a plugin which destination it is
+    /// forming a credential for — the host the *config* named, never one the plugin chose.
+    pub(crate) fn concrete_host(&self) -> Option<&str> {
+        match &self.kind {
+            RuleKind::Host(host, _) | RuleKind::Url { host, .. } => Some(host.as_str()),
+            RuleKind::Ip(..) | RuleKind::Subdomain(..) | RuleKind::Regex { .. } => None,
+        }
+    }
+
     /// Whether this rule matches the (already-canonicalized) request for `method` (uppercased by
     /// the caller): its method set must admit the verb **and** its [`RuleKind`] must match the
     /// host/port/path. The method is a separate dimension, kept out of the canonical URL the

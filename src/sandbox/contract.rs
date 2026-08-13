@@ -281,6 +281,7 @@ mod tests {
                     prefix: "Bearer ".into(),
                     base64: false,
                 },
+                signer: None,
             }],
             env: Default::default(),
             env_allow: vec![],

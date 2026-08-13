@@ -1429,6 +1429,7 @@ mod tests {
                 header: Some("Authorization".into()),
                 value_type: Some("bearer".into()),
                 prefix: None,
+                sign: None,
             }),
         )]
         .into_iter()

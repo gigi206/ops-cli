@@ -4250,7 +4250,7 @@ fn build(
             let Some(plugin) = registry.broker(name) else {
                 // Told apart, because the remedy differs: an ambiguous name is fixed by removing a
                 // plugin, a missing one by installing it.
-                match registry.broker_conflict(name) {
+                match registry.name_conflict(name) {
                     Some(claimants) => crate::diag::warn(&format!(
                         "`[broker.{name}]` names a broker claimed by more than one installed \
                          plugin ({}) — they are all disabled, so the cage gets no broker",
@@ -4368,7 +4368,12 @@ fn build(
                     }
                 }
             };
-            match broker::start(&prep.layout, binding, plugin, &prep.bwrap, secret) {
+            // What this host answers the plugin, from `[plugin.<name>]`. Applied to a copy rather
+            // than to the registry's instance, which is shared and read-only here: the config
+            // validated the table against this very manifest, and the copy is what runs.
+            let mut plugin = plugin.clone();
+            plugin.host = binding.host.clone();
+            match broker::start(&prep.layout, binding, &plugin, &prep.bwrap, secret) {
                 Ok((guard, reachable)) => {
                     crate::diag::note(&format!(
                         "broker: `{name}` stands in front of {}{}",

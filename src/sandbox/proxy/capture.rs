@@ -277,7 +277,7 @@ impl CaptureGuard {
 
     /// Record the client's request head — the bytes exactly as they arrived, **before** any sbx
     /// credential injection, and the names (never the values) of the headers sbx injected.
-    pub(super) fn set_request(&self, head: &[u8], injected: &[(&str, &str)]) {
+    pub(super) fn set_request(&self, head: &[u8], injected: &[(String, String)]) {
         let caps = self.ring.caps();
         let take = caps.head.min(head.len());
         *self.req_head.lock().unwrap() = CaptureBytes {
@@ -285,7 +285,7 @@ impl CaptureGuard {
             truncated: take < head.len(),
         };
         if !injected.is_empty() {
-            let names: Vec<&str> = injected.iter().map(|(name, _)| *name).collect();
+            let names: Vec<&str> = injected.iter().map(|(name, _)| name.as_str()).collect();
             *self.injected.lock().unwrap() = CaptureBytes {
                 bytes: names.join("\n").into_bytes(),
                 truncated: false,
@@ -704,7 +704,10 @@ mod tests {
         let seq = g.seq;
         g.set_request(
             b"POST /v1/messages HTTP/1.1\r\nhost: api.example.com\r\n\r\n",
-            &[("x-api-key", "s3cr3t"), ("authorization", "Bearer t")],
+            &[
+                ("x-api-key".to_string(), "s3cr3t".to_string()),
+                ("authorization".to_string(), "Bearer t".to_string()),
+            ],
         );
         drop(g);
 

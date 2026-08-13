@@ -4453,11 +4453,7 @@ fn a_url_in_the_query_is_not_absolute_form() {
 
 /// A header injection scoped to `to` (in allowlist-entry syntax), setting `header` to `value`.
 fn injection(to: &str, header: &str, value: &str) -> HeaderInjection {
-    HeaderInjection {
-        rule: classify(to).unwrap(),
-        header: header.to_string(),
-        value: value.to_string(),
-    }
+    HeaderInjection::fixed(classify(to).unwrap(), header.to_string(), value.to_string())
 }
 
 /// Drive one request through a proxy that allows `allow` and carries `injections`, to a
@@ -4614,7 +4610,10 @@ fn reserialize_strips_all_spellings_of_an_injected_header() {
     .unwrap();
     let out = reserialize_request(
         &head,
-        &[("Authorization", "Bearer sbx"), ("X-Api-Key", "K")],
+        &[
+            ("Authorization".to_string(), "Bearer sbx".to_string()),
+            ("X-Api-Key".to_string(), "K".to_string()),
+        ],
         None,
         false,
     );
@@ -5219,7 +5218,7 @@ fn a_401_from_an_injection_target_re_resolves_the_credential() {
         "the refusal must consult the source exactly once"
     );
     assert_eq!(
-        credentials.snapshot().injections[0].value,
+        credentials.snapshot().injections[0].value(),
         "Bearer refreshed",
         "the next request carries the re-resolved value"
     );
@@ -5235,7 +5234,7 @@ fn a_successful_response_never_re_resolves() {
         b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n",
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert_eq!(credentials.snapshot().injections[0].value, "Bearer stale");
+    assert_eq!(credentials.snapshot().injections[0].value(), "Bearer stale");
 }
 
 /// A `401` from a host carrying no injection says nothing about our credentials. Acting on it would
@@ -5252,7 +5251,7 @@ fn a_401_from_a_host_we_inject_nothing_into_is_not_a_refresh_signal() {
         0,
         "an unrelated refusal must not reach the resolver"
     );
-    assert_eq!(credentials.snapshot().injections[0].value, "Bearer stale");
+    assert_eq!(credentials.snapshot().injections[0].value(), "Bearer stale");
 }
 
 /// The scan is on the pre-injection client head, so sbx's own injected credential — whose value

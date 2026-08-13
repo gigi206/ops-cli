@@ -695,6 +695,7 @@ fn a_header_secret() -> HeaderSecret {
         header: Some("Authorization".into()),
         value_type: Some("bearer".into()),
         prefix: None,
+        sign: None,
     };
     validate(raw).unwrap()
 }
@@ -1917,6 +1918,72 @@ fn a_project_may_set_a_brokers_policy_but_never_the_resource_it_brokers() {
     assert!(
         r.warnings.iter().any(|w| w.contains("socket")),
         "the dropped socket is named: {:?}",
+        r.warnings
+    );
+}
+
+/// A broker plugin whose manifest reads `env`, for the `[plugin.<name>]` tests.
+fn broker_plugin_reading(name: &str, env: &[&str]) -> crate::plugins::broker::BrokerPlugin {
+    crate::plugins::broker::BrokerPlugin {
+        name: name.to_string(),
+        dir: PathBuf::from(format!("/data/plugins/{name}")),
+        exec: PathBuf::from(format!("/data/plugins/{name}/broker")),
+        sandbox: crate::plugins::SandboxGrant {
+            allow_env: env.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        },
+        broker: crate::plugins::broker::BrokerSpec {
+            cage_env: vec!["X_SOCK".to_string()],
+            cage_env_dir: Vec::new(),
+            socket_name: format!("{name}.sock"),
+            at_host_path: false,
+            framing: crate::plugins::broker::Framing::Line,
+            max_frame: 1024,
+            deny_frame: None,
+            uses_secret: false,
+            host_greets: false,
+            host_deadline: crate::plugins::broker::DEFAULT_HOST_DEADLINE,
+            inspect_replies: false,
+        },
+        version: None,
+        description: None,
+        host: Default::default(),
+    }
+}
+
+/// `[plugin.<name>]` reaches a **broker**, not only a resolver. It is the one table that says what
+/// this host answers a plugin, and a broker is a plugin: leaving it unapplied dropped the values in
+/// silence, reported the table as matching nothing, and still showed it in `sbx plugins info`.
+#[test]
+fn a_plugin_table_naming_a_broker_is_applied_to_it_and_counts_as_used() {
+    let reg = PluginRegistry::with_brokers([broker_plugin_reading("gpg-agent", &["GNUPGHOME"])]);
+    let mut global = with_broker(
+        raw(&[], &[]),
+        "gpg-agent",
+        raw_broker(Some("/run/host/S.gpg-agent"), &["sign"]),
+    );
+    global.plugin = raw_plugin_table(
+        "gpg-agent",
+        &[("GNUPGHOME", "/srv/keys"), ("NOT_DECLARED", "x")],
+    )
+    .plugin;
+
+    let r = super::resolve(global, None, &reg);
+    assert_eq!(
+        r.brokers[0].host.env,
+        vec![("GNUPGHOME".to_string(), "/srv/keys".to_string())],
+        "the declared variable reaches the broker"
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("NOT_DECLARED")),
+        "and the undeclared one is dropped by name: {:?}",
+        r.warnings
+    );
+    assert!(
+        !r.warnings
+            .iter()
+            .any(|w| w.contains("no secret uses a plugin")),
+        "a table naming a broker is not an unused table: {:?}",
         r.warnings
     );
 }
@@ -5501,6 +5568,7 @@ fn raw_secret(
             header: Some(header.into()),
             value_type: ty.map(String::from),
             prefix: prefix.map(String::from),
+            sign: None,
         },
     )
 }
@@ -5568,6 +5636,7 @@ fn raw_secret_from(from: Vec<&str>) -> RawHostSecret {
         header: Some("Authorization".into()),
         value_type: Some("bearer".into()),
         prefix: None,
+        sign: None,
     }
 }
 
@@ -6293,6 +6362,7 @@ fn terse(key: &str) -> RawHostSecret {
         header: Some("Authorization".into()),
         value_type: Some("bearer".into()),
         prefix: None,
+        sign: None,
     }
 }
 
@@ -6308,6 +6378,7 @@ fn terse_bare(key: &str) -> RawHostSecret {
         header: None,
         value_type: None,
         prefix: None,
+        sign: None,
     }
 }
 
@@ -7426,6 +7497,7 @@ fn an_untrusted_project_secret_section_steers_nothing() {
                 header: Some("Authorization".into()),
                 value_type: Some("bearer".into()),
                 prefix: None,
+                sign: None,
             }),
         );
         hosts.insert(

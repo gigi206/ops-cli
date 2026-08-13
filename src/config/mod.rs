@@ -210,6 +210,13 @@ pub(crate) struct BrokerBinding {
     /// the plugin's manifest declares `uses_secret`. Resolved host-side at launch; the plugin is
     /// handed a marker, never the value.
     pub(crate) secret: Vec<SecretSource>,
+    /// What this host supplies the broker plugin, from `[plugin.<name>]`, validated against the
+    /// plugin's own manifest.
+    ///
+    /// Carried on the binding rather than set on the registry's plugin, because the registry is
+    /// shared and read-only by the time a config is resolved: the launch takes the plugin by name
+    /// and applies this to its own copy. Empty unless a table names it.
+    pub(crate) host: crate::plugins::HostConfig,
     /// Which layer supplied the policy, for `sbx config`.
     pub(crate) origin: Provenance,
 }
@@ -1156,6 +1163,8 @@ fn apply_plugin_host_config(
     secrets: &mut [HeaderSecret],
     tasks: &mut [TaskSpec],
     apps: &mut BTreeMap<String, ResolvedApp>,
+    brokers: &mut [BrokerBinding],
+    plugins: &crate::plugins::PluginRegistry,
     cfg: &BTreeMap<String, crate::config::schema::RawPluginConfig>,
     warnings: &mut Vec<String>,
 ) {
@@ -1165,6 +1174,27 @@ fn apply_plugin_host_config(
     let mut matched: BTreeSet<String> = BTreeSet::new();
     for secret in secrets.iter_mut() {
         apply_to_sources(&mut secret.sources, cfg, &mut matched, warnings);
+        // A signer is a plugin this table configures too, and it is not one of the secret's
+        // *sources*: it forms the value the sources resolved. Its manifest travels with the
+        // declaration, so unlike a broker it is answered right here.
+        if let Some(plugin) = secret.signer.as_mut()
+            && let Some(raw) = cfg.get(&plugin.name)
+        {
+            matched.insert(plugin.name.clone());
+            plugin.host = host_config_for(&plugin.name, &plugin.sandbox, raw, warnings);
+        }
+    }
+    // A broker is configured by the same table and reached differently: it is not a secret's
+    // source, so nothing here would ever see it. Its manifest lives in the registry, which is
+    // read-only by now, so the answer is validated against that manifest and carried on the
+    // binding for the launch to apply.
+    for binding in brokers.iter_mut() {
+        let (Some(raw), Some(plugin)) = (cfg.get(&binding.name), plugins.broker(&binding.name))
+        else {
+            continue;
+        };
+        matched.insert(binding.name.clone());
+        binding.host = host_config_for(&binding.name, &plugin.sandbox, raw, warnings);
     }
     // A declared operation resolves its own credentials, through the same resolver chain, so a
     // plugin reached only from a `[task.<name>.secret]` needs the table just as much. Missing these
@@ -1223,29 +1253,38 @@ fn apply_to_sources(
             continue;
         };
         matched.insert(plugin.name.clone());
-        let mut env = Vec::new();
-        for (key, value) in &raw.env {
-            let declared = plugin.sandbox.allow_env.iter().any(|k| k == key)
-                || plugin.sandbox.allow_env_paths.iter().any(|k| k == key);
-            if declared {
-                env.push((key.clone(), value.clone()));
-            } else {
-                warnings.push(format!(
-                    "`[plugin.{}] env`: ignoring `{key}` — the plugin's manifest does not read \
-                     it (it declares: {})",
-                    plugin.name,
-                    declared_vars(plugin)
-                ));
-            }
-        }
-        let programs = validated_programs(
-            &plugin.name,
-            &plugin.sandbox.programs,
-            &raw.programs,
-            warnings,
-        );
-        plugin.host = crate::plugins::HostConfig { env, programs };
+        plugin.host = host_config_for(&plugin.name, &plugin.sandbox, raw, warnings);
     }
+}
+
+/// One `[plugin.<name>]` table, validated against the manifest grant of the plugin it names.
+///
+/// The manifest states what the plugin reads; the config supplies the values. So a variable the
+/// manifest does not declare is refused and dropped, named. One function for every plugin type,
+/// because `[plugin.<name>]` means the same thing whatever the plugin does with it, and because a
+/// second copy is how one type would come to accept what another refuses.
+fn host_config_for(
+    name: &str,
+    grant: &crate::plugins::SandboxGrant,
+    raw: &crate::config::schema::RawPluginConfig,
+    warnings: &mut Vec<String>,
+) -> crate::plugins::HostConfig {
+    let mut env = Vec::new();
+    for (key, value) in &raw.env {
+        let declared = grant.allow_env.iter().any(|k| k == key)
+            || grant.allow_env_paths.iter().any(|k| k == key);
+        if declared {
+            env.push((key.clone(), value.clone()));
+        } else {
+            warnings.push(format!(
+                "`[plugin.{name}] env`: ignoring `{key}` — the plugin's manifest does not read it \
+                 (it declares: {})",
+                declared_vars_of(grant)
+            ));
+        }
+    }
+    let programs = validated_programs(name, &grant.programs, &raw.programs, warnings);
+    crate::plugins::HostConfig { env, programs }
 }
 
 /// The `programs` entries of one `[plugin.<name>]` table, keeping those the manifest can actually
@@ -1293,13 +1332,13 @@ pub(crate) fn validated_programs(
 }
 
 /// The variables a plugin's manifest says it reads, for a diagnostic that names the alternatives
-/// instead of only what was rejected.
-fn declared_vars(plugin: &crate::plugins::ResolverPlugin) -> String {
-    let mut all: Vec<&str> = plugin
-        .sandbox
+/// instead of only what was rejected. Takes the grant rather than a plugin, so the answer is the
+/// same for every type that carries one.
+fn declared_vars_of(grant: &crate::plugins::SandboxGrant) -> String {
+    let mut all: Vec<&str> = grant
         .allow_env
         .iter()
-        .chain(plugin.sandbox.allow_env_paths.iter())
+        .chain(grant.allow_env_paths.iter())
         .map(String::as_str)
         .collect();
     all.sort_unstable();
@@ -2040,6 +2079,11 @@ fn resolve(
         warn_mise_nix_packages(&format!("app `{app_name}` "), &app.packages, &mut warnings);
     }
 
+    // Resolved before the `[plugin.*]` answer below, not inside the literal, because a broker is
+    // one of the plugins that table configures: leaving it until after left every `[plugin.<name>]`
+    // naming a broker unapplied *and* reported as matching nothing.
+    let mut brokers = resolve_brokers(broker_cfg, &broker_origin, plugins, &mut warnings);
+
     // Answer each plugin the config configures, now that `[plugin.*]` has been layered and gated.
     // Done here rather than where a `SecretSource::Plugin` is parsed, because the answer must see
     // the FINAL table: a project layer that is read after the secrets would otherwise be missed.
@@ -2047,6 +2091,8 @@ fn resolve(
         &mut secrets,
         &mut tasks,
         &mut apps,
+        &mut brokers,
+        plugins,
         &plugin_cfg,
         &mut warnings,
     );
@@ -2092,7 +2138,7 @@ fn resolve(
         ssh_agent,
         ssh_agent_origin,
         ssh_agent_confirm,
-        brokers: resolve_brokers(broker_cfg, &broker_origin, plugins, &mut warnings),
+        brokers,
         secrets,
         declared_secrets,
         tasks,
@@ -3545,6 +3591,9 @@ fn resolve_brokers(
             socket,
             allow: table.allow,
             secret,
+            // Filled by `apply_plugin_host_config` once `[plugin.*]` is layered and gated; a
+            // binding resolved with no such table keeps the empty answer.
+            host: crate::plugins::HostConfig::default(),
         });
     }
     out

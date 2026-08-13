@@ -895,9 +895,9 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         .secrets
         .iter()
         .map(|s| SecretView {
-            header: s.header.clone(),
+            header: s.headers().join(", "),
             to: s.to.to_string(),
-            shape: s.shape.describe(),
+            shape: s.shape_label(),
             sources: s.describe_sources(),
         })
         .collect();
@@ -1298,9 +1298,9 @@ fn app_view(
             app.secrets
                 .iter()
                 .map(|s| SecretView {
-                    header: s.header.clone(),
+                    header: s.headers().join(", "),
                     to: s.to.to_string(),
-                    shape: s.shape.describe(),
+                    shape: s.shape_label(),
                     sources: s.describe_sources(),
                 })
                 .collect()
@@ -1540,9 +1540,9 @@ fn app_detail_view(
             app.secrets
                 .iter()
                 .map(|s| SecretView {
-                    header: s.header.clone(),
+                    header: s.headers().join(", "),
                     to: s.to.to_string(),
-                    shape: s.shape.describe(),
+                    shape: s.shape_label(),
                     sources: s.describe_sources(),
                 })
                 .collect()
@@ -2026,6 +2026,7 @@ mod tests {
             },
             header: "Authorization".into(),
             shape: crate::config::HeaderShape::new("Bearer ", false),
+            signer: None,
         }
     }
 

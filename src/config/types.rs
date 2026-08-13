@@ -284,13 +284,45 @@ pub(crate) struct HeaderSecret {
     /// anything else never receives the header. A `*.` wildcard or `re:` regex is
     /// rejected at validation, so a credential reaches exactly one known destination.
     pub(crate) to: Rule,
-    /// The header name to set, e.g. `Authorization`.
+    /// The header name to set, e.g. `Authorization`. For a signed declaration this is the first
+    /// header the plugin's manifest declares: what the inventory names it by, never what decides
+    /// what goes on the wire.
     pub(crate) header: String,
     /// How the plaintext becomes the header value.
     pub(crate) shape: HeaderShape,
+    /// The signer plugin that forms this credential **per request**, when the declaration named
+    /// one with `sign`.
+    ///
+    /// Boxed for the reason a resolver's manifest is: a validated manifest is much larger than any
+    /// other field here, and an un-boxed one would make every secret pay its size. `None` is the
+    /// ordinary case, where [`Self::shape`] formed the value once at launch.
+    pub(crate) signer: Option<Box<crate::plugins::signer::SignerPlugin>>,
 }
 
 impl HeaderSecret {
+    /// Every header this declaration puts on a request. One for an ordinary secret; a signer's
+    /// whole `sets_headers` for a signed one.
+    pub(crate) fn headers(&self) -> Vec<&str> {
+        match &self.signer {
+            None => vec![self.header.as_str()],
+            Some(plugin) => plugin
+                .signer
+                .sets_headers
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        }
+    }
+
+    /// How the value is formed, for the inventory and for `sbx config`. A signed declaration names
+    /// the plugin rather than a shape: there is no shape to name, and the plugin is what a reader
+    /// has to look up.
+    pub(crate) fn shape_label(&self) -> String {
+        match &self.signer {
+            None => self.shape.describe(),
+            Some(plugin) => format!("signed by {}", plugin.name),
+        }
+    }
     /// A human label for `sbx config` — the resolver chain by locator (a variable name or file
     /// path), never a value. A single source reads as itself; a fallback chain is joined with
     /// `, then ` so the precedence is visible.

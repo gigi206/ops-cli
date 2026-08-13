@@ -54,10 +54,46 @@ type = "raw"
 | `header` | the header name to set (e.g. `Authorization`, `x-api-key`) |
 | `type` | how to shape the value: `bearer`, `basic`, or `raw` |
 | `prefix` | override the type's default prefix (`Bearer ` / `Basic ` / empty) |
+| `sign` | a [signer plugin](../secrets/plugins#the-signer-type) that forms the credential **per request** |
 
 A secret must have **exactly one** of `key` or `from`. It must have a `header` and a
 `type`, either on itself or from `[secret.defaults]`: a secret that names neither is
 an **explicit error**, never a silent (and likely wrong) default.
+
+### `sign`: a credential computed from the request
+
+`header`, `type` and `prefix` form the value **once**, at launch, from the resolved
+plaintext. That covers every auth point whose value is a constant: a bearer token, a
+Basic pair, an API key. It cannot cover one whose value depends on the request itself,
+such as a signature over the method, the path and the query.
+
+`sign` names an installed [signer plugin](../secrets/plugins#the-signer-type) instead,
+and the plugin is asked once per request:
+
+```toml
+[secret."s3.eu-west-1.amazonaws.com"]
+from = "env://AWS_SECRET_ACCESS_KEY"
+sign = "example-sigv4"
+```
+
+`sign` is **mutually exclusive** with `header`, `type` and `prefix`: which headers the
+request carries and how they are formed is the plugin's own manifest to say, so a
+declaration stating both would state two answers to one question. The source
+(`key`/`from`) still applies: it is the credential the plugin signs with, resolved
+host-side exactly as any other.
+
+Three properties hold whatever the plugin does:
+
+- **It sees only this host.** A secret's `to` is one concrete destination, so the plugin
+  is shown the requests of exactly the host its own declaration names, which is the host
+  that already receives that credential.
+- **It sets only the headers its manifest declared.** A header outside `sets_headers`
+  refuses the whole answer, and a value carrying a newline is refused too: the request
+  head is sbx's to frame.
+- **A request that could not be signed is not sent.** Any failure, including a plugin
+  that says it cannot sign, refuses the request with a `403` and the reason
+  `signer-refused`. It is never sent unsigned, which would reach the destination as an
+  anonymous request and come back an authentication error for an unrelated reason.
 
 `name` and `description` are what [`sbx secret list`](../cli/secret) prints, and the name matters
 for more than tidiness: it is what a substituted value is reported as (`${NAME}`) if a credential ever

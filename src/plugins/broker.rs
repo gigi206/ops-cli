@@ -420,7 +420,9 @@ pub(super) fn validate(
         }
         Some(secs) if secs > MAX_HOST_DEADLINE_SECS => {
             return Err(format!(
-                "`host_deadline` is {secs} seconds, above the {MAX_HOST_DEADLINE_SECS}-second                  ceiling sbx waits on a host resource — past it a wedged resource would hold a                  thread and two connections for longer than any prompt takes to answer"
+                "`host_deadline` is {secs} seconds, above the {MAX_HOST_DEADLINE_SECS}-second \
+                 ceiling sbx waits on a host resource — past it a wedged resource would hold a \
+                 thread and two connections for longer than any prompt takes to answer"
             ));
         }
         Some(secs) => std::time::Duration::from_secs(secs as u64),

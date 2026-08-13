@@ -170,9 +170,29 @@ struct InstalledPlugin {
     /// The digest recorded when this plugin was placed, when there is one — the installed side of
     /// the comparison against a catalogue's pinned `sha256`.
     digest: Option<String>,
-    /// The ambiguous scheme this plugin claims, when it is one of several claimants — the plugin
-    /// is in place but disabled, which a bare `[installed]` marker would hide.
-    disabled_over: Option<String>,
+    /// The ambiguous key this plugin claims, when it is one of several claimants — the plugin is
+    /// in place but disabled, which a bare `[installed]` marker would hide.
+    disabled_over: Option<Contested>,
+}
+
+/// The key an installed plugin is disabled over, in the namespace it claims it in. Both are
+/// carried, rather than the scheme alone, because a plugin reached by name is disabled by the same
+/// rule and would otherwise render as installed and working.
+#[derive(Clone)]
+enum Contested {
+    Scheme(String),
+    Name(String),
+}
+
+impl Contested {
+    /// How a listing says it, naming the namespace: the remedy is the same (`plugins rm`), but
+    /// which key to look at is not.
+    fn phrase(&self) -> String {
+        match self {
+            Contested::Scheme(scheme) => format!("scheme {scheme}:// in conflict"),
+            Contested::Name(name) => format!("the name {name} claimed twice"),
+        }
+    }
 }
 
 impl InstalledIndex {
@@ -190,15 +210,37 @@ impl InstalledIndex {
             versions.insert(p.dir_name().to_string(), p.version.clone());
             by_scheme.insert(p.scheme.clone(), p.dir_name().to_string());
         }
-        // A conflict's claimants are disabled, so they carry no manifest data here — only the
-        // scheme that disabled them, which is what their marker has to say.
+        // Every kind carries a version, and a listing that only read the resolvers would call a
+        // broker or a signer versionless whatever its manifest declared. Only the scheme index is
+        // a resolver's alone.
+        for (dir_name, version) in registry
+            .brokers()
+            .map(|p| (p.dir_name(), p.version.clone()))
+            .chain(
+                registry
+                    .signers()
+                    .map(|p| (p.dir_name(), p.version.clone())),
+            )
+        {
+            versions.insert(dir_name.to_string(), version);
+        }
+        // A conflict's claimants are disabled, so they carry no manifest data here — only the key
+        // that disabled them, which is what their marker has to say.
         let mut conflicts = std::collections::BTreeMap::new();
         let mut disabled = std::collections::BTreeMap::new();
         for (scheme, claimants) in registry.conflicts() {
             for dir_name in claimants {
-                disabled.insert(dir_name.clone(), scheme.to_string());
+                disabled.insert(dir_name.clone(), Contested::Scheme(scheme.to_string()));
             }
             conflicts.insert(scheme.to_string(), claimants.to_vec());
+        }
+        // A contested *name* disables its claimants exactly as a contested scheme does. Not folded
+        // into `conflicts`, which is the scheme map an install is checked against: this one only
+        // marks the claimants, so a plugin in place and reaching nothing does not read as working.
+        for (name, claimants) in registry.name_conflicts() {
+            for dir_name in claimants {
+                disabled.insert(dir_name.clone(), Contested::Name(name.to_string()));
+            }
         }
 
         let mut by_name = std::collections::BTreeMap::new();
@@ -274,10 +316,7 @@ impl InstalledIndex {
             // In place, but claiming a scheme someone else claims too: it resolves nothing, so a
             // bare `[installed]` would read as working.
             if let Some(over) = &installed.disabled_over {
-                return format!(
-                    "  {}[installed, disabled: scheme {over}:// in conflict]{r}",
-                    pal.err
-                );
+                return format!("  {}[installed, disabled: {}]{r}", pal.err, over.phrase());
             }
             // Is what is installed the artifact this store lists *now*? The digests answer that
             // exactly — the catalogue pins the tree it offers, and the install recorded the tree it
@@ -339,7 +378,7 @@ fn plugins_list() -> ExitCode {
     };
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    let (h, n, dim, err, r) = (pal.head, pal.name, pal.dim, pal.err, pal.reset);
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     println!(
         "{h}built-in schemes{r} (always resolve, never a plugin): {n}{}{r}",
         plugins::builtin_schemes().join(", ")
@@ -368,30 +407,10 @@ fn plugins_list() -> ExitCode {
                 print!("  v{v}");
             }
             print!("  {dim}{net}{r}");
-            if let Err(why) = p.check_exec() {
-                print!("  {err}[not runnable: {why}]{r}");
-            }
-            // Drift since the install, from the digest recorded then. Only the two states that
-            // say something is wrong are shown: a plugin that matches, or one that never had a
-            // digest, would otherwise add a column of noise to every line.
-            match plugins::integrity(&layout, p.dir_name()) {
-                plugins::Integrity::Modified => print!("  {err}[modified since install]{r}"),
-                plugins::Integrity::Unreadable(_) => {
-                    print!("  {err}[cannot be hashed]{r}");
-                }
-                plugins::Integrity::Intact | plugins::Integrity::Unrecorded => {}
-            }
+            print_health(&layout, p.dir_name(), p.check_exec(), &pal);
             println!();
-            if let Some(desc) = &p.description {
-                println!("    {dim}{desc}{r}");
-            }
-            // Where it came from: a manifest is identical whatever the source, so this is the only
-            // place the answer exists. The directory name is what the install (and the origin
-            // record) keys on, which may differ from the manifest's `name` for a hand-placed tree.
-            println!(
-                "    {dim}from: {}{r}",
-                plugins::origin::read(&layout, p.dir_name()).label()
-            );
+            print_description(p.description.as_deref(), &pal);
+            print_provenance(&layout, p.dir_name(), &pal);
         }
         println!("{dim}(remove one with: sbx plugins rm <name>){r}");
     }
@@ -413,31 +432,37 @@ fn plugins_list() -> ExitCode {
             if p.broker.inspect_replies {
                 print!("  {dim}rules on replies{r}");
             }
-            if let Err(why) = p.check_exec() {
-                print!("  {err}[not runnable: {why}]{r}");
-            }
-            match plugins::integrity(&layout, p.dir_name()) {
-                plugins::Integrity::Modified => print!("  {err}[modified since install]{r}"),
-                plugins::Integrity::Unreadable(_) => {
-                    print!("  {err}[cannot be hashed]{r}");
-                }
-                plugins::Integrity::Intact | plugins::Integrity::Unrecorded => {}
-            }
+            print_health(&layout, p.dir_name(), p.check_exec(), &pal);
             println!();
-            if let Some(desc) = &p.description {
-                println!("    {dim}{desc}{r}");
-            }
+            print_description(p.description.as_deref(), &pal);
             println!(
                 "    {dim}found in the cage: {}{r}",
                 how_the_cage_finds_it(p)
             );
-            println!(
-                "    {dim}from: {}{r}",
-                plugins::origin::read(&layout, p.dir_name()).label()
-            );
+            print_provenance(&layout, p.dir_name(), &pal);
         }
     }
-    print_scheme_conflicts(&layout, &registry, None, &pal);
+    // Signers are listed apart again, and named by what a `[[secret]]` writes to be signed by them.
+    // What identifies one is the headers it may set: that is the whole of what it can put on a
+    // request, and the line says it rather than making the reader open the manifest.
+    if registry.signers().next().is_some() {
+        println!("{h}installed signer plugins:{r}");
+        for p in registry.signers() {
+            print!("  {n}{}{r}", p.name);
+            if let Some(v) = &p.version {
+                print!("  v{v}");
+            }
+            print!("  {dim}sets {}{r}", p.signer.sets_headers.join(", "));
+            if p.signer.reads_secret {
+                print!("  {dim}reads the secret{r}");
+            }
+            print_health(&layout, p.dir_name(), p.check_exec(), &pal);
+            println!();
+            print_description(p.description.as_deref(), &pal);
+            print_provenance(&layout, p.dir_name(), &pal);
+        }
+    }
+    print_conflicts(&layout, &registry, None, &pal);
     println!("{dim}(browse the configured stores with: sbx plugins store list){r}");
     for w in &warnings {
         diag::warn(w);
@@ -445,18 +470,73 @@ fn plugins_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The ambiguous schemes, if any: a scheme claimed by more than one installed plugin resolves to
-/// nothing and every claimant is disabled. Reported on stdout, beside the plugins that *do*
-/// resolve, because it is the state of the installed set — not a passing diagnostic — and it stays
-/// until the user removes all but one claimant. `only` narrows the report to a single scheme, for
-/// the caller that was asked about that one.
-fn print_scheme_conflicts(
+/// The two markers that say something is wrong with an installed plugin, printed at the end of its
+/// line (no newline of their own): an executable the runner would refuse, and drift since the
+/// install measured against the digest recorded then.
+///
+/// Only the states that say something is wrong are shown. A plugin that matches its digest, or one
+/// that never had a digest recorded, would otherwise add a column of noise to every line.
+fn print_health(
+    layout: &store::Layout,
+    dir_name: &str,
+    runnable: Result<(), String>,
+    pal: &style::Palette,
+) {
+    let (err, r) = (pal.err, pal.reset);
+    if let Err(why) = runnable {
+        print!("  {err}[not runnable: {why}]{r}");
+    }
+    match plugins::integrity(layout, dir_name) {
+        plugins::Integrity::Modified => print!("  {err}[modified since install]{r}"),
+        plugins::Integrity::Unreadable(_) => print!("  {err}[cannot be hashed]{r}"),
+        plugins::Integrity::Intact | plugins::Integrity::Unrecorded => {}
+    }
+}
+
+/// The manifest's one-line description, indented under the plugin, when it has one.
+fn print_description(description: Option<&str>, pal: &style::Palette) {
+    if let Some(desc) = description {
+        println!("    {}{desc}{}", pal.dim, pal.reset);
+    }
+}
+
+/// Where a plugin came from. A manifest is identical whatever the source, so the origin record is
+/// the only place the answer exists. Keyed on the directory name, which is what the install (and
+/// the record) uses and which may differ from the manifest's `name` for a hand-placed tree.
+fn print_provenance(layout: &store::Layout, dir_name: &str, pal: &style::Palette) {
+    println!(
+        "    {}from: {}{}",
+        pal.dim,
+        plugins::origin::read(layout, dir_name).label(),
+        pal.reset
+    );
+}
+
+/// The ambiguous keys, if any: a key claimed by more than one installed plugin resolves to nothing
+/// and every claimant is disabled. Reported on stdout, beside the plugins that *do* resolve,
+/// because it is the state of the installed set — not a passing diagnostic — and it stays until the
+/// user removes all but one claimant. `only` narrows the report to a single key, for the caller
+/// that was asked about that one.
+///
+/// Both namespaces are rendered here: a resolver's `scheme://`, and the **name** a broker and a
+/// signer are each reached by. They are separate sections because the remedy reads differently
+/// (one says a scheme must be unique, the other a name), and one function because a caller that
+/// showed only one would leave a plugin listed nowhere and explained nowhere.
+fn print_conflicts(
     layout: &store::Layout,
     registry: &plugins::PluginRegistry,
     only: Option<&str>,
     pal: &style::Palette,
 ) {
     let (n, dim, err, r) = (pal.name, pal.dim, pal.err, pal.reset);
+    let claimant_lines = |claimants: &[String]| {
+        for dir_name in claimants {
+            println!(
+                "    {n}{dir_name}{r}  {dim}from: {}{r}",
+                plugins::origin::read(layout, dir_name).label()
+            );
+        }
+    };
     let mut any = false;
     for (scheme, claimants) in registry.conflicts() {
         if only.is_some_and(|want| want != scheme) {
@@ -470,16 +550,32 @@ fn print_scheme_conflicts(
             "  {n}{scheme}://{r}  {err}claimed by {} plugins{r}",
             claimants.len()
         );
-        for dir_name in claimants {
-            println!(
-                "    {n}{dir_name}{r}  {dim}from: {}{r}",
-                plugins::origin::read(layout, dir_name).label()
-            );
-        }
+        claimant_lines(claimants);
     }
     if any {
         println!(
             "{dim}(a scheme must be unique: remove all but one with sbx plugins rm <name>){r}"
+        );
+    }
+    let mut any_name = false;
+    for (name, claimants) in registry.name_conflicts() {
+        if only.is_some_and(|want| want != name) {
+            continue;
+        }
+        if !any_name {
+            println!("{err}name conflicts{r} (every claimant below is disabled):");
+            any_name = true;
+        }
+        println!(
+            "  {n}{name}{r}  {err}claimed by {} plugins{r}",
+            claimants.len()
+        );
+        claimant_lines(claimants);
+    }
+    if any_name {
+        println!(
+            "{dim}(a plugin's name must be unique: remove all but one with sbx plugins rm \
+             <name>){r}"
         );
     }
 }
@@ -508,7 +604,13 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
                 "{}",
-                render_plugin_installed(&installed.name, installed.scheme.as_deref(), None, &pal)
+                render_plugin_installed(
+                    &installed.name,
+                    installed.scheme.as_deref(),
+                    installed.kind,
+                    None,
+                    &pal,
+                )
             );
             provision_configured_programs(&layout, &installed.name)
         }
@@ -537,9 +639,10 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
 fn provision_configured_programs(layout: &store::Layout, plugin_name: &str) -> ExitCode {
     let mut load_warnings = Vec::new();
     let registry = plugins::PluginRegistry::load_quiet(&layout.plugins_dir(), &mut load_warnings);
-    // Looked up by *name*, which is the key `[plugin.<name>]` answers under — and the one key both
-    // plugin types share. A resolver is indexed by its scheme and a broker by its name, but what
-    // is being provisioned here is the manifest's `programs`, which neither index is about.
+    // Looked up by *name*, which is the key `[plugin.<name>]` answers under — and the one key every
+    // plugin type shares. A resolver is indexed by its scheme and the others by their name, but
+    // what is being provisioned here is the manifest's `programs`, which no index is about: every
+    // kind runs a program, so every kind is searched.
     let Some((programs, dir_name)) = registry
         .resolvers()
         .find(|p| p.name == plugin_name)
@@ -547,6 +650,12 @@ fn provision_configured_programs(layout: &store::Layout, plugin_name: &str) -> E
         .or_else(|| {
             registry
                 .brokers()
+                .find(|p| p.name == plugin_name)
+                .map(|p| (&p.sandbox.programs, p.dir_name()))
+        })
+        .or_else(|| {
+            registry
+                .signers()
                 .find(|p| p.name == plugin_name)
                 .map(|p| (&p.sandbox.programs, p.dir_name()))
         })
@@ -1054,6 +1163,7 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
                 render_plugin_installed(
                     &installed.name,
                     installed.scheme.as_deref(),
+                    installed.kind,
                     Some(store_name),
                     &pal,
                 )
@@ -1965,23 +2075,37 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    // A broker claims no scheme, so it is looked up by the name it is registered and configured
-    // under — the same token `sbx plugins list` prints and `[broker.<name>]` binds. Tried before
+    // A broker and a signer claim no scheme, so each is looked up by the name it is registered
+    // under — the same token `sbx plugins list` prints, and the one a config names. Tried before
     // the scheme index reports a miss, because a plugin that is listed and cannot be inspected
-    // reads as a plugin that is not really installed.
+    // reads as a plugin that is not really installed. One name can reach only one of them: the
+    // registry disables both when two plugins claim it.
     if let Some(b) = registry.broker(scheme) {
         return info_broker(&layout, b, &pal);
     }
+    if let Some(s) = registry.signer(scheme) {
+        return info_signer(&layout, s, &pal);
+    }
     let Some(p) = registry.resolver(scheme) else {
-        // A scheme can be absent for three different reasons, and `info <scheme>` is exactly the
-        // command a user runs to learn which: nothing claims it, several plugins do (the answer is
-        // the conflict itself, so it is reported in full), or the one that does is malformed (that
-        // reason lives in the load warnings, re-emitted here).
+        // A key can be absent for four different reasons, and `info <key>` is exactly the command a
+        // user runs to learn which: nothing claims it, several plugins claim it as a scheme or
+        // several claim it as a name (the answer is the conflict itself, so it is reported in
+        // full), or the one that does is malformed (that reason lives in the load warnings,
+        // re-emitted here).
         if let Some(claimants) = registry.conflict(scheme) {
-            print_scheme_conflicts(&layout, &registry, Some(scheme), &pal);
+            print_conflicts(&layout, &registry, Some(scheme), &pal);
             diag::error(&format!(
                 "sbx: the scheme '{scheme}' is claimed by {} installed plugins and resolves to \
                  nothing until exactly one remains",
+                claimants.len()
+            ));
+            return ExitCode::FAILURE;
+        }
+        if let Some(claimants) = registry.name_conflict(scheme) {
+            print_conflicts(&layout, &registry, Some(scheme), &pal);
+            diag::error(&format!(
+                "sbx: the name '{scheme}' is claimed by {} installed plugins and reaches none of \
+                 them until exactly one remains",
                 claimants.len()
             ));
             return ExitCode::FAILURE;
@@ -1997,37 +2121,17 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
     println!("{h}resolver plugin:{r} {n}{}{r}", p.name);
     println!("  scheme:      {n}{}://{r}", p.scheme);
-    println!(
-        "  version:     {}",
-        p.version.as_deref().unwrap_or("(unset)")
+    print_about(
+        &layout,
+        About {
+            version: p.version.as_deref(),
+            description: p.description.as_deref(),
+            dir_name: p.dir_name(),
+            exec: &p.exec,
+        },
+        p.check_exec(),
+        &pal,
     );
-    println!(
-        "  description: {}",
-        p.description.as_deref().unwrap_or("(none)")
-    );
-    println!(
-        "  origin:      {}",
-        plugins::origin::read(&layout, p.dir_name()).label()
-    );
-    // Unlike `list`, every state is named here: `info` is the detail view, and "this matches what
-    // was installed" is exactly the reassurance a user opens it for.
-    println!(
-        "  integrity:   {}",
-        match plugins::integrity(&layout, p.dir_name()) {
-            plugins::Integrity::Intact => "unchanged since install".to_string(),
-            plugins::Integrity::Modified =>
-                format!("{err}MODIFIED since install{r} (verify with: sbx plugins verify)"),
-            plugins::Integrity::Unrecorded =>
-                "no digest recorded (installed before sbx recorded one, or placed by hand)"
-                    .to_string(),
-            plugins::Integrity::Unreadable(why) => format!("{err}cannot be hashed{r} ({why})"),
-        }
-    );
-    print!("  exec:        {}", p.exec.display());
-    match p.check_exec() {
-        Ok(()) => println!(),
-        Err(why) => println!("  {err}[not runnable: {why}]{r}"),
-    }
     println!("  sandbox grant:");
     println!("    network:     {}", p.sandbox.network);
     // Named even when absent, and named *loudly* when present: every other line of this grant is
@@ -2053,47 +2157,56 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     if let Some(n) = crate::sandbox::resolver::nix_closure_paths(&p.sandbox.programs) {
         println!("    nix closure: {n} store paths, so a store-installed program can run");
     }
-    print_host_config(p, err, r);
+    print_plugin_host_config(&p.name, &p.sandbox, err, r);
     ExitCode::SUCCESS
 }
 
-/// What this host answers for a plugin, from `[plugin.<name>]` in the resolved config.
+/// What an installed plugin says about itself, whatever its type: the manifest's display fields,
+/// plus the two facts only the data directory holds — where it came from and whether it still
+/// matches what was installed.
+struct About<'a> {
+    version: Option<&'a str>,
+    description: Option<&'a str>,
+    /// The directory name, which is what the origin record and the digest are filed under. It may
+    /// differ from the manifest's `name` for a hand-placed tree, and these two lines are about the
+    /// tree on disk rather than about what the manifest calls itself.
+    dir_name: &'a str,
+    exec: &'a Path,
+}
+
+/// The `sbx plugins info` block every type shares, under the line naming the plugin.
 ///
-/// Read through the config layer rather than from the manifest, because that is where the table
-/// is layered and gated: an untrusted project's is already dropped by the time it gets here, so
-/// what is printed is what a launch would use. Kept on its own lines under the grant — the grant
-/// is what the plugin asked for and was signed with, this is what the machine supplies, and
-/// reading them as one block would blur which of the two a line came from.
-///
-/// A variable the manifest does not declare is shown as ignored rather than omitted: the config
-/// says it, so the answer to "why is it not applying" belongs here.
-fn print_host_config(p: &crate::plugins::ResolverPlugin, err: &str, r: &str) {
-    let Ok(cwd) = std::env::current_dir() else {
-        return;
-    };
-    let resolved = crate::config::load(&cwd);
-    let Some(raw) = resolved.plugin.get(&p.name) else {
-        return;
-    };
-    if raw.env.is_empty() {
-        return;
-    }
-    println!("  host config (`[plugin.{}]`):", p.name);
-    if !raw.env.is_empty() {
-        let shown: Vec<String> = raw
-            .env
-            .iter()
-            .map(|(k, v)| {
-                let declared = p.sandbox.allow_env.iter().any(|d| d == k)
-                    || p.sandbox.allow_env_paths.iter().any(|d| d == k);
-                if declared {
-                    format!("{k}={v}")
-                } else {
-                    format!("{err}{k} (ignored: the manifest does not read it){r}")
-                }
-            })
-            .collect();
-        println!("    env:         {}", shown.join(", "));
+/// Unlike `list`, every integrity state is named here: `info` is the detail view, and "this matches
+/// what was installed" is exactly the reassurance a user opens it for.
+fn print_about(
+    layout: &store::Layout,
+    about: About<'_>,
+    runnable: Result<(), String>,
+    pal: &style::Palette,
+) {
+    let (err, r) = (pal.err, pal.reset);
+    println!("  version:     {}", about.version.unwrap_or("(unset)"));
+    println!("  description: {}", about.description.unwrap_or("(none)"));
+    println!(
+        "  origin:      {}",
+        plugins::origin::read(layout, about.dir_name).label()
+    );
+    println!(
+        "  integrity:   {}",
+        match plugins::integrity(layout, about.dir_name) {
+            plugins::Integrity::Intact => "unchanged since install".to_string(),
+            plugins::Integrity::Modified =>
+                format!("{err}MODIFIED since install{r} (verify with: sbx plugins verify)"),
+            plugins::Integrity::Unrecorded =>
+                "no digest recorded (installed before sbx recorded one, or placed by hand)"
+                    .to_string(),
+            plugins::Integrity::Unreadable(why) => format!("{err}cannot be hashed{r} ({why})"),
+        }
+    );
+    print!("  exec:        {}", about.exec.display());
+    match runnable {
+        Ok(()) => println!(),
+        Err(why) => println!("  {err}[not runnable: {why}]{r}"),
     }
 }
 
@@ -2218,35 +2331,17 @@ fn info_broker(
 ) -> ExitCode {
     let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
     println!("{h}broker plugin:{r} {n}{}{r}", p.name);
-    println!(
-        "  version:     {}",
-        p.version.as_deref().unwrap_or("(unset)")
+    print_about(
+        layout,
+        About {
+            version: p.version.as_deref(),
+            description: p.description.as_deref(),
+            dir_name: p.dir_name(),
+            exec: &p.exec,
+        },
+        p.check_exec(),
+        pal,
     );
-    println!(
-        "  description: {}",
-        p.description.as_deref().unwrap_or("(none)")
-    );
-    println!(
-        "  origin:      {}",
-        plugins::origin::read(layout, p.dir_name()).label()
-    );
-    println!(
-        "  integrity:   {}",
-        match plugins::integrity(layout, p.dir_name()) {
-            plugins::Integrity::Intact => "unchanged since install".to_string(),
-            plugins::Integrity::Modified =>
-                format!("{err}MODIFIED since install{r} (verify with: sbx plugins verify)"),
-            plugins::Integrity::Unrecorded =>
-                "no digest recorded (installed before sbx recorded one, or placed by hand)"
-                    .to_string(),
-            plugins::Integrity::Unreadable(why) => format!("{err}cannot be hashed{r} ({why})"),
-        }
-    );
-    print!("  exec:        {}", p.exec.display());
-    match p.check_exec() {
-        Ok(()) => println!(),
-        Err(why) => println!("  {err}[not runnable: {why}]{r}"),
-    }
     println!("  protocol:");
     println!("    framing:     {}", p.broker.framing.token());
     println!("    max frame:   {} bytes", p.broker.max_frame);
@@ -2304,28 +2399,80 @@ fn info_broker(
             p.name
         ),
     }
-    print_broker_host_config(p, err, r);
+    print_plugin_host_config(&p.name, &p.sandbox, err, r);
     ExitCode::SUCCESS
 }
 
-/// What this host answers a broker plugin, from `[plugin.<name>]`. The resolver's counterpart is
-/// [`print_host_config`]; both read through the config layer, so an untrusted project's table is
-/// already dropped by the time either prints.
-fn print_broker_host_config(p: &crate::plugins::broker::BrokerPlugin, err: &str, r: &str) {
+/// `sbx plugins info <name>` for a signer plugin. Two questions it has to answer that no other
+/// type does: exactly which headers this plugin may put on a request, and whether it is handed the
+/// credential's plaintext or a marker standing in for one.
+fn info_signer(
+    layout: &store::Layout,
+    p: &crate::plugins::signer::SignerPlugin,
+    pal: &style::Palette,
+) -> ExitCode {
+    let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
+    println!("{h}signer plugin:{r} {n}{}{r}", p.name);
+    print_about(
+        layout,
+        About {
+            version: p.version.as_deref(),
+            description: p.description.as_deref(),
+            dir_name: p.dir_name(),
+            exec: &p.exec,
+        },
+        p.check_exec(),
+        pal,
+    );
+    println!("  auth point:");
+    println!("    sets:        {}", p.signer.sets_headers.join(", "));
+    println!(
+        "    sees:        {}",
+        match p.signer.sees_headers.is_empty() {
+            true => "the method, the host and the target only".to_string(),
+            false => format!(
+                "the method, the host and the target, plus {}",
+                p.signer.sees_headers.join(", ")
+            ),
+        }
+    );
+    println!(
+        "    credential:  {}",
+        match p.signer.reads_secret {
+            true => "the plaintext, which it needs to compute a signature from",
+            false => "a marker standing in for it, which sbx substitutes on the way out",
+        }
+    );
+    print_plugin_host_config(&p.name, &p.sandbox, err, r);
+    ExitCode::SUCCESS
+}
+
+/// What this host answers a plugin, from `[plugin.<name>]` in the resolved config.
+///
+/// Read through the config layer rather than from the manifest, because that is where the table is
+/// layered and gated: an untrusted project's is already dropped by the time it gets here, so what
+/// is printed is what a launch would use. Kept on its own lines under the grant — the grant is what
+/// the plugin asked for and was signed with, this is what the machine supplies, and reading them as
+/// one block would blur which of the two a line came from.
+///
+/// A variable the manifest does not declare is shown as ignored rather than omitted: the config
+/// says it, so the answer to "why is it not applying" belongs here. One printer for every type,
+/// because `[plugin.<name>]` means the same thing whatever the plugin does with it.
+fn print_plugin_host_config(name: &str, grant: &plugins::SandboxGrant, err: &str, r: &str) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
     let resolved = crate::config::load(&cwd);
-    let Some(raw) = resolved.plugin.get(&p.name) else {
+    let Some(raw) = resolved.plugin.get(name) else {
         return;
     };
     if raw.env.is_empty() {
         return;
     }
-    println!("  host config (`[plugin.{}]`):", p.name);
+    println!("  host config (`[plugin.{name}]`):");
     for (k, v) in &raw.env {
-        let declared = p.sandbox.allow_env.iter().any(|d| d == k)
-            || p.sandbox.allow_env_paths.iter().any(|d| d == k);
+        let declared =
+            grant.allow_env.iter().any(|d| d == k) || grant.allow_env_paths.iter().any(|d| d == k);
         match declared {
             true => println!("    {k}={v}"),
             false => println!("    {k}={v}  {err}[ignored: the manifest does not declare it]{r}"),
@@ -2481,7 +2628,7 @@ mod tests {
                     origin: origin.clone(),
                     version: None,
                     digest: None,
-                    disabled_over: Some(scheme.to_string()),
+                    disabled_over: Some(Contested::Scheme(scheme.to_string())),
                 },
             );
         }

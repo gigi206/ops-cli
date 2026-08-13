@@ -122,7 +122,7 @@ impl SecretMarker {
     }
 
     /// What the plugin is told to place.
-    fn token(&self) -> String {
+    pub(crate) fn token(&self) -> String {
         String::from_utf8_lossy(&self.marker).into_owned()
     }
 
@@ -146,6 +146,15 @@ impl SecretMarker {
             }
         }
         out
+    }
+
+    /// The same substitution on text, for a channel whose messages are strings rather than frames:
+    /// a signer answers with header values, not with a byte stream.
+    ///
+    /// Both sides are valid UTF-8 by construction (the marker is ASCII, and the secret came from a
+    /// `String`), so nothing is lost in the round trip.
+    pub(crate) fn substitute_str(&self, text: &str) -> String {
+        String::from_utf8_lossy(&self.substitute(text.as_bytes())).into_owned()
     }
 
     /// Whether these bytes carry the secret itself — the tripwire for the way back.

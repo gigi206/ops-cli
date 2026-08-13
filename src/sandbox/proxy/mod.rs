@@ -179,8 +179,9 @@ use capture::{CaptureGuard, CaptureReader};
 use ctx::effective_policy;
 pub(crate) use ctx::{ProxyCtx, builtin_allow_rules, union_with_builtin};
 pub(crate) use inject::{
-    CredentialRefresh, CredentialSet, Credentials, HeaderInjection, SecretNeedle,
+    CredentialRefresh, CredentialSet, Credentials, Form, HeaderInjection, SecretNeedle, Signed,
 };
+use inject::{SignRefusal, pairs_for as injection_values};
 use pool::{PoolKey, UpstreamTls};
 pub(crate) use ssrf::{AddrRefusal, ip_refusal, names_exact_host};
 use ssrf::{checked_address, resolve_checked};
@@ -618,7 +619,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     before any egress, so no `allow` is recorded — rather than open an unredactable channel
     //     that carries an injected secret. (Reached only when a `{WS}` rule already permitted the
     //     upgrade to this host; a WS to a non-`{WS}` host was denied by method above.)
-    if ws_upgrade && !matching_injections(&creds, &connect_host, port, &itarget).is_empty() {
+    if ws_upgrade && !matching_injection_ids(&creds, &connect_host, port, &itarget).is_empty() {
         ctx.outcome(
             super::control::Proto::Https,
             &connect_host,
@@ -667,7 +668,38 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    cannot ride along to an unintended host. It is settled before any connection is taken,
     //    because which credentials a request carries is half of what partitions the pool below.
     let injected_ids = matching_injection_ids(&creds, &connect_host, port, &itarget);
-    let injected = injection_pairs(&creds, &injected_ids);
+    // Forming the values may take a plugin round trip, and a plugin that cannot sign refuses the
+    // request: a request that could not be given its credential is never sent without it.
+    let injected = match injection_values(
+        &creds,
+        &injected_ids,
+        &inject::RequestFacts {
+            method: &imethod,
+            host: &connect_host,
+            port,
+            target: &itarget,
+            headers: &inner.headers,
+        },
+    ) {
+        Ok(pairs) => pairs,
+        Err(refusal) => {
+            ctx.outcome(
+                super::control::Proto::Https,
+                &connect_host,
+                port,
+                Some(&imethod),
+                Some(&itarget),
+                StatKind::Blocked,
+                SIGNER_REFUSED,
+            );
+            return respond_refusal_tls(
+                &mut br,
+                "403 Forbidden",
+                SIGNER_REFUSED,
+                &signer_refusal_message(&refusal),
+            );
+        }
+    };
 
     // 7b. Remember any credential the cage sent for itself (an OAuth token an app obtained by its
     //     own sign-in), so the tripwires cover it as they cover a declared secret. Placed here for
@@ -676,7 +708,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     and after the injection match, so a header sbx is about to replace is skipped — its value
     //     never reaches the wire, and remembering it would tripwire the client's own placeholder,
     //     refusing every later request that carries it.
-    let injected_names: Vec<&str> = injected.iter().map(|(name, _)| *name).collect();
+    let injected_names = injected_names(&creds, &injected_ids);
     ctx.credentials
         .observe_head(&inner.headers, &injected_names);
 
@@ -1010,9 +1042,11 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         ctx.set_status(allow_seq, code);
         // A `401` from a host this request carried a credential to is the destination itself saying
         // the value is no longer accepted — the one signal worth re-resolving on, and a truer one
-        // than any declared expiry. Gated on `injected`, so a refusal from a host we inject nothing
-        // into can never make an in-cage agent drive sbx's resolver.
-        if code == 401 && !injected.is_empty() {
+        // than any declared expiry. Gated on a *refreshable* injection, so a refusal from a host we
+        // inject nothing into can never make an in-cage agent drive sbx's resolver, and a host whose
+        // credential is signed per request never spends a resolver run on a value that cannot be
+        // stale.
+        if code == 401 && any_refreshable(&creds, &injected_ids) {
             ctx.credential_refused();
         }
     }
@@ -1866,7 +1900,36 @@ fn handle_https_forward(
     //    it encrypted, never in the clear. Settled before a connection is taken, because which
     //    credentials a request carries is half of what partitions the pool.
     let injected_ids = matching_injection_ids(&creds, &host, port, &path);
-    let injected = injection_pairs(&creds, &injected_ids);
+    let injected = match injection_values(
+        &creds,
+        &injected_ids,
+        &inject::RequestFacts {
+            method,
+            host: &host,
+            port,
+            target: &path,
+            headers: &head.headers,
+        },
+    ) {
+        Ok(pairs) => pairs,
+        Err(refusal) => {
+            ctx.outcome(
+                super::control::Proto::Https,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                StatKind::Blocked,
+                SIGNER_REFUSED,
+            );
+            return write_refusal(
+                &mut client,
+                "403 Forbidden",
+                SIGNER_REFUSED,
+                &signer_refusal_message(&refusal),
+            );
+        }
+    };
 
     // 7a. Whether this request may share its upstream leg with others, on the same terms as the
     //     tunneled path: the launch has to have asked for reuse, and the request has to be HTTP/1.1.
@@ -2097,9 +2160,11 @@ fn handle_https_forward(
         ctx.set_status(allow_seq, code);
         // A `401` from a host this request carried a credential to is the destination itself saying
         // the value is no longer accepted — the one signal worth re-resolving on, and a truer one
-        // than any declared expiry. Gated on `injected`, so a refusal from a host we inject nothing
-        // into can never make an in-cage agent drive sbx's resolver.
-        if code == 401 && !injected.is_empty() {
+        // than any declared expiry. Gated on a *refreshable* injection, so a refusal from a host we
+        // inject nothing into can never make an in-cage agent drive sbx's resolver, and a host whose
+        // credential is signed per request never spends a resolver run on a value that cannot be
+        // stale.
+        if code == 401 && any_refreshable(&creds, &injected_ids) {
             ctx.credential_refused();
         }
     }
@@ -2523,16 +2588,7 @@ impl Head {
 /// The credential injections (`header`, `value`) whose host/path rule matches this request,
 /// canonicalized through the same matcher the verdict used. Borrowed from the context, so no
 /// secret is copied beyond the forwarded head.
-fn matching_injections<'a>(
-    creds: &'a CredentialSet,
-    host: &str,
-    port: u16,
-    target: &str,
-) -> Vec<(&'a str, &'a str)> {
-    injection_pairs(creds, &matching_injection_ids(creds, host, port, target))
-}
-
-/// The same match as [`matching_injections`], as **positions** in the credential set.
+/// The **positions** in the credential set of the injections this request receives.
 ///
 /// This is what identifies a credential set without carrying one: the upstream-connection pool is
 /// partitioned by which credentials a request received, and its key has to name them without holding
@@ -2553,17 +2609,39 @@ fn matching_injection_ids(
         .collect()
 }
 
-/// The `(header, value)` pairs named by positions in the credential set. Borrowed from it, so
-/// no secret is copied beyond the forwarded head.
-fn injection_pairs<'a>(creds: &'a CredentialSet, ids: &[usize]) -> Vec<(&'a str, &'a str)> {
+/// The header **names** the matched injections will put on this request, answerable before any
+/// value exists.
+///
+/// Kept apart from forming the values because the two questions have different costs and different
+/// answers: which headers a request will carry is a property of the declarations alone, while what
+/// they contain may take a plugin round trip. Everything that only needs the names — remembering
+/// the cage's own credentials, and the WebSocket refusal — asks this one.
+fn injected_names<'a>(creds: &'a CredentialSet, ids: &[usize]) -> Vec<&'a str> {
     ids.iter()
-        .map(|&i| {
-            (
-                creds.injections[i].header.as_str(),
-                creds.injections[i].value.as_str(),
-            )
-        })
+        .flat_map(|&i| creds.injections[i].header_names())
         .collect()
+}
+
+/// Whether any credential this request carried is one a `401` says something about — the gate on
+/// spending a resolver run. See [`HeaderInjection::refreshable`].
+fn any_refreshable(creds: &CredentialSet, ids: &[usize]) -> bool {
+    ids.iter().any(|&i| creds.injections[i].refreshable())
+}
+
+/// The reason token a request refused for want of a signature carries: the `x-sbx-egress-reason`
+/// header, and the reason in the log. Distinct from every policy tag, because nothing about the
+/// policy said no — the credential could not be formed.
+const SIGNER_REFUSED: &str = "signer-refused";
+
+/// The sentence a signer refusal answers with. It names the plugin, because a refusal that does not
+/// say who refused leaves the user auditing every declaration, and it says plainly that the request
+/// was not sent: an unsigned request reaching the destination would come back as an authentication
+/// error for a reason that has nothing to do with the credential.
+fn signer_refusal_message(refusal: &SignRefusal) -> String {
+    format!(
+        "the `{}` signer plugin did not sign this request ({}), so it was not sent",
+        refusal.signer, refusal.why
+    )
 }
 
 /// Whether the decrypted client request head carries any configured secret value verbatim — the
@@ -2597,7 +2675,7 @@ fn carries_secret(head_bytes: &[u8], redactions: &[SecretNeedle]) -> bool {
 /// would forward as a second, attacker-controlled value).
 fn reserialize_request(
     head: &Head,
-    injections: &[(&str, &str)],
+    injections: &[(String, String)],
     force_content_length: Option<u64>,
     keep_alive: bool,
 ) -> Vec<u8> {

@@ -598,10 +598,12 @@ fn bulk_throughput() {
         "bench-token",
         b"BENCH-SECRET-VALUE-0123456789".to_vec(),
     )];
-    let injection = || HeaderInjection {
-        rule: classify("upstream.test").unwrap(),
-        header: "authorization".to_string(),
-        value: "Bearer BENCH-SECRET-VALUE-0123456789".to_string(),
+    let injection = || {
+        HeaderInjection::fixed(
+            classify("upstream.test").unwrap(),
+            "authorization".to_string(),
+            "Bearer BENCH-SECRET-VALUE-0123456789".to_string(),
+        )
     };
 
     for label in [

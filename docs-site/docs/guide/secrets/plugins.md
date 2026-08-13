@@ -157,7 +157,7 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   socket the resolver is given, in place of the host resource behind it. It is
   the only entry here that takes something away: reading a password store means
   asking the GnuPG agent to decrypt, and the only way to ask was `allow_paths`
-  on the agent's own socket — every operation the agent can perform, signing
+  on the agent's own socket, which is every operation the agent can perform, signing
   included.
   - Both sides consent. The manifest asks by name; the grant is answered only
     where a **global** `[broker.<name>]` binds that name and the broker comes
@@ -537,7 +537,7 @@ launch:
   for the reason `state` is a boolean and never a path, and sets every name in
   `cage_env` to it. A protocol whose clients compute the path themselves says so
   with `at_host_path`, and the socket is then stood at the address of the resource
-  it fences — the one the config named, still never one the manifest chose.
+  it fences: the one the config named, still never one the manifest chose.
 - **`cage_env` passes the reserved-key barrier** an untrusted project's `[env]`
   meets. A broker points a client at its socket; names like `LD_PRELOAD` or `PATH`
   load code in the cage instead.
@@ -545,7 +545,7 @@ launch:
   big-endian length, then the body, which carries the protocol's own type byte),
   `line` (one message per line, the newline being the boundary rather than part of the
   message), and `pgwire` (PostgreSQL's: a type byte, then a length that **counts itself**,
-  except for the startup packet which has no type byte at all — so the reader is stateful). A plugin handed an uncut stream would be the broker rather than rule on its
+  except for the startup packet which has no type byte at all, so the reader is stateful). A plugin handed an uncut stream would be the broker rather than rule on its
   messages. An over-long frame is an error, never a truncation.
 - **`uses_secret` is what lets a broker place a credential it never sees.** The plugin is
   handed a random marker and `sbx` substitutes the value on the way to the host resource;
@@ -555,7 +555,7 @@ launch:
 - **`host_deadline` is how long the protocol may take, not how long the machine takes.** A
   deadline exists so a wedged resource cannot wedge the cage: it holds a thread, a plugin
   process and two connections while it waits. Thirty seconds suits a resource answering at
-  machine speed and is wrong for one that stops to **ask a person** — a gpg-agent opening a
+  machine speed and is wrong for one that stops to **ask a person**: a gpg-agent opening a
   pinentry answers when the human does. A manifest raises it up to ten minutes; past that,
   whatever is on the other side is wedged rather than thinking.
 - **`host_greets` and multi-message answers both need `inspect_replies`.** A protocol
@@ -572,6 +572,102 @@ and it may not declare `brokers` of its own: a fence behind a fence is a chain n
 bounds. It also cannot be handed a credential unless its manifest says `uses_secret`,
 and what it is handed then is a marker, never the value.
 :::
+
+## The signer type
+
+A resolver answers *where a value comes from*. A broker answers *how the cage uses a
+host resource without holding it*. A **signer** answers the question neither can:
+*what does authenticating this request look like?*
+
+[Credential injection](injection) already puts a credential on an outbound request:
+a header name, and a value formed once at launch from the resolved plaintext. That
+covers every auth point whose value is a constant, such as a bearer token, a Basic
+pair or an API key. It cannot cover one whose value depends on the request itself:
+a signature over the method, the path and the query, a per-request nonce, a
+challenge answered in kind. `type = "signer"` is the third plugin type, for exactly
+those.
+
+```toml
+name = "example-sigv4"
+type = "signer"                       # no `scheme`: a signer claims no ref namespace
+exec = "bin/sign"
+
+[signer]
+sets_headers = ["Authorization", "X-Example-Date"]   # every header it may put on a request
+sees_headers = ["Content-Type"]                      # beyond the method, host and target
+reads_secret = false                                 # true = handed the plaintext, not a marker
+```
+
+What bounds a signer is not a new argument, it is an inherited one:
+
+- **The window is one host.** A signer is named by a `[[secret]]`, and a secret's
+  `to` is a single concrete destination (a `*.` wildcard or a `re:` regex is refused
+  at validation). So a signer is shown the requests of exactly the host its own
+  declaration names, which is the host that already receives that credential on
+  every request. No spelling of a manifest widens that: the destination comes from
+  the config, never from the plugin.
+- **The plugin is a pure filter**, on the same terms as a broker: no listening
+  socket, no network descriptor, no host resource. It speaks to `sbx` alone, over
+  stdin and stdout, from a host-side cage with an empty network namespace.
+
+Together those are the ceiling: **a signer plugin can never see or place more than
+the `[[secret]]` naming it already puts on the wire.** It is meant to place it far
+better, bound to one request instead of replayable on any.
+
+The rules a signer manifest is held to, each refused at load rather than at launch:
+
+- **`network` and `state` are refused**, for the reason a broker's are. A signer is
+  shown a credential's requests and, where it reads one, the credential itself.
+- **`sets_headers` is required and non-empty.** A signer that sets nothing
+  authenticates nothing, and the list is what makes the manifest a review surface:
+  reading it tells you every header this plugin can write.
+- **Some headers no manifest may declare.** `Host` chooses where the credential
+  lands; `Content-Length`, `Transfer-Encoding` and `Trailer` choose where `sbx`
+  thinks the request ends; `Connection`, `Upgrade`, `TE`, `Expect` and the
+  `Proxy-*` family belong to the hop rather than to the request. Where a request
+  goes, where it ends and what the connection becomes are sbx's, never a plugin's.
+  The refusal is case-insensitive, since a header name is.
+- **`sees_headers` is empty by default.** A request carries whatever the cage put on
+  it, including credentials an app obtained by its own sign-in, which belong to no
+  declaration. A plugin that must see one says which.
+- **`reads_secret` is the step down, and it is labelled.** Off, the plugin is handed
+  a marker standing in for the credential rather than the credential: it can place a
+  secret it can never read, which is enough for one that is *carried*. It is not
+  enough for one that is *computed*, since an HMAC over the canonical request is a
+  function of the key. On, the plugin gets the key material, and it says so in the
+  manifest that was reviewed rather than in the config of the machine that runs it.
+
+:::note What a signer plugin does not reach
+A signer is given no `scheme`, so nothing a secret's `from` names routes to it, and
+it may not declare `brokers` of its own: a broker fences a cage's access to a host
+resource, and a signer has no cage and reaches no resource.
+:::
+
+A declaration reaches it with [`sign`](../configuration/secret#sign-a-credential-computed-from-the-request):
+
+```toml
+[secret."s3.eu-west-1.amazonaws.com"]
+from = "env://AWS_SECRET_ACCESS_KEY"
+sign = "example-sigv4"
+```
+
+The plugin is started once for the launch and asked once per request. It is told the
+destination the config named, the method, the target and the headers it declared in
+`sees_headers`, and it answers with headers. **Any failure refuses the request** with a
+`403` and the reason `signer-refused`: a request that could not be signed is never sent
+unsigned.
+
+What the tripwires watch also changes, and deliberately: for a signed credential the
+[needle](redaction) is the **key**, not the signature. A signature is derived,
+request-bound and single-use, while the key is the thing that must never leave the cage
+verbatim.
+
+Where a signer is visible: a refused request appears in
+[`sbx net logs`](../cli/net) with the verdict `blocked` and the reason
+`signer-refused`, and is counted under `BLOCKED` in `sbx net stats`. Unlike a broker,
+a signer has **no feed of its own** in [`sbx logs`](../cli/logs): a signed request is
+one line of the egress log like any other request, and there is nothing per-frame to
+show. A plugin's own words reach you on a refusal, where the `403` repeats them.
 
 ## An honest residual: a networked resolver reaches the host network
 

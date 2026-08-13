@@ -20,9 +20,10 @@
 //! response DATA/headers/trailers for an injection-target host ([`relay_body_redacting`]).
 
 use super::capture::CapBuf;
+use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
 use super::{
-    AskPosture, ProxyCtx, SecretNeedle, StatKind, carries_secret, decide_https,
-    matching_injections, redact_in_place, resolve_checked, upstream_server_name,
+    AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, carries_secret, decide_https,
+    matching_injection_ids, redact_in_place, resolve_checked, upstream_server_name,
 };
 use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -323,6 +324,47 @@ async fn relay(
     // One credential state for the whole stream's relay: the injection applied below and the reflection
     // masking decided further down must come from the same resolution.
     let creds = ctx.credentials.snapshot();
+    // Any host-scoped credential to inject — keyed on the already-verified host and the decrypted
+    // path, so it reaches exactly its scoped destination. Runs after the verdict (a denied request
+    // never got here). Each is **strip-and-replace**: the client's own copy of that header is
+    // dropped and sbx's value is the only one forwarded.
+    //
+    // Forming the values goes through the same door the other two plans use, so a signer refusal
+    // cannot be invisible on this one: it is counted at the same chokepoint and answered with the
+    // same status, framed rather than written.
+    //
+    // Settled here, *before* the upstream is opened and before the allow is recorded, which is
+    // where the HTTP/1.1 paths settle it too. Left where the injection used to sit — after the
+    // allow — a refused stream would have been counted twice, once allowed and once blocked, which
+    // is the same asymmetry between the plans that once made an h2 refusal invisible, inverted.
+    let injected_ids = matching_injection_ids(&creds, host, port, path);
+    let injected = match injection_values(
+        &creds,
+        &injected_ids,
+        &RequestFacts {
+            method,
+            host,
+            port,
+            target: path,
+            headers: &H2Headers(req.headers()),
+        },
+    ) {
+        Ok(pairs) => pairs,
+        Err(_refusal) => {
+            ctx.outcome(
+                Proto::Https,
+                host,
+                port,
+                Some(method),
+                Some(path),
+                StatKind::Blocked,
+                SIGNER_REFUSED,
+            );
+            let _ = refuse(respond, StatusCode::FORBIDDEN, SIGNER_REFUSED);
+            return;
+        }
+    };
+
     let tcp =
         match tokio::time::timeout(ctx.timeout, tokio::net::TcpStream::connect((ip, port))).await {
             Ok(Ok(t)) => t,
@@ -397,12 +439,6 @@ async fn relay(
         "allowed",
     );
 
-    // Any host-scoped credential to inject — keyed on the already-verified host and the decrypted
-    // path, so it reaches exactly its scoped destination. Runs after the verdict (a denied request
-    // never got here). Each is **strip-and-replace**: the client's own copy of that header is
-    // dropped and sbx's value is the only one forwarded.
-    let injected = matching_injections(&creds, host, port, path);
-
     // Open the traffic capture for this stream, when the launch captures. The head recorded is the
     // client's own, rendered from the decoded request *before* the rebuild below adds any injected
     // credential, so a secret cannot reach the capture even in principle. The guard files on drop,
@@ -428,7 +464,7 @@ async fn relay(
         builder = builder.header(name, value);
     }
     for (h, v) in &injected {
-        builder = builder.header(*h, *v);
+        builder = builder.header(h.as_str(), v.as_str());
     }
     let up_req = match builder.body(()) {
         Ok(r) => r,
@@ -746,6 +782,20 @@ fn refuse(
         .expect("a static status + ASCII reason is always a valid response");
     respond.send_response(resp, true)?;
     Ok(())
+}
+
+/// This path's header representation, offered to a signer under the shape every path offers.
+///
+/// A wrapper rather than an `impl` on `HeaderMap` itself, because the trait belongs to the
+/// injection layer and the map to `http`: neither is ours to give the other.
+struct H2Headers<'a>(&'a http::HeaderMap);
+
+impl HeaderLookup for H2Headers<'_> {
+    fn get(&self, name: &str) -> Option<&str> {
+        // A header whose bytes are not text is not one a signer can be shown: it would have to be
+        // spelled to reach a JSON line, and a spelling sbx invented is not what the cage sent.
+        self.0.get(name).and_then(|v| v.to_str().ok())
+    }
 }
 
 /// Connection-specific request headers HTTP/2 forbids (RFC 9113 §8.2.2), plus `host` (h2 carries

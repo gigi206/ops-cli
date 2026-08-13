@@ -332,10 +332,11 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
             skipped.join(", ")
         ));
     }
-    // Both kinds are published from one tree and one key. The store is not the boundary a broker
-    // is fenced by — installing one grants nothing until a global `[broker.<name>] socket` binds
-    // it to a host resource — so a second store would add a trust ritual where nothing is decided,
-    // and a second catalogue to keep in step for no property gained.
+    // Every kind is published from one tree and one key. The store is not the boundary any of them
+    // is fenced by — installing a broker grants nothing until a global `[broker.<name>] socket`
+    // binds it to a host resource, and installing a signer grants nothing until a `[[secret]]`
+    // names it — so a second store would add a trust ritual where nothing is decided, and a second
+    // catalogue to keep in step for no property gained.
     struct Listed<'a> {
         name: &'a str,
         dir: &'a Path,
@@ -361,6 +362,15 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
             dir: &p.dir,
             exec: &p.exec,
             kind: crate::plugins::PluginKind::Broker,
+            scheme: None,
+            version: p.version.as_ref(),
+            description: p.description.as_ref(),
+        }))
+        .chain(registry.signers().map(|p| Listed {
+            name: &p.name,
+            dir: &p.dir,
+            exec: &p.exec,
+            kind: crate::plugins::PluginKind::Signer,
             scheme: None,
             version: p.version.as_ref(),
             description: p.description.as_ref(),

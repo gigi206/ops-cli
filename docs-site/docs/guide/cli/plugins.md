@@ -15,7 +15,7 @@ See also: [Resolver plugins](../secrets/plugins) · [Signed plugin stores](../se
 
 | Subcommand | Purpose |
 |---|---|
-| `list` (alias `ls`) | list installed plugins of both kinds (with their origin) and the built-in schemes |
+| `list` (alias `ls`) | list installed plugins of every kind (with their origin) and the built-in schemes |
 | `info <scheme\|name>` | show a plugin's manifest, sandbox grant, and origin |
 | `install <dir>` | install a local plugin directory (`<data>/plugins/<name>`); the built-in schemes are always present, not installed |
 | `rm <name>...` | remove installed resolver plugins; several names may be given, each removed on its own |
@@ -27,9 +27,18 @@ copy is validated exactly as the launcher will and refused, fail-closed, on any 
 
 A resolver is named by the `scheme://` it claims. A [broker](../configuration/broker)
 claims none, so `info` takes the name `[broker.<name>]` binds, and its page adds the
-protocol facts a launch acts on — the framing, the frame ceiling, how long `sbx` waits
-on the host resource, how the cage finds the socket — and whether the global config
-binds it at all.
+protocol facts a launch acts on (the framing, the frame ceiling, how long `sbx` waits
+on the host resource, how the cage finds the socket) plus whether the global config
+binds it at all. A [signer](../secrets/plugins#the-signer-type) is named the same way,
+and its page states its auth point: the headers it may set, what of the request it is
+shown, and whether it is handed the credential's plaintext or a marker standing in for
+one.
+
+A plugin's name is one namespace across the kinds reached by name, so a broker and a
+signer cannot share one. Two plugins answering to one name are both disabled, exactly
+as two claimants of one scheme are: `list` reports it under `name conflicts`, `info
+<name>` names every claimant and exits non-zero, and every install path refuses a name
+another plugin already holds.
 
 Each listing reports where a plugin came from: a named store (with its URL) or a
 local directory (with its path). A plugin installed before origins were recorded

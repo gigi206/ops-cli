@@ -579,7 +579,7 @@ pub(super) fn is_websocket_upgrade(head: &Head) -> bool {
 /// PRESERVES the hop-by-hop `Connection`/`Upgrade` headers (and the `Sec-WebSocket-*` set) so the
 /// upstream actually performs the upgrade — the opposite of the normal path, which forces
 /// `Connection: close`. `Proxy-Connection` and `Expect` are still stripped (proxy-local hop headers).
-pub(super) fn reserialize_upgrade(head: &Head, injections: &[(&str, &str)]) -> Vec<u8> {
+pub(super) fn reserialize_upgrade(head: &Head, injections: &[(String, String)]) -> Vec<u8> {
     let mut out = String::with_capacity(head.request_line.len() + 64);
     out.push_str(&head.request_line);
     out.push_str("\r\n");
@@ -622,7 +622,7 @@ pub(super) fn relay_upgrade(
     mut br: BufReader<StreamOwned<ServerConnection, UnixStream>>,
     mut upstream: StreamOwned<ClientConnection, TcpStream>,
     inner: &Head,
-    injected: &[(&str, &str)],
+    injected: &[(String, String)],
     ctx: &ProxyCtx,
     allow_seq: Option<u64>,
     capture: Option<&CaptureGuard>,

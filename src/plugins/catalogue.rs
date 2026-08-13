@@ -98,7 +98,8 @@ impl Catalogue {
                 None => crate::plugins::PluginKind::Resolver,
             };
             // The same rule the manifest is held to, so a listing cannot advertise something no
-            // install could reconcile: a resolver is reached through a scheme, a broker by name.
+            // install could reconcile: a resolver is reached through a scheme, every other kind
+            // by its name.
             let scheme = match (kind.claims_a_scheme(), entry.scheme) {
                 (true, Some(scheme)) => {
                     crate::plugins::validate_scheme(&scheme).map_err(here)?;
