@@ -197,6 +197,76 @@ reserved set), nor one `sbx` sets for a broker of its own: a broker points a cli
 socket, it does not arrange for something to be executed, and it does not stand in for
 another broker.
 
+### Clients that compute the path themselves
+
+Some protocols never read a variable. A GnuPG client derives
+`/run/user/<uid>/gnupg/S.gpg-agent` from the uid and the home directory, and has done since
+`GPG_AGENT_INFO` stopped naming anything in GnuPG 2.1. Pointing at such a broker with a
+variable is pointing at nothing.
+
+A manifest says so with `at_host_path = true`, and the fenced socket is then bound **at the
+address of the resource it stands in front of** — the path `[broker.<name>] socket` names.
+A client that would have found the raw socket finds the fence, and needs no telling:
+
+```toml
+[broker]
+framing         = "line"
+max_frame       = 2048
+at_host_path    = true
+host_deadline   = 300
+host_greets     = true
+inspect_replies = true
+```
+
+`host_deadline` is the other thing that manifest is saying, and it belongs to the same protocol
+rather than to any machine: a key with a passphrase makes the agent stop mid-exchange and open a
+pinentry, and it answers when the person does. The default `sbx` waits on a host resource is thirty
+seconds — a typing speed, not a fault — so a protocol that asks a person raises it, up to ten
+minutes. Past that, whatever is on the other side is wedged rather than thinking, and letting go is
+what keeps a thread, a plugin process and two connections from being held indefinitely.
+
+This is still not a path in a manifest. It says how the protocol locates a socket; the path
+itself comes from the config that named the resource. A `tcp://` target has no such address,
+so the two declarations together are refused rather than one quietly ignoring the other, and
+a manifest that declares `at_host_path` needs no `cage_env` at all.
+
+## Giving a resolver plugin the fence
+
+A [resolver plugin](../secrets/plugins) can be put behind a broker instead of being handed
+the host resource. This is the one grant in `sbx` that only ever **takes something away**:
+
+```toml
+# in the resolver's plugin.toml
+[sandbox]
+brokers = ["gpg-agent"]
+```
+
+The published `pass` resolver is the worked example. Reading a password store means asking
+the GnuPG agent to decrypt — and the only way to ask used to be `allow_paths` on the agent's
+socket, which carries every operation the agent can perform, signing included. Naming the
+broker binds the filtered socket at that same address instead, so `pass(1)` finds what it
+always looked for and the connection carries only what `[broker.gpg-agent] allow` admits.
+
+Both sides consent. The manifest asks by name; the grant is answered only where a **global**
+`[broker.<name>]` binds that name and the broker actually comes up. A name nothing binds is
+a warning and no socket — never a fall back to the raw resource:
+
+```
+sbx: warning: the `pass` plugin needs the `gpg-agent` broker, which this launch has not
+     stood up — bind it with `[broker.gpg-agent] socket` in the global config, or the
+     plugin runs without it
+```
+
+`sbx plugins info <scheme>` shows the grant and whether this machine answers it, so the
+question can be settled before a secret is resolved rather than during it.
+
+Two limits are worth stating plainly. A **broker** plugin may not declare `brokers`: a fence
+behind a fence is a chain nothing bounds, and what the outer one admits would come to depend
+on a plugin rather than on the config that bound it. And a broker's **own** `secret` is
+resolved before any broker is standing, so a credential for a broker cannot itself be read
+through one — the launch says which declaration made it impossible rather than leaving the
+tool's own error to stand for it.
+
 ## Seeing what is bound
 
 `sbx config show` lists every broker a launch would stand up, and leads each line with the

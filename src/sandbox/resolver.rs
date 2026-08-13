@@ -97,6 +97,11 @@ pub(super) struct CagePlan<'a> {
     pub(super) configured_as: &'a str,
     /// What follows the executable in its argument list.
     pub(super) args: Vec<OsString>,
+    /// The brokers standing for this launch, of which this plugin gets the ones its grant names.
+    ///
+    /// The whole set rather than the matched subset, so the rule that decides which a plugin sees —
+    /// and the warning for a name nothing bound — lives in one place and reads the grant itself.
+    pub(super) brokers: &'a [super::broker::Reachable],
 }
 
 /// The private state directory for a plugin installed at `dir`, by the rule [`state_dir`] applies.
@@ -177,6 +182,7 @@ pub(super) fn compose_cage(
             }
         }
     }
+    let brokers = resolve_brokers(plugin);
     let programs = resolve_programs(plugin)?;
     // A nix-installed program is not a self-contained file, so the paths it needs come with it.
     let closure = nix_closures(&programs)?;
@@ -184,15 +190,16 @@ pub(super) fn compose_cage(
     for program in &programs {
         binds.push((program.name.clone(), program.bind_src()?));
     }
-    let spec = cage_spec(plugin, &allow_env, &env_paths, &binds, &closure).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "cannot build the plugin sandbox for `{}`: {e:?}",
-                plugin.called
-            ),
-        )
-    })?;
+    let spec =
+        cage_spec(plugin, &allow_env, &env_paths, &binds, &closure, &brokers).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot build the plugin sandbox for `{}`: {e:?}",
+                    plugin.called
+                ),
+            )
+        })?;
 
     // The returned descriptor is where the cage's environment is read from, and the reason it is a
     // descriptor is this cage in particular: a plugin's `allow_env` is how it is handed its *own*
@@ -202,7 +209,12 @@ pub(super) fn compose_cage(
 
 /// Run `plugin` to resolve `reff`, returning its raw stdout on success (the caller classifies
 /// empty-as-absent).
-pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Result<String> {
+pub(crate) fn run(
+    bwrap: &Path,
+    plugin: &ResolverPlugin,
+    reff: &str,
+    brokers: &[super::broker::Reachable],
+) -> io::Result<String> {
     let plan = CagePlan {
         dir: &plugin.dir,
         exec: &plugin.exec,
@@ -211,6 +223,7 @@ pub(crate) fn run(bwrap: &Path, plugin: &ResolverPlugin, reff: &str) -> io::Resu
         called: &plugin.scheme,
         configured_as: &plugin.name,
         args: vec![OsString::from(reff)],
+        brokers,
     };
     // `_env` holds the environment descriptor open until bwrap has run.
     let (argv, _env) = compose_cage(&plan)?;
@@ -323,6 +336,42 @@ fn resolve_allow_env(keys: &[String]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Match a plugin's declared `brokers` against the ones standing for this launch.
+///
+/// The grant is answered only where a global `[broker.<name>]` bound that name and the broker came
+/// up: a name nothing bound yields no socket, never the raw resource the broker fences. Said once
+/// per pairing rather than once per resolution — a launch with five `pass://` secrets runs this
+/// plugin five times, and five identical lines read as five faults.
+fn resolve_brokers<'a>(plugin: &CagePlan<'a>) -> Vec<&'a super::broker::Reachable> {
+    let mut out = Vec::with_capacity(plugin.grant.brokers.len());
+    for name in &plugin.grant.brokers {
+        match plugin.brokers.iter().find(|b| &b.name == name) {
+            Some(reachable) => out.push(reachable),
+            None => warn_once(&format!(
+                "the `{}` plugin needs the `{name}` broker, which this launch has not stood up — \
+                 bind it with `[broker.{name}] socket` in the global config, or the plugin runs \
+                 without it",
+                plugin.called
+            )),
+        }
+    }
+    out
+}
+
+/// Emit a warning the first time this process is asked to. The state is the message itself, so two
+/// callers that would say the same thing say it once and two that differ both speak.
+fn warn_once(message: &str) {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+    static SAID: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let said = SAID.get_or_init(|| Mutex::new(BTreeSet::new()));
+    // A poisoned lock is not a reason to lose a warning: recover the set and speak anyway.
+    let mut said = said.lock().unwrap_or_else(|e| e.into_inner());
+    if said.insert(message.to_string()) {
+        crate::diag::warn(message);
+    }
 }
 
 /// Read each declared `allow_env_paths` variable from sbx's environment, keeping the ones that
@@ -652,6 +701,7 @@ fn cage_spec(
     env_paths: &[(String, String)],
     programs: &[(String, PathBuf)],
     closure: &[(PathBuf, PathBuf)],
+    brokers: &[&super::broker::Reachable],
 ) -> Result<SandboxSpec, SpecError> {
     let ro = |p: &str| Mount::RoBind {
         src: PathBuf::from(p),
@@ -745,6 +795,17 @@ fn cage_spec(
         });
     }
 
+    // The brokers this grant named, each bound where its protocol's clients look for it. **After**
+    // the grant paths above, and that order is the point: a manifest that also binds the raw
+    // resource — the case this grant exists to replace — must not end up shadowing the fence with
+    // it. Read-only, like every other socket the cage connects to.
+    for reachable in brokers {
+        mounts.push(Mount::RoBind {
+            src: reachable.src.clone(),
+            dest: reachable.dest.clone(),
+        });
+    }
+
     // A network grant shares the host network and binds the DNS + TLS files a resolver needs to
     // reach a remote secret store; without it the cage gets an empty network namespace (no egress
     // at all — fail-closed). The files are `try`, so a host missing one does not fail the launch.
@@ -786,6 +847,15 @@ fn cage_spec(
     // The grant's pass-throughs first, then sbx's structural HOME/PATH last so the cage's own
     // identity always wins over a manifest that happens to name them (self-harm at worst).
     let mut env: Vec<(String, String)> = allow_env.to_vec();
+    // Each broker's own variables, for a client that is told where its socket is rather than
+    // computing it. After the pass-throughs, so a stale value inherited from sbx's environment
+    // cannot aim the tool past the fence at the resource behind it.
+    for reachable in brokers {
+        for (key, value) in &reachable.env {
+            env.retain(|(k, _)| k != key);
+            env.push((key.clone(), value.clone()));
+        }
+    }
     env.push(("HOME".to_string(), CAGE_HOME.to_string()));
     // Where the private state landed, for a plugin that asked for it. Named rather than assumed, so
     // a plugin never hardcodes the path and sbx stays free to move it.
@@ -831,6 +901,7 @@ mod tests {
             called: &p.scheme,
             configured_as: &p.name,
             args: vec![OsString::from(reff)],
+            brokers: &[],
         }
     }
 
@@ -847,6 +918,111 @@ mod tests {
         }
     }
 
+    /// A standing broker, as the launcher would hand one over.
+    fn standing(name: &str, dest: &str, env: &[(&str, &str)]) -> super::super::broker::Reachable {
+        super::super::broker::Reachable {
+            name: name.to_string(),
+            src: PathBuf::from(format!("/data/sbx/broker/{name}-1.sock")),
+            dest: PathBuf::from(dest),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// The grant a manifest makes by naming a broker: the fenced socket is bound where the
+    /// protocol's clients look, and the variables that name it point there too.
+    #[test]
+    fn a_declared_broker_is_bound_into_the_resolvers_cage() {
+        let dir = TmpDir::new();
+        let grant = SandboxGrant {
+            brokers: vec!["gpg-agent".to_string()],
+            ..Default::default()
+        };
+        let p = plugin_in(dir.path(), grant);
+        let reachable = standing(
+            "gpg-agent",
+            "/run/user/1000/gnupg/S.gpg-agent",
+            &[("GPG_AGENT_SOCK", "/run/user/1000/gnupg/S.gpg-agent")],
+        );
+        let plan = CagePlan {
+            brokers: std::slice::from_ref(&reachable),
+            ..plan_for(&p, "test://x")
+        };
+        let spec = cage_spec(&plan, &[], &[], &[], &[], &[&reachable]).expect("valid spec");
+        let argv = super::super::argv::to_argv(&spec);
+        assert!(
+            argv.windows(3).any(|w| w[0] == "--ro-bind"
+                && w[1] == *reachable.src.to_string_lossy()
+                && w[2] == "/run/user/1000/gnupg/S.gpg-agent"),
+            "the broker's socket must be bound where the client looks: {argv:?}"
+        );
+        assert!(
+            spec.env()
+                .iter()
+                .any(|(k, v)| k == "GPG_AGENT_SOCK" && v == "/run/user/1000/gnupg/S.gpg-agent"),
+            "the declared variable must name it: {:?}",
+            spec.env()
+        );
+    }
+
+    /// The ordering that makes this grant a *replacement*: a manifest which also binds the raw
+    /// resource — the shape every such plugin has today — must not shadow the fence with it.
+    #[test]
+    fn the_broker_bind_lands_after_a_grant_path_naming_the_same_socket() {
+        let dir = TmpDir::new();
+        let socket = "/run/user/1000/gnupg/S.gpg-agent";
+        let grant = SandboxGrant {
+            allow_paths: vec![PathBuf::from(socket)],
+            brokers: vec!["gpg-agent".to_string()],
+            ..Default::default()
+        };
+        let p = plugin_in(dir.path(), grant);
+        let reachable = standing("gpg-agent", socket, &[]);
+        let plan = CagePlan {
+            brokers: std::slice::from_ref(&reachable),
+            ..plan_for(&p, "test://x")
+        };
+        let spec = cage_spec(&plan, &[], &[], &[], &[], &[&reachable]).expect("valid spec");
+        let argv = super::super::argv::to_argv(&spec);
+        let raw = argv
+            .iter()
+            .position(|a| *a == *reachable.dest.to_string_lossy())
+            .expect("the grant path is bound");
+        let fenced = argv
+            .iter()
+            .position(|a| *a == *reachable.src.to_string_lossy())
+            .expect("the broker socket is bound");
+        assert!(
+            fenced > raw,
+            "bwrap applies mounts in argv order, so the fence must come last: {argv:?}"
+        );
+    }
+
+    /// A grant nothing answers binds nothing. The raw resource is not a fallback: a plugin that
+    /// asked for a fence and got none fails on its own terms, which is the fail-closed direction.
+    #[test]
+    fn a_broker_this_launch_did_not_stand_up_binds_nothing() {
+        let dir = TmpDir::new();
+        let grant = SandboxGrant {
+            brokers: vec!["gpg-agent".to_string()],
+            ..Default::default()
+        };
+        let p = plugin_in(dir.path(), grant);
+        let plan = plan_for(&p, "test://x");
+        assert!(
+            resolve_brokers(&plan).is_empty(),
+            "a name no `[broker.<name>]` bound resolves to nothing"
+        );
+        let spec = cage_spec(&plan, &[], &[], &[], &[], &[]).expect("valid spec");
+        let argv = super::super::argv::to_argv(&spec);
+        assert!(
+            !argv.iter().any(|a| a.to_string_lossy().contains("broker")),
+            "nothing broker-shaped may reach the cage: {argv:?}"
+        );
+    }
+
     #[test]
     fn cage_spec_isolates_the_network_and_passes_the_ref_as_argv1() {
         let dir = TmpDir::new();
@@ -858,11 +1034,13 @@ mod tests {
             allow_env_paths: vec![],
             mask_paths: vec![],
             network: false,
+            brokers: vec![],
         };
         let p = plugin_in(dir.path(), grant);
         let spec = cage_spec(
             &plan_for(&p, "test://secret"),
             &[("GNUPGHOME".into(), "/home/u/.gnupg".into())],
+            &[],
             &[],
             &[],
             &[],
@@ -913,10 +1091,11 @@ mod tests {
             allow_env_paths: vec![],
             mask_paths: vec![],
             network: true,
+            brokers: vec![],
         };
         let staged = plugin_in(dir.path(), grant);
-        let spec =
-            cage_spec(&plan_for(&staged, "vault://x"), &[], &[], &[], &[]).expect("valid spec");
+        let spec = cage_spec(&plan_for(&staged, "vault://x"), &[], &[], &[], &[], &[])
+            .expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
@@ -943,6 +1122,7 @@ mod tests {
             &[],
             &[],
             &[("vault".to_string(), resolved.clone())],
+            &[],
             &[],
         )
         .expect("valid spec");
@@ -973,7 +1153,7 @@ mod tests {
         let dir = TmpDir::new();
         let staged = plugin_in(dir.path(), SandboxGrant::default());
         let spec =
-            cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &[]).expect("valid spec");
+            cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &[], &[]).expect("valid spec");
         let env = super::super::argv::env_args(&spec);
         assert!(contains_setenv(&env, "PATH", "/usr/bin:/bin"), "{env:?}");
         assert!(
@@ -1009,7 +1189,7 @@ mod tests {
         };
         let staged = plugin_in(dir.path(), grant);
         let spec =
-            cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &[]).expect("valid spec");
+            cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &[], &[]).expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         let bind = argv
             .iter()
@@ -1044,8 +1224,8 @@ mod tests {
             ),
         ];
         let staged = plugin_in(dir.path(), SandboxGrant::default());
-        let spec =
-            cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &closure).expect("valid spec");
+        let spec = cage_spec(&plan_for(&staged, "test://x"), &[], &[], &[], &closure, &[])
+            .expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
         for (_, dest) in &closure {
             let p = dest.to_string_lossy().to_string();
@@ -1073,6 +1253,7 @@ mod tests {
             &[],
             &[],
             &[(physical.clone(), logical.clone())],
+            &[],
         )
         .expect("valid spec");
         let argv = super::super::argv::to_argv(&spec);
@@ -1109,7 +1290,7 @@ mod tests {
                 ..SandboxGrant::default()
             },
         );
-        let out = run(&bwrap, &p, "test://x").expect("the resolver should run");
+        let out = run(&bwrap, &p, "test://x", &[]).expect("the resolver should run");
         assert_eq!(out.trim_end(), "started=0");
     }
 
@@ -1137,6 +1318,7 @@ mod tests {
             &plan_for(&staged, "test://x"),
             &[("PASSWORD_STORE_DIR".into(), "/data/secrets".into())],
             &[("PASSWORD_STORE_DIR".into(), "/data/secrets".into())],
+            &[],
             &[],
             &[],
         )
@@ -1236,7 +1418,7 @@ mod tests {
                     ..SandboxGrant::default()
                 },
             );
-            let spec = cage_spec(&plan_for(&p, "test://x"), &[], &[], &[], &[]).unwrap();
+            let spec = cage_spec(&plan_for(&p, "test://x"), &[], &[], &[], &[], &[]).unwrap();
             let env = super::super::argv::env_args(&spec);
             let argv: Vec<String> = super::super::argv::to_argv(&spec)
                 .iter()
@@ -1277,9 +1459,9 @@ printf 'run-%s' "$n""#,
                 ..SandboxGrant::default()
             },
         );
-        assert_eq!(run(&bwrap, &p, "test://x").unwrap(), "run-1");
+        assert_eq!(run(&bwrap, &p, "test://x", &[]).unwrap(), "run-1");
         assert_eq!(
-            run(&bwrap, &p, "test://x").unwrap(),
+            run(&bwrap, &p, "test://x", &[]).unwrap(),
             "run-2",
             "the second run must see what the first wrote"
         );
@@ -1300,9 +1482,9 @@ echo "$n" > "$HOME/n"
 printf 'run-%s' "$n""#,
             SandboxGrant::default(),
         );
-        assert_eq!(run(&bwrap, &p, "test://x").unwrap(), "run-1");
+        assert_eq!(run(&bwrap, &p, "test://x", &[]).unwrap(), "run-1");
         assert_eq!(
-            run(&bwrap, &p, "test://x").unwrap(),
+            run(&bwrap, &p, "test://x", &[]).unwrap(),
             "run-1",
             "an ungranted plugin starts from nothing on every run"
         );
@@ -1324,7 +1506,7 @@ printf 'run-%s' "$n""#,
                 ..SandboxGrant::default()
             },
         );
-        let out = run(&bwrap, &p, "test://x").expect("the resolver should run");
+        let out = run(&bwrap, &p, "test://x", &[]).expect("the resolver should run");
         assert_eq!(out.trim_end(), "/run/sbx-programs/env");
     }
 
@@ -1349,7 +1531,7 @@ printf 'run-%s' "$n""#,
             },
         );
         let _var = EnvVar::set(VAR, store.path());
-        let out = run(&bwrap, &p, "test://x");
+        let out = run(&bwrap, &p, "test://x", &[]);
         // A hard-coded literal, so the assertion cannot be met by the test recomputing whatever
         // the code produced. Dropping the bind in `cage_spec` makes `cat` fail instead.
         assert_eq!(
@@ -1378,7 +1560,7 @@ printf 'run-%s' "$n""#,
             },
         );
         let _var = EnvVar::set(VAR, "relative/store");
-        let out = run(&bwrap, &p, "test://x");
+        let out = run(&bwrap, &p, "test://x", &[]);
         assert_eq!(out.expect("the resolver should run").trim_end(), "[unset]");
     }
 
@@ -1395,7 +1577,7 @@ printf 'run-%s' "$n""#,
                 ..SandboxGrant::default()
             },
         );
-        let err = run(&bwrap, &p, "test://x").unwrap_err();
+        let err = run(&bwrap, &p, "test://x", &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         let msg = err.to_string();
         // The terminal state is now BOTH answers exhausted, not just the `PATH` one: a program can
@@ -1427,7 +1609,7 @@ printf 'run-%s' "$n""#,
             return;
         };
         let (_dir, p) = fake_resolver("printf 'resolved:%s' \"$1\"");
-        let out = run(&bwrap, &p, "test://hello").expect("the resolver should run");
+        let out = run(&bwrap, &p, "test://hello", &[]).expect("the resolver should run");
         assert_eq!(out, "resolved:test://hello");
     }
 
@@ -1439,7 +1621,7 @@ printf 'run-%s' "$n""#,
         };
         // prints a plaintext to stdout but exits non-zero — the error must fold stderr, never stdout
         let (_dir, p) = fake_resolver("printf 'the-secret' ; echo 'boom: no key' >&2 ; exit 7");
-        let err = run(&bwrap, &p, "test://x").unwrap_err().to_string();
+        let err = run(&bwrap, &p, "test://x", &[]).unwrap_err().to_string();
         assert!(
             err.contains("test") && err.contains("boom: no key"),
             "{err}"
@@ -1459,7 +1641,10 @@ printf 'run-%s' "$n""#,
         // exit 0, nothing on stdout — the contract's "absent"; the caller's classify_value turns
         // this empty string into a fall-through to the next source.
         let (_dir, p) = fake_resolver("exit 0");
-        assert_eq!(run(&bwrap, &p, "test://x").expect("absent is exit 0"), "");
+        assert_eq!(
+            run(&bwrap, &p, "test://x", &[]).expect("absent is exit 0"),
+            ""
+        );
     }
 
     // --- what a plugin is allowed to say -------------------------------------------
@@ -1521,7 +1706,7 @@ printf 'run-%s' "$n""#,
         // which a careless plugin put the plaintext.
         let (_dir, p) = fake_resolver("printf 'the-secret' ; echo 'debug: the-secret' >&2");
         assert_eq!(
-            run(&bwrap, &p, "test://x").expect("the resolver should run"),
+            run(&bwrap, &p, "test://x", &[]).expect("the resolver should run"),
             "the-secret"
         );
     }
@@ -1533,7 +1718,7 @@ printf 'run-%s' "$n""#,
             return;
         };
         let (_dir, p) = fake_resolver("printf 'boom\\033[2J\\nsbx: fake line' >&2 ; exit 3");
-        let err = run(&bwrap, &p, "test://x").unwrap_err().to_string();
+        let err = run(&bwrap, &p, "test://x", &[]).unwrap_err().to_string();
         assert!(err.contains("boom"), "{err}");
         assert!(
             !err.contains('\u{1b}'),
@@ -1550,7 +1735,7 @@ printf 'run-%s' "$n""#,
         };
         let (_dir, p) = fake_resolver("printf x");
         std::fs::set_permissions(&p.exec, std::fs::Permissions::from_mode(0o775)).unwrap();
-        let err = run(&bwrap, &p, "test://x").unwrap_err();
+        let err = run(&bwrap, &p, "test://x", &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("group or other"), "{err}");
     }

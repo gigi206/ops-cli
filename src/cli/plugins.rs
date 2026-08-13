@@ -428,8 +428,8 @@ fn plugins_list() -> ExitCode {
                 println!("    {dim}{desc}{r}");
             }
             println!(
-                "    {dim}sets in the cage: {}{r}",
-                p.broker.cage_env.join(", ")
+                "    {dim}found in the cage: {}{r}",
+                how_the_cage_finds_it(p)
             );
             println!(
                 "    {dim}from: {}{r}",
@@ -1965,6 +1965,13 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    // A broker claims no scheme, so it is looked up by the name it is registered and configured
+    // under — the same token `sbx plugins list` prints and `[broker.<name>]` binds. Tried before
+    // the scheme index reports a miss, because a plugin that is listed and cannot be inspected
+    // reads as a plugin that is not really installed.
+    if let Some(b) = registry.broker(scheme) {
+        return info_broker(&layout, b, &pal);
+    }
     let Some(p) = registry.resolver(scheme) else {
         // A scheme can be absent for three different reasons, and `info <scheme>` is exactly the
         // command a user runs to learn which: nothing claims it, several plugins do (the answer is
@@ -2039,6 +2046,7 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     print_grant_masks(&p.sandbox.mask_paths);
     print_grant_env("allow_env", &p.sandbox.allow_env);
     print_grant_env_paths(&p.sandbox.allow_env_paths, err, r);
+    print_grant_brokers(&p.sandbox.brokers);
     // The closure, when a declared program lives in the nix store. Shown because it is the one
     // part of the grant no manifest names, so it would otherwise be the largest thing a launch
     // binds and the only one a reader cannot see coming.
@@ -2195,6 +2203,183 @@ fn print_grant_env(label: &str, keys: &[String]) {
     } else {
         println!("    {label}:    {}", keys.join(", "));
     }
+}
+
+/// `sbx plugins info <name>` for a broker plugin.
+///
+/// The same detail view a resolver gets, minus the scheme it has none of, plus the protocol facts
+/// that decide what a launch does with it. Kept beside the resolver's rather than merged with it:
+/// the two share an identity and a grant, and nothing else — a single function would spend its
+/// length saying which half applies.
+fn info_broker(
+    layout: &crate::store::Layout,
+    p: &crate::plugins::broker::BrokerPlugin,
+    pal: &style::Palette,
+) -> ExitCode {
+    let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
+    println!("{h}broker plugin:{r} {n}{}{r}", p.name);
+    println!(
+        "  version:     {}",
+        p.version.as_deref().unwrap_or("(unset)")
+    );
+    println!(
+        "  description: {}",
+        p.description.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "  origin:      {}",
+        plugins::origin::read(layout, p.dir_name()).label()
+    );
+    println!(
+        "  integrity:   {}",
+        match plugins::integrity(layout, p.dir_name()) {
+            plugins::Integrity::Intact => "unchanged since install".to_string(),
+            plugins::Integrity::Modified =>
+                format!("{err}MODIFIED since install{r} (verify with: sbx plugins verify)"),
+            plugins::Integrity::Unrecorded =>
+                "no digest recorded (installed before sbx recorded one, or placed by hand)"
+                    .to_string(),
+            plugins::Integrity::Unreadable(why) => format!("{err}cannot be hashed{r} ({why})"),
+        }
+    );
+    print!("  exec:        {}", p.exec.display());
+    match p.check_exec() {
+        Ok(()) => println!(),
+        Err(why) => println!("  {err}[not runnable: {why}]{r}"),
+    }
+    println!("  protocol:");
+    println!("    framing:     {}", p.broker.framing.token());
+    println!("    max frame:   {} bytes", p.broker.max_frame);
+    println!(
+        "    host wait:   {} seconds for one exchange",
+        p.broker.host_deadline.as_secs()
+    );
+    println!("    found in the cage: {}", how_the_cage_finds_it(p));
+    println!(
+        "    greeting:    {}",
+        match p.broker.host_greets {
+            true => "the host resource speaks first",
+            false => "the cage speaks first",
+        }
+    );
+    println!(
+        "    replies:     {}",
+        match p.broker.inspect_replies {
+            true => "ruled on by the plugin",
+            false => "passed through unseen",
+        }
+    );
+    println!(
+        "    credential:  {}",
+        match p.broker.uses_secret {
+            true => "may be handed a marker standing in for one (`[broker.<name>] secret`)",
+            false => "never handed one",
+        }
+    );
+    // The host resource is the config's to name, so it is read from there rather than from the
+    // manifest — and a broker nothing binds is the difference between installed and in use.
+    let bound = std::env::current_dir()
+        .map(|cwd| crate::config::load(&cwd))
+        .ok()
+        .and_then(|cfg| {
+            cfg.brokers
+                .iter()
+                .find(|b| b.name == p.name)
+                .map(|b| (b.socket.describe(), b.allow.clone()))
+        });
+    match bound {
+        Some((socket, allow)) => {
+            println!("  bound by the global config:");
+            println!("    socket:      {n}{socket}{r}");
+            println!(
+                "    allow:       {}",
+                match allow.is_empty() {
+                    true => "(none — the plugin is handed an empty grant)".to_string(),
+                    false => allow.join(", "),
+                }
+            );
+        }
+        None => println!(
+            "  bound by the global config: no — add `[broker.{}] socket` to stand it up",
+            p.name
+        ),
+    }
+    print_broker_host_config(p, err, r);
+    ExitCode::SUCCESS
+}
+
+/// What this host answers a broker plugin, from `[plugin.<name>]`. The resolver's counterpart is
+/// [`print_host_config`]; both read through the config layer, so an untrusted project's table is
+/// already dropped by the time either prints.
+fn print_broker_host_config(p: &crate::plugins::broker::BrokerPlugin, err: &str, r: &str) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let resolved = crate::config::load(&cwd);
+    let Some(raw) = resolved.plugin.get(&p.name) else {
+        return;
+    };
+    if raw.env.is_empty() {
+        return;
+    }
+    println!("  host config (`[plugin.{}]`):", p.name);
+    for (k, v) in &raw.env {
+        let declared = p.sandbox.allow_env.iter().any(|d| d == k)
+            || p.sandbox.allow_env_paths.iter().any(|d| d == k);
+        match declared {
+            true => println!("    {k}={v}"),
+            false => println!("    {k}={v}  {err}[ignored: the manifest does not declare it]{r}"),
+        }
+    }
+}
+
+/// How a cage reaches this broker's socket, in the terms its own manifest declared: the variables
+/// pointed at it, the address it stands at, or both.
+///
+/// Every form is named, because a listing that showed only one of them printed an empty list for a
+/// broker declaring the others — and an empty list reads as "reaches nothing", which is the one
+/// thing it never means.
+fn how_the_cage_finds_it(p: &crate::plugins::broker::BrokerPlugin) -> String {
+    let mut parts = Vec::new();
+    if p.broker.at_host_path {
+        parts.push("at the host resource's own path".to_string());
+    }
+    if !p.broker.cage_env.is_empty() {
+        parts.push(format!("${}", p.broker.cage_env.join(", $")));
+    }
+    if !p.broker.cage_env_dir.is_empty() {
+        parts.push(format!(
+            "${} (the directory holding it)",
+            p.broker.cage_env_dir.join(", $")
+        ));
+    }
+    parts.join(", ")
+}
+
+/// The `brokers` grant, and whether this machine answers it.
+///
+/// Shown even when empty, like every other line of the grant, and resolved against the config
+/// rather than printed from the manifest: a name no global `[broker.<name>]` binds is answered by
+/// nothing at launch, and a reader asking "does my `pass://` reach the agent?" is asking exactly
+/// that. The plugin's own directory is never consulted here — only the two declarations that have
+/// to agree.
+fn print_grant_brokers(names: &[String]) {
+    if names.is_empty() {
+        println!("    brokers:     (none)");
+        return;
+    }
+    let bound: Vec<String> = std::env::current_dir()
+        .map(|cwd| crate::config::load(&cwd))
+        .map(|cfg| cfg.brokers.iter().map(|b| b.name.clone()).collect())
+        .unwrap_or_default();
+    let shown: Vec<String> = names
+        .iter()
+        .map(|name| match bound.contains(name) {
+            true => name.clone(),
+            false => format!("{name} (no `[broker.{name}]` binds it — the plugin runs without it)"),
+        })
+        .collect();
+    println!("    brokers:     {}", shown.join(", "));
 }
 
 /// The `allow_env_paths` grant, resolved the way a launch would resolve it: each variable with the

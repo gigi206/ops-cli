@@ -15,8 +15,8 @@ See also: [Resolver plugins](../secrets/plugins) · [Signed plugin stores](../se
 
 | Subcommand | Purpose |
 |---|---|
-| `list` (alias `ls`) | list installed resolver plugins (with their origin) and the built-in schemes |
-| `info <scheme>` | show a plugin's manifest, sandbox grant, and origin |
+| `list` (alias `ls`) | list installed plugins of both kinds (with their origin) and the built-in schemes |
+| `info <scheme\|name>` | show a plugin's manifest, sandbox grant, and origin |
 | `install <dir>` | install a local plugin directory (`<data>/plugins/<name>`); the built-in schemes are always present, not installed |
 | `rm <name>...` | remove installed resolver plugins; several names may be given, each removed on its own |
 | `verify [name]` | check installed plugins against the digest recorded at install |
@@ -24,6 +24,12 @@ See also: [Resolver plugins](../secrets/plugins) · [Signed plugin stores](../se
 
 `install` is a deliberate user act (an agent in the cage cannot run it); the staged
 copy is validated exactly as the launcher will and refused, fail-closed, on any flaw.
+
+A resolver is named by the `scheme://` it claims. A [broker](../configuration/broker)
+claims none, so `info` takes the name `[broker.<name>]` binds, and its page adds the
+protocol facts a launch acts on — the framing, the frame ceiling, how long `sbx` waits
+on the host resource, how the cage finds the socket — and whether the global config
+binds it at all.
 
 Each listing reports where a plugin came from: a named store (with its URL) or a
 local directory (with its path). A plugin installed before origins were recorded

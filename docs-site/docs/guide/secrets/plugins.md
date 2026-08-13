@@ -42,6 +42,7 @@ allow_env   = ["VAULT_ADDR"]       # host env vars passed into the otherwise-cle
 allow_env_paths = ["VAULT_CACERT"] # env vars whose VALUE is a path: passed through, and bound
 network     = false                # true = reach the network; false = empty network namespace
 state       = false                # true = a private writable directory that survives the run
+brokers     = []                   # broker plugins whose fenced socket replaces the resource
 ```
 
 - `type` is `"resolver"` here. The discriminator is explicit so a second type
@@ -99,9 +100,8 @@ state       = false                # true = a private writable directory that su
     launch naming why, rather than binding nothing and dying later at `execve`.
 - `allow_paths` is for the plugin's **data**: a token file, a database, a
   socket. `HOME` in the cage is a private tmpfs, so a tool that derives a
-  location from it (a password store, a GnuPG keyring and its agent socket, a
-  token file) looks where nothing exists: bind the host path and point the tool
-  at it. Naming `PATH` in `allow_env` has no effect; the structural value wins.
+  location from it (a password store, a GnuPG keyring, a token file) looks where
+  nothing exists: bind the host path and point the tool at it. Naming `PATH` in `allow_env` has no effect; the structural value wins.
 - `mask_paths` takes something back out of a path `allow_paths` granted, by
   covering it with an empty filesystem. It exists because a grant is sometimes
   wide for a reason unrelated to what the plugin needs: the `pass` plugin binds
@@ -110,7 +110,7 @@ state       = false                # true = a private writable directory that su
   and `gpg` reads its `.conf` files from there too), and a list of files would
   break on the next layout. Naming `~/.gnupg/private-keys-v1.d` here removes the
   secret keys again, and the resolver never misses them: it only ever needed the
-  host `gpg-agent` to decrypt, reached through its socket.
+  host `gpg-agent` to decrypt, reached through the broker it names in `brokers`.
   - A mask can only ever *subtract*, so unlike the other grant fields it needs no
     trust of its own: the widest thing a manifest can do with one is hide
     something from itself.
@@ -119,9 +119,9 @@ state       = false                # true = a private writable directory that su
     the cage and is empty, rather than being absent, so a tool that stats it
     before reading finds what it expects.
   - What a mask buys is that the material cannot be **copied out**. It does not
-    put it beyond **use**: in the example above the agent socket is still bound,
-    so code in that cage can ask the agent to decrypt while it runs. Copying is
-    the capability worth removing, being the one that outlives the run.
+    put it beyond **use**: in the example above the agent is still reachable
+    through the broker, so code in that cage can ask it to decrypt while it runs.
+    Copying is the capability worth removing, being the one that outlives the run.
   - A mask is a **fixed path in a signed manifest**, so it cannot follow a path
     that `allow_env_paths` supplies: if `GNUPGHOME` names another home, that home
     is bound whole and nothing in it is masked. Expanding a mask against the
@@ -153,6 +153,18 @@ state       = false                # true = a private writable directory that su
     variable simply leaves the manifest's own `allow_paths` in force.
   - `sbx plugins info <name>` prints what each variable currently names, so a
     relocated store can be confirmed reachable before the first secret.
+- `brokers` names [broker plugins](../configuration/broker) whose **filtered**
+  socket the resolver is given, in place of the host resource behind it. It is
+  the only entry here that takes something away: reading a password store means
+  asking the GnuPG agent to decrypt, and the only way to ask was `allow_paths`
+  on the agent's own socket — every operation the agent can perform, signing
+  included.
+  - Both sides consent. The manifest asks by name; the grant is answered only
+    where a **global** `[broker.<name>]` binds that name and the broker comes
+    up. A name nothing binds is a warning and no socket, never a fall back to
+    the raw resource.
+  - `sbx plugins info <scheme>` shows the grant and whether this machine
+    answers it.
 
 ## Configuring a plugin from your own config
 
@@ -351,7 +363,7 @@ sbx plugins store install sbx-plugins vault   # then: from = "vault://secret/mya
 
 | Plugin | Reference form | Resolves to | Sandbox grant |
 |---|---|---|---|
-| `pass` | `pass://<path>[#<field>]` | the **first line** of `~/.password-store/<path>.gpg` (the password by convention), or a named `key: value` field below it | `programs = ["pass"]`; `allow_paths` on the store, `~/.gnupg` and the gpg-agent socket; **no network** |
+| `pass` | `pass://<path>[#<field>]` | the **first line** of `~/.password-store/<path>.gpg` (the password by convention), or a named `key: value` field below it | `programs = ["pass"]`; `allow_paths` on the store and `~/.gnupg`; `brokers = ["gpg-agent"]` for the agent; **no network** |
 | `vault` | `vault://<mount>/<path>[?version=<n>]#<field>` | one field of a HashiCorp Vault KV secret, optionally at a past version | `programs = ["vault"]`; `allow_env` for `VAULT_ADDR`/`VAULT_TOKEN`/`VAULT_NAMESPACE`; `allow_paths` on `~/.vault-token`; `network = true` |
 | `openbao` | `openbao://<mount>/<path>[?version=<n>]#<field>` | the same, against an OpenBao server (`bao`) | `programs = ["bao"]`; the `BAO_*` equivalents; `network = true` |
 | `infisical` | `infisical://<project>/<env>[/<folder>][?<opts>]#<secret>` | one secret of an Infisical project | `programs = ["infisical"]`; `allow_env` for the `INFISICAL_*` credentials; `network = true` |
@@ -404,8 +416,9 @@ would and shows the answer.
 ```
 sbx plugins list              # built-in schemes + every installed plugin
                               #   (scheme, name, version, network grant, runnable?, origin)
-sbx plugins info <scheme>     # a plugin's manifest, sandbox grant, and origin
-                              #   (a built-in scheme is reported as such)
+sbx plugins info <scheme|name>  # a plugin's manifest, sandbox grant, and origin
+                              #   (a resolver by its scheme, a broker by its name;
+                              #    a built-in scheme is reported as such)
 sbx plugins install <name|dir>  # install a bundled plugin by name, or copy a local ./dir
 sbx plugins rm <name>...      # remove installed plugins (several names in one call)
 sbx plugins verify [name]     # re-hash installed plugins against the digest recorded at install
@@ -501,11 +514,13 @@ type = "broker"                    # no `scheme`: a broker claims no ref namespa
 exec = "bin/broker"
 
 [broker]
-cage_env  = ["GPG_AGENT_INFO"]     # cage variables pointed at the socket sbx places
+cage_env  = ["MYTOOL_SOCK"]        # cage variables pointed at the socket sbx places
 cage_env_dir = []                  # …or at the directory holding it (libpq's PGHOST)
 socket_name  = "agent.sock"        # the file name inside it; the directory is sbx's
-framing   = "line"                 # `line` or `length-u32-be`
+at_host_path = false               # true = stand at the host resource's own address instead
+framing   = "line"                 # `line`, `length-u32-be` or `pgwire`
 max_frame = 2048                   # the largest frame this protocol admits
+host_deadline = 30                 # seconds sbx waits on the host resource for one exchange
 deny_frame = [5]                   # optional: a refusal frame that needs no request context
 uses_secret = true                 # may be handed a marker standing in for a credential
 host_greets = true                 # the host speaks first, before the cage asks anything
@@ -520,7 +535,9 @@ launch:
   exfiltration path for that credential. A broker holds nothing across runs.
 - **The manifest does not name where the socket lands.** `sbx` picks the location,
   for the reason `state` is a boolean and never a path, and sets every name in
-  `cage_env` to it.
+  `cage_env` to it. A protocol whose clients compute the path themselves says so
+  with `at_host_path`, and the socket is then stood at the address of the resource
+  it fences — the one the config named, still never one the manifest chose.
 - **`cage_env` passes the reserved-key barrier** an untrusted project's `[env]`
   meets. A broker points a client at its socket; names like `LD_PRELOAD` or `PATH`
   load code in the cage instead.
@@ -535,6 +552,12 @@ launch:
   see [`[broker]`](../configuration/broker#placing-a-credential-the-cage-does-not-have).
   Declared here rather than only in the config, because which plugin may be handed one is a
   property of the code that was installed and reviewed.
+- **`host_deadline` is how long the protocol may take, not how long the machine takes.** A
+  deadline exists so a wedged resource cannot wedge the cage: it holds a thread, a plugin
+  process and two connections while it waits. Thirty seconds suits a resource answering at
+  machine speed and is wrong for one that stops to **ask a person** — a gpg-agent opening a
+  pinentry answers when the human does. A manifest raises it up to ten minutes; past that,
+  whatever is on the other side is wedged rather than thinking.
 - **`host_greets` and multi-message answers both need `inspect_replies`.** A protocol
   whose reply is a run of messages needs the plugin to say where the run ends, and a
   greeting is a frame from the host that must not reach the cage unseen.
@@ -543,17 +566,11 @@ launch:
 refusal is the same whatever was refused, and a protocol whose refusal must echo a
 request id has none. The refusal that always works is closing the connection.
 
-:::note What is in place today
-`sbx` reads, validates and lists broker plugins. `sbx plugins install <dir>` places
-one from a local directory, and a `[plugin.<name>] programs` entry provisions its
-package exactly as it would for a resolver.
-
-Two things do not exist yet. **No launch runs a broker plugin**: the relay that
-carries frames between a cage and a host resource is not part of this release, and
-no config activates one. And **a signed store cannot serve one**: a catalogue entry
-names a scheme, so a store install reconciles against a scheme the manifest does
-not claim and is refused. A broker plugin therefore only ever arrives through a
-deliberate local install.
+:::note What a broker plugin does not reach
+A broker plugin is given no `scheme`, so nothing a secret's `from` names routes to it,
+and it may not declare `brokers` of its own: a fence behind a fence is a chain nothing
+bounds. It also cannot be handed a credential unless its manifest says `uses_secret`,
+and what it is handed then is a marker, never the value.
 :::
 
 ## An honest residual: a networked resolver reaches the host network

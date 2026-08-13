@@ -50,6 +50,16 @@ use std::path::PathBuf;
 /// could turn a length prefix into an allocation of its choosing.
 pub(crate) const MAX_FRAME_CEILING: usize = 256 * 1024;
 
+/// How long sbx waits on the host resource for one exchange when a manifest names nothing. The
+/// socket is whatever the machine offers, so a hang there must not become a hang in the cage.
+pub(crate) const DEFAULT_HOST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The longest a manifest may ask sbx to wait on a host resource. Ten minutes: past it, whatever is
+/// on the other side is wedged rather than thinking, and no pinentry prompt a person answers takes
+/// that long. It bounds what a manifest can hold — a thread, a plugin process and two connections —
+/// the way [`MAX_FRAME_CEILING`] bounds what one can read.
+pub(crate) const MAX_HOST_DEADLINE_SECS: i64 = 600;
+
 /// Cage variables sbx sets itself, to point a client at a channel it stands up. A broker
 /// plugin's `cage_env` may not claim one: it would put its own socket where another broker's
 /// belongs, and the client would never know it was talking to something else.
@@ -135,6 +145,21 @@ pub(crate) struct BrokerSpec {
     /// manifest from placing a socket over something the cage needs, and keeps two brokers from
     /// colliding. The same rule `programs` entries are held to, for the same reason.
     pub(crate) socket_name: String,
+    /// Whether this protocol's clients find the socket by a **fixed path** they compute
+    /// themselves, rather than by reading a variable.
+    ///
+    /// Still not a path in the manifest: it says how the protocol locates a socket, and the path
+    /// itself comes from the config that named the host resource. Where this is set, the fenced
+    /// socket is bound at the host socket's own address, so a client that would have found the raw
+    /// resource finds the fence instead and needs no telling.
+    ///
+    /// Measured on GnuPG, whose clients derive `/run/user/<uid>/gnupg/S.gpg-agent` from the uid and
+    /// the home directory: `GPG_AGENT_INFO` has named nothing since GnuPG 2.1, so a broker that
+    /// could only be pointed at by a variable could not fence an agent at all.
+    ///
+    /// Only a Unix target has an address to stand at, so this and a `tcp://` socket are refused
+    /// together rather than one silently ignoring the other.
+    pub(crate) at_host_path: bool,
     /// How the byte stream is cut into messages.
     pub(crate) framing: Framing,
     /// The largest frame this protocol admits, capped at [`MAX_FRAME_CEILING`]. Required, never
@@ -172,6 +197,19 @@ pub(crate) struct BrokerSpec {
     /// the one before. Off by default, because the protocol sbx already brokers (ssh-agent) has no
     /// greeting and a wrong `true` would make sbx wait for a frame that never comes.
     pub(crate) host_greets: bool,
+    /// How long sbx waits on the host resource for one exchange, when the protocol's own answer can
+    /// legitimately take longer than a machine's.
+    ///
+    /// A deadline exists so a wedged resource cannot wedge the cage: it holds a thread, a plugin
+    /// process and two connections while it waits. The default suits a protocol that answers as
+    /// fast as the machine can. It does not suit one that stops to **ask a person** — a gpg-agent
+    /// opening a pinentry for a passphrase answers when the human does, and 30 seconds is a typing
+    /// speed rather than a fault.
+    ///
+    /// So the manifest raises it, bounded by [`MAX_HOST_DEADLINE`], and the number is a property of
+    /// the protocol rather than of the machine: what waits is sbx, and how long a resource may take
+    /// is the one thing only the protocol knows.
+    pub(crate) host_deadline: std::time::Duration,
     /// Whether the plugin also rules on the frames coming *back* from the host resource.
     ///
     /// Off unless asked for: it is the wider grant of the two, and a broker that only needs to
@@ -230,6 +268,7 @@ impl BrokerPlugin {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawBroker {
+    host_deadline: Option<i64>,
     #[serde(default)]
     cage_env: Vec<String>,
     #[serde(default)]
@@ -244,6 +283,8 @@ pub(super) struct RawBroker {
     host_greets: bool,
     #[serde(default)]
     inspect_replies: bool,
+    #[serde(default)]
+    at_host_path: bool,
 }
 
 /// Validate a manifest's `[broker]` table. `is_reserved` is the cage's reserved-environment-key
@@ -255,11 +296,16 @@ pub(super) fn validate(
     is_valid_env_key: impl Fn(&str) -> bool,
     is_reserved: impl Fn(&str) -> bool,
 ) -> Result<BrokerSpec, String> {
-    if raw.cage_env.is_empty() && raw.cage_env_dir.is_empty() {
+    // Something has to point the cage at the socket. A variable is the general answer; a protocol
+    // whose clients compute the path themselves says so instead, and is pointed at by the address
+    // the socket stands at. One of the two, never neither: a broker nothing can find is a fence in
+    // front of a door nobody walks through.
+    if raw.cage_env.is_empty() && raw.cage_env_dir.is_empty() && !raw.at_host_path {
         return Err(
             "missing `cage_env` — sbx picks where the broker's socket lands, so a broker must \
              name at least one cage variable to point at it (`cage_env` for the socket itself, \
-             `cage_env_dir` for the directory holding it)"
+             `cage_env_dir` for the directory holding it), or declare `at_host_path` if its \
+             clients compute the path themselves"
                 .to_string(),
         );
     }
@@ -362,6 +408,24 @@ pub(super) fn validate(
         }
     };
 
+    // Seconds, because that is the unit a protocol's own patience is described in. Defaulted rather
+    // than required, unlike `max_frame`: every protocol has a frame ceiling worth stating, while
+    // only one that waits on a person has a reason to move this.
+    let host_deadline = match raw.host_deadline {
+        None => DEFAULT_HOST_DEADLINE,
+        Some(secs) if secs <= 0 => {
+            return Err(format!(
+                "`host_deadline` must be a positive number of seconds, not {secs}"
+            ));
+        }
+        Some(secs) if secs > MAX_HOST_DEADLINE_SECS => {
+            return Err(format!(
+                "`host_deadline` is {secs} seconds, above the {MAX_HOST_DEADLINE_SECS}-second                  ceiling sbx waits on a host resource — past it a wedged resource would hold a                  thread and two connections for longer than any prompt takes to answer"
+            ));
+        }
+        Some(secs) => std::time::Duration::from_secs(secs as u64),
+    };
+
     // A greeting is a frame the plugin has to be able to rule on: it reaches the cage, and on a
     // multi-message protocol nothing else can say where it ends. Refused rather than quietly
     // forwarded, so a manifest cannot arrange for one frame to bypass the broker entirely.
@@ -381,8 +445,10 @@ pub(super) fn validate(
         max_frame,
         deny_frame,
         uses_secret: raw.uses_secret,
+        host_deadline,
         host_greets: raw.host_greets,
         inspect_replies: raw.inspect_replies,
+        at_host_path: raw.at_host_path,
     })
 }
 
@@ -401,6 +467,14 @@ pub(super) fn check_sandbox(grant: &super::SandboxGrant) -> Result<(), String> {
         return Err(
             "a broker plugin may not declare `state` — a broker holds nothing across runs, and a \
              writable directory would be surface without a use"
+                .to_string(),
+        );
+    }
+    if !grant.brokers.is_empty() {
+        return Err(
+            "a broker plugin may not declare `brokers` — a broker fenced by another broker is a \
+             chain, and what the outer one admits would depend on a plugin rather than on the \
+             config that bound it"
                 .to_string(),
         );
     }
@@ -424,6 +498,7 @@ mod tests {
 
     fn raw() -> RawBroker {
         RawBroker {
+            host_deadline: None,
             cage_env: vec!["GPG_AGENT_SOCK".to_string()],
             cage_env_dir: Vec::new(),
             socket_name: None,
@@ -433,6 +508,7 @@ mod tests {
             uses_secret: false,
             host_greets: false,
             inspect_replies: true,
+            at_host_path: false,
         }
     }
 
@@ -756,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_grants_a_broker_never_gets_are_refused_by_name() {
+    fn the_grants_a_broker_never_gets_are_refused_by_name() {
         let mut grant = super::super::SandboxGrant {
             programs: Vec::new(),
             allow_paths: Vec::new(),
@@ -765,6 +841,7 @@ mod tests {
             allow_env_paths: Vec::new(),
             network: true,
             state: false,
+            brokers: Vec::new(),
         };
         let err = check_sandbox(&grant).expect_err("network is refused");
         assert!(err.contains("network"), "{err}");
@@ -775,6 +852,70 @@ mod tests {
         assert!(err.contains("state"), "{err}");
 
         grant.state = false;
-        check_sandbox(&grant).expect("neither grant declared");
+        grant.brokers = vec!["gpg-agent".to_string()];
+        let err = check_sandbox(&grant).expect_err("a broker behind a broker is refused");
+        assert!(err.contains("brokers"), "{err}");
+
+        grant.brokers.clear();
+        check_sandbox(&grant).expect("none of the three grants declared");
+    }
+
+    /// A protocol that stops to ask a person answers when the human does, so the manifest may raise
+    /// what sbx waits — bounded, since what waits is a thread and two connections of sbx's.
+    #[test]
+    fn a_protocol_that_waits_on_a_human_may_raise_the_host_deadline() {
+        let spec = validate(
+            RawBroker {
+                host_deadline: Some(300),
+                ..raw()
+            },
+            "gpg-agent",
+            valid_key,
+            reserved,
+        )
+        .expect("five minutes is under the ceiling");
+        assert_eq!(spec.host_deadline, std::time::Duration::from_secs(300));
+
+        // The default is what a protocol answering at machine speed gets.
+        assert_eq!(
+            validate(raw(), "fake", valid_key, reserved)
+                .expect("valid")
+                .host_deadline,
+            DEFAULT_HOST_DEADLINE
+        );
+
+        for bad in [0, -1, MAX_HOST_DEADLINE_SECS + 1] {
+            let err = validate(
+                RawBroker {
+                    host_deadline: Some(bad),
+                    ..raw()
+                },
+                "fake",
+                valid_key,
+                reserved,
+            )
+            .expect_err("outside the bounds");
+            assert!(err.contains("host_deadline"), "{bad}: {err}");
+        }
+    }
+
+    /// A protocol whose clients compute the socket path is pointed at by the address the socket
+    /// stands at, so it names no variable — and must not be refused for naming none.
+    #[test]
+    fn a_broker_whose_clients_compute_the_path_needs_no_variable() {
+        let spec = validate(
+            RawBroker {
+                cage_env: Vec::new(),
+                cage_env_dir: Vec::new(),
+                at_host_path: true,
+                ..raw()
+            },
+            "gpg-agent",
+            valid_key,
+            reserved,
+        )
+        .expect("the host path is what points at it");
+        assert!(spec.at_host_path);
+        assert!(spec.cage_env.is_empty());
     }
 }

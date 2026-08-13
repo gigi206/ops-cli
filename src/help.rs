@@ -2681,13 +2681,21 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "info"],
-        synopsis: "sbx plugins info <scheme>",
+        synopsis: "sbx plugins info <scheme|name>",
         summary: "show a plugin's manifest and sandbox grant",
-        options: &[("<scheme>", "the resolver scheme to detail")],
-        details: "Includes where the plugin came from. A built-in scheme is reported as such; a\n\
-            scheme several plugins claim is a non-zero miss that names every claimant (all\n\
-            disabled until one remains); any other miss re-emits the load warnings, so a\n\
-            plugin dropped as malformed explains itself.",
+        options: &[(
+            "<scheme|name>",
+            "the resolver scheme, or the broker name, to detail",
+        )],
+        details: "Includes where the plugin came from. A resolver is named by the scheme it\n\
+            claims; a broker claims none, so it is named by the name `[broker.<name>]` binds,\n\
+            and its page adds the protocol facts a launch acts on and whether the global\n\
+            config binds it at all.\n\
+            \n\
+            A built-in scheme is reported as such; a scheme several plugins claim is a\n\
+            non-zero miss that names every claimant (all disabled until one remains); any\n\
+            other miss re-emits the load warnings, so a plugin dropped as malformed explains\n\
+            itself.",
     },
     Page {
         path: &["plugins", "install"],

@@ -939,6 +939,8 @@ impl PluginProcess {
             // No arguments: everything this plugin is told arrives on the wire, where it can be
             // bounded and where a secret would not be world-readable in `/proc`.
             args: Vec::new(),
+            // None, and a broker manifest may not ask for any: the fence needs no fence.
+            brokers: &[],
         };
         let (argv, env) = super::resolver::compose_cage(&plan)?;
 
@@ -1050,10 +1052,6 @@ impl<T: Read + Write + Send> ReadWrite for T {}
 /// allowed to take a slot nothing bounds — the rule the ssh-agent broker already applies.
 const MAX_CONCURRENT_CONNS: usize = 32;
 
-/// How long sbx waits on the host resource before giving up on one exchange. The socket is
-/// whatever the machine offers, so a hang there must not become a hang in the cage.
-const HOST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// A running broker's host-side resources. The accept loop is detached and dies with sbx; this
 /// guard owns the socket file and unlinks it when the launch ends.
 pub(crate) struct Broker {
@@ -1070,18 +1068,60 @@ impl Drop for Broker {
     }
 }
 
-/// What the launcher must add to the cage for one broker to be reachable.
-pub(crate) struct Wiring {
-    pub(crate) binds: Vec<super::binds::ExtraBind>,
+/// A standing broker, as a cage reaches it: the host socket to bind, where it lands inside, and the
+/// variables that point at it.
+///
+/// One description for every cage that consumes a broker — the agent's, and a resolver plugin's own
+/// — because a broker that stood at one address for one of them and another address for the other
+/// would be two fences with one name.
+#[derive(Debug, Clone)]
+pub(crate) struct Reachable {
+    /// The broker's name, which is what a manifest's `brokers` entry and a `[broker.<name>]` table
+    /// both spell.
+    pub(crate) name: String,
+    /// The host-side socket sbx serves, to be bound into a cage.
+    pub(crate) src: std::path::PathBuf,
+    /// Where it lands inside a cage.
+    pub(crate) dest: std::path::PathBuf,
+    /// The cage variables the manifest declared, resolved against `dest`.
     pub(crate) env: Vec<(String, String)>,
 }
 
-/// Where a broker's cage-facing socket lands. sbx picks it, and a manifest never does: one per
-/// broker name, so two brokers in one cage cannot collide, and under `/tmp` (a tmpfs the cage
-/// owns) so it can shadow nothing the cage needs.
-fn cage_socket(name: &str, file: &str) -> (String, String) {
+impl Reachable {
+    /// The read-only bind that puts this broker in a cage. Read-only suffices to `connect()` — the
+    /// cage runs same-uid — and only the socket file crosses, never the directory holding it.
+    pub(crate) fn bind(&self) -> super::binds::ExtraBind {
+        super::binds::ExtraBind {
+            src: self.src.clone(),
+            dest: self.dest.clone(),
+            writable: false,
+        }
+    }
+}
+
+/// Where a broker's cage-facing socket lands, and the directory holding it.
+///
+/// Two placements, and a manifest chooses between them by describing its protocol rather than by
+/// naming a path. The default is sbx's own namespace: one directory per broker name, so two brokers
+/// in one cage cannot collide, and under `/tmp` (a tmpfs the cage owns) so it can shadow nothing the
+/// cage needs. A protocol whose clients compute the socket path themselves (`at_host_path`) is
+/// instead stood at the address of the resource it fences, so a client that would have found the
+/// raw socket finds the fence — which is the whole of what makes a GnuPG agent fenceable.
+fn cage_socket(
+    name: &str,
+    spec: &crate::plugins::broker::BrokerSpec,
+    host: &crate::config::BrokerTarget,
+) -> (String, String) {
+    if let (true, crate::config::BrokerTarget::Unix(path)) = (spec.at_host_path, host)
+        && let Some(dir) = path.parent()
+    {
+        return (
+            dir.to_string_lossy().into_owned(),
+            path.to_string_lossy().into_owned(),
+        );
+    }
     let dir = format!("/tmp/sbx-broker-{name}");
-    let path = format!("{dir}/{file}");
+    let path = format!("{dir}/{}", spec.socket_name);
     (dir, path)
 }
 
@@ -1107,6 +1147,7 @@ fn serve_conn(
     let marker = marker.as_ref();
     let mut decider =
         PluginProcess::start(bwrap, plugin, allow, marker).map_err(|e| e.to_string())?;
+    let spec = &plugin.broker;
     // One connection, whichever kind of endpoint was named. Both carry the deadline `relay_one`
     // documents as the caller's to set: without it a wedged host resource wedges the cage waiting
     // on it.
@@ -1114,15 +1155,15 @@ fn serve_conn(
         crate::config::BrokerTarget::Unix(path) => {
             let stream = std::os::unix::net::UnixStream::connect(path)
                 .map_err(|e| format!("cannot reach {}: {e}", path.display()))?;
-            let _ = stream.set_read_timeout(Some(HOST_DEADLINE));
-            let _ = stream.set_write_timeout(Some(HOST_DEADLINE));
+            let _ = stream.set_read_timeout(Some(spec.host_deadline));
+            let _ = stream.set_write_timeout(Some(spec.host_deadline));
             Box::new(stream)
         }
         crate::config::BrokerTarget::Tcp { host, port } => {
             let stream = std::net::TcpStream::connect((host.as_str(), *port))
                 .map_err(|e| format!("cannot reach tcp://{host}:{port}: {e}"))?;
-            let _ = stream.set_read_timeout(Some(HOST_DEADLINE));
-            let _ = stream.set_write_timeout(Some(HOST_DEADLINE));
+            let _ = stream.set_read_timeout(Some(spec.host_deadline));
+            let _ = stream.set_write_timeout(Some(spec.host_deadline));
             // Nagle would hold a small frame back waiting for more, which on a request/response
             // protocol is a delay measured in tens of milliseconds per exchange.
             let _ = stream.set_nodelay(true);
@@ -1130,7 +1171,33 @@ fn serve_conn(
         }
     };
 
-    let spec = &plugin.broker;
+    serve_exchanges(
+        spec,
+        &mut decider,
+        &mut host,
+        cage,
+        ring,
+        marker,
+        &plugin.name,
+    )
+}
+
+/// Relay one connection's exchanges, from the host's greeting (where the protocol has one) to
+/// whichever side ends it.
+///
+/// Split from [`serve_conn`] so the loop can be driven by a scripted plugin and a stand-in host:
+/// what ends a connection and what merely produces no bytes are decided here, and neither is
+/// visible from a single exchange.
+#[allow(clippy::too_many_arguments)]
+fn serve_exchanges(
+    spec: &crate::plugins::broker::BrokerSpec,
+    decider: &mut impl Decider,
+    host: &mut impl ReadWrite,
+    cage: std::os::unix::net::UnixStream,
+    ring: &super::broker_control::BrokerRing,
+    marker: Option<&SecretMarker>,
+    name: &str,
+) -> Result<(), String> {
     let mut cage_r = io::BufReader::new(cage.try_clone().map_err(|e| e.to_string())?);
     let mut cage_w = cage;
     let mut seq = 0u64;
@@ -1140,10 +1207,10 @@ fn serve_conn(
     // the cage's first message. Skipping this on a greeting protocol would answer every message
     // with the reply to the one before it.
     if spec.host_greets {
-        let greeting = read_frame(&mut host, spec.framing, spec.max_frame, true)
+        let greeting = read_frame(host, spec.framing, spec.max_frame, true)
             .map_err(|e| format!("cannot read the host resource's greeting: {e}"))?
             .ok_or("the host resource closed before greeting")?;
-        let greeted = collect_reply(spec, &mut decider, &mut host, 0, Some(greeting), marker)?;
+        let greeted = collect_reply(spec, decider, host, 0, Some(greeting), marker)?;
         let to_cage = greeted.frames;
         for bytes in &to_cage {
             if write_frame(&mut cage_w, spec.framing, bytes, true).is_err() {
@@ -1168,15 +1235,7 @@ fn serve_conn(
             Ok(None) | Err(_) => return Ok(()),
         };
         seq += 1;
-        let answer = match relay_one(
-            &frame,
-            seq,
-            spec,
-            &mut decider,
-            &mut host,
-            marker,
-            cage_typed,
-        ) {
+        let (answer, ends) = match relay_one(&frame, seq, spec, decider, host, marker, cage_typed) {
             Ok(relayed) => {
                 // Every decision goes to the record, which is what a reader consults afterwards.
                 // What sbx *observed* decides the kind; the plugin's label is only ever a detail
@@ -1223,8 +1282,7 @@ fn serve_conn(
                         .map(super::lens::sanitize_detail)
                         .unwrap_or_default();
                     crate::diag::note(&format!(
-                        "broker `{}` refused a request from the cage{}",
-                        plugin.name,
+                        "broker `{name}` refused a request from the cage{}",
                         if why.is_empty() {
                             String::new()
                         } else {
@@ -1232,7 +1290,12 @@ fn serve_conn(
                         }
                     ));
                 }
-                relayed.to_cage
+                // Nothing to write is not, by itself, the end of the exchange. A refusal with no
+                // frame ends it (closing is the refusal that needs no protocol); a message the
+                // protocol answers with nothing is simply followed by the next one, and treating
+                // that as an ending cuts the connection under a client that was mid-conversation.
+                let ends = matches!(relayed.outcome, Outcome::Refused { .. });
+                (relayed.to_cage, ends)
             }
             // No verdict was obtained, so nothing is forwarded. The usual cause is a plugin that
             // died or wedged, and that is not a plugin to keep asking: the refusal goes out (as
@@ -1249,8 +1312,7 @@ fn serve_conn(
                 // wedged, and a reply the tripwire stopped, both end the exchange here. Saying
                 // "no verdict" for the second would name the wrong cause.
                 crate::diag::warn(&format!(
-                    "broker `{}`: {} — the request was refused and the connection ended",
-                    plugin.name,
+                    "broker `{name}`: {} — the request was refused and the connection ended",
                     super::lens::sanitize_detail(&why)
                 ));
                 if let Some(deny) = &spec.deny_frame {
@@ -1259,11 +1321,16 @@ fn serve_conn(
                 return Ok(());
             }
         };
-        if answer.is_empty() {
-            // A refusal with nothing to say: closing is the refusal that needs no protocol.
-            return Ok(());
-        }
+        // The cage has now sent a message, which under `pgwire` is what makes every later one
+        // carry a type byte. Recorded before the branch below, since it is true of the frame that
+        // was read rather than of whatever came back.
         cage_typed = true;
+        if answer.is_empty() {
+            if ends {
+                return Ok(());
+            }
+            continue;
+        }
         for bytes in &answer {
             // The last place bytes can reach the cage, and therefore the right place to hold the
             // rule that they must never carry the marker. The verdict paths refuse it earlier and
@@ -1278,9 +1345,8 @@ fn serve_conn(
                     None,
                 );
                 crate::diag::warn(&format!(
-                    "broker `{}`: a frame bound for the cage carried the secret marker — refused \
-                     and the connection ended",
-                    plugin.name
+                    "broker `{name}`: a frame bound for the cage carried the secret marker — \
+                     refused and the connection ended"
                 ));
                 return Ok(());
             }
@@ -1299,7 +1365,7 @@ pub(crate) fn start(
     plugin: &crate::plugins::broker::BrokerPlugin,
     bwrap: &std::path::Path,
     secret: Option<(String, usize)>,
-) -> io::Result<(Broker, Wiring)> {
+) -> io::Result<(Broker, Reachable)> {
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1387,21 +1453,16 @@ pub(crate) fn start(
         }
     });
 
-    let (cage_dir, cage_path) = cage_socket(&binding.name, &plugin.broker.socket_name);
+    let (cage_dir, cage_path) = cage_socket(&binding.name, &plugin.broker, &binding.socket);
     Ok((
         Broker {
             host_uds: host_uds.clone(),
             control_uds,
         },
-        Wiring {
-            // Read-only: the cage runs same-uid, and a read-only bind is enough to `connect()` —
-            // the property the Wayland and ssh-agent sockets already rely on. Only the socket file
-            // crosses, never the directory that holds every other launch's.
-            binds: vec![super::binds::ExtraBind {
-                src: host_uds,
-                dest: std::path::PathBuf::from(&cage_path),
-                writable: false,
-            }],
+        Reachable {
+            name: binding.name.clone(),
+            src: host_uds,
+            dest: std::path::PathBuf::from(&cage_path),
             // Each name gets the form its client expects: the socket itself, or the directory
             // holding it (libpq derives `.s.PGSQL.<port>` from `PGHOST`).
             env: plugin
@@ -1578,6 +1639,8 @@ mod tests {
 
     fn spec(deny_frame: Option<Vec<u8>>) -> BrokerSpec {
         BrokerSpec {
+            at_host_path: false,
+            host_deadline: crate::plugins::broker::DEFAULT_HOST_DEADLINE,
             cage_env: vec!["X_SOCK".to_string()],
             cage_env_dir: Vec::new(),
             socket_name: "x.sock".to_string(),
@@ -2621,5 +2684,92 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         assert_eq!(a.label.as_deref(), Some("no such key"));
         let a = parse_answer(&answer("deny", ",\"label\":\"\""), 7, 64).unwrap();
         assert_eq!(a.label, None);
+    }
+
+    /// A message the protocol answers with nothing does not end the conversation.
+    ///
+    /// Measured on GnuPG: `PKDECRYPT` makes the agent inquire, and the client then sends its
+    /// ciphertext as data lines the agent answers only at the end. Reading the empty verdict as a
+    /// closed exchange cut the connection in the middle of every decryption, and the client
+    /// reported an end of file where a fence had simply stopped relaying.
+    #[test]
+    fn a_message_the_protocol_answers_with_nothing_is_followed_by_the_next_one() {
+        let spec = spec(None);
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        // Two frames from the cage: one the host answers with nothing, then one it answers.
+        let mut client = theirs;
+        write_frame(&mut client, spec.framing, b"data", false).expect("first frame");
+        write_frame(&mut client, spec.framing, b"end", false).expect("second frame");
+        // Half-closed, so the relay reaches the end of the client's messages rather than blocking
+        // on a third that is not coming. The read half stays open to receive what comes back.
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+
+        let mut plugin = ScriptedPlugin::new(vec![
+            Answer {
+                expect_reply: false,
+                ..ScriptedPlugin::forward()
+            },
+            ScriptedPlugin::forward(),
+        ]);
+        let mut host = FakeHost::with_runs(vec![vec![], vec![b"answered".to_vec()]]);
+        let ring = super::super::broker_control::BrokerRing::new(8, "x");
+        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x").expect("served");
+
+        assert_eq!(
+            host.seen,
+            vec![b"data".to_vec(), b"end".to_vec()],
+            "both frames must reach the host: the first one's silence is not an ending"
+        );
+        let mut back = Vec::new();
+        client.read_to_end(&mut back).expect("read what came back");
+        let mut cur = std::io::Cursor::new(&back[..]);
+        assert_eq!(
+            read_frame(&mut cur, spec.framing, 4096, false).unwrap(),
+            Some(b"answered".to_vec()),
+            "the answer to the second frame must reach the cage"
+        );
+    }
+
+    /// A protocol whose clients compute the socket path is stood at the address of the resource it
+    /// fences — the only placement a GnuPG client can find, since it derives the path from the uid
+    /// and the home rather than reading any variable.
+    #[test]
+    fn a_broker_stands_where_its_protocols_clients_look_for_it() {
+        let mut spec = crate::plugins::broker::BrokerSpec {
+            host_deadline: crate::plugins::broker::DEFAULT_HOST_DEADLINE,
+            cage_env: Vec::new(),
+            cage_env_dir: Vec::new(),
+            socket_name: "gpg-agent.sock".to_string(),
+            framing: crate::plugins::broker::Framing::Line,
+            max_frame: 2048,
+            deny_frame: None,
+            uses_secret: false,
+            host_greets: true,
+            inspect_replies: true,
+            at_host_path: true,
+        };
+        let unix = crate::config::BrokerTarget::Unix(std::path::PathBuf::from(
+            "/run/user/1000/gnupg/S.gpg-agent",
+        ));
+        assert_eq!(
+            cage_socket("gpg-agent", &spec, &unix),
+            (
+                "/run/user/1000/gnupg".to_string(),
+                "/run/user/1000/gnupg/S.gpg-agent".to_string()
+            )
+        );
+
+        // Without the declaration, sbx's own namespace — which is where every broker stood before
+        // this existed, and where one whose clients are told the path still stands.
+        spec.at_host_path = false;
+        assert_eq!(
+            cage_socket("gpg-agent", &spec, &unix),
+            (
+                "/tmp/sbx-broker-gpg-agent".to_string(),
+                "/tmp/sbx-broker-gpg-agent/gpg-agent.sock".to_string()
+            )
+        );
     }
 }

@@ -326,6 +326,24 @@ pub(crate) struct SandboxGrant {
     /// landed through `SBX_PLUGIN_STATE`. A plugin cannot name the directory, cannot reach
     /// another plugin's, and nothing in the agent's cage ever sees any of them.
     pub(crate) state: bool,
+    /// Broker plugins, by name, whose fenced socket this plugin is given instead of the host
+    /// resource behind it.
+    ///
+    /// The narrowest grant in this struct, and the only one that can take something away: a
+    /// resolver that reads a password store needs the gpg-agent to decrypt, and the way to reach
+    /// one used to be `allow_paths` on the agent's own socket — every operation the agent can
+    /// perform, signing included. Naming a broker here binds the *filtered* socket at that same
+    /// address instead, so the tool finds what it always looked for and the connection carries
+    /// only what `[broker.<name>] allow` admits.
+    ///
+    /// Both sides consent: the manifest asks by name, and the grant is answered only where a
+    /// **global** `[broker.<name>]` binds that name to a host resource. A name nothing binds is a
+    /// warning and no socket, never a fallback to the raw one — the same fail-closed direction the
+    /// broker takes in the agent's cage.
+    ///
+    /// A broker plugin may not declare this: a broker that reached another broker would be a chain
+    /// whose ends nothing bounds, and the fence sbx stands up needs no fence of its own.
+    pub(crate) brokers: Vec<String>,
 }
 
 /// The installed plugins under two indexes, plus, for each, the keys no plugin gets to claim
@@ -588,6 +606,8 @@ struct RawSandbox {
     network: bool,
     #[serde(default)]
     state: bool,
+    #[serde(default)]
+    brokers: Vec<String>,
 }
 
 /// What a signed store claims about a plugin, reconciled against its manifest before anything is
@@ -732,6 +752,18 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
         }
     }
 
+    for (i, broker) in raw.sandbox.brokers.iter().enumerate() {
+        // The same identity an installed plugin has, because that is what it names: the key a
+        // `[broker.<name>]` table binds and the registry indexes a broker plugin under.
+        validate_install_name(broker)
+            .map_err(|why| format!("a `brokers` entry is invalid: {why}"))?;
+        if raw.sandbox.brokers[..i].contains(broker) {
+            return Err(format!(
+                "`brokers` names `{broker}` twice — one broker, one declaration"
+            ));
+        }
+    }
+
     let sandbox = SandboxGrant {
         programs: raw.sandbox.programs,
         allow_paths,
@@ -740,6 +772,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
         allow_env_paths: raw.sandbox.allow_env_paths,
         network: raw.sandbox.network,
         state: raw.sandbox.state,
+        brokers: raw.sandbox.brokers,
     };
 
     // `host` is filled in by the config layer once `[plugin.<name>]` has been layered and gated: a
@@ -1956,6 +1989,67 @@ mod tests {
         assert_eq!(
             p.sandbox.allow_paths,
             vec![PathBuf::from("/home/u/.password-store")]
+        );
+    }
+
+    /// The grant that narrows rather than widens: the plugin asks for the fenced socket by name,
+    /// instead of `allow_paths` on the host resource behind it.
+    #[test]
+    fn loads_the_brokers_a_resolver_asks_to_be_fenced_behind() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "pass",
+            "type = \"resolver\"\nscheme = \"pass\"\nexec = \"resolve\"\n\
+             [sandbox]\nbrokers = [\"gpg-agent\"]\n",
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let p = reg.resolver("pass").expect("pass resolver");
+        assert_eq!(p.sandbox.brokers, vec!["gpg-agent".to_string()]);
+    }
+
+    #[test]
+    fn a_broker_named_twice_or_unsafely_is_refused() {
+        for (declaration, expected) in [
+            ("[\"gpg-agent\", \"gpg-agent\"]", "twice"),
+            ("[\"../elsewhere\"]", "brokers"),
+        ] {
+            let root = crate::testutil::TmpDir::new();
+            write_plugin(
+                root.path(),
+                "p",
+                &format!(
+                    "type = \"resolver\"\nscheme = \"p\"\nexec = \"resolve\"\n\
+                     [sandbox]\nbrokers = {declaration}\n"
+                ),
+            );
+            let (reg, warnings) = load(root.path());
+            assert!(reg.resolver("p").is_none(), "{declaration} must not load");
+            assert!(
+                warnings.iter().any(|w| w.contains(expected)),
+                "{declaration}: {warnings:?}"
+            );
+        }
+    }
+
+    /// A broker behind a broker is a chain nothing bounds, so the type that stands the fence up
+    /// may not ask for one.
+    #[test]
+    fn a_broker_plugin_may_not_ask_to_be_fenced_itself() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(
+            root.path(),
+            "gpg-agent",
+            "type = \"broker\"\nexec = \"broker\"\n\
+             [broker]\ncage_env = [\"GPG_AGENT_SOCK\"]\nframing = \"line\"\nmax_frame = 2048\n\
+             [sandbox]\nbrokers = [\"another\"]\n",
+        );
+        let (reg, warnings) = load(root.path());
+        assert!(reg.broker("gpg-agent").is_none());
+        assert!(
+            warnings.iter().any(|w| w.contains("brokers")),
+            "{warnings:?}"
         );
     }
 

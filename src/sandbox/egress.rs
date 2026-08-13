@@ -547,14 +547,18 @@ pub(crate) fn start(
     // The launch's `[redact] min_len`: the shortest credential this proxy scans for, on the way out
     // and on the way back.
     redact_min_len: usize,
+    // The brokers already standing for this launch, for a resolver plugin whose manifest names one.
+    // They are stood up before this call precisely so a credential can be resolved through one.
+    brokers: &[super::broker::Reachable],
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     // Tighten the data directory to owner-only before anything reads from it. A resolver plugin
     // is trusted by location — it is run only because it sits under `<data>/plugins`, a tree a
-    // project cannot write — and that perimeter rests on `<data>` being `0700`; establish it here,
-    // ahead of resolving any plugin-backed secret.
+    // project cannot write — and that perimeter rests on `<data>` being `0700`. Established here
+    // for the secrets this call resolves; a launch that stands brokers up first establishes it
+    // there too, since that is where the first plugin then runs.
     crate::store::ensure(layout)?;
 
     // Resolve the credentials before standing anything up, so a missing secret fails the
@@ -563,7 +567,7 @@ pub(crate) fn start(
     // relative `sops` file resolves against the project root (the `.sbx.toml`'s directory). A
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
     let (injections, redactions) =
-        resolve_injections(secrets, project_root, bwrap, redact_min_len)?;
+        resolve_injections(secrets, project_root, bwrap, redact_min_len, brokers)?;
 
     // The credential state the proxy will read, built here so the refresher can hold the same one
     // and swap it in place. Re-resolution repeats exactly this call, which is why the inputs are
@@ -576,14 +580,19 @@ pub(crate) fn start(
         redact_min_len,
     ));
     let refresh = (!secrets.is_empty()).then(|| {
-        let (secrets, root, bwrap) = (
+        let (secrets, root, bwrap, brokers) = (
             secrets.to_vec(),
             project_root.to_path_buf(),
             bwrap.to_path_buf(),
+            // The brokers as they stand now, kept for every later refresh. A refresh that ran after
+            // the launch guard tore them down resolves against a socket that is gone and fails,
+            // which is the fail-closed direction: the alternative — dropping the grant and letting
+            // the resolver reach the raw resource — is the one that must not exist.
+            brokers.to_vec(),
         );
         std::sync::Arc::new(super::proxy::CredentialRefresh::new(
             credentials.clone(),
-            Box::new(move || resolve_injections(&secrets, &root, &bwrap, redact_min_len)),
+            Box::new(move || resolve_injections(&secrets, &root, &bwrap, redact_min_len, &brokers)),
         ))
     });
 
@@ -852,11 +861,12 @@ fn resolve_injections(
     project_root: &Path,
     bwrap: &Path,
     min_len: usize,
+    brokers: &[super::broker::Reachable],
 ) -> io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)> {
     let mut injections = Vec::with_capacity(secrets.len());
     let mut redactions = Vec::new();
     for secret in secrets {
-        let (injection, needles) = resolve_one(secret, project_root, bwrap, min_len)?;
+        let (injection, needles) = resolve_one(secret, project_root, bwrap, min_len, brokers)?;
         injections.push(injection);
         redactions.extend(needles);
     }
@@ -875,8 +885,15 @@ fn resolve_one(
     project_root: &Path,
     bwrap: &Path,
     min_len: usize,
+    brokers: &[super::broker::Reachable],
 ) -> io::Result<(HeaderInjection, Vec<SecretNeedle>)> {
-    let trimmed = resolve_chain(&secret.sources, &secret.header, project_root, bwrap)?;
+    let trimmed = resolve_chain(
+        &secret.sources,
+        &secret.header,
+        project_root,
+        bwrap,
+        brokers,
+    )?;
     let trimmed = trimmed.as_str();
 
     let needles = if trimmed.len() < min_len {
@@ -925,11 +942,12 @@ pub(crate) fn resolve_chain(
     label: &str,
     project_root: &Path,
     bwrap: &Path,
+    brokers: &[super::broker::Reachable],
 ) -> io::Result<String> {
     let mut tried = Vec::with_capacity(sources.len());
     for source in sources {
         tried.push(source.describe());
-        if let Some(value) = read_source(source, label, project_root, bwrap)? {
+        if let Some(value) = read_source(source, label, project_root, bwrap, brokers)? {
             return Ok(value);
         }
     }
@@ -950,6 +968,7 @@ fn read_source(
     header: &str,
     project_root: &Path,
     bwrap: &Path,
+    brokers: &[super::broker::Reachable],
 ) -> io::Result<Option<String>> {
     match source {
         SecretSource::Env(var) => match std::env::var(var) {
@@ -990,7 +1009,7 @@ fn read_source(
         // exit is already a hard error inside `resolver::run`, propagated here (never a silent absent).
         SecretSource::Plugin { plugin, locator } => {
             let reff = format!("{}://{locator}", plugin.scheme);
-            let raw = super::resolver::run(bwrap, plugin, &reff)?;
+            let raw = super::resolver::run(bwrap, plugin, &reff, brokers)?;
             classify_value(raw, header, &format!("{} {locator}", plugin.scheme))
         }
     }
@@ -1152,6 +1171,7 @@ mod tests {
             "-1",
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
         )
         .expect("start the egress proxy");
 
@@ -1299,6 +1319,7 @@ mod tests {
                 instance,
                 None,
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
+                &[],
             )
             .expect("start the egress proxy");
 
@@ -1662,6 +1683,7 @@ mod tests {
             "-2",
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
         )
         .expect("start the ask egress proxy");
 
@@ -1731,6 +1753,7 @@ mod tests {
             "-3",
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
         )
         .expect("start with stats off");
         drop(guard);
@@ -1755,6 +1778,7 @@ mod tests {
             "-4",
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
         )
         .expect("start with stats on");
         drop(guard);
@@ -1804,6 +1828,7 @@ mod tests {
             Path::new("/"),
             Path::new(UNUSED_BWRAP),
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
         )
     }
 
@@ -1943,6 +1968,7 @@ mod tests {
             dir.path(),
             Path::new(UNUSED_BWRAP),
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
         )
         .unwrap();
         assert_eq!(injs[0].value, "Bearer fallback-token-value");
@@ -1970,6 +1996,7 @@ mod tests {
             "Authorization",
             dir.path(),
             Path::new(UNUSED_BWRAP),
+            &[],
         );
         // restore so the temp dir can be cleaned up regardless of the outcome
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2204,6 +2231,7 @@ mod tests {
             Path::new("/"),
             &bwrap,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
         )
         .unwrap();
         assert_eq!(injs[0].value, "Bearer ghp-from-the-plugin");
@@ -2253,6 +2281,7 @@ mod tests {
             "Authorization",
             Path::new("/"),
             &bwrap,
+            &[],
         );
         assert_eq!(value.unwrap(), "from-the-next-source");
     }
@@ -2287,6 +2316,7 @@ mod tests {
             Path::new("/"),
             Path::new(UNUSED_BWRAP),
             8,
+            &[],
         )
         .unwrap();
         assert!(
@@ -2300,7 +2330,7 @@ mod tests {
 
         // Lowered to 5, both sides admit it — the same value, the same step.
         let (_, lowered) =
-            resolve_injections(&[wire], Path::new("/"), Path::new(UNUSED_BWRAP), 5).unwrap();
+            resolve_injections(&[wire], Path::new("/"), Path::new(UNUSED_BWRAP), 5, &[]).unwrap();
         assert_eq!(lowered.len(), 1, "the wire now scans for it");
         assert_eq!(lowered[0].as_bytes(), b"abcde");
         let task_needles = crate::sandbox::task::credential_needles(&task, "abcde", 5);
@@ -2333,7 +2363,7 @@ mod tests {
         };
 
         let (_, wire_needles) =
-            resolve_injections(&[wire], Path::new("/"), Path::new(UNUSED_BWRAP), 8).unwrap();
+            resolve_injections(&[wire], Path::new("/"), Path::new(UNUSED_BWRAP), 8, &[]).unwrap();
         assert!(
             wire_needles.is_empty(),
             "the plaintext is under the floor, so neither spelling is scanned for"

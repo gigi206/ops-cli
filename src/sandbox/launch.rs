@@ -4213,6 +4213,196 @@ fn build(
             forward_guard = Some(guard);
         }
     }
+    // Broker plugins: the same shape as the ssh-agent broker below, for a protocol sbx does not
+    // implement itself. Each `[broker.<name>]` pairs an installed plugin with the host resource
+    // the global config bound it to; sbx serves the socket, holds the host connection, and the
+    // plugin only ever answers verdicts about frames.
+    //
+    // Ahead of the egress proxy, and that order is load-bearing rather than incidental: a resolver
+    // plugin may be given a broker (`[sandbox] brokers`), and the proxy resolves this launch's
+    // secrets as it starts. A broker stood up afterwards would not exist at the moment the resolver
+    // that needs it runs.
+    //
+    // Every failure here degrades to *no broker* rather than to an unfenced one, and says so: a
+    // cage without a broker is a cage that cannot reach that resource, which is the fail-closed
+    // direction. Only standing up a broker the config did ask for and could otherwise have is
+    // fatal, like the egress proxy's and the agent's.
+    let mut broker_guards: Vec<broker::Broker> = Vec::new();
+    let mut brokers: Vec<broker::Reachable> = Vec::new();
+    if !prep.cfg.brokers.is_empty() {
+        // The perimeter every plugin's trust rests on, established before the first plugin runs —
+        // a resolver is run only because it sits under `<data>/plugins`, a tree a project cannot
+        // write, and that rests on `<data>` being owner-only. The egress proxy opens with the same
+        // call for the same reason; standing brokers up ahead of it moved the first plugin-backed
+        // resolution in this process to here.
+        if let Err(e) = crate::store::ensure(&prep.layout) {
+            eprintln!("sbx: cannot prepare the data directory: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+        let mut plugin_warnings = Vec::new();
+        let registry =
+            crate::plugins::PluginRegistry::load(&prep.layout.plugins_dir(), &mut plugin_warnings);
+        for w in &plugin_warnings {
+            crate::diag::warn(w);
+        }
+        for binding in &prep.cfg.brokers {
+            let name = &binding.name;
+            let Some(plugin) = registry.broker(name) else {
+                // Told apart, because the remedy differs: an ambiguous name is fixed by removing a
+                // plugin, a missing one by installing it.
+                match registry.broker_conflict(name) {
+                    Some(claimants) => crate::diag::warn(&format!(
+                        "`[broker.{name}]` names a broker claimed by more than one installed \
+                         plugin ({}) — they are all disabled, so the cage gets no broker",
+                        crate::plugins::quoted_list(claimants)
+                    )),
+                    None => crate::diag::warn(&format!(
+                        "`[broker.{name}]` names no installed broker plugin — install one with \
+                         `sbx plugins install`, or drop the table. The cage gets no broker."
+                    )),
+                }
+                continue;
+            };
+            // Two checks, and the second is the one that keeps a single answer to "where may this
+            // cage go".
+            match &binding.socket {
+                // A Unix socket has to be there *now*: a broker in front of nothing would accept
+                // the cage's connections and fail every frame, which reads as the resource
+                // misbehaving rather than as a configuration that does not hold.
+                crate::config::BrokerTarget::Unix(path) if !path.exists() => {
+                    crate::diag::warn(&format!(
+                        "`[broker.{name}] socket` names {}, which does not exist — the cage gets \
+                         no broker",
+                        path.display()
+                    ));
+                    continue;
+                }
+                crate::config::BrokerTarget::Unix(_) => {}
+                // A protocol whose clients compute the socket's path has no path to compute when
+                // the resource is an endpoint: the two declarations are answering different
+                // questions, and standing the broker up anyway would put it where nothing looks.
+                crate::config::BrokerTarget::Tcp { .. } if plugin.broker.at_host_path => {
+                    crate::diag::warn(&format!(
+                        "`[broker.{name}] socket` names a tcp:// endpoint, but the plugin's clients \
+                         find the socket at a fixed path (`at_host_path`) — a tcp:// target has \
+                         none, so the cage gets no broker"
+                    ));
+                    continue;
+                }
+                // A TCP target is a way out of the cage, so it is admitted only where the network
+                // allowlist already admits it — decided by the very function the proxy and
+                // `sbx test net` decide through, so the three cannot drift apart. Without this
+                // there would be two different answers to what the cage may reach, and the one a
+                // reader checks would not be the one that decides.
+                crate::config::BrokerTarget::Tcp { host, port } => {
+                    let admitted = match &prep.cfg.network {
+                        crate::config::NetworkPolicy::Allowlist(policy) => matches!(
+                            policy.l4_decision(host, *port),
+                            crate::allowlist::L4Decision::Splice(_)
+                        ),
+                        _ => false,
+                    };
+                    if !admitted {
+                        crate::diag::warn(&format!(
+                            "`[broker.{name}] socket` names tcp://{host}:{port}, which the \
+                             network allowlist does not admit — add `tcp://{host}:{port}` to \
+                             `[network] allow`, or the cage gets no broker"
+                        ));
+                        continue;
+                    }
+                }
+            }
+            // The credential is resolved host-side, here, before anything is stood up: a broker
+            // that was promised one and cannot get it must not run, or it would put an
+            // unauthenticated connection in front of the cage and look like the resource refusing
+            // it. The plugin never receives this value — only a marker standing in for it.
+            let secret = if binding.secret.is_empty() {
+                None
+            } else if !plugin.broker.uses_secret {
+                // The grant is the manifest's to make: a credential is not handed to a plugin that
+                // was not written to place one, whatever the config says.
+                crate::diag::warn(&format!(
+                    "`[broker.{name}] secret` names a credential, but the plugin's manifest does \
+                     not declare `uses_secret` — the broker runs without it"
+                ));
+                None
+            } else {
+                // Resolved with **no** broker wired, which is what keeps the graph acyclic: a
+                // broker's own credential cannot be read through a broker, least of all through the
+                // one being stood up. A resolver that needs one fails here on its own terms, so say
+                // which declaration made it impossible rather than leaving the tool's error to
+                // stand for it.
+                for source in &binding.secret {
+                    if let crate::config::SecretSource::Plugin { plugin, .. } = source
+                        && !plugin.sandbox.brokers.is_empty()
+                    {
+                        crate::diag::warn(&format!(
+                            "`[broker.{name}] secret` resolves through the `{}` plugin, which needs \
+                             the {} broker — a broker's own credential is resolved before any \
+                             broker is standing, so that grant is not answered here",
+                            plugin.scheme,
+                            crate::plugins::quoted_list(&plugin.sandbox.brokers)
+                        ));
+                    }
+                }
+                match egress::resolve_chain(&binding.secret, name, &prep.cwd, &prep.bwrap, &[]) {
+                    Ok(value) => {
+                        // Said once, at the launch that decided it, rather than per connection: a
+                        // credential under the redaction floor is placed on the wire but not
+                        // watched on the way back, and that is a fact about this config.
+                        if value.len() < prep.cfg.redact_min_len {
+                            crate::diag::warn(&format!(
+                                "the credential for the `{name}` broker is {} bytes, under the \
+                                 {}-byte `[redact] min_len` floor — it is placed on the wire, but \
+                                 a reply carrying it back is not blocked (a scan that short \
+                                 refuses innocent traffic more often than it catches a leak)",
+                                value.len(),
+                                prep.cfg.redact_min_len
+                            ));
+                        }
+                        Some((value, prep.cfg.redact_min_len))
+                    }
+                    Err(e) => {
+                        eprintln!("sbx: cannot resolve the secret for the `{name}` broker: {e}");
+                        return Err(ExitCode::FAILURE);
+                    }
+                }
+            };
+            match broker::start(&prep.layout, binding, plugin, &prep.bwrap, secret) {
+                Ok((guard, reachable)) => {
+                    crate::diag::note(&format!(
+                        "broker: `{name}` stands in front of {}{}",
+                        binding.socket.describe(),
+                        match binding.allow.len() {
+                            0 => String::new(),
+                            n => format!(" ({n} allow entr{})", if n == 1 { "y" } else { "ies" }),
+                        }
+                    ));
+                    // Two brokers claiming one variable would silently last-wins, leaving a client
+                    // pointed at whichever was stood up second and a broker serving nobody. Named
+                    // instead, like the secrets layer names a duplicated destination header.
+                    for (key, _) in &reachable.env {
+                        if brokers
+                            .iter()
+                            .any(|b: &broker::Reachable| b.env.iter().any(|(k, _)| k == key))
+                        {
+                            crate::diag::warn(&format!(
+                                "broker `{name}` and an earlier broker both set ${key} in the cage \
+                                 — the later one wins, so one of them is unreachable"
+                            ));
+                        }
+                    }
+                    brokers.push(reachable);
+                    broker_guards.push(guard);
+                }
+                Err(e) => {
+                    eprintln!("sbx: cannot start the `{name}` broker: {e}");
+                    return Err(ExitCode::FAILURE);
+                }
+            }
+        }
+    }
+
     // Where each `tcp://` destination lives inside the cage. Computed before the launch because two
     // things need it: the preamble's listeners, and the `/etc/hosts` entries that make the
     // declaration's own host name resolve to them.
@@ -4275,6 +4465,7 @@ fn build(
             "",
             Some(&notify_wiring),
             prep.cfg.redact_min_len,
+            &brokers,
         )
         .map_err(|e| {
             eprintln!("sbx: cannot start the egress filtering proxy: {e}");
@@ -4401,152 +4592,6 @@ fn build(
                         sshagent_env = wiring.env;
                         sshagent_guard = Some(guard);
                     }
-                }
-            }
-        }
-    }
-
-    // Broker plugins: the same shape as the ssh-agent broker above, for a protocol sbx does not
-    // implement itself. Each `[broker.<name>]` pairs an installed plugin with the host resource
-    // the global config bound it to; sbx serves the socket, holds the host connection, and the
-    // plugin only ever answers verdicts about frames.
-    //
-    // Every failure here degrades to *no broker* rather than to an unfenced one, and says so: a
-    // cage without a broker is a cage that cannot reach that resource, which is the fail-closed
-    // direction. Only standing up a broker the config did ask for and could otherwise have is
-    // fatal, like the egress proxy's and the agent's.
-    let mut broker_guards: Vec<broker::Broker> = Vec::new();
-    let mut broker_binds: Vec<binds::ExtraBind> = Vec::new();
-    let mut broker_env: Vec<(String, String)> = Vec::new();
-    if !prep.cfg.brokers.is_empty() {
-        let mut plugin_warnings = Vec::new();
-        let registry =
-            crate::plugins::PluginRegistry::load(&prep.layout.plugins_dir(), &mut plugin_warnings);
-        for w in &plugin_warnings {
-            crate::diag::warn(w);
-        }
-        for binding in &prep.cfg.brokers {
-            let name = &binding.name;
-            let Some(plugin) = registry.broker(name) else {
-                // Told apart, because the remedy differs: an ambiguous name is fixed by removing a
-                // plugin, a missing one by installing it.
-                match registry.broker_conflict(name) {
-                    Some(claimants) => crate::diag::warn(&format!(
-                        "`[broker.{name}]` names a broker claimed by more than one installed \
-                         plugin ({}) — they are all disabled, so the cage gets no broker",
-                        crate::plugins::quoted_list(claimants)
-                    )),
-                    None => crate::diag::warn(&format!(
-                        "`[broker.{name}]` names no installed broker plugin — install one with \
-                         `sbx plugins install`, or drop the table. The cage gets no broker."
-                    )),
-                }
-                continue;
-            };
-            // Two checks, and the second is the one that keeps a single answer to "where may this
-            // cage go".
-            match &binding.socket {
-                // A Unix socket has to be there *now*: a broker in front of nothing would accept
-                // the cage's connections and fail every frame, which reads as the resource
-                // misbehaving rather than as a configuration that does not hold.
-                crate::config::BrokerTarget::Unix(path) if !path.exists() => {
-                    crate::diag::warn(&format!(
-                        "`[broker.{name}] socket` names {}, which does not exist — the cage gets \
-                         no broker",
-                        path.display()
-                    ));
-                    continue;
-                }
-                crate::config::BrokerTarget::Unix(_) => {}
-                // A TCP target is a way out of the cage, so it is admitted only where the network
-                // allowlist already admits it — decided by the very function the proxy and
-                // `sbx test net` decide through, so the three cannot drift apart. Without this
-                // there would be two different answers to what the cage may reach, and the one a
-                // reader checks would not be the one that decides.
-                crate::config::BrokerTarget::Tcp { host, port } => {
-                    let admitted = match &prep.cfg.network {
-                        crate::config::NetworkPolicy::Allowlist(policy) => matches!(
-                            policy.l4_decision(host, *port),
-                            crate::allowlist::L4Decision::Splice(_)
-                        ),
-                        _ => false,
-                    };
-                    if !admitted {
-                        crate::diag::warn(&format!(
-                            "`[broker.{name}] socket` names tcp://{host}:{port}, which the \
-                             network allowlist does not admit — add `tcp://{host}:{port}` to \
-                             `[network] allow`, or the cage gets no broker"
-                        ));
-                        continue;
-                    }
-                }
-            }
-            // The credential is resolved host-side, here, before anything is stood up: a broker
-            // that was promised one and cannot get it must not run, or it would put an
-            // unauthenticated connection in front of the cage and look like the resource refusing
-            // it. The plugin never receives this value — only a marker standing in for it.
-            let secret = if binding.secret.is_empty() {
-                None
-            } else if !plugin.broker.uses_secret {
-                // The grant is the manifest's to make: a credential is not handed to a plugin that
-                // was not written to place one, whatever the config says.
-                crate::diag::warn(&format!(
-                    "`[broker.{name}] secret` names a credential, but the plugin's manifest does \
-                     not declare `uses_secret` — the broker runs without it"
-                ));
-                None
-            } else {
-                match egress::resolve_chain(&binding.secret, name, &prep.cwd, &prep.bwrap) {
-                    Ok(value) => {
-                        // Said once, at the launch that decided it, rather than per connection: a
-                        // credential under the redaction floor is placed on the wire but not
-                        // watched on the way back, and that is a fact about this config.
-                        if value.len() < prep.cfg.redact_min_len {
-                            crate::diag::warn(&format!(
-                                "the credential for the `{name}` broker is {} bytes, under the \
-                                 {}-byte `[redact] min_len` floor — it is placed on the wire, but \
-                                 a reply carrying it back is not blocked (a scan that short \
-                                 refuses innocent traffic more often than it catches a leak)",
-                                value.len(),
-                                prep.cfg.redact_min_len
-                            ));
-                        }
-                        Some((value, prep.cfg.redact_min_len))
-                    }
-                    Err(e) => {
-                        eprintln!("sbx: cannot resolve the secret for the `{name}` broker: {e}");
-                        return Err(ExitCode::FAILURE);
-                    }
-                }
-            };
-            match broker::start(&prep.layout, binding, plugin, &prep.bwrap, secret) {
-                Ok((guard, wiring)) => {
-                    crate::diag::note(&format!(
-                        "broker: `{name}` stands in front of {}{}",
-                        binding.socket.describe(),
-                        match binding.allow.len() {
-                            0 => String::new(),
-                            n => format!(" ({n} allow entr{})", if n == 1 { "y" } else { "ies" }),
-                        }
-                    ));
-                    // Two brokers claiming one variable would silently last-wins, leaving a client
-                    // pointed at whichever was stood up second and a broker serving nobody. Named
-                    // instead, like the secrets layer names a duplicated destination header.
-                    for (key, _) in &wiring.env {
-                        if broker_env.iter().any(|(k, _)| k == key) {
-                            crate::diag::warn(&format!(
-                                "broker `{name}` and an earlier broker both set ${key} in the cage \
-                                 — the later one wins, so one of them is unreachable"
-                            ));
-                        }
-                    }
-                    broker_binds.extend(wiring.binds);
-                    broker_env.extend(wiring.env);
-                    broker_guards.push(guard);
-                }
-                Err(e) => {
-                    eprintln!("sbx: cannot start the `{name}` broker: {e}");
-                    return Err(ExitCode::FAILURE);
                 }
             }
         }
@@ -4753,7 +4798,7 @@ fn build(
     // project path, so they neither shadow nor are shadowed by a structural mount.
     let mut extra_binds = egress_binds;
     extra_binds.extend(sshagent_binds);
-    extra_binds.extend(broker_binds);
+    extra_binds.extend(brokers.iter().map(broker::Reachable::bind));
     extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
     extra_binds.extend(inline_flake_binds);
@@ -4889,7 +4934,10 @@ fn build(
         (EnvLayer::Mise, mise_env(prep)?),
         (EnvLayer::Egress, egress_env),
         (EnvLayer::SshAgent, sshagent_env),
-        (EnvLayer::Broker, broker_env),
+        (
+            EnvLayer::Broker,
+            brokers.iter().flat_map(|b| b.env.clone()).collect(),
+        ),
         (EnvLayer::Task, task_env),
         (EnvLayer::Config, prep.cfg.env.clone()),
     ]);
@@ -4995,7 +5043,8 @@ fn build(
                 },
                 prep.cfg.redact_min_len,
             )
-            .with_notifier(Arc::clone(&notify_wiring));
+            .with_notifier(Arc::clone(&notify_wiring))
+            .with_brokers(brokers.clone());
             // Carry the session's `[fs]` masks into every task cage, so a denied path is closed
             // there too unless the task's own `unmask` names it. The decoys are the ones this
             // launch already staged: a task cage is derived from the agent's, and pointing it at a

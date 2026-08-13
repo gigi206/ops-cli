@@ -343,7 +343,9 @@ pub(crate) fn render_publish_key_warning(key_path: &Path, pal: &style::Palette) 
 
 /// The published-store report: `published store` in green, the plugins by name, the public key
 /// consumers pin highlighted, and the commit-and-host hint dimmed (with the key echoed in it). A
-/// pure presenter over the published plugin lines as `(name, scheme)` pairs.
+/// pure presenter over the published plugin lines as `(name, label)` pairs — the label already
+/// spelled by the publisher, which is the only side that knows whether a plugin has a namespace to
+/// name at all.
 pub(crate) fn render_published(
     rev: u64,
     plugins: &[(&str, &str)],
@@ -359,8 +361,8 @@ pub(crate) fn render_published(
         "{ok}published store{r} at rev {rev} {dim}({} plugin{plural}):{r}",
         plugins.len()
     );
-    for (name, scheme) in plugins {
-        let _ = writeln!(o, "  {n}{name}{r}  {dim}({scheme}://){r}");
+    for (name, label) in plugins {
+        let _ = writeln!(o, "  {n}{name}{r}  {dim}({label}){r}");
     }
     let _ = writeln!(o, "pubkey: {n}{pubkey_hex}{r}");
     let _ = write!(
@@ -485,7 +487,7 @@ mod tests {
             "⚠ keep the signing key `/k/key.pem` secret — it is this store's identity"
         );
         assert_eq!(
-            render_published(5, &[("vault", "vault")], "deadbeef", &p),
+            render_published(5, &[("vault", "vault://")], "deadbeef", &p),
             "published store at rev 5 (1 plugin):\n  vault  (vault://)\npubkey: deadbeef\n\
              commit and host the directory, then consumers add it with: \
              sbx plugins store add --name <n> --url <git-url> --key deadbeef"
@@ -590,7 +592,7 @@ mod tests {
             "the key caution must ride the warn hue:\n{keywarn}"
         );
 
-        let published = render_published(5, &[("vault", "vault")], "deadbeef", &p);
+        let published = render_published(5, &[("vault", "vault://")], "deadbeef", &p);
         assert!(published.contains(&format!("{}published store{}", p.ok, p.reset)));
         assert!(published.contains(&format!("{}deadbeef{}", p.name, p.reset)));
 

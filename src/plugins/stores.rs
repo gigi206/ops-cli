@@ -398,12 +398,13 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
             .replace(std::path::MAIN_SEPARATOR, "/");
         let sha256 =
             crate::plugins::catalogue::to_hex(&crate::plugins::catalogue::dir_digest(p.dir)?);
-        // What the publish confirmation shows: a resolver by the namespace it answers for, a
-        // broker by its type, since it has no namespace to name.
+        // What the publish confirmation shows, spelled here rather than by the renderer: a resolver
+        // by the namespace it answers for, `scheme://` and all, and a broker by its type — it has
+        // no namespace to name, and a `broker://` would read as one it claimed.
         listing.push((
             p.name.to_string(),
             match &p.scheme {
-                Some(scheme) => scheme.clone(),
+                Some(scheme) => format!("{scheme}://"),
                 None => p.kind.token().to_string(),
             },
         ));

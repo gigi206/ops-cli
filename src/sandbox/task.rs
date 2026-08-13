@@ -235,6 +235,11 @@ pub(crate) struct TaskEngine {
     /// Held by the engine rather than read per invocation so a task's output and the session's own
     /// egress are watched to the same depth — they are the two renderings of one floor.
     redact_min_len: usize,
+    /// The session's standing brokers, for a task credential that resolves through a plugin whose
+    /// manifest names one. Held so a `pass://` credential means the same thing in a task as it does
+    /// in a wire injection: one resolver layer, one set of grants, no source that works in one place
+    /// and fails in the other.
+    brokers: Vec<super::broker::Reachable>,
 }
 
 /// The two cage programs a task's egress forwarder is built from, named rather than passed as a pair
@@ -377,6 +382,7 @@ impl TaskEngine {
             notify: None,
             fs_masks: None,
             redact_min_len,
+            brokers: Vec::new(),
         }
     }
 
@@ -410,6 +416,14 @@ impl TaskEngine {
     /// `packages` never materializes a pool, and never pays for one.
     pub(crate) fn with_pool(mut self, pool: PathBuf, mise_bin: PathBuf) -> Self {
         self.pool = Some((pool, mise_bin));
+        self
+    }
+
+    /// Hand the engine the brokers the launch stood up, so a task credential resolving through a
+    /// plugin that names one finds it. Separate from [`TaskEngine::from_cage`] for the reason the
+    /// pool is: a session with no `[broker.*]` stands none up and passes none.
+    pub(crate) fn with_brokers(mut self, brokers: Vec<super::broker::Reachable>) -> Self {
+        self.brokers = brokers;
         self
     }
 
@@ -621,7 +635,7 @@ impl TaskEngine {
         // needles for substituting them back out of the output.
         let mut secret_env = Vec::new();
         for secret in &task.secrets {
-            let plaintext = resolve_secret(secret, &self.config_root, &self.bwrap)
+            let plaintext = resolve_secret(secret, &self.config_root, &self.bwrap, &self.brokers)
                 .map_err(TaskError::Credential)?;
             needles.extend(credential_needles(secret, &plaintext, self.redact_min_len));
             secret_env.push((secret.var.clone(), secret.encode.render(&plaintext)));
@@ -711,6 +725,7 @@ impl TaskEngine {
                 // resolved credentials are added to.
                 self.notify.as_deref(),
                 self.redact_min_len,
+                &self.brokers,
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;
@@ -2115,6 +2130,7 @@ impl TaskEngine {
         Self {
             fs_masks: None,
             notify: None,
+            brokers: Vec::new(),
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             bwrap: PathBuf::from("/nonexistent/bwrap"),
             forwarder: CageForwarder {
@@ -2201,8 +2217,9 @@ fn resolve_secret(
     secret: &crate::config::TaskSecret,
     config_root: &Path,
     bwrap: &Path,
+    brokers: &[super::broker::Reachable],
 ) -> Result<String, String> {
-    super::egress::resolve_chain(&secret.sources, &secret.var, config_root, bwrap)
+    super::egress::resolve_chain(&secret.sources, &secret.var, config_root, bwrap, brokers)
         .map_err(|e| e.to_string())
 }
 
@@ -3159,6 +3176,7 @@ mod tests {
         TaskEngine {
             fs_masks: None,
             notify: None,
+            brokers: Vec::new(),
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             forwarder: CageForwarder {
