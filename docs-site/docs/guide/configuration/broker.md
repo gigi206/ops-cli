@@ -281,6 +281,11 @@ the **policy's** layer, since the socket is always the global config's.
   resolver.
 - **The bound is the hole it replaces**, not perfection. A plugin that decides badly can
   allow whatever the host resource would have allowed. It can never allow more.
+- **A [task](task)'s own cage does not get the socket.** A task cage keeps a named set of
+  destinations and drops every channel — the ssh-agent socket and the display go the same
+  way — so a task's *command* cannot speak to a brokered resource. What a task does get is
+  a credential resolved through one: `[task.<name>.secret]` runs the same resolver layer a
+  wire injection does, host-side, so a `pass://` credential means the same thing in both.
 - **The record says what `sbx` observed, not what the plugin claims.** Every decision goes
   to the session's log, readable with [`sbx logs --feed broker`](../cli/logs). The verdict
   (`forward`, `answer`, `refuse`) is `sbx`'s own account and leads each line; the plugin's
