@@ -7659,3 +7659,93 @@ fn a_refusal_says_the_same_thing_whichever_plane_answers_it() {
         "{body}"
     );
 }
+
+/// A byte another parser could break a line on is refused, on every plane that reads a request head,
+/// before anything is resolved.
+///
+/// The vector: [`parse_head`] splits on CRLF and on a bare LF, so no LF survives into a header value
+/// — but a lone CR does, and every inspected request is written out again, name and value verbatim,
+/// by a reserializer. An upstream that reads a lone CR as a line break then sees a header the *client*
+/// wrote sitting in front of the one sbx strips and replaces: a process in the cage putting its own
+/// `Authorization` ahead of a credential it never held.
+///
+/// All three HTTP/1.1 planes, because each has its own reserializer and each reads its head in its
+/// own place. The HTTP/2 plane cannot carry the byte at all, which is where the rule comes from —
+/// `wire::a_head_carrying_a_byte_another_parser_could_break_a_line_on_is_refused` pins it against
+/// `http::HeaderValue`, the validation HPACK decoding performs there.
+///
+/// The resolver **panics**: this must be settled from the head alone, so a refusal that reaches a
+/// name lookup is one that ran too late to keep the byte off the wire.
+#[test]
+fn a_request_head_carrying_a_control_byte_is_refused_on_every_plane() {
+    let refuser = || -> super::dns::Resolver {
+        Box::new(|_| panic!("the head alone settles this, before any name is resolved"))
+    };
+    let refused = |resp: &str, plane: &str| {
+        assert!(
+            resp.starts_with("HTTP/1.1 400 Bad Request"),
+            "{plane}: {resp:?}"
+        );
+        assert!(
+            resp.contains("X-Sbx-Egress-Reason: bad-request:control-char"),
+            "{plane}: {resp:?}"
+        );
+        assert!(
+            !resp.contains("smuggled"),
+            "{plane}: the refusal must not echo the smuggled header back: {resp:?}"
+        );
+    };
+
+    // 1. The tunnelled MITM plane, with the credential this defends: a carriage return in a value.
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let der = proxy_ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["host.test:*"]))
+            .unwrap()
+            .with_injections(vec![injection(
+                "host.test:*",
+                "Authorization",
+                "Bearer sbx-issued",
+            )])
+            .with_resolver(refuser()),
+    );
+    let resp = through_proxy(
+        ctx,
+        der,
+        "host.test",
+        "host.test",
+        443,
+        b"GET / HTTP/1.1\r\nHost: host.test\r\nX-Note: a\rAuthorization: Bearer smuggled\r\n\r\n",
+    )
+    .unwrap();
+    refused(&resp, "the tunnelled plane");
+
+    // 2. The cleartext plane, and a NUL rather than a carriage return.
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            policy(&["http://upstream.test:*"]),
+        )
+        .unwrap()
+        .with_resolver(refuser()),
+    );
+    let resp = through_cleartext(
+        ctx,
+        b"GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\nX-Note: a\0smuggled\r\n\r\n",
+    )
+    .unwrap();
+    refused(&resp, "the cleartext plane");
+
+    // 3. The absolute-form `https://` plane, and the byte in a header *name* rather than a value.
+    let ctx = Arc::new(
+        ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+            .unwrap()
+            .with_resolver(refuser()),
+    );
+    let resp = through_cleartext(
+        ctx,
+        b"GET https://host.test:443/p HTTP/1.1\r\nHost: host.test\r\nX-No\rte: smuggled\r\n\r\n",
+    )
+    .unwrap();
+    refused(&resp, "the absolute-form https plane");
+}

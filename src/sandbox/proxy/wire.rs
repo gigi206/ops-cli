@@ -56,6 +56,27 @@ pub(super) fn parse_head(bytes: &[u8]) -> io::Result<Head> {
     })
 }
 
+/// Whether a parsed request head carries a byte another parser could frame the message by.
+///
+/// [`parse_head`] splits on CRLF *and* on a bare LF, so no LF survives into a name or a value. A lone
+/// CR does — the trim only reaches the ends — and so does a NUL. Every inspected request is then
+/// written out again by [`reserialize_request`](super::reserialize_request), which emits each name
+/// and value verbatim.
+///
+/// That re-serialization is what makes sbx's own reading of a request authoritative, and it is what
+/// closes the ordinary smuggling desync: the upstream sees what sbx parsed, never what the client
+/// framed. A byte the upstream's parser reads as a line break reopens it from inside a header sbx
+/// wrote itself. The reach is not theoretical — it is how a process in the cage puts a second
+/// `Authorization` in front of the one sbx strips and replaces, having never held the credential.
+///
+/// The rule is the one the HTTP/2 plane already gets for free, HPACK decoding into
+/// `http::HeaderValue`: a byte must be HTAB, visible ASCII, or `obs-text`. Adopting it here is what
+/// makes the same request refused on every plane rather than on one of the three.
+pub(super) fn head_carries_control_byte(head: &Head) -> bool {
+    let bad = |s: &str| s.bytes().any(|b| b != b'\t' && (b < 0x20 || b == 0x7f));
+    bad(&head.request_line) || head.headers.iter().any(|(k, v)| bad(k) || bad(v))
+}
+
 /// The method and target of a request line, requiring all three space-separated tokens
 /// (`METHOD target HTTP/x`).
 pub(super) fn request_line_parts(line: &str) -> Option<(String, String)> {
@@ -1073,6 +1094,72 @@ mod tests {
         assert!(
             parse_head(b"\r\n").is_err(),
             "an empty request line is refused"
+        );
+    }
+
+    /// The exact rule, and where it comes from.
+    ///
+    /// First the vector, because the check only makes sense next to it: a bare CR is *not* a line
+    /// break to [`parse_head`], so it lands whole inside a header value and is written back out
+    /// verbatim. Then the rule, pinned side by side against `http::HeaderValue` — the validation the
+    /// HTTP/2 plane performs for free when HPACK decodes a header. Every byte this refuses is a byte
+    /// that plane already refuses, and every byte it allows is one that plane allows, so the same
+    /// request is turned down whichever way into the cage it came.
+    #[test]
+    fn a_head_carrying_a_byte_another_parser_could_break_a_line_on_is_recognized() {
+        let parsed =
+            parse_head(b"GET / HTTP/1.1\r\nX-Note: a\rAuthorization: Bearer smuggled\r\n\r\n")
+                .unwrap();
+        assert_eq!(
+            parsed.headers,
+            vec![(
+                "X-Note".to_string(),
+                "a\rAuthorization: Bearer smuggled".to_string()
+            )],
+            "a bare CR is one header value here and two headers to a lenient upstream: the whole \
+             reason this check exists"
+        );
+        assert!(head_carries_control_byte(&parsed));
+
+        let with = |name: &str, value: &str| Head {
+            request_line: "GET / HTTP/1.1".to_string(),
+            headers: vec![(name.to_string(), value.to_string())],
+        };
+        for (case, byte) in [
+            ("a carriage return", "\r"),
+            ("a NUL", "\0"),
+            ("a DEL", "\x7f"),
+            ("a form feed", "\x0c"),
+            ("a vertical tab", "\x0b"),
+        ] {
+            let value = format!("a{byte}b");
+            assert!(head_carries_control_byte(&with("X-Note", &value)), "{case}");
+            assert!(
+                head_carries_control_byte(&with(&value, "v")),
+                "{case}, in a header name"
+            );
+            assert!(
+                http::HeaderValue::from_str(&value).is_err(),
+                "{case} is no more acceptable on the HTTP/2 plane, which is where this rule is from"
+            );
+        }
+        for (case, value) in [
+            ("a tab", "a\tb"),
+            ("ordinary text", "Bearer abc.def"),
+            ("obs-text above ASCII", "café"),
+        ] {
+            assert!(!head_carries_control_byte(&with("X-Note", value)), "{case}");
+            assert!(
+                http::HeaderValue::from_str(value).is_ok(),
+                "{case} is carried on the HTTP/2 plane, so it must be carried here"
+            );
+        }
+        assert!(
+            head_carries_control_byte(&Head {
+                request_line: "GET /a\rHost: elsewhere HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+            "the request line is written out verbatim too"
         );
     }
 

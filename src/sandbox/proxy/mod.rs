@@ -90,7 +90,7 @@
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
 //! | `503` | `body-buffer-cap`        | the proxy is already holding as much request-body data as it will hold at one time (retry when one in flight completes). Nothing is wrong with the request: it is a shared ceiling on host memory, since the proxy buffers host-side and the cage's own `MemoryMax` does not reach it |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
-//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
+//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
 //! | `405` | `method-not-allowed`     | a non-CONNECT request that is neither a routable `http://` nor `https://` absolute-form (a bare origin-form has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
@@ -244,6 +244,13 @@ const MAX_CONCURRENT_CONNS: usize = 512;
 
 /// The largest request head (CONNECT or the decrypted inner request) the proxy will buffer.
 const HEAD_MAX: usize = 16 * 1024;
+
+/// What a request refused by [`head_carries_control_byte`] is told, on every plane that reads a head.
+/// It names the byte class rather than the attack, because a client sending one by accident needs to
+/// know what to remove and a client sending one on purpose learns nothing it did not already know.
+const CONTROL_BYTE_DETAIL: &str = "a request line or header carries a control byte (a carriage return, a NUL, or another C0 \
+     character); another parser could read it as a line break, so it is refused rather than \
+     forwarded";
 
 /// The most `ask`-posture requests parked at once. A new one beyond this is denied immediately
 /// (fail-closed) rather than enqueued, so an in-cage agent cannot pin unbounded host threads by
@@ -472,6 +479,23 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // `chunked` — the one streaming coding the proxy de-chunks and re-frames with a synthesized
     // Content-Length below (so no CL/TE ambiguity reaches the upstream); any other TE coding is
     // unsupported and refused.
+    if head_carries_control_byte(&inner) {
+        ctx.push_log(
+            super::control::Proto::Https,
+            &connect_host,
+            port,
+            Some(&imethod),
+            Some(&itarget),
+            super::control::LogVerdict::Blocked,
+            "bad-request:control-char",
+        );
+        return respond_refusal_tls(
+            &mut br,
+            "400 Bad Request",
+            "bad-request:control-char",
+            CONTROL_BYTE_DETAIL,
+        );
+    }
     let te = inner.header("transfer-encoding");
     let cl_count = inner.count("content-length");
     let host_count = inner.count("host");
@@ -1491,8 +1515,26 @@ fn handle_cleartext(
         }
     };
 
-    // 2. Anti request-smuggling, fail-closed — the same guards as the tunneled path: any
-    //    Transfer-Encoding (no chunked framing in this path), or a duplicated Content-Length / Host.
+    // 2. Anti request-smuggling, fail-closed — the same guards as the tunneled path: a byte another
+    //    parser could frame by, any Transfer-Encoding (no chunked framing in this path), or a
+    //    duplicated Content-Length / Host.
+    if head_carries_control_byte(head) {
+        ctx.push_log(
+            super::control::Proto::Http,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            super::control::LogVerdict::Blocked,
+            "bad-request:control-char",
+        );
+        return write_refusal(
+            &mut client,
+            "400 Bad Request",
+            "bad-request:control-char",
+            CONTROL_BYTE_DETAIL,
+        );
+    }
     if head.header("transfer-encoding").is_some()
         || head.count("content-length") > 1
         || head.count("host") > 1
@@ -1875,6 +1917,23 @@ fn handle_https_forward(
     //    vector and is refused outright; a `Transfer-Encoding` is refused UNLESS it is exactly
     //    `chunked`, the one streaming coding the proxy de-chunks and re-frames with a synthesized
     //    Content-Length below (so no CL/TE ambiguity reaches the upstream).
+    if head_carries_control_byte(head) {
+        ctx.push_log(
+            super::control::Proto::Https,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            super::control::LogVerdict::Blocked,
+            "bad-request:control-char",
+        );
+        return write_refusal(
+            &mut client,
+            "400 Bad Request",
+            "bad-request:control-char",
+            CONTROL_BYTE_DETAIL,
+        );
+    }
     let chunked = match head.header("transfer-encoding").map(str::trim) {
         Some(v) if v.eq_ignore_ascii_case("chunked") => true,
         Some(_) => {

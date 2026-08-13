@@ -235,6 +235,15 @@ outright (`400 bad-request`, sub-categorized in the logs). A well-formed `chunke
 request is not refused: it is de-chunked into a bounded buffer and re-framed with a
 synthesized `Content-Length`, so exactly one unambiguous framing reaches the upstream.
 
+An inspected request is also **written out again** rather than forwarded byte for byte,
+which is what makes the proxy's own reading of it the one the upstream sees. For that to
+hold, no header may carry a byte a different parser would break a line on, so a control
+byte in a request line, a header name or a header value is refused as
+`bad-request:control-char`. The rule is the one HTTP/2 enforces by construction: a byte
+must be a tab, visible ASCII, or above ASCII. Without it a single carriage return inside
+a header value reaches a lenient upstream as a header of the caller's own choosing,
+including one placed in front of a credential the proxy strips and replaces.
+
 **Inbound, the rule is fail-open.** The proxy reads the response head, then applies the
 standard delimitation rules in order:
 
