@@ -468,27 +468,22 @@ fn signing_injection(digest: bool) -> HeaderInjection {
     }
 }
 
-/// What holding a request body to digest it costs, and what it buys back.
+/// What holding a request body to digest it costs, and what it buys back — on both framings.
 ///
 /// A signer declaring `body_digest` reverses the order of two things: the body is read into memory
-/// and hashed *before* the request is signed, where it otherwise streams straight to the upstream.
-/// That is work added to the request path, so it is measured rather than assumed — and it is not
-/// only a cost, because a body the proxy holds is one it can send a second time, which is what lets
-/// such a request take a pooled connection at all. Before, a `Content-Length` body opened its own
-/// upstream connection every time.
+/// and hashed *before* the request is signed, where a `Content-Length` body otherwise streams
+/// straight to the upstream. That is work added to the request path, so it is measured rather than
+/// assumed — and it is not only a cost, because a body the proxy holds is one it can send a second
+/// time, which is what lets such a request take a pooled connection at all.
 ///
-/// Three figures, each differing from the one above it by exactly one thing:
+/// Two framings, three signer states, because the two framings start from opposite places:
 ///
-/// 1. **no signer** — the shape before any of this: the body streams, and with reuse on it still
-///    opens its own connection every request, because a streamed body cannot be sent again.
-/// 2. **a signer, no digest** — (1) plus the per-request signer call, which here costs nothing:
-///    this isolates everything the injection machinery does *around* the plugin.
-/// 3. **a signer asking for the digest** — (2) plus reading the body into memory and hashing it,
-///    minus the upstream handshake it no longer pays, because the request is now poolable.
+/// - A **`Content-Length`** body streams. Holding it is new work, and new pool eligibility.
+/// - A **`chunked`** body was already read into memory and re-framed, whatever any signer wanted.
+///   Holding it for a digest adds the hash and nothing else, so that column prices the hash alone.
 ///
-/// (3) minus (2) is the honest price of the feature. That it can come out **negative** is the
-/// point: on a link with real round trips the saved handshake is worth far more than the hash, and
-/// on loopback it is CPU against CPU.
+/// The gap between the two `no signer` rows is what de-chunking costs over streaming, which nothing
+/// measured before either.
 #[test]
 #[ignore = "a measurement, not an assertion: run explicitly, in release"]
 fn held_body_cost() {
@@ -498,36 +493,165 @@ fn held_body_cost() {
         BODY / 1024
     );
     let reply = Arc::new(SMALL_BODY.as_bytes().to_vec());
-    let mut request =
+
+    let mut framed =
         format!("POST /v1/thing HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: {BODY}\r\n\r\n")
             .into_bytes();
-    request.extend(std::iter::repeat_n(b'x', BODY));
+    framed.extend(std::iter::repeat_n(b'x', BODY));
 
-    for (label, injections) in [
-        ("no signer, body streams", Vec::new()),
-        ("a signer, no digest", vec![signing_injection(false)]),
-        (
-            "a signer asking for the digest",
-            vec![signing_injection(true)],
-        ),
-    ] {
-        let (addr, up_ca) = spawn_keepalive_tls_upstream(small_head_keepalive(), reply.clone());
+    // One chunk and its terminator: the framing, not the chunk count, is what differs here.
+    let mut chunked =
+        b"POST /v1/thing HTTP/1.1\r\nHost: upstream.test\r\nTransfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+    chunked.extend(format!("{BODY:x}\r\n").into_bytes());
+    chunked.extend(std::iter::repeat_n(b'x', BODY));
+    chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+
+    for (framing, request) in [("Content-Length", &framed), ("chunked", &chunked)] {
+        for (state, injections) in [
+            ("no signer", Vec::new()),
+            ("a signer, no digest", vec![signing_injection(false)]),
+            (
+                "a signer asking for the digest",
+                vec![signing_injection(true)],
+            ),
+        ] {
+            let (addr, up_ca) = spawn_keepalive_tls_upstream(small_head_keepalive(), reply.clone());
+            let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+            let proxy_ca_der = proxy_ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]).with_pool(true))
+                    .unwrap()
+                    .with_upstream(client_config(up_ca))
+                    .with_injections(injections)
+                    .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+            );
+            let (_dir, sock) = serve_on_uds(ctx);
+            let cfg = client_config(proxy_ca_der);
+            let started = Instant::now();
+            for _ in 0..REQUESTS {
+                one_https_request(&sock, cfg.clone(), "upstream.test", addr.port(), request)
+                    .unwrap();
+            }
+            report_rate(&format!("{framing}, {state}"), started.elapsed(), REQUESTS);
+        }
+    }
+}
+
+/// A loopback TLS upstream that accepts a WebSocket upgrade and then writes `frames` binary frames
+/// of `payload_len` bytes each, as fast as it can. The handshake is the shape the proxy requires to
+/// enter its frame relay at all; what is measured is what happens after it.
+fn spawn_ws_bulk_upstream(
+    frames: usize,
+    payload_len: usize,
+) -> (SocketAddr, CertificateDer<'static>) {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let Ok((sock, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(conn) = ServerConnection::new(server_config) else {
+            return;
+        };
+        let mut tls = StreamOwned::new(conn, sock);
+        if read_head(&mut tls).is_err() {
+            return;
+        }
+        if tls
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: bench\r\n\r\n",
+            )
+            .is_err()
+        {
+            return;
+        }
+        // One unmasked binary frame with a 64-bit length: server frames are never masked, and the
+        // extended length is what a payload this size uses on the wire.
+        let mut frame = vec![0x82u8, 127];
+        frame.extend_from_slice(&(payload_len as u64).to_be_bytes());
+        frame.extend(std::iter::repeat_n(b'x', payload_len));
+        for _ in 0..frames {
+            if tls.write_all(&frame).is_err() {
+                return;
+            }
+        }
+        let _ = tls.flush();
+    });
+    (addr, ca_der)
+}
+
+/// What the WebSocket relay costs per byte, and what decoding its frames aside costs on top.
+///
+/// The frame relay is its own path: past the `101` the connection is no longer requests and
+/// responses, and every byte crosses [`super::websocket`] rather than the HTTP relay measured by
+/// [`bulk_throughput`]. What is relayed is byte-exact and never rewritten, so the axis here is not
+/// masking — it is the **capture**, which decodes frames into its own buffers and scans those for a
+/// configured secret. That is the one thing on this path that reads a byte more than once.
+///
+/// Note what cannot be measured because it cannot happen: an upgrade to a credential-injected host
+/// is refused outright, since past the `101` nothing can be redacted. So there is no
+/// "relay carrying a secret" figure to report, by construction rather than by omission.
+#[test]
+#[ignore = "a measurement, not an assertion: run explicitly, in release"]
+fn websocket_throughput() {
+    const FRAMES: usize = 512;
+    const PAYLOAD: usize = 64 * 1024;
+    println!(
+        "\nwebsocket relay ({} MiB of frames, loopback upstream, CPU only — no RTT)",
+        FRAMES * PAYLOAD / (1024 * 1024)
+    );
+    use crate::sandbox::control::{CaptureCaps, CaptureLevel, CaptureRing};
+
+    let needles = vec![SecretNeedle::named(
+        "bench-token",
+        b"BENCH-SECRET-VALUE-0123456789".to_vec(),
+    )];
+
+    for label in ["plain frame relay", "with capture = bodies"] {
+        let (addr, up_ca) = spawn_ws_bulk_upstream(FRAMES, PAYLOAD);
+        let mut roots = RootCertStore::empty();
+        roots.add(up_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
         let proxy_ca_der = proxy_ca.ca_cert_der();
-        let ctx = Arc::new(
-            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]).with_pool(true))
-                .unwrap()
-                .with_upstream(client_config(up_ca))
-                .with_injections(injections)
-                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
-        );
-        let (_dir, sock) = serve_on_uds(ctx);
-        let cfg = client_config(proxy_ca_der);
-        let started = Instant::now();
-        for _ in 0..REQUESTS {
-            one_https_request(&sock, cfg.clone(), "upstream.test", addr.port(), &request).unwrap();
+        // A WebSocket needs its own grant: a host allowed for every HTTP method is still
+        // method-denied for an upgrade.
+        let mut ctx = ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        if label == "with capture = bodies" {
+            // The capture is what decodes frames and scans its own copy. Injecting a credential is
+            // not the other axis here: an upgrade to a credential-injected host is refused outright,
+            // because past the `101` nothing can be redacted.
+            ctx = ctx
+                .with_capture(Arc::new(CaptureRing::with_needles(
+                    CaptureCaps::new(CaptureLevel::Bodies, 64),
+                    needles.clone(),
+                )))
+                .with_redactions(needles.clone());
         }
-        report_rate(label, started.elapsed(), REQUESTS);
+        let (_dir, path) = serve_on_uds(Arc::new(ctx));
+        let cfg = client_config(proxy_ca_der);
+        let upgrade = b"GET /ws HTTP/1.1\r\nHost: upstream.test\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n";
+        let started = Instant::now();
+        let read = one_https_request(&path, cfg, "upstream.test", addr.port(), upgrade).unwrap();
+        report_rate_bytes(label, started.elapsed(), read);
     }
 }
 
