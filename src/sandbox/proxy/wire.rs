@@ -1223,6 +1223,55 @@ mod tests {
         assert!(!header_name_eq("x-api-key", "x-api-token"));
     }
 
+    /// The proxy compares header names by two different rules, and the boundary between them is a
+    /// decision rather than an oversight. This pins both sides of it.
+    ///
+    /// [`header_name_eq`] folds `_` onto `-` because the collision it defends against is **at the
+    /// application**: a CGI-style server maps `X-Api-Key` and `X_Api_Key` onto the same
+    /// `HTTP_X_API_KEY`, so the caller's spelling would contend with sbx's for one key. That is the
+    /// rule the injection strip needs.
+    ///
+    /// [`Head::count`] and [`Head::header`] fold case only, because the collision they defend
+    /// against is **at the framing**, and framing is read by the HTTP parser, which matches field
+    /// names as exact tokens. `_` is a valid token character, so `Content_Length` is a different
+    /// header, not a spelling of that one; nginx's `underscores_in_headers` drops or forwards such a
+    /// header, it does not rename it. Widening these to fold as well would add a refusal for a
+    /// collision no reachable parser performs, which is the one thing the guards in this proxy do
+    /// not do.
+    ///
+    /// What would overturn it: a demonstrated hop between sbx and an origin that resolves
+    /// `Content_Length` or `Transfer_Encoding` as its framing. This test is where to start.
+    #[test]
+    fn the_framing_lookups_fold_case_only_while_the_injection_strip_also_folds_underscores() {
+        let head = parse_head(
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nContent_Length: 999\r\n\
+              X_API_KEY: caller\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            head.count("content-length"),
+            1,
+            "the underscored spelling is a different header to the framing lookups, so the \
+             duplicate check sees one Content-Length and reads its length from that one"
+        );
+        assert_eq!(head.header("content-length"), Some("5"));
+        assert_eq!(
+            head.count("host"),
+            1,
+            "the same holds for the header the anti-fronting check reads"
+        );
+
+        // ...and the injection strip, over the very same head, does fold: a credential sbx injects
+        // as `x-api-key` takes the caller's `X_API_KEY` copy with it.
+        assert!(
+            head.headers
+                .iter()
+                .any(|(k, _)| header_name_eq(k, "x-api-key")),
+            "the caller's alternate spelling is what the strip has to recognize"
+        );
+    }
+
     #[test]
     fn head_expects_continue_detects_the_case_insensitive_expectation() {
         let with = parse_head(b"POST / HTTP/1.1\r\nExpect: 100-Continue\r\n\r\n").unwrap();

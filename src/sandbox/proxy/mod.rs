@@ -2891,6 +2891,16 @@ struct Head {
 
 impl Head {
     /// The value of a header by case-insensitive name (the first, if duplicated).
+    ///
+    /// Case only, deliberately, where [`header_name_eq`] also folds `_` onto `-`. The two rules
+    /// answer different questions. That one guards an **application** collision — a CGI-style server
+    /// maps `X-Api-Key` and `X_Api_Key` onto one `HTTP_X_API_KEY` — so the injection strip has to
+    /// recognize both. These lookups feed the framing and anti-fronting checks, and framing is read
+    /// by an HTTP parser matching field names as exact tokens; `_` is a valid token character, so
+    /// `Content_Length` is a different header rather than a spelling of this one. The boundary is
+    /// pinned by
+    /// `wire::the_framing_lookups_fold_case_only_while_the_injection_strip_also_folds_underscores`,
+    /// which also names what would overturn it.
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -2898,7 +2908,8 @@ impl Head {
             .map(|(_, v)| v.as_str())
     }
 
-    /// How many headers carry this name (case-insensitive) — to catch a duplicated header.
+    /// How many headers carry this name (case-insensitive, on the same terms as [`Self::header`]) —
+    /// to catch a duplicated header.
     fn count(&self, name: &str) -> usize {
         self.headers
             .iter()
