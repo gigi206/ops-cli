@@ -67,8 +67,9 @@ pub(crate) mod sshagent;
 pub(crate) mod sshagent_control;
 
 // The signer-plugin runner: what authenticating one outbound request looks like, asked of a plugin
-// that holds nothing and reaches nothing.
+// that holds nothing and reaches nothing, plus the record of what it answered.
 pub(crate) mod signer;
+pub(crate) mod signer_control;
 
 // In-cage enforcement: seccomp denylist, cgroup limits, exec policy.
 pub(crate) mod cgroup;

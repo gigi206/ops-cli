@@ -3,11 +3,11 @@
 //! Two things live here. [`run`] is the per-lens view, once for the three observation lenses: the
 //! files a session writes (`sbx fs logs`), the processes it execs (`sbx proc logs`), and what its
 //! ssh-agent broker decided (`sbx ssh-agent logs`). [`run_merged`] is `sbx logs`, which reads those
-//! three plus the egress decisions and the task invocations of one session and interleaves them in
-//! time.
+//! three plus every feed with no verb of its own — the egress decisions, what a broker plugin ruled
+//! on, what a signer plugin formed, and the task invocations — and interleaves them in time.
 //!
 //! They share this module for the output discipline described below, and because the merged view is
-//! the same read loop with five cursors instead of one.
+//! the same read loop with one cursor per feed instead of one in total.
 //!
 //! All three read a bounded ring host-side over a per-session control socket — see
 //! [`crate::sandbox::lens`] for the substrate under them — and all three present it the same way: a
@@ -201,9 +201,9 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
 
 /// One event of one session, flattened out of whichever feed saw it.
 ///
-/// The five feeds record different things and none of them is reshaped here: what they share is
+/// The feeds record different things and none of them is reshaped here: what they share is
 /// already the same shape — a stamp, a short fixed token, and one field of free text — because each
-/// was built to put its verbatim field last on the wire. This is that shape named, so five feeds can
+/// was built to put its verbatim field last on the wire. This is that shape named, so every feed can
 /// be sorted into one column of time.
 struct Row {
     /// When the event **happened**, in epoch milliseconds. The merge key, and the reason every feed
@@ -315,6 +315,24 @@ fn read_broker_rows(
     Ok((rows, Some(snap.head), snap.dropped))
 }
 
+fn read_signer_rows(
+    socket: &Path,
+    after: Option<u64>,
+) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+    let snap = crate::sandbox::signer_control::read_signer_log(socket, after)?;
+    let rows = snap
+        .events
+        .into_iter()
+        .map(|e| Row {
+            at_epoch_ms: e.at_epoch_ms,
+            feed: "signer",
+            token: e.kind.token().to_string(),
+            subject: e.detail,
+        })
+        .collect();
+    Ok((rows, Some(snap.head), snap.dropped))
+}
+
 fn read_net_rows(
     socket: &Path,
     after: Option<u64>,
@@ -381,12 +399,18 @@ fn read_task_rows(
 ///
 /// Named separately because completion needs the vocabulary without a session to read: a feed
 /// carries a socket path, which takes a data directory and a pid that a shell completing a flag
-/// has neither of. `feeds_and_names_agree` pins the two together, so a sixth feed cannot become a
-/// value the CLI accepts and the completion never offers.
-pub(crate) const FEED_NAMES: &[&str] = &["proc", "net", "fs", "ssh", "broker", "task"];
+/// has neither of. `feeds_and_names_agree` pins the two together, so a feed added to one cannot
+/// become a value the CLI accepts and the completion never offers.
+pub(crate) const FEED_NAMES: &[&str] = &["proc", "signer", "net", "fs", "ssh", "broker", "task"];
 
 /// Every feed of one session, in the order their columns read best when two events share a
 /// millisecond: what the agent reached for, then what was decided about it.
+///
+/// That is why `signer` precedes `net`, which reads oddly until the order the proxy works in is
+/// spelled out: a request's credential is formed *before* its allow is recorded, on all three
+/// planes, and a refusal to form one is recorded before the `blocked` it causes. Two events of the
+/// same request can share a millisecond, and the pair must not read as the effect preceding its
+/// cause.
 fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
     vec![
         Feed {
@@ -394,6 +418,13 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
             socket: crate::sandbox::proc_control::proc_control_socket(data_dir, pid),
             absent: "not observed — relaunch with `--observe` to record what it execs",
             read: read_proc_rows,
+            cursor: Some(0),
+        },
+        Feed {
+            name: "signer",
+            socket: crate::sandbox::signer_control::signer_control_socket(data_dir, pid),
+            absent: "no signer plugin — no credential in this config declares `sign`",
+            read: read_signer_rows,
             cursor: Some(0),
         },
         Feed {
@@ -459,8 +490,8 @@ fn write_row(
     } else {
         let (dim, r) = (pal.dim, pal.reset);
         let time = crate::format_log_time(row.at_epoch_ms);
-        // The verdict tokens the four decision feeds share, coloured the same way each of them
-        // colours its own: a refusal must read as one at a glance in a column mixing five sources.
+        // The verdict tokens the decision feeds share, coloured the same way each of them colours
+        // its own: a refusal must read as one at a glance in a column mixing every source.
         let hue = match row.token.as_str() {
             "allow" => pal.ok,
             "deny" | "blocked" | "error" | "refuse" | "refused" => pal.err,
@@ -475,7 +506,7 @@ fn write_row(
     }
 }
 
-/// `sbx logs [<id>] [--feed <a,b,…>] [-n <N>] [-f|--follow] [--json]`: one session's five feeds,
+/// `sbx logs [<id>] [--feed <a,b,…>] [-n <N>] [-f|--follow] [--json]`: one session's feeds,
 /// interleaved in time.
 ///
 /// This reads; it stands nothing up. Every feed it shows is one a launch already decided to run, and
@@ -705,7 +736,7 @@ mod tests {
 
     /// The vocabulary completion offers and the feeds this command actually reads are one list.
     /// Held together here because they cannot be one expression: a feed carries a socket path,
-    /// and completion has no session to derive one from. A sixth feed added to `feeds_for` and
+    /// and completion has no session to derive one from. A feed added to `feeds_for` and
     /// not to `FEED_NAMES` would be accepted by the CLI and offered by nothing.
     #[test]
     fn feeds_and_names_agree() {

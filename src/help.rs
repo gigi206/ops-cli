@@ -637,7 +637,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--feed <a,b,...>",
-                "only these feeds: proc, net, fs, ssh, broker, task",
+                "only these feeds: proc, signer, net, fs, ssh, broker, task",
             ),
             ("-n, --lines <N>", "show only the last N events"),
             (
@@ -649,18 +649,21 @@ const PAGES: &[Page] = &[
                 "one JSON object per line (NDJSON), with a `feed` field",
             ),
         ],
-        details: "One session's five feeds in one column of time: what it execs (`proc`), where it goes\n\
-            (`net`), what it writes (`fs`), what it asked your keys to sign (`ssh`), and the declared\n\
-            operations it invoked (`task`). Each is also readable on its own — `sbx proc logs`,\n\
-            `sbx net logs`, `sbx fs logs`, `sbx ssh-agent logs`, `sbx task logs` — and those show\n\
-            more of their own detail; this one answers the question none of them can, which is what\n\
-            happened in what order.\n\
+        details: "One session's every feed in one column of time: what it execs (`proc`), where it goes\n\
+            (`net`), what it writes (`fs`), what it asked your keys to sign (`ssh`), what a broker\n\
+            plugin ruled on (`broker`), what a signer plugin formed for its requests (`signer`), and\n\
+            the declared operations it invoked (`task`). Several are also readable on their own —\n\
+            `sbx proc logs`, `sbx net logs`, `sbx fs logs`, `sbx ssh-agent logs`, `sbx task logs` —\n\
+            and those show more of their own detail; this one answers the question none of them can,\n\
+            which is what happened in what order. `broker` and `signer` are read here and nowhere\n\
+            else.\n\
             \n\
             A feed that is not recording is **named, with the reason**, before the events. That is\n\
             the point: a feed nothing stood up and a feed with nothing to say both come back empty,\n\
             and only that line tells them apart. Most sessions record two or three — `proc` and `fs`\n\
             need `--observe`, `net` a filtering `[network] mode`, `ssh` an `[ssh_agent] allow`,\n\
-            `task` a `[task]` table.\n\
+            `broker` a `[broker.<name>]`, `signer` a `[[secret]]` with `sign`, `task` a `[task]`\n\
+            table.\n\
             \n\
             Rows are ordered by when each event **happened**. A task invocation is therefore placed\n\
             where it began, not where its record was written when it ended — otherwise a slow\n\

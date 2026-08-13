@@ -1169,6 +1169,9 @@ fn stage_signer(root: &Path, name: &str, reads_secret: bool, body: &str) -> std:
 ///     masked, which is the needle for a signed credential being the key rather than the signature.
 ///   * **The manifest bounds the answer.** A plugin that answers with a header it never declared,
 ///     or that refuses outright, refuses the request with `signer-refused` — and it is not sent.
+///   * **The feed records both outcomes.** A detached session's `sbx logs --feed signer` shows the
+///     signature and the refusal, each naming the signer, and a plugin that echoes the key it was
+///     handed writes the credential's *name* into the record rather than the credential.
 ///
 /// Skips (never fails) when the host cannot sandbox, the binary cache is unreachable (`curl` will
 /// not provision), or the echo service is down.
@@ -1251,7 +1254,19 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         true,
         "    print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": \"ok\", \"Host\": \"evil.example.com\"}}), flush=True)",
     );
-    for dir in [&signs, &marker, &refuses, &oversteps] {
+    // One plugin, both outcomes, so a single session produces a `sign` line and a `refuse` line for
+    // the feed to be read for. Its label deliberately echoes the key it was handed: what lands in
+    // the record must be the credential's name, not the credential.
+    let feeds = stage_signer(
+        root.path(),
+        "demo-feed",
+        true,
+        "    if \"a=1\" in ask[\"target\"]:\n\
+         \x20       print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": \"DEMO ok\"}, \"label\": \"signed with \" + cred[\"value\"]}), flush=True)\n\
+         \x20   else:\n\
+         \x20       print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region\"}), flush=True)",
+    );
+    for dir in [&signs, &marker, &refuses, &oversteps, &feeds] {
         let out = sbx_in(
             project.path(),
             data.path(),
@@ -1365,6 +1380,81 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
             "{signer}: the refusal must name why, and say the request was not sent: {stdout}"
         );
     }
+
+    // 4. The feed. Detached, because the ring lives in the supervisor's memory and the control
+    //    socket is the only way to it — which is also the only way a user reads one.
+    write_config("demo-feed");
+    let started = sbx()
+        .args([
+            "run",
+            "--detach",
+            "--",
+            "sh",
+            "-c",
+            "curl -s https://postman-echo.com/get?a=1; \
+             curl -s https://postman-echo.com/get?a=2; sleep 30",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("SBX_E2E_SIGNING_KEY", key)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn sbx run --detach");
+    let msg = String::from_utf8_lossy(&started.stderr).into_owned();
+    assert!(started.status.success(), "detached launch failed:\n{msg}");
+    let pid: u32 = msg
+        .split("detached session ")
+        .nth(1)
+        .and_then(|after| {
+            after
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no detached session pid in:\n{msg}"));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut feed = String::new();
+    while std::time::Instant::now() < deadline {
+        let out = sbx_in(
+            project.path(),
+            data.path(),
+            state.path(),
+            &["logs", &pid.to_string(), "--feed", "signer"],
+        );
+        feed = String::from_utf8_lossy(&out.stdout).into_owned();
+        if feed.contains("set Authorization") && feed.contains("no credentials") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    // Stopped before the assertions, so a failure never leaves a cage running.
+    let _ = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["session", "stop", &pid.to_string()],
+    );
+
+    assert!(
+        feed.contains("sign      demo-feed: GET postman-echo.com/get?a=1 set Authorization"),
+        "the feed names the signer, the request it formed a credential for, and the headers it put \
+         on it:\n{feed}"
+    );
+    assert!(
+        feed.contains("refuse    demo-feed: GET postman-echo.com/get?a=2")
+            && feed.contains("no credentials for that region"),
+        "and the request it would not sign, with the plugin's own reason:\n{feed}"
+    );
+    assert!(
+        !feed.contains(key),
+        "a plugin that echoes the key it was handed must not put it in the record:\n{feed}"
+    );
+    assert!(
+        feed.contains("signed with ${"),
+        "the key is replaced by the credential's name, in the plugin's own words:\n{feed}"
+    );
 }
 
 /// Whether a failed build log shows a *transient* upstream-download fault — a truncated tarball,

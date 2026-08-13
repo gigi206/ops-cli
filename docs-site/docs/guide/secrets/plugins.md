@@ -662,12 +662,18 @@ What the tripwires watch also changes, and deliberately: for a signed credential
 request-bound and single-use, while the key is the thing that must never leave the cage
 verbatim.
 
-Where a signer is visible: a refused request appears in
+Where a signer is visible: every request it forms a credential for, and every one it
+would not, is one line of the **`signer` feed** in [`sbx logs`](../cli/logs#the-two-plugin-feeds).
+A `sign` line names the signer, the request, and the header names it put on it; the
+values are never shown. A refusal appears there too, and again in
 [`sbx net logs`](../cli/net) with the verdict `blocked` and the reason
-`signer-refused`, and is counted under `BLOCKED` in `sbx net stats`. Unlike a broker,
-a signer has **no feed of its own** in [`sbx logs`](../cli/logs): a signed request is
-one line of the egress log like any other request, and there is nothing per-frame to
-show. A plugin's own words reach you on a refusal, where the `403` repeats them.
+`signer-refused`, counted under `BLOCKED` in `sbx net stats`.
+
+An answer may carry a `label`, the plugin's own account of what it formed (the region
+and service a signature was scoped to, the identity it signed as). It is appended after
+what sbx observed, never before, and the whole line is scrubbed of every credential the
+launch declared: a plugin that echoed the key it was handed writes `${name}` into the
+record, not the key.
 
 ## An honest residual: a networked resolver reaches the host network
 

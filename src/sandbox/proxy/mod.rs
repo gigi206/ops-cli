@@ -680,6 +680,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             target: &itarget,
             headers: &inner.headers,
         },
+        ctx.signer_log(),
     ) {
         Ok(pairs) => pairs,
         Err(refusal) => {
@@ -1910,6 +1911,7 @@ fn handle_https_forward(
             target: &path,
             headers: &head.headers,
         },
+        ctx.signer_log(),
     ) {
         Ok(pairs) => pairs,
         Err(refusal) => {

@@ -348,6 +348,7 @@ async fn relay(
             target: path,
             headers: &H2Headers(req.headers()),
         },
+        ctx.signer_log(),
     ) {
         Ok(pairs) => pairs,
         Err(_refusal) => {

@@ -46,6 +46,14 @@ const SIGN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Generous for a signature, and far under what an upstream accepts as a request head.
 const MAX_VALUE_BYTES: usize = 8 * 1024;
 
+/// The longest single line sbx reads from a plugin.
+///
+/// One answer is one line, and sbx buffers it before it can bound anything inside it — so without a
+/// ceiling a plugin that never writes a newline is a plugin that takes the host's memory. Set well
+/// above what a well-formed answer reaches: with every value already capped at [`MAX_VALUE_BYTES`],
+/// this leaves room for tens of them plus a label.
+const MAX_LINE_BYTES: u64 = 256 * 1024;
+
 /// One request put to a signer, in the terms the plugin is allowed to see.
 ///
 /// The method, the host, the port and the target are always shown: a signature over a request that
@@ -181,21 +189,26 @@ struct RawAnswer {
     seq: Option<u64>,
     headers: Option<std::collections::BTreeMap<String, String>>,
     error: Option<String>,
+    label: Option<String>,
 }
 
-/// What a plugin decided about one request: the headers to set.
+/// What a plugin decided about one request: the headers to set, and what it says it did.
 ///
-/// A broker's answer also carries a `label`, its own account of what it decided, because the broker
-/// feed records one line per frame and that is where it lands. A signer has no feed yet, so it is
-/// given no such field: a key a plugin could fill and nothing would ever read is the trap
-/// `deny_unknown_fields` exists to close, and it would be worse spelled by sbx itself. On a
-/// **refusal** the plugin's own words do travel — they are what the `403` names.
+/// The `label` is the plugin's own account — the region and service a SigV4 signature was scoped to,
+/// the identity it signed as — and it lands on the signer feed beside what sbx observed. It is
+/// optional, and a plugin that sends none simply has sbx's account stand alone. It is third-party
+/// text: [`super::signer_control::SignerRing::push`] writes it *after* sbx's own account, redacts it
+/// against the launch's credential needles, and caps it. On a **refusal** the plugin's words travel
+/// too — they are what the `403` names and what the feed's refusal line carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Signature {
     /// The headers to put on the request, in the manifest's declared order rather than the
     /// plugin's: what a request carries is sbx's to order, and a stable order keeps two identical
     /// requests identical on the wire.
     pub(crate) headers: Vec<(String, String)>,
+    /// The plugin's own account of what it formed, for the feed. Never consulted for anything the
+    /// request carries: nothing a plugin says about its answer can change the answer.
+    pub(crate) label: Option<String>,
 }
 
 /// Parse and **bound** one answer against the manifest that declared what this plugin may set.
@@ -260,7 +273,13 @@ pub(crate) fn parse_signature(
             )
         ));
     }
-    Ok(Signature { headers: out })
+    Ok(Signature {
+        headers: out,
+        // Taken as written and bounded where it is recorded, not here: what makes it safe is a
+        // property of the sink (one wire line, redacted, capped), and duplicating that check here
+        // would leave two spellings of it to drift apart.
+        label: raw.label.filter(|l| !l.is_empty()),
+    })
 }
 
 /// Whether one value may be put on a request head.
@@ -285,6 +304,31 @@ fn check_value(name: &str, value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Read one newline-terminated line, refusing one that runs past [`MAX_LINE_BYTES`].
+///
+/// Bounded rather than read to the newline: the peer is a separate process whose line sbx buffers
+/// before it can bound anything inside it, so a line that never ends is host memory a plugin can
+/// take. The bound is per *line* — a fresh `take` on each call — so a long session of ordinary
+/// answers is never cut short by what earlier ones used.
+fn read_bounded_line(reader: &mut impl io::BufRead) -> io::Result<String> {
+    use std::io::{BufRead as _, Read as _};
+    let mut line = String::new();
+    let n = (&mut *reader).take(MAX_LINE_BYTES).read_line(&mut line)?;
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the plugin closed its side",
+        ));
+    }
+    if !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the plugin wrote more than {MAX_LINE_BYTES} bytes without ending its line"),
+        ));
+    }
+    Ok(line)
 }
 
 /// What a caller needs of a signer, so the callers are testable without a sandbox and a real
@@ -405,18 +449,10 @@ impl SignerProcess {
         })
     }
 
-    /// One line from the plugin, or an error when it says nothing in time or closes.
+    /// One line from the plugin, or an error when it says nothing in time, closes, or says more than
+    /// an answer can be.
     fn read_line(&mut self) -> io::Result<String> {
-        use std::io::BufRead as _;
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the plugin closed its side",
-            ));
-        }
-        Ok(line)
+        read_bounded_line(&mut self.reader)
     }
 }
 
@@ -554,6 +590,46 @@ mod tests {
         assert!(err.contains("sets no header"), "{err}");
         let err = answer(serde_json::json!({ "seq": 7 })).expect_err("nothing at all");
         assert!(err.contains("neither `headers` nor `error`"), "{err}");
+    }
+
+    /// The plugin's own account of what it formed, which the feed prints after sbx's. Optional: an
+    /// answer without one is a complete answer.
+    #[test]
+    fn an_answer_may_carry_the_plugins_account_of_what_it_formed() {
+        let sig = answer(serde_json::json!({
+            "seq": 7,
+            "headers": { "Authorization": "AWS4-HMAC..." },
+            "label": "us-east-1 s3"
+        }))
+        .expect("valid");
+        assert_eq!(sig.label.as_deref(), Some("us-east-1 s3"));
+
+        let bare = answer(serde_json::json!({ "seq": 7, "headers": { "Authorization": "v" } }))
+            .expect("valid");
+        assert_eq!(bare.label, None);
+
+        // An empty label is no label: it would otherwise render as a trailing separator with
+        // nothing after it on the feed.
+        let empty = answer(
+            serde_json::json!({ "seq": 7, "headers": { "Authorization": "v" }, "label": "" }),
+        )
+        .expect("valid");
+        assert_eq!(empty.label, None);
+    }
+
+    /// A line sbx must buffer before it can bound what is inside it. Without a ceiling, a plugin
+    /// that never writes a newline takes host memory for as long as the session lives.
+    #[test]
+    fn a_line_that_never_ends_is_refused_rather_than_buffered() {
+        let flood = vec![b'x'; (MAX_LINE_BYTES + 1) as usize];
+        let err = read_bounded_line(&mut io::BufReader::new(flood.as_slice()))
+            .expect_err("an unterminated flood is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+
+        // The bound is per line, not per session: an ordinary answer after a long one still reads.
+        let mut reader = io::BufReader::new(b"first\nsecond\n".as_slice());
+        assert_eq!(read_bounded_line(&mut reader).expect("first"), "first\n");
+        assert_eq!(read_bounded_line(&mut reader).expect("second"), "second\n");
     }
 
     /// A key nothing reads would leave a plugin author believing they had answered something.

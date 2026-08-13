@@ -11,8 +11,8 @@
 //! `0700` data directory and is **never** bound into the cage. In Mode B the in-cage agent is the
 //! adversary, so it must not read — or amend — the record of what it asked for.
 //!
-//! One thing is different from the other three lenses, and it is why `detail` is treated with more
-//! suspicion here than anywhere else: part of it comes from **third-party plugin code**. A verdict
+//! One thing is different from the lenses that watch the cage, and it is why `detail` is treated
+//! with more suspicion here: part of it comes from **third-party plugin code**. A verdict
 //! carries a `label` the plugin writes, and it is joined to what sbx itself observed. Both halves
 //! go through the substrate's sanitiser, so neither can close the wire line and forge a second
 //! event; and what sbx observed is written first, so a label can never dress a forward up as a

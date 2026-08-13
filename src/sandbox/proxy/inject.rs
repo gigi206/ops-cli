@@ -183,11 +183,21 @@ pub(crate) struct SignRefusal {
 /// request, and **any failure refuses the request**: a request that could not be signed is never
 /// sent unsigned, since it would arrive at the destination as an anonymous one and come back an
 /// authentication error for a reason that has nothing to do with the credential.
+///
+/// `log` is the session's signer feed, where each answer and each refusal is recorded. It is passed
+/// in rather than held on the injection because a credential refresh rebuilds every signed injection
+/// from scratch (see [`super::CredentialRefresh`]): a ring carried on one would have to survive that
+/// rebuild, and the feed would go quiet after the first refresh with every unit test still green.
+/// `None` on the paths with no feed — the tests, and a task's per-invocation proxy, whose lens no
+/// reader globs for.
 pub(crate) fn pairs_for(
     creds: &CredentialSet,
     ids: &[usize],
     req: &RequestFacts<'_>,
+    log: Option<&crate::sandbox::signer_control::SignerRing>,
 ) -> Result<Vec<(String, String)>, SignRefusal> {
+    use crate::sandbox::signer_control::SignerKind;
+
     let mut out = Vec::with_capacity(ids.len());
     for &i in ids {
         match &creds.injections[i].form {
@@ -211,12 +221,27 @@ pub(crate) fn pairs_for(
                     Ok(mut process) => process.sign(&ask),
                     Err(_) => Err("the signer plugin is in an unusable state".to_string()),
                 };
+                // What sbx observed of this request, which leads every line on the feed. The values
+                // are never in it — the header *names* are what a reader needs, and they are the
+                // manifest's own.
+                let asked = format!("{} {}{}", req.method, req.host, req.target);
                 match signed_headers {
                     // The marker is substituted here and nowhere else: on the plugin's own bytes,
                     // on their way out, after they were bounded to the headers its manifest
                     // declared. A plugin that placed the marker gets the credential on the wire; it
                     // never learns what it was.
                     Ok(sig) => {
+                        if let Some(log) = log {
+                            let names: Vec<&str> =
+                                sig.headers.iter().map(|(n, _)| n.as_str()).collect();
+                            log.push(
+                                SignerKind::Sign,
+                                &signed.name,
+                                &format!("{asked} set {}", names.join(", ")),
+                                sig.label.as_deref(),
+                                &creds.needles,
+                            );
+                        }
                         out.extend(sig.headers.into_iter().map(
                             |(name, value)| match &signed.marker {
                                 Some(marker) => (name, marker.substitute_str(&value)),
@@ -225,6 +250,15 @@ pub(crate) fn pairs_for(
                         ))
                     }
                     Err(why) => {
+                        if let Some(log) = log {
+                            log.push(
+                                SignerKind::Refuse,
+                                &signed.name,
+                                &asked,
+                                Some(&why),
+                                &creds.needles,
+                            );
+                        }
                         return Err(SignRefusal {
                             signer: signed.name.clone(),
                             why,
@@ -943,6 +977,7 @@ mod tests {
                     .into_iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
+                label: Some("us-east-1 s3".to_string()),
             }),
             Err(why) => Err(why.to_string()),
         };
@@ -985,7 +1020,7 @@ mod tests {
         };
         let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         let pairs =
-            pairs_for(&creds, &[0], &facts(&headers)).unwrap_or_else(|e| panic!("{}", e.why));
+            pairs_for(&creds, &[0], &facts(&headers), None).unwrap_or_else(|e| panic!("{}", e.why));
         assert_eq!(
             pairs,
             vec![
@@ -1007,7 +1042,7 @@ mod tests {
             needles: Vec::new(),
         };
         let headers = Vec::new();
-        let refusal = match pairs_for(&creds, &[0], &facts(&headers)) {
+        let refusal = match pairs_for(&creds, &[0], &facts(&headers), None) {
             Err(refusal) => refusal,
             Ok(pairs) => panic!("a plugin that cannot sign refuses the request, got {pairs:?}"),
         };
@@ -1032,7 +1067,7 @@ mod tests {
         };
         let headers = Vec::new();
         let pairs =
-            pairs_for(&creds, &[0], &facts(&headers)).unwrap_or_else(|e| panic!("{}", e.why));
+            pairs_for(&creds, &[0], &facts(&headers), None).unwrap_or_else(|e| panic!("{}", e.why));
         assert_eq!(
             pairs,
             vec![(
@@ -1040,6 +1075,68 @@ mod tests {
                 "Custom s3cr3t-value-here".to_string()
             )],
             "the marker is replaced by the value, on the plugin's own bytes"
+        );
+    }
+
+    /// What the signer feed is for: a request's credential is formed by a plugin, and neither the
+    /// egress log nor the launch note can say which declaration formed it or what it put on. Both
+    /// outcomes are recorded — an answer and a refusal — because a feed that only showed failures
+    /// would leave "it worked" indistinguishable from "nothing ran".
+    #[test]
+    fn every_signature_and_every_refusal_reaches_the_feed() {
+        use crate::sandbox::signer_control::{SIGNER_RING_CAP, SignerKind, SignerRing};
+
+        let ring = SignerRing::new(SIGNER_RING_CAP);
+        let signs = CredentialSet {
+            injections: vec![signed_injection(
+                Ok(vec![("Authorization", "SIG abc")]),
+                None,
+            )],
+            needles: Vec::new(),
+        };
+        let headers = Vec::new();
+        pairs_for(&signs, &[0], &facts(&headers), Some(&ring))
+            .unwrap_or_else(|e| panic!("{}", e.why));
+
+        let refuses = CredentialSet {
+            injections: vec![signed_injection(
+                Err("no credentials for that region"),
+                None,
+            )],
+            needles: Vec::new(),
+        };
+        assert!(
+            pairs_for(&refuses, &[0], &facts(&headers), Some(&ring)).is_err(),
+            "the scripted refusal refuses"
+        );
+
+        let events = ring.snapshot(None).events;
+        assert_eq!(events.len(), 2, "{events:?}");
+
+        assert_eq!(events[0].kind, SignerKind::Sign);
+        assert!(
+            events[0].detail.contains("demo-signer")
+                && events[0].detail.contains("GET api.example.com/v1/thing")
+                && events[0].detail.contains("set Authorization"),
+            "who formed it, for what request, and which headers it put on: {:?}",
+            events[0]
+        );
+        assert!(
+            events[0].detail.contains("us-east-1 s3"),
+            "and the plugin's own account of it: {:?}",
+            events[0]
+        );
+        assert!(
+            !events[0].detail.contains("SIG abc"),
+            "never the value it formed: {:?}",
+            events[0]
+        );
+
+        assert_eq!(events[1].kind, SignerKind::Refuse);
+        assert!(
+            events[1].detail.contains("no credentials for that region"),
+            "a refusal carries the plugin's reason: {:?}",
+            events[1]
         );
     }
 

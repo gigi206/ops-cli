@@ -30,8 +30,9 @@ sbx ssh-agent logs 12345 -f            # what it signed
 ```
 
 Each of those shows the most of its own lens. When the question is what happened in what **order**,
-read them together instead: [`sbx logs`](../cli/logs) interleaves all four by time, plus the
-declared operations the session invoked, and names any feed that is not recording so an empty
+read them together instead: [`sbx logs`](../cli/logs) interleaves all four by time, plus the feeds
+with no verb of their own (what a broker plugin ruled on, what a signer plugin formed, and the
+declared operations the session invoked), and names any feed that is not recording so an empty
 column is never mistaken for a quiet one.
 
 ```sh

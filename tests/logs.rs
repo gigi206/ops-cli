@@ -388,7 +388,7 @@ fn each_view_refuses_a_bad_argument_in_its_own_name() {
 }
 
 /// Bind `<data>/sbx/tasks/<pid>/log.sock` — the task plane's host-only socket, which does not follow
-/// the `control-<pid>.sock` shape the four lenses share.
+/// the `control-<pid>.sock` shape the lenses share.
 fn serve_task(data: &Path, pid: u32, events: &[&str]) {
     let dir = data.join("sbx").join("tasks").join(pid.to_string());
     std::fs::create_dir_all(&dir).unwrap();
@@ -408,7 +408,7 @@ fn serve_task(data: &Path, pid: u32, events: &[&str]) {
 }
 
 /// The merged view is the only one that can be wrong about *order*, and the only one that can lie by
-/// omission. Both are checked here, over four feeds served at once and a fifth left unbound.
+/// omission. Both are checked here, over several feeds served at once and one left unbound.
 ///
 /// The stamps are chosen so that every feed contributes exactly one row and the correct order is not
 /// the order the feeds are read in — a view that concatenated its feeds, or sorted by anything but
@@ -451,6 +451,14 @@ fn the_merged_view_orders_every_feed_by_when_it_happened() {
     );
     serve_lens(
         data,
+        "signer",
+        pid,
+        &[
+            "event seq=1 at=1700000000350 kind=sign detail=demo-sigv4: PUT s3.example.com/bucket/key set Authorization",
+        ],
+    );
+    serve_lens(
+        data,
         "fs",
         pid,
         &["event seq=1 at=1700000000400 kind=write path=./retry.sh"],
@@ -462,11 +470,11 @@ fn the_merged_view_orders_every_feed_by_when_it_happened() {
     let lenses: Vec<&str> = out
         .lines()
         .filter_map(|l| l.split_whitespace().nth(1))
-        .filter(|w| ["proc", "task", "net", "fs", "ssh"].contains(w))
+        .filter(|w| ["proc", "task", "net", "fs", "ssh", "signer"].contains(w))
         .collect();
     assert_eq!(
         lenses,
-        ["proc", "task", "net", "fs"],
+        ["proc", "task", "net", "signer", "fs"],
         "every feed sorted by when its event happened, not by feed: {out}"
     );
 
@@ -480,9 +488,13 @@ fn the_merged_view_orders_every_feed_by_when_it_happened() {
     );
     assert!(out.contains("./retry.sh"), "{out}");
     assert!(out.contains("db-query"), "{out}");
+    assert!(
+        out.contains("demo-sigv4: PUT s3.example.com/bucket/key set Authorization"),
+        "a signature names its signer, its request and the headers it put on: {out}"
+    );
 
     assert!(
-        out.contains("recording: proc, net, fs, task"),
+        out.contains("recording: proc, signer, net, fs, task"),
         "the live feeds are named: {out}"
     );
     assert!(
@@ -529,7 +541,7 @@ fn the_merged_view_narrows_by_feed_and_refuses_a_name_no_feed_answers_to() {
     let err = String::from_utf8_lossy(&bad.stderr);
     assert!(err.contains("no feed named `netwrok`"), "{err}");
     assert!(
-        err.contains("proc, net, fs, ssh, broker, task"),
+        err.contains("proc, signer, net, fs, ssh, broker, task"),
         "and the error lists what there is: {err}"
     );
 }

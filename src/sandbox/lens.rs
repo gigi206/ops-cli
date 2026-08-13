@@ -1,11 +1,12 @@
 //! The substrate every observation lens stands on: a bounded, in-RAM ring of stamped events, read
 //! out-of-band over a per-session Unix socket.
 //!
-//! Three lenses are built from it — the files the cage writes ([`super::fs_control`]), the processes
-//! it execs ([`super::proc_control`]), and the decisions its ssh-agent broker made
-//! ([`super::sshagent_control`]). They stay deliberately independent of one another at runtime: each
-//! owns its own ring and its own socket, so a failure to stand one up never takes another down. What
-//! they share is *shape*, and the shape lives here.
+//! Five lenses are built from it — the files the cage writes ([`super::fs_control`]), the processes
+//! it execs ([`super::proc_control`]), the decisions its ssh-agent broker made
+//! ([`super::sshagent_control`]), what a broker plugin ruled on ([`super::broker_control`]), and what
+//! a signer plugin formed for its requests ([`super::signer_control`]). They stay deliberately
+//! independent of one another at runtime: each owns its own ring and its own socket, so a failure to
+//! stand one up never takes another down. What they share is *shape*, and the shape lives here.
 //!
 //! The two socket primitives at the bottom reach a little wider than the three rings do:
 //! [`ensure_control_dir`] and [`bind_and_serve`] are also what stand up the exec supervisor's
@@ -15,8 +16,8 @@
 //!
 //! The egress control plane ([`super::control`]) is not one of them, and folding it in here would be
 //! the wrong trade: its ring keeps a separate muted ring, a second monotonic cursor for retroactive
-//! amendments, captured traffic and secret sightings. That is a superset, and the three lenses that
-//! never need any of it would carry the weight.
+//! amendments, captured traffic and secret sightings. That is a superset, and the lenses that never
+//! need any of it would carry the weight.
 //!
 //! Security is the same for all three, and it is the reason the ring is RAM and the socket is not in
 //! the cage. The socket is bound under the `0700` data dir and is **never** bound into the cage: in
@@ -272,7 +273,7 @@ fn handle(stream: UnixStream, dispatch: &dyn Fn(&str) -> String) -> io::Result<(
 // ── The client (the `sbx … logs` process) ─────────────────────────────────────────────────────
 
 /// The per-session control socket inside a lens's own directory. One spelling of the name, because
-/// three lenses write it and the egress client reads a pid back out of it.
+/// every lens writes it and the egress client reads a pid back out of it.
 pub(crate) fn control_socket(dir: &Path, pid: u32) -> PathBuf {
     dir.join(format!("control-{pid}.sock"))
 }

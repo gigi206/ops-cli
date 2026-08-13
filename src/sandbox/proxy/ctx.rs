@@ -145,6 +145,12 @@ pub(crate) struct ProxyCtx {
     /// — when the launch opens a fresh connection per request. Shared across connection threads
     /// through the `Arc<ProxyCtx>`; see [`super::pool`] for what may enter it and why.
     pub(super) pool: Option<super::pool::UpstreamPool>,
+    /// The session's record of what its signer plugins formed, read by `sbx logs --feed signer`, or
+    /// `None` when the launch declared no signer (and in tests). Attached by
+    /// [`crate::sandbox::egress::start`] via [`Self::with_signer_log`]; every path that forms a
+    /// credential reaches it through the one [`super::inject::pairs_for`] call, so a request whose
+    /// signature was formed elsewhere does not exist.
+    pub(super) signer_log: Option<Arc<crate::sandbox::signer_control::SignerRing>>,
 }
 
 impl ProxyCtx {
@@ -208,6 +214,7 @@ impl ProxyCtx {
             notifier: None,
             capture: None,
             pool,
+            signer_log: None,
         })
     }
 
@@ -250,6 +257,23 @@ impl ProxyCtx {
     pub(crate) fn with_flows(mut self, flows: Arc<crate::sandbox::control::FlowRegistry>) -> Self {
         self.flows = Some(flows);
         self
+    }
+
+    /// Attach the session's signer feed, so every credential a plugin forms — and every request it
+    /// would not sign — is recorded for `sbx logs --feed signer`. Set by the launch
+    /// ([`crate::sandbox::egress::start`]) only when a signer is declared; left unset the forming
+    /// path is unchanged and records nothing.
+    pub(crate) fn with_signer_log(
+        mut self,
+        log: Arc<crate::sandbox::signer_control::SignerRing>,
+    ) -> Self {
+        self.signer_log = Some(log);
+        self
+    }
+
+    /// The session's signer feed, for the one call that forms credentials.
+    pub(super) fn signer_log(&self) -> Option<&crate::sandbox::signer_control::SignerRing> {
+        self.signer_log.as_deref()
     }
 
     /// Attach the session's traffic capture, so each inspected exchange files what it carried for
