@@ -540,21 +540,26 @@ async fn relay(
     let up_req = match builder.body(()) {
         Ok(r) => r,
         Err(_) => {
-            let _ = refuse(respond, StatusCode::BAD_GATEWAY, "bad-request");
+            refuse_upstream(respond, ctx, host, port, method, path, "bad-request");
             return;
         }
     };
+    // From here the upstream connection is open, so a failure is one that CLOSED — never
+    // `upstream-unreachable`, which on every plane means the connection was not made at all. Each
+    // leaves its own `error` line beside the allow already recorded, which is the shape the HTTP/1.1
+    // path leaves for the same event (an allow whose status never arrives, and an `upstream-closed`
+    // naming why).
     let mut send_req = match send_req.ready().await {
         Ok(s) => s,
         Err(_) => {
-            let _ = refuse(respond, StatusCode::BAD_GATEWAY, "upstream-unreachable");
+            refuse_upstream(respond, ctx, host, port, method, path, "upstream-closed");
             return;
         }
     };
     let (resp_fut, up_send_body) = match send_req.send_request(up_req, false) {
         Ok(x) => x,
         Err(_) => {
-            let _ = refuse(respond, StatusCode::BAD_GATEWAY, "upstream-unreachable");
+            refuse_upstream(respond, ctx, host, port, method, path, "upstream-closed");
             return;
         }
     };
@@ -579,7 +584,7 @@ async fn relay(
     let resp = match resp_fut.await {
         Ok(r) => r,
         Err(_) => {
-            let _ = refuse(respond, StatusCode::BAD_GATEWAY, "upstream-unreachable");
+            refuse_upstream(respond, ctx, host, port, method, path, "upstream-closed");
             return;
         }
     };
@@ -838,14 +843,19 @@ fn redact_header_map(headers: &mut http::HeaderMap, needles: &[SecretNeedle]) {
     }
 }
 
-/// Refuse a stream whose validated upstream could not be opened: the client gets the `502` and its
-/// reason, and the exchange leaves an `error` line behind.
+/// Refuse a stream over its upstream: the client gets the `502` and its reason, and the exchange
+/// leaves an `error` line behind.
 ///
 /// The line is the point. Its HTTP/1.1 twin ([`refuse_upstream`](super::refuse_upstream)) writes one
 /// at the same place in its own sequence, and without it a stream that policy allowed but that never
 /// reached its host was reported nowhere at all — neither counted (the allow is recorded only once
-/// the upstream is up) nor logged. Every caller here refuses *before* that allow, so the stream
-/// surfaces exactly once, as the failure it was.
+/// the upstream is up) nor logged.
+///
+/// What a reader ends up with therefore depends on where the failure fell, and both shapes match the
+/// HTTP/1.1 path. Before the allow: one `error` line and nothing else, the stream never having been
+/// an allow. After it: the allow stands, its status never arrives, and the `error` beside it says
+/// why — an upstream that was reached and then closed is a different event from one that was never
+/// reached, and the reasons keep them apart.
 fn refuse_upstream(
     respond: h2::server::SendResponse<Bytes>,
     ctx: &ProxyCtx,
@@ -1387,6 +1397,9 @@ mod tests {
     /// What the test upstream answers on every stream it accepts.
     #[derive(Clone)]
     struct UpstreamReply {
+        /// Whether to answer at all: `false` takes the request and then drops the stream, which is
+        /// how a server that dies mid-call looks from here.
+        answers: bool,
         status: StatusCode,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
@@ -1398,10 +1411,19 @@ mod tests {
         /// call's real outcome — the response half this plane exists to relay intact.
         fn grpc(body: &str) -> Self {
             UpstreamReply {
+                answers: true,
                 status: StatusCode::OK,
                 headers: vec![("content-type".into(), "application/grpc".into())],
                 body: body.as_bytes().to_vec(),
                 trailers: vec![("grpc-status".into(), "0".into())],
+            }
+        }
+
+        /// A server that takes the request and then goes away without answering.
+        fn silence() -> Self {
+            UpstreamReply {
+                answers: false,
+                ..UpstreamReply::grpc("")
             }
         }
     }
@@ -1557,6 +1579,11 @@ mod tests {
         }
         trace.seen.lock().unwrap().push(seen);
 
+        if !reply.answers {
+            // Dropping the responder resets the stream, which is what the proxy sees when a server
+            // takes a call and then dies.
+            return;
+        }
         let mut head = Response::builder().status(reply.status);
         for (n, v) in &reply.headers {
             head = head.header(n.as_str(), v.as_str());
@@ -1915,6 +1942,7 @@ mod tests {
             1,
             vec![b"h2".to_vec()],
             UpstreamReply {
+                answers: true,
                 status: StatusCode::OK,
                 headers: vec![
                     ("content-type".into(), "application/grpc".into()),
@@ -1979,6 +2007,7 @@ mod tests {
         String,
         Vec<(crate::sandbox::control::LogVerdict, String)>,
         u64,
+        Arc<H2Trace>,
     ) {
         let trace = Arc::new(H2Trace::default());
         let (port, upstream_ca) = match listening {
@@ -2023,6 +2052,7 @@ mod tests {
                 .to_string(),
             events,
             allow,
+            trace,
         )
     }
 
@@ -2040,14 +2070,16 @@ mod tests {
     #[test]
     fn each_way_an_h2_upstream_can_fail_to_open_is_answered_and_recorded_as_itself() {
         use crate::sandbox::control::LogVerdict;
+        use std::sync::atomic::Ordering;
 
-        for (case, alpn, trusted, listening, expected) in [
+        for (case, alpn, trusted, listening, expected, reached_tcp) in [
             (
                 "nothing is listening",
                 vec![b"h2".to_vec()],
                 true,
                 false,
                 "upstream-unreachable",
+                0,
             ),
             (
                 "the certificate is not one this proxy trusts",
@@ -2055,6 +2087,7 @@ mod tests {
                 false,
                 true,
                 "upstream-cert-rejected",
+                1,
             ),
             (
                 "the upstream refuses the ALPN offer",
@@ -2062,6 +2095,7 @@ mod tests {
                 true,
                 true,
                 "upstream-http2-unsupported",
+                1,
             ),
             (
                 "the upstream ignores ALPN and negotiates nothing",
@@ -2069,9 +2103,10 @@ mod tests {
                 true,
                 true,
                 "upstream-http2-unsupported",
+                1,
             ),
         ] {
-            let (status, reason, events, allow) = refused_upstream(alpn, trusted, listening);
+            let (status, reason, events, allow, trace) = refused_upstream(alpn, trusted, listening);
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{case}");
             assert_eq!(reason, expected, "what the client is told when {case}");
             assert_eq!(
@@ -2083,6 +2118,74 @@ mod tests {
                 allow, 0,
                 "a stream that never reached its host is not an allow ({case})"
             );
+            // The reason token alone would still read right if the failure happened somewhere else
+            // entirely, so pin where each case actually got to.
+            assert_eq!(
+                (
+                    trace.upstream_tcp.load(Ordering::Relaxed),
+                    trace.entered.load(Ordering::Relaxed),
+                    trace.returned.load(Ordering::Relaxed),
+                ),
+                (reached_tcp, 1, 1),
+                "where the exchange reached when {case} — {}",
+                trace.render()
+            );
         }
+    }
+
+    /// The other side of the same coin: an upstream that is reached, takes the call, and then goes
+    /// away without answering. The allow is already recorded by then, so this stream reads as an
+    /// allow whose status never arrived with an `upstream-closed` beside it — the shape the HTTP/1.1
+    /// path leaves for the same event, and the reason that keeps "reached and then lost" apart from
+    /// "never reached". It answered `upstream-unreachable` until now, which said the connection was
+    /// never made when it plainly had been.
+    #[test]
+    fn an_upstream_that_takes_the_call_and_goes_away_is_reported_as_closed_not_unreachable() {
+        use crate::sandbox::control::LogVerdict;
+
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::silence(),
+            Arc::clone(&trace),
+        );
+        let (ctx, stats, log, _dir) = relaying_ctx(upstream_ca);
+
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[]),
+            None,
+            &trace,
+        );
+        assert_eq!(answer.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            answer.header("x-sbx-egress-reason"),
+            Some("upstream-closed")
+        );
+        assert_eq!(
+            trace.seen.lock().unwrap().len(),
+            1,
+            "the request did reach the upstream: {}",
+            trace.render()
+        );
+
+        // The allow stands, because the request was forwarded; what never came is its status.
+        assert_eq!(stats.snapshot()["grpc.test"].allow, 1);
+        let events: Vec<(LogVerdict, String, Option<u16>)> = log
+            .snapshot(None, None, false)
+            .events
+            .into_iter()
+            .map(|e| (e.verdict, e.reason, e.status))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                (LogVerdict::Allow, "allowed".to_string(), None),
+                (LogVerdict::Error, "upstream-closed".to_string(), None),
+            ]
+        );
     }
 }

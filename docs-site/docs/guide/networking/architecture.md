@@ -359,10 +359,12 @@ offer during the handshake or by ignoring it and negotiating nothing, and both a
 under this reason. Neither is a certificate problem, and reading one as
 `upstream-cert-rejected` would send you after the one thing that is not wrong.
 
-A refusal on this path is also *recorded*, not only answered: a stream that the policy
-allowed but that never reached its host appears in
-[`sbx net logs`](observability#sbx-net-logs) as an `error` carrying the same reason, and
-is not counted as an allow, since nothing was allowed to leave.
+A transport failure is also *recorded*, not only answered, and where it fell is what a
+reader sees. A host that was never reached leaves one `error` line carrying the reason
+and no allow at all, since nothing was allowed to leave. A host that was reached and
+then closed before answering leaves the allow standing, its status blank, with an
+`upstream-closed` beside it. The two reasons are the difference between a host that is
+down and a call that was lost mid-flight, so they are never used for each other.
 
 `signer-refused` is the one that is not a policy verdict: the policy allowed the host,
 and the request was refused because its credential could not be formed. See
