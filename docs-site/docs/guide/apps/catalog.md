@@ -52,7 +52,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `muse` | bootstrap installer (`cmd` wrapper) + `nix:tzdata` (zone database, no toolchain package) | `api.meta.ai` (Meta Model API / Muse Spark BYOK) or a Meta account (device login) |
 | `nanobot` | `mise:pipx:nanobot-ai` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenRouter / OpenAI / Anthropic / Gemini / DeepSeek / any OpenAI-compatible / local) |
 | `nova` | `nix:nodejs` (+ `mise:npm:@compass-ai/nova`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
-| `omp` | `mise:github:can1357/oh-my-pi` (a high-capability fork of Pi — this repo's `pi`) | provider-dependent (BYOK) |
+| `omp` | `mise:github:can1357/oh-my-pi` (a high-capability fork of Pi, this repo's `pi`) | provider-dependent (BYOK) |
 | `openclaude` | `nix:nodejs` (+ `mise:npm:@gitlawb/openclaude`) | provider-dependent (BYOK: OpenAI-compatible / Anthropic / Gemini) |
 | `openclaw` | `nix:nodejs` (+ `mise:npm:openclaw`) | `api.openai.com` (BYOK) |
 | `opencode` | `mise:opencode` | provider-dependent (BYOK) |
@@ -116,7 +116,7 @@ default (`home_scope = "global"`).
 
 Beyond the app profiles, `examples/bundle/`
 ships **39 reusable tool bundles**: a named set of packages and egress rules that
-profiles pull in with `use = [...]` instead of restating it — the namesake profile
+profiles pull in with `use = [...]` instead of restating it: the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as
 `[net.groups]` fragments under

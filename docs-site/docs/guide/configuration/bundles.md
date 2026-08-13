@@ -127,7 +127,7 @@ dropped silently. Nothing was lost.
 
 The repository ships one bundle per agent CLI under
 `examples/bundle/`, each the single source of truth for what that agent needs: the namesake profile in
-`examples/app/` names it with `use` and no longer restates the requirements — a test pins the two
+`examples/app/` names it with `use` and no longer restates the requirements; a test pins the two
 together, so they cannot drift apart:
 
 ```sh
@@ -143,56 +143,56 @@ The 39 shipped bundles, and what each carries:
 
 | Bundle | Packages | Also carries | Requires groups |
 |---|---|---|---|
-| `agy` | 1 (`mise:`) | 9 egress entries | — |
+| `agy` | 1 (`mise:`) | 9 egress entries | none |
 | `aider` | 3 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
-| `ante` | 1 (`mise:`) | 4 egress entries | — |
+| `ante` | 1 (`mise:`) | 4 egress entries | none |
 | `auggie` | 2 (`mise:`, `nix:`) | 6 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `autohand` | 2 (`mise:`, `nix:`) | 4 egress entries | `github-install`, `npm-registry` |
-| `claude-code` | 1 (`mise:`) | 6 egress entries, 3 env vars | — |
+| `claude-code` | 1 (`mise:`) | 6 egress entries, 3 env vars | none |
 | `cline` | 3 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-audit`, `npm-registry` |
 | `codebuddy` | 2 (`mise:`, `nix:`) | 4 egress entries, 2 env vars | `npm-audit`, `npm-registry` |
-| `codex` | 1 (`mise:`) | 6 egress entries | — |
+| `codex` | 1 (`mise:`) | 6 egress entries | none |
 | `command-code` | 2 (`mise:`, `nix:`) | 12 egress entries | `github-install`, `npm-registry` |
-| `copilot` | 1 (`mise:`) | 6 egress entries | — |
+| `copilot` | 1 (`mise:`) | 6 egress entries | none |
 | `crush` | 1 (`mise:`) | 4 egress entries, 2 env vars | `github-install` |
 | `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `dirac` | 3 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-registry` |
 | `freebuff` | 2 (`mise:`, `nix:`) | 8 egress entries | `npm-audit`, `npm-registry` |
-| `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | — |
-| `grok` | 1 (`mise:`) | 3 egress entries, 1 env var | — |
+| `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
+| `grok` | 1 (`mise:`) | 3 egress entries, 1 env var | none |
 | `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-registry` |
-| `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | — |
+| `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
 | `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
 | `kimi` | 2 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-registry` |
 | `mimo` | 2 (`mise:`, `nix:`) | 6 egress entries | `models-catalog`, `npm-registry` |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `nova` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
-| `omp` | 1 (`mise:`) | 1 egress entry | — |
+| `omp` | 1 (`mise:`) | 1 egress entry | none |
 | `openclaude` | 2 (`mise:`, `nix:`) | 1 egress entry | `npm-registry` |
 | `openclaw` | 2 (`mise:`, `nix:`) | 3 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `opencode` | 1 (`mise:`) | 3 egress entries | `models-catalog`, `npm-registry` |
-| `openfox` | 2 (`mise:`, `nix:`) | none | — |
-| `pi` | 1 (`mise:`) | 1 egress entry | — |
+| `openfox` | 2 (`mise:`, `nix:`) | none | none |
+| `pi` | 1 (`mise:`) | 1 egress entry | none |
 | `qoder` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-registry` |
 | `qwen-code` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-registry` |
 | `reasonix` | 2 (`mise:`, `nix:`) | 4 egress entries | `npm-audit`, `npm-registry` |
 | `sigit` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `snow` | 2 (`mise:`, `nix:`) | 2 egress entries | `npm-audit`, `npm-registry` |
-| `stakpak` | 1 (`mise:`) | 4 egress entries | — |
-| `vtcode` | 3 (`mise:`, `nix:`) | none | — |
-| `warp` | 3 (`nix:`) | 6 egress entries | — |
+| `stakpak` | 1 (`mise:`) | 4 egress entries | none |
+| `vtcode` | 3 (`mise:`, `nix:`) | none | none |
+| `warp` | 3 (`nix:`) | 6 egress entries | none |
 
 None of them carries a `cmd` or a posture (`network` mode, `gui`, `gpu`, …): a bundle states
 what a tool *needs*, and the consuming app keeps its own command and its own posture. See
 [What a bundle may carry](#what-a-bundle-may-carry-and-what-it-may-not).
 
 Most shipped profiles name a bundle with `use` instead of restating their agent's
-requirements — 43 of the 65, including the three orchestrators (`aionui`, `t3code`,
+requirements: 43 of the 65, including the three orchestrators (`aionui`, `t3code`,
 `open-design`). They are therefore **not** one-step imports: importing the profile
 alone leaves the bundle (and any group it REQUIRES) undeclared and the launch warns.
-The 22 profiles without a bundle — desktop/web builds, and agents whose tool has no
-bundle — stay one-step imports.
+The 22 profiles without a bundle (desktop/web builds, and agents whose tool has no
+bundle) stay one-step imports.
 
 ## Managing bundles
 

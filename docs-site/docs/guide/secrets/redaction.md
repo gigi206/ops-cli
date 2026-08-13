@@ -133,7 +133,7 @@ verbatim needle, so the encoding residual below still applies there.
 A capture covers a WebSocket's messages too, and they are masked at the same door as
 everything else. Be precise about what that does and does not mean: the **relay** does not
 mask frames. Once a tunnel is open the framed bytes are relayed verbatim, so a secret a peer
-reflects inside a frame **reaches the cage as it was sent** — inbound masking, above, covers
+reflects inside a frame **reaches the cage as it was sent**: inbound masking, above, covers
 HTTP responses, not frames. What is masked is the copy `sbx net logs` shows you. Masking the
 wire would mean rewriting the relayed stream (decode, mask, re-frame, re-mask) on the one
 path that has to stay a byte-exact pipe.
@@ -157,7 +157,7 @@ worded to prevent.
 - Both directions: `cage → upstream` (the agent sent it out) and `upstream → cage` (the far
   side sent it back).
 - The credential's **name**, never its value.
-- **Once per credential per direction** — a repeat carries no new information.
+- **Once per credential per direction**: a repeat carries no new information.
 - It runs **whether or not the launch captures**: an enforcement path must not depend on a
   debugging setting. It sees the payloads decoded, so a masked frame and a
   `permessage-deflate` message are scanned as the text they carry.

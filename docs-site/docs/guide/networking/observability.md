@@ -382,8 +382,8 @@ configured secret seen crossing an exchange's WebSocket tunnel:
 ```
 
 Read the second half of that line literally. Unlike the two HTTP tripwires in
-[Redaction](../secrets/redaction) — which refuse an outbound request with a `403` and mask a
-reflected value out of a response — **nothing was stopped here**. An open tunnel is a
+[Redaction](../secrets/redaction), which refuse an outbound request with a `403` and mask a
+reflected value out of a response, **nothing was stopped here**. An open tunnel is a
 byte-exact pipe between two peers that agreed their own framing, masking and compression, so
 the frame reached its destination exactly as it was sent. What sbx does is tell you that it
 did, while the tunnel is still open.

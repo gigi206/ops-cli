@@ -42,7 +42,7 @@ function the filtering proxy and `sbx test net` decide through, so the three can
 apart. A broker pointed at an endpoint the allowlist does not carry is not started, and the
 message names the rule to add.
 
-Without that rule there would be two different answers to *where may this cage go* — and the
+Without that rule there would be two different answers to *where may this cage go*, and the
 one a reader checks would not be the one that decides.
 
 The cage still reaches nothing itself: it connects to a socket `sbx` serves, and `sbx` opens
@@ -121,7 +121,7 @@ Four rules make that true, and each closes a specific hole:
 
 Both surfaces say so. `sbx config show` lists the credential's **locator** under the broker
 that places it (the variable name or file path, never the value), and the session's
-[`broker` feed](../cli/logs) marks the frames that carried it — a frame bearing a
+[`broker` feed](../cli/logs) marks the frames that carried it: a frame bearing a
 credential is not the same event as one merely rewritten, and an audit should not have to
 guess which was which.
 
@@ -140,7 +140,7 @@ transmitted and everything is computed.
 For PostgreSQL specifically, that line falls where `pg_hba.conf` does. The documentation is
 explicit that a password stored as a SCRAM verifier can still be used by the `password`
 method (`"but password transmission will be in plain text in the latter case"`), so this
-works wherever the server is configured for `password` — and not where it requires
+works wherever the server is configured for `password`, and not where it requires
 `scram-sha-256`, which is the recommended setting.
 
 ## Protocols that answer in several messages
@@ -161,12 +161,12 @@ consequences a manifest has to live with:
 
 Two other shapes a protocol may have, each declared by the plugin rather than guessed:
 
-- **A message the host never answers** — PostgreSQL's `Terminate`, the close of many
+- **A message the host never answers**: PostgreSQL's `Terminate`, the close of many
   protocols. The plugin says so on the verdict, and `sbx` sends it without waiting.
   Waiting would end the connection on a read that can only fail, and the session record
   would call a normal goodbye a refusal.
 - **A framing whose length counts itself**, and whose first message has no type byte:
-  that is `pgwire`. A plugin is handed the type byte and the body, never the byte count —
+  that is `pgwire`. A plugin is handed the type byte and the body, never the byte count,
   because a plugin that rewrites a body must not have to fix a count, so `sbx` recomputes
   it.
 
@@ -181,15 +181,15 @@ the greeting reaches the cage, so the broker has to be able to rule on it.
 The plugin's manifest names the variables that must point at the broker, and `sbx` sets
 each of them. Two forms, because clients differ:
 
-- `cage_env` — the variable takes the **socket file** (`SSH_AUTH_SOCK`, `GPG_AGENT_SOCK`);
-- `cage_env_dir` — it takes the **directory holding it**, for a client that derives the
+- `cage_env`: the variable takes the **socket file** (`SSH_AUTH_SOCK`, `GPG_AGENT_SOCK`);
+- `cage_env_dir`: it takes the **directory holding it**, for a client that derives the
   file name itself. libpq reads `PGHOST` as a directory and looks for `.s.PGSQL.<port>`
   inside, so a broker for PostgreSQL uses this form and names the file with `socket_name`.
 
 `socket_name` is a **file name, never a path**: the directory stays `sbx`'s to choose, which
 is what keeps a manifest from placing a socket over something the cage needs and keeps two
 brokers from colliding. Without these two, a client with its own naming convention could
-only be served by linking the socket into place by hand — the difference between a
+only be served by linking the socket into place by hand, the difference between a
 mechanism that works and one that works for whoever knows the trick.
 
 A manifest also cannot name a variable that loads code (`LD_*`, `PATH`, and the rest of the
@@ -205,7 +205,7 @@ Some protocols never read a variable. A GnuPG client derives
 variable is pointing at nothing.
 
 A manifest says so with `at_host_path = true`, and the fenced socket is then bound **at the
-address of the resource it stands in front of** — the path `[broker.<name>] socket` names.
+address of the resource it stands in front of**: the path `[broker.<name>] socket` names.
 A client that would have found the raw socket finds the fence, and needs no telling:
 
 ```toml
@@ -221,7 +221,7 @@ inspect_replies = true
 `host_deadline` is the other thing that manifest is saying, and it belongs to the same protocol
 rather than to any machine: a key with a passphrase makes the agent stop mid-exchange and open a
 pinentry, and it answers when the person does. The default `sbx` waits on a host resource is thirty
-seconds — a typing speed, not a fault — so a protocol that asks a person raises it, up to ten
+seconds (a typing speed, not a fault), so a protocol that asks a person raises it, up to ten
 minutes. Past that, whatever is on the other side is wedged rather than thinking, and letting go is
 what keeps a thread, a plugin process and two connections from being held indefinitely.
 
@@ -242,14 +242,14 @@ brokers = ["gpg-agent"]
 ```
 
 The published `pass` resolver is the worked example. Reading a password store means asking
-the GnuPG agent to decrypt — and the only way to ask used to be `allow_paths` on the agent's
+the GnuPG agent to decrypt, and the only way to ask used to be `allow_paths` on the agent's
 socket, which carries every operation the agent can perform, signing included. Naming the
 broker binds the filtered socket at that same address instead, so `pass(1)` finds what it
 always looked for and the connection carries only what `[broker.gpg-agent] allow` admits.
 
 Both sides consent. The manifest asks by name; the grant is answered only where a **global**
 `[broker.<name>]` binds that name and the broker actually comes up. A name nothing binds is
-a warning and no socket — never a fall back to the raw resource:
+a warning and no socket, never a fall back to the raw resource:
 
 ```
 sbx: warning: the `pass` plugin needs the `gpg-agent` broker, which this launch has not
@@ -264,7 +264,7 @@ Two limits are worth stating plainly. A **broker** plugin may not declare `broke
 behind a fence is a chain nothing bounds, and what the outer one admits would come to depend
 on a plugin rather than on the config that bound it. And a broker's **own** `secret` is
 resolved before any broker is standing, so a credential for a broker cannot itself be read
-through one — the launch says which declaration made it impossible rather than leaving the
+through one: the launch says which declaration made it impossible rather than leaving the
 tool's own error to stand for it.
 
 ## Seeing what is bound
@@ -282,8 +282,8 @@ the **policy's** layer, since the socket is always the global config's.
 - **The bound is the hole it replaces**, not perfection. A plugin that decides badly can
   allow whatever the host resource would have allowed. It can never allow more.
 - **A [task](task)'s own cage does not get the socket.** A task cage keeps a named set of
-  destinations and drops every channel — the ssh-agent socket and the display go the same
-  way — so a task's *command* cannot speak to a brokered resource. What a task does get is
+  destinations and drops every channel (the ssh-agent socket and the display go the same
+  way), so a task's *command* cannot speak to a brokered resource. What a task does get is
   a credential resolved through one: `[task.<name>.secret]` runs the same resolver layer a
   wire injection does, host-side, so a `pass://` credential means the same thing in both.
 - **The record says what `sbx` observed, not what the plugin claims.** Every decision goes

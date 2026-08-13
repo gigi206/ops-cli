@@ -22,13 +22,13 @@ tagged by the layer it came from.
 ## Global defaults: what applies everywhere
 
 The **global** config (`~/.config/sbx/sbx.toml`) is the one place to declare
-something **once** and have it apply to every launch — every project, and every
+something **once** and have it apply to every launch: every project, and every
 app (an app resolves `global → project → app`, inheriting the layers below it).
 So "make tool X available everywhere" is a [`[packages]`](packages) declaration
 in the global config:
 
 ```toml
-# ~/.config/sbx/sbx.toml — applies to every project and every app
+# ~/.config/sbx/sbx.toml: applies to every project and every app
 [packages]
 ast-grep = "nix:ast-grep"
 ```

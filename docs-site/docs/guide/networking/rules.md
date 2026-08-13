@@ -443,7 +443,7 @@ wide](modes#opening-the-network-wide) for what each spelling really buys.
 | rule | reach | why |
 |---|---|---|
 | `re:.*` | every host | the explicit catch-all |
-| `re:` | every host | **an empty pattern matches every string** — a bare `re:` *is* `re:.*` |
+| `re:` | every host | **an empty pattern matches every string**: a bare `re:` *is* `re:.*` |
 | `re:.` | every host | one arbitrary character, which every URL has |
 | `re:^https://` | every host | every URL the matcher sees starts with it |
 | `{GET} re:.*` | every host, for GET | the method prefix narrows the verb, never the host |
@@ -463,7 +463,7 @@ ALLOWED  https://anything.example.test
 
 The label is decided by asking the pattern itself, not by recognising `.*`: a rule is
 tested against sentinel URLs sharing no host, port, or path, and one that admits them
-all admits anything. It never changes a verdict — a catch-all rule is legitimate, it
+all admits anything. It never changes a verdict: a catch-all rule is legitimate, it
 is just the one rule whose text does not show what it does.
 
 ---

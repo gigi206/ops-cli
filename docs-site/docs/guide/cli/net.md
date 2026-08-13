@@ -37,7 +37,7 @@ session` queries live `ask`-session rules remembered from `--session` answers (`
 is accepted as an alias). Under
 `shared`/`none` there are no rules. See [Observability](../networking/observability).
 
-A rule that matches **every** host is tagged as such — `allow re:.* (config, matches
+A rule that matches **every** host is tagged as such: `allow re:.* (config, matches
 every host)`, and `"catch_all": true` under `--json`. The reach of a `re:` rule lives in
 its pattern, not in the text you read, and a bare `re:` or `re:.` is the same
 catch-all as `re:.*`; the tag makes it visible without changing any verdict. See [the

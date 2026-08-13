@@ -1,7 +1,7 @@
 # Recommended tools for an agent cage
 
-The base userland already carries a small, everyday toolset — `curl`, `git`,
-`less`, `grep`, `rg`, `sed`, `awk`, `find`, `fd`, `jq`, `yq`, `which` —
+The base userland already carries a small, everyday toolset (`curl`, `git`,
+`less`, `grep`, `rg`, `sed`, `awk`, `find`, `fd`, `jq`, `yq`, `which`),
 provisioned into every cage, so the never-worth-declaring tools are already there,
 search and structured-data querying included (see
 [Provisioning](../concepts/provisioning#a-curated-base-toolset)). What remains
@@ -31,7 +31,7 @@ self-documentation, but it adds nothing to `PATH`.
 A copy-paste `[packages]` block:
 
 ```toml
-# ~/.config/sbx/sbx.toml — every project and every agent launch
+# ~/.config/sbx/sbx.toml: every project and every agent launch
 [packages]
 python    = "nix:python312"
 ast-grep  = "nix:ast-grep"
@@ -43,7 +43,7 @@ An LSP server (`rust-analyzer`, `pyright`, `gopls`,
 `typescript-language-server`, …) is an ordinary process to `sbx`: it is
 provisioned like any other `nix:` package, and the cage needs no special
 handling for it. Whether installing one is worth it is a property of the agent
-harness, not of the sandbox — the only question is whether the harness actually
+harness, not of the sandbox: the only question is whether the harness actually
 invokes the server (an LSP client of its own, a tool that shells out to the
 binary, a language-analysis plugin) or leaves it untouched. Equip one when your
 harness documents support for it, not speculatively: a server nothing invokes is
@@ -62,18 +62,18 @@ ts-ls         = "nix:typescript-language-server"  # TypeScript / JavaScript
 The same tools are declared in three different places depending on scope,
 and the tiers compose (global → project → app, the app winning):
 
-- **Global** (`~/.config/sbx/sbx.toml`) — applies to every project and every
+- **Global** (`~/.config/sbx/sbx.toml`): applies to every project and every
   agent launch, trusted by location. This is where the recommended set belongs:
   it is the "always available" answer.
-- **An app profile** (`[packages]` in an imported profile) — a per-agent
+- **An app profile** (`[packages]` in an imported profile): a per-agent
   toolset, for the harness that needs it.
-- **A project's mise files** (`[tools]` in `.mise.toml`) — project-local
+- **A project's mise files** (`[tools]` in `.mise.toml`): project-local
   toolchain, the open self-equip path, auto-installed at launch. There is no
   trust gate on declaring it: the `nix:` prefix keeps it trusted-only, the
   non-`nix:` backends are open.
 
 ```toml
-# .mise.toml — this project only, auto-equipped at launch
+# .mise.toml: this project only, auto-equipped at launch
 [tools]
 "nix:python"   = "3.12"
 "nix:ast-grep" = "latest"
@@ -110,7 +110,7 @@ trade-off.
 The base toolset is deliberately small and transverse (see
 [Provisioning](../concepts/provisioning#a-curated-base-toolset)): re-declaring a
 base tool (`git = "nix:git"`) is harmless and occasionally done in profiles for
-self-documentation, but it buys nothing on `PATH` — the base `git` is already
+self-documentation, but it buys nothing on `PATH`: the base `git` is already
 there. Everything else is either language-specific or harness-dependent, and
 belongs in the tiers above rather than the base: runtimes such as `nodejs` and
 `uv` when your harness needs them, and LSP servers when it drives them. The two

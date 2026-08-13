@@ -106,7 +106,7 @@ not.
 Upgrading is its own verb:
 
 ```
-sbx plugins store update mine     # refresh the catalogue first — comparisons read the cache
+sbx plugins store update mine     # refresh the catalogue first: comparisons read the cache
 sbx plugins upgrade --dry-run     # what would change
 sbx plugins upgrade [name]        # every store-installed plugin, or one
 ```

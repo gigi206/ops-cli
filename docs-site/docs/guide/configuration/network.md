@@ -90,7 +90,7 @@ sbx run --config '[network] capture = "bodies"'
 ```
 
 Every inspected path is captured: HTTPS, inspected cleartext,
-[HTTP/2 and gRPC](#http2-and-grpc) per stream, and a WebSocket — its handshake, then
+[HTTP/2 and gRPC](#http2-and-grpc) per stream, and a WebSocket (its handshake, then
 the messages each direction carried, unmasked. A raw [`tcp://`](../networking/rules)
 splice has no head to read and is the one exception.
 
@@ -342,8 +342,8 @@ sbx run --net allow=api.github.com -- ./ci.sh   # a one-shot allowlist
 SBX_NET=shared sbx run
 ```
 
-`--net` takes the five bare postures the `network` string takes — `none | shared | ask
-| allow | deny` — plus the `allow=host1,host2 | deny=host1,host2` list shorthands. The command line
+`--net` takes the five bare postures the `network` string takes (`none | shared | ask
+| allow | deny`) plus the `allow=host1,host2 | deny=host1,host2` list shorthands. The command line
 beats the environment, and both beat the config file. For the full grammar, the two
 meanings of `allow`, and the four-tier precedence, see
 [One-shot overrides](overrides).

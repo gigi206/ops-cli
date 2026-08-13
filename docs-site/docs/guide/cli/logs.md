@@ -44,7 +44,7 @@ The tokens are each feed's own, not a vocabulary invented here:
 | `net` | `allow`, `deny`, `blocked`, `error` |
 | `fs` | `write`, `create`, `remove`, `rename` |
 | `ssh` | `list`, `sign`, `refuse` |
-| `broker` | `forward`, `answer`, `refuse` — what `sbx` observed, with the plugin's own reason appended |
+| `broker` | `forward`, `answer`, `refuse`: what `sbx` observed, with the plugin's own reason appended |
 | `task` | `exit=<n>`, or `refused` |
 
 ## A feed that is not recording says so
