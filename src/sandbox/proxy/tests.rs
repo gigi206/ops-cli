@@ -3296,36 +3296,133 @@ fn a_held_body_is_the_same_bytes_however_the_client_framed_it() {
     let mut chunked = std::io::BufReader::new(std::io::Cursor::new(
         b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
     ));
-    let held = match hold_request_body(&mut chunked, true, 0).unwrap() {
-        HeldBody::Held(body) => body,
-        HeldBody::TooLarge => panic!("well under the ceiling"),
-    };
-    assert_eq!(held, b"hello world");
+    assert_eq!(
+        hold_request_body(&mut chunked, true, 0).unwrap(),
+        b"hello world"
+    );
 
     let mut framed = std::io::BufReader::new(std::io::Cursor::new(
         b"hello world and a pipelined leftover".to_vec(),
     ));
-    let held = match hold_request_body(&mut framed, false, 11).unwrap() {
-        HeldBody::Held(body) => body,
-        HeldBody::TooLarge => panic!("well under the ceiling"),
-    };
     assert_eq!(
-        held, b"hello world",
+        hold_request_body(&mut framed, false, 11).unwrap(),
+        b"hello world",
         "exactly the Content-Length, never a byte of what follows it"
     );
 }
 
-/// A `Content-Length` above the ceiling is answered without being received: the length is known
-/// from the head, so an oversized upload never crosses the loopback at all.
+/// A signer that reports the digest it was told, in a header its manifest declares, so a test can
+/// read off the forwarded request what the plugin was shown.
+struct DigestEcho;
+
+impl crate::sandbox::signer::Signing for DigestEcho {
+    fn sign(
+        &mut self,
+        req: &crate::sandbox::signer::SignRequest<'_>,
+    ) -> Result<crate::sandbox::signer::Signature, String> {
+        use crate::sandbox::signer::BodyFacts;
+        let told = match req.body {
+            None => "none".to_string(),
+            Some(BodyFacts::Held { bytes, digest, .. }) => format!("{bytes}/{digest}"),
+            Some(BodyFacts::Unheld { .. }) => "unheld".to_string(),
+        };
+        Ok(crate::sandbox::signer::Signature {
+            headers: vec![("X-Body".to_string(), told)],
+            label: None,
+        })
+    }
+}
+
+fn digesting_injection() -> HeaderInjection {
+    HeaderInjection {
+        rule: classify("host.test:*").unwrap(),
+        form: super::Form::Signed(super::Signed {
+            name: "digest-echo".to_string(),
+            sets: vec!["X-Body".to_string()],
+            sees: Vec::new(),
+            key: "the-key".to_string(),
+            marker: None,
+            process: Arc::new(std::sync::Mutex::new(DigestEcho)),
+            body_digest: Some(crate::plugins::signer::BodyDigest::Sha256),
+        }),
+    }
+}
+
+/// Holding a body to digest it changes how sbx **forwards** a request, so what the upstream
+/// receives is asserted rather than inferred from the digest alone.
+///
+/// The second half is the one that has no other witness: a request with no body must reach the
+/// upstream framed exactly as it would have been had no signer asked, because forcing a length is
+/// how a *re-framed* body is made unambiguous and a bodyless request has nothing to re-frame.
+/// Forcing it there put a `Content-Length: 0` on every `GET` to a signed destination.
 #[test]
-fn a_body_above_the_ceiling_is_refused_before_a_byte_of_it_is_read() {
-    let mut reader = std::io::BufReader::new(std::io::Cursor::new(b"only a few bytes".to_vec()));
+fn holding_a_body_to_digest_it_reframes_only_a_request_that_has_one() {
+    let framed = |request: &[u8]| {
+        run_with_injections_and_redactions(vec![digesting_injection()], &[], request)
+    };
+    let lengths = |head: &str| {
+        head.lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .count()
+    };
+
+    // A `Content-Length` body: held, digested, and forwarded under one length — the client's own
+    // copy is dropped and sbx's measurement is the only framing the upstream sees.
+    let (resp, head) =
+        framed(b"POST / HTTP/1.1\r\nHost: host.test\r\nContent-Length: 11\r\n\r\nhello world");
+    assert!(resp.contains("200"), "{resp:?}");
     assert!(
-        matches!(
-            hold_request_body(&mut reader, false, CHUNKED_REQUEST_CAP + 1).unwrap(),
-            HeldBody::TooLarge
+        head.contains(
+            "X-Body: 11/b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         ),
-        "the ceiling is read off the head, not discovered by reading"
+        "the plugin is told the length and the SHA-256 of `hello world`: {head:?}"
+    );
+    assert_eq!(
+        lengths(&head),
+        1,
+        "one framing reaches the upstream: {head:?}"
+    );
+
+    // A `chunked` body: the same digest, and the framing replaced — no coding may survive it.
+    let (resp, head) =
+        framed(b"POST / HTTP/1.1\r\nHost: host.test\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n");
+    assert!(resp.contains("200"), "{resp:?}");
+    assert!(
+        head.contains(
+            "X-Body: 11/b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        ),
+        "how the client framed the body is not what is digested: {head:?}"
+    );
+    assert_eq!(lengths(&head), 1, "{head:?}");
+    assert!(
+        !head.to_ascii_lowercase().contains("transfer-encoding:"),
+        "the coding is replaced, never forwarded beside a length: {head:?}"
+    );
+
+    // No body: told the digest of nothing, and framed exactly as it was.
+    let (resp, head) = framed(b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n");
+    assert!(resp.contains("200"), "{resp:?}");
+    assert!(
+        head.contains("X-Body: 0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        "the digest of the empty string is a fact, not an absence: {head:?}"
+    );
+    assert_eq!(
+        lengths(&head),
+        0,
+        "a bodyless request gains no framing because a signer asked for a digest: {head:?}"
+    );
+}
+
+/// The ceiling on a declared body is answered from the head, so an oversized upload is refused
+/// before the client is invited to send it rather than after it has crossed the loopback. A chunked
+/// request declares no length, so there is nothing to answer from and the de-chunker bounds it.
+#[test]
+fn a_declared_body_above_the_ceiling_is_known_from_the_head() {
+    assert!(body_exceeds_hold(false, CHUNKED_REQUEST_CAP + 1));
+    assert!(!body_exceeds_hold(false, CHUNKED_REQUEST_CAP));
+    assert!(
+        !body_exceeds_hold(true, CHUNKED_REQUEST_CAP + 1),
+        "a chunked request's declared length is not its body's"
     );
 }
 
@@ -5050,7 +5147,48 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         );
     }
 
-    // The shared ring is the ordered transcript of the seven blocks above: each site emitted
+    // signer-body-too-large (a declared body above what sbx holds, for a signer that asked to be
+    // told a digest of it) → blocked. Refused from the head, so the client sends none of the body
+    // it declared and no upstream is opened.
+    {
+        let s = fresh();
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(ca, policy(&["host.test:*"]))
+                .unwrap()
+                .with_stats(s.clone())
+                .with_log(log.clone())
+                .with_injections(vec![digesting_injection()])
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_proxy(
+            ctx,
+            der,
+            "host.test",
+            "host.test",
+            8443,
+            format!(
+                "POST / HTTP/1.1\r\nHost: host.test\r\nContent-Length: {}\r\n\r\n",
+                CHUNKED_REQUEST_CAP + 1
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            resp.contains("413") && resp.contains("signer-body-too-large"),
+            "{resp:?}"
+        );
+        assert_eq!(
+            count(&s, "host.test"),
+            Counts {
+                blocked: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    // The shared ring is the ordered transcript of the eight blocks above: each site emitted
     // exactly one event with the host, verdict, and reason category it recorded. A mis-emitted
     // or missing event here is a log/stats drift (or a missed site), even though the per-block
     // stat assertions passed.
@@ -5067,6 +5205,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         ("allowed.test", LogVerdict::Blocked, "host-mismatch"),
         ("host.test", LogVerdict::Blocked, "outbound-secret"),
         ("host.test", LogVerdict::Blocked, "ssrf-blocked"),
+        ("host.test", LogVerdict::Blocked, "signer-body-too-large"),
     ];
     assert_eq!(
         seen.len(),

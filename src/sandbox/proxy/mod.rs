@@ -85,6 +85,8 @@
 //! | `403` | `ssrf-blocked`           | the host resolved only to private / metadata addresses |
 //! | `403` | `ip-literal`             | the CONNECT target was an IP literal on the inspected path (allow it raw with a `tcp://` rule) |
 //! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
+//! | `403` | `signer-refused`         | a signer plugin would not form this request's credential; the body carries the plugin's own reason, scrubbed of every declared credential |
+//! | `413` | `signer-body-too-large`  | a signer asked to be told a digest over the request body, and the body is above what the proxy holds. No plugin refused: sbx did, from the head, before the body was invited |
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
 //! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
@@ -677,30 +679,32 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let held: Option<Vec<u8>> = match digest_wanted {
         None => None,
         Some(_) => {
+            // Refused before the client is invited to send, so an oversized upload is answered
+            // rather than received.
+            if body_exceeds_hold(chunked, body_len) {
+                ctx.outcome(
+                    super::control::Proto::Https,
+                    &connect_host,
+                    port,
+                    Some(&imethod),
+                    Some(&itarget),
+                    StatKind::Blocked,
+                    SIGNER_BODY_TOO_LARGE,
+                );
+                return respond_refusal_tls(
+                    &mut br,
+                    "413 Payload Too Large",
+                    SIGNER_BODY_TOO_LARGE,
+                    &body_too_large_message(body_len),
+                );
+            }
             if head_expects_continue(&inner) {
                 let client = br.get_mut();
                 let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
                 let _ = client.flush();
             }
             match hold_request_body(&mut br, chunked, body_len) {
-                Ok(HeldBody::Held(body)) => Some(body),
-                Ok(HeldBody::TooLarge) => {
-                    ctx.outcome(
-                        super::control::Proto::Https,
-                        &connect_host,
-                        port,
-                        Some(&imethod),
-                        Some(&itarget),
-                        StatKind::Blocked,
-                        SIGNER_BODY_TOO_LARGE,
-                    );
-                    return respond_refusal_tls(
-                        &mut br,
-                        "413 Payload Too Large",
-                        SIGNER_BODY_TOO_LARGE,
-                        &body_too_large_message(body_len),
-                    );
-                }
+                Ok(body) => Some(body),
                 // A malformed chunked body is the same refusal it is when the de-chunk happens on
                 // the way out, under the same reason. A `Content-Length` body that ends early is a
                 // transport failure rather than a malformed request, and stays the dropped
@@ -901,7 +905,10 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // A body streaming straight from the client: gone once written, which is why such a request
         // never took a parked connection.
         None
-    } else if let Some(body) = held {
+        // A held body that is empty is a request with no body, and reserializes as one below:
+        // nothing about a bodyless request changes because a signer asked to be told a digest. A
+        // chunked request takes this arm whatever it carried, since its framing must be replaced.
+    } else if let Some(body) = held.filter(|held| chunked || !held.is_empty()) {
         // The body was read above so a signer could be told its digest. It is framed exactly as a
         // de-chunked one: a forced `Content-Length`, and the client's own framing headers dropped by
         // `reserialize_request`. The capture tee lives on the streaming path, so a held body is
@@ -1986,6 +1993,24 @@ fn handle_https_forward(
     let held: Option<Vec<u8>> = match digest_wanted {
         None => None,
         Some(_) => {
+            // Refused before the client is invited to send, as on the tunneled path.
+            if body_exceeds_hold(chunked, body_len) {
+                ctx.outcome(
+                    super::control::Proto::Https,
+                    &host,
+                    port,
+                    Some(method),
+                    Some(&path),
+                    StatKind::Blocked,
+                    SIGNER_BODY_TOO_LARGE,
+                );
+                return write_refusal(
+                    &mut client,
+                    "413 Payload Too Large",
+                    SIGNER_BODY_TOO_LARGE,
+                    &body_too_large_message(body_len),
+                );
+            }
             if head_expects_continue(head) {
                 let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
                 let _ = client.flush();
@@ -1997,24 +2022,7 @@ fn handle_https_forward(
                 hold_request_body(&mut reader, chunked, body_len)
             };
             match read {
-                Ok(HeldBody::Held(body)) => Some(body),
-                Ok(HeldBody::TooLarge) => {
-                    ctx.outcome(
-                        super::control::Proto::Https,
-                        &host,
-                        port,
-                        Some(method),
-                        Some(&path),
-                        StatKind::Blocked,
-                        SIGNER_BODY_TOO_LARGE,
-                    );
-                    return write_refusal(
-                        &mut client,
-                        "413 Payload Too Large",
-                        SIGNER_BODY_TOO_LARGE,
-                        &body_too_large_message(body_len),
-                    );
-                }
+                Ok(body) => Some(body),
                 Err(e) if chunked => {
                     ctx.push_log(
                         super::control::Proto::Https,
@@ -2134,7 +2142,10 @@ fn handle_https_forward(
         // A body streaming straight from the client: gone once written, which is why such a request
         // never took a parked connection.
         None
-    } else if let Some(body) = held {
+        // A held body that is empty is a request with no body, and reserializes as one below:
+        // nothing about a bodyless request changes because a signer asked to be told a digest. A
+        // chunked request takes this arm whatever it carried, since its framing must be replaced.
+    } else if let Some(body) = held.filter(|held| chunked || !held.is_empty()) {
         // The body was read above so a signer could be told its digest, and is framed exactly as a
         // de-chunked one. The capture tee lives on the streaming path, so a held body is handed to
         // the capture here instead.
@@ -2740,13 +2751,14 @@ impl Head {
     }
 }
 
-/// The outcome of trying to hold a request body a signer asked to be told the digest of.
-enum HeldBody {
-    /// The whole body, in memory.
-    Held(Vec<u8>),
-    /// Longer than [`CHUNKED_REQUEST_CAP`], so it is not held at all — the caller refuses the
-    /// request rather than sign it as though it had no body.
-    TooLarge,
+/// Whether a request's declared body is already larger than sbx will hold, before a byte is read.
+///
+/// Answered from the head alone, and answered **first**: a client waiting on `Expect: 100-continue`
+/// must not be invited to send a body sbx has already decided to refuse, or an oversized upload
+/// crosses the loopback only to meet a `413`. A `chunked` request declares no length, so there is
+/// nothing to answer from and its ceiling is enforced by the de-chunker as it reads.
+fn body_exceeds_hold(chunked: bool, body_len: u64) -> bool {
+    !chunked && body_len > CHUNKED_REQUEST_CAP
 }
 
 /// Read a request's whole body into memory, before the request is signed.
@@ -2757,25 +2769,22 @@ enum HeldBody {
 /// requests — and only those — the body is held first.
 ///
 /// The same [`CHUNKED_REQUEST_CAP`] bounds both shapes, since the memory it bounds is the same
-/// memory. A `Content-Length` over it is known before a byte is read, so an oversized upload is
-/// answered without being received.
+/// memory: for a `chunked` body by the de-chunker as it reads, and for a declared one by
+/// [`body_exceeds_hold`], which the caller must have asked before calling this.
 fn hold_request_body<R: BufRead>(
     reader: &mut R,
     chunked: bool,
     body_len: u64,
-) -> io::Result<HeldBody> {
+) -> io::Result<Vec<u8>> {
     if chunked {
-        return read_chunked_body(reader, CHUNKED_REQUEST_CAP).map(HeldBody::Held);
-    }
-    if body_len > CHUNKED_REQUEST_CAP {
-        return Ok(HeldBody::TooLarge);
+        return read_chunked_body(reader, CHUNKED_REQUEST_CAP);
     }
     let mut body = Vec::new();
     let read = reader.take(body_len).read_to_end(&mut body)?;
     if read as u64 != body_len {
         return Err(invalid("the request body ended before its Content-Length"));
     }
-    Ok(HeldBody::Held(body))
+    Ok(body)
 }
 
 /// The credential injections (`header`, `value`) whose host/path rule matches this request,

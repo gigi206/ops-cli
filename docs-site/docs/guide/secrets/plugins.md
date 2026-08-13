@@ -760,10 +760,12 @@ Two consequences worth knowing before you meet them:
 
 - A body larger than the buffer sbx de-chunks into is **refused**, with `413` and the
   reason `signer-body-too-large`. For a `Content-Length` request the length is read off
-  the head, so an oversized upload is answered without ever being received.
-- A client's `Expect: 100-continue` is answered before the body is read, so the body
-  arrives before the request can be refused. A signer refusal then follows an interim
-  `100`, which is what HTTP allows and what the de-chunking path already did.
+  the head and the refusal comes before the client is invited to send, so an oversized
+  upload is answered rather than received.
+- Below that ceiling, a client's `Expect: 100-continue` is answered before the body is
+  read, so the body arrives before the *plugin* can refuse the request. A signer refusal
+  then follows an interim `100`, which is what HTTP allows and what the de-chunking path
+  already did.
 
 What the tripwires watch also changes, and deliberately: for a signed credential the
 [needle](redaction) is the **key**, not the signature. A signature is derived,

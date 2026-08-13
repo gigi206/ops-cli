@@ -905,14 +905,14 @@ fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
 
 /// A signer plugin source directory: a manifest declaring an auth point, and the executable it
 /// names.
-fn local_signer(root: &Path, name: &str, sets: &str) -> PathBuf {
+fn local_signer(root: &Path, name: &str, sets: &str, extra: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
         format!(
-            "name=\"{name}\"\ntype=\"signer\"\nexec=\"sign\"\n[signer]\nsets_headers=[\"{sets}\"]\n"
+            "name=\"{name}\"\ntype=\"signer\"\nexec=\"sign\"\n[signer]\nsets_headers=[\"{sets}\"]\n{extra}"
         ),
     )
     .unwrap();
@@ -922,13 +922,39 @@ fn local_signer(root: &Path, name: &str, sets: &str) -> PathBuf {
     dir
 }
 
+/// The one signer manifest field that changes how sbx **forwards** a request rather than what the
+/// plugin is shown: declaring it means request bodies to this destination are held before they
+/// leave, so it belongs on the page someone reads before installing.
+#[test]
+fn a_signer_that_asks_for_a_body_digest_says_so_on_its_page() {
+    let home = TmpDir::new();
+    let src = TmpDir::new();
+    let source = local_signer(
+        src.path(),
+        "demo-digest",
+        "Authorization",
+        "body_digest=\"sha256\"\n",
+    );
+    run(
+        &["plugins", "install", source.to_str().unwrap()],
+        home.path(),
+    );
+    let info = run(&["plugins", "info", "demo-digest"], home.path());
+    assert!(
+        info.contains(
+            "body:        its sha256 digest, which sbx holds the request body to compute"
+        ),
+        "{info}"
+    );
+}
+
 /// The third kind, through the real binary: installed by name, listed as its own section, and
 /// inspected by that name rather than by a scheme it does not claim.
 #[test]
 fn a_signer_installs_under_its_name_and_states_the_auth_point_it_holds() {
     let home = TmpDir::new();
     let src = TmpDir::new();
-    let source = local_signer(src.path(), "demo-sigv4", "Authorization");
+    let source = local_signer(src.path(), "demo-sigv4", "Authorization", "");
     run(
         &["plugins", "install", source.to_str().unwrap()],
         home.path(),
@@ -954,6 +980,10 @@ fn a_signer_installs_under_its_name_and_states_the_auth_point_it_holds() {
     assert!(
         info.contains("a marker standing in for it"),
         "and that the plaintext stays out of it by default:\n{info}"
+    );
+    assert!(
+        !info.contains("body:"),
+        "a signer that asks for no body digest says nothing about bodies:\n{info}"
     );
 
     // A plugin's name is one namespace across the kinds reached by it. A broker answering to the
