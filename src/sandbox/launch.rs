@@ -4492,6 +4492,11 @@ fn build(
     // one: a `[[secret]]` the agent's own proxy resolves, or a `[task.<name>.inject]` a declared
     // operation's proxy will. One ring and one socket for all of them, like the notifier — a proxy
     // that built its own would record where no reader can look.
+    //
+    // The task half reads the same `prep.cfg.tasks` the engine below is built from, in this one
+    // function, off an immutable `prep`. So the set scanned here and the set that can actually
+    // invoke a signer are the same set, whatever layer contributed a task — there is no ordering
+    // to get wrong, and a late-arriving declaration cannot slip past the feed.
     let signs = prep.cfg.secrets.iter().any(|s| s.signer.is_some())
         || prep
             .cfg

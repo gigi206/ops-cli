@@ -188,8 +188,15 @@ pub(crate) struct SignRefusal {
 /// in rather than held on the injection because a credential refresh rebuilds every signed injection
 /// from scratch (see [`super::CredentialRefresh`]): a ring carried on one would have to survive that
 /// rebuild, and the feed would go quiet after the first refresh with every unit test still green.
-/// `None` on the paths with no feed — the tests, and a task's per-invocation proxy, whose lens no
-/// reader globs for.
+/// `None` where no feed was stood up (the tests, and any launch that declares no signer).
+///
+/// One session's proxies share that feed — the agent's, and one per invocation of a declared
+/// operation — but each records against **its own** needles, which are the ones in `creds` here.
+/// That is the correct set and not an approximation: a plugin is told one credential, its own
+/// declaration's, resolved by this very proxy, so the only value it could echo back is one these
+/// needles cover. The exception is a credential under the launch's redaction floor, which has no
+/// needle anywhere — the launch says so when it resolves it, and this record is no different from
+/// the wire in that respect.
 pub(crate) fn pairs_for(
     creds: &CredentialSet,
     ids: &[usize],
