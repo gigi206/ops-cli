@@ -2947,6 +2947,102 @@ fn two_requests_to_one_host_share_a_single_upstream_connection() {
     );
 }
 
+/// A `Content-Length` body under the ceiling rides the connection the request before it left
+/// behind, and one over it does not.
+///
+/// Reuse asks one thing of a request: that it could be sent a second time, because a connection the
+/// far side closed while parked only shows up after the write. A streamed body is gone once written,
+/// so such a request used to open its own connection and pay a handshake for it every time. Holding
+/// a small body trades a copy for that handshake, which is why the ceiling exists and why the test
+/// covers both sides of it.
+#[test]
+fn a_small_declared_body_reuses_a_parked_connection_and_a_large_one_does_not() {
+    let body_of = |n: usize| -> Vec<u8> {
+        let mut r =
+            format!("POST /p HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: {n}\r\n\r\n")
+                .into_bytes();
+        r.extend(std::iter::repeat_n(b'x', n));
+        r
+    };
+
+    // Under the ceiling: held, so the second request takes the first's connection.
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let small = body_of(1024);
+    let got = through_proxy_repeatedly(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[&small, &small],
+    )
+    .unwrap();
+    for resp in &got {
+        assert!(resp.ends_with("hello"), "both responses arrive: {resp:?}");
+    }
+    assert_eq!(
+        upstream.connections(),
+        1,
+        "a body small enough to hold is a body the request can re-send, so it may take a parked \
+         connection"
+    );
+
+    // Over it: streamed, so each request opens its own.
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let large = body_of(POOL_HOLD_MAX as usize + 1);
+    let got = through_proxy_repeatedly(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[&large, &large],
+    )
+    .unwrap();
+    for resp in &got {
+        assert!(
+            resp.ends_with("hello"),
+            "both responses still arrive: {resp:?}"
+        );
+    }
+    assert_eq!(
+        upstream.connections(),
+        2,
+        "past the ceiling the body streams, and a streamed body cannot be re-sent"
+    );
+}
+
+/// A held-for-reuse body is invited exactly once. The interim answer is written where the body is
+/// read, and the streaming relay writes its own further down — a body read in the first place must
+/// not meet the second.
+#[test]
+fn a_body_held_for_reuse_is_invited_exactly_once() {
+    let (addr, upstream_ca, _upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let mut request =
+        b"POST /p HTTP/1.1\r\nHost: upstream.test\r\nExpect: 100-continue\r\nContent-Length: 8\r\n\r\n"
+            .to_vec();
+    request.extend_from_slice(b"payload8");
+    let resp = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        "upstream.test",
+        addr.port(),
+        &request,
+    )
+    .unwrap();
+    assert_eq!(
+        resp.matches("100 Continue").count(),
+        1,
+        "one interim answer, not two: {resp:?}"
+    );
+    assert!(resp.ends_with("hello"), "{resp:?}");
+}
+
 /// The control for the test above, and the guarantee for every launch that does not ask for
 /// reuse: without the setting the proxy opens — and validates — its own connection per request.
 #[test]

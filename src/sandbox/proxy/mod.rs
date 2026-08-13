@@ -732,6 +732,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // costs no connection. Released with the buffer it covers, once the forwarded bytes are on the
     // wire: holding it through the response relay would turn a ceiling on what is *held* into a
     // limit on how many responses may be in flight.
+    // Whether a `Content-Length` body is read into memory although nothing asked for its digest.
+    // A performance decision, not a policy one: a held body is a re-sendable one, and re-sendable is
+    // exactly what makes a request eligible for a pooled upstream connection. Streamed, it opened
+    // its own connection and paid a handshake for it every time. See [`POOL_HOLD_MAX`].
+    let hold_for_reuse = ctx.pool.is_some()
+        && digest_wanted.is_none()
+        && !chunked
+        && (1..=POOL_HOLD_MAX).contains(&body_len);
     let mut budget: Option<BodyBudget> = None;
     if chunked || digest_wanted.is_some() {
         budget = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len) {
@@ -754,10 +762,17 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 );
             }
         };
+    } else if hold_for_reuse {
+        // Best-effort, unlike the two above: the ceiling exists to bound host memory, and a request
+        // that cannot have a buffer right now simply streams as it always did. There is nothing to
+        // refuse it over — nothing asked for this body, the proxy only preferred it.
+        budget = reserve_body_buffer(&ctx.held_bodies, false, body_len);
     }
-    let held: Option<Vec<u8>> = match digest_wanted {
-        None => None,
-        Some(_) => {
+    let hold_for_reuse = hold_for_reuse && budget.is_some();
+    let held: Option<Vec<u8>> = if digest_wanted.is_none() && !hold_for_reuse {
+        None
+    } else {
+        {
             // Only where there is a body to invite. A request that declares none is answered by the
             // response itself, and an interim `100` for a body that will never come is noise.
             if (chunked || body_len > 0) && head_expects_continue(&inner) {
@@ -2128,6 +2143,14 @@ fn handle_https_forward(
     // costs no connection. Released with the buffer it covers, once the forwarded bytes are on the
     // wire: holding it through the response relay would turn a ceiling on what is *held* into a
     // limit on how many responses may be in flight.
+    // Whether a `Content-Length` body is read into memory although nothing asked for its digest.
+    // A performance decision, not a policy one: a held body is a re-sendable one, and re-sendable is
+    // exactly what makes a request eligible for a pooled upstream connection. Streamed, it opened
+    // its own connection and paid a handshake for it every time. See [`POOL_HOLD_MAX`].
+    let hold_for_reuse = ctx.pool.is_some()
+        && digest_wanted.is_none()
+        && !chunked
+        && (1..=POOL_HOLD_MAX).contains(&body_len);
     let mut budget: Option<BodyBudget> = None;
     if chunked || digest_wanted.is_some() {
         budget = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len) {
@@ -2150,10 +2173,17 @@ fn handle_https_forward(
                 );
             }
         };
+    } else if hold_for_reuse {
+        // Best-effort, unlike the two above: the ceiling exists to bound host memory, and a request
+        // that cannot have a buffer right now simply streams as it always did. There is nothing to
+        // refuse it over — nothing asked for this body, the proxy only preferred it.
+        budget = reserve_body_buffer(&ctx.held_bodies, false, body_len);
     }
-    let held: Option<Vec<u8>> = match digest_wanted {
-        None => None,
-        Some(_) => {
+    let hold_for_reuse = hold_for_reuse && budget.is_some();
+    let held: Option<Vec<u8>> = if digest_wanted.is_none() && !hold_for_reuse {
+        None
+    } else {
+        {
             if (chunked || body_len > 0) && head_expects_continue(head) {
                 let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
                 let _ = client.flush();
@@ -2937,6 +2967,20 @@ const CONCURRENT_CHUNKED_UPLOADS: u64 = 16;
 
 /// The bytes held at one moment across every connection. See [`CONCURRENT_CHUNKED_UPLOADS`].
 const HELD_BODY_BUDGET: u64 = CONCURRENT_CHUNKED_UPLOADS * CHUNKED_REQUEST_CAP;
+
+/// The largest `Content-Length` body the proxy reads into memory for **reuse**, when nothing else
+/// asked it to.
+///
+/// A body the proxy holds is one it can send a second time, and that is the whole of what makes a
+/// request eligible for a pooled upstream connection: a connection the far side closed while it was
+/// parked only shows up after the write, so a body already streamed away cannot be recovered. A
+/// streamed body therefore opened its own connection and paid a TLS handshake for it, every time.
+///
+/// Holding it instead trades a copy for that handshake, so the ceiling is where the two meet. The
+/// handshake is a fixed cost and the copy grows with the body, which puts the crossing at several
+/// hundred kilobytes on this machine; this sits comfortably below it and covers the request bodies
+/// an API client actually sends. Past it the request streams exactly as it did before.
+const POOL_HOLD_MAX: u64 = 256 * 1024;
 
 /// The reason token a request refused for want of buffer budget carries. Its own token, and a
 /// `503` rather than a `4xx`, because nothing is wrong with the request: the proxy is holding other

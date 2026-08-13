@@ -301,6 +301,19 @@ proxy takes toward held resources. The clock answers a different question, which
 stale a connection may be and still be handed over: one that has waited more than 10
 seconds is dropped rather than reused.
 
+There is one more condition, on the *taking* side rather than the offering one: a
+request may only ride a waiting connection if it could be sent again. A server that
+closed while its connection sat idle only reveals it after the write, and a body that
+streamed straight through from the caller is gone by then. So a request with no body,
+or one whose body the proxy holds in memory, may take a parked connection; one whose
+body streams opens its own, and still leaves it behind for the next request.
+
+That is why a **small declared body is read into memory** even when nothing else asked
+for it. Holding it costs a copy and buys back a whole TLS handshake, so the proxy does
+it up to a few hundred kilobytes and streams anything larger, where the copy would cost
+more than the handshake saves. A `chunked` body is already read this way, to be re-framed
+with a length the upstream can trust, so it has always been eligible.
+
 The residual is a server closing a waiting connection in the microseconds between the
 proxy's check and its write. That request gets a `502 upstream-closed`, never a silent
 empty response.
