@@ -4431,6 +4431,13 @@ fn build(
                 }
             }
         }
+        // Nothing stood up, so nothing has decisions to record. Dropping the feed unlinks its socket
+        // and takes this launch back to what it would have been without the block: a launch with no
+        // broker, which needs no live parent and can exec-replace. Held any longer, a bound socket
+        // with no owner would force the supervised path on a config whose brokers all fell away.
+        if brokers.is_empty() {
+            broker_feed = None;
+        }
     }
 
     // Where each `tcp://` destination lives inside the cage. Computed before the launch because two

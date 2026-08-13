@@ -711,38 +711,33 @@ pub(crate) fn start(
     // a ring per signer would need a socket per signer under one per-session name, which is how a
     // reader ends up seeing one of them and believing it saw them all.
     //
-    // Bound only for the session's own proxy. A task's per-invocation proxy runs under an
-    // `instance` of its own, and no reader globs for one: its socket would be a file nothing reads
-    // and nothing sweeps. The ring is built either way, so the forming path has no branch of its
-    // own and a task's signatures still cost what a session's do.
-    // Held by the guard below, which unlinks it when the launch ends: nothing sweeps `<data>/signer`,
-    // so a socket nobody owns is a file per session left behind for good.
+    // The session's own proxy only. A task's per-invocation proxy runs under an `instance` of its
+    // own and no reader globs for one, so a ring there would be a record nothing can ever read —
+    // which is worse than no record, because the forming path would look observed while nothing
+    // observed it. A task's signatures are therefore not recorded today; sharing the session's ring
+    // with its task proxies is the way to change that, and it is the route the notifier already
+    // takes.
+    //
+    // The socket is held by the guard returned below, which unlinks it when the launch ends.
     let mut signer_uds = None;
-    if secrets.iter().any(|s| s.signer.is_some()) {
+    if instance.is_empty() && secrets.iter().any(|s| s.signer.is_some()) {
         let ring = Arc::new(super::signer_control::SignerRing::new(
             super::signer_control::SIGNER_RING_CAP,
         ));
         ctx = ctx.with_signer_log(ring.clone());
-        if instance.is_empty() {
-            let socket = super::signer_control::signer_control_socket(layout.data_dir(), pid);
-            // A failure to stand the reader up is not a reason to fail the launch: the signer is the
-            // fence, the record is the witness — so it degrades to signing with no reader rather
-            // than to no signing.
-            match super::lens::ensure_control_dir(&layout.data_dir().join("signer")).and_then(
-                |()| {
-                    let ring = ring.clone();
-                    super::lens::bind_and_serve(&socket, move |l| {
-                        super::signer_control::serve(l, ring)
-                    })
-                },
-            ) {
-                Ok(()) => signer_uds = Some(socket),
-                Err(e) => crate::diag::warn(&format!(
-                    "credentials will be signed, but what was signed cannot be read (`{}`: {e}) — \
-                     `sbx logs --feed signer` will report no signer for this session",
-                    socket.display()
-                )),
-            }
+        let socket = super::signer_control::signer_control_socket(layout.data_dir(), pid);
+        // A failure to stand the reader up is not a reason to fail the launch: the signer is the
+        // fence, the record is the witness — so it degrades to signing with no reader rather than
+        // to no signing.
+        match super::lens::ensure_control_dir(&layout.data_dir().join("signer")).and_then(|()| {
+            super::lens::bind_and_serve(&socket, move |l| super::signer_control::serve(l, ring))
+        }) {
+            Ok(()) => signer_uds = Some(socket),
+            Err(e) => crate::diag::warn(&format!(
+                "credentials will be signed, but what was signed cannot be read (`{}`: {e}) — \
+                 `sbx logs --feed signer` will report no signer for this session",
+                socket.display()
+            )),
         }
     }
 

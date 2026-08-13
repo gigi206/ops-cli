@@ -1419,10 +1419,11 @@ fn host_socket(data_dir: &std::path::Path, name: &str, pid: u32) -> std::path::P
 /// degrades to brokers with no reader rather than to no brokers. The guard is `None` then, and the
 /// warning says which it was.
 ///
-/// The socket exists for a launch that *declared* a broker, not for one whose broker started: a
-/// declaration that could not be honoured leaves a feed with no events, which is the truthful
-/// reading, while an absent socket would have `sbx logs` say the config declares no broker when it
-/// does.
+/// Bound before the loop that starts the brokers, and dropped by the caller when none of them
+/// stood up. Both halves matter: binding first means the first decision cannot beat a reader to
+/// the socket, and letting it go when nothing started keeps a launch whose brokers all fell away
+/// off the supervised path — a bound socket needs a live owner to unlink it, and that owner is a
+/// parent process this launch would otherwise not need.
 pub(crate) fn stand_up_feed(
     layout: &crate::store::Layout,
 ) -> (

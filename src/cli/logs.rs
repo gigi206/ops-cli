@@ -423,7 +423,8 @@ fn feeds_for(data_dir: &Path, pid: u32) -> Vec<Feed> {
         Feed {
             name: "signer",
             socket: crate::sandbox::signer_control::signer_control_socket(data_dir, pid),
-            absent: "no signer plugin — no credential in this config declares `sign`",
+            absent: "no signer plugin — no session credential declares `sign` (a task's are not \
+                      recorded)",
             read: read_signer_rows,
             cursor: Some(0),
         },

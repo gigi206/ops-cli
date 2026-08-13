@@ -8412,4 +8412,19 @@ fn a_broker_that_cannot_be_provided_warns_and_the_launch_still_succeeds() {
         stderr.contains("does not exist"),
         "the launch must say the host resource is not there: {stderr}"
     );
+
+    // Neither launch left a broker feed behind. The socket is bound before the brokers start, so
+    // when none of them does it has to be let go again: a bound socket needs a live owner to unlink
+    // it, and that owner is a parent process a broker-less launch does not otherwise need.
+    let broker_dir = data.path().join("sbx/broker");
+    let left: Vec<String> = std::fs::read_dir(&broker_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "a launch whose brokers all fell away leaves nothing behind: {left:?}"
+    );
 }
