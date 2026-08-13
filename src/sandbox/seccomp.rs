@@ -59,7 +59,7 @@
 
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
-    SeccompRule, TargetArch,
+    SeccompRule, TargetArch, sock_filter,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -257,11 +257,74 @@ fn enosys_rules(policy: &SeccompPolicy) -> Rules {
     m
 }
 
+/// The bit an x32 system call carries in its number (`__X32_SYSCALL_BIT`).
+///
+/// x32 is a third ABI on x86_64: 32-bit pointers, 64-bit registers. What matters here is how it
+/// presents itself to a filter. It reports `AUDIT_ARCH_X86_64`, so the architecture check the
+/// compiled filter opens with **passes**, and it carries this bit in the call number, so every rule
+/// below compares against a number it can never equal. A denylist whose default action is `Allow`
+/// then allows the whole of it.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+/// Refuse anything arriving through the x32 ABI, ahead of the compiled rules.
+///
+/// Three instructions, prepended rather than woven in: cBPF jumps are relative to the following
+/// instruction, so a block placed entirely in front leaves every offset the compiler emitted
+/// untouched. It loads the call number, and returns `ENOSYS` for any number carrying
+/// [`X32_SYSCALL_BIT`] — the same answer this module already gives for a call it will not let
+/// through but does not want to make fatal.
+///
+/// It is unconditional on purpose, and it cannot be demonstrated on a host whose kernel is built
+/// without `CONFIG_X86_X32_ABI` — which is most of them, and is exactly why it is written from the
+/// ABI's specification rather than from a reproduction. A guard that only defends the hosts a
+/// developer happened to have is not a guard.
+#[cfg(target_arch = "x86_64")]
+fn refuse_x32(program: &mut BpfProgram) {
+    const LD_W_ABS: u16 = 0x20;
+    const JMP_JGE_K: u16 = 0x35;
+    const RET_K: u16 = 0x06;
+    const RET_ERRNO: u32 = 0x0005_0000;
+    program.splice(
+        0..0,
+        [
+            // A <- seccomp_data.nr
+            sock_filter {
+                code: LD_W_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            // if A >= __X32_SYSCALL_BIT: fall through to the refusal; else skip it
+            sock_filter {
+                code: JMP_JGE_K,
+                jt: 0,
+                jf: 1,
+                k: X32_SYSCALL_BIT,
+            },
+            sock_filter {
+                code: RET_K,
+                jt: 0,
+                jf: 0,
+                k: RET_ERRNO | (libc::ENOSYS as u32),
+            },
+        ],
+    );
+}
+
+/// No such ABI here: aarch64 has one system-call convention, and the architecture check the
+/// compiled filter opens with is the whole of the answer.
+#[cfg(not(target_arch = "x86_64"))]
+fn refuse_x32(_program: &mut BpfProgram) {}
+
 /// Compile a rule set with the given match action into raw cBPF bytes.
 fn compile(rules: Rules, match_action: SeccompAction) -> Vec<u8> {
     let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, TARGET_ARCH)
         .expect("a statically-defined filter is always valid");
-    let program: BpfProgram = filter.try_into().expect("the filter compiles to cBPF");
+    let mut program: BpfProgram = filter.try_into().expect("the filter compiles to cBPF");
+    // Every program, not one of them: each is installed on its own and each defaults to `Allow`, so
+    // a bypass left open in any of them is a bypass.
+    refuse_x32(&mut program);
     serialize(&program)
 }
 
@@ -539,6 +602,56 @@ impl SeccompPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every compiled filter opens by refusing the x32 ABI, and the architecture check it was
+    /// already opening with still follows.
+    ///
+    /// Decoded from what [`programs`] actually emits — the bytes bwrap is handed — rather than by
+    /// calling the guard and checking the guard. A filter that forgot to apply it would pass the
+    /// second and fail this.
+    ///
+    /// It has to be read out of the instructions rather than exercised, because the ABI it defends
+    /// against does not exist on a kernel built without `CONFIG_X86_X32_ABI` — most of them, this
+    /// machine included. The constants are spelled out so they can be compared by eye against
+    /// `seccomp(2)` instead of trusted through a name.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn every_filter_refuses_the_x32_abi_before_it_looks_at_anything_else() {
+        /// One instruction, decoded from the serialized `struct sock_filter` bwrap reads.
+        fn insn(bytes: &[u8], at: usize) -> (u16, u8, u8, u32) {
+            let w = &bytes[at * 8..at * 8 + 8];
+            (
+                u16::from_ne_bytes([w[0], w[1]]),
+                w[2],
+                w[3],
+                u32::from_ne_bytes([w[4], w[5], w[6], w[7]]),
+            )
+        }
+
+        let compiled = programs(&SeccompPolicy::default());
+        assert_eq!(compiled.len(), 2, "the default policy emits both filters");
+        for program in &compiled {
+            // A <- seccomp_data.nr (a word at offset 0)
+            assert_eq!(insn(program, 0), (0x20, 0, 0, 0));
+            // if A >= 0x40000000 fall through to the return (jt = 0), else skip it (jf = 1)
+            assert_eq!(insn(program, 1), (0x35, 0, 1, 0x4000_0000));
+            // return ENOSYS: SECCOMP_RET_ERRNO (0x00050000) with the errno in the low bits
+            assert_eq!(insn(program, 2), (0x06, 0, 0, 0x0005_0000 | 38));
+            assert_eq!(libc::ENOSYS, 38, "the errno the line above spells out");
+
+            // ...and the compiler's own prologue is intact behind it: load the architecture, and
+            // kill anything that is not the one this filter was built for.
+            assert_eq!(insn(program, 3), (0x20, 0, 0, 4));
+            assert_eq!(insn(program, 4).0, 0x15);
+            assert_eq!(insn(program, 4).3, 0xc000_003e);
+            assert_eq!(
+                insn(program, 5),
+                (0x06, 0, 0, 0x8000_0000),
+                "an architecture this filter does not know is killed, not allowed"
+            );
+        }
+    }
+
     use std::io::Read;
 
     #[test]

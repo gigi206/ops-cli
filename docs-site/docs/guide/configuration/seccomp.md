@@ -95,6 +95,15 @@ refused). Lifting a syscall is your informed, trusted-only choice.
 Re-permitting the mount/namespace family does **not** re-enable nix's own build sandbox, `sbx` still runs in-cage `nix build` with `sandbox = false` (see
 [Enforcement stack](../concepts/enforcement)).
 
+The denylist also covers the *way* a call is made, not only which call it is. A syscall
+filter sees an architecture alongside the call number, and a call arriving under an
+architecture the filter was not built for is killed rather than let through. On x86_64
+there is a third calling convention, `x32`, which reports itself as x86_64 while
+numbering its calls differently; a cage refuses it outright, so it cannot be used to
+reach a denied syscall by another route. Most kernels are built without it, which is
+precisely why the refusal is unconditional rather than conditional on finding one that
+is not.
+
 ## Per-app relaxation
 
 An `[app.<name>.seccomp]` table (or a `[seccomp]` table in an imported profile) relaxes
