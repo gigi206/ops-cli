@@ -3507,6 +3507,97 @@ fn holding_a_body_to_digest_it_reframes_only_a_request_that_has_one() {
     );
 }
 
+/// A held body is **re-sendable**, which is the whole reason it may take a parked connection.
+///
+/// Two facts have to agree for a request to be safe on a pooled connection: whether it was allowed
+/// to take one, and whether the proxy still holds every byte it sent. Holding a body to digest it
+/// changes the first — a `Content-Length` request that used to stream now qualifies, where before
+/// it opened its own connection every time — so the second has to change with it, or a request
+/// would ride a connection the upstream closed while it was parked with nothing left to send
+/// again. The code makes them one binding; this proves the property that binding exists for.
+///
+/// Both halves, because either alone is satisfied by the wrong implementation: reuse without
+/// re-sendability loses the second body, and re-sendability without reuse is a property nothing
+/// exercises.
+#[test]
+fn a_held_body_is_reusable_and_re_sendable_together() {
+    let put = |path: &'static str| -> &'static [u8] {
+        match path {
+            "one" => {
+                b"PUT /one HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 11\r\n\r\nhello world"
+            }
+            _ => {
+                b"PUT /two HTTP/1.1\r\nHost: upstream.test\r\nContent-Length: 11\r\n\r\nhello world"
+            }
+        }
+    };
+
+    // (a) Reuse. A `Content-Length` body is streamed straight through without a signer, which is
+    //     what kept it off a parked connection; held, it rides the one the first request left.
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(
+        upstream_ca,
+        true,
+        vec![digesting_injection_for("upstream.test:*")],
+    );
+    let got = through_proxy_repeatedly(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[put("one"), put("two")],
+    )
+    .unwrap();
+    for resp in &got {
+        assert!(resp.ends_with("hello"), "both responses arrive: {resp:?}");
+    }
+    assert_eq!(
+        upstream.connections(),
+        1,
+        "a held body may take the connection the first request left behind"
+    );
+    let heads = upstream.heads();
+    assert_eq!(heads.len(), 2, "{heads:?}");
+    assert!(
+        heads.iter().all(|h| h.contains(
+            "X-Body: 11/b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        )),
+        "each carries the digest of the body it sent: {heads:?}"
+    );
+
+    // (b) Re-sendability. The same shape against an upstream that destroys the parked connection:
+    //     the second request discovers it on the write and must send the same body again rather
+    //     than reach the cage as a failure. `PUT`, because the retry is only offered to a method
+    //     whose effect does not depend on how many times it lands.
+    let (addr, upstream_ca, upstream) =
+        spawn_upstream_that_resets_after_one(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(
+        upstream_ca,
+        true,
+        vec![digesting_injection_for("upstream.test:*")],
+    );
+    let got = through_proxy_repeatedly(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[put("one"), put("two")],
+    )
+    .unwrap();
+    for resp in &got {
+        assert!(
+            resp.ends_with("hello"),
+            "a held body survives the connection it was first written to: {resp:?}"
+        );
+    }
+    assert_eq!(
+        upstream.connections(),
+        2,
+        "the parked connection was taken and destroyed, so a fresh one carried the retry"
+    );
+}
+
 /// A body held to be digested still reaches the **capture**.
 ///
 /// The tee that fills the request-body sink lives on the streaming relay, and a held body never
