@@ -24,8 +24,14 @@
 //! compiler's inlining, not the design:
 //!
 //! ```sh
-//! CARGO_PROFILE_RELEASE_LTO=false cargo test --release --bins -- --ignored --nocapture bench
+//! CARGO_PROFILE_RELEASE_LTO=false cargo test --release --bins -- --ignored --nocapture \
+//!     --test-threads=1 bench
 //! ```
+//!
+//! `--test-threads=1` is not tidiness. Run in parallel, these measurements contend for the machine
+//! and for its page cache, and each one's figure is then partly the others': the WebSocket relay
+//! read 738 MiB/s against a plain 1184 that way and 1345 against 1412 on its own, which is the
+//! difference between "the capture costs a third of this path" and "the capture costs a twentieth".
 
 use super::ca::CertResolver;
 use super::*;
@@ -1253,13 +1259,19 @@ fn refusal_cost() {
     }
 }
 
-/// Bytes this process has written through the write syscalls, from `/proc/self/io` (`wchar`).
+/// Bytes **this thread** has written through the write syscalls, from `/proc/thread-self/io`
+/// (`wchar`).
 ///
 /// The axis a bookkeeping cost hides on. Rewriting a small file per decision is nearly invisible in
 /// a per-request time and is the whole story in what the host's storage is asked to absorb, so a
 /// measurement that reports only the clock would answer half the question.
+///
+/// Per **thread**, not per process, and that is not a detail: `cargo test` runs these measurements
+/// concurrently by default, and a process-wide counter charges this one for every byte the others
+/// wrote. Read that way it reported four kilobytes per refusal on a path that writes none, which is
+/// the same class of wrong answer the figure exists to catch.
 fn bytes_written() -> u64 {
-    std::fs::read_to_string("/proc/self/io")
+    std::fs::read_to_string("/proc/thread-self/io")
         .ok()
         .and_then(|s| {
             s.lines()
