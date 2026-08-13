@@ -346,9 +346,10 @@ The categories surface in [`sbx net logs`](observability#sbx-net-logs) as the
 per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text is
 never disclosed, so a global-config rule the cage cannot read does not leak),
 `denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,
-`outbound-secret`, `signer-refused`, `signer-body-too-large`, and the transport-side
-`dns-failure`, `upstream-unreachable`, `upstream-cert-rejected`, and `upstream-closed`.
-A genuine upstream status (a real `404`) is relayed verbatim with no such header.
+`outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`, and the
+transport-side `dns-failure`, `upstream-unreachable`, `upstream-cert-rejected`, and
+`upstream-closed`. A genuine upstream status (a real `404`) is relayed verbatim with no
+such header.
 
 `signer-refused` is the one that is not a policy verdict: the policy allowed the host,
 and the request was refused because its credential could not be formed. See
@@ -363,6 +364,14 @@ answers `413`, from the head, before the client is invited to send. An over-cap
 `chunked` body declares no length and is discovered while being read, so it keeps the
 `bad-request:chunked` above. See
 [what a signer is told about the body](../secrets/plugins#what-a-signer-is-told-about-the-body).
+
+`body-buffer-cap` says nothing is wrong with the request. Some requests have their body
+read into memory before being forwarded: a `chunked` one, which is de-chunked and re-framed,
+and one whose destination has a signer that asks to be told a digest of it. That buffer is
+bounded per request, but the proxy runs host-side, outside the cage's own memory ceiling, so
+the *sum* of them is bounded too. When that shared ceiling is reached a further such request
+is answered `503` and is not sent; it succeeds once one in flight completes. A request whose
+body streams through is never affected.
 
 `upstream-closed` is the one that names a server that accepted the request and then
 went away without answering. Saying so is deliberate: an empty relay would be

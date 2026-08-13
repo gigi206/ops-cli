@@ -3507,6 +3507,82 @@ fn holding_a_body_to_digest_it_reframes_only_a_request_that_has_one() {
     );
 }
 
+/// The shared ceiling on request-body buffers, which is what keeps a per-request bound from being
+/// multiplied by concurrency.
+///
+/// The proxy buffers a request body host-side, and `cgroup::wrap` puts *bwrap* in the launch's
+/// systemd scope, so the cage's own `MemoryMax` does not reach these bytes. `CHUNKED_REQUEST_CAP`
+/// alone therefore bounds one request while `MAX_CONCURRENT_CONNS` of them can be in flight: the
+/// product is what an in-cage agent could make the host allocate, and this is what refuses it.
+#[test]
+fn the_body_buffer_budget_is_shared_and_released() {
+    use std::sync::atomic::AtomicU64;
+
+    let budget = AtomicU64::new(0);
+    // A chunked request cannot say how much it will read, so it reserves the per-request ceiling.
+    let held: Vec<_> = (0..HELD_BODY_BUDGET / CHUNKED_REQUEST_CAP)
+        .map(|_| reserve_body_buffer(&budget, true, 0).expect("within the ceiling"))
+        .collect();
+    assert!(
+        reserve_body_buffer(&budget, true, 0).is_none(),
+        "the ceiling is shared, so one more chunked body past it is refused"
+    );
+    assert!(
+        reserve_body_buffer(&budget, false, 1).is_none(),
+        "and so is a single byte: the ceiling is on the sum, not on a count of requests"
+    );
+    drop(held);
+    assert_eq!(
+        budget.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "every reservation is released when its request ends"
+    );
+    assert!(
+        reserve_body_buffer(&budget, true, 0).is_some(),
+        "and the room comes back"
+    );
+
+    // A declared length reserves exactly itself, so many small bodies are not penalised by one
+    // large one's ceiling.
+    let budget = AtomicU64::new(0);
+    let small: Vec<_> = (0..1000)
+        .map(|_| reserve_body_buffer(&budget, false, 1024).expect("a KiB each"))
+        .collect();
+    assert_eq!(small.len(), 1000);
+}
+
+/// The refusal the ceiling issues, through the real proxy: `503`, its own reason, and the request
+/// is never sent. A `4xx` would say the request was at fault, and it is not — the proxy is busy.
+#[test]
+fn a_request_that_would_pass_the_body_buffer_ceiling_is_refused_without_being_sent() {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let der = ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(ca, policy(&["host.test:*"]))
+            .unwrap()
+            .with_injections(vec![digesting_injection()])
+            // Resolvable, and nothing listening there: the ceiling is reached before any upstream
+            // is opened, so a `503` rather than an `upstream-unreachable` is itself the proof.
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    // Spend the ceiling, as other requests in flight would.
+    ctx.held_bodies
+        .store(HELD_BODY_BUDGET, std::sync::atomic::Ordering::Relaxed);
+    let resp = through_proxy(
+        ctx,
+        der,
+        "host.test",
+        "host.test",
+        8443,
+        b"POST / HTTP/1.1\r\nHost: host.test\r\nContent-Length: 11\r\n\r\nhello world",
+    )
+    .unwrap();
+    assert!(
+        resp.contains("503") && resp.contains("body-buffer-cap"),
+        "the proxy is busy, not the request malformed: {resp:?}"
+    );
+}
+
 /// A held body is **re-sendable**, which is the whole reason it may take a parked connection.
 ///
 /// Two facts have to agree for a request to be safe on a pooled connection: whether it was allowed

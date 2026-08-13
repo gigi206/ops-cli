@@ -126,6 +126,15 @@ pub(crate) struct ProxyCtx {
     /// (see [`MAX_CONCURRENT_CONNS`](super::MAX_CONCURRENT_CONNS)) — a burst of connections cannot exhaust host threads/fds and
     /// take the whole session's egress down. Shared through the `Arc<ProxyCtx>`.
     pub(super) conns: AtomicUsize,
+    /// The bytes currently reserved across every connection for buffering a **request body**.
+    ///
+    /// Per request the buffer is bounded by [`CHUNKED_REQUEST_CAP`](super::CHUNKED_REQUEST_CAP),
+    /// but that bound is per request: [`MAX_CONCURRENT_CONNS`](super::MAX_CONCURRENT_CONNS) of them
+    /// can be in flight at once, and the proxy runs **host-side**, outside the cage's own memory
+    /// cgroup (`cgroup::wrap` puts bwrap in the scope, not the supervisor). Without a shared
+    /// ceiling an in-cage agent could make the host allocate the product of the two. See
+    /// [`HELD_BODY_BUDGET`](super::HELD_BODY_BUDGET).
+    pub(super) held_bodies: std::sync::atomic::AtomicU64,
     /// The `sbx app <name>` this launch runs, if any — used only to scope the `sbx net allow`
     /// suggestion in a `denied-default` refusal body to the app (`--app <name>`). `None` for a bare
     /// `sbx run`/`shell`.
@@ -210,6 +219,7 @@ impl ProxyCtx {
             flows: None,
             splices: AtomicUsize::new(0),
             conns: AtomicUsize::new(0),
+            held_bodies: std::sync::atomic::AtomicU64::new(0),
             app: None,
             notifier: None,
             capture: None,
