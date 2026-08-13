@@ -1227,4 +1227,515 @@ mod tests {
             "HTTP/2 sends no reason phrase, so none is shown: {rendered:?}"
         );
     }
+
+    // ------------------------------------------------------------------------------------------
+    // A real upstream on this plane.
+    //
+    // Every test above refuses *before* the upstream is opened, so none of them ever reached the
+    // relay itself: the connect, the upstream TLS negotiating ALPN `h2`, the client handshake, the
+    // request rebuilt from the decoded head, and the response head + DATA + trailers coming back.
+    // The harness below is the first thing here to drive an h2 stream to a real HTTP/2 server, and
+    // it is assembled from the same pieces the HTTP/1.1 tests use (an ephemeral CA minting a leaf
+    // per SNI, a loopback listener, a resolver pinned to 127.0.0.1 — allowed only because the
+    // deciding rule names the exact host).
+    // ------------------------------------------------------------------------------------------
+
+    /// Where an exchange got to, recorded from both ends.
+    ///
+    /// An in-memory h2 exchange either completes in microseconds or does not complete at all, and
+    /// from the client leg alone "the handler was never entered", "it is stuck inside" and "the
+    /// upstream never answered" are the same silence. Each milestone is bumped where it happens, so
+    /// one run localizes a stall instead of leaving it to be guessed at.
+    #[derive(Default)]
+    struct H2Trace {
+        /// the test upstream accepted a TCP connection
+        upstream_tcp: std::sync::atomic::AtomicUsize,
+        /// ...and finished TLS, negotiating this ALPN protocol (empty string = none) — one per connection
+        upstream_alpn: std::sync::Mutex<Vec<String>>,
+        /// ...and every request head it received, with the body that followed
+        seen: std::sync::Mutex<Vec<SeenRequest>>,
+        /// the proxy's per-stream handler started
+        entered: std::sync::atomic::AtomicUsize,
+        /// ...and returned
+        returned: std::sync::atomic::AtomicUsize,
+    }
+
+    impl H2Trace {
+        /// The five-point trace, for the panic message of an exchange that did not finish.
+        fn render(&self) -> String {
+            use std::sync::atomic::Ordering;
+            format!(
+                "upstream: tcp={} alpn={:?} heads={} | proxy handler: entered={} returned={}",
+                self.upstream_tcp.load(Ordering::Relaxed),
+                self.upstream_alpn.lock().unwrap(),
+                self.seen.lock().unwrap().len(),
+                self.entered.load(Ordering::Relaxed),
+                self.returned.load(Ordering::Relaxed),
+            )
+        }
+
+        fn seen_one(&self) -> SeenRequest {
+            let seen = self.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one request reached the upstream: {seen:?}");
+            seen[0].clone()
+        }
+    }
+
+    /// One request as the test upstream received it — what the proxy actually put on the wire,
+    /// which is the only trustworthy account of what it forwarded.
+    #[derive(Debug, Default, Clone)]
+    struct SeenRequest {
+        method: String,
+        /// the `:authority` pseudo-header, which `http` carries on the URI rather than in the map
+        authority: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl SeenRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// What the test upstream answers on every stream it accepts.
+    #[derive(Clone)]
+    struct UpstreamReply {
+        status: StatusCode,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        trailers: Vec<(String, String)>,
+    }
+
+    impl UpstreamReply {
+        /// The gRPC shape: a `200`, one message, and the `grpc-status` trailer that carries the
+        /// call's real outcome — the response half this plane exists to relay intact.
+        fn grpc(body: &str) -> Self {
+            UpstreamReply {
+                status: StatusCode::OK,
+                headers: vec![("content-type".into(), "application/grpc".into())],
+                body: body.as_bytes().to_vec(),
+                trailers: vec![("grpc-status".into(), "0".into())],
+            }
+        }
+    }
+
+    /// What the client received back through the proxy.
+    #[derive(Debug)]
+    struct H2Answer {
+        status: StatusCode,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        trailers: Vec<(String, String)>,
+    }
+
+    impl H2Answer {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn trailer(&self, name: &str) -> Option<&str> {
+            self.trailers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.body).into_owned()
+        }
+    }
+
+    fn header_pairs(map: &http::HeaderMap) -> Vec<(String, String)> {
+        map.iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// The proxy's upstream config, trusting only the test upstream's CA and offering ALPN `h2`
+    /// (without it the proxy fails closed on `upstream-http2-unsupported`, which is the intent).
+    fn trusting_h2(
+        upstream_ca: rustls::pki_types::CertificateDer<'static>,
+    ) -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+        Arc::new(cfg)
+    }
+
+    /// Send a body under h2 flow control, ending the stream if asked.
+    ///
+    /// `reserve_capacity` is a request and `poll_capacity` is the answer: what may be written is
+    /// what was **granted**, never what was asked for, and writing past the grant overruns the
+    /// peer's window.
+    async fn send_under_flow_control(send: &mut h2::SendStream<Bytes>, mut data: Bytes, end: bool) {
+        while !data.is_empty() {
+            send.reserve_capacity(data.len());
+            let granted = match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+                Some(Ok(n)) if n > 0 => n,
+                Some(Ok(_)) => continue,
+                _ => return,
+            };
+            let chunk = data.split_to(granted.min(data.len()));
+            if send.send_data(chunk, data.is_empty() && end).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// One stream on the test upstream: record what arrived, then answer.
+    async fn upstream_stream(
+        req: Request<h2::RecvStream>,
+        mut respond: h2::server::SendResponse<Bytes>,
+        reply: UpstreamReply,
+        trace: Arc<H2Trace>,
+    ) {
+        let (parts, mut src) = req.into_parts();
+        let mut seen = SeenRequest {
+            method: parts.method.to_string(),
+            authority: parts
+                .uri
+                .authority()
+                .map(|a| a.as_str().to_string())
+                .unwrap_or_default(),
+            path: parts
+                .uri
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default(),
+            headers: header_pairs(&parts.headers),
+            body: Vec::new(),
+        };
+        while let Some(chunk) = src.data().await {
+            let Ok(chunk) = chunk else { break };
+            seen.body.extend_from_slice(&chunk);
+            let _ = src.flow_control().release_capacity(chunk.len());
+        }
+        trace.seen.lock().unwrap().push(seen);
+
+        let mut head = Response::builder().status(reply.status);
+        for (n, v) in &reply.headers {
+            head = head.header(n.as_str(), v.as_str());
+        }
+        let ends_with_the_head = reply.body.is_empty() && reply.trailers.is_empty();
+        let Ok(head) = head.body(()) else { return };
+        let Ok(mut send) = respond.send_response(head, ends_with_the_head) else {
+            return;
+        };
+        if !reply.body.is_empty() {
+            let end = reply.trailers.is_empty();
+            send_under_flow_control(&mut send, Bytes::from(reply.body.clone()), end).await;
+        }
+        if !reply.trailers.is_empty() {
+            let mut trailers = http::HeaderMap::new();
+            for (n, v) in &reply.trailers {
+                if let (Ok(n), Ok(v)) = (
+                    n.parse::<http::HeaderName>(),
+                    v.parse::<http::HeaderValue>(),
+                ) {
+                    trailers.insert(n, v);
+                }
+            }
+            let _ = send.send_trailers(trailers);
+        }
+    }
+
+    /// One connection on the test upstream: TLS, then h2, then its streams — driven with the same
+    /// select-and-drive shape [`serve`] uses, since a response is only written while the connection
+    /// itself is being polled.
+    async fn upstream_conn(
+        sock: tokio::net::TcpStream,
+        acceptor: tokio_rustls::TlsAcceptor,
+        reply: UpstreamReply,
+        trace: Arc<H2Trace>,
+    ) {
+        let Ok(tls) = acceptor.accept(sock).await else {
+            return;
+        };
+        trace.upstream_alpn.lock().unwrap().push(
+            tls.get_ref()
+                .1
+                .alpn_protocol()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .unwrap_or_default(),
+        );
+        let Ok(mut conn) = h2::server::handshake(tls).await else {
+            return;
+        };
+        let mut inflight = FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                accepted = conn.accept() => match accepted {
+                    Some(Ok((req, respond))) => inflight.push(upstream_stream(
+                        req,
+                        respond,
+                        reply.clone(),
+                        Arc::clone(&trace),
+                    )),
+                    _ => break,
+                },
+                Some(()) = inflight.next(), if !inflight.is_empty() => {}
+            }
+        }
+        while inflight.next().await.is_some() {}
+    }
+
+    /// A loopback HTTP/2 TLS upstream serving `conns` connections — one per stream, since this
+    /// plane opens a fresh upstream connection for every stream it relays.
+    ///
+    /// It runs on **its own OS thread with its own runtime**: the proxy's leg is a current-thread
+    /// runtime, and an upstream sharing it would be one blocking call away from starving the very
+    /// timers meant to bound the exchange. The thread ends on its own once the proxy's runtime is
+    /// dropped and the connections close.
+    fn spawn_h2_upstream(
+        conns: usize,
+        alpn: Vec<Vec<u8>>,
+        reply: UpstreamReply,
+        trace: Arc<H2Trace>,
+    ) -> (
+        std::net::SocketAddr,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let ca = Arc::new(super::super::Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let mut cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(super::super::ca::CertResolver::new(ca)));
+        cfg.alpn_protocols = alpn;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let mut live = Vec::new();
+                for _ in 0..conns {
+                    let Ok((sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    trace.upstream_tcp.fetch_add(1, Ordering::Relaxed);
+                    live.push(tokio::spawn(upstream_conn(
+                        sock,
+                        acceptor.clone(),
+                        reply.clone(),
+                        Arc::clone(&trace),
+                    )));
+                }
+                for task in live {
+                    let _ = task.await;
+                }
+            });
+        });
+        (addr, ca_der)
+    }
+
+    /// One h2 exchange through the real handler and on to whatever upstream `ctx` points at:
+    /// client leg over an in-memory duplex, proxy leg driven exactly as [`serve`] drives it.
+    ///
+    /// Awaiting a stream without polling the connection is the deadlock this shape exists to avoid:
+    /// a queued response is only written while the connection is being polled, so the accept loop
+    /// and the in-flight streams have to advance together.
+    fn through_h2_proxy(
+        ctx: &ProxyCtx,
+        connect_host: &str,
+        port: u16,
+        request: Request<()>,
+        body: Option<Vec<u8>>,
+        trace: &H2Trace,
+    ) -> H2Answer {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Wide enough that the duplex is never the bottleneck: what is being exercised is the
+            // proxy, not a buffer between two halves of the same test.
+            let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+            let client = async {
+                let (mut send, conn) = h2::client::handshake(client_io).await.unwrap();
+                let driver = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let (resp_fut, mut send_body) = send.send_request(request, body.is_none()).unwrap();
+                if let Some(b) = body {
+                    send_under_flow_control(&mut send_body, Bytes::from(b), true).await;
+                }
+                let (parts, mut recv) = resp_fut.await.unwrap().into_parts();
+                let mut data = Vec::new();
+                while let Some(chunk) = recv.data().await {
+                    let chunk = chunk.unwrap();
+                    data.extend_from_slice(&chunk);
+                    // Return the window as it is consumed, or a response larger than the initial
+                    // one stalls halfway through.
+                    let _ = recv.flow_control().release_capacity(chunk.len());
+                }
+                let trailers = recv.trailers().await.unwrap();
+                driver.abort();
+                H2Answer {
+                    status: parts.status,
+                    headers: header_pairs(&parts.headers),
+                    body: data,
+                    trailers: trailers.as_ref().map(header_pairs).unwrap_or_default(),
+                }
+            };
+            let proxy = async {
+                let mut conn = h2::server::handshake(server_io).await.unwrap();
+                let mut inflight = FuturesUnordered::new();
+                loop {
+                    tokio::select! {
+                        accepted = conn.accept() => match accepted {
+                            Some(Ok((req, respond))) => inflight.push(async {
+                                trace.entered.fetch_add(1, Ordering::Relaxed);
+                                stream(req, respond, connect_host, port, ctx).await;
+                                trace.returned.fetch_add(1, Ordering::Relaxed);
+                            }),
+                            _ => break,
+                        },
+                        Some(()) = inflight.next(), if !inflight.is_empty() => {}
+                    }
+                }
+                while inflight.next().await.is_some() {}
+            };
+            // A bound so a regression that stalls the exchange fails here instead of hanging the
+            // suite; the trace says where it got to.
+            tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::select! {
+                    answer = client => answer,
+                    () = proxy => panic!(
+                        "the proxy leg ended before the client had its answer — {}",
+                        trace.render()
+                    ),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the h2 exchange stalled — {}", trace.render()))
+        })
+    }
+
+    /// The happy path this plane never had: an allowed gRPC stream is relayed to a real HTTP/2
+    /// upstream and its whole answer comes back — head, message, and the `grpc-status` trailer that
+    /// carries the call's actual result. Everything else here refuses before the connect, so this
+    /// is the only test that exercises the relay: the upstream TLS with ALPN `h2`, the request
+    /// rebuilt from the decoded head, and both body directions under flow control.
+    #[test]
+    fn an_allowed_h2_stream_is_relayed_to_a_real_upstream_and_the_whole_answer_returns() {
+        use crate::allowlist::classify;
+        use crate::sandbox::control::{HttpVer, LOG_RING_CAP, LogRing, LogVerdict, RpcKind};
+        use crate::sandbox::egress_stats::EgressStats;
+        use crate::testutil::TmpDir;
+        use std::sync::atomic::Ordering;
+
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+
+        let dir = TmpDir::new();
+        let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let mut ctx = ProxyCtx::new(
+            Arc::new(super::super::Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+        )
+        .unwrap()
+        .with_stats(Arc::clone(&stats))
+        .with_log(Arc::clone(&log))
+        // loopback, permitted only because the deciding rule names this exact host
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        ctx.upstream_h2 = trusting_h2(upstream_ca);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://grpc.test/pkg.Svc/Method")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .unwrap();
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            req,
+            Some(b"PING".to_vec()),
+            &trace,
+        );
+
+        assert_eq!(answer.status, StatusCode::OK);
+        assert_eq!(answer.header("content-type"), Some("application/grpc"));
+        assert_eq!(answer.text(), "PONG", "the response message crossed back");
+        assert_eq!(
+            answer.trailer("grpc-status"),
+            Some("0"),
+            "the trailer carrying the RPC's outcome crossed back: {answer:?}"
+        );
+
+        // What the upstream actually received, which is the only trustworthy account of what was
+        // forwarded: the request half, rebuilt from the decoded head and still bound to its host.
+        let seen = trace.seen_one();
+        assert_eq!(seen.method, "POST");
+        assert_eq!(seen.path, "/pkg.Svc/Method");
+        assert_eq!(seen.authority, "grpc.test");
+        assert_eq!(seen.header("content-type"), Some("application/grpc"));
+        assert_eq!(seen.header("te"), Some("trailers"));
+        assert_eq!(seen.body, b"PING", "the request body crossed too");
+
+        assert_eq!(
+            *trace.upstream_alpn.lock().unwrap(),
+            vec!["h2".to_string()],
+            "the upstream leg is HTTP/2 end to end, never downgraded"
+        );
+        assert_eq!(
+            (
+                trace.entered.load(Ordering::Relaxed),
+                trace.returned.load(Ordering::Relaxed)
+            ),
+            (1, 1),
+            "one stream, entered and returned"
+        );
+
+        // The allow is recorded only once the upstream is connected, and the response status is
+        // amended onto that same event when the head returns.
+        assert_eq!(stats.snapshot()["grpc.test"].allow, 1);
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(
+            events.len(),
+            1,
+            "one event for one relayed stream: {events:?}"
+        );
+        assert_eq!(events[0].verdict, LogVerdict::Allow);
+        assert_eq!(events[0].reason, "allowed");
+        assert_eq!(events[0].method.as_deref(), Some("POST"));
+        assert_eq!(events[0].path.as_deref(), Some("/pkg.Svc/Method"));
+        assert_eq!(events[0].http_ver, HttpVer::H2);
+        assert_eq!(events[0].rpc, RpcKind::Grpc);
+        assert_eq!(events[0].status, Some(200));
+    }
 }
