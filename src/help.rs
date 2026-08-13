@@ -2699,8 +2699,9 @@ const PAGES: &[Page] = &[
             claims; a broker and a signer claim none, so each is named by its own name. A\n\
             broker's page adds the protocol facts a launch acts on and whether the global\n\
             config binds it at all; a signer's states its auth point: the headers it may set,\n\
-            what of the request it is shown, and whether it is handed the credential's\n\
-            plaintext or a marker standing in for one.\n\
+            what of the request it is shown, whether it is handed the credential's plaintext\n\
+            or a marker standing in for one, and whether sbx holds the request body to tell\n\
+            it a digest.\n\
             \n\
             A built-in scheme is reported as such; a scheme several plugins claim is a\n\
             non-zero miss that names every claimant (all disabled until one remains); any\n\

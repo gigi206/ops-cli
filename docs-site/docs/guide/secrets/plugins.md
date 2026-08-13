@@ -442,13 +442,17 @@ places are strip-and-replaced, an `aws` CLI or a boto3 running in the sandbox ca
 carry placeholder credentials: whatever it signed with is dropped, and the
 plugin's signature is the only one the destination sees.
 
-Its one boundary is the request body, and it is worth knowing before you meet it.
-A signer is shown a request's head, never its body, so a payload digest reaches it
-only three ways: the client computed one and sent it as `x-amz-content-sha256`
-(which every AWS SDK does, so bodies work), the request provably has none, or the
-service is S3, which accepts an unsigned payload. A body outside those is
-**refused** rather than signed over the wrong digest, and the refusal says which
-of the three to reach for.
+Bodies work, and the manifest is what makes them: `aws-sigv4` declares
+[`body_digest = "sha256"`](#what-a-signer-is-told-about-the-body), so sbx holds a
+request body before asking and states its digest in the question. That digest is
+of exactly the bytes AWS will receive, so it supersedes one the client claimed,
+while an `x-amz-content-sha256` carrying a literal AWS token rather than a digest
+is honoured verbatim, since it chooses what the signature covers.
+
+One shape is still **refused** rather than signed over a digest that does not
+exist: a body to a non-S3 service over **HTTP/2**, where sbx states the body as
+unheld, from a client that computed no digest of its own. The refusal repeats the
+reason sbx gave.
 
 If a launch refuses because a declared program is not on `PATH`, the tool the
 plugin runs is not installed, or not where the shell that starts sbx looks for

@@ -2443,6 +2443,15 @@ fn info_signer(
             false => "a marker standing in for it, which sbx substitutes on the way out",
         }
     );
+    // Printed only where a manifest asked, because it is what changes how sbx *forwards* a request
+    // and not merely what the plugin is shown: a reader deciding whether to install this plugin is
+    // deciding whether their request bodies are held before they leave.
+    if let Some(algorithm) = p.signer.body_digest {
+        println!(
+            "    body:        its {} digest, which sbx holds the request body to compute",
+            algorithm.name()
+        );
+    }
     print_plugin_host_config(&p.name, &p.sandbox, err, r);
     ExitCode::SUCCESS
 }

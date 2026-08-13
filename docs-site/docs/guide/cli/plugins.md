@@ -31,8 +31,9 @@ protocol facts a launch acts on (the framing, the frame ceiling, how long `sbx` 
 on the host resource, how the cage finds the socket) plus whether the global config
 binds it at all. A [signer](../secrets/plugins#the-signer-type) is named the same way,
 and its page states its auth point: the headers it may set, what of the request it is
-shown, and whether it is handed the credential's plaintext or a marker standing in for
-one.
+shown, whether it is handed the credential's plaintext or a marker standing in for one,
+and whether sbx [holds the request body](../secrets/plugins#what-a-signer-is-told-about-the-body)
+to tell it a digest.
 
 A plugin's name is one namespace across the kinds reached by name, so a broker and a
 signer cannot share one. Two plugins answering to one name are both disabled, exactly
