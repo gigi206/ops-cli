@@ -141,6 +141,8 @@ async fn serve(
         _ => return Ok(()),
     };
 
+    // One pool per tunnel, living exactly as long as the runtime that drives its connections.
+    let pool = UpstreamPool::default();
     let mut inflight = FuturesUnordered::new();
     loop {
         tokio::select! {
@@ -152,7 +154,7 @@ async fn serve(
                         let _ = refuse(respond, StatusCode::TOO_MANY_REQUESTS, "http2-stream-cap");
                         continue;
                     }
-                    inflight.push(stream(req, respond, connect_host, port, ctx));
+                    inflight.push(stream(req, respond, connect_host, port, ctx, &pool));
                 }
                 // Accept error, or the client sent GOAWAY / closed the connection: stop taking
                 // new streams, then drain the ones already in flight below.
@@ -177,12 +179,14 @@ async fn serve(
 /// Handle one h2 stream: decode it, enforce the verdict + SSRF exactly like the HTTP/1.1 path,
 /// then relay it to the validated upstream. Every early return has already answered the client
 /// with a refusal carrying an `x-sbx-egress-reason`.
+#[allow(clippy::too_many_arguments)]
 async fn stream(
     req: Request<h2::RecvStream>,
     respond: h2::server::SendResponse<Bytes>,
     connect_host: &str,
     port: u16,
     ctx: &ProxyCtx,
+    pool: &UpstreamPool,
 ) {
     let method = req.method().clone();
     let path = req
@@ -307,6 +311,7 @@ async fn stream(
         method.as_str(),
         &path,
         ctx,
+        pool,
     )
     .await;
 }
@@ -324,6 +329,7 @@ async fn relay(
     method: &str,
     path: &str,
     ctx: &ProxyCtx,
+    pool: &UpstreamPool,
 ) {
     // One credential state for the whole stream's relay: the injection applied below and the reflection
     // masking decided further down must come from the same resolution.
@@ -394,99 +400,20 @@ async fn relay(
         }
     };
 
-    let tcp =
-        match tokio::time::timeout(ctx.timeout, tokio::net::TcpStream::connect((ip, port))).await {
-            Ok(Ok(t)) => {
-                // Nagle off, as on the HTTP/1.1 paths: h2 writes headers and DATA as separate
-                // frames, so the coalescing Nagle waits for is latency this plane adds per stream.
-                let _ = t.set_nodelay(true);
-                t
-            }
-            _ => {
-                refuse_upstream(
-                    respond,
-                    ctx,
-                    host,
-                    port,
-                    method,
-                    path,
-                    "upstream-unreachable",
-                );
-                return;
-            }
-        };
-    let name = match upstream_server_name(host) {
-        Ok(n) => n,
-        Err(_) => {
-            refuse_upstream(
-                respond,
-                ctx,
-                host,
-                port,
-                method,
-                path,
-                "upstream-cert-rejected",
-            );
+    // The upstream this stream will ride: one this tunnel already opened for the same credential
+    // set, or a new one. HTTP/2 multiplexes, so a connection here is **shared** rather than taken
+    // and returned: several streams use it at once and none of them gives it back.
+    //
+    // Nothing about the decision is reused. The `:authority` re-check, the outbound tripwire, the
+    // verdict, the resolution and the address guard all ran above, per stream, and a stream that any
+    // of them refuses never reaches this line. What is reused is the handshake.
+    let send_req = match ready_upstream(pool, &injected_ids, ip, port, host, ctx).await {
+        Ok(send) => send,
+        Err(reason) => {
+            refuse_upstream(respond, ctx, host, port, method, path, reason);
             return;
         }
     };
-    let connector = tokio_rustls::TlsConnector::from(ctx.upstream_h2.clone());
-    let upstream_tls = match tokio::time::timeout(ctx.timeout, connector.connect(name, tcp)).await {
-        Ok(Ok(t)) => t,
-        // A forged / self-signed / otherwise-untrusted upstream fails validation here — never
-        // downgraded, exactly like the HTTP/1.1 `connect_upstream`. One failure among these is not
-        // about the certificate at all, so it is not reported as one: see [`handshake_reason`].
-        Ok(Err(e)) => {
-            refuse_upstream(respond, ctx, host, port, method, path, handshake_reason(&e));
-            return;
-        }
-        Err(_) => {
-            refuse_upstream(
-                respond,
-                ctx,
-                host,
-                port,
-                method,
-                path,
-                "upstream-cert-rejected",
-            );
-            return;
-        }
-    };
-    if upstream_tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-        // gRPC is HTTP/2 end-to-end; the proxy does not translate to HTTP/1.1. Fail closed.
-        refuse_upstream(
-            respond,
-            ctx,
-            host,
-            port,
-            method,
-            path,
-            "upstream-http2-unsupported",
-        );
-        return;
-    }
-    let (send_req, connection) = match h2::client::handshake(upstream_tls).await {
-        Ok(x) => x,
-        Err(_) => {
-            refuse_upstream(
-                respond,
-                ctx,
-                host,
-                port,
-                method,
-                path,
-                "upstream-http2-unsupported",
-            );
-            return;
-        }
-    };
-    // The upstream connection driver owns only the TLS stream + h2 state (it does not borrow
-    // `ctx`), so it is `'static` and can be spawned on this connection's runtime; it is cancelled
-    // when the runtime is dropped.
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
 
     // The upstream is connected and validated (this is the HTTP/1.1 path's `connect_upstream`
     // success point), so record the allow now — a verdict-passing request that failed to reach
@@ -567,13 +494,7 @@ async fn relay(
     // leaves its own `error` line beside the allow already recorded, which is the shape the HTTP/1.1
     // path leaves for the same event (an allow whose status never arrives, and an `upstream-closed`
     // naming why).
-    let mut send_req = match send_req.ready().await {
-        Ok(s) => s,
-        Err(_) => {
-            refuse_upstream(respond, ctx, host, port, method, path, "upstream-closed");
-            return;
-        }
-    };
+    let mut send_req = send_req;
     let (resp_fut, up_send_body) = match send_req.send_request(up_req, false) {
         Ok(x) => x,
         Err(_) => {
@@ -608,6 +529,11 @@ async fn relay(
     };
     let (mut rparts, up_body) = resp.into_parts();
     ctx.set_status(seq, rparts.status.as_u16());
+    // Stop sharing a connection the upstream has just bound an identity to — see
+    // [`binds_identity_to_the_connection`].
+    if binds_identity_to_the_connection(&rparts.headers) {
+        pool.open.borrow_mut().retain(|(k, _)| *k != injected_ids);
+    }
 
     // Capture the response head, rendered from the framed status + headers. Teed ahead of the
     // reflection masking below, like the HTTP/1.1 path: the capture masks its own buffers at filing
@@ -861,6 +787,144 @@ fn redact_header_map(headers: &mut http::HeaderMap, needles: &[SecretNeedle]) {
     }
 }
 
+/// The upstream connections one tunnel has opened, shared by the streams riding it.
+///
+/// HTTP/2 multiplexes, so this is not the HTTP/1.1 pool's take-and-return: a connection is handed to
+/// every stream that may use it, all at once, and none of them gives it back. It lives exactly as
+/// long as the tunnel, because the runtime driving it is the tunnel's own.
+///
+/// **Keyed by the injected credential set**, which is the whole of the HTTP/1.1 pool's key that is
+/// left once the host and port are fixed by the CONNECT. It is also the half that matters: a
+/// connection that carried a credential is never offered to a stream that does not receive the same
+/// one.
+/// The most connections one tunnel keeps. The key is the injected credential set, which follows
+/// from the **path**, and the path is the caller's to choose: with several path-scoped credentials a
+/// stream can ask for a combination no earlier one used, and each combination is a live connection.
+/// Far above any real policy's distinct sets, and past it a stream still gets its connection, the
+/// tunnel simply stops keeping it — the same stance the leaf cache takes.
+const MAX_POOLED: usize = 8;
+
+#[derive(Default)]
+struct UpstreamPool {
+    // A `RefCell` rather than a lock: every stream of a tunnel runs on that tunnel's single
+    // current-thread runtime. No borrow is ever held across an await.
+    open: std::cell::RefCell<Vec<(Vec<usize>, h2::client::SendRequest<Bytes>)>>,
+}
+
+/// A connection ready to carry this stream: the tunnel's, if it has one for this credential set,
+/// else a new one. `Err` carries the reason token the client is refused with.
+///
+/// A pooled connection the far side closed while it sat idle only reveals that here — and here is
+/// **before** the request is handed over, because `ready` resolves on the connection and
+/// `send_request` is a separate step. So a stale one costs this stream nothing but the handshake it
+/// was trying to avoid, and there is no re-sendability to establish first. That is the whole of why
+/// this pool is simpler than the HTTP/1.1 one, where a body already streamed away cannot be replayed
+/// and the request must therefore qualify before it may take a parked connection at all.
+async fn ready_upstream(
+    pool: &UpstreamPool,
+    ids: &[usize],
+    ip: IpAddr,
+    port: u16,
+    host: &str,
+    ctx: &ProxyCtx,
+) -> Result<h2::client::SendRequest<Bytes>, &'static str> {
+    // `[network] pool = false` means what it says on this plane too: a launch that asked for no
+    // upstream reuse gets a connection per stream, as it did before this pool existed.
+    if ctx.pool.is_none() {
+        return open_upstream(ip, port, host, ctx)
+            .await?
+            .ready()
+            .await
+            .map_err(|_| "upstream-closed");
+    }
+    // Cloned out, and the borrow dropped, before anything is awaited.
+    let pooled = pool
+        .open
+        .borrow()
+        .iter()
+        .find(|(k, _)| k == ids)
+        .map(|(_, send)| send.clone());
+    if let Some(send) = pooled {
+        match send.ready().await {
+            Ok(ready) => return Ok(ready),
+            Err(_) => pool.open.borrow_mut().retain(|(k, _)| k != ids),
+        }
+    }
+    let send = open_upstream(ip, port, host, ctx).await?;
+    {
+        let mut open = pool.open.borrow_mut();
+        if open.len() < MAX_POOLED {
+            open.push((ids.to_vec(), send.clone()));
+        }
+    }
+    send.ready().await.map_err(|_| "upstream-closed")
+}
+
+/// Open one validated HTTP/2 connection to the checked address: connect, terminate TLS with the
+/// certificate validated and ALPN `h2` required, then run the client handshake. `Err` carries the
+/// reason token, so a caller answers the same refusal whether the connection was opened for this
+/// stream or for the one before it.
+async fn open_upstream(
+    ip: IpAddr,
+    port: u16,
+    host: &str,
+    ctx: &ProxyCtx,
+) -> Result<h2::client::SendRequest<Bytes>, &'static str> {
+    let tcp =
+        match tokio::time::timeout(ctx.timeout, tokio::net::TcpStream::connect((ip, port))).await {
+            Ok(Ok(t)) => {
+                // Nagle off, as on the HTTP/1.1 paths: h2 writes headers and DATA as separate
+                // frames, so the coalescing Nagle waits for is latency this plane adds per stream.
+                let _ = t.set_nodelay(true);
+                t
+            }
+            _ => return Err("upstream-unreachable"),
+        };
+    let name = upstream_server_name(host).map_err(|_| "upstream-cert-rejected")?;
+    let connector = tokio_rustls::TlsConnector::from(ctx.upstream_h2.clone());
+    let upstream_tls = match tokio::time::timeout(ctx.timeout, connector.connect(name, tcp)).await {
+        Ok(Ok(t)) => t,
+        // A forged / self-signed / otherwise-untrusted upstream fails validation here — never
+        // downgraded, exactly like the HTTP/1.1 `connect_upstream`. One failure among these is not
+        // about the certificate at all, so it is not reported as one: see [`handshake_reason`].
+        Ok(Err(e)) => return Err(handshake_reason(&e)),
+        Err(_) => return Err("upstream-cert-rejected"),
+    };
+    if upstream_tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+        // gRPC is HTTP/2 end-to-end; the proxy does not translate to HTTP/1.1. Fail closed.
+        return Err("upstream-http2-unsupported");
+    }
+    let (send_req, connection) = h2::client::handshake(upstream_tls)
+        .await
+        .map_err(|_| "upstream-http2-unsupported")?;
+    // The connection driver owns only the TLS stream + h2 state (it does not borrow `ctx`), so it is
+    // `'static` and can be spawned on this tunnel's runtime; it is cancelled when the runtime is
+    // dropped, which is what bounds a pooled connection's life to its tunnel.
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok(send_req)
+}
+
+/// Whether a response binds an authenticated identity to the **connection** rather than to the
+/// request: an `NTLM` or `Negotiate` challenge. The HTTP/1.1 pool refuses to park such a connection
+/// for the same reason this one stops sharing it — handing it to a later stream would hand that
+/// stream an identity it never asked for and cannot see.
+///
+/// The streams already riding it are not recalled, which is inherent to multiplexing and true of any
+/// HTTP/2 client. What this stops is every stream after.
+fn binds_identity_to_the_connection(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all("www-authenticate")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|challenge| {
+            let scheme = challenge.split_whitespace().next().unwrap_or("");
+            scheme.eq_ignore_ascii_case("ntlm") || scheme.eq_ignore_ascii_case("negotiate")
+        })
+}
+
 /// Refuse a stream over its upstream: the client gets the `502` and its reason, and the exchange
 /// leaves an `error` line behind.
 ///
@@ -1059,7 +1123,15 @@ mod tests {
             let proxy = async {
                 let mut conn = h2::server::handshake(server_io).await.unwrap();
                 let (req, respond) = conn.accept().await.unwrap().unwrap();
-                stream(req, respond, "grpc.test", 443, &ctx).await;
+                stream(
+                    req,
+                    respond,
+                    "grpc.test",
+                    443,
+                    &ctx,
+                    &UpstreamPool::default(),
+                )
+                .await;
                 while conn.accept().await.is_some() {}
             };
             // A bound so a regression that stalls the exchange fails the test instead of hanging
@@ -1162,7 +1234,7 @@ mod tests {
                 let proxy = async {
                     let mut conn = h2::server::handshake(server_io).await.unwrap();
                     let (req, respond) = conn.accept().await.unwrap().unwrap();
-                    stream(req, respond, "grpc.test", 443, &ctx).await;
+                    stream(req, respond, "grpc.test", 443, &ctx, &UpstreamPool::default()).await;
                     while conn.accept().await.is_some() {}
                 };
                 // The bound is also the assertion for the `ask` case: a verdict that parked would
@@ -1731,6 +1803,7 @@ mod tests {
     /// Awaiting a stream without polling the connection is the deadlock this shape exists to avoid:
     /// a queued response is only written while the connection is being polled, so the accept loop
     /// and the in-flight streams have to advance together.
+    /// One exchange, for the tests that send a single stream.
     fn through_h2_proxy(
         ctx: &ProxyCtx,
         connect_host: &str,
@@ -1739,6 +1812,20 @@ mod tests {
         body: Option<Vec<u8>>,
         trace: &H2Trace,
     ) -> H2Answer {
+        let mut answers =
+            through_h2_proxy_streams(ctx, connect_host, port, vec![(request, body)], trace);
+        answers.remove(0)
+    }
+
+    /// Several streams over **one** tunnel, answered in order — the shape a multiplexing client
+    /// actually has, and the only way to see what the tunnel's upstream pool does.
+    fn through_h2_proxy_streams(
+        ctx: &ProxyCtx,
+        connect_host: &str,
+        port: u16,
+        requests: Vec<(Request<()>, Option<Vec<u8>>)>,
+        trace: &H2Trace,
+    ) -> Vec<H2Answer> {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
@@ -1755,37 +1842,44 @@ mod tests {
                 let driver = tokio::spawn(async move {
                     let _ = conn.await;
                 });
-                let (resp_fut, mut send_body) = send.send_request(request, body.is_none()).unwrap();
-                if let Some(b) = body {
-                    send_under_flow_control(&mut send_body, Bytes::from(b), true).await;
+                let mut answers = Vec::new();
+                for (request, body) in requests {
+                    let (resp_fut, mut send_body) =
+                        send.send_request(request, body.is_none()).unwrap();
+                    if let Some(b) = body {
+                        send_under_flow_control(&mut send_body, Bytes::from(b), true).await;
+                    }
+                    let (parts, mut recv) = resp_fut.await.unwrap().into_parts();
+                    let mut data = Vec::new();
+                    while let Some(chunk) = recv.data().await {
+                        let chunk = chunk.unwrap();
+                        data.extend_from_slice(&chunk);
+                        // Return the window as it is consumed, or a response larger than the
+                        // initial one stalls halfway through.
+                        let _ = recv.flow_control().release_capacity(chunk.len());
+                    }
+                    let trailers = recv.trailers().await.unwrap();
+                    answers.push(H2Answer {
+                        status: parts.status,
+                        headers: header_pairs(&parts.headers),
+                        body: data,
+                        trailers: trailers.as_ref().map(header_pairs).unwrap_or_default(),
+                    });
                 }
-                let (parts, mut recv) = resp_fut.await.unwrap().into_parts();
-                let mut data = Vec::new();
-                while let Some(chunk) = recv.data().await {
-                    let chunk = chunk.unwrap();
-                    data.extend_from_slice(&chunk);
-                    // Return the window as it is consumed, or a response larger than the initial
-                    // one stalls halfway through.
-                    let _ = recv.flow_control().release_capacity(chunk.len());
-                }
-                let trailers = recv.trailers().await.unwrap();
                 driver.abort();
-                H2Answer {
-                    status: parts.status,
-                    headers: header_pairs(&parts.headers),
-                    body: data,
-                    trailers: trailers.as_ref().map(header_pairs).unwrap_or_default(),
-                }
+                answers
             };
             let proxy = async {
                 let mut conn = h2::server::handshake(server_io).await.unwrap();
+                // One pool per tunnel, exactly as `serve` holds it.
+                let pool = UpstreamPool::default();
                 let mut inflight = FuturesUnordered::new();
                 loop {
                     tokio::select! {
                         accepted = conn.accept() => match accepted {
                             Some(Ok((req, respond))) => inflight.push(async {
                                 trace.entered.fetch_add(1, Ordering::Relaxed);
-                                stream(req, respond, connect_host, port, ctx).await;
+                                stream(req, respond, connect_host, port, ctx, &pool).await;
                                 trace.returned.fetch_add(1, Ordering::Relaxed);
                             }),
                             _ => break,
@@ -1809,6 +1903,186 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("the h2 exchange stalled — {}", trace.render()))
         })
+    }
+
+    /// Two streams of one tunnel that receive the same credential share one upstream connection;
+    /// two that receive different ones do not.
+    ///
+    /// The first half is the point of the pool: HTTP/2 multiplexes, so a client that opens one
+    /// tunnel and many streams was paying a TCP connection, a TLS handshake and an h2 handshake for
+    /// every one of them.
+    ///
+    /// **The second half is the reason the pool is keyed the way it is**, and it is the half worth
+    /// breaking the test over: a connection that carried a credential must never be offered to a
+    /// stream that does not receive the same one. Everything else a stream is checked for happens
+    /// before the pool is consulted at all, per stream, so reuse cannot skip it: the `:authority`
+    /// re-check, the outbound tripwire, the verdict, the resolution and the address guard.
+    #[test]
+    fn streams_share_an_upstream_only_with_the_credential_set_they_share() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::HeaderInjection;
+        use std::sync::atomic::Ordering;
+
+        let plain = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("https://grpc.test/pkg.Svc/Method")
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap()
+        };
+        let scoped = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("https://grpc.test/pkg.Svc/Secret")
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap()
+        };
+
+        // Same credential set (neither stream matches the injection): one connection for both.
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            4,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx.with_injections(vec![HeaderInjection::fixed(
+            classify("grpc.test:*/pkg.Svc/Secret").unwrap(),
+            "authorization".to_string(),
+            "Bearer sbx-issued".to_string(),
+        )]);
+        let answers = through_h2_proxy_streams(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            vec![(plain(), None), (plain(), None)],
+            &trace,
+        );
+        assert!(answers.iter().all(|a| a.status == StatusCode::OK));
+        assert_eq!(
+            trace.upstream_tcp.load(Ordering::Relaxed),
+            1,
+            "two streams receiving the same credentials ride one connection: {}",
+            trace.render()
+        );
+
+        // Different credential sets: the injected stream must not ride the other's connection.
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            4,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let ctx = ctx.with_injections(vec![HeaderInjection::fixed(
+            classify("grpc.test:*/pkg.Svc/Secret").unwrap(),
+            "authorization".to_string(),
+            "Bearer sbx-issued".to_string(),
+        )]);
+        let answers = through_h2_proxy_streams(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            vec![(plain(), None), (scoped(), None)],
+            &trace,
+        );
+        assert!(answers.iter().all(|a| a.status == StatusCode::OK));
+        assert_eq!(
+            trace.upstream_tcp.load(Ordering::Relaxed),
+            2,
+            "a stream carrying a credential opens its own: {}",
+            trace.render()
+        );
+        let seen = trace.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        let credentialed: Vec<&SeenRequest> = seen
+            .iter()
+            .filter(|r| r.header("authorization").is_some())
+            .collect();
+        assert_eq!(
+            credentialed.len(),
+            1,
+            "exactly one of the two carried the credential: {seen:?}"
+        );
+        assert_eq!(credentialed[0].path, "/pkg.Svc/Secret");
+        drop(seen);
+
+        // ...and `[network] pool = false` means what it says here too: no reuse, one connection per
+        // stream, exactly as before the pool existed.
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            4,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let dir = crate::testutil::TmpDir::new();
+        let mut ctx = ProxyCtx::new(
+            Arc::new(super::super::Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]).with_pool(false),
+        )
+        .unwrap()
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+        ctx.upstream_h2 = trusting_h2(upstream_ca);
+        let _keep = dir;
+        let answers = through_h2_proxy_streams(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            vec![(plain(), None), (plain(), None)],
+            &trace,
+        );
+        assert!(answers.iter().all(|a| a.status == StatusCode::OK));
+        assert_eq!(
+            trace.upstream_tcp.load(Ordering::Relaxed),
+            2,
+            "a launch that asked for no reuse gets none: {}",
+            trace.render()
+        );
+    }
+
+    /// A connection the upstream binds an identity to stops being shared.
+    ///
+    /// `NTLM` and `Negotiate` authenticate the *connection*, not the request, so a later stream
+    /// riding it would inherit an identity it never asked for and cannot see. The HTTP/1.1 pool
+    /// refuses to park such a connection; this one stops offering it. The streams already on it are
+    /// not recalled, which is inherent to multiplexing.
+    #[test]
+    fn a_connection_the_upstream_binds_an_identity_to_stops_being_shared() {
+        use std::sync::atomic::Ordering;
+
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            4,
+            vec![b"h2".to_vec()],
+            UpstreamReply {
+                answers: true,
+                status: StatusCode::UNAUTHORIZED,
+                headers: vec![("www-authenticate".into(), "Negotiate".into())],
+                body: Vec::new(),
+                trailers: Vec::new(),
+            },
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let answers = through_h2_proxy_streams(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            vec![(grpc_request(&[]), None), (grpc_request(&[]), None)],
+            &trace,
+        );
+        assert!(answers.iter().all(|a| a.status == StatusCode::UNAUTHORIZED));
+        assert_eq!(
+            trace.upstream_tcp.load(Ordering::Relaxed),
+            2,
+            "the second stream must not ride the connection the challenge was bound to: {}",
+            trace.render()
+        );
     }
 
     /// The happy path this plane never had: an allowed gRPC stream is relayed to a real HTTP/2

@@ -318,6 +318,20 @@ The residual is a server closing a waiting connection in the microseconds betwee
 proxy's check and its write. That request gets a `502 upstream-closed`, never a silent
 empty response.
 
+**On the HTTP/2 plane it is sharing rather than take-and-return.** HTTP/2 multiplexes,
+so a connection there is handed to every stream that may use it at once and none of them
+gives it back; it lives as long as the tunnel that opened it. The key keeps its
+load-bearing half, the injected credential set, so a connection that carried a
+credential is still never offered to a stream that does not receive the same one. What
+does not carry over is the re-sendability condition, and for a good reason: on this
+plane the proxy learns a connection is stale *before* the request is handed to it, so a
+stale one costs the stream only the handshake it was trying to save. Everything a stream
+is checked for happens before any of this: the `:authority` re-check, the outbound
+tripwire, the verdict, the resolution and the address guard all run per stream, and one
+that any of them refuses never reaches the connection at all.
+
+`pool = false` turns reuse off on both planes alike.
+
 ### CONNECT authority == SNI == decrypted Host (anti-domain-fronting)
 
 Domain fronting is connecting to one host at the TCP/TLS layer while addressing a
