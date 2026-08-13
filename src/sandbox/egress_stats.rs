@@ -12,8 +12,14 @@
 //! - **Flush per decision, not on exit.** A long-running agent session most often ends by being
 //!   killed (`sbx session stop` sends SIGTERM→SIGKILL), and a Rust `Drop` does not run on a signal — so a
 //!   flush-on-drop would silently persist nothing for exactly the sessions worth auditing. Each
-//!   recorded decision rewrites the (tiny — one line per distinct host) session file atomically, so
-//!   the file is current as of the last completed request regardless of how the session dies.
+//!   recorded decision rewrites the session file atomically, so the file is current as of the last
+//!   completed request regardless of how the session dies.
+//! - **Bounded in destinations.** That per-decision rewrite is only affordable because the file is
+//!   small, and it is only small because the number of rows is capped ([`MAX_HOSTS`]). The key is
+//!   the destination the caller in the cage chose, reached before any policy decision permits
+//!   anything, so uncapped it is the caller who decides how much the host rewrites per request.
+//!   Destinations past the cap are folded into one counter rather than dropped ([`Tally::overflow`]),
+//!   so the totals stay true.
 //! - **One file per session, aggregated at read.** Files are keyed by this process *incarnation*
 //!   (`stats-<pid>-<start-ticks>`), so two sessions of the same project never contend on a write and
 //!   a later process reusing the pid cannot clobber a prior session's still-wanted file; `sbx net
@@ -31,8 +37,9 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Which bucket a recorded request falls into — one per request (see the module note).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +74,89 @@ impl Counts {
             StatKind::Blocked => self.blocked += 1,
         }
     }
+
+    fn add(&mut self, other: &Counts) {
+        self.allow += other.allow;
+        self.deny += other.deny;
+        self.blocked += other.blocked;
+    }
+}
+
+/// The most destinations one set of counters keeps a row for.
+///
+/// The key is the destination host, which the caller in the cage chooses and which reaches this
+/// counter **before** any policy decision permits anything — a refused request is counted, and a
+/// refused `http://` request is one plaintext line on a socket with no TLS, no DNS and no upstream
+/// behind it. Uncapped, that is an in-cage caller setting the pace at which the host allocates and
+/// rewrites a file, outside the cage's own memory ceiling; every other accumulation this proxy
+/// exposes to a caller is bounded the same way (the leaf cache, the capture and log rings, the
+/// notification queue, the splice and connection counts, the held-body budget, the pool).
+///
+/// Far above any real workload, which reaches a handful of hosts: this is the pathological case's
+/// bound, not a budget anyone should meet. What lands past it is folded rather than dropped, so the
+/// totals stay true — see [`Tally::overflow`].
+const MAX_HOSTS: usize = 256;
+
+/// How often at most the session file is rewritten while requests keep arriving.
+///
+/// The file is rewritten whole on every decision, which is what keeps it current no matter how a
+/// session dies. At an ordinary request rate that is a few writes a second and the interval never
+/// binds. Under a flood it is the difference between the caller in the cage choosing how fast the
+/// host writes to storage and the host choosing: a refused request costs the caller one line on a
+/// socket and was costing the host a rewrite of every row it had ever recorded, measured at roughly
+/// four kilobytes for every sixty bytes asked.
+///
+/// Short enough that a person reading `sbx net stats` beside a running session sees live numbers,
+/// which is the property being traded against — see [`start_flusher`] for the other half of keeping
+/// it.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// A set of egress counters: a row per destination, plus everything folded past [`MAX_HOSTS`].
+///
+/// The two travel together everywhere counters do — recorded, serialized, parsed, summed across
+/// sessions, folded into a rollup — which is why they are one type rather than two values a caller
+/// has to remember to carry in pairs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    /// One row per destination, up to [`MAX_HOSTS`] of them.
+    pub(crate) hosts: BTreeMap<String, Counts>,
+    /// Requests whose destination got no row of its own. Their counts are kept, so what
+    /// `sbx net stats` adds up is still every request the proxy decided; *which* hosts they were is
+    /// deliberately not remembered, since remembering is what the cap exists to stop.
+    pub(crate) overflow: Counts,
+}
+
+impl Tally {
+    /// Count one request for `host`, giving it a row while there is room and folding it into
+    /// [`Self::overflow`] once there is not. A host that already has a row always keeps counting
+    /// into it, so the cap never turns a busy destination into an anonymous one part-way through.
+    fn bump(&mut self, host: &str, kind: StatKind) {
+        if self.hosts.contains_key(host) || self.hosts.len() < MAX_HOSTS {
+            self.hosts.entry(host.to_string()).or_default().bump(kind);
+        } else {
+            self.overflow.bump(kind);
+        }
+    }
+
+    /// Add another tally into this one, host by host — summing across sessions, and folding session
+    /// files into a rollup. A host beyond the cap folds here too, so merging many sessions that each
+    /// stayed under it cannot walk past it.
+    pub(crate) fn merge(&mut self, other: &Tally) {
+        for (host, c) in &other.hosts {
+            if self.hosts.contains_key(host) || self.hosts.len() < MAX_HOSTS {
+                self.hosts.entry(host.clone()).or_default().add(c);
+            } else {
+                self.overflow.add(c);
+            }
+        }
+        self.overflow.add(&other.overflow);
+    }
+
+    /// Whether nothing has been recorded at all — the "nothing recorded yet" case, which the
+    /// overflow has to be part of or a tally holding only folded counts would read as empty.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.overflow.total() == 0
+    }
 }
 
 /// One session's live counters plus the metadata that lets a reader attribute them to a project.
@@ -82,7 +172,16 @@ pub(crate) struct EgressStats {
     /// A monotonic counter giving each flush a unique temp filename, so concurrent flushes from
     /// different connection threads never collide on the temp before the atomic rename.
     tmp_seq: AtomicU64,
-    inner: Mutex<BTreeMap<String, Counts>>,
+    /// When this set of counters was created, the origin [`Self::next_flush_ms`] is measured from.
+    started: Instant,
+    /// Milliseconds since [`Self::started`] at which the next write is allowed. Read and written
+    /// only under `inner`, which is what serialises it.
+    next_flush_ms: AtomicU64,
+    /// Whether a decision has been recorded that no write has yet persisted — what
+    /// [`start_flusher`] looks at, so the tail of a burst is not left in memory once the traffic
+    /// that produced it stops.
+    pending: AtomicBool,
+    inner: Mutex<Tally>,
 }
 
 impl EgressStats {
@@ -92,7 +191,12 @@ impl EgressStats {
             project,
             app,
             tmp_seq: AtomicU64::new(0),
-            inner: Mutex::new(BTreeMap::new()),
+            started: Instant::now(),
+            // Zero, so the first decision of a session writes its file at once rather than after an
+            // interval in which `sbx net stats` would have nothing to read.
+            next_flush_ms: AtomicU64::new(0),
+            pending: AtomicBool::new(false),
+            inner: Mutex::new(Tally::default()),
         }
     }
 
@@ -103,9 +207,43 @@ impl EgressStats {
     /// flush race is at most an off-by-a-few that the next decision corrects.
     pub(crate) fn record(&self, host: &str, kind: StatKind) {
         let snapshot = {
-            let mut map = self.inner.lock().unwrap();
-            map.entry(host.to_string()).or_default().bump(kind);
-            map.clone()
+            let mut tally = self.inner.lock().unwrap();
+            tally.bump(host, kind);
+            if !self.due_to_write() {
+                self.pending.store(true, Ordering::Relaxed);
+                return;
+            }
+            // Cleared before the snapshot is taken and under the same lock, so a decision recorded
+            // after this one cannot have its flag cleared by this write.
+            self.pending.store(false, Ordering::Relaxed);
+            tally.clone()
+        };
+        let _ = self.flush(&snapshot);
+    }
+
+    /// Whether enough time has passed since the last write to take another. Called only under
+    /// `inner`, which is what makes the read-then-write of the deadline sound.
+    fn due_to_write(&self) -> bool {
+        let now = self.started.elapsed().as_millis() as u64;
+        if now < self.next_flush_ms.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.next_flush_ms
+            .store(now + FLUSH_INTERVAL.as_millis() as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// Write out whatever the interval left behind, if anything. The trailing half of the debounce:
+    /// without it the decisions of the last interval before a session goes quiet would sit in memory
+    /// for as long as the silence lasts, and a reader would be told a number that stops short of
+    /// what the proxy decided.
+    fn flush_pending(&self) {
+        let snapshot = {
+            let tally = self.inner.lock().unwrap();
+            if !self.pending.swap(false, Ordering::Relaxed) {
+                return;
+            }
+            tally.clone()
         };
         let _ = self.flush(&snapshot);
     }
@@ -113,7 +251,11 @@ impl EgressStats {
     /// Write the current counters out, a final tidy for a graceful exit (the per-decision flush
     /// already keeps the file current; this just guarantees the last state is on disk).
     pub(crate) fn flush_final(&self) {
-        let snapshot = self.inner.lock().unwrap().clone();
+        let snapshot = {
+            let tally = self.inner.lock().unwrap();
+            self.pending.store(false, Ordering::Relaxed);
+            tally.clone()
+        };
         let _ = self.flush(&snapshot);
     }
 
@@ -121,13 +263,13 @@ impl EgressStats {
     /// without round-tripping through the file.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> BTreeMap<String, Counts> {
-        self.inner.lock().unwrap().clone()
+        self.inner.lock().unwrap().hosts.clone()
     }
 
     /// Serialise a snapshot to the session file atomically (temp + rename), so a reader never sees a
     /// torn file and a crash mid-write leaves the prior good file in place.
-    fn flush(&self, counts: &BTreeMap<String, Counts>) -> io::Result<()> {
-        let body = serialize(&self.project, self.app.as_deref(), counts);
+    fn flush(&self, tally: &Tally) -> io::Result<()> {
+        let body = serialize(&self.project, self.app.as_deref(), tally);
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         let tmp = self.path.with_extension(format!("tmp.{seq}"));
         // Owner-only: the counters live under the 0700 egress dir, but tighten the file too.
@@ -156,19 +298,28 @@ impl EgressStats {
 pub(crate) struct SessionStats {
     pub(crate) project: String,
     pub(crate) app: Option<String>,
-    pub(crate) counts: BTreeMap<String, Counts>,
+    pub(crate) tally: Tally,
 }
 
 /// The session-file body: `project=`/`app=` metadata lines, then one `host\tallow\tdeny\tblocked`
 /// row per destination (host first; a host carries no tab, so the four fields are unambiguous).
-fn serialize(project: &str, app: Option<&str>, counts: &BTreeMap<String, Counts>) -> String {
+fn serialize(project: &str, app: Option<&str>, tally: &Tally) -> String {
     let mut out = String::new();
     out.push_str(&format!("project={project}\n"));
     if let Some(app) = app {
         out.push_str(&format!("app={app}\n"));
     }
-    for (host, c) in counts {
+    for (host, c) in &tally.hosts {
         out.push_str(&format!("{host}\t{}\t{}\t{}\n", c.allow, c.deny, c.blocked));
+    }
+    // Written only when something was actually folded, so a file from a session that stayed under
+    // the cap — every real one — is byte-for-byte what it was before the cap existed.
+    let o = &tally.overflow;
+    if o.total() > 0 {
+        out.push_str(&format!(
+            "overflow={}\t{}\t{}\n",
+            o.allow, o.deny, o.blocked
+        ));
     }
     out
 }
@@ -179,12 +330,29 @@ fn serialize(project: &str, app: Option<&str>, counts: &BTreeMap<String, Counts>
 fn parse(contents: &str) -> Option<SessionStats> {
     let mut project = None;
     let mut app = None;
-    let mut counts = BTreeMap::new();
+    let mut tally = Tally::default();
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("project=") {
             project = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("app=") {
             app = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("overflow=") {
+            // Read on the same terms as a counter row: three numbers, and a malformed one skipped
+            // rather than fatal. Recognized by prefix like the two headers above, and carrying the
+            // same theoretical ambiguity they do (a destination literally named `overflow=…`), which
+            // costs that destination its row and nothing else.
+            let mut f = rest.split('\t');
+            let (Some(a), Some(d), Some(b), None) = (f.next(), f.next(), f.next(), f.next()) else {
+                continue;
+            };
+            let (Ok(allow), Ok(deny), Ok(blocked)) = (a.parse(), d.parse(), b.parse()) else {
+                continue;
+            };
+            tally.overflow.add(&Counts {
+                allow,
+                deny,
+                blocked,
+            });
         } else {
             let mut f = line.split('\t');
             let (Some(host), Some(a), Some(d), Some(b)) = (f.next(), f.next(), f.next(), f.next())
@@ -194,7 +362,7 @@ fn parse(contents: &str) -> Option<SessionStats> {
             let (Ok(allow), Ok(deny), Ok(blocked)) = (a.parse(), d.parse(), b.parse()) else {
                 continue;
             };
-            counts.insert(
+            tally.hosts.insert(
                 host.to_string(),
                 Counts {
                     allow,
@@ -207,8 +375,33 @@ fn parse(contents: &str) -> Option<SessionStats> {
     project.map(|project| SessionStats {
         project,
         app,
-        counts,
+        tally,
     })
+}
+
+/// Start the trailing write for `stats`: a thread that persists whatever [`FLUSH_INTERVAL`] held
+/// back, once the traffic that produced it stops.
+///
+/// It is what keeps the interval a rate limit rather than a change to what the file means. Without
+/// it, a burst that ends inside an interval leaves its last decisions in memory, and a person
+/// reading `sbx net stats` beside a session that has gone quiet is told a number that stops short of
+/// what the proxy decided — for as long as the quiet lasts.
+///
+/// The thread holds a [`Weak`](std::sync::Weak), so it ends on its own once the launch lets go of
+/// its counters. There is no stop flag, and so none to forget to set on a path that exits early.
+pub(crate) fn start_flusher(stats: &Arc<EgressStats>) {
+    let weak = Arc::downgrade(stats);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(FLUSH_INTERVAL);
+            // The upgraded handle is dropped at the end of this arm, so holding it never keeps the
+            // counters (and with them this thread) alive past the launch.
+            match weak.upgrade() {
+                Some(stats) => stats.flush_pending(),
+                None => break,
+            }
+        }
+    });
 }
 
 /// The prefix of a folded file: the summed counters of sessions that have ended, one per
@@ -256,7 +449,7 @@ fn rollup_name(project: &str, app: Option<&str>) -> String {
 }
 
 /// The finished files of one project+app, and the counters they add up to.
-type Group = (Vec<PathBuf>, BTreeMap<String, Counts>);
+type Group = (Vec<PathBuf>, Tally);
 
 /// Fold the counters of every finished session into one file per project+app, and return the files
 /// that were (or, in a dry run, would be) folded away.
@@ -287,18 +480,13 @@ pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
         };
         let slot = groups
             .entry((session.project, session.app))
-            .or_insert_with(|| (Vec::new(), BTreeMap::new()));
+            .or_insert_with(|| (Vec::new(), Tally::default()));
         slot.0.push(entry.path());
-        for (host, c) in session.counts {
-            let e = slot.1.entry(host).or_default();
-            e.allow += c.allow;
-            e.deny += c.deny;
-            e.blocked += c.blocked;
-        }
+        slot.1.merge(&session.tally);
     }
 
     let mut folded = Vec::new();
-    for ((project, app), (sources, counts)) in groups {
+    for ((project, app), (sources, tally)) in groups {
         let target = egress_dir.join(rollup_name(&project, app.as_deref()));
         // A group that is already exactly its own rollup has nothing to fold; re-writing it every
         // pass would be churn for no change.
@@ -310,7 +498,7 @@ pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
             folded.extend(gone);
             continue;
         }
-        if write_rollup(&target, &project, app.as_deref(), &counts).is_err() {
+        if write_rollup(&target, &project, app.as_deref(), &tally).is_err() {
             continue; // keep the sources: losing counters is worse than keeping files
         }
         for path in gone {
@@ -325,14 +513,9 @@ pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
 
 /// Write a folded file atomically (temp + rename), so a reader never sees it half-written and an
 /// interrupted fold leaves the sources still standing.
-fn write_rollup(
-    target: &Path,
-    project: &str,
-    app: Option<&str>,
-    counts: &BTreeMap<String, Counts>,
-) -> io::Result<()> {
+fn write_rollup(target: &Path, project: &str, app: Option<&str>, tally: &Tally) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let body = serialize(project, app, counts);
+    let body = serialize(project, app, tally);
     let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
     let write = || -> io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
@@ -374,12 +557,8 @@ fn session_files(egress_dir: &Path) -> Vec<SessionStats> {
 /// Aggregate every session file for `project` (and `app`, when given) into one host→counts map,
 /// summing across sessions. An absent directory or no matching file is an empty map (a clean
 /// "nothing recorded yet").
-pub(crate) fn aggregate(
-    egress_dir: &Path,
-    project: &str,
-    app: Option<&str>,
-) -> BTreeMap<String, Counts> {
-    let mut total: BTreeMap<String, Counts> = BTreeMap::new();
+pub(crate) fn aggregate(egress_dir: &Path, project: &str, app: Option<&str>) -> Tally {
+    let mut total = Tally::default();
     for session in session_files(egress_dir) {
         if session.project != project {
             continue;
@@ -389,12 +568,7 @@ pub(crate) fn aggregate(
         {
             continue;
         }
-        for (host, c) in session.counts {
-            let e = total.entry(host).or_default();
-            e.allow += c.allow;
-            e.deny += c.deny;
-            e.blocked += c.blocked;
-        }
+        total.merge(&session.tally);
     }
     total
 }
@@ -456,9 +630,13 @@ mod tests {
         )]
         .into_iter()
         .collect();
+        let tally = Tally {
+            hosts: counts,
+            ..Tally::default()
+        };
         std::fs::write(
             dir.join(format!("stats-{pid}-{ticks}")),
-            serialize(project, None, &counts),
+            serialize(project, None, &tally),
         )
         .unwrap();
     }
@@ -519,7 +697,7 @@ mod tests {
             "the live session's file must be untouched"
         );
         assert_eq!(
-            aggregate(egress, "/p", None)["api.example.com"].allow,
+            aggregate(egress, "/p", None).hosts["api.example.com"].allow,
             3,
             "the live file and the fold are both still counted"
         );
@@ -540,7 +718,10 @@ mod tests {
             "a folded directory has nothing left to fold"
         );
         assert_eq!(std::fs::read_dir(egress).unwrap().count(), 1);
-        assert_eq!(aggregate(egress, "/p", None)["api.example.com"].allow, 7);
+        assert_eq!(
+            aggregate(egress, "/p", None).hosts["api.example.com"].allow,
+            7
+        );
     }
 
     /// A dry run reports what it would fold and touches nothing — the same contract the rest of gc
@@ -570,13 +751,19 @@ mod tests {
 
         compact(egress, true);
 
-        assert_eq!(aggregate(egress, "/a", None)["api.example.com"].allow, 3);
-        assert_eq!(aggregate(egress, "/b", None)["api.example.com"].allow, 4);
+        assert_eq!(
+            aggregate(egress, "/a", None).hosts["api.example.com"].allow,
+            3
+        );
+        assert_eq!(
+            aggregate(egress, "/b", None).hosts["api.example.com"].allow,
+            4
+        );
         assert_eq!(std::fs::read_dir(egress).unwrap().count(), 2);
     }
 
     #[test]
-    fn record_flushes_each_decision_to_the_session_file() {
+    fn recorded_decisions_round_trip_through_the_session_file() {
         let dir = TmpDir::new();
         let path = dir.path().join("stats-1");
         let stats = EgressStats::new(path.clone(), "/home/u/proj".into(), None);
@@ -585,14 +772,16 @@ mod tests {
         stats.record("cache.nixos.org", StatKind::Allow);
         stats.record("evil.test", StatKind::Deny);
         stats.record("evil.test", StatKind::Blocked);
+        // The tail of a burst is written by the trailing write or, as here, by the session's own
+        // final one — see `a_burst_is_rate_limited_but_never_lost` for the timing this stands on.
+        stats.flush_final();
 
-        // The file is current after each decision (not only on a final flush) — read it straight
-        // back through the parser.
+        // Read the file straight back through the parser.
         let parsed = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed.project, "/home/u/proj");
         assert_eq!(parsed.app, None);
         assert_eq!(
-            parsed.counts["cache.nixos.org"],
+            parsed.tally.hosts["cache.nixos.org"],
             Counts {
                 allow: 2,
                 deny: 0,
@@ -600,7 +789,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parsed.counts["evil.test"],
+            parsed.tally.hosts["evil.test"],
             Counts {
                 allow: 0,
                 deny: 1,
@@ -622,12 +811,19 @@ mod tests {
                 blocked: 0,
             },
         );
-        let body = serialize("/p", Some("demo"), &counts);
+        let body = serialize(
+            "/p",
+            Some("demo"),
+            &Tally {
+                hosts: counts,
+                ..Tally::default()
+            },
+        );
         let parsed = parse(&body).unwrap();
         assert_eq!(parsed.project, "/p");
         assert_eq!(parsed.app.as_deref(), Some("demo"));
         assert_eq!(
-            parsed.counts["a.test"],
+            parsed.tally.hosts["a.test"],
             Counts {
                 allow: 5,
                 deny: 1,
@@ -642,8 +838,8 @@ mod tests {
         assert!(parse("a.test\t1\t0\t0\n").is_none());
         // A header plus one good row and one malformed row → the good row survives.
         let parsed = parse("project=/p\ngood.test\t3\t0\t0\nbad row\tx\ty\n").unwrap();
-        assert_eq!(parsed.counts.len(), 1);
-        assert_eq!(parsed.counts["good.test"].allow, 3);
+        assert_eq!(parsed.tally.hosts.len(), 1);
+        assert_eq!(parsed.tally.hosts["good.test"].allow, 3);
     }
 
     #[test]
@@ -668,12 +864,173 @@ mod tests {
 
         // Project-wide: both /p sessions sum (2+3), the /other one is excluded.
         let all = aggregate(dir.path(), "/p", None);
-        assert_eq!(all["h.test"].allow, 5);
+        assert_eq!(all.hosts["h.test"].allow, 5);
         // App-scoped: only the `demo` session.
         let app = aggregate(dir.path(), "/p", Some("demo"));
-        assert_eq!(app["h.test"].allow, 3);
+        assert_eq!(app.hosts["h.test"].allow, 3);
         // An unrelated project: empty.
         assert!(aggregate(dir.path(), "/nope", None).is_empty());
+    }
+
+    /// The first decision of a session is written at once, a burst behind it is rate-limited rather
+    /// than written per decision, and none of it is lost.
+    ///
+    /// The interval exists because the file is rewritten whole and the destination is the caller's
+    /// to choose: uncapped, an in-cage caller decides how fast the host writes to storage, measured
+    /// at roughly four kilobytes of writes for a sixty-byte refused request. What it must not become
+    /// is a change to what the file *means*, which is what the trailing write settles.
+    #[test]
+    fn a_burst_is_rate_limited_but_never_lost() {
+        let dir = TmpDir::new();
+        let path = dir.path().join("stats-1");
+        let stats = EgressStats::new(path.clone(), "/p".into(), None);
+        let on_disk = || {
+            parse(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .tally
+                .hosts["a.test"]
+                .allow
+        };
+
+        stats.record("a.test", StatKind::Allow);
+        assert_eq!(
+            on_disk(),
+            1,
+            "the first decision of a session is on disk immediately, so a reader beside a launch \
+             that has just started is not told there is nothing"
+        );
+
+        for _ in 0..999 {
+            stats.record("a.test", StatKind::Allow);
+        }
+        assert!(
+            on_disk() < 1000,
+            "the burst behind it did not rewrite the file once per decision"
+        );
+
+        stats.flush_pending();
+        assert_eq!(
+            on_disk(),
+            1000,
+            "and the trailing write persists every one of them"
+        );
+        // Nothing further is pending, so a quiet session does not keep rewriting the same file.
+        std::fs::remove_file(&path).unwrap();
+        stats.flush_pending();
+        assert!(
+            !path.exists(),
+            "a trailing write with nothing to say writes nothing"
+        );
+    }
+
+    /// Past the cap a destination gets no row, and its requests are still counted.
+    ///
+    /// The cap exists because the key is chosen by the caller in the cage and reached before any
+    /// policy decision permits anything — see [`MAX_HOSTS`]. Dropping the counts instead would make
+    /// the one number this file exists to produce quietly wrong, so they fold.
+    ///
+    /// The expected values are literals rather than expressions over [`MAX_HOSTS`]: moving the cap
+    /// should make a reader come here and agree to the new numbers, not slide past a test that
+    /// re-derives whatever the constant now says.
+    #[test]
+    fn a_destination_past_the_cap_is_folded_rather_than_dropped() {
+        let mut tally = Tally::default();
+        for i in 0..300 {
+            tally.bump(&format!("h{i}.test"), StatKind::Deny);
+        }
+        assert_eq!(tally.hosts.len(), 256, "the cap is where rows stop");
+        assert_eq!(
+            tally.overflow,
+            Counts {
+                allow: 0,
+                deny: 44,
+                blocked: 0
+            },
+            "the 44 destinations past it are counted without being named"
+        );
+        assert_eq!(
+            tally.hosts.values().map(Counts::total).sum::<u64>() + tally.overflow.total(),
+            300,
+            "every request is still counted exactly once"
+        );
+
+        // A destination that already has a row keeps counting into it, so the cap never turns a busy
+        // one anonymous part-way through.
+        tally.bump("h0.test", StatKind::Deny);
+        assert_eq!(tally.hosts["h0.test"].deny, 2);
+        assert_eq!(tally.overflow.deny, 44, "and does not fold on the way");
+    }
+
+    /// Merging obeys the same cap, so summing many sessions that each stayed under it cannot walk
+    /// past it — the read side is where a project's sessions actually add up.
+    #[test]
+    fn merging_sessions_folds_past_the_cap_too() {
+        let session = |from: usize| {
+            let mut t = Tally::default();
+            for i in from..from + 200 {
+                t.bump(&format!("h{i}.test"), StatKind::Allow);
+            }
+            t
+        };
+        let mut total = Tally::default();
+        total.merge(&session(0));
+        total.merge(&session(1000));
+        assert_eq!(total.hosts.len(), 256);
+        assert_eq!(total.overflow.allow, 144, "400 recorded, 256 named");
+        assert_eq!(
+            total.hosts.values().map(Counts::total).sum::<u64>() + total.overflow.total(),
+            400
+        );
+    }
+
+    /// The fold survives the file: it is written, read back, and summed like any other counter.
+    /// And a session that never met the cap writes exactly the file it always did — no new line, so
+    /// nothing about an ordinary session's bytes changes.
+    #[test]
+    fn the_folded_counts_round_trip_and_only_appear_when_something_folded() {
+        let plain = Tally {
+            hosts: [(
+                "a.test".to_string(),
+                Counts {
+                    allow: 5,
+                    deny: 1,
+                    blocked: 0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Tally::default()
+        };
+        let body = serialize("/p", None, &plain);
+        assert_eq!(body, "project=/p\na.test\t5\t1\t0\n");
+        assert_eq!(parse(&body).unwrap().tally, plain);
+
+        let folded = Tally {
+            overflow: Counts {
+                allow: 0,
+                deny: 44,
+                blocked: 2,
+            },
+            ..plain.clone()
+        };
+        let body = serialize("/p", None, &folded);
+        assert_eq!(body, "project=/p\na.test\t5\t1\t0\noverflow=0\t44\t2\n");
+        assert_eq!(parse(&body).unwrap().tally, folded);
+
+        // A malformed fold line is skipped like a malformed counter row, not fatal.
+        let parsed = parse("project=/p\na.test\t5\t1\t0\noverflow=nope\n").unwrap();
+        assert_eq!(parsed.tally, plain);
+    }
+
+    /// A tally holding only folded counts is not empty. It reads as empty on the host map alone,
+    /// which is the shape that would tell a reader "nothing recorded yet" about a session that
+    /// refused a hundred thousand requests.
+    #[test]
+    fn a_tally_holding_only_folded_counts_is_not_empty() {
+        let mut only_folded = Tally::default();
+        only_folded.overflow.bump(StatKind::Deny);
+        assert!(!only_folded.is_empty());
+        assert!(Tally::default().is_empty());
     }
 
     #[test]
@@ -705,6 +1062,9 @@ mod tests {
             for _ in 0..n {
                 self.record(host, kind);
             }
+            // As a session's own teardown does: writes are rate-limited, so a burst reaches disk
+            // once something asks for it rather than after every decision.
+            self.flush_final();
         }
     }
 }

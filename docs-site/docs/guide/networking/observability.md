@@ -134,6 +134,15 @@ Recording is **on by default**; a trusted `[network] stats = false` turns it off
 (`true` re-enables it). `--reset` clears the recorded files of *ended* sessions; a
 live session's counters reappear on its next request.
 
+A listing keeps a row for a bounded number of destinations. Past that, further hosts are
+counted together under a single `(other hosts)` row rather than each getting one of their
+own; `--json` carries the same figures under an `overflow` key, which is `null` when
+nothing was folded. The counts are never dropped, so what the listing adds up to is still
+every request the proxy decided. A real workload reaches a handful of hosts and never
+sees that row; what it bounds is an agent walking through thousands of destinations,
+since the destination is chosen inside the sandbox and a refused request is counted like
+any other.
+
 ---
 
 ## `sbx net logs`

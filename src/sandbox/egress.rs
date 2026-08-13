@@ -751,6 +751,9 @@ pub(crate) fn start(
         Some(control_uds)
     };
     if let Some(stats) = &stats {
+        // The trailing write, so the debounce below only bounds how *often* the file is rewritten
+        // and never how much of the session it reflects once the traffic stops.
+        super::egress_stats::start_flusher(stats);
         ctx = ctx.with_stats(stats.clone());
     }
     let ctx = Arc::new(ctx);

@@ -1220,6 +1220,7 @@ fn refusal_cost() {
             );
             let (_dir, sock) = serve_on_uds(ctx);
             let started = Instant::now();
+            let wrote_before = bytes_written();
             for i in 0..n {
                 let host = match distinct {
                     true => format!("h{i}.test"),
@@ -1230,12 +1231,19 @@ fn refusal_cost() {
                 );
                 one_http_request(&sock, req.as_bytes()).unwrap();
             }
+            let wrote = bytes_written().saturating_sub(wrote_before);
             elapsed.push(started.elapsed());
             let label = match distinct {
                 true => "a new host each time",
                 false => "the same host each time",
             };
             report_rate(&format!("{n} refusals, {label}"), started.elapsed(), n);
+            println!(
+                "  {:<44} {:>8.1} MiB written, {} B per refusal",
+                "",
+                wrote as f64 / (1024.0 * 1024.0),
+                wrote / n as u64
+            );
         }
         println!(
             "  {:<44} {:>8.1}x",
@@ -1243,4 +1251,20 @@ fn refusal_cost() {
             elapsed[1].as_secs_f64() / elapsed[0].as_secs_f64()
         );
     }
+}
+
+/// Bytes this process has written through the write syscalls, from `/proc/self/io` (`wchar`).
+///
+/// The axis a bookkeeping cost hides on. Rewriting a small file per decision is nearly invisible in
+/// a per-request time and is the whole story in what the host's storage is asked to absorb, so a
+/// measurement that reports only the clock would answer half the question.
+fn bytes_written() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("wchar:"))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
 }

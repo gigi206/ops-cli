@@ -1079,9 +1079,10 @@ fn net_stats(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let counts = sandbox::egress_stats::aggregate(&egress_dir, &project, app.as_deref());
+    let tally = sandbox::egress_stats::aggregate(&egress_dir, &project, app.as_deref());
     if json {
-        let rows: Vec<_> = counts
+        let rows: Vec<_> = tally
+            .hosts
             .iter()
             .map(|(host, c)| {
                 serde_json::json!({
@@ -1092,14 +1093,29 @@ fn net_stats(args: &[OsString]) -> ExitCode {
                 })
             })
             .collect();
+        // Present only when something was folded, so a reader that never meets the cap sees the
+        // shape it always saw. Its counts are in no row above, so a consumer summing the rows must
+        // add this to get the total the proxy decided.
+        let overflow = (tally.overflow.total() > 0).then(|| {
+            serde_json::json!({
+                "allow": tally.overflow.allow,
+                "deny": tally.overflow.deny,
+                "blocked": tally.overflow.blocked,
+            })
+        });
         println!(
             "{}",
-            serde_json::json!({ "project": project, "app": app, "stats": rows })
+            serde_json::json!({
+                "project": project,
+                "app": app,
+                "stats": rows,
+                "overflow": overflow,
+            })
         );
         return ExitCode::SUCCESS;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_stats(&project, app.as_deref(), &counts, &pal));
+    print!("{}", render_stats(&project, app.as_deref(), &tally, &pal));
     ExitCode::SUCCESS
 }
 
@@ -1110,7 +1126,7 @@ fn net_stats(args: &[OsString]) -> ExitCode {
 fn render_stats(
     project: &str,
     app: Option<&str>,
-    counts: &std::collections::BTreeMap<String, sandbox::egress_stats::Counts>,
+    tally: &sandbox::egress_stats::Tally,
     pal: &style::Palette,
 ) -> String {
     use std::fmt::Write as _;
@@ -1118,7 +1134,7 @@ fn render_stats(
     let mut o = String::new();
     let scope = app.map(|a| format!(" · app {a}")).unwrap_or_default();
     let _ = writeln!(o, "{h}egress stats{r} {dim}({project}{scope}){r}");
-    if counts.is_empty() {
+    if tally.is_empty() {
         let _ = writeln!(
             o,
             "  {dim}nothing recorded yet \
@@ -1127,7 +1143,7 @@ fn render_stats(
         return o;
     }
     // Busiest host first; ties by host name so the order is stable run to run.
-    let mut rows: Vec<(&String, &sandbox::egress_stats::Counts)> = counts.iter().collect();
+    let mut rows: Vec<(&String, &sandbox::egress_stats::Counts)> = tally.hosts.iter().collect();
     rows.sort_by(|(ha, a), (hb, b)| b.total().cmp(&a.total()).then(ha.cmp(hb)));
     let host_w = rows
         .iter()
@@ -1145,6 +1161,17 @@ fn render_stats(
             o,
             "  {n}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}",
             host, c.allow, c.deny, c.blocked
+        );
+    }
+    // The destinations past the per-session cap, as one row. Shown only when something was folded,
+    // and named rather than left out: a total that silently omitted them would be the one number
+    // here nobody could reconcile.
+    let folded = &tally.overflow;
+    if folded.total() > 0 {
+        let _ = writeln!(
+            o,
+            "  {dim}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}",
+            "(other hosts)", folded.allow, folded.deny, folded.blocked
         );
     }
     o
@@ -4619,7 +4646,7 @@ mod tests {
         let p = style::Palette::plain();
 
         // Empty → the project header plus the "nothing recorded yet" line.
-        let empty = std::collections::BTreeMap::new();
+        let empty = sandbox::egress_stats::Tally::default();
         let out = render_stats("/home/u/proj", None, &empty, &p);
         assert!(
             out.contains("/home/u/proj") && out.contains("nothing recorded yet"),
@@ -4643,7 +4670,15 @@ mod tests {
                 blocked: 1,
             },
         );
-        let out = render_stats("/home/u/proj", Some("demo"), &counts, &p);
+        let tally = sandbox::egress_stats::Tally {
+            hosts: counts,
+            ..Default::default()
+        };
+        let out = render_stats("/home/u/proj", Some("demo"), &tally, &p);
+        assert!(
+            !out.contains("(other hosts)"),
+            "no fold row when nothing was folded: {out}"
+        );
         // The app scope is shown in the header, and the columns are present.
         assert!(out.contains("app demo"), "{out}");
         assert!(
@@ -4657,5 +4692,50 @@ mod tests {
         let busy = out.find("busy.test").unwrap();
         let quiet = out.find("quiet.test").unwrap();
         assert!(busy < quiet, "busiest host must sort first:\n{out}");
+    }
+
+    /// The destinations past the per-session cap get one row of their own, named rather than left
+    /// out: a listing whose numbers did not add up to what the proxy decided would be the one figure
+    /// here nobody could reconcile.
+    #[test]
+    fn render_stats_shows_the_folded_destinations_as_their_own_row() {
+        use sandbox::egress_stats::{Counts, Tally};
+        let p = style::Palette::plain();
+        let tally = Tally {
+            hosts: [(
+                "busy.test".to_string(),
+                Counts {
+                    allow: 40,
+                    deny: 0,
+                    blocked: 0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            overflow: Counts {
+                allow: 0,
+                deny: 44,
+                blocked: 2,
+            },
+        };
+        let out = render_stats("/home/u/proj", None, &tally, &p);
+        let folded = out
+            .lines()
+            .find(|l| l.contains("(other hosts)"))
+            .unwrap_or_else(|| panic!("no fold row:\n{out}"));
+        assert!(folded.contains("44") && folded.contains("2"), "{folded:?}");
+
+        // ...and a tally holding *only* folded counts is a listing, not "nothing recorded yet".
+        let only_folded = Tally {
+            overflow: Counts {
+                allow: 0,
+                deny: 7,
+                blocked: 0,
+            },
+            ..Default::default()
+        };
+        let out = render_stats("/home/u/proj", None, &only_folded, &p);
+        assert!(!out.contains("nothing recorded yet"), "{out}");
+        assert!(out.contains("(other hosts)"), "{out}");
     }
 }
