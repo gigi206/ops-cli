@@ -1531,6 +1531,132 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
     );
 }
 
+/// A signer refusal reaches an **HTTP/2** caller with the plugin's own reason, not as a bare status.
+///
+/// This path frames its refusals as a status plus a reason token, deliberately: for a policy refusal
+/// the token is the whole answer. A signer refusal is the one exception, because its content is a
+/// third party's sentence that no token encodes and no other channel carries to the caller. Left
+/// unframed, an h2 caller learned that a request was refused and nothing more, where an HTTP/1.1
+/// caller learned what to change.
+///
+/// **It needs no upstream**, which is what makes it cheap beside the gRPC e2e: the refusal returns
+/// before the connect, so a designated h2 host that merely *resolves* is enough, and the request
+/// provably never leaves. What the assertions read is the response the cage's own client received.
+///
+/// Skips (never fails) when the host cannot sandbox or the binary cache is unreachable (`curl` will
+/// not provision).
+#[test]
+fn an_http2_caller_is_told_why_its_request_was_not_signed() {
+    let root = TmpDir::new("h2-refusal-e2e");
+    let project = TmpDir::new("h2-refusal-proj");
+    let data = TmpDir::new("h2-refusal-data");
+    let state = TmpDir::new("h2-refusal-state");
+
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[packages]\ncurl = \"nix:curl\"\n\n\
+         [network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
+         http2 = [\"cache.nixos.org\"]\n\n\
+         [secret.\"cache.nixos.org\"]\nfrom = \"env://SBX_E2E_SIGNING_KEY\"\n\
+         sign = \"demo-h2-refuses\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping h2 signer refusal e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping h2 signer refusal e2e: the binary cache is unreachable");
+        return;
+    }
+
+    let refuses = stage_signer(
+        root.path(),
+        "demo-h2-refuses",
+        true,
+        "    print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region\"}), flush=True)",
+    );
+    let installed = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["plugins", "install", refuses.to_str().unwrap()],
+    );
+    assert!(
+        installed.status.success(),
+        "installing the signer: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let out = sbx()
+        .args([
+            "run",
+            "--",
+            "curl",
+            "-s",
+            "-i",
+            "--http2",
+            "https://cache.nixos.org/nix-cache-info",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("SBX_E2E_SIGNING_KEY", "the-real-signing-key-8f2a-h2")
+        .output()
+        .expect("spawn sbx run");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    // The stream is answered on the h2 plane, which is what makes this a different proof from the
+    // HTTP/1.1 one rather than a copy of it.
+    assert!(
+        stdout.contains("HTTP/2 403"),
+        "the refusal must arrive over HTTP/2: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("signer-refused"),
+        "and carry its own reason token: {stdout}"
+    );
+    // The frame this test exists for: the plugin's sentence, which no token encodes.
+    assert!(
+        stdout.contains("`demo-h2-refuses`")
+            && stdout.contains("no credentials for that region")
+            && stdout.contains("so it was not sent"),
+        "the caller must learn which plugin refused, why, and that nothing was sent: {stdout}"
+    );
+
+    // Counted once, as a block: a refusal that answered with a body is still a refusal.
+    let stats = sbx_in(project.path(), data.path(), state.path(), &["net", "stats"]);
+    let stats = String::from_utf8_lossy(&stats.stdout).into_owned();
+    // Read with the column padding collapsed: the widths follow the host name, and a literal that
+    // encoded them would be asserting on layout rather than on the counts.
+    let row = stats
+        .lines()
+        .find(|l| l.contains("cache.nixos.org"))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    assert_eq!(
+        row, "cache.nixos.org 0 0 1",
+        "one blocked, no allow and no deny — the request never left: {stats}"
+    );
+}
+
 /// What a pid's process is called right now: `sbx` until it execs into the cage, the cage's own
 /// launcher afterwards (`bwrap`, or `systemd-run` where a scope is used).
 fn comm_of(pid: u32) -> String {
