@@ -6899,3 +6899,38 @@ fn a_signer_refusal_answered_into_the_cage_carries_no_credential() {
     let plain = super::signer_refusal_message(&refusal, &[]);
     assert!(plain.contains("wJalrXUtnFEMI-the-secret-key"), "{plain}");
 }
+
+/// Both planes answer a refusal with the same sentence.
+///
+/// The HTTP/1.1 planes serialize the body themselves and the HTTP/2 plane sends it as a DATA
+/// frame, so the text is the only thing they share and the only thing that can drift. A caller
+/// must not learn a different explanation for the same refusal depending on which protocol
+/// version it happened to speak to the proxy over, which is the shape the signer refusal had
+/// before: written on one plane, dropped on the other.
+#[test]
+fn a_refusal_says_the_same_thing_whichever_plane_answers_it() {
+    let refusal = super::SignRefusal {
+        signer: "aws-sigv4".to_string(),
+        why: "this request carries a body".to_string(),
+    };
+    let detail = super::signer_refusal_message(&refusal, &[]);
+
+    // What the HTTP/1.1 planes put on the wire, taken from the wire.
+    let mut written = Vec::new();
+    super::write_refusal(&mut written, "403 Forbidden", "signer-refused", &detail).unwrap();
+    let written = String::from_utf8(written).unwrap();
+    let (head, body) = written.split_once("\r\n\r\n").expect("a head and a body");
+
+    // What the HTTP/2 plane sends as its DATA frame.
+    assert_eq!(body, super::refusal_body(&detail));
+    assert_eq!(
+        head.matches(&format!("Content-Length: {}", body.len()))
+            .count(),
+        1,
+        "the length framing must describe the shared body: {head}"
+    );
+    assert!(
+        body.contains("`aws-sigv4`") && body.contains("so it was not sent"),
+        "{body}"
+    );
+}

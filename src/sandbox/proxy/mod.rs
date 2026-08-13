@@ -2975,13 +2975,23 @@ fn print_egress_notice(head: &str, actions: &[(&str, &str)]) {
 /// token, so it is safe in a header; the detail is sbx-authored and only ever echoes what the
 /// agent already sent (its own host/port) or a category — never the injected credential, any
 /// host-side secret, or the policy's internal rule text (for which `sbx test net` is the tool).
+/// The body of a written refusal, in one place because two planes write it.
+///
+/// The HTTP/1.1 planes serialize it themselves and the HTTP/2 plane sends it as a DATA frame, so
+/// nothing but a shared function keeps them saying the same thing: a caller must not learn a
+/// different sentence about the same refusal depending on which protocol version it happened to
+/// speak to the proxy over.
+pub(super) fn refusal_body(detail: &str) -> String {
+    format!("sbx egress refused this request: {detail}\n")
+}
+
 fn write_refusal<W: Write>(
     w: &mut W,
     status: &str,
     category: &str,
     detail: &str,
 ) -> io::Result<()> {
-    let body = format!("sbx egress refused this request: {detail}\n");
+    let body = refusal_body(detail);
     write!(
         w,
         "HTTP/1.1 {status}\r\n\

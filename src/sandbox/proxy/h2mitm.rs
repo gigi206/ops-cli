@@ -23,7 +23,8 @@ use super::capture::CapBuf;
 use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
 use super::{
     AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, carries_secret, decide_https,
-    matching_injection_ids, redact_in_place, resolve_checked, upstream_server_name,
+    matching_injection_ids, redact_in_place, resolve_checked, signer_refusal_message,
+    upstream_server_name,
 };
 use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -249,7 +250,10 @@ async fn stream(
 
     // The verdict — literally the same decision the HTTP/1.1 paths reach, through the shared
     // [`decide_https`]: config policy ∪ any `--session` overlay, deny-wins, method/path aware. Only
-    // the answer differs, framed here as a status plus the reason token rather than written.
+    // the answer differs, framed here as a status plus the reason token rather than written — the
+    // token *is* the answer for a policy refusal, and the prose the other planes add says the same
+    // thing about a host the caller named. A signer refusal is the one exception, and carries the
+    // plugin's own sentence as a body: see [`refuse_with_detail`].
     //
     // [`AskPosture::RefuseUnsupported`] is where this path genuinely diverges. Parking blocks the
     // caller until a person answers, and every stream of this connection shares one current-thread
@@ -351,7 +355,7 @@ async fn relay(
         ctx.signer_log(),
     ) {
         Ok(pairs) => pairs,
-        Err(_refusal) => {
+        Err(refusal) => {
             ctx.outcome(
                 Proto::Https,
                 host,
@@ -361,7 +365,15 @@ async fn relay(
                 StatKind::Blocked,
                 SIGNER_REFUSED,
             );
-            let _ = refuse(respond, StatusCode::FORBIDDEN, SIGNER_REFUSED);
+            // Answered with the plugin's own sentence, as both HTTP/1.1 planes answer it, and
+            // scrubbed by the same function they share: what reaches the sandbox here is what
+            // reaches it there.
+            let _ = refuse_with_detail(
+                respond,
+                StatusCode::FORBIDDEN,
+                SIGNER_REFUSED,
+                &signer_refusal_message(&refusal, &creds.needles),
+            );
             return;
         }
     };
@@ -782,6 +794,38 @@ fn refuse(
         .body(())
         .expect("a static status + ASCII reason is always a valid response");
     respond.send_response(resp, true)?;
+    Ok(())
+}
+
+/// Refuse a stream **with prose**, in the body shape the HTTP/1.1 planes write.
+///
+/// The exception to this path's framing, and the exception is the point. Every other refusal here
+/// answers with a status and a reason token because the token *is* the answer: `denied`, `ssrf`,
+/// `not-upgradable` say the whole of what happened, and the prose the HTTP/1.1 planes add is
+/// derived from that token plus a host the caller already named.
+///
+/// A signer refusal is not like that. Its content is the plugin's own sentence about why it would
+/// not form this credential, which no token encodes and nothing else carries to the caller: the
+/// `signer` feed is the operator's, not the sandbox's. Framed without it, an h2 caller is told a
+/// request was refused and given no way to learn what to change, where an HTTP/1.1 caller is told
+/// exactly. That is the asymmetry this closes, and it closes it without overturning the framing
+/// choice for the refusals whose answer really is one word.
+fn refuse_with_detail(
+    mut respond: h2::server::SendResponse<Bytes>,
+    status: StatusCode,
+    reason: &str,
+    detail: &str,
+) -> Result<(), h2::Error> {
+    let body = Bytes::from(super::refusal_body(detail));
+    let resp = Response::builder()
+        .status(status)
+        .header("x-sbx-egress-reason", reason)
+        .header("content-type", "text/plain")
+        .header("content-length", body.len())
+        .body(())
+        .expect("a static status + ASCII reason is always a valid response");
+    let mut stream = respond.send_response(resp, false)?;
+    stream.send_data(body, true)?;
     Ok(())
 }
 
