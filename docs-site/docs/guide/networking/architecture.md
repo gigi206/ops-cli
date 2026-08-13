@@ -346,10 +346,10 @@ The categories surface in [`sbx net logs`](observability#sbx-net-logs) as the
 per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text is
 never disclosed, so a global-config rule the cage cannot read does not leak),
 `denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,
-`outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`, and the
-transport-side `dns-failure`, `upstream-unreachable`, `upstream-cert-rejected`,
-`upstream-http2-unsupported`, and `upstream-closed`. A genuine upstream status (a real
-`404`) is relayed verbatim with no such header.
+`outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
+`injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
+`upstream-cert-rejected`, `upstream-http2-unsupported`, and `upstream-closed`. A genuine
+upstream status (a real `404`) is relayed verbatim with no such header.
 
 `upstream-http2-unsupported` belongs to a host designated
 [`http2`](../configuration/network#http2-and-grpc) alone: gRPC is HTTP/2 end to end and the

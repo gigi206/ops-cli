@@ -537,10 +537,23 @@ async fn relay(
     for (h, v) in &injected {
         builder = builder.header(h.as_str(), v.as_str());
     }
+    // The client's own headers were decoded by `h2` and cannot fail to be re-added, so the only way
+    // this builder refuses is a header **sbx** is adding whose value cannot be one. It is a backstop
+    // rather than a live path — a signer's value is already refused at the plugin boundary if it
+    // carries a newline or a NUL — and it is named for its cause: reporting it as a malformed
+    // request would blame the caller for a header the caller never sent.
     let up_req = match builder.body(()) {
         Ok(r) => r,
         Err(_) => {
-            refuse_upstream(respond, ctx, host, port, method, path, "bad-request");
+            refuse_upstream(
+                respond,
+                ctx,
+                host,
+                port,
+                method,
+                path,
+                "injected-header-invalid",
+            );
             return;
         }
     };

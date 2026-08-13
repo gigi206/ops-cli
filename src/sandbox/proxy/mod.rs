@@ -97,6 +97,7 @@
 //! | `502` | `upstream-cert-rejected` | the upstream TLS certificate failed validation (never downgraded) |
 //! | `502` | `upstream-http2-unsupported` | a `[network] http2` host will not speak HTTP/2. gRPC is HTTP/2 end to end and this plane does not translate, so it fails closed. Reported whether the upstream refuses the ALPN offer or ignores ALPN and negotiates nothing: both are the same fact about the server, and neither is a certificate problem |
 //! | `502` | `upstream-closed`        | the upstream was reached and then closed (or reset the stream) before answering. Distinct from `upstream-unreachable`, which means the connection was never made: this one falls *after* the allow is recorded, so the exchange reads as an allow whose status never arrived, with this error beside it |
+//! | `502` | `injected-header-invalid` | a header sbx was adding could not be one (HTTP/2 plane). A backstop, not a live path: a signer's value is refused at the plugin boundary if it carries a newline or a NUL. Named for its cause rather than folded into `bad-request`, which would blame the caller for a header the caller never sent |
 //!
 //! A genuine upstream status (e.g. a `404`) is streamed back unchanged and carries no such
 //! header — save that a reflected secret is masked out of it on the way back (see *Credential
