@@ -1122,7 +1122,13 @@ fn postman_echo_reachable() -> bool {
 /// Stage a signer plugin: a manifest naming the headers it may set, and a Python executable that
 /// speaks the line-JSON protocol. `body` is the loop that answers each question, so one helper
 /// serves the plugin that signs, the one that refuses, and the one that oversteps its manifest.
-fn stage_signer(root: &Path, name: &str, reads_secret: bool, body: &str) -> std::path::PathBuf {
+fn stage_signer(
+    root: &Path,
+    name: &str,
+    reads_secret: bool,
+    signer_extra: &str,
+    body: &str,
+) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = root.join(name);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -1131,7 +1137,7 @@ fn stage_signer(root: &Path, name: &str, reads_secret: bool, body: &str) -> std:
         format!(
             "name = \"{name}\"\ntype = \"signer\"\nexec = \"bin/sign\"\n\n\
              [signer]\nsets_headers = [\"Authorization\", \"X-Demo-Date\"]\n\
-             reads_secret = {reads_secret}\n\n\
+             reads_secret = {reads_secret}\n{signer_extra}\n\
              [sandbox]\nprograms = [\"python3\"]\n"
         ),
     )
@@ -1231,6 +1237,7 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         root.path(),
         "demo-signs",
         true,
+        "",
         "    import hashlib, hmac\n\
          \x20   canonical = f\"{ask['method']}\\n{ask['target']}\\n{hello['host']}\"\n\
          \x20   sig = hmac.new(cred['value'].encode(), canonical.encode(), hashlib.sha256).hexdigest()\n\
@@ -1240,18 +1247,21 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         root.path(),
         "demo-marker",
         false,
+        "",
         "    print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": f\"Token {cred['value']}\", \"X-Demo-Date\": f\"kind={cred['kind']}\"}}), flush=True)",
     );
     let refuses = stage_signer(
         root.path(),
         "demo-refuses",
         true,
+        "",
         "    print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region\"}), flush=True)",
     );
     let oversteps = stage_signer(
         root.path(),
         "demo-oversteps",
         true,
+        "",
         "    print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": \"ok\", \"Host\": \"evil.example.com\"}}), flush=True)",
     );
     // One plugin, both outcomes, so a single session produces a `sign` line and a `refuse` line for
@@ -1261,6 +1271,7 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         root.path(),
         "demo-feed",
         true,
+        "",
         "    if \"a=1\" in ask[\"target\"]:\n\
          \x20       print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": \"DEMO ok\"}, \"label\": \"signed with \" + cred[\"value\"]}), flush=True)\n\
          \x20   else:\n\
@@ -1579,6 +1590,7 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
         root.path(),
         "demo-h2-refuses",
         true,
+        "",
         "    print(json.dumps({\"seq\": ask[\"seq\"], \"error\": \"no credentials for that region\"}), flush=True)",
     );
     let installed = sbx_in(
@@ -1654,6 +1666,146 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
     assert_eq!(
         row, "cache.nixos.org 0 0 1",
         "one blocked, no allow and no deny — the request never left: {stats}"
+    );
+}
+
+/// A signer whose manifest asks for a digest over the request body is told one, and the body still
+/// reaches the upstream whole.
+///
+/// The proxy streams a `Content-Length` body straight through and de-chunks a `chunked` one only on
+/// its way out, so on both framings the bytes are past sbx by the time a signature would be formed.
+/// A manifest that declares `body_digest` changes that: the body is held first, digested, and
+/// forwarded from the buffer. What this proves is that the change is invisible to everything else —
+/// the upstream receives the same bytes it always did, whichever way the client framed them.
+///
+/// The digests are **literals**: a test that recomputed the value it asserts on would agree with a
+/// broken implementation as readily as a working one. `postman-echo.com/post` returns both the
+/// headers it received (carrying what the plugin was told) and the body (carrying what arrived), so
+/// one round trip shows the two halves together.
+///
+/// Skips (never fails) when the host cannot sandbox, the binary cache is unreachable (`curl` will
+/// not provision), or the echo service is down.
+#[test]
+fn a_signer_that_asked_for_a_body_digest_is_told_it_and_the_body_still_arrives() {
+    let root = TmpDir::new("digest-e2e");
+    let project = TmpDir::new("digest-proj");
+    let data = TmpDir::new("digest-data");
+    let state = TmpDir::new("digest-state");
+
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[packages]\ncurl = \"nix:curl\"\n\n\
+         [network]\nmode = \"deny\"\nallow = [\"postman-echo.com\"]\n\n\
+         [secret.\"postman-echo.com\"]\nfrom = \"env://SBX_E2E_SIGNING_KEY\"\n\
+         sign = \"demo-digest\"\n",
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping body digest e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+    if !cache_reachable() {
+        eprintln!("skipping body digest e2e: the binary cache is unreachable");
+        return;
+    }
+    if !postman_echo_reachable() {
+        eprintln!("skipping body digest e2e: postman-echo.com is unreachable");
+        return;
+    }
+
+    // The plugin reports what it was told rather than signing with it: what is under test is the
+    // fact reaching the plugin, and a signature would only hide it behind an HMAC.
+    let digests = stage_signer(
+        root.path(),
+        "demo-digest",
+        true,
+        "body_digest = \"sha256\"",
+        "    b = ask.get(\"body\") or {}\n\
+         \x20   told = (\"held:\" + b.get(\"sha256\", \"none\")) if b.get(\"held\") else \"unheld\"\n\
+         \x20   print(json.dumps({\"seq\": ask[\"seq\"], \"headers\": {\"Authorization\": \"DEMO \" + told}}), flush=True)",
+    );
+    let installed = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["plugins", "install", digests.to_str().unwrap()],
+    );
+    assert!(
+        installed.status.success(),
+        "installing the signer: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    let post = |extra: &[&str]| -> String {
+        let mut args = vec![
+            "run",
+            "--",
+            "curl",
+            "-s",
+            "-H",
+            "Content-Type: text/plain",
+            "--data-binary",
+            "hello world",
+        ];
+        args.extend_from_slice(extra);
+        args.push("https://postman-echo.com/post");
+        let out = sbx()
+            .args(&args)
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", state.path())
+            .env("SBX_E2E_SIGNING_KEY", "the-real-signing-key-8f2a-digest")
+            .output()
+            .expect("spawn sbx run");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            stdout.contains("postman-echo.com"),
+            "the request did not reach the echo: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    };
+
+    // The SHA-256 of `hello world`, written down rather than computed here.
+    let expected = "DEMO held:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+    // 1. A `Content-Length` body — the framing the proxy otherwise streams without ever holding.
+    let framed = post(&[]);
+    assert!(
+        framed.contains(expected),
+        "the plugin must be told the digest of the body it is signing over: {framed}"
+    );
+    assert!(
+        framed.contains("hello world"),
+        "and the body must still reach the upstream whole: {framed}"
+    );
+
+    // 2. The same body sent `chunked` — a different framing, and the same digest, because what is
+    //    digested is the body and not the way the client wrote it down.
+    let chunked = post(&["-H", "Transfer-Encoding: chunked"]);
+    assert!(
+        chunked.contains(expected),
+        "a chunked body digests to the same value as the framed one: {chunked}"
+    );
+    assert!(
+        chunked.contains("hello world"),
+        "and it too arrives whole: {chunked}"
     );
 }
 

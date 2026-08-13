@@ -342,6 +342,21 @@ async fn relay(
     // allow — a refused stream would have been counted twice, once allowed and once blocked, which
     // is the same asymmetry between the plans that once made an h2 refusal invisible, inverted.
     let injected_ids = matching_injection_ids(&creds, host, port, path);
+    // What a signer asking for a body digest is told here. A stream that ended with its headers has
+    // no body, and the digest of nothing is exact and free. Anything else is **stated as unheld**:
+    // this plan relays DATA frames as they arrive, and an h2 request half may legitimately never end
+    // (a bidi-streaming RPC), so a digest over it is not a cost sbx declines to pay — it is a fact
+    // that does not exist yet at the moment the request must be signed. Saying so lets a scheme that
+    // requires the body covered refuse, instead of signing as though there were none.
+    let body_facts = creds.wants_body_digest(&injected_ids).map(|algorithm| {
+        match req.body().is_end_stream() {
+            true => crate::sandbox::signer::BodyFacts::held(&[], algorithm),
+            false => crate::sandbox::signer::BodyFacts::unheld(
+                "this request's body arrives as HTTP/2 DATA frames, which sbx relays as they come \
+                 rather than holding — an HTTP/2 request half may legitimately never end",
+            ),
+        }
+    });
     let injected = match injection_values(
         &creds,
         &injected_ids,
@@ -351,6 +366,7 @@ async fn relay(
             port,
             target: path,
             headers: &H2Headers(req.headers()),
+            body: body_facts.as_ref(),
         },
         ctx.signer_log(),
     ) {

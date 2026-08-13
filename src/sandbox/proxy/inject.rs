@@ -56,6 +56,10 @@ pub(crate) struct Signed {
     /// The running plugin, serialized: it is one process answering one question at a time, and a
     /// launch may have many requests in flight.
     pub(crate) process: std::sync::Arc<std::sync::Mutex<dyn crate::sandbox::signer::Signing>>,
+    /// The digest this plugin's manifest asked for over the request body, if any. Read *before* the
+    /// plugin runs, because it decides whether the caller holds the body at all — which is a choice
+    /// about how the request is forwarded, not about how it is signed.
+    pub(crate) body_digest: Option<crate::plugins::signer::BodyDigest>,
 }
 
 impl HeaderInjection {
@@ -166,6 +170,10 @@ pub(crate) struct RequestFacts<'a> {
     /// The request target as it goes on the wire: the path with its query.
     pub(crate) target: &'a str,
     pub(crate) headers: &'a dyn HeaderLookup,
+    /// What the caller established about the request body, where a matched signer asked for it (see
+    /// [`CredentialSet::wants_body_digest`]). `None` where nothing asked — and a signer that did ask
+    /// then refuses the request rather than signing it as though the body were empty.
+    pub(crate) body: Option<&'a crate::sandbox::signer::BodyFacts>,
 }
 
 /// Why a request could not be given its credential. Carried rather than logged here, so the caller
@@ -215,12 +223,30 @@ pub(crate) fn pairs_for(
                     .iter()
                     .filter_map(|name| req.headers.get(name).map(|v| (name.clone(), v.to_string())))
                     .collect();
+                // A plugin that asked for a body digest is never signed *around*: where the caller
+                // established nothing, the request is refused rather than put to the plugin without
+                // the fact its scheme was written to cover.
+                let body = match signed.body_digest {
+                    None => None,
+                    Some(_) => match req.body {
+                        Some(facts) => Some(facts),
+                        None => {
+                            return Err(SignRefusal {
+                                signer: signed.name.clone(),
+                                why: "sbx established nothing about this request's body, which \
+                                      this plugin's manifest asks to be told"
+                                    .to_string(),
+                            });
+                        }
+                    },
+                };
                 let ask = crate::sandbox::signer::SignRequest {
                     method: req.method,
                     host: req.host,
                     port: req.port,
                     target: req.target,
                     headers,
+                    body,
                 };
                 // A poisoned lock is a panic in another thread's `sign`, which is not a state to
                 // sign in: refuse like any other failure rather than reach past it.
@@ -352,6 +378,24 @@ impl fmt::Debug for SecretNeedle {
 pub(crate) struct CredentialSet {
     pub(crate) injections: Vec<HeaderInjection>,
     pub(crate) needles: Vec<SecretNeedle>,
+}
+
+impl CredentialSet {
+    /// The digest a matched signer asks to be told over this request's body, if one does.
+    ///
+    /// Answered from the manifests alone, before any plugin runs, because the answer decides how the
+    /// request is *forwarded*: a body sbx must digest is one it holds rather than streams, and that
+    /// choice is made before the head goes out. There is one body, and it is held and digested once
+    /// however many matched injections ask about it.
+    pub(crate) fn wants_body_digest(
+        &self,
+        ids: &[usize],
+    ) -> Option<crate::plugins::signer::BodyDigest> {
+        ids.iter().find_map(|&i| match &self.injections[i].form {
+            Form::Signed(signed) => signed.body_digest,
+            Form::Fixed { .. } => None,
+        })
+    }
 }
 
 /// The live credential state, shared by every consumer that scans or injects: the HTTP/1.1 path, the
@@ -1037,6 +1081,7 @@ mod tests {
                 key: "the-key".to_string(),
                 marker,
                 process: std::sync::Arc::new(std::sync::Mutex::new(FakeSigner(answer))),
+                body_digest: None,
             }),
         }
     }
@@ -1048,6 +1093,7 @@ mod tests {
             port: 443,
             target: "/v1/thing",
             headers,
+            body: None,
         }
     }
 
@@ -1074,6 +1120,123 @@ mod tests {
                 ("Authorization".to_string(), "SIG abc".to_string()),
                 ("X-Demo-Date".to_string(), "20260813".to_string()),
             ]
+        );
+    }
+
+    /// A signer records what it was asked, so a test can assert on the question rather than only on
+    /// the answer.
+    struct RecordingSigner(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+    impl crate::sandbox::signer::Signing for RecordingSigner {
+        fn sign(
+            &mut self,
+            req: &crate::sandbox::signer::SignRequest<'_>,
+        ) -> Result<crate::sandbox::signer::Signature, String> {
+            use crate::sandbox::signer::BodyFacts;
+            *self.0.lock().expect("lock") = Some(match req.body {
+                None => "no body stated".to_string(),
+                Some(BodyFacts::Held {
+                    bytes,
+                    algorithm,
+                    digest,
+                }) => format!("held {bytes} bytes, {algorithm} {digest}"),
+                Some(BodyFacts::Unheld { why }) => format!("unheld: {why}"),
+            });
+            Ok(crate::sandbox::signer::Signature {
+                headers: vec![("Authorization".to_string(), "SIG abc".to_string())],
+                label: None,
+            })
+        }
+    }
+
+    fn digesting_injection(
+        seen: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ) -> HeaderInjection {
+        HeaderInjection {
+            rule: crate::allowlist::classify("api.example.com").unwrap(),
+            form: Form::Signed(Signed {
+                name: "demo-signer".to_string(),
+                sets: vec!["Authorization".to_string()],
+                sees: Vec::new(),
+                key: "the-key".to_string(),
+                marker: None,
+                process: std::sync::Arc::new(std::sync::Mutex::new(RecordingSigner(seen.clone()))),
+                body_digest: Some(crate::plugins::signer::BodyDigest::Sha256),
+            }),
+        }
+    }
+
+    /// Which injections a request receives is answerable from the manifests alone — the caller has
+    /// to know whether to hold the body *before* any plugin runs, because holding it is a decision
+    /// about how the request is forwarded.
+    #[test]
+    fn the_digest_a_matched_signer_asks_for_is_known_before_the_plugin_runs() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let creds = CredentialSet {
+            injections: vec![
+                signed_injection(Ok(vec![("Authorization", "SIG abc")]), None),
+                digesting_injection(&seen),
+            ],
+            needles: Vec::new(),
+        };
+        assert_eq!(
+            creds.wants_body_digest(&[0]),
+            None,
+            "a signer that asked for no digest leaves the body streaming"
+        );
+        assert_eq!(
+            creds.wants_body_digest(&[0, 1]),
+            Some(crate::plugins::signer::BodyDigest::Sha256),
+            "one matched injection asking is enough to hold the body"
+        );
+    }
+
+    /// The facts the caller established reach the plugin that asked for them.
+    #[test]
+    fn a_signer_that_asked_for_a_digest_is_told_it() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let creds = CredentialSet {
+            injections: vec![digesting_injection(&seen)],
+            needles: Vec::new(),
+        };
+        let headers = Vec::new();
+        let body = crate::sandbox::signer::BodyFacts::held(
+            b"hello",
+            crate::plugins::signer::BodyDigest::Sha256,
+        );
+        let mut req = facts(&headers);
+        req.body = Some(&body);
+        pairs_for(&creds, &[0], &req, None).unwrap_or_else(|e| panic!("{}", e.why));
+        let asked = seen
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the plugin was asked");
+        assert!(
+            asked.contains("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"),
+            "the SHA-256 of `hello` reaches the plugin: {asked}"
+        );
+    }
+
+    /// Fail-closed, and the one refusal that catches a caller which forgot to establish the body: a
+    /// plugin whose scheme covers the payload must never be asked as though the request had none.
+    #[test]
+    fn a_signer_that_asked_for_a_digest_is_never_signed_around() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let creds = CredentialSet {
+            injections: vec![digesting_injection(&seen)],
+            needles: Vec::new(),
+        };
+        let headers = Vec::new();
+        let refusal = match pairs_for(&creds, &[0], &facts(&headers), None) {
+            Err(refusal) => refusal,
+            Ok(pairs) => panic!("a body the caller did not establish refuses, got {pairs:?}"),
+        };
+        assert_eq!(refusal.signer, "demo-signer");
+        assert!(refusal.why.contains("body"), "{}", refusal.why);
+        assert!(
+            seen.lock().expect("lock").is_none(),
+            "the plugin is never asked at all"
         );
     }
 

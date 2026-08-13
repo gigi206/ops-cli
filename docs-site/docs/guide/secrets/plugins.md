@@ -640,6 +640,7 @@ exec = "bin/sign"
 sets_headers = ["Authorization", "X-Example-Date"]   # every header it may put on a request
 sees_headers = ["Content-Type"]                      # beyond the method, host and target
 reads_secret = false                                 # true = handed the plaintext, not a marker
+body_digest = "sha256"                               # optional: be told a digest of the body
 ```
 
 What bounds a signer is not a new argument, it is an inherited one:
@@ -680,6 +681,10 @@ The rules a signer manifest is held to, each refused at load rather than at laun
   enough for one that is *computed*, since an HMAC over the canonical request is a
   function of the key. On, the plugin gets the key material, and it says so in the
   manifest that was reviewed rather than in the config of the machine that runs it.
+- **`body_digest` is absent by default**, and names an algorithm rather than being a
+  flag: `"sha256"` is the one sbx computes, and a manifest naming another is refused
+  rather than quietly handed the one it does. What declaring it changes is described
+  [below](#what-a-signer-is-told-about-the-body).
 
 :::note What a signer plugin does not reach
 A signer is given no `scheme`, so nothing a secret's `from` names routes to it, and
@@ -705,6 +710,56 @@ The plugin's own reason travels in that `403`, so the caller learns what to chan
 is **scrubbed of every declared credential on the way**. That body is the one refusal sbx
 writes that repeats a third party's words rather than its own, and it is answered into the
 sandbox, which is the one reader that must never see a key.
+
+### What a signer is told about the body
+
+A signer is shown a request's head. The body is a different matter, and the reason is
+structural rather than a policy: the proxy streams a `Content-Length` body straight
+through to the upstream and de-chunks a `chunked` one only on its way out, so on both
+framings the bytes are past sbx by the moment a signature has to be formed. A scheme
+whose signature covers the payload would have nothing to sign over.
+
+`body_digest = "sha256"` changes that, for the requests of the declaration naming this
+plugin and no others. sbx holds the whole body before it asks, digests it, and states
+the result in the question:
+
+```json
+{"seq": 1, "method": "POST", "host": "dynamodb.eu-west-1.amazonaws.com",
+ "target": "/", "headers": {},
+ "body": {"held": true, "bytes": 42, "sha256": "9f86d0…"}}
+```
+
+The digest is stated under the name of the algorithm that produced it, so a plugin reads
+it under the spelling its own manifest asked for. A plugin that declared no `body_digest`
+is shown no `body` key at all: asking for one changes nothing about what any other signer
+is shown.
+
+It does not widen what the plugin sees. A digest is a fact *about* the body, and the bytes
+themselves never leave sbx.
+
+**Where sbx cannot hold the body it says so**, rather than leaving the absence to be
+inferred from a missing field:
+
+```json
+{"seq": 1, "method": "POST", "host": "…", "target": "/", "headers": {},
+ "body": {"held": false, "why": "this request's body arrives as HTTP/2 DATA frames, …"}}
+```
+
+That is one plane, HTTP/2, for one reason: an HTTP/2 request half may legitimately never
+end (a bidirectional streaming RPC), so a digest over it is not a cost sbx declines to
+pay, it is a fact that does not exist at the moment the request must be signed. A stream
+that ended with its headers carries no body, and the digest of nothing is stated as held
+like any other. A scheme that requires the payload covered can refuse on `held: false`
+instead of signing as though the request had none.
+
+Two consequences worth knowing before you meet them:
+
+- A body larger than the buffer sbx de-chunks into is **refused**, with `413` and the
+  reason `signer-body-too-large`. For a `Content-Length` request the length is read off
+  the head, so an oversized upload is answered without ever being received.
+- A client's `Expect: 100-continue` is answered before the body is read, so the body
+  arrives before the request can be refused. A signer refusal then follows an interim
+  `100`, which is what HTTP allows and what the de-chunking path already did.
 
 What the tripwires watch also changes, and deliberately: for a signed credential the
 [needle](redaction) is the **key**, not the signature. A signature is derived,

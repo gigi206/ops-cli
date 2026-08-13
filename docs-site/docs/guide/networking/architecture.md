@@ -346,15 +346,20 @@ The categories surface in [`sbx net logs`](observability#sbx-net-logs) as the
 per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text is
 never disclosed, so a global-config rule the cage cannot read does not leak),
 `denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,
-`outbound-secret`, `signer-refused`, and the transport-side `dns-failure`,
-`upstream-unreachable`, `upstream-cert-rejected`, and `upstream-closed`. A genuine
-upstream status (a real `404`) is relayed verbatim with no such header.
+`outbound-secret`, `signer-refused`, `signer-body-too-large`, and the transport-side
+`dns-failure`, `upstream-unreachable`, `upstream-cert-rejected`, and `upstream-closed`.
+A genuine upstream status (a real `404`) is relayed verbatim with no such header.
 
 `signer-refused` is the one that is not a policy verdict: the policy allowed the host,
 and the request was refused because its credential could not be formed. See
 [`sign`](../configuration/secret#sign-a-credential-computed-from-the-request). Its body
 names the plugin and repeats the plugin's own reason, because a refusal that does not
 say who refused leaves every declaration to audit.
+
+`signer-body-too-large` is its neighbour, and no plugin refused it: a signer whose
+manifest asks to be told a digest over the request body needs sbx to hold that body,
+and this one is larger than the buffer it holds. It answers `413`. See
+[what a signer is told about the body](../secrets/plugins#what-a-signer-is-told-about-the-body).
 
 `upstream-closed` is the one that names a server that accepted the request and then
 went away without answering. Saying so is deliberate: an empty relay would be

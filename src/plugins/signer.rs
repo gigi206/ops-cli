@@ -108,6 +108,37 @@ pub(crate) struct SignerSpec {
     /// by declaring it in the manifest that was reviewed rather than in the config of the machine
     /// that runs it.
     pub(crate) reads_secret: bool,
+    /// The digest of the request body this plugin is told, for a scheme whose signature covers the
+    /// body. Absent by default: a signer is shown a request's head, and most auth points need
+    /// nothing more.
+    ///
+    /// Declaring it asks sbx to **hold** the body before signing rather than stream it, which is
+    /// what makes a digest exist at the moment the question is put. It does not widen what the
+    /// plugin sees: a digest is a fact *about* the body, and the bytes themselves never leave sbx.
+    ///
+    /// The plugin is told the digest where sbx holds the body and told plainly that it does not
+    /// where it cannot — so a scheme that requires the body to be covered can refuse, instead of
+    /// signing a request as if it had none.
+    pub(crate) body_digest: Option<BodyDigest>,
+}
+
+/// The one digest a manifest may ask for over a request body.
+///
+/// A named algorithm rather than a flag, because the choice is the plugin's scheme's and not sbx's:
+/// a second one arrives as a second spelling, and a manifest that names an algorithm sbx does not
+/// compute is refused rather than silently given the one it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyDigest {
+    Sha256,
+}
+
+impl BodyDigest {
+    /// How the algorithm is spelled — in a manifest, and as the key carrying it on the wire.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            BodyDigest::Sha256 => "sha256",
+        }
+    }
 }
 
 /// A validated signer plugin: `exec` is run host-side and, on stdin/stdout, is asked what
@@ -164,6 +195,8 @@ pub(super) struct RawSigner {
     sees_headers: Vec<String>,
     #[serde(default)]
     reads_secret: bool,
+    #[serde(default)]
+    body_digest: Option<String>,
 }
 
 /// Validate a manifest's `[signer]` table.
@@ -186,11 +219,25 @@ pub(super) fn validate(raw: RawSigner, name: &str) -> Result<SignerSpec, String>
         }
     }
     let sees_headers = check_header_list(raw.sees_headers, "sees_headers")?;
+    let body_digest = match raw.body_digest.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(algorithm) if algorithm.eq_ignore_ascii_case(BodyDigest::Sha256.name()) => {
+            Some(BodyDigest::Sha256)
+        }
+        Some(algorithm) => {
+            return Err(format!(
+                "`body_digest` names `{algorithm}`, which sbx does not compute — the one algorithm \
+                 it does is `{}`",
+                BodyDigest::Sha256.name()
+            ));
+        }
+    };
 
     Ok(SignerSpec {
         sets_headers,
         sees_headers,
         reads_secret: raw.reads_secret,
+        body_digest,
     })
 }
 
@@ -277,6 +324,7 @@ mod tests {
             sets_headers: vec!["Authorization".to_string()],
             sees_headers: Vec::new(),
             reads_secret: false,
+            body_digest: None,
         }
     }
 
@@ -289,6 +337,41 @@ mod tests {
             !spec.reads_secret,
             "the plaintext is the wider grant, so it must be off by default"
         );
+        assert_eq!(
+            spec.body_digest, None,
+            "holding the body is what a scheme asks for, not what every signer gets"
+        );
+    }
+
+    #[test]
+    fn the_digest_a_manifest_asks_for_over_the_body_is_the_one_sbx_computes() {
+        for spelling in ["sha256", "SHA256", " sha256 "] {
+            let spec = validate(
+                RawSigner {
+                    body_digest: Some(spelling.to_string()),
+                    ..raw()
+                },
+                "fake",
+            )
+            .unwrap_or_else(|e| panic!("`{spelling}` names the one algorithm: {e}"));
+            assert_eq!(spec.body_digest, Some(BodyDigest::Sha256));
+        }
+    }
+
+    /// An algorithm sbx does not compute is refused rather than quietly given the one it does: a
+    /// plugin signing a `sha512` scheme over a `sha256` digest would produce a signature the
+    /// destination rejects, for a reason the manifest said nothing about.
+    #[test]
+    fn a_body_digest_sbx_does_not_compute_is_refused() {
+        let err = validate(
+            RawSigner {
+                body_digest: Some("sha512".to_string()),
+                ..raw()
+            },
+            "fake",
+        )
+        .expect_err("sbx computes one algorithm");
+        assert!(err.contains("sha512") && err.contains("sha256"), "{err}");
     }
 
     #[test]

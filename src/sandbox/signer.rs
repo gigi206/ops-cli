@@ -68,6 +68,70 @@ pub(crate) struct SignRequest<'a> {
     pub(crate) target: &'a str,
     /// The declared subset of the request's headers, in the order they were sent.
     pub(crate) headers: Vec<(String, String)>,
+    /// What sbx can say about the body, for a plugin whose manifest declared `body_digest`. `None`
+    /// for every other plugin, and the key is then absent from the question entirely — so asking
+    /// for a digest changes nothing about what any other signer is shown.
+    pub(crate) body: Option<&'a BodyFacts>,
+}
+
+/// What sbx tells a signer about the body of the request it is signing.
+///
+/// Two shapes and one discriminant, because the difference is one a signing scheme has to act on:
+/// a signature that covers the payload cannot be formed over a body sbx did not hold, and a plugin
+/// told nothing would sign as though the request had none. So the absence is *stated*, with the
+/// reason, rather than left to be inferred from a missing field.
+pub(crate) enum BodyFacts {
+    /// sbx holds the whole body: its length, and the digest the manifest asked for.
+    Held {
+        bytes: u64,
+        algorithm: &'static str,
+        digest: String,
+    },
+    /// sbx does not hold it, and this is why.
+    Unheld { why: String },
+}
+
+impl BodyFacts {
+    /// The facts for a body sbx holds in full, digested with the algorithm the manifest named.
+    pub(crate) fn held(body: &[u8], algorithm: crate::plugins::signer::BodyDigest) -> Self {
+        use crate::plugins::signer::BodyDigest;
+        let digest = match algorithm {
+            BodyDigest::Sha256 => crate::trust::hash_bytes(body),
+        };
+        BodyFacts::Held {
+            bytes: body.len() as u64,
+            algorithm: algorithm.name(),
+            digest,
+        }
+    }
+
+    /// The facts for a body sbx does not hold. `why` is repeated to the plugin verbatim, so it says
+    /// what about this request kept sbx from holding it.
+    pub(crate) fn unheld(why: impl Into<String>) -> Self {
+        BodyFacts::Unheld { why: why.into() }
+    }
+
+    fn value(&self) -> serde_json::Value {
+        match self {
+            // The algorithm names its own key, so a plugin reads the digest under the spelling its
+            // manifest asked for rather than under a generic one it would have to interpret.
+            BodyFacts::Held {
+                bytes,
+                algorithm,
+                digest,
+            } => {
+                let mut map = serde_json::Map::new();
+                map.insert("held".to_string(), serde_json::Value::from(true));
+                map.insert("bytes".to_string(), serde_json::Value::from(*bytes));
+                map.insert(
+                    (*algorithm).to_string(),
+                    serde_json::Value::from(digest.clone()),
+                );
+                serde_json::Value::Object(map)
+            }
+            BodyFacts::Unheld { why } => serde_json::json!({ "held": false, "why": why }),
+        }
+    }
 }
 
 impl SignRequest<'_> {
@@ -78,7 +142,7 @@ impl SignRequest<'_> {
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::Value::from(v.clone())))
             .collect();
-        let v = serde_json::json!({
+        let mut v = serde_json::json!({
             "seq": seq,
             "method": self.method,
             "host": self.host,
@@ -86,6 +150,9 @@ impl SignRequest<'_> {
             "target": self.target,
             "headers": headers,
         });
+        if let (Some(body), Some(map)) = (self.body, v.as_object_mut()) {
+            map.insert("body".to_string(), body.value());
+        }
         format!("{v}\n")
     }
 }
@@ -660,6 +727,7 @@ mod tests {
             port: 443,
             target: "/bucket/key?x=1",
             headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+            body: None,
         };
         let line = req.line(3);
         let v: serde_json::Value = serde_json::from_str(line.trim_end()).expect("json");
@@ -673,6 +741,54 @@ mod tests {
             v["headers"].as_object().map(serde_json::Map::len),
             Some(1),
             "nothing the caller did not select"
+        );
+        assert!(
+            v.get("body").is_none(),
+            "a plugin that asked for no digest is shown the question it was always shown: {line}"
+        );
+    }
+
+    /// The digest is stated under the name of the algorithm that produced it, so a plugin reads it
+    /// under the spelling its own manifest asked for.
+    #[test]
+    fn a_held_body_is_stated_by_length_and_digest() {
+        let facts = BodyFacts::held(b"hello", crate::plugins::signer::BodyDigest::Sha256);
+        let req = SignRequest {
+            method: "POST",
+            host: "dynamodb.example.com",
+            port: 443,
+            target: "/",
+            headers: Vec::new(),
+            body: Some(&facts),
+        };
+        let v: serde_json::Value = serde_json::from_str(req.line(1).trim_end()).expect("json");
+        assert_eq!(v["body"]["held"], true);
+        assert_eq!(v["body"]["bytes"], 5);
+        assert_eq!(
+            v["body"]["sha256"], "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "the SHA-256 of `hello`, as a literal rather than a second computation of the same thing"
+        );
+    }
+
+    /// The absence is stated rather than implied by a missing field: a scheme whose signature must
+    /// cover the payload has to be able to tell "no body" from "a body sbx does not hold".
+    #[test]
+    fn a_body_sbx_does_not_hold_says_so_and_says_why() {
+        let facts = BodyFacts::unheld("it streams");
+        let req = SignRequest {
+            method: "POST",
+            host: "dynamodb.example.com",
+            port: 443,
+            target: "/",
+            headers: Vec::new(),
+            body: Some(&facts),
+        };
+        let v: serde_json::Value = serde_json::from_str(req.line(1).trim_end()).expect("json");
+        assert_eq!(v["body"]["held"], false);
+        assert_eq!(v["body"]["why"], "it streams");
+        assert!(
+            v["body"].get("sha256").is_none(),
+            "an unheld body carries no digest to mistake for one"
         );
     }
 

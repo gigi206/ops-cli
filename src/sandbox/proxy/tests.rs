@@ -3289,6 +3289,54 @@ fn read_chunked_body_dechunks_a_well_formed_body() {
     );
 }
 
+/// The two framings a signer's digest may have to cover, read through the one function, so a body
+/// held for a signature is the same bytes the upstream is sent whichever way the client framed it.
+#[test]
+fn a_held_body_is_the_same_bytes_however_the_client_framed_it() {
+    let mut chunked = std::io::BufReader::new(std::io::Cursor::new(
+        b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
+    ));
+    let held = match hold_request_body(&mut chunked, true, 0).unwrap() {
+        HeldBody::Held(body) => body,
+        HeldBody::TooLarge => panic!("well under the ceiling"),
+    };
+    assert_eq!(held, b"hello world");
+
+    let mut framed = std::io::BufReader::new(std::io::Cursor::new(
+        b"hello world and a pipelined leftover".to_vec(),
+    ));
+    let held = match hold_request_body(&mut framed, false, 11).unwrap() {
+        HeldBody::Held(body) => body,
+        HeldBody::TooLarge => panic!("well under the ceiling"),
+    };
+    assert_eq!(
+        held, b"hello world",
+        "exactly the Content-Length, never a byte of what follows it"
+    );
+}
+
+/// A `Content-Length` above the ceiling is answered without being received: the length is known
+/// from the head, so an oversized upload never crosses the loopback at all.
+#[test]
+fn a_body_above_the_ceiling_is_refused_before_a_byte_of_it_is_read() {
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(b"only a few bytes".to_vec()));
+    assert!(
+        matches!(
+            hold_request_body(&mut reader, false, CHUNKED_REQUEST_CAP + 1).unwrap(),
+            HeldBody::TooLarge
+        ),
+        "the ceiling is read off the head, not discovered by reading"
+    );
+}
+
+/// A body that ends early is an error rather than a short one silently digested: the signature
+/// would cover bytes the upstream never receives.
+#[test]
+fn a_body_that_ends_before_its_content_length_is_an_error() {
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(b"short".to_vec()));
+    assert!(hold_request_body(&mut reader, false, 500).is_err());
+}
+
 #[test]
 fn read_chunked_body_concatenates_multiple_chunks_and_strips_trailers() {
     // two chunks then a trailer section (discarded) then the final blank line.

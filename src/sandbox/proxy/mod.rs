@@ -668,6 +668,68 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //    cannot ride along to an unintended host. It is settled before any connection is taken,
     //    because which credentials a request carries is half of what partitions the pool below.
     let injected_ids = matching_injection_ids(&creds, &connect_host, port, &itarget);
+    // 7'. A signer whose manifest asks for a digest over the body is told one, which means the body
+    //     has to exist before the question is put: hold it here rather than stream it at step 9. The
+    //     `100-continue` a client may be waiting on is answered first — it withholds the body until
+    //     it sees one — so this reads a body the request may still be refused over, which is the
+    //     price of a signature that covers it.
+    let digest_wanted = creds.wants_body_digest(&injected_ids);
+    let held: Option<Vec<u8>> = match digest_wanted {
+        None => None,
+        Some(_) => {
+            if head_expects_continue(&inner) {
+                let client = br.get_mut();
+                let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                let _ = client.flush();
+            }
+            match hold_request_body(&mut br, chunked, body_len) {
+                Ok(HeldBody::Held(body)) => Some(body),
+                Ok(HeldBody::TooLarge) => {
+                    ctx.outcome(
+                        super::control::Proto::Https,
+                        &connect_host,
+                        port,
+                        Some(&imethod),
+                        Some(&itarget),
+                        StatKind::Blocked,
+                        SIGNER_BODY_TOO_LARGE,
+                    );
+                    return respond_refusal_tls(
+                        &mut br,
+                        "413 Payload Too Large",
+                        SIGNER_BODY_TOO_LARGE,
+                        &body_too_large_message(body_len),
+                    );
+                }
+                // A malformed chunked body is the same refusal it is when the de-chunk happens on
+                // the way out, under the same reason. A `Content-Length` body that ends early is a
+                // transport failure rather than a malformed request, and stays the dropped
+                // connection it is when the body streams.
+                Err(e) if chunked => {
+                    ctx.push_log(
+                        super::control::Proto::Https,
+                        &connect_host,
+                        port,
+                        Some(&imethod),
+                        Some(&itarget),
+                        super::control::LogVerdict::Blocked,
+                        "bad-request:chunked",
+                    );
+                    return respond_refusal_tls(
+                        &mut br,
+                        "400 Bad Request",
+                        "bad-request:chunked",
+                        &format!("the chunked request body could not be read: {e}"),
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let body_facts = held
+        .as_deref()
+        .zip(digest_wanted)
+        .map(|(body, algorithm)| super::signer::BodyFacts::held(body, algorithm));
     // Forming the values may take a plugin round trip, and a plugin that cannot sign refuses the
     // request: a request that could not be given its credential is never sent without it.
     let injected = match injection_values(
@@ -679,6 +741,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             port,
             target: &itarget,
             headers: &inner.headers,
+            body: body_facts.as_ref(),
         },
         ctx.signer_log(),
     ) {
@@ -724,10 +787,11 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let pool_key = keep_alive.then(|| PoolKey::new(&connect_host, port, &injected_ids));
     // Taking a parked connection is limited to a request the proxy can send a second time, because a
     // connection the upstream closed while it was parked only shows up after the write. That means a
-    // request with no body, or a chunked one whose body the de-chunker buffers before forwarding; a
-    // body streaming straight from the client is gone once written. Such a request opens its own
-    // connection and still leaves it behind for the next one.
-    let replayable = chunked || body_len == 0;
+    // request with no body, a chunked one whose body the de-chunker buffers before forwarding, or one
+    // whose body was held to be digested above; a body streaming straight from the client is gone
+    // once written. Such a request opens its own connection and still leaves it behind for the next
+    // one.
+    let replayable = chunked || body_len == 0 || held.is_some();
 
     // 7b. Take the upstream connection: a parked one, or a new one to the address just checked (not
     //     a re-resolve, which would reopen the rebinding window) with its certificate validated up
@@ -828,11 +892,27 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // 9. Forward this one request and stream the response back — a pipelined second request from the
     //    client is never forwarded, so it cannot skip the per-request check.
     //
-    //    The forwarded bytes are materialized whenever the proxy still holds all of them (see
-    //    `replayable` above): that is what lets a connection the upstream closed while it was parked
-    //    cost a second attempt instead of an empty response. A body streaming straight from the
-    //    client is gone once written, which is exactly why such a request never took a parked one.
-    let forwarded: Option<Vec<u8>> = if chunked {
+    //    The forwarded bytes are materialized whenever the proxy still holds all of them, which is
+    //    exactly what `replayable` above decided: that is what lets a connection the upstream closed
+    //    while it was parked cost a second attempt instead of an empty response. Branching on the
+    //    same binding is what keeps the two in step — a request that took a parked connection and
+    //    then could not be sent again would drop the client's connection instead of retrying.
+    let forwarded: Option<Vec<u8>> = if !replayable {
+        // A body streaming straight from the client: gone once written, which is why such a request
+        // never took a parked connection.
+        None
+    } else if let Some(body) = held {
+        // The body was read above so a signer could be told its digest. It is framed exactly as a
+        // de-chunked one: a forced `Content-Length`, and the client's own framing headers dropped by
+        // `reserialize_request`. The capture tee lives on the streaming path, so a held body is
+        // handed to the capture here instead.
+        if let Some(c) = &capture {
+            c.set_request_body(&body);
+        }
+        let mut req = reserialize_request(&inner, &injected, Some(body.len() as u64), keep_alive);
+        req.extend_from_slice(&body);
+        Some(req)
+    } else if chunked {
         // A `Transfer-Encoding: chunked` request: de-chunk the body into a bounded buffer and
         // forward a clean `Content-Length`-framed request (the `Transfer-Encoding` header is
         // stripped by `reserialize_request` when a length is forced), so no chunked framing — and
@@ -873,10 +953,9 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         let mut req = reserialize_request(&inner, &injected, Some(body.len() as u64), keep_alive);
         req.extend_from_slice(&body);
         Some(req)
-    } else if body_len == 0 {
-        Some(reserialize_request(&inner, &injected, None, keep_alive))
     } else {
-        None
+        // Replayable, neither held nor chunked: a request with no body at all.
+        Some(reserialize_request(&inner, &injected, None, keep_alive))
     };
 
     if let Some(req) = &forwarded {
@@ -1901,6 +1980,66 @@ fn handle_https_forward(
     //    it encrypted, never in the clear. Settled before a connection is taken, because which
     //    credentials a request carries is half of what partitions the pool.
     let injected_ids = matching_injection_ids(&creds, &host, port, &path);
+    // 7'. As on the tunneled path: a signer that asks for a digest over the body needs the body held
+    //     before the question is put, so it is read here rather than streamed at step 9.
+    let digest_wanted = creds.wants_body_digest(&injected_ids);
+    let held: Option<Vec<u8>> = match digest_wanted {
+        None => None,
+        Some(_) => {
+            if head_expects_continue(head) {
+                let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                let _ = client.flush();
+            }
+            // The buffered reader is scoped to the read, as it is for the de-chunk below: it may
+            // read past the body's terminator, and this path forwards no pipelined second request.
+            let read = {
+                let mut reader = BufReader::new(&client);
+                hold_request_body(&mut reader, chunked, body_len)
+            };
+            match read {
+                Ok(HeldBody::Held(body)) => Some(body),
+                Ok(HeldBody::TooLarge) => {
+                    ctx.outcome(
+                        super::control::Proto::Https,
+                        &host,
+                        port,
+                        Some(method),
+                        Some(&path),
+                        StatKind::Blocked,
+                        SIGNER_BODY_TOO_LARGE,
+                    );
+                    return write_refusal(
+                        &mut client,
+                        "413 Payload Too Large",
+                        SIGNER_BODY_TOO_LARGE,
+                        &body_too_large_message(body_len),
+                    );
+                }
+                Err(e) if chunked => {
+                    ctx.push_log(
+                        super::control::Proto::Https,
+                        &host,
+                        port,
+                        Some(method),
+                        Some(&path),
+                        super::control::LogVerdict::Blocked,
+                        "bad-request:chunked",
+                    );
+                    return write_refusal(
+                        &mut client,
+                        "400 Bad Request",
+                        "bad-request:chunked",
+                        &format!("the chunked request body could not be read: {e}"),
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let body_facts = held
+        .as_deref()
+        .zip(digest_wanted)
+        .map(|(body, algorithm)| super::signer::BodyFacts::held(body, algorithm));
     let injected = match injection_values(
         &creds,
         &injected_ids,
@@ -1910,6 +2049,7 @@ fn handle_https_forward(
             port,
             target: &path,
             headers: &head.headers,
+            body: body_facts.as_ref(),
         },
         ctx.signer_log(),
     ) {
@@ -1939,7 +2079,7 @@ fn handle_https_forward(
     let keep_alive =
         ctx.pool.is_some() && head.request_line.split_whitespace().nth(2) == Some("HTTP/1.1");
     let pool_key = keep_alive.then(|| PoolKey::new(&host, port, &injected_ids));
-    let replayable = chunked || body_len == 0;
+    let replayable = chunked || body_len == 0 || held.is_some();
 
     // 7b. Take the upstream connection: a parked one, or a new validated TLS connection to the
     //     checked address (not a re-resolve, which would reopen the rebinding window). A
@@ -1979,8 +2119,8 @@ fn handle_https_forward(
     // 9. Forward the one request in **origin-form** (`POST /path`) with the injected credential (the
     //    reserializer strips hop-by-hop headers and the client's copy of any injected header). A
     //    pipelined second request is never forwarded, so it cannot skip the per-request check. The
-    //    forwarded bytes are materialized when the proxy still holds all of them, so a connection the
-    //    upstream closed while it was parked costs a second attempt rather than an empty response.
+    //    forwarded bytes are materialized when the proxy still holds all of them — the same binding
+    //    that decided whether this request could take a parked connection, so the two cannot drift.
     let version = head
         .request_line
         .split_whitespace()
@@ -1990,7 +2130,21 @@ fn handle_https_forward(
         request_line: format!("{method} {path} {version}"),
         headers: head.headers.clone(),
     };
-    let forwarded: Option<Vec<u8>> = if chunked {
+    let forwarded: Option<Vec<u8>> = if !replayable {
+        // A body streaming straight from the client: gone once written, which is why such a request
+        // never took a parked connection.
+        None
+    } else if let Some(body) = held {
+        // The body was read above so a signer could be told its digest, and is framed exactly as a
+        // de-chunked one. The capture tee lives on the streaming path, so a held body is handed to
+        // the capture here instead.
+        if let Some(c) = &capture {
+            c.set_request_body(&body);
+        }
+        let mut req = reserialize_request(&origin, &injected, Some(body.len() as u64), keep_alive);
+        req.extend_from_slice(&body);
+        Some(req)
+    } else if chunked {
         // A `Transfer-Encoding: chunked` request: de-chunk the body into a bounded buffer and forward
         // a clean `Content-Length`-framed request (the reserializer strips the client's
         // Transfer-Encoding when a length is forced), so no chunked framing — and no CL/TE
@@ -2033,10 +2187,9 @@ fn handle_https_forward(
         let mut req = reserialize_request(&origin, &injected, Some(body.len() as u64), keep_alive);
         req.extend_from_slice(&body);
         Some(req)
-    } else if body_len == 0 {
-        Some(reserialize_request(&origin, &injected, None, keep_alive))
     } else {
-        None
+        // Replayable, neither held nor chunked: a request with no body at all.
+        Some(reserialize_request(&origin, &injected, None, keep_alive))
     };
 
     if let Some(req) = &forwarded {
@@ -2587,6 +2740,44 @@ impl Head {
     }
 }
 
+/// The outcome of trying to hold a request body a signer asked to be told the digest of.
+enum HeldBody {
+    /// The whole body, in memory.
+    Held(Vec<u8>),
+    /// Longer than [`CHUNKED_REQUEST_CAP`], so it is not held at all — the caller refuses the
+    /// request rather than sign it as though it had no body.
+    TooLarge,
+}
+
+/// Read a request's whole body into memory, before the request is signed.
+///
+/// The proxy otherwise streams a `Content-Length` body straight through and de-chunks a `chunked`
+/// one only on its way out, both of which put the bytes past sbx by the time a signature is formed.
+/// A signer whose scheme covers the payload needs the digest *in the question*, so for those
+/// requests — and only those — the body is held first.
+///
+/// The same [`CHUNKED_REQUEST_CAP`] bounds both shapes, since the memory it bounds is the same
+/// memory. A `Content-Length` over it is known before a byte is read, so an oversized upload is
+/// answered without being received.
+fn hold_request_body<R: BufRead>(
+    reader: &mut R,
+    chunked: bool,
+    body_len: u64,
+) -> io::Result<HeldBody> {
+    if chunked {
+        return read_chunked_body(reader, CHUNKED_REQUEST_CAP).map(HeldBody::Held);
+    }
+    if body_len > CHUNKED_REQUEST_CAP {
+        return Ok(HeldBody::TooLarge);
+    }
+    let mut body = Vec::new();
+    let read = reader.take(body_len).read_to_end(&mut body)?;
+    if read as u64 != body_len {
+        return Err(invalid("the request body ended before its Content-Length"));
+    }
+    Ok(HeldBody::Held(body))
+}
+
 /// The credential injections (`header`, `value`) whose host/path rule matches this request,
 /// canonicalized through the same matcher the verdict used. Borrowed from the context, so no
 /// secret is copied beyond the forwarded head.
@@ -2634,6 +2825,21 @@ fn any_refreshable(creds: &CredentialSet, ids: &[usize]) -> bool {
 /// header, and the reason in the log. Distinct from every policy tag, because nothing about the
 /// policy said no — the credential could not be formed.
 const SIGNER_REFUSED: &str = "signer-refused";
+
+/// The reason token a request refused for a body too large to hold carries. Its own token rather
+/// than [`SIGNER_REFUSED`], because no plugin refused: sbx did, before asking, and the fix is the
+/// request's size and not the credential.
+const SIGNER_BODY_TOO_LARGE: &str = "signer-body-too-large";
+
+/// What a request refused for an unholdable body is told. It names the ceiling, because a size limit
+/// a caller cannot read is one it can only discover by bisection.
+fn body_too_large_message(body_len: u64) -> String {
+    format!(
+        "a signer for this destination is told the digest of the request body, so sbx holds the \
+         body before signing — and this request's {body_len} bytes are above the \
+         {CHUNKED_REQUEST_CAP}-byte ceiling for a body it holds"
+    )
+}
 
 /// The sentence a signer refusal answers with. It names the plugin, because a refusal that does not
 /// say who refused leaves the user auditing every declaration, and it says plainly that the request

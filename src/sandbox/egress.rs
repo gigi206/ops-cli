@@ -1007,6 +1007,7 @@ fn resolve_one(
                 key: trimmed.to_string(),
                 marker,
                 process,
+                body_digest: plugin.signer.body_digest,
             }),
         },
         needles,
@@ -2003,6 +2004,7 @@ mod tests {
                     super::super::broker::SecretMarker::new(key, 8).expect("marker"),
                 )),
                 process: std::sync::Arc::new(std::sync::Mutex::new(InertSigner)),
+                body_digest: None,
             }),
         }
     }
