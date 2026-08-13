@@ -406,6 +406,39 @@ because a path may hold one, while `infisical://` splits at the **first**, since
 an Infisical secret name may hold a `#` and the project, environment and folder
 before it cannot.
 
+### The published signer
+
+One plugin in the store is not a resolver at all. Where every resolver above
+answers *where a value comes from*, `aws-sigv4` answers what no resolved value
+can: what authenticating **this** request looks like. It is reached with
+[`sign`](../configuration/secret#sign-a-credential-computed-from-the-request)
+rather than by a scheme, and the type it belongs to is
+[described below](#the-signer-type).
+
+| Plugin | Named by | Forms | Sandbox grant |
+|---|---|---|---|
+| `aws-sigv4` | `sign = "aws-sigv4"` | an AWS Signature Version 4 signature over each request: `Authorization`, `X-Amz-Date`, `X-Amz-Content-Sha256`, and `X-Amz-Security-Token` for a temporary credential | `programs = ["python3"]`; `allow_env` for `AWS_ACCESS_KEY_ID`, `AWS_SESSION_TOKEN` and the region and service overrides; **no network**, no state, no broker |
+
+```toml
+[secret."my-bucket.s3.eu-west-3.amazonaws.com"]
+from = "pass://aws/prod#secret_access_key"
+sign = "aws-sigv4"
+```
+
+The secret access key stays host-side; the sandbox holds nothing reusable, and
+each request leaves it unsigned and reaches AWS signed. Because the headers sbx
+places are strip-and-replaced, an `aws` CLI or a boto3 running in the sandbox can
+carry placeholder credentials: whatever it signed with is dropped, and the
+plugin's signature is the only one the destination sees.
+
+Its one boundary is the request body, and it is worth knowing before you meet it.
+A signer is shown a request's head, never its body, so a payload digest reaches it
+only three ways: the client computed one and sent it as `x-amz-content-sha256`
+(which every AWS SDK does, so bodies work), the request provably has none, or the
+service is S3, which accepts an unsigned payload. A body outside those is
+**refused** rather than signed over the wrong digest, and the refusal says which
+of the three to reach for.
+
 If a launch refuses because a declared program is not on `PATH`, the tool the
 plugin runs is not installed, or not where the shell that starts sbx looks for
 it. `sbx plugins info <name>` resolves each declared program the way a launch
@@ -588,7 +621,7 @@ challenge answered in kind. `type = "signer"` is the third plugin type, for exac
 those.
 
 ```toml
-name = "example-sigv4"
+name = "example-signer"
 type = "signer"                       # no `scheme`: a signer claims no ref namespace
 exec = "bin/sign"
 
@@ -648,7 +681,7 @@ A declaration reaches it with [`sign`](../configuration/secret#sign-a-credential
 ```toml
 [secret."s3.eu-west-1.amazonaws.com"]
 from = "env://AWS_SECRET_ACCESS_KEY"
-sign = "example-sigv4"
+sign = "aws-sigv4"
 ```
 
 The plugin is started once for the launch and asked once per request. It is told the

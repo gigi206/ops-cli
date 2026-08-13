@@ -73,7 +73,7 @@ and the plugin is asked once per request:
 ```toml
 [secret."s3.eu-west-1.amazonaws.com"]
 from = "env://AWS_SECRET_ACCESS_KEY"
-sign = "example-sigv4"
+sign = "aws-sigv4"
 ```
 
 `sign` is **mutually exclusive** with `header`, `type` and `prefix`: which headers the

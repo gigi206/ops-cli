@@ -8,11 +8,11 @@ See also: [Resolver plugins](plugins) · [`sbx plugins store`](../cli/plugins#st
 [Resolvers](resolvers) · [The trust gate](../concepts/trust).
 
 A **remote plugin store** is a git repository of plugins that `sbx` fetches on your
-behalf. One store serves **both kinds** ([resolvers](plugins) and
-[brokers](plugins#the-broker-type)), under one key and one catalogue: the store is not
-what fences a broker, since installing one grants nothing until a global
-[`[broker.<name>] socket`](../configuration/broker) binds it to a host resource. A second
-store would ask you to pin a second key where nothing is decided. Because you do not inspect what is fetched, authenticity
+behalf. One store serves **every kind** ([resolvers](plugins),
+[brokers](plugins#the-broker-type) and [signers](plugins#the-signer-type)), under one key
+and one catalogue: the store is not what fences a broker, since installing one grants
+nothing until a global [`[broker.<name>] socket`](../configuration/broker) binds it to a
+host resource. A second store would ask you to pin a second key where nothing is decided. Because you do not inspect what is fetched, authenticity
 cannot come from the transport: git moves bytes and checks their *integrity*,
 never their *origin*. It comes from a signature.
 
