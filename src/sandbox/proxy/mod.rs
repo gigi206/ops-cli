@@ -677,8 +677,38 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     //     it sees one — so this reads a body the request may still be refused over, which is the
     //     price of a signature that covers it.
     let digest_wanted = creds.wants_body_digest(&injected_ids);
-    let (held, _budget): (Option<Vec<u8>>, Option<BodyBudget>) = match digest_wanted {
-        None => (None, None),
+    // Whether the proxy will read this request's body into memory rather than stream it: a chunked
+    // request, which it de-chunks and re-frames whatever any signer wanted, or one a signer will be
+    // told a digest of. One reservation covers both, taken here — before the allow is recorded and
+    // before any upstream is opened, so a request refused for want of buffer is counted once and
+    // costs no connection. Released with the buffer it covers, once the forwarded bytes are on the
+    // wire: holding it through the response relay would turn a ceiling on what is *held* into a
+    // limit on how many responses may be in flight.
+    let mut budget: Option<BodyBudget> = None;
+    if chunked || digest_wanted.is_some() {
+        budget = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len) {
+            Some(reserved) => Some(reserved),
+            None => {
+                ctx.outcome(
+                    super::control::Proto::Https,
+                    &connect_host,
+                    port,
+                    Some(&imethod),
+                    Some(&itarget),
+                    StatKind::Blocked,
+                    BODY_BUFFER_CAP,
+                );
+                return respond_refusal_tls(
+                    &mut br,
+                    "503 Service Unavailable",
+                    BODY_BUFFER_CAP,
+                    &body_budget_message(),
+                );
+            }
+        };
+    }
+    let held: Option<Vec<u8>> = match digest_wanted {
+        None => None,
         Some(_) => {
             // Refused before the client is invited to send, so an oversized upload is answered
             // rather than received.
@@ -699,27 +729,6 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                     &body_too_large_message(body_len),
                 );
             }
-            // Reserved before a byte is read; `_budget` releases it when the request ends.
-            let reserved = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len) {
-                Some(reserved) => reserved,
-                None => {
-                    ctx.outcome(
-                        super::control::Proto::Https,
-                        &connect_host,
-                        port,
-                        Some(&imethod),
-                        Some(&itarget),
-                        StatKind::Blocked,
-                        BODY_BUFFER_CAP,
-                    );
-                    return respond_refusal_tls(
-                        &mut br,
-                        "503 Service Unavailable",
-                        BODY_BUFFER_CAP,
-                        &body_budget_message(),
-                    );
-                }
-            };
             // Only where there is a body to invite. A request that declares none is answered by the
             // response itself, and an interim `100` for a body that will never come is noise.
             if (chunked || body_len > 0) && head_expects_continue(&inner) {
@@ -728,7 +737,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
                 let _ = client.flush();
             }
             match hold_request_body(&mut br, chunked, body_len) {
-                Ok(body) => (Some(body), Some(reserved)),
+                Ok(body) => Some(body),
                 // A malformed chunked body is the same refusal it is when the de-chunk happens on
                 // the way out, under the same reason. A `Content-Length` body that ends early is a
                 // transport failure rather than a malformed request, and stays the dropped
@@ -948,31 +957,8 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // forward a clean `Content-Length`-framed request (the `Transfer-Encoding` header is
         // stripped by `reserialize_request` when a length is forced), so no chunked framing — and
         // no CL/TE request-smuggling ambiguity — reaches the upstream. The cap bounds memory for
-        // an agent prompt body (KB–MB); a larger chunked upload fails closed.
-        //
-        // The same shared ceiling the held path takes, and for the same reason: this buffer is
-        // host-side, and one per connection would let concurrency multiply the per-request cap into
-        // the host's memory. Reserved before a byte is read; released when this scope ends.
-        let _budget = match reserve_body_buffer(&ctx.held_bodies, true, 0) {
-            Some(reserved) => reserved,
-            None => {
-                ctx.outcome(
-                    super::control::Proto::Https,
-                    &connect_host,
-                    port,
-                    Some(&imethod),
-                    Some(&itarget),
-                    StatKind::Blocked,
-                    BODY_BUFFER_CAP,
-                );
-                return respond_refusal_tls(
-                    &mut br,
-                    "503 Service Unavailable",
-                    BODY_BUFFER_CAP,
-                    &body_budget_message(),
-                );
-            }
-        };
+        // an agent prompt body (KB–MB); a larger chunked upload fails closed. Its room in the
+        // shared ceiling was reserved at step 7', before the allow was recorded.
         // Answer a client `Expect: 100-continue` before reading, else it withholds the body. A
         // de-chunk failure (malformed framing, or over the cap) is fail-closed: log + refuse 400
         // (the interim 100 already sent is harmless — a final 4xx may follow it on one connection).
@@ -1112,6 +1098,13 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
         // streamed completion), so lift the upstream read timeout for the relay below.
         begin_response_stream(&upstream.sock);
     }
+
+    // The forwarded bytes are on the wire, retries included: the buffer and its reservation are
+    // done. Released here rather than at the end of the function, or a ceiling on what the proxy
+    // *holds* would silently become a limit on how many responses may be relayed at once — a
+    // streaming completion would hold its 64 MiB of budget for as long as it streams.
+    drop(forwarded);
+    drop(budget);
 
     // 9b. Response-side leak backstop: a configured secret can only re-enter the cage by being
     //     *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores
@@ -2045,8 +2038,38 @@ fn handle_https_forward(
     // 7'. As on the tunneled path: a signer that asks for a digest over the body needs the body held
     //     before the question is put, so it is read here rather than streamed at step 9.
     let digest_wanted = creds.wants_body_digest(&injected_ids);
-    let (held, _budget): (Option<Vec<u8>>, Option<BodyBudget>) = match digest_wanted {
-        None => (None, None),
+    // Whether the proxy will read this request's body into memory rather than stream it: a chunked
+    // request, which it de-chunks and re-frames whatever any signer wanted, or one a signer will be
+    // told a digest of. One reservation covers both, taken here — before the allow is recorded and
+    // before any upstream is opened, so a request refused for want of buffer is counted once and
+    // costs no connection. Released with the buffer it covers, once the forwarded bytes are on the
+    // wire: holding it through the response relay would turn a ceiling on what is *held* into a
+    // limit on how many responses may be in flight.
+    let mut budget: Option<BodyBudget> = None;
+    if chunked || digest_wanted.is_some() {
+        budget = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len) {
+            Some(reserved) => Some(reserved),
+            None => {
+                ctx.outcome(
+                    super::control::Proto::Https,
+                    &host,
+                    port,
+                    Some(method),
+                    Some(&path),
+                    StatKind::Blocked,
+                    BODY_BUFFER_CAP,
+                );
+                return write_refusal(
+                    &mut client,
+                    "503 Service Unavailable",
+                    BODY_BUFFER_CAP,
+                    &body_budget_message(),
+                );
+            }
+        };
+    }
+    let held: Option<Vec<u8>> = match digest_wanted {
+        None => None,
         Some(_) => {
             // Refused before the client is invited to send, as on the tunneled path.
             if body_exceeds_hold(chunked, body_len) {
@@ -2066,26 +2089,6 @@ fn handle_https_forward(
                     &body_too_large_message(body_len),
                 );
             }
-            let reserved = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len) {
-                Some(reserved) => reserved,
-                None => {
-                    ctx.outcome(
-                        super::control::Proto::Https,
-                        &host,
-                        port,
-                        Some(method),
-                        Some(&path),
-                        StatKind::Blocked,
-                        BODY_BUFFER_CAP,
-                    );
-                    return write_refusal(
-                        &mut client,
-                        "503 Service Unavailable",
-                        BODY_BUFFER_CAP,
-                        &body_budget_message(),
-                    );
-                }
-            };
             if (chunked || body_len > 0) && head_expects_continue(head) {
                 let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
                 let _ = client.flush();
@@ -2097,7 +2100,7 @@ fn handle_https_forward(
                 hold_request_body(&mut reader, chunked, body_len)
             };
             match read {
-                Ok(body) => (Some(body), Some(reserved)),
+                Ok(body) => Some(body),
                 Err(e) if chunked => {
                     ctx.push_log(
                         super::control::Proto::Https,
@@ -2238,26 +2241,6 @@ fn handle_https_forward(
         // before reading, else it withholds the body. A de-chunk failure (malformed framing, or over
         // the cap) is fail-closed: log + refuse 400. The shared buffer ceiling is taken here as the
         // held path takes it, for the same host-side memory it bounds.
-        let _budget = match reserve_body_buffer(&ctx.held_bodies, true, 0) {
-            Some(reserved) => reserved,
-            None => {
-                ctx.outcome(
-                    super::control::Proto::Https,
-                    &host,
-                    port,
-                    Some(method),
-                    Some(&path),
-                    StatKind::Blocked,
-                    BODY_BUFFER_CAP,
-                );
-                return write_refusal(
-                    &mut client,
-                    "503 Service Unavailable",
-                    BODY_BUFFER_CAP,
-                    &body_budget_message(),
-                );
-            }
-        };
         if head_expects_continue(head) {
             let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
             let _ = client.flush();
@@ -2373,6 +2356,13 @@ fn handle_https_forward(
         // The request is fully forwarded; the response may idle between bursts, so lift the timeout.
         begin_response_stream(&upstream.sock);
     }
+
+    // The forwarded bytes are on the wire, retries included: the buffer and its reservation are
+    // done. Released here rather than at the end of the function, or a ceiling on what the proxy
+    // *holds* would silently become a limit on how many responses may be relayed at once — a
+    // streaming completion would hold its 64 MiB of budget for as long as it streams.
+    drop(forwarded);
+    drop(budget);
 
     // 10. Relay the response head, then stream its framed body to the plaintext client and close.
     //     Mask a reflected secret only for a response from an injection-target host (every other
@@ -2862,9 +2852,15 @@ impl Head {
 /// have the host allocate the product of the two — a denial of service an in-cage agent reaches
 /// with nothing more than an allowed host and concurrency.
 ///
-/// Generous for the workload it exists for (agent prompt bodies, KB to MB) and small beside the
-/// product it replaces.
-const HELD_BODY_BUDGET: u64 = 512 * 1024 * 1024;
+/// The ceiling is **derived** from the number below rather than picked as a round figure, because
+/// that number is the one a user meets: a `chunked` request reserves the whole per-request ceiling
+/// (its length is unknowable until read), so the budget divided by that ceiling is exactly how many
+/// chunked uploads may be in flight at once. Making the divisor the constant keeps that visible
+/// instead of leaving it to be discovered by division.
+const CONCURRENT_CHUNKED_UPLOADS: u64 = 16;
+
+/// The bytes held at one moment across every connection. See [`CONCURRENT_CHUNKED_UPLOADS`].
+const HELD_BODY_BUDGET: u64 = CONCURRENT_CHUNKED_UPLOADS * CHUNKED_REQUEST_CAP;
 
 /// The reason token a request refused for want of buffer budget carries. Its own token, and a
 /// `503` rather than a `4xx`, because nothing is wrong with the request: the proxy is holding other

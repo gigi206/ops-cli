@@ -3519,8 +3519,13 @@ fn the_body_buffer_budget_is_shared_and_released() {
     use std::sync::atomic::AtomicU64;
 
     let budget = AtomicU64::new(0);
-    // A chunked request cannot say how much it will read, so it reserves the per-request ceiling.
-    let held: Vec<_> = (0..HELD_BODY_BUDGET / CHUNKED_REQUEST_CAP)
+    // A chunked request cannot say how much it will read, so it reserves the per-request ceiling —
+    // which makes this the number of concurrent chunked uploads, and why that is the named constant.
+    assert_eq!(
+        HELD_BODY_BUDGET / CHUNKED_REQUEST_CAP,
+        CONCURRENT_CHUNKED_UPLOADS
+    );
+    let held: Vec<_> = (0..CONCURRENT_CHUNKED_UPLOADS)
         .map(|_| reserve_body_buffer(&budget, true, 0).expect("within the ceiling"))
         .collect();
     assert!(
@@ -3551,36 +3556,78 @@ fn the_body_buffer_budget_is_shared_and_released() {
     assert_eq!(small.len(), 1000);
 }
 
-/// The refusal the ceiling issues, through the real proxy: `503`, its own reason, and the request
-/// is never sent. A `4xx` would say the request was at fault, and it is not — the proxy is busy.
+/// The refusal the ceiling issues, through the real proxy, at **every** site that reserves.
+///
+/// Four relays read a request body into memory: each plane's held path (a signer asking for a
+/// digest) and each plane's chunked path (de-chunked and re-framed, whatever any signer wanted).
+/// The reservation was applied to all four by hand, and a test that removes the ceiling inside the
+/// helper cannot catch a site that never calls the helper — which is exactly how the absolute-form
+/// plane went uncovered once already. So each site is driven with the ceiling already spent.
+///
+/// A `503` and not a `4xx`: nothing is wrong with the request, the proxy is holding other bodies.
 #[test]
-fn a_request_that_would_pass_the_body_buffer_ceiling_is_refused_without_being_sent() {
-    let ca = Arc::new(Ca::ephemeral().unwrap());
-    let der = ca.ca_cert_der();
-    let ctx = Arc::new(
-        ProxyCtx::new(ca, policy(&["host.test:*"]))
-            .unwrap()
-            .with_injections(vec![digesting_injection()])
-            // Resolvable, and nothing listening there: the ceiling is reached before any upstream
-            // is opened, so a `503` rather than an `upstream-unreachable` is itself the proof.
-            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
-    );
-    // Spend the ceiling, as other requests in flight would.
-    ctx.held_bodies
-        .store(HELD_BODY_BUDGET, std::sync::atomic::Ordering::Relaxed);
-    let resp = through_proxy(
-        ctx,
-        der,
-        "host.test",
-        "host.test",
-        8443,
-        b"POST / HTTP/1.1\r\nHost: host.test\r\nContent-Length: 11\r\n\r\nhello world",
-    )
-    .unwrap();
-    assert!(
-        resp.contains("503") && resp.contains("body-buffer-cap"),
-        "the proxy is busy, not the request malformed: {resp:?}"
-    );
+fn every_site_that_buffers_a_body_refuses_once_the_ceiling_is_spent() {
+    let signed = b"POST / HTTP/1.1\r\nHost: host.test\r\nContent-Length: 11\r\n\r\nhello world";
+    let chunked = b"POST / HTTP/1.1\r\nHost: host.test\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    // The tunneled plane, both of its sites.
+    for (site, request, injections) in [
+        (
+            "tunneled, held for a digest",
+            &signed[..],
+            vec![digesting_injection()],
+        ),
+        ("tunneled, chunked", &chunked[..], Vec::new()),
+    ] {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(ca, policy(&["host.test:*"]))
+                .unwrap()
+                .with_injections(injections)
+                // Resolvable, nothing listening: the ceiling is reached before any upstream is
+                // opened, so a `503` rather than an `upstream-unreachable` is itself the proof.
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        ctx.held_bodies
+            .store(HELD_BODY_BUDGET, std::sync::atomic::Ordering::Relaxed);
+        let resp = through_proxy(ctx, der, "host.test", "host.test", 8443, request)
+            .unwrap_or_else(|e| panic!("{site}: {e}"));
+        assert!(
+            resp.contains("503") && resp.contains("body-buffer-cap"),
+            "{site}: the proxy is busy, not the request malformed: {resp:?}"
+        );
+    }
+
+    // The absolute-form plane, both of its sites. Its own writer, its own reservation.
+    for (site, request, injections) in [
+        (
+            "absolute-form, held for a digest",
+            // The head alone: the refusal precedes the read, and a plaintext client still writing
+            // its body meets the close as a reset rather than as the `503` under test.
+            &b"POST https://host.test:8443/ HTTP/1.1\r\nHost: host.test\r\nContent-Length: 11\r\n\r\n"[..],
+            vec![digesting_injection()],
+        ),
+        (
+            "absolute-form, chunked",
+            &b"POST https://host.test:8443/ HTTP/1.1\r\nHost: host.test\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            Vec::new(),
+        ),
+    ] {
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+                .unwrap()
+                .with_injections(injections)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        ctx.held_bodies
+            .store(HELD_BODY_BUDGET, std::sync::atomic::Ordering::Relaxed);
+        let resp = through_cleartext(ctx, request).unwrap_or_else(|e| panic!("{site}: {e}"));
+        assert!(
+            resp.contains("503") && resp.contains("body-buffer-cap"),
+            "{site}: {resp:?}"
+        );
+    }
 }
 
 /// A held body is **re-sendable**, which is the whole reason it may take a parked connection.
@@ -5640,7 +5687,45 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         );
     }
 
-    // The shared ring is the ordered transcript of the eight blocks above: each site emitted
+    // body-buffer-cap (the shared ceiling on request-body buffers is spent) → blocked. Recorded
+    // before the allow is, and before any upstream is opened, so a request refused for want of
+    // buffer is counted once rather than as an allow and a block.
+    {
+        let s = fresh();
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(ca, policy(&["host.test:*"]))
+                .unwrap()
+                .with_stats(s.clone())
+                .with_log(log.clone())
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        ctx.held_bodies
+            .store(HELD_BODY_BUDGET, std::sync::atomic::Ordering::Relaxed);
+        let resp = through_proxy(
+            ctx,
+            der,
+            "host.test",
+            "host.test",
+            8443,
+            b"POST / HTTP/1.1\r\nHost: host.test\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            resp.contains("503") && resp.contains("body-buffer-cap"),
+            "{resp:?}"
+        );
+        assert_eq!(
+            count(&s, "host.test"),
+            Counts {
+                blocked: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    // The shared ring is the ordered transcript of the nine blocks above: each site emitted
     // exactly one event with the host, verdict, and reason category it recorded. A mis-emitted
     // or missing event here is a log/stats drift (or a missed site), even though the per-block
     // stat assertions passed.
@@ -5658,6 +5743,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
         ("host.test", LogVerdict::Blocked, "outbound-secret"),
         ("host.test", LogVerdict::Blocked, "ssrf-blocked"),
         ("host.test", LogVerdict::Blocked, "signer-body-too-large"),
+        ("host.test", LogVerdict::Blocked, "body-buffer-cap"),
     ];
     assert_eq!(
         seen.len(),
