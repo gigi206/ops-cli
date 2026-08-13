@@ -138,8 +138,14 @@ pub(crate) fn wrap_command(
     cmd: Vec<OsString>,
     tcp: &[TcpDestination],
 ) -> Vec<OsString> {
+    // `nodelay` on every TCP address the forwarder owns. The cage's side of a request is loopback
+    // TCP, and a proxy answers a request as a head and then a body — two writes. With Nagle on, the
+    // second waits for the first to be acknowledged, which on a connection that stays open is a
+    // delayed ACK away. It cost tens of milliseconds per request, measured, and nothing at all to
+    // remove: these are localhost sockets carrying an agent's traffic, where latency is the whole
+    // budget and there is no congestion for Nagle to protect anyone from.
     let preamble = format!(
-        "{socat} TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{uds} \
+        "{socat} TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr,nodelay UNIX-CONNECT:{uds} \
          </dev/null >/dev/null 2>&1 & {tcp_forwarders}",
         socat = socat.to_string_lossy(),
         port = CAGE_PROXY_PORT,
@@ -412,13 +418,18 @@ pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPl
 /// Each listener speaks `CONNECT` to the in-cage proxy port on the destination's behalf, naming the
 /// host **as written**: socat sends the name rather than resolving it (verified), so the `/etc/hosts`
 /// entry pointing that name at the cage address cannot loop the connection back on itself.
+///
+/// Both TCP addresses carry `nodelay`, for the reason given in [`wrap_command`] and one more that is
+/// this path's own: a raw splice is what carries an interactive session (a shell, a database
+/// client), where Nagle turns a keystroke into a round trip's wait.
 fn tcp_forwarders(socat: &Path, destinations: &[TcpDestination]) -> String {
     let mut out = String::new();
     for dest in destinations {
         for port in &dest.ports {
             out.push_str(&format!(
-                "{socat} TCP-LISTEN:{port},bind={addr},fork,reuseaddr \
-                 PROXY:127.0.0.1:{host}:{port},proxyport={proxy} </dev/null >/dev/null 2>&1 & ",
+                "{socat} TCP-LISTEN:{port},bind={addr},fork,reuseaddr,nodelay \
+                 PROXY:127.0.0.1:{host}:{port},proxyport={proxy},nodelay \
+                 </dev/null >/dev/null 2>&1 & ",
                 socat = socat.to_string_lossy(),
                 addr = dest.cage_addr,
                 host = dest.host,
@@ -1272,6 +1283,44 @@ mod tests {
         assert_eq!(argv[3], OsString::from("sbx-egress-forward"));
         assert_eq!(argv[4], OsString::from("jq"));
         assert_eq!(argv[5], OsString::from("--version"));
+    }
+
+    /// Every TCP address the cage's forwarder owns carries `nodelay`.
+    ///
+    /// Nagle holds a small write back until the previous one is acknowledged, and a proxy answers a
+    /// request as a head then a body. On a connection that closes after each response the close
+    /// flushed the pair; on one that stays open for the next request it does not, and the second
+    /// write waits out a delayed ACK — tens of milliseconds per request, on a loopback socket with
+    /// no congestion for Nagle to protect anyone from. A raw `tcp://` splice pays it per keystroke.
+    #[test]
+    fn every_tcp_address_of_the_cage_forwarder_disables_nagle() {
+        let argv = wrap_command(
+            Path::new("/nix/store/abc-socat/bin/socat"),
+            Path::new("/nix/store/def-bash/bin/bash"),
+            vec![OsString::from("jq")],
+            &[TcpDestination {
+                host: "db.internal".into(),
+                cage_addr: std::net::Ipv4Addr::new(127, 0, 0, 2),
+                ports: vec![5432],
+                map_name: true,
+            }],
+        );
+        let script = argv[2].to_string_lossy().into_owned();
+        let tcp_addresses: Vec<&str> = script
+            .split_whitespace()
+            .filter(|token| token.starts_with("TCP-LISTEN:") || token.starts_with("PROXY:"))
+            .collect();
+        assert_eq!(
+            tcp_addresses.len(),
+            3,
+            "the proxy listener plus the destination's listener and its outgoing leg: {script}"
+        );
+        for address in tcp_addresses {
+            assert!(
+                address.contains(",nodelay"),
+                "`{address}` must disable Nagle: {script}"
+            );
+        }
     }
 
     #[test]
