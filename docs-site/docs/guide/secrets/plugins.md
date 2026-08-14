@@ -629,6 +629,11 @@ bounds. It also cannot be handed a credential unless its manifest says `uses_sec
 and what it is handed then is a marker, never the value.
 :::
 
+The rest of `[sandbox]` applies exactly as it does to a resolver, because one function
+builds all three cages from it: `programs`, `allow_paths`, `mask_paths`, `allow_env` and
+`allow_env_paths` bind the same way, and `sbx plugins info <name>` shows them on a
+broker's page with each declared program resolved against this host's `PATH`.
+
 ## The signer type
 
 A resolver answers *where a value comes from*. A broker answers *how the cage uses a
@@ -703,6 +708,12 @@ A signer is given no `scheme`, so nothing a secret's `from` names routes to it, 
 it may not declare `brokers` of its own: a broker fences a cage's access to a host
 resource, and a signer has no cage and reaches no resource.
 :::
+
+The rest of `[sandbox]` applies exactly as it does to a resolver: `programs`,
+`allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` bind the same way, and
+`sbx plugins info <name>` shows them on a signer's page with each declared program
+resolved against this host's `PATH`. `aws-sigv4` declares `programs = ["python3"]`, so
+that line is where a missing interpreter is visible before a request is ever signed.
 
 A declaration reaches it with [`sign`](../configuration/secret#sign-a-credential-computed-from-the-request):
 

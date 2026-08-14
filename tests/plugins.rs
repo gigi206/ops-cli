@@ -922,6 +922,83 @@ fn local_signer(root: &Path, name: &str, sets: &str, extra: &str) -> PathBuf {
     dir
 }
 
+/// A broker plugin source directory: a manifest declaring a protocol, and the executable it names.
+fn local_broker(root: &Path, name: &str, extra: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        format!(
+            "name=\"{name}\"\ntype=\"broker\"\nexec=\"broker\"\n[broker]\n\
+             cage_env=[\"DEMO_SOCK\"]\nframing=\"line\"\nmax_frame=1024\n{extra}"
+        ),
+    )
+    .unwrap();
+    let exec = dir.join("broker");
+    std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// The grant block is not a resolver's privilege.
+///
+/// `programs`, `allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` are refused to no
+/// kind, and one `compose_cage` builds all three cages from them, so a broker's and a signer's
+/// declaration bind exactly what a resolver's does. A page that showed the grant for one kind only
+/// would read as a kind that cannot ask — and it would withhold the `programs` probe, which is the
+/// answer to "it works on yours and fails on mine": a signer that cannot find its interpreter fails
+/// where a resolver that cannot find its CLI does.
+#[test]
+fn every_kind_of_plugin_shows_the_grant_it_declared() {
+    let home = TmpDir::new();
+    let src = TmpDir::new();
+    // `sh` because the assertion is that the PATH probe ran and resolved something, and it is the
+    // one program a machine running these tests certainly has.
+    let grant = "[sandbox]\nprograms=[\"sh\"]\nallow_env=[\"DEMO_TOKEN\"]\n";
+    let signer = local_signer(src.path(), "demo-signer", "Authorization", grant);
+    let broker = local_broker(src.path(), "demo-broker", grant);
+
+    for source in [&signer, &broker] {
+        run(
+            &["plugins", "install", source.to_str().unwrap()],
+            home.path(),
+        );
+    }
+
+    for (name, kind) in [("demo-signer", "signer"), ("demo-broker", "broker")] {
+        let info = run(&["plugins", "info", name], home.path());
+        assert!(
+            info.contains("  sandbox grant:"),
+            "the {kind}'s page carries the grant block:\n{info}"
+        );
+        assert!(
+            info.contains("    programs:    sh -> "),
+            "and resolves each declared program against this host's PATH:\n{info}"
+        );
+        assert!(
+            info.contains("    allow_env:    DEMO_TOKEN"),
+            "and names what of the environment it is handed:\n{info}"
+        );
+        // Always printed, even empty: a block whose shape changes per plugin cannot be compared
+        // across two of them.
+        assert!(
+            info.contains("    allow_paths:  (none)") && info.contains("    mask_paths:   (none)"),
+            "and keeps the same shape when a field is empty:\n{info}"
+        );
+        // The three the loader refuses to this kind are stated as a rule of the type. `brokers:`
+        // has no line at all: an empty one would report as a choice what the manifest may not make.
+        assert!(
+            info.contains(&format!("a {kind} plugin may declare none of the three")),
+            "and says the reach it may not ask for:\n{info}"
+        );
+        assert!(
+            !info.contains("    brokers:"),
+            "with no empty fence line to read as a declined option:\n{info}"
+        );
+    }
+}
+
 /// The one signer manifest field that changes how sbx **forwards** a request rather than what the
 /// plugin is shown: declaring it means request bodies to this destination are held before they
 /// leave, so it belongs on the page someone reads before installing.

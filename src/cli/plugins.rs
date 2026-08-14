@@ -2145,18 +2145,15 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         ),
         false => println!("    state:       no (nothing the plugin writes outlives the run)"),
     }
-    print_grant_programs(&layout, p, err, r);
-    print_grant_paths("allow_paths", &p.sandbox.allow_paths);
-    print_grant_masks(&p.sandbox.mask_paths);
-    print_grant_env("allow_env", &p.sandbox.allow_env);
-    print_grant_env_paths(&p.sandbox.allow_env_paths, err, r);
-    print_grant_brokers(&p.sandbox.brokers);
-    // The closure, when a declared program lives in the nix store. Shown because it is the one
-    // part of the grant no manifest names, so it would otherwise be the largest thing a launch
-    // binds and the only one a reader cannot see coming.
-    if let Some(n) = crate::sandbox::resolver::nix_closure_paths(&p.sandbox.programs) {
-        println!("    nix closure: {n} store paths, so a store-installed program can run");
-    }
+    print_shared_grant(
+        &layout,
+        p.dir_name(),
+        &p.name,
+        &p.sandbox,
+        Some(&p.sandbox.brokers),
+        err,
+        r,
+    );
     print_plugin_host_config(&p.name, &p.sandbox, err, r);
     ExitCode::SUCCESS
 }
@@ -2220,36 +2217,35 @@ fn print_about(
 /// already provisioned; not on `PATH`, configured, and **not yet built** — the state a user reaches
 /// by adding `programs` after installing, whose remedy is to re-run the install; and neither, which
 /// is what fails a launch. Nothing here builds: the answer must be free to ask.
+///
+/// Takes the grant's parts rather than a plugin, because every kind of plugin runs a program and
+/// the question is the same for all three: a signer that cannot find its interpreter fails exactly
+/// where a resolver that cannot find its CLI does.
 fn print_grant_programs(
     layout: &store::Layout,
-    plugin: &crate::plugins::ResolverPlugin,
+    dir_name: &str,
+    name: &str,
+    programs: &[String],
     err: &str,
     r: &str,
 ) {
-    if plugin.sandbox.programs.is_empty() {
+    if programs.is_empty() {
         println!("    programs:    (none)");
         return;
     }
     let configured: std::collections::BTreeMap<String, String> = std::env::current_dir()
         .ok()
         .map(|cwd| crate::config::load(&cwd))
-        .and_then(|c| c.plugin.get(&plugin.name).cloned())
+        .and_then(|c| c.plugin.get(name).cloned())
         .map(|raw| {
             let mut ignored = Vec::new();
-            crate::config::validated_programs(
-                &plugin.name,
-                &plugin.sandbox.programs,
-                &raw.programs,
-                &mut ignored,
-            )
-            .into_iter()
-            .collect()
+            crate::config::validated_programs(name, programs, &raw.programs, &mut ignored)
+                .into_iter()
+                .collect()
         })
         .unwrap_or_default();
 
-    let shown = plugin
-        .sandbox
-        .programs
+    let shown = programs
         .iter()
         .map(|name| {
             if let Some(path) = crate::sandbox::resolver::locate_program(name) {
@@ -2259,14 +2255,13 @@ fn print_grant_programs(
                 }
                 return line;
             }
-            if let Some(path) = plugins::programs::provisioned(layout, plugin.dir_name(), name) {
+            if let Some(path) = plugins::programs::provisioned(layout, dir_name, name) {
                 return format!("{name} -> {} (provisioned)", path.display());
             }
             match configured.get(name) {
                 Some(attr) => format!(
                     "{name} -> {err}nix:{attr} configured but not built{r} (run: sbx plugins \
-                     install {})",
-                    plugin.dir_name()
+                     install {dir_name})"
                 ),
                 None => format!("{name} -> {err}not on PATH{r}"),
             }
@@ -2274,6 +2269,42 @@ fn print_grant_programs(
         .collect::<Vec<_>>()
         .join(", ");
     println!("    programs:    {shown}");
+}
+
+/// The `sbx plugins info` grant lines every kind of plugin shares.
+///
+/// `programs`, `allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` are refused to no
+/// type: one `compose_cage` builds all three cages from the same grant, so a broker's or a signer's
+/// declaration binds exactly what a resolver's does. Printing them from one place is what keeps the
+/// three pages saying so — a page that shows the grant for one kind and not the others reads as a
+/// kind that cannot ask, which is the opposite of what the loader does.
+///
+/// `brokers` is the exception, and it is passed rather than read off the grant: a broker and a
+/// signer are refused the field at load, so an empty line here would report as a choice what is a
+/// rule of the type.
+fn print_shared_grant(
+    layout: &store::Layout,
+    dir_name: &str,
+    name: &str,
+    grant: &plugins::SandboxGrant,
+    fences: Option<&[String]>,
+    err: &str,
+    r: &str,
+) {
+    print_grant_programs(layout, dir_name, name, &grant.programs, err, r);
+    print_grant_paths("allow_paths", &grant.allow_paths);
+    print_grant_masks(&grant.mask_paths);
+    print_grant_env("allow_env", &grant.allow_env);
+    print_grant_env_paths(&grant.allow_env_paths, err, r);
+    if let Some(brokers) = fences {
+        print_grant_brokers(brokers);
+    }
+    // The closure, when a declared program lives in the nix store. Shown because it is the one part
+    // of the grant no manifest names, so it would otherwise be the largest thing a launch binds and
+    // the only one a reader cannot see coming.
+    if let Some(n) = crate::sandbox::resolver::nix_closure_paths(&grant.programs) {
+        println!("    nix closure: {n} store paths, so a store-installed program can run");
+    }
 }
 
 /// One `sbx plugins info` grant line listing read-only path binds, or `(none)`.
@@ -2323,7 +2354,8 @@ fn print_grant_env(label: &str, keys: &[String]) {
 /// The same detail view a resolver gets, minus the scheme it has none of, plus the protocol facts
 /// that decide what a launch does with it. Kept beside the resolver's rather than merged with it:
 /// the two share an identity and a grant, and nothing else — a single function would spend its
-/// length saying which half applies.
+/// length saying which half applies. What they do share is printed by one function
+/// ([`print_shared_grant`]), which is what keeps the claim in this sentence true.
 fn info_broker(
     layout: &crate::store::Layout,
     p: &crate::plugins::broker::BrokerPlugin,
@@ -2399,6 +2431,15 @@ fn info_broker(
             p.name
         ),
     }
+    println!("  sandbox grant:");
+    // Stated rather than left out, because "can the process fencing my credential reach the
+    // network" is a fair question with a firm answer, and the answer is a rule of the type rather
+    // than a choice this manifest made.
+    println!(
+        "    network:     no, and neither state nor a broker fence — a broker plugin may declare \
+         none of the three"
+    );
+    print_shared_grant(layout, p.dir_name(), &p.name, &p.sandbox, None, err, r);
     print_plugin_host_config(&p.name, &p.sandbox, err, r);
     ExitCode::SUCCESS
 }
@@ -2452,6 +2493,12 @@ fn info_signer(
             algorithm.name()
         );
     }
+    println!("  sandbox grant:");
+    println!(
+        "    network:     no, and neither state nor a broker fence — a signer plugin may declare \
+         none of the three"
+    );
+    print_shared_grant(layout, p.dir_name(), &p.name, &p.sandbox, None, err, r);
     print_plugin_host_config(&p.name, &p.sandbox, err, r);
     ExitCode::SUCCESS
 }
