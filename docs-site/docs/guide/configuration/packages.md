@@ -308,19 +308,32 @@ its binaries against the same curated library set, **host-side**, seeded and
 offline-reusable. Pairs with [`gui = "wayland"`](gui), [`gpu = true`](gpu), and
 [`dbus = true`](dbus) exactly like a `.deb` desktop app.
 
-**Two archive shapes are understood**, and the first that matches wins:
+**Three archive shapes are understood**, tried in this order, and the first that matches wins:
 
 - a **desktop bundle**, located by its `resources/app.asar` (or a loose `resources/app/`), whose
   launcher is then wrapped. This is the Electron/VS Code-fork shape the three prebuilt backends were
   built for;
+- a **named binary in an FHS tree**, an executable at `*/bin/<the [packages] key>` — the shape a
+  vendor `.deb` ships, where the program sits at `usr/bin/<name>` beside a CLI and an updater. It
+  matches on the declared name rather than by counting, so a tree holding several binaries is
+  unambiguous by construction. More than one match anywhere in the tree is not a guess to make, so
+  it falls through to the last shape;
 - a **bare binary**, an archive whose root holds exactly one executable and nothing else to choose
   from, the shape a self-contained CLI ships in. It is wrapped under the `[packages]` **key**, so
   the `cmd` a profile writes is that key whatever the vendor named the file inside the archive.
 
 Anything else fails the build with a message naming what it found: two executables at the root is an
 ambiguity, not a pick-the-first situation, and an archive that unpacks into a versioned
-sub-directory is not reached into. The same two shapes apply to `deb:` and `appimage:`, which share
+sub-directory is not reached into. The same three shapes apply to `deb:` and `appimage:`, which share
 this install phase.
+
+The second shape has one wrinkle worth knowing. An archive whose *own* root is an FHS tree — the
+`bin/<tool>` + `share/` layout a self-contained CLI with man pages ships in — lands its program on
+exactly `$out/bin/<name>`, which is where the generated wrapper is written. Wrapping it in place
+would have `makeWrapper` overwrite the binary it wraps, so the program is **moved to
+`$out/libexec/<name>` first** and wrapped from there; a `bin/<name>` that is a symlink into the tree
+is resolved instead of moved. Either way the `cmd` a profile writes is still the `[packages]` key.
+`devin` is the shipped example of that layout.
 
 Two forms:
 

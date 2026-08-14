@@ -81,9 +81,15 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
 /// updater there too). It matches on the *declared* name — the `[packages]` key, which the profile
 /// also writes as its `cmd` — so a tree holding several binaries is unambiguous by construction
 /// rather than by counting. More than one match anywhere in the tree is not a guess to make, so it
-/// falls through to the last pass instead. The wrapper's own destination (`$out/bin/<name>`) is
-/// excluded from that search: an archive that already unpacks to `bin/<name>` would otherwise have
-/// `makeWrapper` overwrite the very binary it wraps.
+/// falls through to the last pass instead.
+///
+/// That search excludes the wrapper's own destination, `$out/bin/<name>`, because `makeWrapper`
+/// writes there — but an archive whose *own* root is an FHS tree (`bin/<name>` + `share/`, the
+/// shape a self-contained CLI with man pages ships in) lands its program on exactly that path, and
+/// dropping it would refuse a perfectly unambiguous layout. So it gets its own arm: the program is
+/// moved to `$out/libexec/<name>` and wrapped from there, which frees the destination instead of
+/// overwriting the binary being wrapped. A `bin/<name>` that is a *symlink* into the tree is
+/// resolved rather than moved, since the wrapper may replace the link without touching its target.
 ///
 /// The last pass covers the plainest shape a vendor ships: an archive whose root holds one executable
 /// and nothing else to choose from — a self-contained CLI rather than a desktop bundle. It applies
@@ -118,6 +124,14 @@ pub(crate) const LAUNCHER_WRAP: &str = r#"    app=$(find $out -type f -path '*/r
       named=$(find $out -type f -executable -path '*/bin/@NAME@' ! -path "$out/bin/@NAME@" | sort)
       if [ -n "$named" ] && [ "$(printf '%s\n' "$named" | wc -l)" -eq 1 ]; then
         main=$named
+      elif [ -x "$out/bin/@NAME@" ]; then
+        if [ -L "$out/bin/@NAME@" ]; then
+          main=$(readlink -f "$out/bin/@NAME@")
+        else
+          mkdir -p $out/libexec
+          mv "$out/bin/@NAME@" "$out/libexec/@NAME@"
+          main=$out/libexec/@NAME@
+        fi
       else
         cands=$(find $out -maxdepth 1 -type f -executable \
           ! -name 'AppRun' ! -name 'chrome-sandbox' ! -name 'chrome_crashpad_handler' \
@@ -1490,6 +1504,24 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
     /// plain paths — everything else (the `find` passes, the counting, the refusals) is the shipped
     /// snippet verbatim, so a layout that breaks here breaks a real build.
     fn wrap_on(tree: &std::path::Path, files: &[(&str, bool)]) -> Result<String, String> {
+        wrap_tree(tree, files, None)
+    }
+
+    /// [`wrap_on`] plus one symlink, for the layout whose `bin/<name>` points into the tree.
+    fn wrap_on_with_link(
+        tree: &std::path::Path,
+        files: &[(&str, bool)],
+        link: &str,
+        target: &str,
+    ) -> Result<String, String> {
+        wrap_tree(tree, files, Some((link, target)))
+    }
+
+    fn wrap_tree(
+        tree: &std::path::Path,
+        files: &[(&str, bool)],
+        link: Option<(&str, &str)>,
+    ) -> Result<String, String> {
         use std::os::unix::fs::PermissionsExt;
         for (rel, executable) in files {
             let path = tree.join(rel);
@@ -1497,6 +1529,11 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             std::fs::write(&path, b"#!/bin/sh\n").unwrap();
             let mode = if *executable { 0o755 } else { 0o644 };
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        if let Some((rel, target)) = link {
+            let path = tree.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, &path).unwrap();
         }
         let snippet = launcher_wrap("demo-app", "/lib")
             .replace(GST_SEARCH_PATH, "/gst")
@@ -1570,13 +1607,36 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         .expect_err("an unresolvable tree must fail the build");
         assert!(err.contains("no executable at the archive root"), "{err}");
 
-        // (e) An archive that already unpacks to `bin/<name>`: the named pass excludes the wrapper's
-        // own destination, so makeWrapper never overwrites the binary it wraps. It refuses instead —
-        // the behaviour before this pass existed.
+        // (e) An archive whose own root is an FHS tree, so its program lands on the wrapper's own
+        // destination. Wrapping it in place would have makeWrapper overwrite the binary it wraps,
+        // so the program is moved aside first and wrapped from there — the destination is freed,
+        // not clobbered.
         let collide = tmp.join("collide");
-        let err = wrap_on(&collide, &[("bin/demo-app", true)])
-            .expect_err("wrapping onto itself must never happen");
-        assert!(err.contains("no executable at the archive root"), "{err}");
+        assert_eq!(
+            wrap_on(
+                &collide,
+                &[("bin/demo-app", true), ("share/man/man1/demo-app.1", false)]
+            ),
+            Ok(format!("WRAPPED {}/libexec/demo-app", collide.display()))
+        );
+        assert!(
+            !collide.join("bin/demo-app").exists(),
+            "the program must be moved off the wrapper's destination, not copied"
+        );
+
+        // (f) The same shape, but `bin/<name>` is a symlink into the tree: the link is resolved
+        // rather than moved, since the wrapper may replace a link without touching its target.
+        let linked = tmp.join("linked");
+        std::fs::create_dir_all(linked.join("bin")).unwrap();
+        assert_eq!(
+            wrap_on_with_link(
+                &linked,
+                &[("libexec/demo-app", true)],
+                "bin/demo-app",
+                "../libexec/demo-app",
+            ),
+            Ok(format!("WRAPPED {}/libexec/demo-app", linked.display()))
+        );
     }
 
     #[test]
