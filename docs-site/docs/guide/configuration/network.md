@@ -59,6 +59,7 @@ for the full semantics.
 | `pool` | `false` stops the proxy carrying a request over a connection an earlier request left behind, on either leg (default `true`): see below |
 | `idle_timeout` | how long a connection with nothing to carry is kept, as a duration (`"30s"`, `"2m"`; default 10 seconds): see below |
 | `max_connections` | the most client connections the proxy serves at once (default `512`): see below |
+| `body_max_mb` | the most of one request body the proxy holds in memory, in MiB (default `64`): see below |
 | `ca_roots` | `false` hands the cage the session CA alone instead of pairing it with the public roots (default `true`): see below |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
@@ -263,6 +264,36 @@ what the cap bounds. Zero is warned and ignored; a cage that should reach nothin
 Like the rest of the table this is trusted and global-only, so a global config can set it for
 a project that has no way to observe it: nothing in the cage can tell whether a connection
 was reused. Whenever a layer turns it off, [`sbx config`](../cli/config) says so.
+
+### How much of a body is held (`body_max_mb`)
+
+Most request bodies pass straight through: the proxy forwards a declared `Content-Length`
+body as it arrives, however large. Two kinds do not, and this is their ceiling.
+
+A `Transfer-Encoding: chunked` request is buffered whole, because the proxy replaces its
+framing with a length the upstream can trust rather than forwarding chunked framing it
+would have to vouch for. And a request whose destination has a
+[signer](secret#sign-a-credential-computed-from-the-request) that covers the payload is
+held, because the digest has to exist before the signature does.
+
+```toml
+[network]
+mode  = "deny"
+allow = ["api.example.com"]
+body_max_mb = 256   # default 64
+```
+
+Over the ceiling, a chunked request is refused `400` (`bad-request:chunked`, discovered
+while reading, since it declares no length) and a signed one `413`
+(`signer-body-too-large`, answered from its declared length before the client is invited to
+send). Raise it for a workload that genuinely streams uploads that large.
+
+Note what it multiplies. The proxy runs host-side, outside the cage's memory cgroup, so the
+cage's own memory limit does not reach these buffers; what bounds them is a second ceiling
+on the **sum** across every connection, a fixed multiple of this number. Raising one raises
+both. A request that meets the shared ceiling rather than its own is answered `503`
+(`body-buffer-cap`): nothing is wrong with it, and the same request is taken once one in
+flight completes. Zero is warned and ignored.
 
 ## The cage trust anchor (`ca_roots`)
 

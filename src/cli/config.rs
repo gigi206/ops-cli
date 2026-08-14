@@ -339,6 +339,7 @@ struct NetTransport {
     dns_cache_ttl: Option<u64>,
     idle_timeout: Option<u64>,
     max_connections: Option<usize>,
+    body_max_mb: Option<u64>,
 }
 
 fn write_net_transport(o: &mut String, t: NetTransport, details: bool, pal: &style::Palette) {
@@ -349,6 +350,7 @@ fn write_net_transport(o: &mut String, t: NetTransport, details: bool, pal: &sty
         dns_cache_ttl,
         idle_timeout,
         max_connections,
+        body_max_mb,
     } = t;
     let mut line = |s: &str| {
         let _ = writeln!(o, "    {}", style::dim_prose(s, pal));
@@ -405,6 +407,18 @@ fn write_net_transport(o: &mut String, t: NetTransport, details: bool, pal: &sty
             "max connections: {} (built-in default; one beyond it is refused `connection-cap`, \
              not queued)",
             crate::allowlist::DEFAULT_MAX_CONNECTIONS
+        )),
+        None => {}
+    }
+    match body_max_mb {
+        Some(mb) => line(&format!(
+            "body ceiling: {mb} MiB (the most of one request body held; a larger streamed upload \
+             is refused)"
+        )),
+        None if details => line(&format!(
+            "body ceiling: {} MiB (built-in default; the most of one request body held; a larger \
+             streamed upload is refused)",
+            crate::allowlist::DEFAULT_BODY_MAX / (1024 * 1024)
         )),
         None => {}
     }
@@ -571,6 +585,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             dns_cache_ttl,
             idle_timeout,
             max_connections,
+            body_max_mb,
             builtin,
         } => {
             let _ = writeln!(
@@ -621,6 +636,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     dns_cache_ttl: *dns_cache_ttl,
                     idle_timeout: *idle_timeout,
                     max_connections: *max_connections,
+                    body_max_mb: *body_max_mb,
                 },
                 details,
                 pal,
@@ -1404,6 +1420,7 @@ fn render_app_detail(
             dns_cache_ttl,
             idle_timeout,
             max_connections,
+            body_max_mb,
             builtin,
         } => {
             let _ = writeln!(
@@ -1449,6 +1466,7 @@ fn render_app_detail(
                     dns_cache_ttl: *dns_cache_ttl,
                     idle_timeout: *idle_timeout,
                     max_connections: *max_connections,
+                    body_max_mb: *body_max_mb,
                 },
                 details,
                 pal,
@@ -2585,6 +2603,7 @@ mod tests {
                 dns_cache_ttl: None,
                 idle_timeout: None,
                 max_connections: None,
+                body_max_mb: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
@@ -2932,6 +2951,10 @@ mod tests {
                 "max connections: {} (built-in default;",
                 crate::allowlist::DEFAULT_MAX_CONNECTIONS
             ),
+            format!(
+                "body ceiling: {} MiB (built-in default;",
+                crate::allowlist::DEFAULT_BODY_MAX / (1024 * 1024)
+            ),
         ] {
             assert!(
                 out.contains(&expected),
@@ -2947,12 +2970,14 @@ mod tests {
             dns_cache_ttl,
             idle_timeout,
             max_connections,
+            body_max_mb,
             ..
         } = &mut view.network
         {
             *dns_cache_ttl = Some(crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs());
             *idle_timeout = Some(crate::allowlist::DEFAULT_IDLE_TIMEOUT.as_secs());
             *max_connections = Some(crate::allowlist::DEFAULT_MAX_CONNECTIONS);
+            *body_max_mb = Some(crate::allowlist::DEFAULT_BODY_MAX / (1024 * 1024));
         }
         let out = render_config(&view, &plain, true);
         assert!(
@@ -2971,6 +2996,10 @@ mod tests {
             format!(
                 "max connections: {} (one beyond it",
                 crate::allowlist::DEFAULT_MAX_CONNECTIONS
+            ),
+            format!(
+                "body ceiling: {} MiB (the most of one",
+                crate::allowlist::DEFAULT_BODY_MAX / (1024 * 1024)
             ),
         ] {
             assert!(
@@ -3012,6 +3041,7 @@ mod tests {
                 dns_cache_ttl: None,
                 idle_timeout: None,
                 max_connections: None,
+                body_max_mb: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Global,

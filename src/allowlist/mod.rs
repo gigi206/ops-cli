@@ -827,6 +827,16 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration
 /// workload from a single cage.
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 512;
 
+/// The most of one request body the proxy holds in memory, when no layer set `[network]
+/// body_max_mb`.
+///
+/// Reached by a `Transfer-Encoding: chunked` request, which has to be buffered whole to be
+/// re-framed with a length the upstream can trust, and by one a signer asked for a digest over.
+/// Agent prompt bodies are KB–MB, so this is generous; a larger streamed upload fails closed rather
+/// than being forwarded with framing sbx could not vouch for. Named here for the same reason as
+/// [`DEFAULT_DNS_CACHE_TTL`]: the proxy enforces it, `sbx config show --details` reports it.
+pub(crate) const DEFAULT_BODY_MAX: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
@@ -877,6 +887,11 @@ pub(crate) struct EgressPolicy {
     /// that matters is up: raising it raises how many host threads and descriptors an in-cage caller
     /// can tie up. Read via [`Self::max_connections`].
     max_connections: Option<usize>,
+    /// The most of one request body the proxy holds in memory, in bytes (`[network] body_max_mb`).
+    /// `None` means the proxy's own default. A resource bound rather than a verdict, and the
+    /// direction that matters is up: the sum across connections is a multiple of it. Read via
+    /// [`Self::body_max`].
+    body_max: Option<u64>,
 }
 
 impl Default for EgressPolicy {
@@ -911,6 +926,7 @@ impl EgressPolicy {
             ca_roots: true,
             idle_timeout: None,
             max_connections: None,
+            body_max: None,
         }
     }
 
@@ -1026,6 +1042,17 @@ impl EgressPolicy {
     /// The **configured** connection cap, raw: `None` says no layer set one.
     pub(crate) fn max_connections(&self) -> Option<usize> {
         self.max_connections
+    }
+
+    /// The most of one request body the proxy holds, in bytes, from `[network] body_max_mb`.
+    pub(crate) fn with_body_max(mut self, bytes: Option<u64>) -> Self {
+        self.body_max = bytes;
+        self
+    }
+
+    /// The **configured** per-request body ceiling in bytes, raw: `None` says no layer set one.
+    pub(crate) fn body_max(&self) -> Option<u64> {
+        self.body_max
     }
 
     /// Pair the cage's MITM CA with the public roots, or hand it the MITM CA alone, from

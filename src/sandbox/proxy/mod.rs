@@ -835,7 +835,7 @@ fn serve_tunneled_request(
     // and before the client is invited to send. The order carries the meaning: this refusal is
     // **permanent** and the budget's is **transient**, so a request turned away by the budget for a
     // length no budget could ever admit would be told to retry something that will never succeed.
-    if digest_wanted.is_some() && body_exceeds_hold(chunked, body_len) {
+    if digest_wanted.is_some() && body_exceeds_hold(chunked, body_len, ctx.body) {
         ctx.outcome(
             super::control::Proto::Https,
             connect_host,
@@ -849,7 +849,7 @@ fn serve_tunneled_request(
             &mut br,
             "413 Payload Too Large",
             SIGNER_BODY_TOO_LARGE,
-            &body_too_large_message(body_len),
+            &body_too_large_message(body_len, ctx.body),
         );
     }
     // Whether the proxy will read this request's body into memory rather than stream it: a chunked
@@ -869,7 +869,7 @@ fn serve_tunneled_request(
         && (1..=POOL_HOLD_MAX).contains(&body_len);
     let mut budget: Option<BodyBudget> = None;
     if chunked || digest_wanted.is_some() {
-        budget = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len) {
+        budget = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len, ctx.body) {
             Some(reserved) => Some(reserved),
             None => {
                 ctx.outcome(
@@ -893,7 +893,7 @@ fn serve_tunneled_request(
         // Best-effort, unlike the two above: the ceiling exists to bound host memory, and a request
         // that cannot have a buffer right now simply streams as it always did. There is nothing to
         // refuse it over — nothing asked for this body, the proxy only preferred it.
-        budget = reserve_body_buffer(&ctx.held_bodies, false, body_len);
+        budget = reserve_body_buffer(&ctx.held_bodies, false, body_len, ctx.body);
     }
     let hold_for_reuse = hold_for_reuse && budget.is_some();
     let held: Option<Vec<u8>> = if digest_wanted.is_none() && !hold_for_reuse {
@@ -907,7 +907,7 @@ fn serve_tunneled_request(
                 let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
                 let _ = client.flush();
             }
-            match hold_request_body(&mut br, chunked, body_len) {
+            match hold_request_body(&mut br, chunked, body_len, ctx.body) {
                 Ok(body) => Some(body),
                 // A malformed chunked body is the same refusal it is when the de-chunk happens on
                 // the way out, under the same reason. A `Content-Length` body that ends early is a
@@ -1142,7 +1142,7 @@ fn serve_tunneled_request(
             let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
             let _ = client.flush();
         }
-        let body = match read_chunked_body(&mut br, CHUNKED_REQUEST_CAP) {
+        let body = match read_chunked_body(&mut br, ctx.body.per_request) {
             Ok(b) => b,
             Err(e) => {
                 ctx.push_log(
@@ -2282,7 +2282,7 @@ fn handle_https_forward(
     let digest_wanted = creds.wants_body_digest(&injected_ids);
     // Ahead of the reservation, for the reason the tunneled path states: a permanent refusal must
     // not be delivered as the budget's transient one.
-    if digest_wanted.is_some() && body_exceeds_hold(chunked, body_len) {
+    if digest_wanted.is_some() && body_exceeds_hold(chunked, body_len, ctx.body) {
         ctx.outcome(
             super::control::Proto::Https,
             &host,
@@ -2296,7 +2296,7 @@ fn handle_https_forward(
             &mut client,
             "413 Payload Too Large",
             SIGNER_BODY_TOO_LARGE,
-            &body_too_large_message(body_len),
+            &body_too_large_message(body_len, ctx.body),
         );
     }
     // Whether the proxy will read this request's body into memory rather than stream it: a chunked
@@ -2316,7 +2316,7 @@ fn handle_https_forward(
         && (1..=POOL_HOLD_MAX).contains(&body_len);
     let mut budget: Option<BodyBudget> = None;
     if chunked || digest_wanted.is_some() {
-        budget = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len) {
+        budget = match reserve_body_buffer(&ctx.held_bodies, chunked, body_len, ctx.body) {
             Some(reserved) => Some(reserved),
             None => {
                 ctx.outcome(
@@ -2340,7 +2340,7 @@ fn handle_https_forward(
         // Best-effort, unlike the two above: the ceiling exists to bound host memory, and a request
         // that cannot have a buffer right now simply streams as it always did. There is nothing to
         // refuse it over — nothing asked for this body, the proxy only preferred it.
-        budget = reserve_body_buffer(&ctx.held_bodies, false, body_len);
+        budget = reserve_body_buffer(&ctx.held_bodies, false, body_len, ctx.body);
     }
     let hold_for_reuse = hold_for_reuse && budget.is_some();
     let held: Option<Vec<u8>> = if digest_wanted.is_none() && !hold_for_reuse {
@@ -2355,7 +2355,7 @@ fn handle_https_forward(
             // read past the body's terminator, and this path forwards no pipelined second request.
             let read = {
                 let mut reader = BufReader::new(&client);
-                hold_request_body(&mut reader, chunked, body_len)
+                hold_request_body(&mut reader, chunked, body_len, ctx.body)
             };
             match read {
                 Ok(body) => Some(body),
@@ -2516,7 +2516,7 @@ fn handle_https_forward(
         // pipelined second request), which this path never forwards anyway.
         let read = {
             let mut reader = BufReader::new(&client);
-            read_chunked_body(&mut reader, CHUNKED_REQUEST_CAP)
+            read_chunked_body(&mut reader, ctx.body.per_request)
         };
         let body = match read {
             Ok(b) => b,
@@ -3146,7 +3146,7 @@ impl Head {
 /// The bytes the proxy will hold in request-body buffers at any one moment, **across every
 /// connection**.
 ///
-/// [`CHUNKED_REQUEST_CAP`] bounds one body; this bounds their sum. The distinction matters because
+/// [`BodyLimits::per_request`] bounds one body; this bounds their sum. The distinction matters because
 /// the proxy is host-side: [`crate::sandbox::cgroup::wrap`] puts *bwrap* in the launch's systemd
 /// scope, so the cage's `MemoryMax` governs the cage and not the supervisor holding these buffers.
 /// Without a shared ceiling, [`MAX_CONCURRENT_CONNS`] requests each buffering a maximal body would
@@ -3158,10 +3158,30 @@ impl Head {
 /// (its length is unknowable until read), so the budget divided by that ceiling is exactly how many
 /// chunked uploads may be in flight at once. Making the divisor the constant keeps that visible
 /// instead of leaving it to be discovered by division.
-const CONCURRENT_CHUNKED_UPLOADS: u64 = 16;
+pub(crate) const CONCURRENT_CHUNKED_UPLOADS: u64 = 16;
 
-/// The bytes held at one moment across every connection. See [`CONCURRENT_CHUNKED_UPLOADS`].
-const HELD_BODY_BUDGET: u64 = CONCURRENT_CHUNKED_UPLOADS * CHUNKED_REQUEST_CAP;
+/// What one launch will hold in request-body buffers: one body's ceiling, and the sum across every
+/// connection. Resolved once from `[network] body_max_mb` and carried on the context, so the check
+/// that refuses a body, the reservation that admits one, and the message that explains the refusal
+/// all read the same two numbers.
+#[derive(Clone, Copy)]
+pub(super) struct BodyLimits {
+    /// The most of one request body the proxy holds. Reached by a `chunked` request, which must be
+    /// buffered to be re-framed, and by one a signer asked for a digest over.
+    per_request: u64,
+    /// The bytes held at one moment across every connection — [`CONCURRENT_CHUNKED_UPLOADS`] times
+    /// the above, for the reason given there.
+    total: u64,
+}
+
+impl BodyLimits {
+    pub(super) fn new(per_request: u64) -> Self {
+        Self {
+            per_request,
+            total: per_request.saturating_mul(CONCURRENT_CHUNKED_UPLOADS),
+        }
+    }
+}
 
 /// The largest `Content-Length` body the proxy reads into memory for **reuse**, when nothing else
 /// asked it to.
@@ -3182,7 +3202,7 @@ const POOL_HOLD_MAX: u64 = 256 * 1024;
 /// bodies right now and will take this one when it is not — the same shape as [`MAX_CONCURRENT_SPLICES`].
 const BODY_BUFFER_CAP: &str = "body-buffer-cap";
 
-/// A reservation against [`HELD_BODY_BUDGET`], released when it drops.
+/// A reservation against [`BodyLimits::total`], released when it drops.
 ///
 /// Taken **before a byte is read**, because a budget checked afterwards bounds nothing: by then the
 /// memory is allocated. Held for as long as the buffer is, which is until the forwarded request has
@@ -3207,9 +3227,10 @@ fn reserve_body_buffer(
     budget: &std::sync::atomic::AtomicU64,
     chunked: bool,
     body_len: u64,
+    limits: BodyLimits,
 ) -> Option<BodyBudget<'_>> {
     let bytes = match chunked {
-        true => CHUNKED_REQUEST_CAP,
+        true => limits.per_request,
         false => body_len,
     };
     let mut seen = budget.load(Ordering::Relaxed);
@@ -3220,7 +3241,7 @@ fn reserve_body_buffer(
         // overflow here would wrap to a small total and admit exactly what the ceiling exists to
         // refuse.
         let total = seen.checked_add(bytes)?;
-        if total > HELD_BODY_BUDGET {
+        if total > limits.total {
             return None;
         }
         match budget.compare_exchange_weak(seen, total, Ordering::Relaxed, Ordering::Relaxed) {
@@ -3242,8 +3263,8 @@ fn body_budget_message() -> String {
 /// must not be invited to send a body sbx has already decided to refuse, or an oversized upload
 /// crosses the loopback only to meet a `413`. A `chunked` request declares no length, so there is
 /// nothing to answer from and its ceiling is enforced by the de-chunker as it reads.
-fn body_exceeds_hold(chunked: bool, body_len: u64) -> bool {
-    !chunked && body_len > CHUNKED_REQUEST_CAP
+fn body_exceeds_hold(chunked: bool, body_len: u64, limits: BodyLimits) -> bool {
+    !chunked && body_len > limits.per_request
 }
 
 /// Read a request's whole body into memory, before the request is signed.
@@ -3253,21 +3274,22 @@ fn body_exceeds_hold(chunked: bool, body_len: u64) -> bool {
 /// A signer whose scheme covers the payload needs the digest *in the question*, so for those
 /// requests — and only those — the body is held first.
 ///
-/// The same [`CHUNKED_REQUEST_CAP`] bounds both shapes, since the memory it bounds is the same
-/// memory: for a `chunked` body by the de-chunker as it reads, and for a declared one by
+/// The same per-request ceiling bounds both shapes, since the memory it bounds is the same memory:
+/// for a `chunked` body by the de-chunker as it reads, and for a declared one by
 /// [`body_exceeds_hold`], which the caller must have asked before calling this.
 fn hold_request_body<R: BufRead>(
     reader: &mut R,
     chunked: bool,
     body_len: u64,
+    limits: BodyLimits,
 ) -> io::Result<Vec<u8>> {
     if chunked {
-        return read_chunked_body(reader, CHUNKED_REQUEST_CAP);
+        return read_chunked_body(reader, limits.per_request);
     }
     // Sized up front, so the read fills one allocation rather than growing geometrically into a
     // transient peak above what was reserved for it. Clamped, because the allocation must be bounded
     // by what this function will accept whatever the caller checked.
-    let mut body = Vec::with_capacity(body_len.min(CHUNKED_REQUEST_CAP) as usize);
+    let mut body = Vec::with_capacity(body_len.min(limits.per_request) as usize);
     let read = reader.take(body_len).read_to_end(&mut body)?;
     if read as u64 != body_len {
         return Err(invalid("the request body ended before its Content-Length"));
@@ -3330,11 +3352,12 @@ const SIGNER_BODY_TOO_LARGE: &str = "signer-body-too-large";
 
 /// What a request refused for an unholdable body is told. It names the ceiling, because a size limit
 /// a caller cannot read is one it can only discover by bisection.
-fn body_too_large_message(body_len: u64) -> String {
+fn body_too_large_message(body_len: u64, limits: BodyLimits) -> String {
     format!(
         "a signer for this destination is told the digest of the request body, so sbx holds the \
-         body before signing — and this request's {body_len} bytes are above the \
-         {CHUNKED_REQUEST_CAP}-byte ceiling for a body it holds"
+         body before signing — and this request's {body_len} bytes are above the {}-byte ceiling \
+         for a body it holds (`[network] body_max_mb` moves it)",
+        limits.per_request
     )
 }
 

@@ -4773,6 +4773,18 @@ fn validate_network_table(
         Some(max) => policy = policy.with_max_connections(Some(max)),
         None => {}
     }
+    // The most of one request body the proxy holds. Zero would refuse every `chunked` request and
+    // every signed one, which is a typo rather than a posture.
+    match table.body_max_mb {
+        Some(0) => warnings.push(format!(
+            "{source_label}: ignoring `body_max_mb = 0` — it would refuse every streamed upload \
+             and every request a signer digests"
+        )),
+        Some(mb) => {
+            policy = policy.with_body_max(Some(mb.saturating_mul(1024 * 1024)));
+        }
+        None => {}
+    }
     // What the cage's CA bundle contains. Never a verdict — it decides which anchors the cage trusts,
     // not which requests are permitted, and dropping the roots only ever narrows that trust. The one
     // case where they are load-bearing is a splice: `tcp://` hands the stream through untouched, so

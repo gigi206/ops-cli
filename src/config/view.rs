@@ -355,6 +355,10 @@ pub(crate) enum NetworkView {
         /// `max_connections` — `None` when none did. Surfaced because a refused connection is
         /// reported to the cage as a `503`, and the number that refused it lives only here.
         max_connections: Option<usize>,
+        /// The most of one request body the proxy holds, in MiB, when a layer set `body_max_mb` —
+        /// `None` when none did. Surfaced because the refusal it produces (`413`, or a `503` when
+        /// the shared ceiling is what was reached) names a number that lives only here.
+        body_max_mb: Option<u64>,
         builtin: Vec<String>,
     },
 }
@@ -1175,6 +1179,7 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             dns_cache_ttl: a.dns_cache_ttl().map(|d| d.as_secs()),
             idle_timeout: a.idle_timeout().map(|d| d.as_secs()),
             max_connections: a.max_connections(),
+            body_max_mb: a.body_max().map(|bytes| bytes / (1024 * 1024)),
             builtin: sandbox::builtin_allow_rules()
                 .iter()
                 .map(|r| r.to_string())
@@ -1758,6 +1763,7 @@ mod tests {
                 dns_cache_ttl: Some(30),
                 idle_timeout: None,
                 max_connections: None,
+                body_max_mb: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,

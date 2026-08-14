@@ -163,6 +163,11 @@ pub(crate) struct ProxyCtx {
     /// [`crate::allowlist::DEFAULT_MAX_CONNECTIONS`]). A connection beyond it is refused rather than
     /// spawned; see [`super::serve`].
     pub(super) max_conns: usize,
+    /// What this launch holds in request-body buffers (`[network] body_max_mb`, else
+    /// [`crate::allowlist::DEFAULT_BODY_MAX`]): one body's ceiling and the sum across every
+    /// connection. Resolved here so the refusal, the reservation and the message that explains
+    /// them cannot read three different numbers.
+    pub(super) body: super::BodyLimits,
     /// The session's record of what its signer plugins formed, read by `sbx logs --feed signer`, or
     /// `None` when the launch declared no signer (and in tests). Attached by
     /// [`crate::sandbox::egress::start`] via [`Self::with_signer_log`]; every path that forms a
@@ -212,6 +217,11 @@ impl ProxyCtx {
         let policy_max_conns = policy
             .max_connections()
             .unwrap_or(crate::allowlist::DEFAULT_MAX_CONNECTIONS);
+        let policy_body = super::BodyLimits::new(
+            policy
+                .body_max()
+                .unwrap_or(crate::allowlist::DEFAULT_BODY_MAX),
+        );
         Ok(ProxyCtx {
             ca,
             server_config,
@@ -244,6 +254,7 @@ impl ProxyCtx {
             pool,
             idle: policy_idle,
             max_conns: policy_max_conns,
+            body: policy_body,
             signer_log: None,
         })
     }

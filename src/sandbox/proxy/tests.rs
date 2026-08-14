@@ -1816,7 +1816,7 @@ fn the_absolute_form_plane_holds_a_body_to_digest_it_on_the_same_terms() {
 
     let (resp, _) = forwarded(format!(
         "POST https://host.test:{{port}}/ HTTP/1.1\r\nHost: host.test\r\nContent-Length: {}\r\n\r\n",
-        CHUNKED_REQUEST_CAP + 1
+        crate::allowlist::DEFAULT_BODY_MAX + 1
     ));
     assert!(
         resp.contains("413") && resp.contains("signer-body-too-large"),
@@ -4330,7 +4330,13 @@ fn a_held_body_is_the_same_bytes_however_the_client_framed_it() {
         b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
     ));
     assert_eq!(
-        hold_request_body(&mut chunked, true, 0).unwrap(),
+        hold_request_body(
+            &mut chunked,
+            true,
+            0,
+            BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+        )
+        .unwrap(),
         b"hello world"
     );
 
@@ -4338,7 +4344,13 @@ fn a_held_body_is_the_same_bytes_however_the_client_framed_it() {
         b"hello world and a pipelined leftover".to_vec(),
     ));
     assert_eq!(
-        hold_request_body(&mut framed, false, 11).unwrap(),
+        hold_request_body(
+            &mut framed,
+            false,
+            11,
+            BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+        )
+        .unwrap(),
         b"hello world",
         "exactly the Content-Length, never a byte of what follows it"
     );
@@ -4454,29 +4466,36 @@ fn holding_a_body_to_digest_it_reframes_only_a_request_that_has_one() {
 /// multiplied by concurrency.
 ///
 /// The proxy buffers a request body host-side, and `cgroup::wrap` puts *bwrap* in the launch's
-/// systemd scope, so the cage's own `MemoryMax` does not reach these bytes. `CHUNKED_REQUEST_CAP`
-/// alone therefore bounds one request while `MAX_CONCURRENT_CONNS` of them can be in flight: the
-/// product is what an in-cage agent could make the host allocate, and this is what refuses it.
+/// systemd scope, so the cage's own `MemoryMax` does not reach these bytes. The per-request ceiling
+/// alone therefore bounds one request while the connection cap's worth can be in flight: the product
+/// is what an in-cage agent could make the host allocate, and this is what refuses it.
 #[test]
 fn the_body_buffer_budget_is_shared_and_released() {
     use std::sync::atomic::AtomicU64;
 
     let budget = AtomicU64::new(0);
+    let limits = BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX);
     // A chunked request cannot say how much it will read, so it reserves the per-request ceiling —
     // which makes this the number of concurrent chunked uploads, and why that is the named constant.
     assert_eq!(
-        HELD_BODY_BUDGET / CHUNKED_REQUEST_CAP,
+        limits.total / limits.per_request,
         CONCURRENT_CHUNKED_UPLOADS
     );
     let held: Vec<_> = (0..CONCURRENT_CHUNKED_UPLOADS)
-        .map(|_| reserve_body_buffer(&budget, true, 0).expect("within the ceiling"))
+        .map(|_| reserve_body_buffer(&budget, true, 0, limits).expect("within the ceiling"))
         .collect();
     assert!(
-        reserve_body_buffer(&budget, true, 0).is_none(),
+        reserve_body_buffer(&budget, true, 0, limits).is_none(),
         "the ceiling is shared, so one more chunked body past it is refused"
     );
     assert!(
-        reserve_body_buffer(&budget, false, 1).is_none(),
+        reserve_body_buffer(
+            &budget,
+            false,
+            1,
+            BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+        )
+        .is_none(),
         "and so is a single byte: the ceiling is on the sum, not on a count of requests"
     );
     drop(held);
@@ -4486,7 +4505,13 @@ fn the_body_buffer_budget_is_shared_and_released() {
         "every reservation is released when its request ends"
     );
     assert!(
-        reserve_body_buffer(&budget, true, 0).is_some(),
+        reserve_body_buffer(
+            &budget,
+            true,
+            0,
+            BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+        )
+        .is_some(),
         "and the room comes back"
     );
 
@@ -4494,7 +4519,15 @@ fn the_body_buffer_budget_is_shared_and_released() {
     // large one's ceiling.
     let budget = AtomicU64::new(0);
     let small: Vec<_> = (0..1000)
-        .map(|_| reserve_body_buffer(&budget, false, 1024).expect("a KiB each"))
+        .map(|_| {
+            reserve_body_buffer(
+                &budget,
+                false,
+                1024,
+                BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX),
+            )
+            .expect("a KiB each")
+        })
         .collect();
     assert_eq!(small.len(), 1000);
 }
@@ -4533,7 +4566,7 @@ fn every_site_that_buffers_a_body_refuses_once_the_ceiling_is_spent() {
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         ctx.held_bodies
-            .store(HELD_BODY_BUDGET, std::sync::atomic::Ordering::Relaxed);
+            .store(ctx.body.total, std::sync::atomic::Ordering::Relaxed);
         let resp = through_proxy(ctx, der, "host.test", "host.test", 8443, request)
             .unwrap_or_else(|e| panic!("{site}: {e}"));
         assert!(
@@ -4564,7 +4597,7 @@ fn every_site_that_buffers_a_body_refuses_once_the_ceiling_is_spent() {
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         ctx.held_bodies
-            .store(HELD_BODY_BUDGET, std::sync::atomic::Ordering::Relaxed);
+            .store(ctx.body.total, std::sync::atomic::Ordering::Relaxed);
         let resp = through_cleartext(ctx, request).unwrap_or_else(|e| panic!("{site}: {e}"));
         assert!(
             resp.contains("503") && resp.contains("body-buffer-cap"),
@@ -4749,7 +4782,7 @@ fn an_oversized_body_is_refused_before_the_client_is_invited_to_send_it() {
         format!(
             "POST / HTTP/1.1\r\nHost: host.test\r\nExpect: 100-continue\r\n\
              Content-Length: {}\r\n\r\n",
-            CHUNKED_REQUEST_CAP + 1
+            crate::allowlist::DEFAULT_BODY_MAX + 1
         )
         .as_bytes(),
     )
@@ -4800,15 +4833,61 @@ fn a_chunked_body_over_the_ceiling_keeps_its_own_refusal() {
     );
 }
 
+/// The launch's own ceiling is the one the de-chunker enforces.
+///
+/// The number reaches the wire through four hands — the table, the policy, the context, the reader —
+/// so it is asserted where a client would feel it rather than where it was written: the same chunked
+/// body passes under a ceiling that admits it and is refused under one that does not.
+#[test]
+fn a_configured_body_ceiling_is_the_one_the_de_chunker_enforces() {
+    // A body of 4 KiB, against a ceiling of 1 KiB and one of 1 MiB.
+    let chunk = format!(
+        "POST / HTTP/1.1\r\nHost: host.test\r\nTransfer-Encoding: chunked\r\n\r\n1000\r\n{}\r\n0\r\n\r\n",
+        "x".repeat(4096)
+    );
+    for (ceiling, refused) in [(1024_u64, true), (1024 * 1024, false)] {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let der = ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(ca, policy(&["host.test:*"]).with_body_max(Some(ceiling)))
+                .unwrap()
+                // A signer that digests the body is what makes the de-chunker run *before* any
+                // upstream is opened, so what this reads is the ceiling and not the network.
+                .with_injections(vec![digesting_injection()])
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_proxy(ctx, der, "host.test", "host.test", 8443, chunk.as_bytes())
+            .unwrap_or_default();
+        assert_eq!(
+            resp.contains("bad-request:chunked"),
+            refused,
+            "a {ceiling}-byte ceiling must {} a 4 KiB body: {resp:?}",
+            if refused { "refuse" } else { "admit" }
+        );
+    }
+}
+
 /// The ceiling on a declared body is answered from the head, so an oversized upload is refused
 /// before the client is invited to send it rather than after it has crossed the loopback. A chunked
 /// request declares no length, so there is nothing to answer from and the de-chunker bounds it.
 #[test]
 fn a_declared_body_above_the_ceiling_is_known_from_the_head() {
-    assert!(body_exceeds_hold(false, CHUNKED_REQUEST_CAP + 1));
-    assert!(!body_exceeds_hold(false, CHUNKED_REQUEST_CAP));
+    assert!(body_exceeds_hold(
+        false,
+        crate::allowlist::DEFAULT_BODY_MAX + 1,
+        BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+    ));
+    assert!(!body_exceeds_hold(
+        false,
+        crate::allowlist::DEFAULT_BODY_MAX,
+        BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+    ));
     assert!(
-        !body_exceeds_hold(true, CHUNKED_REQUEST_CAP + 1),
+        !body_exceeds_hold(
+            true,
+            crate::allowlist::DEFAULT_BODY_MAX + 1,
+            BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+        ),
         "a chunked request's declared length is not its body's"
     );
 }
@@ -4818,7 +4897,15 @@ fn a_declared_body_above_the_ceiling_is_known_from_the_head() {
 #[test]
 fn a_body_that_ends_before_its_content_length_is_an_error() {
     let mut reader = std::io::BufReader::new(std::io::Cursor::new(b"short".to_vec()));
-    assert!(hold_request_body(&mut reader, false, 500).is_err());
+    assert!(
+        hold_request_body(
+            &mut reader,
+            false,
+            500,
+            BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -6612,7 +6699,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
             8443,
             format!(
                 "POST / HTTP/1.1\r\nHost: host.test\r\nContent-Length: {}\r\n\r\n",
-                CHUNKED_REQUEST_CAP + 1
+                crate::allowlist::DEFAULT_BODY_MAX + 1
             )
             .as_bytes(),
         )
@@ -6645,7 +6732,7 @@ fn each_refusal_site_records_its_stat_bucket_and_emits_a_log_event() {
                 .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
         ctx.held_bodies
-            .store(HELD_BODY_BUDGET, std::sync::atomic::Ordering::Relaxed);
+            .store(ctx.body.total, std::sync::atomic::Ordering::Relaxed);
         let resp = through_proxy(
             ctx,
             der,
@@ -8815,7 +8902,11 @@ fn a_declared_body_above_the_ceiling_is_permanently_refused_at_every_size() {
         );
     };
 
-    for len in [CHUNKED_REQUEST_CAP + 1, HELD_BODY_BUDGET + 1, u64::MAX] {
+    for len in [
+        crate::allowlist::DEFAULT_BODY_MAX + 1,
+        BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX).total + 1,
+        u64::MAX,
+    ] {
         // The tunnelled MITM plane.
         let ca = Arc::new(Ca::ephemeral().unwrap());
         let der = ca.ca_cert_der();
@@ -8870,7 +8961,13 @@ fn a_declared_body_above_the_ceiling_is_permanently_refused_at_every_size() {
 fn the_body_budget_refuses_a_length_that_would_overflow_its_total() {
     let budget = std::sync::atomic::AtomicU64::new(1);
     assert!(
-        reserve_body_buffer(&budget, false, u64::MAX).is_none(),
+        reserve_body_buffer(
+            &budget,
+            false,
+            u64::MAX,
+            BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX)
+        )
+        .is_none(),
         "a length that overflows the running total is refused, never wrapped into a small one"
     );
     assert_eq!(

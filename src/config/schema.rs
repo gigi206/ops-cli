@@ -1343,6 +1343,18 @@ pub(crate) struct NetworkTable {
     /// than requests. Zero is warned and ignored. Trusted/global-only like the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_connections: Option<usize>,
+    /// The most of one request body the egress proxy holds in memory, in MiB. Absent means the
+    /// default (64).
+    ///
+    /// It is reached by a `Transfer-Encoding: chunked` request, which has to be buffered whole to be
+    /// re-framed with a length the upstream can trust, and by one a signer asked for a digest over.
+    /// A `Content-Length` body larger than this is *streamed*, not refused: only a body sbx must
+    /// hold meets the ceiling. Raise it for a workload that genuinely streams uploads larger than
+    /// this, and note what it multiplies: the proxy runs host-side, outside the cage's memory cgroup,
+    /// so the sum it will hold across every connection is a fixed multiple of this number. Zero is
+    /// warned and ignored. Trusted/global-only like the rest of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) body_max_mb: Option<u64>,
     /// Whether the cage's CA bundle carries the public root certificates after the per-session MITM
     /// CA. **On by default**; set it to `false` to hand the cage the MITM CA alone. Under a filtering
     /// posture the MITM CA is the only anchor that verifies anything: every byte the cage receives is
@@ -2176,6 +2188,7 @@ mod tests {
                 pool: None,
                 idle_timeout: None,
                 max_connections: None,
+                body_max_mb: None,
                 ca_roots: None,
             }))
         );
@@ -2202,6 +2215,7 @@ mod tests {
                 pool: None,
                 idle_timeout: None,
                 max_connections: None,
+                body_max_mb: None,
                 ca_roots: None,
             }))
         );
@@ -2230,6 +2244,7 @@ mod tests {
                 pool: None,
                 idle_timeout: None,
                 max_connections: None,
+                body_max_mb: None,
                 ca_roots: None,
             }))
         );

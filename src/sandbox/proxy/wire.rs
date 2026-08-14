@@ -188,11 +188,6 @@ pub(super) fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) ->
     Ok(())
 }
 
-/// The most request body the proxy will buffer to de-chunk a `Transfer-Encoding: chunked` request
-/// before re-framing it with a synthesized Content-Length. Agent prompt bodies are KB–MB, so 64 MiB
-/// is generous; a larger chunked upload fails closed (the proxy does not stream chunked through).
-pub(super) const CHUNKED_REQUEST_CAP: u64 = 64 * 1024 * 1024;
-
 /// The most one chunk-size line (or one trailer line) may be before it is refused. A chunk-size
 /// line is a hex count plus optional `;extensions`; a trailer is one header — both are short, so 8
 /// KiB is generous. Without this bound a bare `read_until` would buffer an arbitrarily long
@@ -203,7 +198,7 @@ pub(super) const CHUNK_LINE_MAX: u64 = 8 * 1024;
 
 /// De-chunk a `Transfer-Encoding: chunked` request body into one buffer, fail-closed on malformed
 /// framing (a non-hex chunk size, a short data read, a missing trailing CRLF) or a body over
-/// [`CHUNKED_REQUEST_CAP`]. The caller re-frames the result with a synthesized `Content-Length`
+/// the caller's ceiling. The caller re-frames the result with a synthesized `Content-Length`
 /// (stripping `Transfer-Encoding`), so the upstream receives one unambiguous Content-Length and no
 /// TE — no CL/TE request-smuggling ambiguity can reach it. Trailers after the zero chunk are read
 /// and discarded (the proxy does not forward them; they are not part of any secret-tripwire path).
@@ -1343,12 +1338,12 @@ mod tests {
         // two chunks then the zero terminator (with a trailer) reassemble to the payload.
         let mut r: &[u8] = b"3\r\nabc\r\n2\r\nde\r\n0\r\nTrailer: x\r\n\r\n";
         assert_eq!(
-            read_chunked_body(&mut r, CHUNKED_REQUEST_CAP).unwrap(),
+            read_chunked_body(&mut r, crate::allowlist::DEFAULT_BODY_MAX).unwrap(),
             b"abcde"
         );
         // chunk data not followed by CRLF is a malformed body.
         let mut r: &[u8] = b"3\r\nabcXX";
-        assert!(read_chunked_body(&mut r, CHUNKED_REQUEST_CAP).is_err());
+        assert!(read_chunked_body(&mut r, crate::allowlist::DEFAULT_BODY_MAX).is_err());
         // a body over the cap fails closed rather than buffering unboundedly.
         let mut r: &[u8] = b"4\r\ndata\r\n0\r\n\r\n";
         assert!(

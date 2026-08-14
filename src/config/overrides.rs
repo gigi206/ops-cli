@@ -880,6 +880,7 @@ fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField 
         pool: None,
         idle_timeout: None,
         max_connections: None,
+        body_max_mb: None,
         ca_roots: None,
         capture: None,
         capture_max_kb: None,
