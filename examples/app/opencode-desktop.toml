@@ -3,6 +3,13 @@
 #   sbx app import examples/app/opencode-desktop.toml
 #   sbx app run opencode-desktop
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's package and the hosts it reaches come
+# from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/opencode-desktop.toml
+#     sbx app import    examples/app/opencode-desktop.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-runtime.toml
@@ -85,10 +92,18 @@ dbus = true
 #    { path = "~/.local/share/opencode", mode = "rw" },  # auth + sessions (SQLite)
 #]
 
-[packages]
-# Track the latest GitHub release's linux-amd64 `.deb` automatically (see "THE `deb:github:`
-# BACKEND" above) — the pin is the release's version-stamped asset, rolled by `sbx upgrade deb`.
-opencode-desktop = "deb:github:anomalyco/opencode"
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `opencode-desktop` BUNDLE — the `.deb` and the hosts the app reaches — from
+# one declaration shared with the bundle file itself, so this profile cannot fall behind when the
+# app's requirements change. The posture above (`gui`/`gpu`/`dbus`) stays here: a bundle may never
+# widen what the cage exposes of the host.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/opencode-desktop.toml
+# Without it the launch warns that the bundle is undeclared and the app is simply absent.
+use = ["opencode-desktop"]
+
+# No `[packages]` here: the app's package comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"
@@ -105,9 +120,11 @@ mode = "deny"
 # gateway, add its host (`{*} https://api.anthropic.com`, `{*} https://api.openai.com`, or
 # `{*} https://openrouter.ai`) and fill the [secret] block below.
 allow = [
-    "@models-catalog",
-    "@npm-runtime",
-    "{*} https://opencode.ai",
+    # The model catalogue, the startup npm fetch and the opencode gateway arrive with the bundle
+    # (`use` above) and are unioned into this list at resolution — inspect them with
+    # `sbx bundle opencode-desktop`, and see the launch's own view with
+    # `sbx config show --app opencode-desktop`.
+    #
     # /share syncs a session to opencode's servers on demand (HTTPS POST, not a WebSocket).
     #"{*} https://opncd.ai",
     # opencode streams completions over HTTPS (SSE), not a WebSocket, so the default posture needs
@@ -121,7 +138,7 @@ allow = [
 # Silence the denied telemetry: the desktop app POSTs crash/usage envelopes to Sentry, which the
 # allowlist already refuses (`denied-default`). `mute` keeps those refusals out of the default
 # `sbx net logs` (still denied, still counted in `sbx net stats`; see them with `--all`).
-mute = ["*.sentry.io"]
+mute = []  # the Sentry refusal is muted by the bundle
 
 # The real key is read on the HOST and injected by the egress proxy — never in the cage. Provide
 # it on the host as $OPENROUTER_API_KEY (or point `from` at a resolver, e.g.

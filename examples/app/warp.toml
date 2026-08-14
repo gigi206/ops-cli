@@ -10,25 +10,17 @@
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.
 #
-# PACKAGING — a bootstrap install, NOT a clean sbx backend. Warp distributes the Agent CLI as a
-# versioned tar.gz from its own release infrastructure: the official installer
-# (`curl -fsSL https://app.warp.dev/download/agent-cli | bash`) resolves
-# `app.warp.dev/download/agent-cli/artifact?os=<os>&arch=<arch>` to a 302 onto
-# `releases.warp.dev/stable/<version>/tui/<os>/<arch>/warp-tui-stable-<os>-<arch>.tar.gz`. There
-# is no GitHub release, no aqua package, no nixpkgs attribute, and no npm package — and the
-# tarball's payload is a `warp-tui-stable` binary plus a sibling `resources/` tree the binary
-# resolves relative to its own location at runtime (verified in the shipped artifact). So the
-# profile uses the bootstrap pattern proven by `rovo.toml`/`pool.toml`: the `cmd` wrapper
-# resolves the artifact endpoint, downloads the tarball, validates the payload (binary AND
-# resources/), installs it into the app's persistent isolated home, and execs the binary.
+# PACKAGING — the vendor's own tarball, tracked automatically. Warp exposes a stable artifact
+# endpoint (`app.warp.dev/download/agent-cli/artifact?os=…&arch=…`) that 302s onto a versioned
+# `releases.warp.dev/.../warp-tui-stable-<os>-<arch>.tar.gz`, whose payload is a lone
+# `warp-tui-stable` executable beside a `resources/` tree the binary resolves relative to its own
+# location. The bundle declares it `tarball:resolve` with a resolver that reads that redirect
+# host-side, so `sbx upgrade tarball` rolls the version forward.
 #
-# Installed once on the first launch; persistent across projects (the same isolated home). Re-run
-# the bootstrap to advance: `sbx app run warp --env WARP_REINSTALL=1` (the `--env` override is
-# read on the HOST and authoritative for that one launch). The install layout mirrors the
-# official one (`~/.warp/tui/current/…`); the CLI's own background auto-updater is disabled
-# because the layout is not a "managed install" (observed in the CLI's own log:
-# `TUI autoupdate disabled: not running from a managed install`) — advancing is exactly the
-# `WARP_REINSTALL=1` re-bootstrap above, which is also what a fresh download gets you.
+# This profile used to run that download from its own `cmd`, with a background-updater dance in the
+# isolated home. Nothing about the artifact required it: a lone executable at an archive root is
+# wrapped under the `[packages]` key, and the wrapper execs the real binary in place, so its
+# sibling `resources/` are still found.
 #
 # CREDENTIAL POSTURE — a Warp account. Two paths:
 #
@@ -67,67 +59,7 @@
 # app.warp.dev), the host set and the WebSocket URLs (read out of the binary's outbound URL
 # table), the `WARP_API_KEY` env name (printed by the binary's own `--help`), and the device-code
 # flow (docs + the binary's OAuth strings).
-cmd = [
-    "bash",
-    "-c",
-    '''
-set -eo pipefail
-# --- locate the platform triple (release naming is <os>/<arch>: os=linux|macos,
-#     arch=x86_64|aarch64) ---
-case "$(uname -s)" in
-  Linux)  os="linux" ;;
-  Darwin) os="macos" ;;
-  *) echo "warp: unsupported OS $(uname -s)" >&2; exit 1 ;;
-esac
-case "$(uname -m)" in
-  x86_64)          arch="x86_64" ;;
-  aarch64 | arm64) arch="aarch64" ;;
-  *) echo "warp: unsupported arch $(uname -m)" >&2; exit 1 ;;
-esac
-
-# --- the Warp CLI binary links liblzma.so.5 (xz), which the hermetic cage lacks; the bundle
-#     declares `nix:xz` (the pinned nixpkgs has no `liblzma` attribute, and `xz` is split — the
-#     `xz-5.8.3-bin` on PATH carries no libraries). The library lives in the `out` output, whose
-#     store path is content-addressed and cannot be written literally, so find it by its name —
-#     the same pattern `odysseus.toml` uses for libstdc++. ---
-for d in /nix/store/*xz-*/lib; do
-  [ -e "$d/liblzma.so.5" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-done
-
-# --- install path inside the app's persistent isolated home ---
-bin="$HOME/.warp/tui/current/warp-tui-stable"
-
-if [ ! -x "$bin" ] || [ -n "$WARP_REINSTALL" ]; then
-  # Resolve the artifact endpoint (302 -> releases.warp.dev/<channel>/<version>/tui/<os>/<arch>)
-  # and download the tarball — fail closed (`-fsSL` errors on non-2xx, silent on progress).
-  url="https://app.warp.dev/download/agent-cli/artifact?os=$os&arch=$arch"
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL "$url" -o "$tmp/warp-tui.tar.gz"
-  mkdir -p "$tmp/payload"
-  tar xzf "$tmp/warp-tui.tar.gz" -C "$tmp/payload"
-  # Validate before touching the install: the binary AND its sibling `resources/` tree (the
-  # binary resolves `resources/` relative to its own location — a bare binary starts broken).
-  [ -x "$tmp/payload/warp-tui-stable" ] || { echo "warp: payload lacks warp-tui-stable" >&2; exit 1; }
-  [ -d "$tmp/payload/resources" ] || { echo "warp: payload lacks resources/" >&2; exit 1; }
-  mkdir -p "$HOME/.warp/tui"
-  # Replace `current` whether it is the updater's symlink or a plain directory from an earlier
-  # bootstrap; never touch `versions/` (a live update may be staged there).
-  if [ -L "$HOME/.warp/tui/current" ]; then
-    rm -f "$HOME/.warp/tui/current"
-  else
-    rm -rf "$HOME/.warp/tui/current"
-  fi
-  mv "$tmp/payload" "$HOME/.warp/tui/current"
-fi
-
-exec "$bin" "$@"
-    ''',
-    # `$0` placeholder: `sbx app run warp -- <args>` appends <args> to this cmd
-    # array, so they arrive as `$1 $2 …` and reach the agent verbatim via
-    # `exec … "$@"`.
-    "warp",
-]
+cmd = "warp"
 
 # Your host Warp CLI settings (theme, statusline, MCP config, execution profiles), mounted
 # read-write at its real absolute path. `binds` is a security field, honored only because this

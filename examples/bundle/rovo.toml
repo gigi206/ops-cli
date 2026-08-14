@@ -1,0 +1,67 @@
+# `rovo` — Atlassian's Rovo Dev agent, which ships as a subcommand of the Atlassian CLI: the CLI
+# itself, plus the hosts it reaches.
+#
+#   sbx bundle import examples/bundle/rovo.toml
+#   # then in an app profile:   use = ["rovo"]
+#
+# Derived from `examples/app/rovo.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for what this agent needs, while the profile
+# keeps its own command, posture and credential choices. A test pins the two artifacts together,
+# so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The agent is reached as `acli rovodev …`, so
+# the consuming app writes that command itself.
+#
+# THIS BUNDLE IS COMPLETE — an app that names it gets the CLI, with no install step to reproduce.
+# The profile used to download Atlassian's tarball from its own `cmd`, on the grounds that there
+# was no nixpkgs attribute. There is one now (`acli`, the official binary with its sha256), and it
+# rolls with `sbx upgrade nix` like every other `nix:` package.
+#
+# WHY `.unwrapped`. The nixpkgs default wraps the binary in `buildFHSEnv`, which runs bubblewrap at
+# launch — and the cage's mandatory seccomp denylist refuses the mount and namespace family, so that
+# wrapper cannot come up inside a cage. The `unwrapped` attribute is the same statically linked Go
+# binary without it, which is what a cage wants: verified by building it and running
+# `acli --version`.
+#
+# VERSION LAG is the trade. The channel carried 1.3.22-stable while upstream published 1.3.23, and
+# the CLI says so on every run ("You're using an outdated version"). That is the normal nixpkgs
+# cadence: `sbx upgrade nix` moves it when the channel does, and nothing self-updates behind your
+# back. The alternative — a `tarball:resolve` reading Atlassian's Homebrew formula — is blocked by
+# the archive's shape: it unpacks into a versioned sub-directory (`acli_<ver>_linux_amd64/acli`),
+# which the shared install phase refuses rather than reaching into.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.rovo]
+allow = [
+    # The API the agent calls, and the three hosts its token exchange and account login span. The
+    # CLI download host is NOT here: the package is provisioned host-side by nix.
+    "{*} https://api.atlassian.com",
+    "{*} https://auth.atlassian.com",
+    "{*} https://id.atlassian.com",
+    "{*} https://as.atlassian.com",
+    # YOUR site. The bounded, anchored regex admits one `<site>.atlassian.net` label and nothing
+    # else, so a look-alike (`evil.atlassian.net.attacker.com`) is refused.
+    '{*} re:^https://[a-zA-Z0-9-]+\.atlassian\.net(/|$)',
+]
+mute = [
+    "o55978.ingest.us.sentry.io",   # crash reporting
+    "api.segment.io",              # product analytics
+    # The CLI's own update check, refused on purpose: `sbx upgrade nix` owns the version.
+    "acli.atlassian.com",
+    # Vendor sites the CLI references but no session needs: the staging API, the docs, the admin
+    # console and the link shortener.
+    "api.stg.atlassian.com",
+    "developer.atlassian.com",
+    "admin.atlassian.com",
+    "go.atlassian.com",
+]
+
+[bundle.rovo.packages]
+# The Atlassian CLI from nixpkgs, built host-side and seeded — proprietary (an `unfree` attribute),
+# which a `[packages]` declaration is trusted-only for. `.unwrapped` skips the FHS wrapper that
+# cannot start inside a cage; see the note above.
+acli = "nix:acli.unwrapped"

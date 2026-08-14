@@ -1,0 +1,78 @@
+# `vibe` — Mistral's Vibe CLI: what it needs to be installed, to sign in, and to reach its own
+# services.
+#
+#   sbx bundle import examples/bundle/vibe.toml
+#   # then in an app profile:   use = ["vibe"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/pypi.toml
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
+# Derived from `examples/app/vibe.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for the agent's packages, env and egress,
+# while the app keeps its own command, posture and credential choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The browser SSO needs `gui = "wayland"` and
+# `gpu = true`, which a bundle may never grant.
+#
+# THE BROWSER IS OPTIONAL, and so is the Google chain. A consuming app that authenticates with an
+# API key instead of the SSO can drop `chromium` from what it uses — the closure is the heaviest
+# thing here — and never touches the `accounts.google.<ccTLD>` rules. They are in the bundle
+# because the shipped profile's default posture is the browser sign-in.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.vibe]
+allow = [
+    # Account SSO + runtime. The browser sign-in spans several Mistral subdomains: the CLI drives
+    # the create/poll/exchange API on console.mistral.ai, the browser is redirected through
+    # auth.mistral.ai and v2.auth.mistral.ai for the login itself, and api.mistral.ai serves the
+    # models. Rather than chase each subdomain, all of Mistral's own domain is opened — spoof-safe:
+    # `*.mistral.ai` matches the apex and its subdomains only, never `mistral.ai.evil.com`.
+    "{*} https://*.mistral.ai",
+    # Mistral's first-party feature-flag / experiments SDK, on the `.services` domain rather than
+    # `.ai`, so NOT covered above. Deny it in the consuming app to run with default flags.
+    "{*} https://experiments.mistral.services",
+    # THIRD-PARTY SSO — the "Sign in with Google" path leaves `*.mistral.ai`. After auth Google does
+    # CheckCookie then `/accounts/SetSID` on YOUR country domain before returning to Mistral's
+    # callback: a LOAD-BEARING step, not noise. The bounded regex covers every locale in one
+    # anchored rule. For email/password login these are unnecessary; for Apple/Microsoft SSO, the
+    # consuming app swaps in `appleid.apple.com` / `login.microsoftonline.com`. The token exchange
+    # is server-side on Mistral, so no googleapis.com token endpoint is needed.
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{GET} https://*.gstatic.com",
+    "{GET} https://*.googleusercontent.com",
+    # Install-time (mise's `uv tool install`): the Python wheels and the package index.
+    "@pypi",
+    # (cache.nixos.org and github.com — the nix binary cache for uv/Python/chromium — are already in
+    # sbx's built-in allow-set, so they need no entry.)
+]
+# Denied noise, kept out of the default log (still denied, still counted by `sbx net stats`).
+mute = [
+    # The in-cage browser's own background services.
+    "@chromium-background",
+    # Wider than the group: the remaining background services this browser reaches.
+    "*.googleapis.com",
+    "*.gvt1.com",
+    "www.google.com",                 # omnibox / async requests seen during sign-in
+    "*.sentry.io",                    # page telemetry (Mistral console and auth pages)
+    "static.cloudflareinsights.com",  # Cloudflare web-analytics beacon
+    # NOT muted on purpose: `widget.intercom.io` (the support-chat widget, unused from the CLI). It
+    # is refused by the allowlist and hits once, so leaving it VISIBLE in `sbx net log` is more
+    # useful than hiding it.
+]
+
+[bundle.vibe.packages]
+# Vibe itself via mise's pipx backend, so `sbx upgrade mise` rolls it forward: mise runs
+# `uv tool install mistral-vibe` because `nix:uv` puts uv on PATH, and `nix:python312` supplies a
+# supported interpreter.
+vibe = "mise:pipx:mistral-vibe"
+uv = "nix:uv"
+python = "nix:python312"
+# The in-cage browser for the SSO sign-in. HEAVY — a large nixpkgs closure on first launch, shared
+# with every other Chromium profile in your store. Not needed on the API-key path.
+chromium = "nix:chromium"

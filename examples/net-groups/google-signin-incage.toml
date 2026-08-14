@@ -1,0 +1,54 @@
+# `google-signin-incage` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# entries ONLY, so the repo's native mechanism is a group referenced with `@<name>`; a bundle
+# exists to carry maps (`packages`/`env`/`[secret]`), which a pure host set has none of.
+#
+#   sbx net groups import examples/net-groups/google-signin-incage.toml
+#   # then in a bundle or an app profile's [network]:   allow = ["@google-signin-incage"]
+#
+# "Continue with Google" when the consent renders in an IN-CAGE browser — the set the shipped
+# desktop profiles converged on, entry for entry. It is deliberately WIDER than
+# [`google-oauth`](google-oauth.toml), which serves the other posture: an agent that prints a URL
+# you open in your HOST browser needs the `.com` sign-in host and the token endpoints, and nothing
+# else. A browser inside the cage needs three more things:
+#
+#  - **the country domain.** Google serves the consent and the cross-domain `/accounts/SetSID`
+#    cookie step from YOUR ccTLD (`accounts.google.fr`, `.de`, `.co.uk`, …), not always `.com`.
+#    Deny SetSID and the OAuth chain never completes — the browser hangs on a blank page, which is
+#    the single most common symptom this group fixes. The regex is bounded and ANCHORED, so a
+#    look-alike (`accounts.google.com.evil.com`) is REFUSED.
+#  - **the consent page's assets**, which a real browser fetches and an API client never does:
+#    fonts and the static hosts, plus the account avatar the profile step reads.
+#  - **`apis.google.com`**, the JS client the sign-in page loads.
+#
+# WHAT IT DOES NOT CARRY: the product's own hosts (those belong to the agent's bundle), the
+# in-cage browser's background chatter (see [`chromium-background`](chromium-background.toml),
+# which is a `mute` set, not an `allow` set), and the userinfo endpoint
+# `www.googleapis.com/oauth2/*` — only some flows read it, so a profile that does names it itself
+# rather than every consumer inheriting a host that serves many other Google APIs.
+#
+# THREE SHIPPED BUNDLES NAME IT — `claude-desktop`, `hermes-desktop` and `kiro` — because their
+# host sets were identical. The other in-cage sign-in profiles keep their own list because theirs
+# genuinely differ: `cursor`, `kiro-desktop` and `vibe` use `*.gstatic.com` /
+# `*.googleusercontent.com` wildcards, `freebuff-desktop` adds two favicon services and omits
+# `apis.google.com`, `antigravity` adds the userinfo endpoint and omits `www.google.com`.
+# Harmonizing them would be a change to what each cage can reach, so it is left to a deliberate
+# decision rather than folded in here.
+#
+# Groups are global-only (like bundles): an app's allow may reference one, a project may not
+# define one.
+
+[net.groups]
+google-signin-incage = [
+    # The sign-in and SetSID pages, in any locale.
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    # The token endpoint and the JS client the page loads.
+    "{*} https://oauth2.googleapis.com",
+    "{*} https://apis.google.com",
+    # Consent-page assets and the account avatar.
+    "{GET} https://www.google.com",
+    "{GET} https://ssl.gstatic.com",
+    "{GET} https://www.gstatic.com",
+    "{GET} https://fonts.gstatic.com",
+    "{GET} https://fonts.googleapis.com",
+    "{GET} https://lh3.googleusercontent.com",
+]

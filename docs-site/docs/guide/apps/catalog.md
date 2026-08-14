@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's `examples/app/` directory ships **68 importable
+The repository's `examples/app/` directory ships **69 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -37,7 +37,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `crush` | `mise:github:charmbracelet/crush` | `hyper.charm.land` (Hyper account) or multi-provider BYOK |
 | `cursor-agent` | `nix:gnutar` (+ `nix:gzip`) | `*.cursor.sh` (Cursor account / `CURSOR_API_KEY`) |
 | `deepagents-code` | `mise:pipx:deepagents-code` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Google) |
-| `devin` | bootstrap installer (`cmd` wrapper, verifies SHA256; + `nix:gnutar`, `nix:gzip`) | `api.devin.ai` (BYOK API key) |
+| `devin` | `tarball:resolve` (the vendor's live manifest) | `api.devin.ai` (BYOK API key) |
 | `dirac` | `nix:nodejs` (+ `mise:npm:dirac-cli`, `nix:ripgrep`) | provider-dependent (BYOK, no vendor account) |
 | `droid` | `nix:nodejs` (+ `mise:npm:droid`) | `*.factory.ai` (account) |
 | `freebuff` | `nix:nodejs` (+ `mise:npm:freebuff`) | `www.codebuff.com` (account) |
@@ -58,17 +58,17 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `opencode` | `mise:opencode` | provider-dependent (BYOK) |
 | `openfox` | `nix:nodejs` (+ `mise:npm:openfox`) | **none**: a local LLM you point it at |
 | `pi` | `mise:aqua:earendil-works/pi` | provider-dependent (BYOK) |
-| `pool` | `nix:gnutar` (+ `nix:gzip`) | `*.poolside.ai` (Poolside account) |
+| `pool` | `tarball:resolve` (the vendor's version file) | `*.poolside.ai` (Poolside account) |
 | `prime-agent` | bootstrap `curl app.primeintellect.ai/prime-agent/install.sh` (+ `nix:nodejs`, `nix:uv`, `nix:git`, `nix:ripgrep`, `nix:fd`) | provider-dependent (BYOK: `ANTHROPIC_API_KEY` in the profile, or a `/login` subscription): Prime Intellect's self-improving RLM agent, whose one built-in tool is a persistent IPython kernel |
 | `qoder` | `nix:nodejs` (+ `mise:npm:@qoder-ai/qodercli`, `nix:ripgrep`) | `*.qoder.sh` (Qoder account / `QODER_PERSONAL_ACCESS_TOKEN`) |
 | `qwen-code` | `nix:nodejs` (+ `mise:npm:@qwen-code/qwen-code`) | `dashscope.aliyuncs.com` (`DASHSCOPE_API_KEY`) |
 | `reasonix` | `nix:nodejs` (+ `mise:npm:reasonix`) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
-| `rovo` | bootstrap installer (`cmd` wrapper; + `nix:gnutar`, `nix:gzip`) | `api.atlassian.com` + `*.atlassian.net` (Atlassian API token, scoped to Rovo Dev) |
+| `rovo` | `nix:acli.unwrapped` (the Atlassian CLI; Rovo Dev is its subcommand) | `api.atlassian.com` + `*.atlassian.net` (Atlassian API token, scoped to Rovo Dev) |
 | `sigit` | `nix:nodejs` (+ `mise:npm:@smbcloud/sigit`) | **none**: the model runs in-cage |
 | `snow` | `nix:nodejs` (+ `mise:npm:snow-ai`) | provider-dependent (BYOK) |
 | `stakpak` | `mise:github:stakpak/agent` | `apiv2.stakpak.dev` (`STAKPAK_API_KEY`) or BYOK: a DevOps agent |
 | `trae` | bootstrap installer (`cmd` wrapper; + `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / OpenRouter / Doubao / Azure / Ollama) |
-| `warp` | bootstrap installer (`cmd` wrapper; + `nix:gnutar`, `nix:gzip`) | `app.warp.dev` + `sessions`/`rtc.app.warp.dev` WS (Warp account, device-code login; `WARP_API_KEY`) |
+| `warp` | `tarball:resolve` (the vendor's artifact redirect) | `app.warp.dev` + `sessions`/`rtc.app.warp.dev` WS (Warp account, device-code login; `WARP_API_KEY`) |
 | `vtcode` | `mise:github:vinhnx/VTCode` (+ `nix:ripgrep`, `nix:ast-grep`) | provider-dependent (BYOK, default OpenRouter) |
 
 ## Desktop applications (14)
@@ -96,13 +96,14 @@ whole login closes inside the cage.
 | `t3code` | `appimage:github:pingdotgg/t3code` (+ `nix:chromium`) | provider-dependent (BYOK) |
 | `vibe` | `mise:pipx:mistral-vibe` (+ `nix:uv`, `nix:python312`, …) | `*.mistral.ai` (`MISTRAL_API_KEY`) |
 
-## Browser-served UIs (5)
+## Browser-served UIs (6)
 
 The app serves a UI inside the cage; the profile [forwards](../networking/forward) its
 port to your host loopback, and you open it in your own browser.
 
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
+| `deepseek-harness` | `mise:npm:@deepseek-ai/dsh` (+ `nix:nodejs`, `nix:python3`, `nix:gnumake`, `nix:gcc`) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
 | `hermes-web` | `flake:github:NousResearch/hermes-agent#default` (+ `nix:nodejs`, `nix:chromium`, …) | `openrouter.ai` (BYOK) |
 | `hermes-webui` | `flake:github:nesquena/hermes-webui#default` (+ `flake:github:NousResearch/hermes-agent#default`, `nix:nodejs`, …) | `openrouter.ai` (BYOK) |
 | `odysseus` | `nix:git` (+ `nix:python312`, `nix:uv`, …) | multi-provider (BYOK), self-hosted workspace |
@@ -115,7 +116,7 @@ default (`home_scope = "global"`).
 ## Bundles: the shared pieces
 
 Beyond the app profiles, `examples/bundle/`
-ships **39 reusable tool bundles**: a named set of packages and egress rules that
+ships **62 reusable tool bundles**: a named set of packages and egress rules that
 profiles pull in with `use = [...]` instead of restating it: the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as

@@ -3,6 +3,14 @@
 #   sbx app import examples/app/reasonix-desktop.toml
 #   sbx app run reasonix-desktop
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.deb`, its resolver and library list, the
+# environment the shell needs to start, and its provider host come from a shared BUNDLE, so import
+# it too:
+#     sbx bundle import examples/bundle/reasonix-desktop.toml
+#     sbx app import    examples/app/reasonix-desktop.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
 # PACKAGING — a prebuilt `.deb`, but NOT an Electron one. Reasonix Desktop is a **Wails** shell
 # (GTK3 + WebKit2GTK 4.1) around the same static Go kernel `reasonix.toml` runs in the terminal.
 # Verified against `desktop-v1.20.0`: the `.deb`'s control block declares
@@ -69,53 +77,19 @@ gpu = true
 audio = true
 dbus = true
 
-[packages]
-reasonix-desktop = "deb:resolve"
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `reasonix-desktop` BUNDLE — the `.deb`, its auto-upgrade resolver AND the
+# WebKitGTK library list that makes its ELF resolve, the GDK/WebKit environment the shell needs to
+# start in a cage, its provider host and its crash-reporter mute — from one declaration shared with
+# the bundle file itself. The posture (`gui`/`gpu`/`dbus`) stays here: a bundle may never widen it,
+# and `dbus = true` is what serves this shell its light/dark scheme.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/reasonix-desktop.toml
+# Without it the launch warns that the bundle is undeclared and the app is simply absent.
+use = ["reasonix-desktop"]
 
-[deb.reasonix-desktop]
-# Print the newest `desktop-v*` release's `.deb` URL, and nothing else. `jq` is in sbx's base
-# toolset, so the resolver cage needs no extra package.
-resolve = [
-    "sh",
-    "-c",
-    "curl -fsSL 'https://api.github.com/repos/esengine/DeepSeek-Reasonix/releases?per_page=30' | jq -r '[.[] | select(.tag_name | startswith(\"desktop-v\"))][0].assets[] | select(.name==\"Reasonix-linux-amd64.deb\") | .browser_download_url'",
-]
-# What the shell links against beyond the built-in Electron/Chromium set, read out of its ELF NEEDED
-# list: WebKit2GTK 4.1 (which also supplies libjavascriptcoregtk) and libsoup 3. The rest is the
-# runtime a GTK application looks up by path rather than by linking, which the generated wrapper
-# points at: GStreamer elements for WebKit's media pipeline, glib-networking for GIO's TLS backend
-# (without it HTTPS fails outright), librsvg for SVG icons, the desktop schemas GTK reads, and
-# `gnome-themes-extra` for the `Adwaita-dark` theme the portal names when your desktop is in dark
-# mode — GTK ships only the light Adwaita itself, so without it the shell stays light on a dark
-# desktop.
-libs = [
-    "webkitgtk_4_1",
-    "libsoup_3",
-    "glib-networking",
-    "gsettings-desktop-schemas",
-    "gnome-themes-extra",
-    "librsvg",
-    "gst_all_1.gstreamer",
-    "gst_all_1.gst-plugins-base",
-    "gst_all_1.gst-plugins-good",
-]
-
-# Wails v2 defaults GDK to the **x11** backend when `GDK_BACKEND` is unset (verified: the shell
-# panics with "failed to init GTK" and GDK reports "Trying x11 backend", while a plain GTK3 client
-# in the same cage opens the Wayland display fine). sbx never offers X11, so the backend is named
-# here — this one line is what makes the window map. Nothing names the light/dark scheme: under
-# `dbus = true` the cage's portal serves your desktop's scheme and sbx sets `GTK_USE_PORTAL=1`, which
-# is what makes GDK consult it, so the shell opens in your theme and follows a switch live (verified
-# both ways on a running window). The WEBKIT_* three turn off WebKit's own
-# bubblewrap sandbox (it cannot nest inside the cage's user namespace, and the cage IS the boundary
-# here) and its DMA-BUF renderer (it wants a device path a hermetic cage does not expose). Note the
-# spelling: `WEBKIT_FORCE_SANDBOX=0` is ignored by current WebKitGTK, which says so on stderr and
-# keeps the sandbox on.
-[env]
-GDK_BACKEND = "wayland"
-WEBKIT_DISABLE_COMPOSITING_MODE = "1"
-WEBKIT_DISABLE_DMABUF_RENDERER = "1"
-WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS = "1"
+# No `[packages]` table here, and no `[deb.reasonix-desktop]` resolver: both come from the bundle.
 
 # An app is read-by-default ({GET,HEAD}); the completions endpoint is a POST, so the provider host is
 # opened to all verbs with `{*}`. The `deb:resolve` command and the build both run HOST-SIDE, on the
@@ -123,11 +97,12 @@ WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS = "1"
 [network]
 mode = "deny"
 allow = [
-    "{*} https://api.deepseek.com",
+    # The provider host arrives with the bundle (`use` above) and is unioned into this list at
+    # resolution — inspect it with `sbx bundle reasonix-desktop`.
 ]
 
 mute = [
-    "crash.reasonix.io",
+    # Nothing here: the vendor's crash reporter is muted by the bundle.
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in the cage. To key

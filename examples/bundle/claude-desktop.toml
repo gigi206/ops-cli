@@ -1,0 +1,108 @@
+# `claude-desktop` — Anthropic's Claude Desktop app: what it needs to be installed, to sign in, and
+# to reach its own services.
+#
+#   sbx bundle import examples/bundle/claude-desktop.toml
+#   # then in an app profile:   use = ["claude-desktop"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
+#
+# Derived from `examples/app/claude-desktop.toml`, whose namesake profile names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
+# while the profile keeps its own command, posture and credential choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. An Electron app needs `gui = "wayland"` and
+# `gpu = true` to map a window at all, and the Google Sign-In needs the `xdg-open`/deep-link
+# preamble `examples/app/claude-desktop.toml` writes — a consuming profile without them gets a
+# package it cannot display or log into.
+#
+# THE `.deb` VERSION IS TRACKED, not hand-pinned: `deb:apt:` points at Anthropic's apt `Packages`
+# index (their pool publishes versioned filenames with no `latest` alias), sbx picks the newest
+# version's `.deb` and pins it per project, and `sbx upgrade deb` re-reads the index.
+#
+# THE `{WS}` GRANTS ARE DELIBERATE. Three hosts carry WebSockets the app depends on (voice
+# speech-to-text, the real-time session channel, Cowork's browser bridge). sbx gates a WebSocket
+# behind an explicit `WS` opt-in that a plain `{*}` does NOT cover, because a bidirectional channel
+# is one whose frames the proxy can neither inspect nor redact. Narrow them in the consuming app if
+# you do not use those features.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.claude-desktop]
+allow = [
+    # Claude API — model completions, the Code-tab engine, the WebFetch domain-safety preflight, and
+    # the voice speech-to-text WebSocket.
+    "{*,WS} https://api.anthropic.com",
+    # Account authentication — a claude.ai subscription login — plus the real-time session channel.
+    "{*,WS} https://claude.ai",
+    # The login/marketing domain: the Google Sign-In flow ENTERS here before bouncing to Google, so
+    # an email login needs it too. A distinct host from claude.ai.
+    "{*} https://claude.com",
+    # The app's web UI bundle (JS/CSS/images), served from here rather than from claude.ai. Without
+    # it the Electron webview loads no content and the window stays BLACK.
+    "{*} https://assets-proxy.anthropic.com",
+    # Console / SSO account authentication.
+    "{*} https://platform.claude.com",
+    "{*} https://console.anthropic.com",
+    # MCP connectors reached by the Code engine (JSON-RPC: POST/SSE/DELETE).
+    "{*} https://mcp-proxy.anthropic.com",
+    # Plugin executable downloads (read-only; the Linux app itself updates through apt).
+    "{GET} https://downloads.claude.ai",
+    # The Chat tab's artifact viewer loads each artifact from a sandboxed subdomain here, and
+    # Cowork's browser bridge opens a WebSocket over the same domain.
+    "{*,WS} https://*.claudeusercontent.com",
+    # First-party Anthropic asset CDNs the desktop UI reads: settings plus the subresource-integrity
+    # manifests it verifies bundle assets against.
+    "{GET} https://a-cdn.anthropic.com",
+    "{GET} https://a-cdn.claude.ai",
+    # Google Sign-In ("Continue with Google"): the consent renders in the in-cage browser and the
+    # OAuth result returns as a `claude://login/google-auth` deep-link. The shared lane — the ccTLD
+    # sign-in pages, the token endpoint and the consent assets. An EMAIL login needs none of it.
+    "@google-signin-incage",
+]
+# Deliberately-DENIED telemetry, kept out of the default `sbx net logs`. A `mute` never opens egress
+# and never hides a count (`sbx net stats` still tallies them; see them with `--all`).
+mute = [
+    "*.sentry.io",
+    "*.statsig.com",
+    # Datadog RUM (real-user monitoring) — pure analytics, POSTed frequently.
+    "browser-intake-us5-datadoghq.com",
+    # Intercom — the third-party in-app support-chat widget. Not first-party Anthropic and not
+    # needed for Chat/Code/Cowork; left denied so no third-party support tracker gets egress.
+    # Un-mute and allow it in the consuming app if you want the in-app support chat.
+    "*.intercom.io",
+    # Segment analytics and its loader — usage analytics, not functional.
+    "a.claude.ai",
+    "s-cdn.anthropic.com",
+    # First-party Anthropic metrics endpoints the UI POSTs to: the analytics CDN (allowed read-only
+    # above, so its POST is refused `denied-method`) and the metrics API.
+    "a-cdn.claude.ai",
+    "a-api.anthropic.com",
+    # The in-cage Chromium's own background services — irrelevant to the login.
+    "@chromium-background",
+    # Google account-UI infrastructure the browser pulls in on Google pages (the "One Google"
+    # account bar and its promos). Not part of the OAuth.
+    "ogads-pa.clients6.google.com",
+    "ogs.google.com",
+]
+
+[bundle.claude-desktop.packages]
+# Anthropic's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron, no source build).
+claude-desktop = "deb:apt:https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages"
+# An in-cage Chromium for the Google Sign-In flow. HEAVY — a large nixpkgs closure on first launch,
+# shared with every other Chromium profile in your store. Not needed for an EMAIL login.
+chromium = "nix:chromium"
+
+[bundle.claude-desktop.env]
+# Cut Claude Code's non-essential / telemetry / error-reporting traffic at the source (these apply
+# to the Code-tab engine), so the tool never even generates it. The umbrella var covers all
+# non-essential background traffic except the WebFetch host-safety check, which keeps its own
+# opt-out.
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+DISABLE_TELEMETRY = "1"
+DISABLE_ERROR_REPORTING = "1"

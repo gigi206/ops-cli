@@ -3,6 +3,13 @@
 #
 #   sbx app import examples/app/trae.toml
 #   sbx app run trae
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The interpreter its source install needs and the hosts it reaches come from a
+# shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/trae.toml
+#     sbx app import    examples/app/trae.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
 #   sbx app run trae -- run "Add unit tests to utils.py"
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
@@ -25,7 +32,7 @@
 # `nix:`/`mise:`/`deb:`/`tarball:` backends fit. Instead the `cmd` wrapper
 # below clones the repo, builds an isolated `uv` env, and runs the resulting
 # `trae-cli` from the cage's persistent isolated home — the same pattern
-# `pool.toml` / `devin.toml` / `rovo.toml` use, generalised to a source build.
+# `cursor-agent.toml` and `prime-agent.toml` use, generalised to a source build.
 #
 # Installed once on the first launch; persistent across projects (the same
 # isolated home). Re-run the bootstrap to advance: `sbx app run trae --env
@@ -134,14 +141,18 @@ exec trae-cli "$@"
 #    { path = "~/.trae", mode = "rw" },
 #]
 
-[packages]
-# The wrapper above `git clone`s the repo, `uv tool install .`s it, and execs
-# `trae-cli`. `git` IS in sbx's base toolset (bash, coreutils, curl, git, less,
-# grep, sed, awk, find, jq, which), so only `uv` has to be provisioned. Python
-# 3.12 is required by the project's `pyproject.toml`; `uv tool install --python
-# python3.12` reuses a Python already on PATH, so we provision `nix:python312`.
-uv       = "nix:uv"
-python   = "nix:python312"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `trae` BUNDLE — the uv/python substrate its source install needs and the two lanes that install uses —
+# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
+# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
+# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/trae.toml
+# Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
+use = ["trae"]
+
+# No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
 # prompts / context, reading completions) is opened to all verbs with `{*}`.
@@ -150,30 +161,8 @@ python   = "nix:python312"
 [network]
 mode = "deny"
 allow = [
-    # Provider BYOK — uncomment the ONE(s) the model you call with
-    # `trae-cli run --provider <id> --model <model>` picks. Trae routes
-    # EVERY model through the standard provider API; there is no
-    # first-party host. The matching env var (e.g. `ANTHROPIC_API_KEY`)
-    # carries the key — host-side, injected on the wire, never in the
-    # cage.
-    #"{*} https://api.openai.com",
-    #"{*} https://api.anthropic.com",
-    #"{*} https://generativelanguage.googleapis.com",
-    #"{*} https://openrouter.ai",
-    # Doubao is ByteDance's own model family; the base URL is the
-    # Volcengine ARK gateway (per the README's env-var example).
-    #"{*} https://ark.cn-beijing.volces.com",
-    # Azure OpenAI — base_url is per-deployment, e.g.
-    # `https://<resource>.openai.azure.com`.
-    #"{*} re:^https://[a-z0-9-]+\\.openai\\.azure\\.com(/|$)",
-    # Bootstrap, first leg: `git clone` over HTTPS. Smart HTTP is NOT read-only —
-    # it GETs `/info/refs?service=git-upload-pack` and then POSTs the wants to
-    # `/git-upload-pack`, so the built-in self-equip allow-set (`{GET,HEAD}
-    # github.com`) is not enough and the clone needs the write verb explicitly —
-    # the shared `@github` group.
-    "@github",
-    # Bootstrap, second leg: `uv tool install .` builds the source tree and
-    # resolves its dependency set (tree-sitter, textual, mcp, the provider SDKs)
-    # from PyPI — the shared `@pypi` group.
-    "@pypi",
+    # Every host this agent reaches arrives with the `trae` bundle (`use` above) and is unioned
+    # into this list at resolution — inspect them with `sbx bundle trae`, and see the launch's own
+    # view with `sbx config show --app trae`. A host the flow reaches that is not in the union is
+    # refused and named: watch `sbx net logs -a trae`.
 ]

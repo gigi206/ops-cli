@@ -1,0 +1,54 @@
+# `junie` — JetBrains' Junie coding agent (the CLI): what it needs to be installed and to reach its
+# own services.
+#
+#   sbx bundle import examples/bundle/junie.toml
+#   # then in an app profile:   use = ["junie"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#
+# Derived from `examples/app/junie.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for the agent's packages, env and egress,
+# while the app keeps its own command, posture and credential choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# WHAT THIS BUNDLE ALONE DOES NOT GIVE YOU. The npm package is a SHIM whose `postinstall` downloads
+# the real JVM build, and mise's npm backend installs with `--ignore-scripts=true`, so a consuming
+# app that execs a bare `junie` fails with "[Junie] Shim not found at …". The cure is one `cmd`
+# wrapper running the vendor's own `postinstall.js` once — copy it from `examples/app/junie.toml`.
+#
+# NO BYOK PROVIDER HOST. Junie authenticates three ways (a JetBrains account, a Junie API key, or
+# BYOK against your own provider); only the first two reach the hosts below. A consuming app that
+# takes the BYOK path opens that provider's host itself, and supplies the key, because which
+# provider you use is the app's choice rather than the agent's requirement.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.junie]
+allow = [
+    # Install: the shim package from npm. The release zip itself (github.com + the
+    # *.githubusercontent.com asset host) and the installer's update index on
+    # raw.githubusercontent.com ride sbx's built-in read-only allow-set, so they need no entry.
+    "@npm-registry",
+    # The vendor's own distribution host: release channels, updates, and the `/cli` token page.
+    "{*} https://junie.jetbrains.com",
+    # Runtime: the JetBrains AI service the agent talks to, and its sibling cloud endpoint.
+    "{*} https://api.jetbrains.ai",
+    "{*} https://api.jetbrains.cloud",
+    # Account login (OAuth) — needed for the JetBrains-account path, not for a key or BYOK.
+    "{*} https://oauth.account.jetbrains.com",
+]
+mute = [
+    "@npm-audit",              # npm's audit endpoint, POSTed by the install
+    "youtrack.jetbrains.com",  # the issue tracker the app references; no session needs it
+]
+
+[bundle.junie.packages]
+junie = "mise:npm:@jetbrains/junie"  # the shim package, from JetBrains' own npm scope
+nodejs = "nix:nodejs"                # installs the shim and runs the vendor postinstall; the downloaded build carries its own JVM

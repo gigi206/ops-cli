@@ -3,6 +3,13 @@
 #   sbx app import examples/app/antigravity.toml
 #   sbx app run antigravity
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The IDE tarball, its auto-upgrade resolver, the
+# sign-in browser and the hosts they reach come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/antigravity.toml
+#     sbx app import    examples/app/antigravity.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #
@@ -181,34 +188,19 @@ dbus = true
 #    { path = "~/.config/Antigravity", mode = "rw" },
 #]
 
-[packages]
-# Google's official prebuilt IDE tarball, tracked automatically via the auto-upgrade resolver form
-# (see `[tarball.antigravity-ide]` below). Trusted-only [packages]; this profile is trusted by location
-# once imported. Provisioned + autoPatchelf'd HOST-SIDE (Electron, no source build).
-antigravity-ide = "tarball:resolve"
-# An in-cage Chromium for the Google Sign-In flow (see the `cmd` wrapper above). HEAVY — this pulls a
-# large nixpkgs closure into the project store on the first launch (seeded + offline-reusable after).
-chromium = "nix:chromium"
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `antigravity` BUNDLE — the IDE tarball and its auto-upgrade resolver, the
+# sign-in Chromium, the hosts both reach and the telemetry mutes — from one declaration shared with
+# the bundle file itself, so this profile cannot fall behind when the app's requirements change.
+# What the bundle may never carry is posture: the `gui`/`gpu`/`dbus` grants and the sign-in
+# preamble in `cmd` stay here.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/antigravity.toml
+# Without it the launch warns that the bundle is undeclared and the IDE is simply absent.
+use = ["antigravity"]
 
-# The auto-upgrade resolver: sbx runs `resolve` in a HERMETIC sandbox (sbx's own base tools — curl,
-# grep, sed, coreutils — never the host's; sbx's store + CA bundle bound; the HOST network, NOT this
-# profile's `[network]` allowlist — provisioning is host-side, the allowlist governs runtime egress),
-# captures the `.tar.gz` URL it prints on stdout, validates it, and pins its
-# content hash. `sbx upgrade tarball` re-runs it and rolls forward; a no-op upgrade never re-downloads.
-# The command queries Google's official auto-updater version API (a JSON array, newest release first),
-# reads `version` + `execution_id` from element [0] with base tools (NO jq needed — if you ever needed
-# it, add `jq = "nix:jq"` above and it would be on the resolver's PATH), and builds the download URL on
-# Google's official Edge CDN (`gvt1.com`, the CDN Chrome ships from). VERIFIED LIVE: this exact command
-# prints `…/stable/2.1.1-6123990880747520/linux-x64/Antigravity%20IDE.tar.gz`, which resolves HTTP 200
-# / ~220 MiB / application/gzip. `printf` (not `echo`) prints the URL with no trailing newline.
-[tarball.antigravity-ide]
-resolve = ["sh", "-c", '''
-api="https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases"
-data=$(curl -fsS "$api")
-ver=$(printf '%s' "$data" | grep -oE '"version":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
-eid=$(printf '%s' "$data" | grep -oE '"execution_id":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
-printf 'https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/%s-%s/linux-x64/Antigravity%%20IDE.tar.gz' "$ver" "$eid"
-''']
+# No `[packages]` table here, and no `[tarball.antigravity-ide]` resolver: both come from the bundle.
 
 # An app is read-by-default ({GET,HEAD}); a host the editor/agent WRITES to (POSTing completions,
 # tokens) is opened to all verbs with `{*}`. Grounded on the `agy` CLI profile's Google chain +
@@ -221,78 +213,16 @@ mode = "deny"
 # used here — the backend works over h1, exactly as it did before (observed: 104 h1 requests to
 # `daily-cloudcode-pa`). Only add an `http2` entry if a host is proven h2-*only*.
 allow = [
-    # Model / agent traffic — Google's Cloud Code (Gemini Code Assist) backend, the host the caged
-    # agent + the native language_server POST completions to (observed on the `agy` CLI + the IDE spike).
-    # `daily-` is the same backend's staging channel. All verbs (request bodies).
-    "{*} https://cloudcode-pa.googleapis.com",
-    "{*} https://daily-cloudcode-pa.googleapis.com",
-    # Docs / bootstrap — a read-only fetch (from the `agy` profile).
-    "{GET} https://antigravity.google",
-    #
-    # Google Sign-In ("Continue with Google") — the consent renders in the in-cage Chromium (see the
-    # `cmd` wrapper); the OAuth result returns as the deep-link the editor handles, so the flow closes
-    # inside the cage. Google's sign-in domain is a bounded regex so it works in ANY locale (Google
-    # serves the consent + the `/accounts/SetSID` cross-domain cookie step from the COUNTRY domain —
-    # .com/.fr/.co.uk/… — not always .com). Anchored to `accounts.google.<tld>` so a look-alike
-    # (accounts.google.com.evil.com) is REFUSED (verified). Do NOT hardcode a single ccTLD.
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    "{*} https://oauth2.googleapis.com",
-    "{*} https://apis.google.com",
-    # The OAuth userinfo endpoint the login reads after the token exchange (path-scoped — this host
-    # serves many other Google APIs). From the `agy` profile.
-    "{GET} https://www.googleapis.com/oauth2/*",
-    # Google Sign-In page assets + the avatar the userinfo response points at.
-    "{GET} https://www.gstatic.com",
-    "{GET} https://ssl.gstatic.com",
-    "{GET} https://fonts.gstatic.com",
-    "{GET} https://fonts.googleapis.com",
-    "{GET} https://lh3.googleusercontent.com",
-    #
-    # The VS Code-fork asset CDN — Antigravity (a VS Code fork) fetches extension / built-in metadata
-    # here (observed live: `GET main.vscode-cdn.net/extensions/chat.json`). Allowed so extensions and
-    # the built-in chat surface work. If extension *install* (not just metadata) is later denied, add
-    # the query host too — a fork may use `marketplace.visualstudio.com`, Open VSX `open-vsx.org`, or
-    # its own; check `sbx net logs -a antigravity --all` and add it.
-    "{*} https://main.vscode-cdn.net",
-    # The extension MARKETPLACE — Antigravity (a VS Code fork) queries + downloads extensions from
-    # Open VSX (observed live: `open-vsx.org` denied while browsing extensions). `main.vscode-cdn.net`
-    # above is only the asset CDN; this is the gallery/query host, so extensions need BOTH. All verbs
-    # (the gallery protocol OPTIONS-preflights + POSTs an `extensionquery`). Remove if you do not want
-    # the extension marketplace reachable.
-    "{*} https://open-vsx.org",
-    # The Open VSX CONTENT CDN — the gallery (`open-vsx.org`) serves the query/metadata, but the
-    # extension packages themselves (`.vsix` + `package.json`) are downloaded from this Eclipse
-    # Foundation CDN (observed: `OPTIONS/GET …/golang/Go/…/package.json` when installing an
-    # extension). Read-only download + its CORS preflight, so GET/HEAD/OPTIONS. Both hosts are needed
-    # to install an extension; remove if you do not want the marketplace reachable.
-    "{GET,HEAD,OPTIONS} https://openvsx.eclipsecontent.org",
+    # The Cloud Code backend, the docs host, the Google Sign-In chain, the VS Code asset CDN and
+    # the Open VSX marketplace all arrive with the `antigravity` bundle (`use` above) and are
+    # unioned into this list at resolution — inspect them with `sbx bundle antigravity`, and see
+    # the launch's own view with `sbx config show --app antigravity`. A host the flow reaches that
+    # is not in the union is refused and named: watch `sbx net logs -a antigravity --all`.
 ]
 # Silence deliberately-DENIED noise so `sbx net logs` reads clean (a `mute` never changes the verdict —
 # the host stays denied and still counts in `sbx net stats`; see them with `--all`). These are
 # telemetry / feature flags / the inert in-app self-updater / Chromium's own background services.
 mute = [
-    # Telemetry + feature flags (from the `agy` CLI profile).
-    "play.googleapis.com",              # Google Play Services telemetry
-    "antigravity-unleash.goog",         # Unleash feature flags (remote toggles)
-    "playwright.azureedge.net",         # Playwright browser-driver download…
-    "playwright-akamai.azureedge.net",  # …and its two CDN fallback mirrors
-    "playwright-verizon.azureedge.net",
-    # The IN-APP self-updater — inert in the cage (a self-downloaded binary is not autoPatchelf'd);
-    # `sbx upgrade tarball` is the real upgrade path. Its version API + the gvt1 download CDN (the
-    # build fetches the tarball over the HOST network, not this allowlist, so gvt1 is not needed here).
-    "antigravity-ide-auto-updater-974169037036.us-central1.run.app",
-    "edgedl.me.gvt1.com",
-    # The in-cage Chromium's own background services — irrelevant to the login. Shared with every
-    # other profile that embeds a browser engine, so they come from a group rather than a copy.
-    "@chromium-background",
-    # Crash reporting (the app's own, not Chromium's).
-    "*.sentry.io",
-    # VS Code telemetry (Antigravity is a VS Code fork) — Microsoft's OneCollector endpoint (browser +
-    # mobile events subdomains). Denied; muted.
-    "*.events.data.microsoft.com",
-    # Google page chrome (favicon, account `async/folae`) — not needed for the agent or the login,
-    # which completes without it.
-    "www.google.com",
-    # Google Tag Manager — analytics / marketing tags, not functional. Denied; muted.
-    "www.googletagmanager.com",
+    # Nothing here: the telemetry, feature-flag, self-updater and browser-engine refusals arrive
+    # with the bundle and are unioned in at resolution.
 ]

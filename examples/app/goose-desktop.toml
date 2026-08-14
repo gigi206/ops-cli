@@ -3,6 +3,13 @@
 #   sbx app import examples/app/goose-desktop.toml
 #   sbx app run goose-desktop
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's `.deb` and the environment it reads come
+# from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/goose-desktop.toml
+#     sbx app import    examples/app/goose-desktop.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
 # This is the GUI sibling of the `goose` CLI profile — the same multi-provider agent with a
 # desktop UI (sessions, recipe browser, extension marketplace). Upstream ships it on Linux only
 # as a versioned `.deb` (`goose_<ver>_amd64.deb`), which does not install in the hermetic cage, so
@@ -92,14 +99,19 @@ dbus = true
 #    { path = "~/.config/goose", mode = "rw" },
 #]
 
-[packages]
-# Goose's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron + embedded Rust CLI,
-# no source build). Trusted-only [packages]; this profile is trusted by location once imported.
-# The `github:` form tracks the repo's latest release and picks the native-arch `.deb`, so
-# `sbx upgrade deb` rolls it forward (no hand-pinned version). The repo ships both a plain
-# `…_amd64.deb` and a `…_amd64-vulkan.deb` GPU variant; the plain build is selected (arch token
-# terminal). On arm64 the same form selects the aarch64 build when upstream ships one.
-goose-desktop = "deb:github:aaif-goose/goose"
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `goose-desktop` BUNDLE — the tracked `.deb` and the two environment variables
+# that disable the keyring lookup and the telemetry — from one declaration shared with the bundle
+# file itself, so this profile cannot fall behind when the app's requirements change. The bundle
+# carries NO egress, faithfully: Goose is multi-provider, so the model host is the one you pick
+# below. The posture (`gui`/`gpu`/`dbus`) stays here too — a bundle may never widen it.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/goose-desktop.toml
+# Without it the launch warns that the bundle is undeclared and the app is simply absent.
+use = ["goose-desktop"]
+
+# No `[packages]` here: the app's package comes from its bundle — see `use` above.
 
 [network]
 mode = "deny"
@@ -117,16 +129,11 @@ allow = [
 ]
 
 [env]
-# Provider-neutral: disable the parts that have no business in a cage, regardless of provider.
-# The cage's private portal exposes no host keyring, so tell Goose to fall back to a file under
-# the isolated home instead of hanging on Secret Service.
-GOOSE_DISABLE_KEYRING = "1"
-# Cut Goose's non-essential traffic at the source (telemetry, update checks) so the app never
-# generates it — complementing the [network] deny-by-construction backstop. (The app's own
-# electron-updater still probes GitHub releases — allowed by the built-in github allow-set, and
-# harmless: the pinned build in the store is read-only, so an update it found could not apply;
-# sbx manages upgrades via `sbx upgrade deb`.)
-GOOSE_TELEMETRY_OFF = "1"
+# The provider-neutral settings — the keyring fallback and the telemetry opt-out — ride the bundle
+# with the package that reads them (`sbx bundle goose-desktop`). What is left here is your provider
+# choice. (The app's own electron-updater still probes GitHub releases, allowed by the built-in
+# github allow-set and harmless: the pinned build in the store is read-only, so an update it found
+# could not apply; sbx manages upgrades via `sbx upgrade deb`.)
 
 # --- Provider example (commented) — uncomment ONE block to inject a key host-side instead of
 # entering it in the GUI. ---

@@ -2,31 +2,30 @@
 #
 #   sbx app import examples/app/rovo.toml
 #   sbx app run rovo
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The Atlassian CLI this agent rides on, and the
+# hosts it reaches, come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/rovo.toml
+#     sbx app import    examples/app/rovo.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
 #   sbx app run rovo -- auth login
 #
-# PACKAGING — a bootstrap install, NOT a clean sbx backend. Rovo Dev is an EXTENSION of
-# the Atlassian CLI (ACLI): the official install path is `acli rovodev ...`, so the
-# profile equips ACLI itself and runs the `rovodev` subcommand (verified against
-# `acli 1.3.22-stable` — see `atlassian.com/cli/pkg/cmd/rovodev/auth/login` and
-# `atlassian.com/cli/pkg/api/rovodev` in the binary). ACLI is a single, statically
-# linked Go binary (verified: `ELF 64-bit LSB … statically linked, Go BuildID …`),
-# distributed by Atlassian as a `.tar.gz` containing exactly one path
-# (`acli_<ver>-stable_linux_<arch>/acli`, ~6.3 MiB) from their own CDN. There is no
-# GitHub release, no aqua package, and no nixpkgs attribute — and the sbx `tarball:`
-# backend is hard-coded to wrap an Electron `resources/app(.asar)` launcher (see
-# `src/sandbox/tarball.rs:101-105`), so a plain `bin/acli` archive aborts the build
-# with "no Electron resources/app(.asar)" (the same trap that bit devin). So this
-# profile uses the bootstrap pattern proven by `pool.toml` and `devin.toml`: the
-# `cmd` wrapper downloads the tarball, extracts `*/acli` into the app's persistent
-# isolated home, and execs `acli rovodev "$@"`.
+# PACKAGING — nixpkgs, host-side. Rovo Dev is an EXTENSION of the Atlassian CLI (ACLI): the
+# official path is `acli rovodev …`, so the bundle equips ACLI and this profile runs that
+# subcommand (verified against `acli 1.3.22-stable` — `atlassian.com/cli/pkg/cmd/rovodev/auth/login`
+# and `atlassian.com/cli/pkg/api/rovodev` in the binary). ACLI is a single statically linked Go
+# binary; nixpkgs packages it from Atlassian's own release with its sha256, so `sbx upgrade nix`
+# rolls it with the channel.
 #
-# Installed once on the first launch; persistent across projects (the same isolated
-# home). Re-run the bootstrap to advance: `sbx app run rovo --env ACLI_REINSTALL=1`
-# (the `--env` override is read on the HOST and authoritative for that one launch —
-# the binary moves only when you ask, matching the "versions move only on an explicit
-# upgrade" contract). There is no published manifest with SHA256, so the wrapper
-# trusts the TLS of the Atlassian CDN rather than checking a hash.
+# This profile used to download that tarball from its own `cmd`, because there was no nixpkgs
+# attribute when it was written. There is one now. The bundle uses `acli.unwrapped`: the default
+# wraps the binary in `buildFHSEnv`, which runs bubblewrap at launch, and the cage's seccomp
+# denylist refuses the mount and namespace family — so the FHS wrapper cannot come up in a cage
+# while the plain binary runs fine. The trade is version lag: the channel may sit a release behind
+# Atlassian's own, and the CLI says so on every run; nothing self-updates behind your back.
 #
+
 # CREDENTIAL POSTURE — an Atlassian API token, scoped to Rovo Dev. ACLI calls it
 # "API token" in the docs but treats it as HTTP Basic (`email:token`) at the API
 # boundary. Two paths:
@@ -75,48 +74,7 @@
 # `*.atlassian.net` sites — read out of the binary's outbound URL table), the
 # `ACLI_*` env-var list (read out of the binary), and the basic-auth headless flow
 # (read out of the binary's help text + the official install docs).
-cmd = [
-    "bash",
-    "-c",
-    '''
-set -eo pipefail
-# --- locate platform triple (linux x86_64 / aarch64 in the cage; macOS handled by
-#     the same mapping under darwin/arm64 and darwin/amd64 keys) ---
-case "$(uname -m)" in
-  x86_64)  triple="linux_amd64" ;;
-  aarch64) triple="linux_arm64" ;;
-  *) echo "rovo: unsupported arch $(uname -m)" >&2; exit 1 ;;
-esac
-
-# --- install path inside the app's persistent isolated home ---
-bin="$HOME/.local/bin/acli"
-url="https://acli.atlassian.com/linux/latest/acli_${triple}.tar.gz"
-
-if [ ! -x "$bin" ] || [ -n "$ACLI_REINSTALL" ]; then
-  # Download the upstream tarball — fail closed (`-fsSL` errors on non-2xx, silent on
-  # progress). The archive contains exactly one path
-  # (`acli_<ver>-stable_linux_<arch>/acli`); the `*/acli` glob extracts it.
-  tmp="$(mktemp -d)"
-  trap "rm -rf $tmp" EXIT
-  curl -fsSL "$url" -o "$tmp/acli.tar.gz"
-  mkdir -p "$(dirname "$bin")"
-  # The tarball has no top-level `bin/` — just `acli_<ver>-stable_linux_<arch>/acli`,
-  # so the glob lands the binary directly. GNU tar needs `--wildcards` to interpret
-  # `*`; `-m 0755` matches ACLI's own installer.
-  tar -xzf "$tmp/acli.tar.gz" --wildcards -C "$tmp" "*/acli"
-  install -m 0755 "$tmp"/*/acli "$bin"
-fi
-
-# Always export the install dir on PATH (in case downstream tools shell out to `acli`
-# from a sub-process spawned outside the wrapper).
-export PATH="$HOME/.local/bin:$PATH"
-exec acli rovodev "$@"
-    ''',
-    # `$0` placeholder: `sbx app run rovo -- <args>` appends <args> to this cmd
-    # array, so they arrive as `$1 $2 …` and reach the agent verbatim via
-    # `exec … "$@"` (which is `acli rovodev <args>`).
-    "rovo",
-]
+cmd = ["acli", "rovodev"]
 
 # Your host ACLI config/auth, mounted read-write at its real absolute path. `binds`
 # is a security field, honored only because this profile lives in your trusted
@@ -128,14 +86,19 @@ exec acli rovodev "$@"
 #    { path = "~/.config/acli", mode = "rw" },
 #]
 
-[packages]
-# The wrapper above downloads + extracts the tarball. `curl` is in sbx's base
-# toolset; `tar` + `gzip` are NOT (same gap `pool.toml`, `devin.toml`, and
-# `cursor-agent.toml` cite), so the `nix:` backend provisions them host-side, seeded,
-# offline-reusable. The ACLI binary itself is statically linked (no `nix-ld` shim
-# needed).
-gnutar = "nix:gnutar"
-gzip   = "nix:gzip"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `rovo` BUNDLE — the Atlassian CLI itself, the hosts it reaches and its
+# telemetry mutes — from one declaration shared with the bundle file itself, so this profile cannot
+# fall behind when the agent's requirements change. The bundle is COMPLETE: an app that names it
+# gets the CLI, with nothing to reproduce; what stays here is the command that reaches the agent,
+# `acli rovodev`.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/rovo.toml
+# Without it the launch warns that the bundle is undeclared and the CLI is simply absent.
+use = ["rovo"]
+
+# No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing tasks /
 # context, reading completions) is opened to all verbs with `{*}`. Hosts are from the
@@ -144,29 +107,10 @@ gzip   = "nix:gzip"
 [network]
 mode = "deny"
 allow = [
-    # Bootstrap (the wrapper, on first launch or `ACLI_REINSTALL=1`): the ACLI
-    # `.tar.gz` from Atlassian's CDN. `latest/` is a redirect to the current
-    # versioned asset.
-    "{GET} https://acli.atlassian.com",
-    # Runtime — Atlassian's first-party API gateway + OAuth. `api.atlassian.com` is
-    # the unified gateway (verified in the binary's outbound URL table —
-    # `api.atlassian.comZEIT_BITBUCKET_COMMIT_SHA`); `auth.atlassian.com` is OAuth
-    # (verified — `auth.atlassian.com/authorize`, `auth.atlassian.com/oauth/token`);
-    # `id.atlassian.com` is the user-identity / API-token surface (verified —
-    # `id.atlassian.com/manage-profile/security/api-tokens`). All `{*}` because the
-    # agent posts tasks and reads completions.
-    "{*} https://api.atlassian.com",
-    "{*} https://auth.atlassian.com",
-    "{*} https://id.atlassian.com",
-    # First-party Atlassian services used by ACLI internally (verified — `as.atlassian
-    # .com/api` and the staging twin `as.staging.atl-paas.net` in the binary). `as.`
-    # is the only public one; staging is a fall-back Atlasian may use internally.
-    "{*} https://as.atlassian.com",
-    # Per-site Cloud host — the `--site mysite.atlassian.net` the user passes to
-    # `acli rovodev auth login` and `acli rovodev run`. Anchored regex: matches the
-    # `.atlassian.net` apex + any subdomain only (so `mysite.atlassian.net` works
-    # but `mysite.atlassian.net.evil.com` does not).
-    "{*} re:^https://[a-zA-Z0-9-]+\\.atlassian\\.net(/|$)",
+    # Every host this agent reaches arrives with the `rovo` bundle (`use` above) and is unioned
+    # into this list at resolution — inspect them with `sbx bundle rovo`, and see the launch's own
+    # view with `sbx config show --app rovo`. A host the flow reaches that is not in the union is
+    # refused and named: watch `sbx net logs -a rovo`.
 ]
 
 # Silence the DENIED telemetry hosts. `mute` never changes the verdict (still
@@ -175,10 +119,5 @@ allow = [
 # env var, so denying them here is the only cage-side lever. Local error logs are
 # unaffected — only the outbox is silent.
 mute = [
-    "o55978.ingest.us.sentry.io",   # ACLI's baked-in Sentry DSN host
-    "api.segment.io",               # ACLI's analytics POST
-    "api.stg.atlassian.com",        # Atlassian staging gateway (only used in dev)
-    "developer.atlassian.com",      # docs site (the binary links to it from help)
-    "admin.atlassian.com",          # admin UI — only needed for `acli admin ...` (not used by `rovodev`)
-    "go.atlassian.com",             # marketing / link-tracking redirects from the help text
+    # Nothing here: the refusals worth hiding arrive with the bundle.
 ]

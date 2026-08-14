@@ -3,29 +3,26 @@
 #   sbx app import examples/app/devin.toml
 #   sbx app run devin
 #
-# PACKAGING — a bootstrap install, NOT a clean sbx backend. Devin (Cognition) ships its
-# terminal agent as a single static-pie linked Rust binary (bin `devin`, ~48 MiB
-# compressed / ~100 MiB unpacked) inside a per-platform tarball on their own S3-backed
-# CDN at `https://static.devin.ai/cli/`. Verified against `3000.3.27`: the archive
-# layout is `bin/devin` + `share/devin/docs/` (bundled reference) + `share/man/man1/
-# devin*.1` (man pages). The binary IS the agent — no node, no electron, no companion
-# runtime. Static-pie means no dynamic loader, no autoPatchelf. There is no nixpkgs
-# attribute, no GitHub release (the `DevinAI-agent/devin-AI` GitHub repo is the desktop
-# client, not the CLI), and no aqua package — so none of sbx's `tarball:` / `deb:` /
-# `nix:` / `mise:` / `flake:` backends fit (the `tarball:` backend, the closest shape,
-# is hard-coded to wrap an Electron `resources/app(.asar)` launcher — see
-# `src/sandbox/tarball.rs:101-105` — so a plain `bin/devin` archive aborts the build
-# with "no Electron resources/app(.asar)"). So this profile uses the bootstrap pattern
-# proven by `pool.toml` for Poolside's standalone CLI: the `cmd` wrapper downloads
-# the tarball, verifies the SHA256 the vendor publishes in their own live manifest,
-# extracts `bin/devin` into the app's persistent isolated home, and execs it.
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent itself, the resolver that keeps it
+# current and the hosts it reaches come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/devin.toml
+#     sbx app import    examples/app/devin.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
 #
-# Installed once on the first launch; persistent across projects (the same isolated
-# home). Re-run the bootstrap to advance: `sbx app run devin --env DEVIN_REINSTALL=1`
-# (the `--env` override is read on the HOST and authoritative for that one launch —
-# the binary moves only when you ask, matching the "versions move only on an explicit
-# upgrade" contract). `devin update` ALSO works in-cage (its manifest URL is in
-# `allow`); the two paths are independent.
+# PACKAGING — the vendor's own tarball, tracked automatically. Cognition ships the terminal agent
+# as a single static-pie linked Rust binary inside a per-platform tarball on their CDN at
+# `https://static.devin.ai/cli/`, laid out as `bin/devin` plus bundled docs and man pages. The
+# binary IS the agent: no node, no Electron, no companion runtime, and static-pie means no dynamic
+# loader for autoPatchelf to fix. The bundle declares it `tarball:resolve`, so sbx reads the
+# vendor's live manifest host-side, pins the URL with its own content hash, and `sbx upgrade
+# tarball` rolls it forward.
+#
+# This profile used to bootstrap that download from `cmd`, because the shared install phase refused
+# an archive whose program lands on `$out/bin/<name>` — the wrapper's own destination. It now moves
+# such a program aside and wraps it from there, so the install left the cage and `cmd` went back to
+# being the agent alone. `devin update` still works in-cage (its manifest host is allowed); the two
+# paths are independent, and `sbx upgrade tarball` is the one that moves the pinned artifact.
 #
 # CREDENTIAL POSTURE — three paths, headless-first (this profile is for the empty netns):
 #
@@ -68,81 +65,15 @@
 # hosts — `allow` is the tightest working set; add the host of any server you
 # actually configure (the cage's deny-default is the point).
 #
-# UNVERIFIED (like every profile until run with a real API key): the live bootstrap +
-# first prompt under the allowlist, the `DEVIN_API_KEY` proxy injection, and the
+# UNVERIFIED (like every profile until run with a real API key): the first prompt under the
+# allowlist, the `DEVIN_API_KEY` proxy injection, and the
 # wiki feature (`cognition.ai/wiki/...`, allowed but optional). Grounded here: the
 # packaging and release manifest (read out of `static.devin.ai/cli/current/manifest
 # .json`), the `DEVIN_*` env-var list and the `api.devin.ai` / `app.devin.ai` hosts
 # (read out of the shipped binary, the version-string `3000.3.27` from
 # `share/devin/docs/changelog/stable.mdx`), and the `auto_update: true` config
 # default (read out of `share/devin/docs/reference/configuration/config-file.mdx`).
-cmd = [
-    "bash",
-    "-c",
-    '''
-set -eo pipefail
-# --- locate platform triple (linux x86_64 / aarch64 in the cage; the resolve command
-#     runs the same mapping on macOS) ---
-case "$(uname -m)" in
-  x86_64)  key="x86_64-unknown-linux" ;;
-  aarch64) key="aarch64-unknown-linux" ;;
-  *) echo "devin: unsupported arch $(uname -m)" >&2; exit 1 ;;
-esac
-
-# --- install path inside the app's persistent isolated home ---
-bin="$HOME/.local/bin/devin"
-ver_file="$HOME/.local/share/devin/.sbx-version"
-tmp="$(mktemp -d)"
-trap "rm -rf $tmp" EXIT
-
-# Skip the install if the binary exists AND the version matches AND the user did
-# not request an explicit re-install. `devin update` is a separate, in-cage path
-# that manages the vendor's own version pinning under
-# ~/.local/share/devin/cli/_versions/<v>/ — it can also promote the binary
-# forward; after a `devin update`, the wrapper's pinning is harmless (the binary
-# at $bin is a symlink to the active version when installed by `devin update`).
-if [ ! -x "$bin" ] || [ -n "$DEVIN_REINSTALL" ]; then
-  manifest_url="https://static.devin.ai/cli/current/manifest.json"
-  # Fetch the live manifest. The JSON is stable, each platform on a single line — the
-  # same shape the Homebrew Cask `livecheck` parses. First isolate the platform's
-  # object block (no nested braces), then extract url + sha256 + version with three
-  # small greps. `set -o pipefail` makes a non-matching grep fail the pipeline.
-  manifest="$(curl -fsSL "$manifest_url")"
-  block="$(printf "%s" "$manifest" | grep -oE "\"$key\":\\s*\\{[^}]*\\}" | head -1)"
-  url="$(printf "%s" "$block" | grep -oE '"url":\s*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
-  expected_sha="$(printf "%s" "$block" | grep -oE '"sha256":\s*"[0-9a-f]{64}"' | head -1 | sed 's/.*"\([0-9a-f]\{64\}\)"$/\1/')"
-  version="$(printf "%s" "$manifest" | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
-  if [ -z "$url" ] || [ -z "$expected_sha" ] || [ -z "$version" ]; then
-    echo "devin: failed to parse $manifest_url for $key" >&2
-    exit 1
-  fi
-  # Download, verify, extract — fail closed on any step (`set -e`, `pipefail`).
-  tarball="$tmp/devin.tar.gz"
-  curl -fsSL "$url" -o "$tarball"
-  actual_sha="$(sha256sum "$tarball" | cut -d' ' -f1)"
-  if [ "$actual_sha" != "$expected_sha" ]; then
-    echo "devin: sha256 mismatch — vendor=$expected_sha got=$actual_sha" >&2
-    exit 1
-  fi
-  mkdir -p "$(dirname "$bin")" "$(dirname "$ver_file")"
-  # Extract just `bin/devin` (the tarball also carries docs + man pages; the docs
-  # are bundled inside the binary as help pages, and the man pages are not
-  # mounted in-cage — keep the install minimal and verifiable).
-  tar -xzf "$tarball" -C "$tmp" bin/devin
-  install -m 0755 "$tmp/bin/devin" "$bin"
-  printf "%s" "$version" > "$ver_file"
-fi
-
-# Always export the install dir on PATH (in case downstream tools shell out to
-# `devin` from a sub-process spawned outside the wrapper).
-export PATH="$HOME/.local/bin:$PATH"
-exec "$bin" "$@"
-    ''',
-    # `$0` placeholder: `sbx app run devin -- <args>` appends <args> to this cmd
-    # array, so they arrive as `$1 $2 …` and reach the agent verbatim via
-    # `exec … "$@"`.
-    "devin",
-]
+cmd = "devin"
 
 # Your host Devin config/auth, mounted read-write at their real absolute paths.
 # `binds` is a security field, honored only because this profile lives in your
@@ -155,14 +86,18 @@ exec "$bin" "$@"
 #    { path = "~/.devin",       mode = "rw" },     # project config (when running in a bound project)
 #]
 
-[packages]
-# The wrapper above downloads + extracts + verifies the tarball. `curl` + `sha256sum` are
-# in sbx's base toolset; `tar` + `gzip` are NOT (same gap `pool.toml` and `cursor-agent
-# .toml` cite), so the `nix:` backend provisions them host-side, seeded, offline-reusable.
-# Devin's CLI is a single static-pie binary with no companion runtime, and the wrapper's
-# install is the source of truth for the binary's location on PATH.
-gnutar = "nix:gnutar"
-gzip   = "nix:gzip"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `devin` BUNDLE — the agent's own tarball with the resolver that keeps it
+# current, the hosts the CLI reaches and its crash-reporter mute — from one declaration shared with
+# the bundle file itself, so this profile cannot fall behind when the agent's requirements change.
+# The bundle is COMPLETE: an app that names it gets the agent, with nothing to reproduce.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/devin.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["devin"]
+
+# No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing prompts /
 # model traffic) is opened to all verbs with `{*}`. Hosts are from the shipped binary
@@ -170,30 +105,9 @@ gzip   = "nix:gzip"
 [network]
 mode = "deny"
 allow = [
-    # Bootstrap (the wrapper, on first launch or `DEVIN_REINSTALL=1`) + the in-cage
-    # `devin update` flow — both fetch the same live manifest + signed tarball from
-    # this one host.
-    "{GET} https://static.devin.ai",
-    # Runtime — model traffic, sessions, account info, telemetry, wiki. The CLI's main
-    # backend is `api.devin.ai` (verified in the binary's outbound URL table —
-    # `api_key_set`, `devin_api_url`); the web app at `app.devin.ai` is also hit during
-    # PKCE flow, even though the headless cage uses the BYOK path; the wildcards are
-    # first-party and spoof-safe.
-    "{*} https://api.devin.ai",
-    "{*} https://app.devin.ai",
-    # First-party Cognition services used by the CLI's optional features (wiki
-    # status/contents — `cognition.ai/wiki/...`, also seen in the binary's outbound
-    # URL table). The CLI degrades gracefully when these are denied (the wiki feature
-    # just doesn't populate), so opening it is opt-in via the comment below; leave
-    # commented to keep the cage quiet. Match the same `cognition.ai` apex + subdomains
-    # the binary targets.
-    #"{*} https://cognition.ai",
-    # Install via the friendly domain (`cli.devin.ai` is a CloudFront rewrite to
-    # `static.devin.ai` — see `cli.devin.ai/install.sh`); same content, no functional
-    # difference once the tarball is in the cage. Uncomment if you also want to allow
-    # `cli.devin.ai` for the install-time fetch (the wrapper above uses
-    # `static.devin.ai` already).
-    #"{GET} https://cli.devin.ai",
+    # Every host this agent reaches arrives with the `devin` bundle (`use` above) and is unioned
+    # into this list at resolution — inspect them with `sbx bundle devin`, and see the launch's own
+    # view with `sbx config show --app devin`.
 ]
 
 # Silence the DENIED error-reporting host. `mute` never changes the verdict (still
@@ -202,7 +116,7 @@ allow = [
 # per-installation opt-out env var, so denying it here is the only cage-side lever.
 # Local error logs are unaffected — only the outbox is silent.
 mute = [
-    "o4507463137361920.ingest.us.sentry.io",  # Devin CLI's baked-in Sentry DSN host (sentry.rust/0.47.0)
+    # Nothing here: the vendor's crash reporter is muted by the bundle.
 ]
 
 # --- BYOK API key (commented, headless). The in-cage placeholder lets `devin auth

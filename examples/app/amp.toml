@@ -3,6 +3,13 @@
 #   sbx app import examples/app/amp.toml
 #   sbx app run amp
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package, environment and hosts come
+# from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/amp.toml
+#     sbx app import    examples/app/amp.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
@@ -71,44 +78,36 @@ exec node "$amp/cli-wrapper.cjs" "$@"
 #    { path = "~/.config/AGENTS.md", mode = "rw" },
 #]
 
-[packages]
-# A node runtime — needed both to install the npm package and to run the vendor's
-# `cli-wrapper.cjs` fallback in `cmd` (the executed `amp` itself is a native binary and needs no
-# node).
-nodejs = "nix:nodejs"
-amp = "mise:npm:@ampcode/cli"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `amp` BUNDLE — the package(s), the environment it reads, the hosts it must
+# reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
+# profile cannot fall behind when the agent's requirements change. What the bundle cannot carry is
+# the install repair: that is the wrapper in `cmd` above, and it stays here with the rest of this
+# app's posture.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/amp.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["amp"]
 
-# An app is read-by-default ({GET,HEAD}); Amp's API carries POSTs, so its host is opened to all
-# verbs with `{*}`.
+# No `[packages]` here: the agent's packages come from its bundle — see `use` above.
+
+# An app is read-by-default ({GET,HEAD}). This table stays even though it names nothing: the
+# bundle's egress entries land in the consuming app's OWN `[network]` table, and an app that
+# declares none gets a warning rather than an invented posture. Check what the bundle adds with
+# `sbx bundle amp`, and what the launch ends up with via `sbx config show --app amp`.
 [network]
 mode = "deny"
 allow = [
-    # Install: the packument (version resolution, also used by `sbx upgrade mise`), the wrapper
-    # tarball, and the platform binary published at its own top-level path — npm spreads these
-    # across sibling paths, so the registry host is opened read-only as a whole, like the other
-    # npm-backed profiles — the shared `@npm-registry` group.
-    "@npm-registry",
-    # Runtime: Amp's service (threads, model traffic, account) and its static asset host.
-    "{*} https://ampcode.com",
-    "{GET} https://static.ampcode.com",
+    # Nothing here: the install lane (`@npm-registry`) and Amp's own hosts arrive with the bundle
+    # and are unioned in at resolution. A host the flow reaches that is not in the union is refused
+    # and named — watch `sbx net logs -a amp`, or check ahead with `sbx test net <url>`.
 ]
-
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint,
-# which the install POSTs to and which is irrelevant to whether the install succeeds. A `mute`
-# never changes the verdict (it stays refused) and never hides a count (`sbx net stats` still
-# tallies it). See it with `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a amp`.
-mute = [
-    "@npm-audit",
-]
-
-[env]
-# sbx owns upgrades (`sbx upgrade mise`), so tell Amp not to check for a newer version of itself
-# on every start — the pinned install is the one sbx equips.
-AMP_SKIP_UPDATE_CHECK = "1"
 
 # --- BYOK-style account key (commented). The in-cage placeholder lets the CLI start and issue its
 # request; the proxy strips it and substitutes the real key, read on the HOST (as $AMP_API_KEY, or
 # via a resolver such as sops://secrets.yaml#amp), on the wire to ampcode.com. ---
+#[env]
 #AMP_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
 
 #[secret."ampcode.com"]

@@ -80,7 +80,7 @@ cmd = [
     "-c",
     '''
 # Bare `sbx app run nanobot` lands in the agent chat; `-- <args>` appends arrive as $1 $2 …
-# and pass through verbatim (the same `$0` placeholder convention as warp.toml).
+# and pass through verbatim (the `$0` placeholder convention every `bash -c` profile here uses).
 if [ "$#" -eq 0 ]; then
     exec nanobot agent
 fi

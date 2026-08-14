@@ -1,0 +1,109 @@
+# `kiro` — AWS's Kiro CLI (the rebranded Amazon Q Developer CLI): what it needs to be installed, to
+# sign in, and to reach its own services.
+#
+#   sbx bundle import examples/bundle/kiro.toml
+#   # then in an app profile:   use = ["kiro"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
+#
+# Derived from `examples/app/kiro.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for the agent's packages, env and egress,
+# while the app keeps its own command, posture and credential choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. That split matters here — the sign-in browser
+# needs `gui = "wayland"`, `gpu = true` and `dbus = true`, which a bundle may never grant. A
+# consuming app that wants the in-cage login states those itself, and supplies the `xdg-open` shim
+# `examples/app/kiro.toml` writes; without it the CLI's `xdg-open <url>` finds nothing and the
+# browser login cannot start.
+#
+# WHY CHROMIUM IS IN HERE. `kiro-cli` is a native terminal program and never needs a browser to
+# run; the browser exists so the OAuth sign-in can COMPLETE inside the cage, and the sign-in is
+# part of what this agent requires to be usable at all. A consuming app that authenticates some
+# other way (a persisted token bind, the device flow) still pays that closure, which is shared with
+# every other Chromium profile in your store.
+#
+# THE ALLOW LIST COVERS DAILY RUNS AND THE DEFAULT LOGIN, including the Google Sign-In chain whose
+# cross-domain `SetSID` step is the classic blank-page blocker. The enterprise Identity Center
+# portal and directory hosts are NOT here: they are per-organization, so the consuming app names
+# its own.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.kiro]
+allow = [
+    # Inference / chat (POST completions).
+    "{*} https://runtime.us-east-1.kiro.dev",
+    "{*} https://runtime.eu-central-1.kiro.dev",
+    "{*} https://q.us-east-1.amazonaws.com",
+    "{*} https://q.eu-central-1.amazonaws.com",
+
+    # Auth / token exchange / refresh / logout + the sign-in page (rendered in the in-cage browser).
+    "{*} https://prod.us-east-1.auth.desktop.kiro.dev",
+    "{*} https://prod.eu-central-1.auth.desktop.kiro.dev",
+    "{*} https://kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
+    # The Kiro sign-in page AND its OAuth continuation (it POSTs back after the IdP), so all verbs.
+    "{*} https://app.kiro.dev",
+    "{GET} https://assets.app.kiro.dev",
+    # AWS "shortbread" cookie-consent banner assets rendered on the sign-in page.
+    "{GET} https://prod.assets.shortbread.aws.dev",
+    # AWS SSO OIDC device-flow endpoint — `login --use-device-flow` polls it for the token.
+    "{*} https://oidc.us-east-1.amazonaws.com",
+    "{*} https://oidc.eu-central-1.amazonaws.com",
+
+    # Google Sign-In ("Continue with Google"): the consent AND the cross-domain cookie step render
+    # in the in-cage browser, and both come from your COUNTRY domain. The shared lane carries them,
+    # the token endpoint and the consent assets; not needed for GitHub / Builder ID sign-in, which
+    # stays on its own domains.
+    "@google-signin-incage",
+
+    # Config / management.
+    "{*} https://management.us-east-1.kiro.dev",
+    "{*} https://management.eu-central-1.kiro.dev",
+
+    # Update check / downloads (the CLI's own self-update probe).
+    "{GET} https://prod.download.cli.kiro.dev",
+    "{GET} https://prod.download.desktop.kiro.dev",
+    "{GET} https://desktop-release.q.us-east-1.amazonaws.com",
+    "{GET} https://cli.kiro.dev",
+]
+# Telemetry / metrics deliberately left DENIED. `mute` never changes the verdict (still refused,
+# still counted by `sbx net stats`); it only keeps the refusal out of the default `sbx net log`.
+# One telemetry call cannot be muted at all — the AWS SDK's absolute-form request inside the
+# CONNECT tunnel is refused by a pre-verdict security guard, which `mute` does not cover; the
+# consuming app's `cmd` disables telemetry at the source instead (see `examples/app/kiro.toml`).
+mute = [
+    "telemetry.us-east-1.kiro.dev",
+    "telemetry.eu-central-1.kiro.dev",
+    "prod.us-east-1.telemetry-v2.kiro.dev",
+    "prod.eu-central-1.telemetry-v2.kiro.dev",
+    "prod.us-east-1.telemetry.desktop.kiro.dev",
+    "prod.eu-central-1.telemetry.desktop.kiro.dev",
+    "prod.us-east-1.telemetry.kiro.aws.dev",
+    "dataplane.rum.us-east-1.amazonaws.com",
+    "dataplane.rum.eu-central-1.amazonaws.com",
+    # Legacy Amazon Q metrics endpoint the CLI still probes.
+    "client-telemetry.us-east-1.amazonaws.com",
+    # The cookie-consent banner's analytics/logging beacons (its ASSETS host is allowed above).
+    "prod.log.shortbread.aws.dev",
+    "prod.tools.shortbread.aws.dev",
+    "prod.tools.shortbread.analytics.console.aws.a2z.com",
+    # Chromium's own probes + Google noise during the in-cage sign-in, shared with every other
+    # profile that embeds a browser engine.
+    "@chromium-background",
+    "translate.googleapis.com",
+]
+
+[bundle.kiro.packages]
+# Kiro CLI from nixpkgs (host-side, durable, offline-reusable after the first build). The
+# derivation fetches the official AWS `.tar.gz`, patchelfs the native binaries, and puts
+# kiro-cli / kiro-cli-chat / kiro-cli-term on PATH. It is proprietary (an `unfree` nixpkgs
+# package), which a `[packages]` declaration is trusted-only for.
+kiro = "nix:kiro-cli"
+# Chromium for the in-cage OAuth sign-in only — see the note above.
+chromium = "nix:chromium"

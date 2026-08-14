@@ -1,0 +1,52 @@
+# `prime-agent` — Prime Intellect's prime-agent: the runtime its installer needs, plus the hosts it reaches.
+#
+#   sbx bundle import examples/bundle/prime-agent.toml
+#   # then in an app profile:   use = ["prime-agent"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/pypi.toml
+#
+# Derived from `examples/app/prime-agent.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for what this agent needs, while the profile
+# keeps its own command, posture and credential choices. A test pins the two artifacts together,
+# so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# WHAT THIS BUNDLE DOES NOT GIVE YOU — read this before naming it. The agent itself is a VENDOR BOOTSTRAP download (`curl … install.sh`), which is why `[packages]`
+# names a runtime and the tools the agent looks up on PATH rather than the agent.
+# A bundle cannot carry a `cmd`, so what is here is the FETCH TOOLING plus the hosts and
+# environment the agent needs once installed. A consuming app must reproduce the install step from
+# `examples/app/prime-agent.toml`; naming this bundle alone equips a cage that can reach the agent's
+# service but has no agent in it.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.prime-agent]
+allow = [
+    # The installer script's host and the release bucket it pulls the build from.
+    "{GET} https://app.primeintellect.ai",
+    "{GET} https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev",
+    # What the agent installs at runtime: npm packages, and the wheels its Python kernel resolves.
+    "@npm-registry",
+    "@pypi",
+]
+
+[bundle.prime-agent.packages]
+# The runtime the installer and the agent need, and the two tools the agent looks up on PATH
+# before falling back to a download. The agent itself arrives through the profile's `cmd`.
+nodejs = "nix:nodejs"
+uv = "nix:uv"        # the Python kernel's resolver
+git = "nix:git"      # called directly for repository state
+ripgrep = "nix:ripgrep"
+fd = "nix:fd"
+
+[bundle.prime-agent.env]
+# The agent's Node runtime reaches its endpoints through Node's built-in fetch (undici), which
+# ignores http_proxy/https_proxy unless this is set — and in the empty netns a bypassed fetch
+# dies with `EAI_AGAIN` before the proxy is ever consulted.
+NODE_USE_ENV_PROXY = "1"

@@ -1,0 +1,101 @@
+# `freebuff-desktop` — the Freebuff desktop app (CodebuffAI's free tier): what it needs to be
+# installed, to sign in, and to reach its own services.
+#
+#   sbx bundle import examples/bundle/freebuff-desktop.toml
+#   # then in an app profile:   use = ["freebuff-desktop"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-runtime.toml
+#     sbx net groups import examples/net-groups/github.toml
+#     sbx net groups import examples/net-groups/github-api.toml
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
+# Derived from `examples/app/freebuff-desktop.toml`, whose namesake profile names this bundle in
+# `use` (thin profile): the bundle is the single source of truth for the app's packages, env and
+# egress, while the profile keeps its own command, posture and credential choices. A test pins the
+# two artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. The in-cage sign-in also needs the browser
+# wrapper `examples/app/freebuff-desktop.toml` writes, which a bundle cannot carry.
+#
+# DISTINCT FROM THE `freebuff` BUNDLE, which carries the CLI. This one carries the desktop
+# `.AppImage`, auto-upgraded through the resolver below: the vendor's download endpoint is a stable
+# 302 to the current versioned asset, so the resolver asks curl for the redirect TARGET rather than
+# following it to a time-limited storage URL. `sbx upgrade appimage` re-runs it.
+#
+# THE ALLOW LIST IS A STARTING POINT, grounded on a real run's logs. The definitive list is what
+# the app actually calls: watch `sbx net logs -a <app>` on the first launch and login.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.freebuff-desktop]
+allow = [
+    # Codebuff account + model backend (Freebuff is CodebuffAI's free tier). The login page, the
+    # device-code flow and the model traffic all target codebuff.com; the app POSTs, so all verbs.
+    "{*} https://api.codebuff.com",
+    "{*} https://www.codebuff.com",
+    "{*} https://codebuff.com",
+    # Freebuff's own site/API (login landing, update checks) — its vendor domain, not a third party.
+    "{*} https://freebuff.com",
+    "{*} https://www.freebuff.com",
+    # Runtime npm fetches — the Bun orchestrator/SDK pulls packages (agent CLIs, plugins) at runtime.
+    "@npm-runtime",
+    # GitHub account sign-in and forge access. github.com/api.github.com are also in sbx's built-in
+    # allow-set, so they are always reachable; named here for clarity.
+    "@github",
+    "@github-api",
+    # Google OAuth (sign in with Google). The bounded regex covers any ccTLD and is anchored.
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{*} https://oauth2.googleapis.com",
+    "{GET} https://www.google.com",
+    "{GET} https://ssl.gstatic.com",
+    "{GET} https://www.gstatic.com",
+    "{GET} https://fonts.gstatic.com",
+    "{GET} https://fonts.googleapis.com",
+    "{GET} https://lh3.googleusercontent.com",       # Google account avatar
+    # Domain favicons the app shows next to links and repos. Google serves them from two endpoints:
+    # the older `s2.googleusercontent.com/s2/favicons`, and `faviconV2` on the rotating `t0`–`t9`
+    # gstatic shards (path-scoped regex, so only the favicon path on those shards is opened).
+    "{GET} https://s2.googleusercontent.com",
+    '{GET} re:^https://t[0-9]\.gstatic\.com/faviconV2',
+    # DuckDuckGo's favicon service, which the app uses too.
+    "{GET} https://icons.duckduckgo.com",
+    # The in-cage browser's spellcheck dictionaries, served from rotating `*.gvt1.com` redirectors.
+    # GET-only and path-scoped to the dictionary path.
+    '{GET} re:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+]
+# Denied noise, kept out of the default log (still denied, still counted by `sbx net stats`).
+mute = [
+    # App / page telemetry and ad pixels.
+    "*.posthog.com",
+    "*.sentry.io",
+    "www.redditstatic.com",
+    "code.trygravity.ai",
+    # The in-cage browser's own Google background traffic, none of it required for function. The
+    # group includes the leaked-password check, which would send password data to Google: denying
+    # it is a feature, not a loss.
+    "@chromium-background",
+    # Chrome's page-translation service — same class, but not every browser embed reaches it.
+    "translate.googleapis.com",
+]
+
+[bundle.freebuff-desktop.packages]
+# The Freebuff desktop app, auto-upgraded through the resolver below. The package name is
+# `freebuff`, so it binds to the `[…appimage.freebuff]` table and is wrapped as `bin/freebuff`.
+freebuff = "appimage:resolve"
+# In-cage Chromium for the sign-in flow. HEAVY — a large nixpkgs closure on first launch, shared
+# with every other Chromium profile in your store. Not needed if you authenticate with an API key.
+chromium = "nix:chromium"
+
+# The `appimage:resolve` command for the `freebuff` package above. sbx runs it in a HERMETIC
+# sandbox (base tools only; a shared network to reach the vendor) and pins the `.AppImage` URL it
+# prints. `-w '%{redirect_url}'` takes the FIRST hop only — the clean release URL, not the
+# time-limited storage URL a full `-L` follow would end at. `-fsS` fails closed on an HTTP error,
+# and the printed URL is re-validated as an `.AppImage` URL before it is fetched.
+[bundle.freebuff-desktop.appimage.freebuff]
+resolve = ["sh", "-c", '''
+curl -fsS -o /dev/null -w '%{redirect_url}' "https://freebuff.com/api/desktop/download/linux"
+''']

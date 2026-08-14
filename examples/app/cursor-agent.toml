@@ -2,6 +2,13 @@
 #
 #   sbx app import examples/app/cursor-agent.toml
 #   sbx app run cursor-agent -- -p "your task here"        # headless: prompt in, result out
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The tooling its bootstrap install needs and the hosts it reaches come from a
+# shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/cursor-agent.toml
+#     sbx app import    examples/app/cursor-agent.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
 #   sbx app run cursor-agent                               # interactive TUI
 #
 # This is the Cursor **CLI** (`cursor-agent`, a.k.a. `agent`), NOT the Cursor desktop editor
@@ -14,7 +21,10 @@
 # `curl https://cursor.com/install | bash` installer) — there is no nixpkgs attribute, no GitHub
 # release, and no genuine npm/mise package (the npm package literally named `cursor-agent` is an
 # UNRELATED third-party package by another author — using it would install the wrong thing). So
-# none of sbx's `nix:`/`mise:`/`flake:`/`deb:`/`appimage:` backends fit. Instead the `cmd` below
+# none of sbx's `nix:`/`mise:`/`flake:`/`deb:`/`appimage:` backends fit. Nor does `tarball:`, and
+# the reason is the archive rather than the URL (which is versioned and resolvable): it unpacks to
+# a `dist-package/` tree of JavaScript plus native `.node` addons, with no executable for the
+# install phase to wrap — measured against `agent-cli-package.tar.gz`. Instead the `cmd` below
 # runs Cursor's OWN installer INSIDE the cage on the first launch, into the app's isolated home —
 # contained by bubblewrap + seccomp + the empty netns + the egress allowlist. The installer needs
 # `tar` + `gzip` (absent from the base toolset), so `[packages]` provisions them via nix (host-side,
@@ -101,44 +111,29 @@ exec cursor-agent "$@"
     "cursor-agent",
 ]
 
-[packages]
-# The Cursor installer extracts a `.tar.gz` with `tar -xzf`, so the cage needs `tar` + `gzip` (the
-# base toolset has `curl` but not these). Both are trusted-only `nix:` packages — provisioned
-# host-side, seeded, offline-reusable — and this profile is trusted by location once imported.
-gnutar = "nix:gnutar"
-gzip = "nix:gzip"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `cursor-agent` BUNDLE — the archiver its bootstrap unpacks with, the hosts the CLI reaches and the proxy variable its
+# Node runtime needs —
+# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
+# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
+# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/cursor-agent.toml
+# Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
+use = ["cursor-agent"]
+
+# No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing prompts/context) is
 # opened to all verbs with a `{*}` prefix. See the EGRESS note in the header for the HTTP/2 caveat.
 [network]
 mode = "deny"
 allow = [
-    # Bootstrap (first launch): Cursor's installer script and the CLI tarball it downloads.
-    # `{GET}` — both are plain downloads. Needed only until the binary is installed in the home.
-    "{GET} https://cursor.com",
-    "{GET} https://downloads.cursor.com",
-    # Runtime: Cursor's agent + API + auth backends. Cursor's own network-config doc recommends the
-    # `*.cursor.sh` wildcard, which covers api2 (most API requests), api5 + `agent.*`/regional
-    # (the agent requests), repo42 (indexing, HTTP/2-only — degrades under the MITM), and
-    # authenticate / authenticator / authentication (login). Opened to all verbs because the agent
-    # POSTs prompts and workspace context.
-    "{*} https://*.cursor.sh",
-    # A git fetch of the `makenotion/cursor-notion-plugin` repo (the CLI pulls it as a dependency
-    # via the git smart-HTTP protocol). github.com is already allowed for {GET} by sbx's built-in
-    # nix-cache set (so `GET /info/refs` passes); only the `POST /git-upload-pack` was denied by
-    # method-scope. Authorized as the EXACT upload-pack URL (least privilege — not a host wildcard).
-    "{POST} https://github.com/makenotion/cursor-notion-plugin/git-upload-pack",
-    # The `makenotion/cursor-notion-plugin` (cloned above) runtime backend — Notion's MCP server
-    # (Model Context Protocol over Streamable HTTP: POST JSON-RPC + a GET SSE stream). `mcp.notion.com`
-    # is a dedicated single-purpose host (Notion's MCP endpoint), so the whole host is opened, not an
-    # exact URL. Lets the plugin read/write your Notion pages from inside the cage.
-    "{*} https://mcp.notion.com",
-    # If the CLI fetches client updates / extensions, these are the documented hosts — uncomment the
-    # one the proxy names in `sbx net logs -a cursor-agent` (least privilege; not needed for the
-    # agent's core prompt/response path).
-    #"{GET} https://*.cursor-cdn.com",
-    #"{GET} https://*.cursorapi.com",
-    #"{GET} https://anysphere-binaries.s3.us-east-1.amazonaws.com",
+    # Every host this agent reaches arrives with the `cursor-agent` bundle (`use` above) and is unioned
+    # into this list at resolution — inspect them with `sbx bundle cursor-agent`, and see the launch's own
+    # view with `sbx config show --app cursor-agent`. A host the flow reaches that is not in the union is
+    # refused and named: watch `sbx net logs -a cursor-agent`.
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; this is the
 # TRANSPORT, orthogonal to the `allow` verdict above — a host here must ALSO be in `allow`, and every
@@ -161,13 +156,8 @@ http2 = [
 ]
 
 [env]
-# REQUIRED if `cursor-agent` reaches its backend through Node's built-in fetch (undici) — Cursor's
-# proxy support is documented as "inherited from Node.js", and undici does NOT honour the
-# http_proxy/https_proxy variables sbx injects unless this is set. In the Model-B cage (empty netns,
-# no DNS resolver) a fetch that bypasses the proxy dies with `EAI_AGAIN: getaddrinfo <host>` and
-# never reaches the proxy (0 denies in `sbx net stats`). NODE_USE_ENV_PROXY (Node 24+) routes fetch
-# through the proxy so every request is subject to the allowlist above. Harmless if the binary uses a
-# proxy-aware client instead. (Do NOT add `CURSOR_API_KEY` here — see the credential note in the
-# header; a placeholder in `[env]` would blank the `--env` key. sbx injects its MITM CA into the cage
-# automatically under a filtering posture via NODE_EXTRA_CA_CERTS / SSL_CERT_FILE, which Cursor honours.)
-NODE_USE_ENV_PROXY = "1"
+# `NODE_USE_ENV_PROXY`, which routes the CLI's undici fetch through the proxy so every request is
+# subject to the allowlist, rides the bundle with the tool that reads it (`sbx bundle cursor-agent`).
+# Do NOT add `CURSOR_API_KEY` here — see the credential note in the header; a placeholder in `[env]`
+# would blank the `--env` key. sbx injects its MITM CA into the cage automatically under a filtering
+# posture via NODE_EXTRA_CA_CERTS / SSL_CERT_FILE, which Cursor honours.

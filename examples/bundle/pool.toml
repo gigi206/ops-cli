@@ -1,0 +1,53 @@
+# `pool` — Poolside's CLI: the agent itself, auto-upgraded, plus the hosts it reaches.
+#
+#   sbx bundle import examples/bundle/pool.toml
+#   # then in an app profile:   use = ["pool"]
+#
+# Derived from `examples/app/pool.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for what this agent needs, while the profile
+# keeps its own command, posture and credential choices. A test pins the two artifacts together,
+# so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# THIS BUNDLE IS COMPLETE — an app that names it gets the agent, with no install step to reproduce.
+# The profile used to run Poolside's own `curl … | bash` installer inside the cage on first launch;
+# what it fetched is a plain archive holding one statically linked Go binary, which is a shape the
+# install phase already wrapped. Moving it to `tarball:resolve` puts the download host-side, keeps
+# the version under `sbx upgrade tarball` instead of a one-shot `POOL_SBX_UPDATE=1` re-run, and
+# leaves the profile's `cmd` as the agent alone.
+#
+# THE ARTIFACT. `pool-linux-amd64`, a statically linked Go binary alone at the archive root. The
+# install phase wraps a lone root executable under the `[packages]` KEY, so the command a profile
+# writes stays `pool` whatever the vendor named the file. Nothing to autoPatchelf: it is static.
+#
+# ARCHITECTURE: the resolver names the `amd64` build, following the vendor's own naming
+# (`uname -m` → `amd64`/`arm64`). On aarch64 change that one token to `arm64`.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.pool]
+allow = [
+    # The account and model backends behind one first-party wildcard. The download host is NOT
+    # here: the resolver and the fetch run host-side, outside any cage allowlist.
+    "{*} https://*.poolside.ai",
+]
+
+[bundle.pool.packages]
+# The agent itself, auto-upgraded through the resolver below.
+pool = "tarball:resolve"
+
+# The `tarball:resolve` command. sbx runs it in a hermetic sandbox (its own base tools; the HOST
+# network, because provisioning is host-side and an allowlist governs runtime egress), captures the
+# URL it prints, validates it is an https `.tar.gz`, and pins it with its content hash. The vendor
+# publishes the current version as a bare text file — the same one their installer reads — and the
+# archive path is composed from it. A warm launch reuses the pin offline and never re-runs this.
+[bundle.pool.tarball.pool]
+resolve = [
+    "sh",
+    "-c",
+    "v=$(curl -fsS https://downloads.poolside.ai/pool/pool-latest-version.txt | tr -d '[:space:]'); printf 'https://downloads.poolside.ai/pool/%s/pool-linux-amd64.tar.gz' \"$v\"",
+]

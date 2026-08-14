@@ -1,0 +1,222 @@
+# DeepSeek Harness — DeepSeek's open-source agent harness (deepseek-ai/deepseek-harness), served
+# in your own browser, sandboxed by sbx.
+#
+#   sbx app import examples/app/deepseek-harness.toml
+#   sbx app run deepseek-harness
+#   # then open http://127.0.0.1:3080 in your browser
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's packages and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/deepseek-harness.toml
+#     sbx app import    examples/app/deepseek-harness.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#
+# `dsh` is a plugin composition engine (Cordis) wearing an agent as its product: the LLM route, the
+# shell executor, every tool, and the web UI itself are plugin rows in a profile's ordered layer
+# stack. The shipped `web` profile — the `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app`
+# bundles — is the face this profile serves: it starts the harness and its browser UI on the
+# loopback, so there is no Electron, no `gui = "wayland"` hole, and no in-cage source build. The
+# launcher auto-initializes `$DSH_HOME/profiles/web` from templates inside the installed package by
+# writing three files (a manifest, an empty user patch layer, pnpm settings); it runs no
+# `pnpm install`, so first boot needs no network beyond the equip below. `dsh plugin --profile
+# <name> …` — the out-of-tree plugin path — is the invocation that would forward to pnpm, and it is
+# not this launch.
+#
+# PACKAGING — npm, and ONE addon that has to be built. `@deepseek-ai/dsh` (bin `dsh`) declares no
+# install scripts of its own, and three of the four native pieces in its closure publish their
+# binaries as PLATFORM OPTIONAL DEPENDENCIES, which mise's npm backend resolves and places even
+# though it installs with `--ignore-scripts=true`: the Landlock launcher
+# `@deepseek-ai/node-addon-landlock-run`, `node-addon-require-builtin`, and `@vscode/ripgrep` 1.18
+# (the file-search tool's own ripgrep, resolved lazily at the first search rather than at load).
+#
+# The fourth is `node-pty` 1.1.0, the terminal's pseudo-terminal binding, and it is the first of
+# two reasons `cmd` below is a wrapper rather than a bare `dsh`. Its tarball ships prebuilds for macOS and
+# Windows only; on Linux its `install` script falls through to `node-gyp rebuild`, so an install
+# that skips scripts leaves `build/Release/pty.node` absent — and the web profile loads node-pty at
+# BOOT, so `dsh web` dies in its loader before serving anything. The wrapper heals that the way
+# `openfox.toml` does: on first launch, and again after `sbx upgrade mise` rolls dsh into a fresh
+# install directory, it runs `npm rebuild node-pty` inside the install tree and then execs the
+# server. Two details keep that honest — the guard skips the build once the binary exists, and
+# `--nodedir` points node-gyp at the node package's own headers instead of letting it download a
+# header tarball. That is why `nodejs.org` is in no allowlist here; it was measured on a nixpkgs
+# node package, not on the exact node this channel resolves, so if a future one ever ships without
+# its `include/node` tree the build reaches for that host and the proxy names it in `sbx net logs`
+# — a named refusal, not a silent break. The toolchain the compile needs (python3, make, a C++
+# compiler) rides the bundle, alongside the harness itself. Upstream requires Node
+# `^22.19.0 || >=24.0.0`; the unversioned `nix:nodejs` satisfies it.
+#
+# THE SECOND REASON: `--expose-internals`, and it is about THIS cage's node build. After boot, the
+# launcher mounts a reload plugin whenever no `hmr` service is present — which is exactly this
+# profile's case, since the web layer disables the bundle's own `hmr` row — and that plugin needs
+# Node's internal module loader. The loader reaches it two ways: directly when `--expose-internals`
+# is on the command line, otherwise through the native addon `node-addon-require-builtin`. That
+# addon locates the internals by recognizing the machine code of a compiled getter, and it does not
+# recognize the node this cage runs: probed in-cage on nixpkgs node 24.18 it answers
+# `node-addon-require-builtin unsupported: Unsupported/no-getter (x64 sysv getter is not a
+# recognized this->field accessor)`, the reload plugin then throws `--expose-internals is required
+# for HMR service`, and the process exits BEFORE serving — after printing its URL, which makes the
+# failure easy to misread as a working launch. The same package on an official node build (v24.19
+# and v25 from the node distribution) loads that addon and serves without the flag, so this is a
+# build difference, not a version one. The flag is the upstream-supported path, so `cmd` execs
+# `node --expose-internals <install>/lib/bin.js` instead of the `dsh` shim. Drop the flag the day
+# the addon learns this build, and re-test by launching, not by reading: the URL line prints either
+# way. Note what the flag costs: internal Node modules become reachable from in-cage code, which is
+# a boundary INSIDE a cage that already runs the agent's own code.
+#
+# HOW THE BROWSER REACHES IT. The cage runs in an empty network namespace, so a port the server
+# binds on the cage's `127.0.0.1` is NOT reachable from the host by default — that is the boundary.
+# `forward = [3080]` is the inbound hole (a security field, trusted-only): sbx binds
+# `127.0.0.1:3080` on the HOST and bridges it to the cage's `127.0.0.1:3080`. The host port and the
+# cage port must be the SAME number, so if you change one, change BOTH: the `--port` in `cmd` AND
+# the `forward` value. `forward` is a TOP-LEVEL field — never nest it under `[network]`, where it
+# would be silently ignored.
+#
+# Two upstream fences make that bridge the only way in, and both are satisfied by it. The web app
+# refuses `--host 0.0.0.0` with a usage error (it would publish remote code execution to the LAN),
+# and every `/api` request must carry a loopback `Host` — a DNS-rebinding defense — which
+# `http://127.0.0.1:3080` is. Do not paper over either with `--host`/`--trusted-host`: the cage's
+# loopback plus this forward is the shape both fences expect.
+#
+# WORKSPACE — sbx binds your project root read-write at its real absolute path, and `dsh` uses its
+# invoking directory as the default filesystem location, but a fresh Web UI holds NO workspace until
+# you add one: click **Choose workspace** and add that same project path. The session composer stays
+# unavailable until then.
+#
+# THE AGENT'S OWN SANDBOX, INSIDE THE CAGE. The base bundle mounts a confining bash executor: every
+# command runs through a platform runner, `read-only` by default, with `workspace-write` and
+# `danger-full-access` reachable only through an approval prompt in the UI. On Linux the provider
+# probes bwrap first and Landlock second. Inside an sbx cage the bwrap rung cannot win — bwrap is
+# not in the cage, and the mandatory seccomp denylist refuses the mount/namespace family it would
+# need — so the Landlock rung is the one that has to answer; those syscalls are not on the denylist.
+# This matters because the executor FAILS CLOSED: with no usable runner it raises
+# `SANDBOX_UNAVAILABLE` per command rather than running anything unconfined, so a `bash` tool call
+# either runs confined or does not run. Note the belt-and-braces: sbx's cage is the security
+# boundary, and dsh confines again inside it.
+#
+# CREDENTIALS — one key, `DEEPSEEK_API_KEY`, and the standard `[env]` + `[secret]` substitution
+# reaches it directly (no wrapper trick, contrast `reasonix.toml`): the adapter resolves `apiKeyEnv`
+# per request, and the credential source order puts the INHERITED ENVIRONMENT above the managed
+# `$DSH_HOME/.credentials.yaml` that the Models page writes. So the in-cage placeholder wins, the
+# egress proxy strips it and substitutes the real key on the wire to api.deepseek.com, and the real
+# key never enters the cage. The default route is already `deepseek-official` / `deepseek-v4-flash`,
+# so with the pair below uncommented the UI is usable without visiting **Settings → Models** at all.
+# Typing a real key into that page instead would store it in cleartext inside the cage AND leave it
+# unused while the environment carries the placeholder — pick one posture, not both.
+#
+# WEB SEARCH is on and is the SAME host and the SAME key: the shipped search provider calls
+# `https://api.deepseek.com/anthropic/v1`, a separate endpoint on the host already allowed below.
+# `web_fetch` is disabled upstream in this composition (no fetch provider is mounted, because that
+# provider defers SSRF protection and the model would choose the target), so the agent cannot fetch
+# a URL of its own choosing — the allowlist below is the whole runtime egress surface.
+#
+# CONFIG + STATE — `$DSH_HOME`, `~/.dsh` by default, inside the app's isolated home: `settings.yaml`
+# (hot-reloaded), the managed `.credentials.yaml`, `profiles/web`, and the session logs. Each
+# provider request also carries a stable anonymous id (`x-deepseek-harness-user-id`) persisted
+# there, plus the session id when one exists.
+#
+# GROUNDED, and how: this profile was LAUNCHED. In the cage, mise installed the harness, the guard
+# built `pty.node` with no host outside `@npm-registry` reached (the egress log for the run names
+# only the packument fetch), and the browser UI answered `200` on the host's `127.0.0.1:3080`
+# through the forward — its page titled `DeepSeek Harness`. Both wrapper clauses come from that run
+# rather than from reading: the first launch died on the missing addon binary, the second on the
+# internals loader, and the third served. The rest is read from upstream
+# sources: the launcher grammar and the `web` alias passing app flags through (apps/cli/src/args.ts,
+# confirmed by `dsh web --help` printing the web app's own flags), the default port and the
+# `--host 0.0.0.0` refusal (packages/bundle/web-app/src/startup.ts, apps/cli/reference/README.md),
+# the loopback `Host` fence (packages/client/connection/src/api-request-trust.ts), the credential
+# order, the mounted LLM/search rows and `fetch: false` (packages/bundle/base/cordis.patch.yml), the
+# API host and bearer header (packages/llm/llm-deepseek/src), `$DSH_HOME` defaulting to `~/.dsh`
+# (packages/util/home-paths/src/index.ts), and the sandbox runner order and fail-closed contract
+# (packages/sandbox/sandbox-local, packages/shell/bash-sandbox).
+#
+# UNVERIFIED (like every profile until run with a real key): the first prompt under the allowlist,
+# the key substitution on the wire, and what the Landlock probe answers in here — the one that
+# decides whether the agent's `bash` tool runs or reports `SANDBOX_UNAVAILABLE`. The launch itself,
+# up to the served page, is not among them.
+#
+# TWO THINGS THAT WILL BREAK THIS, AND THEIR TRIGGER. First, dsh is a DEVELOPER PREVIEW at
+# 0.1.0-rc.6 and says so: "THERE WILL BE COMPATIBILITY-BREAKING CHANGES." Config paths, profile
+# layout, and flag names are all fair game upstream — re-read this header against whatever
+# `sbx upgrade mise` lands on. Second, the equip depends on mise resolving npm through npm itself:
+# newer mise releases install npm packages with their own embedded package manager, which refused
+# the `@deepseek-ai` scope with "user aborted" in every case tried, while other scoped packages and
+# plain npm on the same package succeeded. The day the pinned
+# nixpkgs channel moves mise past that switch, this profile stops installing, and the fix is to make
+# that install shell out to npm rather than to change anything here.
+cmd = [
+    "bash",
+    "-c",
+    """
+set -eu
+dsh_dir="$(mise where 'npm:@deepseek-ai/dsh')/lib/node_modules/@deepseek-ai/dsh"
+# The one addon mise's --ignore-scripts leaves unbuilt: node-pty ships no Linux prebuild, and the
+# web profile loads it at boot. Build it once per install directory, against the nix node package's
+# own headers so node-gyp fetches nothing.
+if [ ! -e "$dsh_dir/node_modules/node-pty/build/Release/pty.node" ]; then
+  echo "deepseek-harness: building node-pty, the addon the script-free install leaves out …" >&2
+  node_prefix="$(dirname "$(dirname "$(command -v node)")")"
+  ( cd "$dsh_dir" && npm rebuild node-pty --nodedir="$node_prefix" )
+fi
+# `--expose-internals` instead of a bare `dsh`: the loader reaches Node's internal module loader
+# either through that flag or through a native addon, and the addon refuses this cage's node build
+# (see the header). Without it the boot dies applying the reload plugin.
+exec node --expose-internals "$dsh_dir/lib/bin.js" web --port 3080 "$@"
+""",
+    "deepseek-harness",
+]
+
+# The inbound hole: forward host 127.0.0.1:3080 into the cage at the same port (TOP-LEVEL, not
+# under [network]). Change this together with the `--port` in `cmd` if 3080 is taken on your host.
+forward = [3080]
+
+# Your host dsh home, mounted read-write at its real absolute path. `binds` is a security field,
+# honored only because this profile lives in your trusted config dir; `mode = "rw"` lets the caged
+# `dsh` read and write these host files (settings, credentials, profiles, sessions). Uncomment to
+# share your host dsh setup with the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.dsh", mode = "rw" },
+#]
+
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `deepseek-harness` BUNDLE — the harness package, the node runtime and the
+# node-gyp toolchain its one source-built addon needs, the host it must reach, and its install-time
+# mute — from one declaration shared with the bundle file itself, so this profile cannot fall behind
+# when the agent's requirements change. What the bundle cannot carry is the build step: that is the
+# guarded wrapper in `cmd` above, and it stays here with the rest of this app's posture.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/deepseek-harness.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["deepseek-harness"]
+
+# No `[packages]` here: the agent's packages come from its bundle — see `use` above.
+
+# An app is read-by-default ({GET,HEAD}). This table stays even though it names nothing: the
+# bundle's egress entries land in the consuming app's OWN `[network]` table, and an app that
+# declares none gets a warning rather than an invented posture. Check what the bundle adds with
+# `sbx bundle deepseek-harness`, and what the launch ends up with via
+# `sbx config show --app deepseek-harness`.
+[network]
+mode = "deny"
+allow = [
+    # Nothing here: the install lane (`@npm-registry`) and the runtime host (api.deepseek.com,
+    # chat plus the `web_search` endpoint) arrive with the bundle and are unioned in at resolution.
+    # A host the flow reaches that is not in the union is refused and named — watch
+    # `sbx net logs -a deepseek-harness`, or check ahead with `sbx test net <url>`.
+]
+
+# BYOK. The in-cage placeholder lets the harness issue its request; the proxy strips it and
+# substitutes the real key, read on the HOST (as $DEEPSEEK_API_KEY, or via a resolver such as
+# sops://secrets.yaml#deepseek), on the wire to api.deepseek.com. Uncomment both blocks together.
+#[env]
+#DEEPSEEK_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+#
+#[secret."api.deepseek.com"]
+#from = "env://DEEPSEEK_API_KEY"
+#header = "Authorization"
+#type = "bearer"

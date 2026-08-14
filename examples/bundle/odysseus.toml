@@ -1,0 +1,62 @@
+# `odysseus` — the Odysseus workspace: the substrate its source checkout builds against, plus the hosts it reaches.
+#
+#   sbx bundle import examples/bundle/odysseus.toml
+#   # then in an app profile:   use = ["odysseus"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/pypi.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#
+# Derived from `examples/app/odysseus.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for what this agent needs, while the profile
+# keeps its own command, posture and credential choices. A test pins the two artifacts together,
+# so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# WHAT THIS BUNDLE DOES NOT GIVE YOU — read this before naming it. The agent itself is a SOURCE CHECKOUT: the profile's `cmd` clones the repo and builds a venv on
+# first launch, which is why `[packages]` names a toolchain rather than the app.
+# A bundle cannot carry a `cmd`, so what is here is the FETCH TOOLING plus the hosts and
+# environment the agent needs once installed. A consuming app must reproduce the install step from
+# `examples/app/odysseus.toml`; naming this bundle alone equips a cage that can reach the agent's
+# service but has no agent in it.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.odysseus]
+allow = [
+    # The repo clone over smart HTTP: github.com is already readable through sbx's built-in set, so
+    # only the upload-pack POST is authorized, as the EXACT URL.
+    "{POST} https://github.com/odysseus-dev/odysseus.git/git-upload-pack",
+    # The wheels the venv resolves, and the npm packages the front end pulls.
+    "@pypi",
+    "@npm-registry",
+    # Model weights fetched on first use: metadata on Hugging Face, blobs through the Xet CDN.
+    "{GET,HEAD} https://*.huggingface.co",
+    "{GET,HEAD} https://*.xethub.hf.co",
+]
+mute = [
+    "@npm-audit",  # npm's audit POST during the front-end install
+]
+
+[bundle.odysseus.packages]
+# The build and runtime substrate; the workspace itself arrives through the profile's `cmd`.
+git = "nix:git"          # clones the repo on first launch
+python = "nix:python312" # the venv interpreter (Python 3.11+ required)
+uv = "nix:uv"            # the wheel resolver the install runs
+libstdc = "nix:gcc.cc"   # the C++ runtime the native wheels link against
+node = "nix:nodejs"      # the front-end build
+chromium = "nix:chromium" # the browser the workspace drives
+
+[bundle.odysseus.env]
+# The in-cage browser cannot bring up its own SUID/userns sandbox (sbx's seccomp denylist blocks
+# `clone(CLONE_NEWUSER)`), and the cage IS the boundary, so the workspace is told to launch it
+# without one — otherwise every browser action aborts at startup.
+ODYSSEUS_BROWSER_NO_SANDBOX = "1"
+# The vector store the workspace talks to, on the cage loopback.
+CHROMADB_HOST = "127.0.0.1"
+CHROMADB_PORT = "8100"

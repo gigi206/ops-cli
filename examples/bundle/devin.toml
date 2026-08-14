@@ -1,0 +1,62 @@
+# `devin` — Cognition's Devin CLI: the agent itself, auto-upgraded, plus the hosts it reaches.
+#
+#   sbx bundle import examples/bundle/devin.toml
+#   # then in an app profile:   use = ["devin"]
+#
+# Derived from `examples/app/devin.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for what this agent needs, while the profile
+# keeps its own command, posture and credential choices. A test pins the two artifacts together,
+# so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# THIS BUNDLE IS COMPLETE — an app that names it gets the agent, with no install step to reproduce.
+# That is worth stating because it was not always true. The profile used to fetch Devin from its
+# own `cmd`, because the shared install phase refused this archive's shape: the program sits at
+# `bin/devin`, which is exactly where the generated wrapper is written, so wrapping it in place
+# would have overwritten the binary being wrapped. That phase now moves such a program aside and
+# wraps it from there, so the download moved host-side where it belongs.
+#
+# THE ARTIFACT. A single static-pie linked Rust binary — no loader, so autoPatchelf has nothing to
+# fix — inside a per-platform tarball laid out as `bin/devin` plus `share/devin/docs/` and
+# `share/man/`. The vendor publishes a live manifest naming the current version, each platform URL
+# and its sha256; the resolver below reads it, and sbx pins the URL with its own content hash.
+# `sbx upgrade tarball` re-runs the resolver and re-fetches only when the URL actually changed.
+#
+# ARCHITECTURE: the resolver names the `x86_64-unknown-linux` build. On aarch64 change that key to
+# `aarch64-unknown-linux` — the manifest carries both.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.devin]
+allow = [
+    # The agent's API and app backends.
+    "{*} https://api.devin.ai",
+    "{*} https://app.devin.ai",
+    # The vendor's CDN. The INSTALL no longer needs it — the resolver and the download run
+    # host-side, outside any cage allowlist — but the CLI's own `devin update` reads the same
+    # manifest from inside the cage, so it stays open read-only. Drop it in the consuming app to
+    # make `sbx upgrade tarball` the only path that moves the version.
+    "{GET} https://static.devin.ai",
+]
+mute = [
+    "o4507463137361920.ingest.us.sentry.io",  # the vendor's crash reporter, refused by construction
+]
+
+[bundle.devin.packages]
+# The agent itself, auto-upgraded through the resolver below.
+devin = "tarball:resolve"
+
+# The `tarball:resolve` command. sbx runs it in a hermetic sandbox (its own base tools — `curl` and
+# `jq` are both in the base toolset; the HOST network, because provisioning is host-side and an
+# allowlist governs runtime egress), captures the URL it prints, validates it is an https `.tar.gz`,
+# and pins it with its content hash. A warm launch reuses the pin offline and never re-runs this.
+[bundle.devin.tarball.devin]
+resolve = [
+    "sh",
+    "-c",
+    "curl -fsSL 'https://static.devin.ai/cli/current/manifest.json' | jq -r '.platforms[\"x86_64-unknown-linux\"].url'",
+]

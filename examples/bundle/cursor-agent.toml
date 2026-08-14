@@ -1,0 +1,47 @@
+# `cursor-agent` — the Cursor Agent CLI: the tooling its bootstrap install needs, plus the hosts it reaches.
+#
+#   sbx bundle import examples/bundle/cursor-agent.toml
+#   # then in an app profile:   use = ["cursor-agent"]
+#
+# Derived from `examples/app/cursor-agent.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for what this agent needs, while the profile
+# keeps its own command, posture and credential choices. A test pins the two artifacts together,
+# so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# WHAT THIS BUNDLE DOES NOT GIVE YOU — read this before naming it. The agent itself is a VENDOR BOOTSTRAP download: the profile's `cmd` fetches and unpacks it on
+# first launch, which is why `[packages]` names an archiver rather than the CLI.
+# A bundle cannot carry a `cmd`, so what is here is the FETCH TOOLING plus the hosts and
+# environment the agent needs once installed. A consuming app must reproduce the install step from
+# `examples/app/cursor-agent.toml`; naming this bundle alone equips a cage that can reach the agent's
+# service but has no agent in it.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.cursor-agent]
+allow = [
+    # The vendor site and its download host (the bootstrap fetch), then the agent's own backends.
+    "{GET} https://cursor.com",
+    "{GET} https://downloads.cursor.com",
+    "{*} https://*.cursor.sh",
+    # A git fetch of the Notion plugin over smart HTTP: github.com is already readable through sbx's
+    # built-in set, so only the upload-pack POST is authorized, as the EXACT URL.
+    "{POST} https://github.com/makenotion/cursor-notion-plugin/git-upload-pack",
+    # The hosted Notion MCP connector.
+    "{*} https://mcp.notion.com",
+]
+
+[bundle.cursor-agent.packages]
+# What the bootstrap install unpacks with; the CLI itself arrives through the profile's `cmd`.
+gnutar = "nix:gnutar"
+gzip = "nix:gzip"
+
+[bundle.cursor-agent.env]
+# The CLI's Node runtime reaches its endpoints through Node's built-in fetch (undici), which
+# ignores http_proxy/https_proxy unless this is set — and in the empty netns a bypassed fetch
+# dies with `EAI_AGAIN` before the proxy is ever consulted.
+NODE_USE_ENV_PROXY = "1"

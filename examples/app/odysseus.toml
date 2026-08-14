@@ -3,6 +3,13 @@
 #
 #   sbx app import examples/app/odysseus.toml
 #   sbx app run odysseus
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The substrate its source build needs and the hosts it reaches come from a
+# shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/odysseus.toml
+#     sbx app import    examples/app/odysseus.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
 #   # then open http://127.0.0.1:7000 in your host browser
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
@@ -213,87 +220,32 @@ forward = [7000]
 #    { path = "~/odysseus-data", mode = "rw" },
 #]
 
-[packages]
-# Build/runtime substrate for the native server, provisioned host-side into sbx's
-# store (seeded, offline-reusable). Trusted-only [packages]; this profile is trusted
-# by location once imported.
-git     = "nix:git"        # clones the repo on first launch
-python  = "nix:python312"  # the venv interpreter (Python 3.11+ required by Odysseus)
-uv      = "nix:uv"         # `uv pip install` — fast wheel resolver for requirements.txt
-# The C++ runtime manylinux wheels (numpy, and most scientific wheels Odysseus'
-# requirements pull) link at import. The cage's glibc (via sbx's nix-ld shim)
-# carries no libstdc++.so.6, so a bare import of numpy dies with
-# `libstdc++.so.6: cannot open shared object file`. This provisions the library
-# into sbx's store; the `cmd` below exposes its `lib/` on LD_LIBRARY_PATH so
-# the interpreter's native extensions find it. Trusted-only [packages].
-# NOTE: the nixpkgs attribute is `gcc.cc` — the C++ runtime is the `cc` output of
-# the `gcc` package (the store path is `…-gcc-<ver>-lib/lib/libstdc++.so.6`). It is
-# NOT `libstdc++` (Nix's `++` is the string-concat operator — an unquoted attr
-# path `nix:libstdc++` fails the build with `unexpected end of file`) and NOT
-# `libstdcxx` (that attribute does not exist in nixpkgs; the suggestion
-# `libsigcxx` is an unrelated library). `gcc.cc` is the same GNU libstdc++
-# that provides libstdc++.so.6.
-libstdc = "nix:gcc.cc"
-# The Browser MCP server (a built-in) runs `@playwright/mcp` via `npx`, so the
-# cage needs a Node toolchain on PATH. `nix:nodejs` ships node + npm + npx.
-# Trusted-only [packages].
-node    = "nix:nodejs"
-# The Browser MCP needs a Chromium binary; point Odysseus' `ODYSSEUS_BROWSER_EXECUTABLE`
-# env at sbx's provisioned Chromium (resolved in `cmd` below, hash-addressed).
-# Odysses adds `--no-sandbox` itself (ODYSSEUS_BROWSER_NO_SANDBOX defaults to 1) —
-# mandatory: sbx's seccomp denylist blocks clone(CLONE_NEWUSER), so Chromium's own
-# userns sandbox cannot come up. The `cmd` wrapper also adds --disable-dev-shm-usage
-# and --disable-gpu, which Odysses' env surface cannot express. Heavy (~620 MB).
-chromium = "nix:chromium"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `odysseus` BUNDLE — the git/python/uv/node/chromium substrate its source build needs, the hosts that build and the
+# workspace reach, and the environment the workspace reads —
+# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
+# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
+# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/odysseus.toml
+# Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
+use = ["odysseus"]
+
+# No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 [network]
 mode = "deny"
 allow = [
-    # First-launch clone, and the opt-in refresh (git smart-HTTP). The ref
-    # advertisement is a `GET /info/refs`, which sbx's BUILT-IN github lane already
-    # covers; the negotiation that follows is a `POST …/git-upload-pack`, and that
-    # built-in lane is deliberately `{GET,HEAD}`-only, so the POST needs this
-    # explicit entry — without it `git clone` is refused and the app never installs.
-    # Scoped to the one endpoint on the one repo rather than opening github to POST.
-    "{POST} https://github.com/odysseus-dev/odysseus.git/git-upload-pack",
-    # First-launch install — the Python wheels + the package index (the shared `@pypi` group).
-    "@pypi",
-    # First-launch Browser MCP: `npx -y @playwright/mcp` installs the package from
-    # npm (like hermes-web's agent-browser). The audit POST is noisy and non-essential,
-    # so it is muted rather than allowed (see `mute` below). The registry lane itself is
-    # the shared `@npm-registry` group.
-    "@npm-registry",
-    # ChromaDB's default embedding model (all-MiniLM-L6-v2) is fetched from
-    # Hugging Face on first start if Odysseus uses Chroma's built-in embeddings.
-    # Harmless under --net shared; needed in deny+allow mode. The APEX alone is not
-    # enough: a bare host rule is EXACT (only `*.domain` covers subdomains), and a
-    # weights download redirects off-apex to the LFS CDN (`cdn-lfs*.huggingface.co`),
-    # which an exact `huggingface.co` rule refuses. The wildcard covers the apex, the
-    # LFS CDN and the resolve endpoints in one; `*.xethub.hf.co` (a DIFFERENT apex)
-    # covers the newer Xet storage path and still needs its own entry.
-    "{GET,HEAD} https://*.huggingface.co",
-    "{GET,HEAD} https://*.xethub.hf.co",
-    # (cache.nixos.org — the nix binary cache for git/python/uv — is already in
-    # sbx's built-in nix-cache allow-set, so it needs no entry here.)
-
-    # --- Optional BYOK providers (uncomment the [env]/[secret] blocks below too) ---
-    # OpenAI-compatible endpoints (OpenAI, and most OpenAI-compatible hosts).
-    #"{*} https://api.openai.com",
-    # Anthropic.
-    #"{*} https://api.anthropic.com",
-    # Google Generative Language API.
-    #"{*} https://generativelanguage.googleapis.com",
-    # Ollama on a REACHABLE host (not the host loopback — see the note above).
-    # An `http://` rule selects the inspected-CLEARTEXT path and is strictly opt-in;
-    # name the host and port, since a scheme with no host is not a rule.
-    #"{*} http://ollama.example.lan:11434",
-    # Any other provider you configure in Settings: the proxy names the blocked host,
-    # open it with `sbx net allow -a odysseus <url>`.
+    # Every host this agent reaches arrives with the `odysseus` bundle (`use` above) and is unioned
+    # into this list at resolution — inspect them with `sbx bundle odysseus`, and see the launch's own
+    # view with `sbx config show --app odysseus`. A host the flow reaches that is not in the union is
+    # refused and named: watch `sbx net logs -a odysseus`.
 ]
 # npm's audit POST on every install: refused anyway, just kept out of the default log. Shared with
 # every npm-backed profile, so it comes from a group rather than a copy.
 mute = [
-    "@npm-audit",
+    # Nothing here: the refusals worth hiding arrive with the bundle.
 ]
 
 # The real API key is read on the HOST and injected by the egress proxy — never in
@@ -303,17 +255,11 @@ mute = [
 # listed, set the key in the Settings UI instead and open their host with
 # `sbx net allow`.
 [env]
-# Chromium under a seccomp-caged sbx: Odysses already adds `--no-sandbox` itself
-# (ODYSSEUS_BROWSER_NO_SANDBOX defaults to 1, because clone(CLONE_NEWUSER) is
-# blocked by sbx's seccomp denylist). Set it explicitly for clarity. The remaining
-# flags Odysses' env surface cannot express are added by the $HOME/chromium-wrap.sh
-# wrapper the `cmd` below generates (--disable-dev-shm-usage, --disable-gpu).
-ODYSSEUS_BROWSER_NO_SANDBOX = "1"
-# Vector memory: point Odysses at the literal IPv4 loopback (not `localhost`,
-# which the cage may resolve to ::1 / IPv6 first and silently refuse). The
-# ChromaDB server is launched on 0.0.0.0:8100 by `cmd` below.
-CHROMADB_HOST = "127.0.0.1"
-CHROMADB_PORT = "8100"
+# The browser-sandbox opt-out and the ChromaDB host/port ride the bundle with the workspace that
+# reads them (`sbx bundle odysseus`): Chromium cannot bring up its own sandbox under sbx's seccomp
+# denylist, and the vector store is addressed by the literal IPv4 loopback rather than `localhost`,
+# which the cage may resolve to ::1 first and silently refuse. The remaining Chromium flags that
+# env surface cannot express are added by the `$HOME/chromium-wrap.sh` wrapper `cmd` generates.
 #OPENAI_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
 #ANTHROPIC_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
 

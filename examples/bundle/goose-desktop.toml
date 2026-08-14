@@ -1,0 +1,45 @@
+# `goose-desktop` — Block's Goose desktop app: what it needs to be installed and the environment it
+# reads.
+#
+#   sbx bundle import examples/bundle/goose-desktop.toml
+#   # then in an app profile:   use = ["goose-desktop"]
+#
+# Derived from `examples/app/goose-desktop.toml`, whose namesake profile names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
+# while the profile keeps its own command, posture and provider choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. An Electron app needs `gui = "wayland"` and
+# `gpu = true` to map a window at all.
+#
+# NO EGRESS AT ALL, and that is faithful to the app. Goose is MULTI-PROVIDER: the model host is
+# whichever provider you pick in the GUI, so the consuming app opens that one and supplies its key.
+# The `.deb`'s own update check and the install ride sbx's built-in github allow-set, and the two
+# environment variables below cut the rest at the source.
+#
+# DISTINCT FROM THE `goose` BUNDLE, which carries the CLI (`mise:`). This one carries the desktop
+# `.deb`, whose `github:` form tracks the repo's latest release so `sbx upgrade deb` rolls it
+# forward with no hand-pinned version.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.goose-desktop]
+
+[bundle.goose-desktop.packages]
+# Goose's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron plus an embedded Rust
+# CLI, no source build). The repo ships both a plain `…_amd64.deb` and a `…_amd64-vulkan.deb` GPU
+# variant; the plain build is selected. On arm64 the same form selects the aarch64 build when
+# upstream ships one.
+goose-desktop = "deb:github:aaif-goose/goose"
+
+[bundle.goose-desktop.env]
+# Provider-neutral: disable the parts that have no business in a cage, whatever provider you use.
+# The cage's private portal exposes no host keyring, so tell Goose to fall back to a file under the
+# isolated home instead of hanging on Secret Service.
+GOOSE_DISABLE_KEYRING = "1"
+# Cut Goose's non-essential traffic (telemetry, update checks) at the source, complementing the
+# consuming app's deny-by-construction backstop.
+GOOSE_TELEMETRY_OFF = "1"

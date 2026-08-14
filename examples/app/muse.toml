@@ -3,6 +3,13 @@
 #   sbx app import examples/app/muse.toml
 #   sbx app run muse
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The zone database it reads and the hosts it reaches come from a
+# shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/muse.toml
+#     sbx app import    examples/app/muse.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # PACKAGING — a bootstrap install, NOT a clean sbx backend. Meta distributes Muse
 # Code ONLY as a two-stage `curl …/install.sh | bash` bootstrap:
 #
@@ -16,15 +23,18 @@
 #
 # So the installed artifact is the LAUNCHER; every `muse` run goes through it. There
 # is no nixpkgs attribute, no GitHub release, and no mise/aqua package for the
-# standalone binary, so none of `nix:`/`mise:`/`flake:`/`deb:` fit — the same reason
-# `cursor-agent`, `pool`, `rovo` and `devin` use the bootstrap pattern. The `cmd`
+# standalone binary, so none of `nix:`/`mise:`/`flake:`/`deb:` fit. Nor does `tarball:`: Meta's
+# channel and manifest do name a versioned artifact, but it is a BARE BINARY
+# (`…/download/?…&file=muse-x86-linux`), not an archive, and that backend takes a `.tar.gz`.
+# `cursor-agent` and `prime-agent` stay on the same pattern for their own reasons; `pool`, `rovo`,
+# `devin` and `warp` left it once a backend fit their artifact. The `cmd`
 # below runs Meta's OWN installer INSIDE the cage on the first launch, contained by
 # bubblewrap + seccomp + the empty netns + the egress allowlist.
 #
 # No toolchain package needed: the launcher's whole toolchain — `curl`, `date`,
 # `mktemp`, `uname`, `wc`, `sha256sum` — is the sbx base toolset (coreutils + a
-# curated `curl`; the curated tools are in src/sandbox/fhs.rs). Unlike `pool`/`rovo`,
-# no tarball is extracted, so no `nix:gnutar`/`nix:gzip` either: the binary arrives
+# curated `curl`; the curated tools are in src/sandbox/fhs.rs). No tarball is
+# extracted either, so no `nix:gnutar`/`nix:gzip`: the binary arrives
 # unarchived and is `chmod +x`'d into place by `update_binary` (verified in the
 # launcher source, downloaded fresh for this profile). The single `[packages]` entry
 # below serves the cage, not the launcher: it is the zone database (see TIMEZONE).
@@ -43,7 +53,7 @@
 # only on an explicit one-launch override:
 #     sbx app run muse --env MUSE_SBX_UPDATE=1
 # (`--env` is an authoritative one-shot override read on the HOST). The override is
-# the same contract as `--env POOL_SBX_UPDATE=1` on `pool.toml`:
+# the same contract a one-shot `--env` override gives any bootstrap profile:
 # the wrapper re-runs the installer, which re-resolves the channel and re-downloads
 # the binary only if the channel version changed (the launcher short-circuits when
 # `.muse-version` matches and `<dir>/muse-bin-<version>` exists).
@@ -163,8 +173,18 @@ exec "$bin" "$@"
 # network). Declared rather than assumed — tzdata reaches a store only as a
 # transitive dependency of whatever else was built there, so without this entry the
 # wrapper's lookup is a lottery on which packages the project happens to carry.
-[packages]
-tzdata = "nix:tzdata"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `muse` BUNDLE — the zone database the CLI reads, the hosts it reaches and its auto-update opt-out —
+# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
+# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
+# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/muse.toml
+# Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
+use = ["muse"]
+
+# No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing
 # prompts / model traffic / device login) is opened to all verbs with `{*}`. The
@@ -173,35 +193,16 @@ tzdata = "nix:tzdata"
 [network]
 mode = "deny"
 allow = [
-    # Bootstrap: `install.sh` is served from here (the one line the wrapper curls).
-    "{GET} https://dev.meta.ai",
-    # Install + runtime in one host: the launcher script, the channel manifest, and
-    # the Model API (`api.meta.ai/v1`, OpenAI-compatible Responses — SSE over
-    # HTTPS, NOT a WebSocket) share the `api.meta.ai` apex. Opened to all verbs
-    # because model traffic is POST. If the CLI's live traffic diverges, the proxy
-    # names the new host in `sbx net logs -a muse`.
-    "{*}   https://api.meta.ai",
-    # Release binary + release manifest: the channel manifest points at
-    # `lookaside.facebook.com` as the download host (the URL is retargeted so the
-    # DOWNLOAD never touches api.meta.ai). Read-only. If Meta ever moves the CDN
-    # host, the launcher's `MUSE_DOWNLOAD_HOST` override tells you: the vendor
-    # reads it from `MUSE_DOWNLOAD_HOST`, and it will surface as a refused host
-    # named in `sbx net logs`.
-    "{GET}  https://lookaside.facebook.com",
-    # Account / device login: the OIDC device endpoints (`/oidc/device
-    # authorization/` and `…/token/`), both POST. Only needed for the account
-    # posture; the BYOK path never touches it (comment it out if you keep the
-    # defaults and never sign in).
-    "{*}   https://auth.meta.com",
+    # Every host this agent reaches arrives with the `muse` bundle (`use` above) and is unioned
+    # into this list at resolution — inspect them with `sbx bundle muse`, and see the launch's own
+    # view with `sbx config show --app muse`. A host the flow reaches that is not in the union is
+    # refused and named: watch `sbx net logs -a muse`.
 ]
 
 [env]
-# Cut the CLI's background behavior that moves the version without asking:
-# disables the launcher's hourly auto-check + background re-download, so a
-# long-lived project store keeps the version it was installed at until you run
-# `--env MUSE_SBX_UPDATE=1`. Complementing the [network] deny-by-construction
-# backstop for whatever else the CLI tries to reach at startup.
-MUSE_NO_AUTO_UPDATE = "1"
+# The auto-update opt-out rides the bundle with the tool that reads it (`sbx bundle muse`): it
+# disables the launcher's hourly check and background re-download, so a long-lived project store
+# keeps the version it was installed at until you run `--env MUSE_SBX_UPDATE=1`.
 # BYOK API key (commented, headless) — the in-cage placeholder lets `muse` start
 # and issue its first request; the egress proxy strips it and substitutes the real
 # key, read on the HOST (as $META_API_KEY), on the wire to `api.meta.ai`.

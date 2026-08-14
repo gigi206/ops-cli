@@ -3,6 +3,13 @@
 #   sbx app import examples/app/cortex.toml
 #   sbx app run cortex
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's binary, the library it needs and its
+# service host come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/cortex.toml
+#     sbx app import    examples/app/cortex.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 # Cortex ships as a Rust release binary on its own GitHub releases (`CortexLM/cortex-code`). sbx
 # equips it fresh from upstream via mise's `github` backend — which here does more than download:
 # it verifies the release's **GitHub artifact attestations and SLSA provenance** before installing,
@@ -59,21 +66,27 @@ exec Cortex "$@"
 #    { path = "~/.cortex", mode = "rw" },
 #]
 
-[packages]
-# Upstream's own release binary, attestation- and SLSA-verified by mise at install time.
-cortex = "mise:github:CortexLM/cortex-code"
-# The one library that binary needs and the cage lacks (see the header). Declared as a package so it
-# is host-provisioned and seeded — its `bin/aserver` is also what lets the wrapper find its `lib/`.
-alsa-lib = "nix:alsa-lib"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `cortex` BUNDLE — the release binary, the ALSA library the cage lacks, the
+# service host and the vendor mutes — from one declaration shared with the bundle file itself, so
+# this profile cannot fall behind when the agent's requirements change. What the bundle cannot
+# carry is the library wiring: that is the wrapper in `cmd` above.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/cortex.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["cortex"]
+
+# No `[packages]` here: the agent's packages come from its bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a completions endpoint is a POST, so the model host is
 # opened to all verbs with `{*}`.
 [network]
 mode = "deny"
 allow = [
-    # The vendor's own service — model traffic and account. The install itself needs no entry: the
-    # GitHub release download and its attestation check ride sbx's built-in read-only allow-set.
-    "{*} https://api.cortex.foundation",
+    # The vendor's service host arrives with the bundle (`use` above) and is unioned into this list
+    # at resolution — inspect it with `sbx bundle cortex`.
+    #
     # BYOK instead: uncomment this and supply an OpenAI key below rather than a Cortex one.
     #"{*} https://api.openai.com",
     # Its search / hosted-MCP tools, if you want them.
@@ -87,18 +100,15 @@ allow = [
 # stay refused) and never hides a count (`sbx net stats` still tallies them). See everything with
 # `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a cortex`.
 mute = [
-    "software.cortex.foundation",
-    "docs.cortex.foundation",
-    "registry.cortex.foundation",
-    "duckduckgo.com",
-    "mcp.exa.ai",
+    # Nothing here: the vendor installer/docs hosts and the optional tool backends are muted by
+    # the bundle.
 ]
 
 # --- Provider key (commented) — uncomment the placeholder and the matching [secret] block. The
 # in-cage placeholder lets the CLI start and issue its request; the proxy strips it and substitutes
 # the real key, read on the HOST (as the named variable, or via a resolver such as
-# sops://secrets.yaml#cortex), on the wire. ---
-[env]
+# sops://secrets.yaml#cortex), on the wire. Uncomment the table header with the key. ---
+#[env]
 #CORTEX_API_KEY = "sbx-placeholder-replaced-by-the-egress-proxy"
 #OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
 

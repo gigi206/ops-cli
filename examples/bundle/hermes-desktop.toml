@@ -1,0 +1,117 @@
+# `hermes-desktop` — Nous Research's Hermes desktop app: what it needs to be installed, to sign in,
+# and to reach its own services.
+#
+#   sbx bundle import examples/bundle/hermes-desktop.toml
+#   # then in an app profile:   use = ["hermes-desktop"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
+#
+# Derived from `examples/app/hermes-desktop.toml`, whose namesake profile names this bundle in
+# `use` (thin profile): the bundle is the single source of truth for the app's packages, env and
+# egress, while the profile keeps its own command, posture and credential choices. A test pins the
+# two artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. Two of those are load-bearing here — the
+# Electron window needs `gui = "wayland"` plus `gpu = true`, and the voice features need the audio
+# hole; a bundle may never grant either.
+#
+# DISTINCT FROM THE `hermes` BUNDLE, which carries the CLI (the flake's default output). This one
+# carries the `#desktop` output: nixpkgs' Electron wrapped around the built renderer with the Python
+# backend wired IN, so there is no separate uv/python/nodejs/git/make/gcc/electron and no
+# launch-time clone, venv and vite build. First launch BUILDS it host-side (large, minutes) over the
+# host network, outside any cage allowlist.
+#
+# THE BROWSER TOOLSET IS PART OF THE PACKAGE SET, deliberately. Hermes' 12 `browser_*` tools are
+# gated on `agent-browser` being on PATH AND a Chromium build being on disk; when either is missing
+# Hermes silently drops them from the model's tool schema. So the driver CLI and the browser ship
+# here with the app, not as an optional extra a consuming profile has to remember.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.hermes-desktop]
+allow = [
+    # `agent-browser`, fetched from npm at launch (mise's npm backend installs in-cage, unlike the
+    # host-side `flake:` build). Its audit POST is noisy and non-essential, so it is muted below.
+    "@npm-registry",
+    # The LLM provider. With a BYOK key that is OpenRouter; with the NousResearch account login
+    # instead (the shipped default), model traffic goes to the account's own API: portal is the
+    # OAuth token endpoint, inference-api serves the models.
+    "{*} https://openrouter.ai",
+    "{*} https://portal.nousresearch.com",
+    # The portal's static assets, which render on the sign-in page. Read-only.
+    "{GET} https://web-assets.nousresearch.com",
+    "{*} https://inference-api.nousresearch.com",
+    # Model catalogs (read-only, TTL-cached on disk, fail-soft if blocked).
+    "{*} https://hermes-agent.nousresearch.com",
+    "@models-catalog",
+    # Hermes' "pet" gallery: a public read-only pixel-art sprite gallery, pinned to `*.petdex.dev`
+    # by Hermes itself (anti-SSRF), GET-only, no data sent. Cosmetic.
+    "{GET} https://*.petdex.dev",
+    # Voice STT (`/voice on`): the local faster-whisper model is fetched from Hugging Face on first
+    # use — metadata on huggingface.co, the blobs through the Xet CDN. Cached in the app home after.
+    "{GET,HEAD} https://huggingface.co",
+    "{GET,HEAD} https://*.xethub.hf.co",
+    # Voice replies / read-aloud (edge-tts) over a WebSocket. `{WS}` is the explicit opt-in sbx gates
+    # a WebSocket behind, and `{GET}` covers the voice-list fetch. Two things make it work under the
+    # MITM: sbx sets `wss_proxy` (a WS client resolves its proxy by URL scheme, so `https_proxy`
+    # alone would not cover it), and the audio hole's Python shim points certifi at sbx's CA, which
+    # edge-tts pins.
+    "{GET,WS} https://speech.platform.bing.com",
+    # Login (Nous Portal sign-in, rendered in the in-cage browser). Nous Portal authenticates with
+    # Privy (email / social / wallet); the device-code page, the Privy modal, the Cloudflare
+    # Turnstile gate and — for "Continue with Google" — the Google consent all render in that
+    # browser. Signing in another way surfaces its own host: the proxy names it.
+    "{*} https://*.privy.io",                  # Privy auth API + embedded login modal
+    "{*} https://privy.nousresearch.com",      # Nous's own Privy endpoint, not covered by *.privy.io
+    "{*} https://*.challenges.cloudflare.com", # Turnstile human-check, incl. the interactive host
+    # "Continue with Google" — the shared in-cage sign-in lane.
+    "@google-signin-incage",
+    # (cache.nixos.org — the nix binary cache — is already in sbx's built-in allow-set.)
+]
+# Refusals to keep out of the default `sbx net log`. A `mute` never changes the verdict and never
+# hides a count; `sbx net log --all` shows the line, tagged `muted`.
+mute = [
+    # npm's audit POST on every install of the browser driver.
+    "@npm-audit",
+    # A cloud SDK in the closure probes the AWS metadata endpoint on startup; the proxy refuses
+    # link-local/metadata by construction (SSRF guard), and there is nothing to discover off-cloud.
+    "169.254.169.254",
+    # Telemetry the app and its deps POST: RUM analytics, and the wallet-option probe from the Privy
+    # modal (irrelevant when you sign in with Google).
+    "browser-intake-datadoghq.com",
+    "explorer-api.walletconnect.com",
+    # The in-cage browser's own background services during the login flow.
+    "@chromium-background",
+    # Tag-manager analytics on the login page (not a browser background service).
+    "www.googletagmanager.com",
+]
+
+[bundle.hermes-desktop.packages]
+# Hermes Desktop via the flake's `#desktop` output, built host-side — so `sbx upgrade flake` rolls
+# it forward.
+hermes-desktop = "flake:github:NousResearch/hermes-agent#desktop"
+# An in-cage Chromium, used for two things: the OAuth device-code login (the hermetic cage has no
+# host browser) and Hermes' own browser toolset. It trusts the egress MITM CA through the NSS db
+# sbx seeds.
+chromium = "nix:chromium"
+# The browser toolset's driver: a self-contained Rust binary shipped in its npm tarball, which is
+# why mise's `--ignore-scripts` install is not merely harmless but wanted — it skips the postinstall
+# that would download a Playwright browser. `nodejs` is required because mise's npm backend needs a
+# node in the cage (the flake's own bundled node is only on the app wrapper's PATH).
+nodejs = "nix:nodejs"
+agent-browser = "mise:npm:agent-browser"
+
+[bundle.hermes-desktop.env]
+# Flags agent-browser passes to the Chromium it launches for the browser tools. `--no-sandbox` is
+# MANDATORY: Chromium's own SUID/userns sandbox cannot come up in the cage (sbx's seccomp denylist
+# blocks `clone(CLONE_NEWUSER)`), so without it the browser aborts at startup and every browser tool
+# fails. Acceptable because bubblewrap + seccomp + the empty netns IS the boundary.
+AGENT_BROWSER_ARGS = "--no-sandbox,--disable-dev-shm-usage"

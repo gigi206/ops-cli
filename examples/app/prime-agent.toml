@@ -3,6 +3,13 @@
 #
 #   sbx app import examples/app/prime-agent.toml
 #   sbx app run prime-agent                      # interactive TUI, working on the current project
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The runtime its installer needs and the hosts it reaches come from a
+# shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/prime-agent.toml
+#     sbx app import    examples/app/prime-agent.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
 #   sbx app run prime-agent -- -p "<task>"       # one-shot, non-interactive
 #   sbx app run prime-agent -- agents            # browse running, idle and saved sessions
 #
@@ -27,7 +34,9 @@
 # PACKAGING — a bootstrap install, NOT a clean sbx backend. There is no `prime-agent` on the public
 # npm registry (the `@earendil-works/pi-*` workspace names in the source tree are pi's, which Prime
 # Agent is built on, and upstream says they are not the install path), no nixpkgs attribute, and no
-# native release binary: the release assets are npm `.tgz` archives. The official path is Prime
+# native release binary: the release assets are npm `.tgz` archives — packed packages carrying
+# their own `postinstall.cjs`, not something `tarball:` can wrap (measured against
+# `prime-agent-0.7.2.tgz`). The official path is Prime
 # Intellect's installer, which reads the `stable` channel file, downloads the release tarball,
 # verifies it against the release `SHA256SUMS` and runs `npm install -g`. So the `cmd` below runs
 # THAT installer inside the cage on the first launch — contained by bubblewrap + seccomp + the empty
@@ -135,38 +144,31 @@ exec prime-agent "$@"
 #    { path = "~/.prime/agent", mode = "rw" },
 #]
 
-[packages]
-# The node runtime the installer and the agent need, and uv for the Python kernel. `git` is called
-# directly by the agent for repository state, and ripgrep + fd are the two tools it looks up on PATH
-# before falling back to a GitHub download.
-nodejs   = "nix:nodejs"
-uv       = "nix:uv"
-git      = "nix:git"
-ripgrep  = "nix:ripgrep"
-fd       = "nix:fd"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `prime-agent` BUNDLE — the runtime and PATH tools its installer needs, the hosts it reaches and the proxy variable its
+# Node runtime needs —
+# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
+# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
+# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/prime-agent.toml
+# Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
+use = ["prime-agent"]
+
+# No `[packages]` here: what the bundle provisions comes from it — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); the model provider the agent POSTs to is opened with `{*}`.
 [network]
 mode = "deny"
 allow = [
-    # Bootstrap, first launch (and an explicit PRIME_AGENT_SBX_UPDATE re-run): the installer script.
-    # The same host serves the Prime Inference dashboard the CLI points at for keys.
-    "{GET} https://app.primeintellect.ai",
-    # The release bucket the installer resolves the channel, tarball and SHA256SUMS from, which the
-    # tarball's own internal dependency URLs also point at. The agent's startup notice reads its
-    # release manifest (`latest.json`) from the same host.
-    "{GET} https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev",
-    # The third-party npm dependencies of that tarball (the shared `@npm-registry` group).
-    "@npm-registry",
-    # The Python kernel: ipykernel, prime-agent-runtime and the default working set (the
-    # shared `@pypi` group).
-    "@pypi",
+    # Every host this agent reaches arrives with the `prime-agent` bundle (`use` above) and is unioned
+    # into this list at resolution — inspect them with `sbx bundle prime-agent`, and see the launch's own
+    # view with `sbx config show --app prime-agent`. A host the flow reaches that is not in the union is
+    # refused and named: watch `sbx net logs -a prime-agent`.
 ]
 
 [env]
-# REQUIRED. Prime Agent is a Node CLI that reaches its provider through fetch (undici), which does
-# not honour the http_proxy/https_proxy variables sbx injects. In the cage's empty network namespace
-# a fetch that bypasses the proxy resolves the host itself and dies with `EAI_AGAIN`, never reaching
-# the proxy at all. This makes it route through the proxy, so every request is subject to the
-# allowlist above.
-NODE_USE_ENV_PROXY = "1"
+# `NODE_USE_ENV_PROXY` rides the bundle with the tool that reads it (`sbx bundle prime-agent`):
+# without it the CLI's undici fetch bypasses the proxy, resolves the host itself, and dies with
+# `EAI_AGAIN` in the empty network namespace — never reaching the allowlist at all.

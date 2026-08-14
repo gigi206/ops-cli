@@ -1,0 +1,41 @@
+# `trae` — ByteDance's Trae CLI: the interpreter its source install needs, plus the hosts it reaches.
+#
+#   sbx bundle import examples/bundle/trae.toml
+#   # then in an app profile:   use = ["trae"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/github.toml
+#     sbx net groups import examples/net-groups/pypi.toml
+#
+# Derived from `examples/app/trae.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for what this agent needs, while the profile
+# keeps its own command, posture and credential choices. A test pins the two artifacts together,
+# so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# WHAT THIS BUNDLE DOES NOT GIVE YOU — read this before naming it. The agent itself is a SOURCE CHECKOUT: the profile's `cmd` clones the repo and runs
+# `uv tool install .`, which is why `[packages]` names an interpreter and a resolver rather than
+# the CLI. (`git` is already in sbx's base toolset, so it is not declared.)
+# A bundle cannot carry a `cmd`, so what is here is the FETCH TOOLING plus the hosts and
+# environment the agent needs once installed. A consuming app must reproduce the install step from
+# `examples/app/trae.toml`; naming this bundle alone equips a cage that can reach the agent's
+# service but has no agent in it.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.trae]
+allow = [
+    # The clone, and the wheels `uv tool install` resolves. No provider host: Trae is BYOK across
+    # many providers, so the consuming app opens the one it uses and supplies the key.
+    "@github",
+    "@pypi",
+]
+
+[bundle.trae.packages]
+# The install substrate; the CLI itself arrives through the profile's `cmd`.
+uv = "nix:uv"             # `uv tool install .` from the checkout
+python = "nix:python312"  # the interpreter the project requires

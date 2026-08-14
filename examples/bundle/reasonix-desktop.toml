@@ -1,0 +1,77 @@
+# `reasonix-desktop` — the Reasonix desktop shell (a Wails/WebKitGTK app, not Electron): what it
+# needs to be installed, what it must be told to start in a cage, and the host it reaches.
+#
+#   sbx bundle import examples/bundle/reasonix-desktop.toml
+#   # then in an app profile:   use = ["reasonix-desktop"]
+#
+# Derived from `examples/app/reasonix-desktop.toml`, whose namesake profile names this bundle in
+# `use` (thin profile): the bundle is the single source of truth for the app's packages, env and
+# egress, while the profile keeps its own command, posture and credential choices. A test pins the
+# two artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. `dbus = true` matters more than usual here —
+# the portal is what serves the desktop's light/dark scheme that this shell follows.
+#
+# WHY THE `libs` LIST IS PART OF THE PACKAGE. A Wails app links against WebKit2GTK rather than
+# Chromium, so it needs libraries outside sbx's built-in Electron/Chromium set: the `libs` entry on
+# the resolver below is what makes its `NEEDED` entries resolve at autoPatchelf time, plus the
+# runtime GTK/GStreamer pieces it looks up by path. Take the package without them and the shell
+# does not start.
+#
+# WHY THE ENVIRONMENT IS PART OF THE PACKAGE TOO. Wails v2 defaults GDK to the x11 backend when
+# `GDK_BACKEND` is unset, and sbx never offers X11, so naming `wayland` is what makes the window
+# map at all. The three `WEBKIT_*` variables turn off WebKit's own bubblewrap sandbox (it cannot
+# nest inside the cage's user namespace, and the cage IS the boundary) and its DMA-BUF renderer
+# (it wants a device path a hermetic cage does not expose). Note the spelling: `WEBKIT_FORCE_SANDBOX=0`
+# is ignored by current WebKitGTK, which says so on stderr and keeps the sandbox on.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.reasonix-desktop]
+allow = [
+    # The provider host the shell POSTs completions to. The `deb:resolve` command and the build both
+    # run HOST-SIDE, on the host network, so neither needs an entry.
+    "{*} https://api.deepseek.com",
+]
+mute = [
+    "crash.reasonix.io",  # the vendor's crash reporter, refused by construction
+]
+
+[bundle.reasonix-desktop.packages]
+reasonix-desktop = "deb:resolve"
+
+[bundle.reasonix-desktop.env]
+GDK_BACKEND = "wayland"
+WEBKIT_DISABLE_COMPOSITING_MODE = "1"
+WEBKIT_DISABLE_DMABUF_RENDERER = "1"
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS = "1"
+
+# The `deb:resolve` command for the package above: print the newest `desktop-v*` release's `.deb`
+# URL and nothing else. `jq` is in sbx's base toolset, so the resolver cage needs no extra package.
+# `libs` names what the shell links against beyond the built-in Electron/Chromium set, read out of
+# its ELF NEEDED list — WebKit2GTK 4.1 (which also supplies libjavascriptcoregtk) and libsoup 3 —
+# plus the runtime a GTK application looks up by path: GStreamer elements for WebKit's media
+# pipeline, glib-networking for GIO's TLS backend (without it HTTPS fails outright), librsvg for SVG
+# icons, the desktop schemas GTK reads, and `gnome-themes-extra` for the `Adwaita-dark` theme the
+# portal names when your desktop is in dark mode — GTK ships only the light Adwaita itself, so
+# without it the shell stays light on a dark desktop.
+[bundle.reasonix-desktop.deb.reasonix-desktop]
+resolve = [
+    "sh",
+    "-c",
+    "curl -fsSL 'https://api.github.com/repos/esengine/DeepSeek-Reasonix/releases?per_page=30' | jq -r '[.[] | select(.tag_name | startswith(\"desktop-v\"))][0].assets[] | select(.name==\"Reasonix-linux-amd64.deb\") | .browser_download_url'",
+]
+libs = [
+    "webkitgtk_4_1",
+    "libsoup_3",
+    "glib-networking",
+    "gsettings-desktop-schemas",
+    "gnome-themes-extra",
+    "librsvg",
+    "gst_all_1.gstreamer",
+    "gst_all_1.gst-plugins-base",
+    "gst_all_1.gst-plugins-good",
+]

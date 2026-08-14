@@ -1,0 +1,49 @@
+# `amp` — the Amp coding agent CLI: what it needs to be installed and to reach its own service.
+#
+#   sbx bundle import examples/bundle/amp.toml
+#   # then in an app profile:   use = ["amp"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#
+# Derived from `examples/app/amp.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for the agent's packages, env and egress,
+# while the app keeps its own command, posture and credential choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# WHAT THIS BUNDLE ALONE DOES NOT GIVE YOU. The npm package's real payload is a platform binary
+# placed by a `postinstall` script, and mise's npm backend installs with `--ignore-scripts=true`,
+# so a consuming app that execs a bare `amp` runs a 141-byte placeholder and fails. The cure is one
+# `cmd` wrapper, which a bundle cannot carry: copy the one in `examples/app/amp.toml`, which runs
+# the package's own `cli-wrapper.cjs` fallback (no placement, no extra network).
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.amp]
+allow = [
+    # Install: the packument (version resolution, also used by `sbx upgrade mise`), the wrapper
+    # tarball, and the platform binary published at its own top-level path — the shared
+    # `@npm-registry` group.
+    "@npm-registry",
+    # Runtime: Amp's service (threads, model traffic, account) and its static asset host.
+    "{*} https://ampcode.com",
+    "{GET} https://static.ampcode.com",
+]
+mute = [
+    "@npm-audit",  # npm's audit endpoint: POSTed by the install, irrelevant to whether it succeeded
+]
+
+[bundle.amp.packages]
+amp = "mise:npm:@ampcode/cli"  # the tool itself, from npm
+nodejs = "nix:nodejs"          # mise's npm backend needs a node runtime, and the wrapper runs the package's JS fallback
+
+[bundle.amp.env]
+# sbx owns upgrades (`sbx upgrade mise`), so tell Amp not to check for a newer version of itself on
+# every start — the pinned install is the one sbx equips.
+AMP_SKIP_UPDATE_CHECK = "1"

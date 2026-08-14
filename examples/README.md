@@ -33,9 +33,9 @@ enough. Import the bundle, and any group its header lists under `REQUIRES`, firs
 says which. The reason is the failure this layout removes: a hand-copied set of an agent's
 requirements falls behind the agent silently, and the launch that breaks says nothing about why.
 
-Profiles that keep their own packages and hosts are the ones with no namesake bundle: the
-desktop and web builds, and the agents whose tool has no bundle for the reasons below. Many of
-those still reference shared egress groups directly, so import those first.
+Every shipped profile names a bundle, so this is the shape everywhere: import the bundle, then the
+profile. The seven that name **another** agent's bundle rather than their own are the orchestrators
+listed below.
 
 ## App profiles (`app/`)
 
@@ -78,8 +78,8 @@ sbx bundle import examples/bundle/opencode.toml   # then: use = ["opencode"] in 
 sbx bundle                                        # what is declared, and what each brings
 ```
 
-One bundle per agent CLI: its package, the environment it reads, and the hosts it must reach, and
-**nothing about the shape of the cage** (no `cmd`, no `binds`, no `gui`/`gpu`/`audio`/`dbus`, no
+One bundle per shipped tool — a CLI, a desktop build, a web UI's engine: its package, the
+environment it reads, and the hosts it must reach, and **nothing about the shape of the cage** (no `cmd`, no `binds`, no `gui`/`gpu`/`audio`/`dbus`, no
 network mode). Each is derived from the agent profile of the same name in [`app/`](app/), and a
 test pins the two together so they cannot drift apart: the namesake profile must name its bundle in
 `use`, and must not restate any package, environment variable or egress rule the bundle already
@@ -89,18 +89,33 @@ The bundle's egress entries land in the consuming app's own `[network]` table. A
 no such table gets a warning rather than an invented one, because inventing one would move its
 posture.
 
-Not every agent has a bundle, for two distinct reasons:
+**A bundle publishes what another profile can consume**, and that is the rule. Every shipped tool
+now has one — 62 bundles for 69 profiles — with a single exception: a profile that consumes another
+agent's engine publishes nothing of its own. `t3code` names `claude-code`; `aionui`,
+`opencode-web`, `open-design` and `orca-desktop` name `opencode`; `hermes-web` and `hermes-webui`
+name `hermes`. Nothing would ever compose one of *those*, so a bundle for them would be an artifact
+with no consumer and a second file to keep in step. The two roles are exclusive by construction:
+the test above requires a namesake profile to name its own bundle **and only it**, so a profile
+cannot both publish and consume. If an app ever needs both, that assertion is the one line to
+change.
 
-- **Nothing for a bundle to carry.** A tool distributed only as a vendor bootstrap download is
-  installed by its `cmd` wrapper, so there is no package declaration to share.
-- **The requirement needs a `cmd`, and a bundle cannot carry one.** Some agents need a step that
-  only a wrapper can perform: running a vendor postinstall that mise's `--ignore-scripts` skips, or
-  supplying a library the binary needs to start at all. A bundle of the packages alone would hand a
-  consuming app a binary that refuses to start.
+**When the install needs a `cmd`, the bundle still ships — and says so.** Three shapes need a step
+only a wrapper can perform: a vendor postinstall mise's `--ignore-scripts` skips (`amp`, `junie`),
+a native addon with no prebuilt binary for this platform (`deepseek-harness`), and a whole agent
+whose artifact no backend fits (`cursor-agent`, a JavaScript tree with no binary to wrap; `muse`, a
+bare binary rather than an archive; `prime-agent`, a packed npm tarball) or that is built from a
+source checkout (`odysseus`, `trae`). Four profiles left this list once their artifact was measured
+rather than assumed: `devin` and `warp` moved to `tarball:resolve`, `pool` too, and `rovo` to the
+nixpkgs attribute that now exists. A bundle cannot carry a `cmd`, so those bundles
+carry the fetch tooling, the environment and the hosts, and their headers state plainly what is
+missing: name one alone and you equip a cage that can reach the agent's service but has no agent in
+it. That is a warning where silence used to be — and it is what lets an app like `t3code` declare
+any of them with `use` and then reproduce the install step deliberately.
 
-The discriminator for the second case is not "is a postinstall skipped" but **can the tool still
-find what that postinstall would have placed**. An agent that looks its helper binary up on `PATH`
-first is cured by declaring that helper as a `nix:` package, needs no wrapper, and keeps its bundle.
+A related discriminator is worth keeping in mind: "is a postinstall skipped" is not the question —
+**can the tool still find what that postinstall would have placed** is. An agent that looks its
+helper binary up on `PATH` first is cured by declaring that helper as a `nix:` package and needs no
+wrapper at all.
 
 ## Egress groups (`net-groups/`)
 
@@ -123,6 +138,16 @@ The shipped groups cover the install lanes shared by the npm- and GitHub-backed 
 runtime lanes (same hosts as the install lane, different verbs, hence separate fragments), the
 Python install lane, the npm runtime lane for agents that fetch packages while running, the model
 catalogue, the optional OpenRouter provider, and the Google and GitHub identity-provider lanes.
+
+The Google sign-in comes as **two** fragments, because the posture decides the reach.
+`google-oauth` serves an agent that prints a URL you open in your HOST browser: the `.com` sign-in
+host and the token endpoints, nothing more. `google-signin-incage` serves the consent rendered
+INSIDE the cage, which needs three things the first does not — the country domain the `/SetSID`
+cookie step redirects to (an anchored regex, so a look-alike is refused), the consent page's fonts
+and static assets, and the JS client it loads. Three bundles converged on that exact set, entry for
+entry, so it is described once; the other in-cage sign-in profiles keep their own list because
+theirs genuinely differ (wildcard asset hosts, an extra favicon service, a missing `apis.google.com`),
+and harmonizing them would change what each cage can reach.
 
 One of them is a **mute** group rather than an allow group: `chromium-background`, the background
 services a Chromium engine reaches on its own whatever it is embedded in. Every profile that ships a

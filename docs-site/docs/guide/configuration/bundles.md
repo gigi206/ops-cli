@@ -125,7 +125,7 @@ dropped silently. Nothing was lost.
 
 ## The shipped bundles
 
-The repository ships one bundle per agent CLI under
+The repository ships one bundle per tool — a CLI, a desktop build, a web UI's engine — under
 `examples/bundle/`, each the single source of truth for what that agent needs: the namesake profile in
 `examples/app/` names it with `use` and no longer restates the requirements; a test pins the two
 together, so they cannot drift apart:
@@ -139,60 +139,89 @@ A bundle may itself reference shared egress groups with `@name` (its header then
 `examples/net-groups/`,
 with `sbx net groups import`.
 
-The 39 shipped bundles, and what each carries:
+The 62 shipped bundles, and what each carries:
 
 | Bundle | Packages | Also carries | Requires groups |
 |---|---|---|---|
 | `agy` | 1 (`mise:`) | 9 egress entries | none |
 | `aider` | 3 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
+| `amp` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `ante` | 1 (`mise:`) | 4 egress entries | none |
+| `antigravity` | 2 (`nix:`, `tarball:`) | 27 egress entries, a `tarball:` resolver | `chromium-background` |
 | `auggie` | 2 (`mise:`, `nix:`) | 6 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `autohand` | 2 (`mise:`, `nix:`) | 4 egress entries | `github-install`, `npm-registry` |
 | `claude-code` | 1 (`mise:`) | 6 egress entries, 3 env vars | none |
+| `claude-desktop` | 2 (`deb:`, `nix:`) | 23 egress entries, 3 env vars | `chromium-background`, `google-signin-incage` |
 | `cline` | 3 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-audit`, `npm-registry` |
 | `codebuddy` | 2 (`mise:`, `nix:`) | 4 egress entries, 2 env vars | `npm-audit`, `npm-registry` |
 | `codex` | 1 (`mise:`) | 6 egress entries | none |
 | `command-code` | 2 (`mise:`, `nix:`) | 12 egress entries | `github-install`, `npm-registry` |
 | `copilot` | 1 (`mise:`) | 6 egress entries | none |
+| `cortex` | 2 (`mise:`, `nix:`) | 6 egress entries | none |
 | `crush` | 1 (`mise:`) | 4 egress entries, 2 env vars | `github-install` |
+| `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
+| `cursor-agent` | 2 (`nix:`) | 5 egress entries, 1 env var | none |
 | `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
+| `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries | `npm-audit`, `npm-registry` |
+| `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
 | `dirac` | 3 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-registry` |
 | `freebuff` | 2 (`mise:`, `nix:`) | 8 egress entries | `npm-audit`, `npm-registry` |
+| `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 26 egress entries, an `appimage:` resolver | `chromium-background`, `github`, `github-api`, `npm-runtime` |
 | `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
+| `goose-desktop` | 1 (`deb:`) | 2 env vars | none |
 | `grok` | 1 (`mise:`) | 3 egress entries, 1 env var | none |
 | `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-registry` |
+| `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 21 egress entries, 1 env var | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-registry` |
 | `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
+| `junie` | 2 (`mise:`, `nix:`) | 7 egress entries | `npm-audit`, `npm-registry` |
 | `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
 | `kimi` | 2 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-registry` |
+| `kiro` | 2 (`nix:`) | 34 egress entries | `chromium-background`, `google-signin-incage` |
+| `kiro-desktop` | 2 (`nix:`, `tarball:`) | 36 egress entries, 1 env var, a `tarball:` resolver | `chromium-background` |
 | `mimo` | 2 (`mise:`, `nix:`) | 6 egress entries | `models-catalog`, `npm-registry` |
+| `muse` | 1 (`nix:`) | 4 egress entries, 1 env var | none |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `nova` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
+| `odysseus` | 6 (`nix:`) | 6 egress entries, 3 env vars | `npm-audit`, `npm-registry`, `pypi` |
 | `omp` | 1 (`mise:`) | 1 egress entry | none |
 | `openclaude` | 2 (`mise:`, `nix:`) | 1 egress entry | `npm-registry` |
 | `openclaw` | 2 (`mise:`, `nix:`) | 3 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `opencode` | 1 (`mise:`) | 3 egress entries | `models-catalog`, `npm-registry` |
+| `opencode-desktop` | 1 (`deb:`) | 4 egress entries | `models-catalog`, `npm-runtime` |
 | `openfox` | 2 (`mise:`, `nix:`) | none | none |
 | `pi` | 1 (`mise:`) | 1 egress entry | none |
+| `pool` | 1 (`tarball:`) | 1 egress entry, a `tarball:` resolver | none |
+| `prime-agent` | 5 (`nix:`) | 4 egress entries, 1 env var | `npm-registry`, `pypi` |
 | `qoder` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-registry` |
 | `qwen-code` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-registry` |
 | `reasonix` | 2 (`mise:`, `nix:`) | 4 egress entries | `npm-audit`, `npm-registry` |
+| `reasonix-desktop` | 1 (`deb:`) | 2 egress entries, 4 env vars, a `deb:` resolver | none |
+| `rovo` | 1 (`nix:`) | 12 egress entries | none |
 | `sigit` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `snow` | 2 (`mise:`, `nix:`) | 2 egress entries | `npm-audit`, `npm-registry` |
 | `stakpak` | 1 (`mise:`) | 4 egress entries | none |
+| `trae` | 2 (`nix:`) | 2 egress entries | `github`, `pypi` |
+| `vibe` | 4 (`mise:`, `nix:`) | 12 egress entries | `chromium-background`, `pypi` |
 | `vtcode` | 3 (`mise:`, `nix:`) | none | none |
-| `warp` | 3 (`nix:`) | 6 egress entries | none |
+| `warp` | 1 (`tarball:`) | 6 egress entries, a `tarball:` resolver | none |
 
 None of them carries a `cmd` or a posture (`network` mode, `gui`, `gpu`, …): a bundle states
 what a tool *needs*, and the consuming app keeps its own command and its own posture. See
 [What a bundle may carry](#what-a-bundle-may-carry-and-what-it-may-not).
 
-Most shipped profiles name a bundle with `use` instead of restating their agent's
-requirements: 43 of the 65, including the three orchestrators (`aionui`, `t3code`,
-`open-design`). They are therefore **not** one-step imports: importing the profile
-alone leaves the bundle (and any group it REQUIRES) undeclared and the launch warns.
-The 22 profiles without a bundle (desktop/web builds, and agents whose tool has no
-bundle) stay one-step imports.
+Every shipped profile now names a bundle with `use`: 62 of the 69 name their own, and the
+other 7 consume **another** agent's, because nothing would ever compose them in turn —
+`t3code` names `claude-code`; `aionui`, `opencode-web`, `open-design` and `orca-desktop`
+name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profile is a
+one-step import any more: importing one alone leaves its bundle (and any group that
+bundle REQUIRES) undeclared, and the launch warns.
+
+Five of those bundles carry the **fetch tooling** rather than the agent: `cursor-agent`, `muse`,
+`odysseus`, `prime-agent` and `trae` install through their profile's own `cmd` — a vendor bootstrap
+whose artifact no backend fits, or a source checkout — which a bundle cannot carry.
+Their headers say so: naming one equips a cage that can reach the agent's service but has
+no agent in it until the consuming app reproduces that install step.
 
 ## Managing bundles
 

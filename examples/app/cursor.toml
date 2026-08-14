@@ -3,6 +3,13 @@
 #   sbx app import examples/app/cursor.toml
 #   sbx app run cursor
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The editor's package, its auto-upgrade resolver,
+# the sign-in browser and the hosts they reach come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/cursor.toml
+#     sbx app import    examples/app/cursor.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #
@@ -203,85 +210,36 @@ dbus = true
 #    { path = "~/.cursor", mode = "rw" },            # extensions / CLI state
 #]
 
-[packages]
-# Cursor's prebuilt `.deb`, AUTO-UPGRADED via `deb:resolve` (see the VERSION note in the header): the
-# `[deb.cursor]` table below re-derives the current `.deb` URL from Cursor's download API, so
-# `sbx upgrade deb` rolls forward with no manual URL bump. Trusted-only, like every backend; this
-# profile is trusted by location once imported.
-cursor = "deb:resolve"
-# In-cage Chromium for the account sign-in flow (the `cmd` wrapper opens http(s) auth URLs in it and
-# routes the `cursor://` callback back to the editor). A large closure (a couple hundred MB the first
-# launch, seeded + offline-reusable after). Drop this and the `cmd` wrapper if you only ever sign in
-# with EMAIL (that stays in the app webview and needs no external browser).
-chromium = "nix:chromium"
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `cursor` BUNDLE — the `.deb` and its auto-upgrade resolver, the sign-in
+# Chromium, the environment the editor reads, the hosts it must reach and its telemetry mutes —
+# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
+# the app's requirements change. What the bundle may never carry is posture: the `gui`/`gpu`/
+# `audio`/`dbus` grants above, the `http2` designation below, and the sign-in preamble in `cmd`
+# stay here.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/cursor.toml
+# Without it the launch warns that the bundle is undeclared and the editor is simply absent.
+use = ["cursor"]
 
-# The `deb:resolve` command for `cursor` above. sbx runs it in a hermetic sandbox (base tools only —
-# `curl`/`sed`; SHARED network to reach the vendor API, sbx's own CA bundle for TLS) and pins the
-# `.deb` URL it prints. Cursor's `.deb` URL embeds a version + build hash and has no `…/latest/…`
-# alias, so a direct `deb:<url>` would freeze; this queries Cursor's download API for the CURRENT
-# `debUrl` instead. `curl -fsSL` follows the API's redirect and fails closed on an HTTP error; `sed`
-# extracts the `debUrl` JSON field. `sbx upgrade deb` re-runs this and rolls forward; a warm launch
-# reuses the pin WITHOUT re-running it (offline). The printed URL is re-validated as a `.deb` URL
-# before it is fetched, so an unexpected API response cannot point sbx at a non-`.deb` source.
-[deb.cursor]
-resolve = ["sh", "-c", '''
-curl -fsSL "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable" | sed -n 's/.*"debUrl":"\([^"]*\)".*/\1/p'
-''']
+# No `[packages]` table here, and no `[deb.cursor]` resolver: both come from the bundle.
 
 # An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is
 # opened to all verbs with `{*}`. See the EGRESS note in the header for the HTTP/2 caveat.
 [network]
 mode = "deny"
 allow = [
-    # Cursor's agent + API + auth backends. Cursor's own network-config doc recommends the
-    # `*.cursor.sh` wildcard — it covers api2 (most API), api5 + `agent.*`/regional (agent
-    # requests), repo42 (indexing, HTTP/2-only — handled via `[network] http2` below), and
-    # authenticate / authenticator / authentication (login). Opened to all verbs (the editor POSTs
-    # prompts and workspace context).
-    "{*} https://*.cursor.sh",
-    # The LOGIN + billing root. `cursor.com` is a SEPARATE domain from `*.cursor.sh`, so the wildcard
-    # above does NOT cover it. The sign-in opens `cursor.com/loginDeepControl`, then the flow touches
-    # `www.cursor.com` (dashboard/billing) — all first-party Cursor, so a `*.cursor.com` wildcard
-    # covers the apex and every subdomain (confirmed live via `sbx net logs -a cursor`).
-    "{*} https://*.cursor.com",
-    # WorkOS — Cursor's identity provider. The sign-in redirects here for
-    # `/user_management/authorize` (OAuth) and the token exchange (POST), so all verbs (confirmed
-    # live via `sbx net logs -a cursor`). The login cannot complete without it.
-    "{*} https://api.workos.com",
-    # The VS Code-style extension marketplace (browse/install extensions). The gallery query is a
-    # CORS preflight `OPTIONS` + a `POST /_apis/public/gallery/extensionquery`, so it needs `{*}`, not
-    # `{GET}` (confirmed live via `sbx net logs -a cursor`). Comment out if you do not use extensions.
-    "{*} https://marketplace.cursorapi.com",
-    # The extension asset host — the manifest/`.vsix` an extension install fetches (an `OPTIONS`
-    # preflight + a download; confirmed live via `sbx net logs -a cursor`). Also Cursor's own
-    # `.deb`/update host, but that is fetched HOST-SIDE at build time, not through the cage. Comment
-    # out if you do not use extensions.
-    "{*} https://downloads.cursor.com",
+    # The Cursor backends, the login/billing domain, WorkOS, the marketplace and asset hosts, the
+    # Google SSO chain and the Stripe checkout all arrive with the `cursor` bundle (`use` above)
+    # and are unioned into this list at resolution — inspect them with `sbx bundle cursor`, and see
+    # what the launch ends up with via `sbx config show --app cursor`.
+    #
     # Other client update / CDN hosts — uncomment whichever the editor names in `sbx net logs -a
     # cursor` (least privilege; not needed for the editor's core edit/AI path).
     #"{GET} https://*.cursor-cdn.com",
     #"{*} https://*.cursorapi.com",
     #"{GET} https://anysphere-binaries.s3.us-east-1.amazonaws.com",
-    # WorkOS auth-page assets (the sign-in page CSS/logos). Needed for the page to render so the form
-    # submits (confirmed live via `sbx net logs -a cursor`). `{GET}` — both are asset downloads.
-    "{GET} https://cdn.workos.com",
-    "{GET} https://workos.imgix.net",
-    # Google SSO chain (you sign in with Google). The bounded regex covers `accounts.google.com` AND
-    # the country domain (`accounts.google.<ccTLD>/…/SetSID`) the OAuth flow redirects to — the SetSID
-    # redirect is load-bearing (deny it and the chain never completes). `gstatic`/`googleusercontent`
-    # are the consent-page assets/avatar.
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    "{GET} https://*.gstatic.com",
-    "{GET} https://*.googleusercontent.com",
-    # A git fetch of the `makenotion/cursor-notion-plugin` repo (Cursor pulls it as a dependency via
-    # the git smart-HTTP protocol). github.com is already allowed for {GET} by sbx's built-in
-    # nix-cache set (so the `GET /info/refs` discovery passes); only the `POST /git-upload-pack` was
-    # denied by method-scope. Authorized as the EXACT upload-pack URL (least privilege — not a host
-    # wildcard, not the whole repo).
-    "{POST} https://github.com/makenotion/cursor-notion-plugin/git-upload-pack",
-    # Billing — a paid plan checkout after login (Stripe). Not needed to log in or use the free tier.
-    "{GET} https://js.stripe.com",
-    "{*} https://checkout.stripe.com",
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; orthogonal to the
 # `allow` verdict above — a host here must ALSO be in `allow`, every stream still verdict-checked).
@@ -298,47 +256,12 @@ http2 = [
 # Keep denied telemetry out of the default `sbx net logs` (still denied by construction, still
 # counted in `sbx net stats`; see them with `--all`). Add hosts the proxy names as telemetry.
 mute = [
-    # Chrome's component/dictionary CDN — the spellcheck `.bdic` from `redirector.gvt1.com`, etc. Not
-    # model/agent traffic and not needed for editing/AI, so it stays denied by construction; muted so
-    # its refusals don't clutter `sbx net logs` (still counted in `sbx net stats`; see them with `--all`).
-    "*.gvt1.com",
-    # The in-cage Chromium's OWN telemetry/component-update noise (not Cursor traffic), shared with
-    # every other profile that embeds a browser engine, so it comes from a group rather than a copy.
-    # None of it is the Google SSO flow (that lives on `accounts.google.<ccTLD>`, a different host —
-    # see the SSO block in `allow`).
-    "@chromium-background",
-    # Wider than the group: every remaining `*-pa.googleapis.com` background service this editor's
-    # engine reaches, without enumerating them.
-    "*.googleapis.com",
-    "www.google.com",
-    # Analytics on the WorkOS/Cursor login page (not auth traffic). Denied by construction; muted.
-    "www.googletagmanager.com",
-    # Auth-page + app telemetry (not auth-completion traffic). Denied by construction; muted.
-    "*.sentry.io",
-    "browser-intake-datadoghq.com",
-    "forwarder.workos.com",
-    # Third-party marketing/tracking pixels Cursor embeds on its www.cursor.com pages (dashboard,
-    # billing, marketing). Pure noise — none is Cursor or auth traffic. Denied by construction; muted.
-    "ad.doubleclick.net",
-    "snap.licdn.com",
-    "px.ads.linkedin.com",
-    "connect.facebook.net",
-    "www.redditstatic.com",
-    "sc-static.net",
-    "analytics.tiktok.com",
-    "analytics.roadwayai.com",
-    "ip.conceptualhq.com",
-    "ptht05hbb1ssoooe.public.blob.vercel-storage.com",
+    # Nothing here: the browser-engine noise (`@chromium-background` and friends), the login-page
+    # analytics and the marketing pixels arrive with the bundle and are unioned in at resolution.
 ]
 
-[env]
-# If Cursor's Node backend (the extension host that makes model calls) reaches its endpoints through
-# Node's built-in fetch (undici) — its proxy support is documented as "inherited from Node.js" —
-# undici ignores http_proxy/https_proxy unless this is set, and in the Model-B empty netns a bypassed
-# fetch dies with `EAI_AGAIN` before the proxy is ever consulted (0 denies in `sbx net stats`).
-# NODE_USE_ENV_PROXY (Node 24+) routes fetch through the proxy so every request is subject to the
-# allowlist. Harmless if the backend uses a proxy-aware client instead.
-NODE_USE_ENV_PROXY = "1"
+# No `[env]` table here: `NODE_USE_ENV_PROXY`, which routes the editor's Node fetch through the
+# proxy, rides the bundle with the package that reads it.
 
 # No [secret] block: the desktop editor logs in to a Cursor account (see the credential note in the
 # header), not a header-injectable provider key — there is nothing for sbx to inject host-side.

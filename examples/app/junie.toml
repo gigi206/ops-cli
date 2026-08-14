@@ -3,6 +3,13 @@
 #   sbx app import examples/app/junie.toml
 #   sbx app run junie
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
+# BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/junie.toml
+#     sbx app import    examples/app/junie.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
@@ -69,42 +76,33 @@ exec junie "$@"
 #    { path = "~/.local/share/junie", mode = "rw" },
 #]
 
-[packages]
-# A node runtime — needed to install the shim package and to run the vendor's postinstall above.
-# The Junie build it downloads carries its own JetBrains Runtime, so node is not needed at runtime.
-nodejs = "nix:nodejs"
-junie = "mise:npm:@jetbrains/junie"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `junie` BUNDLE — the package(s), the hosts it must reach, and its mutes — from
+# one declaration shared with the bundle file itself, so this profile cannot fall behind when the
+# agent's requirements change. What the bundle cannot carry is the install repair: that is the
+# wrapper in `cmd` above, and it stays here with the rest of this app's posture.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/junie.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["junie"]
 
-# An app is read-by-default ({GET,HEAD}); the AI service carries POSTs, so it is opened to all
-# verbs with `{*}`.
+# No `[packages]` here: the agent's packages come from its bundle — see `use` above.
+
+# An app is read-by-default ({GET,HEAD}); the AI service carries POSTs, so the bundle opens it to
+# all verbs. This table stays: the bundle's egress entries land in the consuming app's OWN
+# `[network]` table, and an app that declares none gets a warning rather than an invented posture.
+# Check what the bundle adds with `sbx bundle junie`, and what the launch ends up with via
+# `sbx config show --app junie`.
 [network]
 mode = "deny"
 allow = [
-    # Install: the shim package from npm. The release zip itself (github.com + the
-    # *.githubusercontent.com asset host) and the installer's update index on
-    # raw.githubusercontent.com ride sbx's built-in read-only allow-set, so they need no entry.
-    # The registry lane itself is the shared `@npm-registry` group.
-    "@npm-registry",
-    # The vendor's own distribution host: release channels, updates, and the `/cli` token page.
-    "{*} https://junie.jetbrains.com",
-    # Runtime: the JetBrains AI service the agent talks to, and its sibling cloud endpoint.
-    "{*} https://api.jetbrains.ai",
-    "{*} https://api.jetbrains.cloud",
-    # Account login (OAuth) — needed for the JetBrains-account path, not for a key or BYOK.
-    "{*} https://oauth.account.jetbrains.com",
-    # BYOK instead: uncomment the ONE provider you use (and supply its key as `cline.toml` shows).
+    # The install lane, the JetBrains distribution host, the AI service and the account login all
+    # arrive with the bundle. BYOK instead: uncomment the ONE provider you use (and supply its key
+    # as `cline.toml` shows).
     #"{*} https://api.anthropic.com",
     #"{*} https://api.openai.com",
     #"{*} https://openrouter.ai",
-]
-
-# Refusals to keep OUT of the default `sbx net log` (SELinux `dontaudit`): npm's audit endpoint,
-# and JetBrains' issue tracker, which the app references but which no session needs. A `mute` never
-# changes the verdict (they stay refused) and never hides a count. See them with
-# `sbx net log --all`; edit with `sbx net mute|unmute <rule> -a junie`.
-mute = [
-    "@npm-audit",
-    "youtrack.jetbrains.com",
 ]
 
 # --- Junie API key (commented) — the in-cage placeholder lets the CLI start and issue its request;

@@ -13,6 +13,14 @@
 # OWN `[network]` table — an app that declares none gets a warning instead, because inventing one
 # could move its posture.
 #
+# THIS BUNDLE IS COMPLETE — an app that names it gets the agent, with no install step to reproduce.
+# The profile used to download the release tarball from its own `cmd`, on the grounds that no sbx
+# backend fit. One does: the vendor's artifact endpoint 302s to a versioned `.tar.gz` whose payload
+# is a lone `warp-tui-stable` executable at the archive root beside its `resources/` tree, which is
+# the shape the shared install phase wraps under the `[packages]` KEY. The wrapper execs the real
+# binary in place, so the `resources/` it resolves relative to its own location are still beside it.
+# `sbx upgrade tarball` re-runs the resolver and rolls the version forward.
+#
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
@@ -49,20 +57,17 @@ mute = [
 ]
 
 [bundle.warp.packages]
-# The bootstrap wrapper in `examples/app/warp.toml` downloads + extracts the release tarball.
-# `curl` is in sbx's base toolset; `tar` + `gzip` are NOT (same gap `pool.toml`, `devin.toml`,
-# and `cursor-agent.toml` cite), so the `nix:` backend provisions them host-side, seeded,
-# offline-reusable.
-#
-# liblzma: the Warp CLI binary itself is a foreign (non-nix) binary that links exactly one
-# library the hermetic cage lacks — `liblzma.so.5` (measured with `ldd` on the shipped
-# `warp-tui-stable`; everything else it needs — libz, libgcc_s, glibc — the base userland already
-# provides through its nix-ld shim). Declared here so it is host-provisioned; the wrapper finds
-# its `lib/` by store-path name (a content-addressed path cannot be written literally — the same
-# pattern `odysseus.toml` uses for libstdc++). The nixpkgs attribute is the full `xz` package —
-# there is no `liblzma` attribute in the pinned revision (checked against the same
-# `github:NixOS/nixpkgs/0954f7…` flake sbx resolves), and `xz` is split, so its `-bin` output on
-# PATH carries no libraries: the wrapper globs the `out` output's `lib/`.
-gnutar   = "nix:gnutar"
-gzip     = "nix:gzip"
-xz       = "nix:xz"
+# The agent itself, auto-upgraded through the resolver below.
+warp = "tarball:resolve"
+
+# The `tarball:resolve` command. sbx runs it in a hermetic sandbox (its own base tools; the HOST
+# network, because provisioning is host-side and an allowlist governs runtime egress), captures the
+# URL it prints, validates it is an https `.tar.gz`, and pins it with its content hash. The vendor
+# exposes a stable artifact endpoint that 302s to the current versioned tarball, so the resolver
+# asks curl for the redirect TARGET (first hop only) rather than following it.
+[bundle.warp.tarball.warp]
+resolve = [
+    "sh",
+    "-c",
+    "curl -fsS -o /dev/null -w '%{redirect_url}' 'https://app.warp.dev/download/agent-cli/artifact?os=linux&arch=x86_64'",
+]

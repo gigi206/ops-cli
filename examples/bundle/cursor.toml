@@ -1,0 +1,121 @@
+# `cursor` — the Cursor editor: what it needs to be installed, to sign in, and to reach its own
+# services.
+#
+#   sbx bundle import examples/bundle/cursor.toml
+#   # then in an app profile:   use = ["cursor"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
+# Derived from `examples/app/cursor.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for the app's packages, env and egress, while
+# the profile keeps its own command, posture and credential choices. A test pins the two artifacts
+# together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. That split is load-bearing here — an Electron
+# editor needs `gui = "wayland"` and `gpu = true` to map a window at all, and the account sign-in
+# needs `dbus = true` plus the `xdg-open`/portal-handler preamble that `examples/app/cursor.toml`
+# writes. A consuming app that names this bundle and execs `cursor` with none of that gets a
+# package it cannot display.
+#
+# NOR the HTTP/2 designation: `[network] http2` is a transport posture, not a requirement of the
+# package, so it stays with the consuming app (Cursor's `repo42` indexing host is HTTP/2-only —
+# see the profile).
+#
+# THE `.deb` IS AUTO-UPGRADED. `deb:resolve` plus the resolver below re-derives the current `.deb`
+# URL from Cursor's download API, so `sbx upgrade deb` rolls it forward with no manual URL bump.
+# The resolver travels with the package it resolves, which is why it belongs here rather than in
+# the app.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.cursor]
+allow = [
+    # Cursor's agent + API + auth backends. Cursor's own network-config doc recommends the
+    # `*.cursor.sh` wildcard — it covers api2 (most API), api5 + `agent.*`/regional (agent
+    # requests), repo42 (indexing) and the authenticate/authenticator hosts (login). Opened to all
+    # verbs (the editor POSTs prompts and workspace context).
+    "{*} https://*.cursor.sh",
+    # The LOGIN + billing root. `cursor.com` is a SEPARATE domain from `*.cursor.sh`, so the
+    # wildcard above does NOT cover it.
+    "{*} https://*.cursor.com",
+    # WorkOS — Cursor's identity provider: `/user_management/authorize` and the token exchange.
+    "{*} https://api.workos.com",
+    # The VS Code-style extension marketplace: a CORS preflight `OPTIONS` plus a `POST` gallery
+    # query, so `{*}` rather than `{GET}`.
+    "{*} https://marketplace.cursorapi.com",
+    # The extension asset host — the manifest/`.vsix` an extension install fetches.
+    "{*} https://downloads.cursor.com",
+    # WorkOS auth-page assets (the sign-in page CSS/logos), needed for the form to render.
+    "{GET} https://cdn.workos.com",
+    "{GET} https://workos.imgix.net",
+    # Google SSO chain. The bounded, anchored regex covers `accounts.google.com` AND the country
+    # domain whose `/SetSID` redirect is load-bearing; the rest are consent-page assets.
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{GET} https://*.gstatic.com",
+    "{GET} https://*.googleusercontent.com",
+    # A git fetch of the `makenotion/cursor-notion-plugin` repo over smart HTTP. github.com is
+    # already readable through sbx's built-in set; only the `POST /git-upload-pack` was denied by
+    # method scope, authorized here as the EXACT URL rather than a host wildcard.
+    "{POST} https://github.com/makenotion/cursor-notion-plugin/git-upload-pack",
+    # Billing — a paid-plan checkout after login (Stripe). Not needed to log in or use the free tier.
+    "{GET} https://js.stripe.com",
+    "{*} https://checkout.stripe.com",
+]
+# Refusals to keep out of the default `sbx net log`. `mute` never changes the verdict (still
+# refused, still counted by `sbx net stats`); see them with `--all`.
+mute = [
+    # Chrome's component/dictionary CDN (spellcheck `.bdic` and friends) — not model traffic.
+    "*.gvt1.com",
+    # The in-cage Chromium's OWN telemetry/component-update noise, shared with every other profile
+    # that embeds a browser engine. None of it is the Google SSO flow, which lives on
+    # `accounts.google.<ccTLD>` — see the SSO block in `allow`.
+    "@chromium-background",
+    # Wider than the group: the remaining background services this engine reaches.
+    "*.googleapis.com",
+    "www.google.com",
+    # Analytics on the WorkOS/Cursor login page (not auth traffic).
+    "www.googletagmanager.com",
+    # Auth-page + app telemetry (not auth-completion traffic).
+    "*.sentry.io",
+    "browser-intake-datadoghq.com",
+    "forwarder.workos.com",
+    # Third-party marketing/tracking pixels embedded on the www.cursor.com pages.
+    "ad.doubleclick.net",
+    "snap.licdn.com",
+    "px.ads.linkedin.com",
+    "connect.facebook.net",
+    "www.redditstatic.com",
+    "sc-static.net",
+    "analytics.tiktok.com",
+    "analytics.roadwayai.com",
+    "ip.conceptualhq.com",
+    "ptht05hbb1ssoooe.public.blob.vercel-storage.com",
+]
+
+[bundle.cursor.packages]
+# Cursor's prebuilt `.deb`, auto-upgraded through the resolver below.
+cursor = "deb:resolve"
+# In-cage Chromium for the account sign-in flow. Drop it (and the consuming app's wrapper) if you
+# only ever sign in with EMAIL, which stays in the app webview and needs no external browser.
+chromium = "nix:chromium"
+
+[bundle.cursor.env]
+# If Cursor's Node backend reaches its endpoints through Node's built-in fetch (undici), undici
+# ignores http_proxy/https_proxy unless this is set, and in the empty netns a bypassed fetch dies
+# with `EAI_AGAIN` before the proxy is ever consulted. Harmless if the backend uses a proxy-aware
+# client instead.
+NODE_USE_ENV_PROXY = "1"
+
+# The `deb:resolve` command for the `cursor` package above. sbx runs it in a hermetic sandbox (base
+# tools only, shared network to reach the vendor API) and pins the `.deb` URL it prints. Cursor's
+# `.deb` URL embeds a version and build hash with no `…/latest/…` alias, so a direct `deb:<url>`
+# would freeze; this queries the download API for the CURRENT `debUrl` instead. `curl -fsSL` fails
+# closed on an HTTP error; the printed URL is re-validated as a `.deb` URL before it is fetched.
+[bundle.cursor.deb.cursor]
+resolve = ["sh", "-c", '''
+curl -fsSL "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable" | sed -n 's/.*"debUrl":"\([^"]*\)".*/\1/p'
+''']

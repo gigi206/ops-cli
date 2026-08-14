@@ -5,6 +5,13 @@
 #   sbx app run kiro -- chat                    # agentic chat/coding mode (strict egress)
 #   sbx app run kiro                            # the CLI (kiro-cli)
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The CLI package, the sign-in browser and the
+# hosts they reach come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/kiro.toml
+#     sbx app import    examples/app/kiro.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #
@@ -167,17 +174,19 @@ dbus = true
 #    { path = "~/.aws", mode = "rw" },
 #]
 
-[packages]
-# Kiro CLI from nixpkgs (host-side, durable, offline-reusable after the first build). The
-# derivation fetches the official AWS `.tar.gz`, patchelfs the native binaries, and puts
-# kiro-cli / kiro-cli-chat / kiro-cli-term on PATH.
-kiro = "nix:kiro-cli"
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `kiro` BUNDLE — the CLI package, the Chromium the in-cage sign-in needs, the
+# hosts both reach, and the telemetry mutes — from one declaration shared with the bundle file
+# itself, so this profile cannot fall behind when the agent's requirements change. What the bundle
+# may never carry is posture: the `gui`/`gpu`/`dbus` grants above and the `xdg-open` shim in `cmd`
+# stay here, and without them the browser login cannot start.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/kiro.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["kiro"]
 
-# Chromium for the in-cage OAuth sign-in only (see the LOGIN note above). This closure is seeded
-# per project even though daily TUI runs never launch it — the cost of a single profile whose
-# login self-contains inside the cage. It is shared across every `gui`/Chromium profile, so it is
-# built at most once for your whole store.
-chromium = "nix:chromium"
+# No `[packages]` here: the agent's packages come from its bundle — see `use` above.
 
 # BYOK (Pro / Pro+ / Pro Max / Power tiers): the CLI reads a `KIRO_API_KEY` env var (key
 # generated at app.kiro.dev). The exact wire header the CLI sends this key in is NOT
@@ -202,54 +211,10 @@ chromium = "nix:chromium"
 [network]
 mode = "deny"
 allow = [
-    # Inference / chat (POST completions).
-    "{*} https://runtime.us-east-1.kiro.dev",
-    "{*} https://runtime.eu-central-1.kiro.dev",
-    "{*} https://q.us-east-1.amazonaws.com",
-    "{*} https://q.eu-central-1.amazonaws.com",
-
-    # Auth / token exchange / refresh / logout + the sign-in page (rendered in the in-cage browser).
-    "{*} https://prod.us-east-1.auth.desktop.kiro.dev",
-    "{*} https://prod.eu-central-1.auth.desktop.kiro.dev",
-    "{*} https://kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
-    # The Kiro sign-in page AND its OAuth continuation (it POSTs back after the IdP), so all verbs.
-    "{*} https://app.kiro.dev",
-    "{GET} https://assets.app.kiro.dev",
-    # AWS "shortbread" cookie-consent banner assets rendered on the sign-in page.
-    "{GET} https://prod.assets.shortbread.aws.dev",
-    # AWS SSO OIDC device-flow endpoint — `login --use-device-flow` polls it for the token.
-    # Required for Builder ID / Google / GitHub (`--license free`) AND Identity Center
-    # (`--license pro`), because in the cage a browser redirect cannot be handled.
-    "{*} https://oidc.us-east-1.amazonaws.com",
-    "{*} https://oidc.eu-central-1.amazonaws.com",
-
-    # ── Google Sign-In ("Continue with Google") — the consent AND the cross-domain cookie step
-    # render in the in-cage Chromium. Google serves the consent and the `/accounts/SetSID`
-    # session-cookie step from your COUNTRY domain (accounts.google.com, .fr, .de, .co.uk, …), then
-    # bounces back to app.kiro.dev → localhost. DENY SetSID and the OAuth chain never completes —
-    # the browser hangs on a BLANK SetSID page (the exact symptom this set fixes). The bounded regex
-    # covers any ccTLD and is anchored so a look-alike (accounts.google.com.evil.com) is REFUSED.
-    # Not needed for GitHub / Builder ID sign-in (those stay on their own domains — a simpler login).
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    "{*} https://oauth2.googleapis.com",
-    "{*} https://apis.google.com",
-    "{GET} https://www.google.com",
-    "{GET} https://ssl.gstatic.com",
-    "{GET} https://www.gstatic.com",
-    "{GET} https://fonts.gstatic.com",
-    "{GET} https://fonts.googleapis.com",
-    "{GET} https://lh3.googleusercontent.com",
-
-    # Config / management.
-    "{*} https://management.us-east-1.kiro.dev",
-    "{*} https://management.eu-central-1.kiro.dev",
-
-    # Update check / downloads (the CLI's own self-update probe).
-    "{GET} https://prod.download.cli.kiro.dev",
-    "{GET} https://prod.download.desktop.kiro.dev",
-    "{GET} https://desktop-release.q.us-east-1.amazonaws.com",
-    "{GET} https://cli.kiro.dev",
-
+    # The inference, auth, sign-in, management and update hosts all arrive with the `kiro` bundle
+    # (`use` above) and are unioned into this list at resolution — inspect them with
+    # `sbx bundle kiro`, and see what the launch ends up with via `sbx config show --app kiro`.
+    #
     # Enterprise AWS IAM Identity Center (`--license pro`) also needs your org's portal +
     # directory hosts — uncomment and replace <region>/<directory> with yours (the OIDC host
     # above is already allowed). See kiro.dev/docs/cli/authentication.
@@ -258,10 +223,11 @@ allow = [
     #"{GET} https://signin.aws",
 ]
 
-# Telemetry / metrics we deliberately leave DENIED. `mute` never changes the verdict (still
-# refused, still counted by `sbx net stats`); it only keeps the refusal out of the default
-# `sbx net log` so the actionable denials stay readable. See them with `sbx net log --all`,
-# and edit from the CLI with `sbx net mute|unmute <host> -a kiro`.
+# Telemetry / metrics we deliberately leave DENIED. The mute list itself rides the `kiro` bundle
+# (`sbx bundle kiro` shows it): `mute` never changes the verdict (still refused, still counted by
+# `sbx net stats`); it only keeps the refusal out of the default `sbx net log` so the actionable
+# denials stay readable. See them with `sbx net log --all`, and edit from the CLI with
+# `sbx net mute|unmute <host> -a kiro`.
 #
 # NOTE — one telemetry call canNOT be muted: kiro-cli's anonymous metrics POST to
 # `cognito-identity.us-east-1.amazonaws.com` goes through an AWS SDK that, because `http_proxy` is
@@ -273,28 +239,6 @@ allow = [
 # ~/.kiro/settings/cli.json), which stops cognito-identity AND every telemetry host below from being
 # called at all. The mutes below stay as a belt-and-suspenders in case telemetry is re-enabled.
 mute = [
-    "telemetry.us-east-1.kiro.dev",
-    "telemetry.eu-central-1.kiro.dev",
-    # v2 metrics endpoint the current CLI (2.13.0) reports to — observed denied during login.
-    "prod.us-east-1.telemetry-v2.kiro.dev",
-    "prod.eu-central-1.telemetry-v2.kiro.dev",
-    "prod.us-east-1.telemetry.desktop.kiro.dev",
-    "prod.eu-central-1.telemetry.desktop.kiro.dev",
-    "prod.us-east-1.telemetry.kiro.aws.dev",
-    "dataplane.rum.us-east-1.amazonaws.com",
-    "dataplane.rum.eu-central-1.amazonaws.com",
-    # Legacy Amazon Q metrics endpoint the CLI still probes (denied — no functional impact).
-    "client-telemetry.us-east-1.amazonaws.com",
-    # AWS "shortbread" cookie-consent banner analytics/logging beacons. The banner ASSETS host
-    # (prod.assets.shortbread.aws.dev) IS allowed above so the banner renders; these are just its
-    # telemetry/logging endpoints — denied, no functional impact on login.
-    "prod.log.shortbread.aws.dev",
-    "prod.tools.shortbread.aws.dev",
-    "prod.tools.shortbread.analytics.console.aws.a2z.com",
-    # Chromium's own probes + Google noise during the in-cage sign-in (denied, non-essential), shared
-    # with every other profile that embeds a browser engine, so they come from a group rather than a
-    # copy.
-    "@chromium-background",
-    # Chrome's page-translation service — same class, but not every browser embed reaches it.
-    "translate.googleapis.com",
+    # Nothing here: the telemetry hosts, the cookie-banner beacons, `@chromium-background` and the
+    # translation service arrive with the bundle and are unioned into this list at resolution.
 ]

@@ -1,0 +1,50 @@
+# `cortex` — the Cortex Code CLI: what it needs to be installed and to reach its own service.
+#
+#   sbx bundle import examples/bundle/cortex.toml
+#   # then in an app profile:   use = ["cortex"]
+#
+# Derived from `examples/app/cortex.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for the agent's packages, env and egress,
+# while the app keeps its own command, posture and BYOK choices. A test pins the two artifacts
+# together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. That matters here — the binary needs an ALSA
+# library the cage lacks, and the wrapper in `examples/app/cortex.toml` is what points it at the
+# `alsa-lib` package below. A consuming app that execs the binary directly hits the missing
+# library instead.
+#
+# NO PROVIDER KEY, and no BYOK host. The Cortex service is the agent's own; running it against
+# OpenAI instead, or enabling its search/hosted-MCP tools, is the consuming app's choice, so those
+# hosts and their keys stay with the app.
+#
+# THE INSTALL NEEDS NO EGRESS ENTRY: the GitHub release download and its attestation check ride
+# sbx's built-in read-only allow-set.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.cortex]
+allow = [
+    # The vendor's own service — model traffic and account.
+    "{*} https://api.cortex.foundation",
+]
+# Refusals to keep out of the default `sbx net log`: the vendor's installer and docs hosts (sbx owns
+# updates here through `sbx upgrade mise`, so the self-update channel is refused on purpose), and
+# the optional tool backends the app leaves denied. A `mute` never changes the verdict.
+mute = [
+    "software.cortex.foundation",
+    "docs.cortex.foundation",
+    "registry.cortex.foundation",
+    "duckduckgo.com",
+    "mcp.exa.ai",
+]
+
+[bundle.cortex.packages]
+# Upstream's own release binary, attestation- and SLSA-verified by mise at install time.
+cortex = "mise:github:CortexLM/cortex-code"
+# The one library that binary needs and the cage lacks. Declared as a package so it is
+# host-provisioned and seeded — its `bin/aserver` is also what lets the consuming app's wrapper
+# find its `lib/`.
+alsa-lib = "nix:alsa-lib"

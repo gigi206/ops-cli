@@ -3,6 +3,13 @@
 #   sbx app import examples/app/kiro-desktop.toml
 #   sbx app run kiro-desktop
 #
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The IDE tarball, its auto-upgrade resolver, the
+# sign-in browser and the hosts they reach come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/kiro-desktop.toml
+#     sbx app import    examples/app/kiro-desktop.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #
@@ -191,28 +198,19 @@ dbus = true
 #    { path = "~/.kiro", mode = "rw" },            # agent/CLI state
 #]
 
-[packages]
-# Kiro's prebuilt `.tar.gz`, AUTO-UPGRADED via `tarball:resolve` (see the VERSION + WHY-tarball notes
-# in the header): the `[tarball.kiro]` table below reads the current signed `.tar.gz` URL from Kiro's
-# release metadata, so `sbx upgrade tarball` rolls forward with no manual URL bump. Trusted-only, like
-# every backend; this profile is trusted by location once imported.
-kiro = "tarball:resolve"
-# In-cage Chromium for the account sign-in flow (the `cmd` wrapper opens the http(s) auth URL in it and
-# the localhost callback returns to the IDE's own server). A large closure (a couple hundred MB the
-# first launch, seeded + offline-reusable after; shared across every gui/Chromium profile).
-chromium = "nix:chromium"
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `kiro-desktop` BUNDLE — the IDE tarball and its auto-upgrade resolver, the
+# sign-in Chromium, the environment the editor reads, the hosts it must reach and its telemetry
+# mutes — from one declaration shared with the bundle file itself, so this profile cannot fall
+# behind when the app's requirements change. What the bundle may never carry is posture: the
+# `gui`/`gpu`/`dbus` grants, the `http2` designation below, and the sign-in preamble in `cmd`.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/kiro-desktop.toml
+# Without it the launch warns that the bundle is undeclared and the IDE is simply absent.
+use = ["kiro-desktop"]
 
-# The `tarball:resolve` command for `kiro` above. sbx runs it in a hermetic sandbox (base tools only —
-# `curl`/`grep`; SHARED network to reach the vendor API, sbx's own CA bundle for TLS) and pins the URL
-# it prints. Kiro's release metadata JSON lists the signed `.tar.gz` under `releases[].url`; the
-# command extracts that URL directly (no path reconstruction — it reads the vendor's own declared
-# URL). `curl -fsSL` fails closed on an HTTP error, `head -1` keeps a single URL, and sbx re-validates
-# the printed URL is an https `.tar.gz` before fetching. `sbx upgrade tarball` re-runs this and rolls
-# forward; a warm launch reuses the pin WITHOUT re-running it (offline).
-[tarball.kiro]
-resolve = ["sh", "-c", '''
-curl -fsSL "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json" | grep -oE 'https://[^"]*kiro-ide-[^"]*-linux-x64\.tar\.gz' | head -1
-''']
+# No `[packages]` table here, and no `[tarball.kiro]` resolver: both come from the bundle.
 
 # An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is
 # opened to all verbs with `{*}`. Hosts are from Kiro's own IDE firewall doc
@@ -222,56 +220,13 @@ curl -fsSL "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-sta
 [network]
 mode = "deny"
 allow = [
-    # Auth / token exchange + the sign-in page (rendered in the in-cage browser). The IDE POSTs back
-    # after the IdP, so all verbs.
-    "{*} https://app.kiro.dev",
-    "{GET} https://assets.app.kiro.dev",
-    # AWS "shortbread" cookie-consent banner assets rendered on the sign-in page (css/js). Its
-    # analytics/logging beacons stay denied+muted below; these are just the banner's static assets.
-    "{GET} https://prod.assets.shortbread.aws.dev",
-    "{*} https://prod.us-east-1.auth.desktop.kiro.dev",
-    "{*} https://prod.eu-central-1.auth.desktop.kiro.dev",
-    # Social federation (Google/GitHub sign-in). Kiro's IDE firewall doc lists cognito-identity under
-    # AUTH (unlike the CLI, where it was anonymous telemetry) — allowed here as a login dependency.
-    "{*} https://cognito-identity.us-east-1.amazonaws.com",
-    "{*} https://kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
-
-    # Inference / chat (POST completions).
-    "{*} https://runtime.us-east-1.kiro.dev",
-    "{*} https://runtime.eu-central-1.kiro.dev",
-    "{*} https://q.us-east-1.amazonaws.com",
-    "{*} https://q.eu-central-1.amazonaws.com",
-
-    # Config / management.
-    "{*} https://management.us-east-1.kiro.dev",
-    "{*} https://management.eu-central-1.kiro.dev",
-
-    # Update check / IDE assets (the editor's own self-update probe; the `.deb` itself is fetched
-    # HOST-SIDE at build time, not through the cage).
-    "{GET} https://prod.download.desktop.kiro.dev",
-
-    # Extensions — Open VSX (Kiro cannot use Microsoft's marketplace). Search/metadata + the `.vsix`
-    # asset/icon host. `{*}` because the gallery query is a CORS preflight + POST. Comment out if you
-    # do not use extensions.
-    "{*} https://open-vsx.org",
-    "{GET} https://openvsx.eclipsecontent.org",
-
-    # ── Google Sign-In ("Continue with Google") — the consent AND the cross-domain cookie step render
-    # in the in-cage Chromium (the exact chain proven live for kiro.toml). Google serves the consent
-    # and `/accounts/SetSID` from your COUNTRY domain (.com/.fr/.de/…), then bounces back via
-    # amazoncognito.com → app.kiro.dev → localhost. DENY SetSID and the OAuth chain never completes.
-    # The bounded regex covers any ccTLD, anchored so a look-alike is REFUSED. Not needed for GitHub /
-    # Builder ID sign-in (those stay on their own domains).
-    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
-    "{*} https://oauth2.googleapis.com",
-    "{*} https://apis.google.com",
-    "{GET} https://www.google.com",
-    "{GET} https://*.gstatic.com",
-    "{GET} https://fonts.googleapis.com",
-    "{GET} https://*.googleusercontent.com",
-
-    # Optional Kiro "Powers" / agent tool use (git operations). github.com {GET} is already covered by
-    # sbx's built-in nix-cache set; uncomment the raw host if a Power fetches from it.
+    # The auth, inference, management, update and marketplace hosts, plus the Google Sign-In chain,
+    # all arrive with the `kiro-desktop` bundle (`use` above) and are unioned into this list at
+    # resolution — inspect them with `sbx bundle kiro-desktop`, and see the launch's own view with
+    # `sbx config show --app kiro-desktop`.
+    #
+    # Optional Kiro "Powers" / agent tool use (git operations). github.com {GET} is already covered
+    # by sbx's built-in nix-cache set; uncomment the raw host if a Power fetches from it.
     #"{GET} https://raw.githubusercontent.com",
 ]
 # HTTP/2 (gRPC) transport — an exact host or a `*.domain` wildcard (host-level; orthogonal to the
@@ -288,38 +243,12 @@ http2 = [
 # `sbx net mute|unmute <host> -a kiro-desktop`. (Kiro's telemetry can also be turned off IN the editor
 # — Settings → `telemetry.telemetryLevel: "off"`, VS Code-style — which stops these being called.)
 mute = [
-    "prod.us-east-1.telemetry.desktop.kiro.dev",
-    "prod.eu-central-1.telemetry.desktop.kiro.dev",
-    "telemetry.us-east-1.kiro.dev",
-    "telemetry.eu-central-1.kiro.dev",
-    "prod.us-east-1.telemetry-v2.kiro.dev",
-    "prod.us-east-1.telemetry.kiro.aws.dev",
-    "dataplane.rum.us-east-1.amazonaws.com",
-    "client-telemetry.us-east-1.amazonaws.com",
-    # AWS "shortbread" cookie-consent banner analytics/logging on the sign-in page (the banner assets
-    # are served from app.kiro.dev; these are its telemetry beacons). Denied, no functional impact.
-    "prod.log.shortbread.aws.dev",
-    "prod.tools.shortbread.aws.dev",
-    "prod.tools.shortbread.analytics.console.aws.a2z.com",
-    # The in-cage Chromium's OWN telemetry/component-update noise during sign-in (not Kiro traffic) —
-    # component/DRM/self updates, Safe Browsing, connectivity checks, translate, YouTube cookie sync.
-    # None is the Google SSO flow (that lives on accounts.google.<ccTLD>, allowed above).
-    # The in-cage Chromium's own background services during the sign-in, none login-critical (the
-    # Google auth completes without them), and shared with every other profile that embeds a browser
-    # engine, so they come from a group rather than a copy. The group includes the password
-    # leak-check, which stays DENIED: no passwords are sent to Google's leak service.
-    "@chromium-background",
-    # Chrome's page-translation service — same class, but not every browser embed reaches it.
-    "translate.googleapis.com",
+    # Nothing here: the telemetry hosts, the cookie-banner beacons, `@chromium-background` and the
+    # translation service arrive with the bundle and are unioned in at resolution.
 ]
 
-[env]
-# If Kiro's Node backend (the extension host / agent that makes model calls) reaches its endpoints
-# through Node's built-in fetch (undici), undici ignores http_proxy/https_proxy unless this is set,
-# and in the Model-B empty netns a bypassed fetch dies with `EAI_AGAIN` before the proxy is ever
-# consulted. NODE_USE_ENV_PROXY (Node 24+) routes fetch through the proxy so every request is subject
-# to the allowlist. Harmless if the backend uses a proxy-aware client instead.
-NODE_USE_ENV_PROXY = "1"
+# No `[env]` table here: `NODE_USE_ENV_PROXY`, which routes the editor's Node fetch through the
+# proxy, rides the bundle with the package that reads it.
 
 # No [secret] block: the desktop editor logs in to a Kiro account (see the credential note in the
 # header), not a header-injectable provider key — there is nothing for sbx to inject host-side.

@@ -1,0 +1,111 @@
+# `antigravity` — Google's Antigravity IDE: what it needs to be installed, to sign in, and to reach
+# its own services.
+#
+#   sbx bundle import examples/bundle/antigravity.toml
+#   # then in an app profile:   use = ["antigravity"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
+# Derived from `examples/app/antigravity.toml`, whose namesake profile names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
+# while the profile keeps its own command, posture and credential choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. An Electron IDE needs `gui = "wayland"` and
+# `gpu = true` to map a window at all, and the Google Sign-In needs the `xdg-open`/deep-link
+# preamble `examples/app/antigravity.toml` writes — a consuming profile without them gets a package
+# it cannot display or log into.
+#
+# THE TARBALL IS AUTO-UPGRADED. `tarball:resolve` plus the resolver below re-derives the current
+# download URL from Google's own auto-updater version API, so `sbx upgrade tarball` rolls it
+# forward. The resolver travels with the package it resolves, which is why it belongs here.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.antigravity]
+allow = [
+    # Model / agent traffic — Google's Cloud Code (Gemini Code Assist) backend, the host the caged
+    # agent and the native language server POST completions to. `daily-` is the same backend's
+    # staging channel. All verbs (request bodies).
+    "{*} https://cloudcode-pa.googleapis.com",
+    "{*} https://daily-cloudcode-pa.googleapis.com",
+    # Docs / bootstrap — a read-only fetch.
+    "{GET} https://antigravity.google",
+    # Google Sign-In ("Continue with Google"). Google serves the consent AND the cross-domain
+    # `/accounts/SetSID` cookie step from your COUNTRY domain, so the bounded regex covers any
+    # ccTLD; it is anchored, so a look-alike (accounts.google.com.evil.com) is REFUSED.
+    '{*} re:^https://accounts\.google\.[a-z.]{2,7}(/|$)',
+    "{*} https://oauth2.googleapis.com",
+    "{*} https://apis.google.com",
+    # The OAuth userinfo endpoint the login reads after the token exchange, path-scoped because
+    # this host serves many other Google APIs.
+    "{GET} https://www.googleapis.com/oauth2/*",
+    # Sign-in page assets and the avatar the userinfo response points at.
+    "{GET} https://www.gstatic.com",
+    "{GET} https://ssl.gstatic.com",
+    "{GET} https://fonts.gstatic.com",
+    "{GET} https://fonts.googleapis.com",
+    "{GET} https://lh3.googleusercontent.com",
+    # The VS Code-fork asset CDN — Antigravity fetches extension and built-in metadata here.
+    "{*} https://main.vscode-cdn.net",
+    # The extension MARKETPLACE (Open VSX): the gallery protocol OPTIONS-preflights and POSTs an
+    # `extensionquery`, so all verbs. Remove it in the consuming app if you do not want the
+    # marketplace reachable.
+    "{*} https://open-vsx.org",
+    # The Open VSX CONTENT CDN — the gallery serves metadata, the packages themselves come from
+    # this Eclipse Foundation host. Both are needed to install an extension.
+    "{GET,HEAD,OPTIONS} https://openvsx.eclipsecontent.org",
+]
+# Deliberately-DENIED noise, kept out of the default `sbx net logs`. A `mute` never changes the
+# verdict (still denied, still counted by `sbx net stats`; see them with `--all`).
+mute = [
+    # Telemetry + feature flags.
+    "play.googleapis.com",              # Google Play Services telemetry
+    "antigravity-unleash.goog",         # Unleash feature flags (remote toggles)
+    "playwright.azureedge.net",         # Playwright browser-driver download…
+    "playwright-akamai.azureedge.net",  # …and its two CDN fallback mirrors
+    "playwright-verizon.azureedge.net",
+    # The IN-APP self-updater — inert in the cage (a self-downloaded binary is not autoPatchelf'd);
+    # `sbx upgrade tarball` is the real upgrade path. Its version API and the gvt1 download CDN are
+    # reached HOST-SIDE by the resolver below, not through a cage allowlist.
+    "antigravity-ide-auto-updater-974169037036.us-central1.run.app",
+    "edgedl.me.gvt1.com",
+    # The in-cage Chromium's own background services — irrelevant to the login.
+    "@chromium-background",
+    # Crash reporting (the app's own, not Chromium's).
+    "*.sentry.io",
+    # VS Code telemetry (Antigravity is a VS Code fork) — Microsoft's OneCollector endpoint.
+    "*.events.data.microsoft.com",
+    # Google page chrome (favicon, account `async/folae`) — the login completes without it.
+    "www.google.com",
+    # Google Tag Manager — analytics / marketing tags, not functional.
+    "www.googletagmanager.com",
+]
+
+[bundle.antigravity.packages]
+# Google's official prebuilt IDE tarball, tracked automatically through the resolver below.
+# Provisioned and autoPatchelf'd HOST-SIDE (Electron, no source build).
+antigravity-ide = "tarball:resolve"
+# An in-cage Chromium for the Google Sign-In flow. HEAVY — a large nixpkgs closure on first launch,
+# seeded and offline-reusable after, and shared with every other Chromium profile in your store.
+chromium = "nix:chromium"
+
+# The auto-upgrade resolver. sbx runs `resolve` in a HERMETIC sandbox (sbx's own base tools, never
+# the host's; the HOST network, because provisioning is host-side and the allowlist governs runtime
+# egress), captures the `.tar.gz` URL it prints, validates it, and pins its content hash. The
+# command queries Google's official auto-updater version API (a JSON array, newest first), reads
+# `version` and `execution_id` from element [0] with base tools (no jq), and builds the download
+# URL on Google's official Edge CDN. `printf` rather than `echo`, so the URL carries no trailing
+# newline.
+[bundle.antigravity.tarball.antigravity-ide]
+resolve = ["sh", "-c", '''
+api="https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases"
+data=$(curl -fsS "$api")
+ver=$(printf '%s' "$data" | grep -oE '"version":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
+eid=$(printf '%s' "$data" | grep -oE '"execution_id":"[^"]*"' | head -1 | sed 's/.*:"//;s/"$//')
+printf 'https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/%s-%s/linux-x64/Antigravity%%20IDE.tar.gz' "$ver" "$eid"
+''']
