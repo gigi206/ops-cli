@@ -162,6 +162,48 @@ const ASKPASS_PATHS: &[&str] = &[
     "/usr/lib/ssh/x11-ssh-askpass",
 ];
 
+/// What `[ssh_agent] confirm` comes to on this host, decided before anything is stood up.
+///
+/// A separate value, and one that is *given* the helper rather than finding it, because the arm
+/// that matters most cannot otherwise be reached by a test: [`ASKPASS_PATHS`] is a fixed list no
+/// environment shadows, so a host that has a helper installed — every host these tests run on —
+/// can never exercise the refusal. Deciding here also means the search happens once, where the
+/// launch used to run it twice and could in principle get two answers.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    /// `confirm` was not asked for. The broker runs, and signs without prompting.
+    NotAsked,
+    /// Asked, and this helper answers for it.
+    Prompt(PathBuf),
+    /// Asked, and the host has none. The grant is refused **whole** rather than quietly served
+    /// without prompts: running the broker anyway would hand the cage a key *and* drop the one
+    /// condition it was granted under, which is the failure mode this variant exists to keep
+    /// distinct from [`NotAsked`](Self::NotAsked).
+    NoHelper,
+}
+
+impl Confirmation {
+    /// The helper a broker is wired with, which is `None` for both refusing arms — a grant that
+    /// asked for prompts and found no helper must never be started with prompting off.
+    pub(crate) fn helper(self) -> Option<PathBuf> {
+        match self {
+            Confirmation::Prompt(path) => Some(path),
+            Confirmation::NotAsked | Confirmation::NoHelper => None,
+        }
+    }
+}
+
+/// Resolve `[ssh_agent] confirm` against the helper this host offers, if any.
+pub(crate) fn confirmation(asked: bool, askpass: Option<PathBuf>) -> Confirmation {
+    match (asked, askpass) {
+        // A helper the config never asked to use is not consulted: `confirm` is what turns
+        // prompting on, and a host that happens to have one does not turn it on by itself.
+        (false, _) => Confirmation::NotAsked,
+        (true, Some(helper)) => Confirmation::Prompt(helper),
+        (true, None) => Confirmation::NoHelper,
+    }
+}
+
 /// The host-side per-signature confirmation (`[ssh_agent] confirm`).
 ///
 /// Every signature the cage asks for becomes a prompt **on the host desktop**, and is forwarded to
@@ -1427,6 +1469,46 @@ mod tests {
             !tmp.path().join("never.seen").exists(),
             "no prompt may be raised for a key that was never granted"
         );
+    }
+
+    /// What a launch does with `confirm`, including the arm no host these tests run on can reach.
+    ///
+    /// `search` is already driven with empty candidate lists above, but the *decision* it feeds was
+    /// only reachable through the launch, which searches the real host — and this one always has a
+    /// helper. The distinction that carries the security is between the two arms that both wire no
+    /// helper: not asking means sign without prompting, asking and finding none means **no agent at
+    /// all**. Collapsing them would hand the cage a key while dropping the condition it was granted
+    /// under, and nothing in the types stops that collapse.
+    #[test]
+    fn confirm_with_no_helper_on_the_host_refuses_the_grant_rather_than_dropping_the_prompt() {
+        let helper = PathBuf::from("/usr/lib/openssh/gnome-ssh-askpass");
+
+        assert_eq!(
+            confirmation(true, Some(helper.clone())),
+            Confirmation::Prompt(helper.clone()),
+            "asked, and a helper answers: every signature prompts"
+        );
+        assert_eq!(
+            confirmation(true, None),
+            Confirmation::NoHelper,
+            "asked, and the host has none: the grant is refused whole"
+        );
+        assert_eq!(
+            confirmation(false, None),
+            Confirmation::NotAsked,
+            "not asked: the broker runs and signs without prompting"
+        );
+        assert_eq!(
+            confirmation(false, Some(helper.clone())),
+            Confirmation::NotAsked,
+            "a helper the config never asked for does not turn prompting on by itself"
+        );
+
+        // What each arm wires. Both refusing arms yield no helper, and only one of them is allowed
+        // to reach `start` — the launch refuses on `NoHelper` before it gets here.
+        assert_eq!(Confirmation::Prompt(helper.clone()).helper(), Some(helper));
+        assert_eq!(Confirmation::NotAsked.helper(), None);
+        assert_eq!(Confirmation::NoHelper.helper(), None);
     }
 
     /// The helper sbx runs must never be one the *cage's* configuration chose. `$SSH_ASKPASS` is

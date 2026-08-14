@@ -4611,57 +4611,54 @@ fn build(
                          entry may name."
                     )),
                     // `confirm` asks for a prompt on every signature, which takes an askpass helper
-                    // on the host. Resolved before anything is stood up, and its absence refuses the
-                    // grant: running the broker anyway would hand the cage a key *and* silently drop
-                    // the one condition the grant was made under.
-                    Ok(a)
-                        if prep.cfg.ssh_agent_confirm
-                            && sshagent::Confirmer::askpass().is_none() =>
-                    {
-                        crate::diag::warn(&format!(
+                    // on the host. Resolved once, before anything is stood up, so the decision to
+                    // refuse and the wiring that follows it cannot be answered by two searches.
+                    Ok(a) => match sshagent::confirmation(
+                        prep.cfg.ssh_agent_confirm,
+                        sshagent::Confirmer::askpass(),
+                    ) {
+                        // The absence of a helper refuses the grant: running the broker anyway
+                        // would hand the cage a key *and* silently drop the one condition the
+                        // grant was made under.
+                        sshagent::Confirmation::NoHelper => crate::diag::warn(&format!(
                             "`[ssh_agent] confirm` asks for a prompt on every signature, but no \
                              askpass helper was found on the host (`$SSH_ASKPASS`, `ssh-askpass` on \
                              PATH, or OpenSSH's own) — the cage gets no agent rather than a grant \
                              whose confirmation would never appear. Install one (e.g. the \
                              `ssh-askpass` package), or drop `confirm`. Grant: {}",
                             a.admitted.join(", ")
-                        ));
-                    }
-                    Ok(a) => {
-                        let confirm_with = prep
-                            .cfg
-                            .ssh_agent_confirm
-                            .then(sshagent::Confirmer::askpass)
-                            .flatten();
-                        let (guard, wiring) = sshagent::start(
-                            &prep.layout,
-                            &prep.cfg.ssh_agent,
-                            &host_sock,
-                            confirm_with,
-                            Arc::clone(&notify_wiring.notifier),
-                        )
-                        .map_err(|e| {
-                            eprintln!("sbx: cannot start the ssh-agent broker: {e}");
-                            ExitCode::FAILURE
-                        })?;
-                        crate::diag::note(&format!(
-                            "ssh-agent: the cage may sign with {}{}{}",
-                            a.admitted.join(", "),
-                            match a.withheld {
-                                0 => String::new(),
-                                1 => " (1 other key withheld)".to_string(),
-                                n => format!(" ({n} other keys withheld)"),
-                            },
-                            if prep.cfg.ssh_agent_confirm {
-                                " — each signature asks you first"
-                            } else {
-                                ""
-                            }
-                        ));
-                        sshagent_binds = wiring.binds;
-                        sshagent_env = wiring.env;
-                        sshagent_guard = Some(guard);
-                    }
+                        )),
+                        confirmation => {
+                            let (guard, wiring) = sshagent::start(
+                                &prep.layout,
+                                &prep.cfg.ssh_agent,
+                                &host_sock,
+                                confirmation.helper(),
+                                Arc::clone(&notify_wiring.notifier),
+                            )
+                            .map_err(|e| {
+                                eprintln!("sbx: cannot start the ssh-agent broker: {e}");
+                                ExitCode::FAILURE
+                            })?;
+                            crate::diag::note(&format!(
+                                "ssh-agent: the cage may sign with {}{}{}",
+                                a.admitted.join(", "),
+                                match a.withheld {
+                                    0 => String::new(),
+                                    1 => " (1 other key withheld)".to_string(),
+                                    n => format!(" ({n} other keys withheld)"),
+                                },
+                                if prep.cfg.ssh_agent_confirm {
+                                    " — each signature asks you first"
+                                } else {
+                                    ""
+                                }
+                            ));
+                            sshagent_binds = wiring.binds;
+                            sshagent_env = wiring.env;
+                            sshagent_guard = Some(guard);
+                        }
+                    },
                 }
             }
         }
