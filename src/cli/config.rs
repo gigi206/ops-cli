@@ -330,15 +330,26 @@ fn bind_mode_tag(writable: bool, pal: &style::Palette) -> String {
 /// means "reuse is on and the cache is the built-in one", which is exactly what someone asking for
 /// details wants spelled out. Only the resolver cache can say *which* of the two it is, because the
 /// view keeps its unset state (`None`) while `pool` arrives already collapsed to a `bool`.
-fn write_net_transport(
-    o: &mut String,
+/// The transport settings of a filtering launch: how a permitted request is *carried*, none of them
+/// a verdict. Grouped rather than passed one by one because they are reported together and grow
+/// together.
+struct NetTransport {
     pool: bool,
     ca_roots: bool,
     dns_cache_ttl: Option<u64>,
-    details: bool,
-    pal: &style::Palette,
-) {
+    idle_timeout: Option<u64>,
+    max_connections: Option<usize>,
+}
+
+fn write_net_transport(o: &mut String, t: NetTransport, details: bool, pal: &style::Palette) {
     use std::fmt::Write as _;
+    let NetTransport {
+        pool,
+        ca_roots,
+        dns_cache_ttl,
+        idle_timeout,
+        max_connections,
+    } = t;
     let mut line = |s: &str| {
         let _ = writeln!(o, "    {}", style::dim_prose(s, pal));
     };
@@ -368,6 +379,32 @@ fn write_net_transport(
         None if details => line(&format!(
             "dns cache: {}s (built-in default; a resolved address stands for that long)",
             crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs()
+        )),
+        None => {}
+    }
+    // Only meaningful where something is kept: `pool = false` holds nothing to age out, and the
+    // line above already said so.
+    if pool {
+        match idle_timeout {
+            Some(secs) => line(&format!(
+                "idle timeout: {secs}s (a connection with nothing to carry is closed after that)"
+            )),
+            None if details => line(&format!(
+                "idle timeout: {}s (built-in default; a connection with nothing to carry is \
+                 closed after that)",
+                crate::allowlist::DEFAULT_IDLE_TIMEOUT.as_secs()
+            )),
+            None => {}
+        }
+    }
+    match max_connections {
+        Some(max) => line(&format!(
+            "max connections: {max} (one beyond it is refused `connection-cap`, not queued)"
+        )),
+        None if details => line(&format!(
+            "max connections: {} (built-in default; one beyond it is refused `connection-cap`, \
+             not queued)",
+            crate::allowlist::DEFAULT_MAX_CONNECTIONS
         )),
         None => {}
     }
@@ -532,6 +569,8 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             pool,
             ca_roots,
             dns_cache_ttl,
+            idle_timeout,
+            max_connections,
             builtin,
         } => {
             let _ = writeln!(
@@ -574,7 +613,18 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
                     )
                 );
             }
-            write_net_transport(&mut o, *pool, *ca_roots, *dns_cache_ttl, details, pal);
+            write_net_transport(
+                &mut o,
+                NetTransport {
+                    pool: *pool,
+                    ca_roots: *ca_roots,
+                    dns_cache_ttl: *dns_cache_ttl,
+                    idle_timeout: *idle_timeout,
+                    max_connections: *max_connections,
+                },
+                details,
+                pal,
+            );
             match default_action {
                 // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
                 NetDefaultView::Deny => {
@@ -1352,6 +1402,8 @@ fn render_app_detail(
             pool,
             ca_roots,
             dns_cache_ttl,
+            idle_timeout,
+            max_connections,
             builtin,
         } => {
             let _ = writeln!(
@@ -1389,7 +1441,18 @@ fn render_app_detail(
                     )
                 );
             }
-            write_net_transport(&mut o, *pool, *ca_roots, *dns_cache_ttl, details, pal);
+            write_net_transport(
+                &mut o,
+                NetTransport {
+                    pool: *pool,
+                    ca_roots: *ca_roots,
+                    dns_cache_ttl: *dns_cache_ttl,
+                    idle_timeout: *idle_timeout,
+                    max_connections: *max_connections,
+                },
+                details,
+                pal,
+            );
             if details {
                 for rule in allow {
                     let _ = writeln!(o, "    allow {n}{rule}{r}");
@@ -2520,6 +2583,8 @@ mod tests {
                 pool: true,
                 ca_roots: true,
                 dns_cache_ttl: None,
+                idle_timeout: None,
+                max_connections: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,
@@ -2854,32 +2919,65 @@ mod tests {
             out.contains("connection reuse: on"),
             "the reuse default must be named under --details:\n{out}"
         );
-        assert!(
-            out.contains(&format!(
+        for expected in [
+            format!(
                 "dns cache: {}s (built-in default;",
                 crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs()
-            )),
-            "the built-in resolver cache must be named, and marked as the built-in:\n{out}"
-        );
+            ),
+            format!(
+                "idle timeout: {}s (built-in default;",
+                crate::allowlist::DEFAULT_IDLE_TIMEOUT.as_secs()
+            ),
+            format!(
+                "max connections: {} (built-in default;",
+                crate::allowlist::DEFAULT_MAX_CONNECTIONS
+            ),
+        ] {
+            assert!(
+                out.contains(&expected),
+                "each built-in must be named, and marked as the built-in — missing \
+                 `{expected}`:\n{out}"
+            );
+        }
 
         // A layer-set value keeps its own wording: it is not a default and must not read as one,
         // even where the number happens to match.
         let mut view = sample_config_view();
-        if let NetworkView::Allowlist { dns_cache_ttl, .. } = &mut view.network {
+        if let NetworkView::Allowlist {
+            dns_cache_ttl,
+            idle_timeout,
+            max_connections,
+            ..
+        } = &mut view.network
+        {
             *dns_cache_ttl = Some(crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs());
+            *idle_timeout = Some(crate::allowlist::DEFAULT_IDLE_TIMEOUT.as_secs());
+            *max_connections = Some(crate::allowlist::DEFAULT_MAX_CONNECTIONS);
         }
         let out = render_config(&view, &plain, true);
         assert!(
             !out.contains("built-in default"),
             "a value a layer set must not be reported as the built-in:\n{out}"
         );
-        assert!(
-            out.contains(&format!(
+        for expected in [
+            format!(
                 "dns cache: {}s (a resolved address",
                 crate::allowlist::DEFAULT_DNS_CACHE_TTL.as_secs()
-            )),
-            "a layer-set value must still name its duration:\n{out}"
-        );
+            ),
+            format!(
+                "idle timeout: {}s (a connection with nothing",
+                crate::allowlist::DEFAULT_IDLE_TIMEOUT.as_secs()
+            ),
+            format!(
+                "max connections: {} (one beyond it",
+                crate::allowlist::DEFAULT_MAX_CONNECTIONS
+            ),
+        ] {
+            assert!(
+                out.contains(&expected),
+                "a layer-set value must still name itself — missing `{expected}`:\n{out}"
+            );
+        }
     }
 
     #[test]
@@ -2912,6 +3010,8 @@ mod tests {
                 pool: true,
                 ca_roots: true,
                 dns_cache_ttl: None,
+                idle_timeout: None,
+                max_connections: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Global,

@@ -88,6 +88,7 @@
 //! | `403` | `signer-refused`         | a signer plugin would not form this request's credential; the body carries the plugin's own reason, scrubbed of every declared credential |
 //! | `413` | `signer-body-too-large`  | a signer asked to be told a digest over the request body, and the request declares a `Content-Length` above what the proxy holds. No plugin refused: sbx did, from the head, before the body was invited. An over-cap `chunked` body declares no length and is discovered while being read, so it keeps the `bad-request:chunked` above |
 //! | `503` | `splice-cap`             | the concurrent raw (`tcp://`) tunnel cap was reached (retry when one closes) |
+//! | `503` | `connection-cap`         | the proxy is already serving as many client connections as it will serve at once (`[network] max_connections`). Answered on the accept loop, before anything is read, so the caller's own request is still unread when the connection closes and the refusal arrives followed by a reset |
 //! | `503` | `body-buffer-cap`        | the proxy is already holding as much request-body data as it will hold at one time (retry when one in flight completes). Nothing is wrong with the request: it is a shared ceiling on host memory, since the proxy buffers host-side and the cage's own `MemoryMax` does not reach it |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
 //! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
@@ -199,7 +200,7 @@ use wire::*;
 /// or hung peer cannot pin a thread forever.
 pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()> {
     for stream in listener.incoming() {
-        let stream = match stream {
+        let mut stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 // A transient accept error (host fd exhaustion, an aborted connection) must not
@@ -210,11 +211,38 @@ pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()
                 continue;
             }
         };
-        // Cap live connection threads: a new connection beyond the cap is refused (closed) rather
-        // than spawned, so an in-cage agent cannot exhaust host threads/fds by opening connections
+        // Cap live connection threads: a new connection beyond the cap is refused rather than
+        // spawned, so an in-cage caller cannot exhaust host threads/fds by opening connections
         // faster than they complete. The guard decrements on the handler thread's exit.
-        if ctx.conns.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNS {
-            drop(stream);
+        //
+        // Refused with a reason, not dropped. The raw-splice cap a few hundred lines down has always
+        // answered `503 splice-cap`, and a caller that hits this one has exactly the same question;
+        // a bare close reaches it as a connection reset with nothing anywhere to explain it. The
+        // write timeout goes on first and is short: this runs on the accept loop, and a peer that
+        // connects and never reads must not be able to hold the loop while it does so.
+        //
+        // The caller's own request is still unread when this closes, so the close reaches it as a
+        // reset — after the refusal itself has been handed over, which is where an HTTP client reads
+        // its response from. Draining the request first to make the close clean would put an
+        // unbounded read on the accept loop to spare a client something it already handles.
+        if ctx.conns.load(Ordering::Relaxed) >= ctx.max_conns {
+            ctx.outcome(
+                super::control::Proto::Other,
+                "",
+                0,
+                None,
+                None,
+                StatKind::Blocked,
+                CONNECTION_CAP,
+            );
+            let _ = stream.set_write_timeout(Some(CAP_REFUSAL_WRITE_TIMEOUT));
+            let _ = write_refusal(
+                &mut stream,
+                "503 Service Unavailable",
+                CONNECTION_CAP,
+                "the egress proxy is already serving as many connections as it will serve at once; \
+                 retry when one finishes, or raise `[network] max_connections`",
+            );
             continue;
         }
         ctx.conns.fetch_add(1, Ordering::Relaxed);
@@ -236,22 +264,16 @@ pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()
     Ok(())
 }
 
-/// The most connection-handling threads alive at once. A connection beyond this is refused
-/// (fail-closed) rather than spawned, bounding the host threads/fds an in-cage agent can tie up
-/// (including a slowloris drip-feed that holds each thread through the per-read timeout window). Far
-/// above any realistic concurrent-fetch workload from a single cage.
-const MAX_CONCURRENT_CONNS: usize = 512;
+/// What a connection refused over [`ProxyCtx::max_conns`] is told.
+const CONNECTION_CAP: &str = "connection-cap";
+
+/// How long the accept loop will spend telling one over-cap connection why it was refused. The
+/// refusal is ~200 bytes into a socket buffer, so this expires only for a peer that connected and
+/// stopped reading — and that peer must not be able to hold the loop open while it does.
+const CAP_REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// The largest request head (CONNECT or the decrypted inner request) the proxy will buffer.
 const HEAD_MAX: usize = 16 * 1024;
-
-/// How long an intercepted tunnel that has already served a request waits for the next one before it
-/// is closed. It answers for the client's leg the question [`pool`]'s `MAX_IDLE` answers for the
-/// upstream's, and lands on the same short bound for the same reason: the workload reuse actually
-/// helps comes back in milliseconds, and waiting longer only widens the window in which the far side
-/// closes first. Here it also bounds a host thread, which is why it is capped rather than left at the
-/// launch's own timeout. A client that comes back later simply opens a tunnel again.
-const CLIENT_IDLE: Duration = Duration::from_secs(10);
 
 /// What a request refused by [`head_carries_control_byte`] is told, on every plane that reads a head.
 /// It names the byte class rather than the attack, because a client sending one by accident needs to
@@ -418,7 +440,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
             let _ = br
                 .get_ref()
                 .sock
-                .set_read_timeout(Some(ctx.timeout.min(CLIENT_IDLE)));
+                .set_read_timeout(Some(ctx.timeout.min(ctx.idle)));
         }
         match serve_tunneled_request(br, ctx, &connect_host, port)? {
             Turn::Continue(tunnel) => {
@@ -1301,7 +1323,7 @@ fn serve_tunneled_request(
         // belongs to the client and answering keep-alive over a `Connection: close` would be sbx
         // telling the client something the client did not ask for.
         if inner.keeps_alive() {
-            ClientLeg::MayReuse
+            ClientLeg::MayReuse { idle: ctx.idle }
         } else {
             ClientLeg::Close
         },
@@ -3480,7 +3502,7 @@ fn relay_response_head<R: BufRead, W: Write>(
             BodyFraming::ToEof
         };
         let persistent = final_head
-            && matches!(client_leg, ClientLeg::MayReuse)
+            && matches!(client_leg, ClientLeg::MayReuse { .. })
             && response_keeps_alive(&head)
             // A body whose end the client can only find by watching for the close cannot be followed
             // by anything: announcing a persistent connection would leave it waiting for a boundary
@@ -3494,8 +3516,8 @@ fn relay_response_head<R: BufRead, W: Write>(
         let mut wire = match client_leg {
             _ if !final_head => head.clone(),
             ClientLeg::Verbatim => head.clone(),
-            ClientLeg::MayReuse if persistent => offer_reuse_in_head(&head),
-            ClientLeg::Close | ClientLeg::MayReuse => force_close_in_head(&head),
+            ClientLeg::MayReuse { idle } if persistent => offer_reuse_in_head(&head, idle),
+            ClientLeg::Close | ClientLeg::MayReuse { .. } => force_close_in_head(&head),
         };
         if !redactions.is_empty() {
             redact_in_place(&mut wire, redactions);
@@ -3538,8 +3560,10 @@ enum ClientLeg {
     /// already forced `Connection: close` upstream, so the head being relayed carries that answer.
     Verbatim,
     /// Relay the head as the upstream framed it when it leaves the client's connection usable, and
-    /// rewrite it to `Connection: close` when it does not. The only variant that reports back.
-    MayReuse,
+    /// rewrite it to `Connection: close` when it does not. The only variant that reports back, and
+    /// the only one that carries the idle bound: what it announces to the client has to be the bound
+    /// the tunnel will actually be held for.
+    MayReuse { idle: Duration },
 }
 
 /// Cleanly shut down the interception TLS after a response is fully relayed: queue a `close_notify`

@@ -154,6 +154,15 @@ pub(crate) struct ProxyCtx {
     /// — when the launch opens a fresh connection per request. Shared across connection threads
     /// through the `Arc<ProxyCtx>`; see [`super::pool`] for what may enter it and why.
     pub(super) pool: Option<super::pool::UpstreamPool>,
+    /// How long a connection may sit idle before it is let go, on either leg (`[network]
+    /// idle_timeout`, else [`crate::allowlist::DEFAULT_IDLE_TIMEOUT`]). Resolved here rather than
+    /// read from the policy at each use, so the tunnel that waits and the pool that ages out a
+    /// parked connection cannot end up answering the same question two ways.
+    pub(super) idle: Duration,
+    /// The most connection threads alive at once (`[network] max_connections`, else
+    /// [`crate::allowlist::DEFAULT_MAX_CONNECTIONS`]). A connection beyond it is refused rather than
+    /// spawned; see [`super::serve`].
+    pub(super) max_conns: usize,
     /// The session's record of what its signer plugins formed, read by `sbx logs --feed signer`, or
     /// `None` when the launch declared no signer (and in tests). Attached by
     /// [`crate::sandbox::egress::start`] via [`Self::with_signer_log`]; every path that forms a
@@ -193,7 +202,16 @@ impl ProxyCtx {
         );
         // Built only when the launch asks for reuse, so a launch that does not is byte-for-byte the
         // connection-per-request path and cannot inherit any of reuse's failure modes.
-        let pool = policy.pool().then(super::pool::UpstreamPool::new);
+        // Both resolved once, here, so every place that asks reads the same answer.
+        let policy_idle = policy
+            .idle_timeout()
+            .unwrap_or(crate::allowlist::DEFAULT_IDLE_TIMEOUT);
+        let pool = policy
+            .pool()
+            .then(|| super::pool::UpstreamPool::new(policy_idle));
+        let policy_max_conns = policy
+            .max_connections()
+            .unwrap_or(crate::allowlist::DEFAULT_MAX_CONNECTIONS);
         Ok(ProxyCtx {
             ca,
             server_config,
@@ -224,6 +242,8 @@ impl ProxyCtx {
             notifier: None,
             capture: None,
             pool,
+            idle: policy_idle,
+            max_conns: policy_max_conns,
             signer_log: None,
         })
     }
@@ -729,28 +749,19 @@ fn refusal_detail(reason: &str) -> &'static str {
 }
 
 /// Append the built-in self-equip allow rules to a policy's allow list (deny is unchanged, so a
-/// user deny still wins over a built-in allow). The default action *and* the ask timeout are
-/// carried through unchanged — rebuilding the policy must not silently demote an allow-by-default
-/// (denylist) posture to deny-by-default, nor drop the configured ask timeout.
+/// user deny still wins over a built-in allow).
+///
+/// It **amends** the policy rather than rebuilding one, and that is the whole point: this is the
+/// policy the proxy context reads every transport setting from, and a rebuild carries only the
+/// settings someone remembered to name. The list was right until each new setting was added — the
+/// idle bound and the connection cap were both dropped here on their first day, found by a test that
+/// asked what the wire actually said. [`EgressPolicy::with_rules`] cannot drop what it never
+/// touches.
 pub(crate) fn union_with_builtin(user: EgressPolicy) -> EgressPolicy {
     let mut allow = user.allow_rules().to_vec();
     allow.extend(builtin_allow_rules());
-    EgressPolicy::new(allow, user.deny_rules().to_vec())
-        .with_default(user.default_action())
-        .with_ask_timeout(user.ask_timeout())
-        .with_ask_notice(user.ask_notice())
-        // Carry the mute (`dontaudit`) set through — it is log-only, so the built-in allow union
-        // does not touch it, but a rebuild that dropped it would silently un-suppress the refusals.
-        .with_mute(user.mute_rules().to_vec())
-        // Carry the DNS cache TTL through — a rebuild that dropped it would silently revert the
-        // configured value to the default.
-        .with_dns_cache_ttl(user.dns_cache_ttl())
-        // Carry the HTTP/2 host set through — a rebuild that dropped it would silently demote a
-        // designated gRPC host back to HTTP/1.1, failing every h2-only client.
-        .with_http2(user.http2_hosts().to_vec())
-        // Carry the upstream-reuse setting through — this rebuild is what the proxy context reads
-        // the setting from, so dropping it here would turn the whole feature off.
-        .with_pool(user.pool())
+    let deny = user.deny_rules().to_vec();
+    user.with_rules(allow, deny)
 }
 
 /// The policy the proxy evaluates for a request: the immutable config policy, or — when a live
@@ -774,19 +785,10 @@ pub(super) fn effective_policy(ctx: &ProxyCtx) -> std::borrow::Cow<'_, EgressPol
     // session. Carried through this rebuild (like default_action/ask), or it would be dropped.
     let mut mute = ctx.policy.mute_rules().to_vec();
     mute.extend(ctx.manual.mute_snapshot());
-    // Carry default_action + ask_timeout + ask_notice through unchanged — a pure allow/deny merge
-    // would silently flip the posture (lose the timeout, or demote deny↔ask), the same contract
-    // `union_with_builtin` keeps.
-    std::borrow::Cow::Owned(
-        EgressPolicy::new(allow, deny)
-            .with_default(ctx.policy.default_action())
-            .with_ask_timeout(ctx.policy.ask_timeout())
-            .with_ask_notice(ctx.policy.ask_notice())
-            .with_mute(mute)
-            .with_dns_cache_ttl(ctx.policy.dns_cache_ttl())
-            .with_http2(ctx.policy.http2_hosts().to_vec())
-            .with_pool(ctx.policy.pool()),
-    )
+    // Amended, not rebuilt, for the reason [`union_with_builtin`] gives: a merge that names the
+    // settings it carries loses the ones it does not, and a `--session` overlay must change what is
+    // allowed and nothing else.
+    std::borrow::Cow::Owned(ctx.policy.clone().with_rules(allow, deny).with_mute(mute))
 }
 
 #[cfg(test)]

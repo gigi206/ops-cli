@@ -129,6 +129,8 @@ fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
         default_methods: None,
         dns_cache_ttl: None,
         pool: None,
+        idle_timeout: None,
+        max_connections: None,
         ca_roots: None,
     })
 }
@@ -203,6 +205,8 @@ fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
         default_methods: None,
         dns_cache_ttl: None,
         pool: None,
+        idle_timeout: None,
+        max_connections: None,
         ca_roots: None,
     });
     let policy =
@@ -547,6 +551,8 @@ fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })),
         ..RawConfig::default()
@@ -785,6 +791,8 @@ fn an_untrusted_project_app_cannot_widen_its_default_methods() {
         default_methods: Some(vec!["*".into()]),
         dns_cache_ttl: None,
         pool: None,
+        idle_timeout: None,
+        max_connections: None,
         ca_roots: None,
     });
     let project = raw_with_app("probe", raw_app(&["id"], &[], &[], &[], Some(net)));
@@ -930,6 +938,8 @@ fn network_modes_set_the_egress_default_action() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })
     };
@@ -1032,6 +1042,8 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })
     };
@@ -1092,6 +1104,8 @@ fn a_mode_less_project_network_table_inherits_the_global_mode() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })),
         ..RawConfig::default()
@@ -1132,6 +1146,8 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
                 default_methods: None,
                 dns_cache_ttl: None,
                 pool: None,
+                idle_timeout: None,
+                max_connections: None,
                 ca_roots: None,
             })),
             ..RawApp::default()
@@ -1171,6 +1187,8 @@ fn the_pool_toggle_defaults_on_and_is_gated_trusted_only() {
             default_methods: None,
             dns_cache_ttl: None,
             pool,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })
     };
@@ -1235,6 +1253,8 @@ fn ca_roots_defaults_on_and_a_splice_overrides_a_request_to_drop_them() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots,
         })
     };
@@ -1318,6 +1338,8 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
             default_methods: None,
             dns_cache_ttl: ttl,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })
     };
@@ -1338,6 +1360,86 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
 }
 
 #[test]
+fn the_connection_settings_flow_from_the_table_and_fail_closed_on_a_value_that_would_bite() {
+    let conn_table = |idle: Option<&str>, max: Option<usize>| {
+        NetworkField::Table(NetworkTable {
+            mute: vec![],
+            http2: vec![],
+            capture: None,
+            capture_max_kb: None,
+            mode: Some("deny".into()),
+            allow: vec!["api.example.com".into()],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+            dns_cache_ttl: None,
+            pool: None,
+            idle_timeout: idle.map(str::to_string),
+            max_connections: max,
+            ca_roots: None,
+        })
+    };
+    let policy = |w: &mut Vec<String>, idle, max| match validate_network(
+        w,
+        GLOBAL_CONFIG,
+        conn_table(idle, max),
+    )
+    .unwrap()
+    {
+        NetworkPolicy::Allowlist(p) => p,
+        _ => panic!("a filtering posture is expected"),
+    };
+    let mut w = Vec::new();
+
+    // Unset → the policy carries None, and the proxy applies its own defaults.
+    let def = policy(&mut w, None, None);
+    assert!(def.idle_timeout().is_none());
+    assert!(def.max_connections().is_none());
+
+    // Set → the value flows through, in the duration grammar `ask_timeout` already uses.
+    let set = policy(&mut w, Some("2m"), Some(64));
+    assert_eq!(
+        set.idle_timeout(),
+        Some(std::time::Duration::from_secs(120))
+    );
+    assert_eq!(set.max_connections(), Some(64));
+    assert!(w.is_empty(), "valid values warn nothing: {w:?}");
+
+    // A zero idle bound is `pool = false` said less clearly, and reading it as a bound would leave a
+    // launch reusing connections it closes at once. Refused, and the built-in stays.
+    let zero = policy(&mut w, Some("0s"), None);
+    assert!(zero.idle_timeout().is_none(), "the built-in bound stays");
+    assert!(
+        w.iter()
+            .any(|m| m.contains("idle_timeout") && m.contains("pool = false")),
+        "the warning must name the field that actually turns reuse off: {w:?}"
+    );
+
+    // A cap of zero would refuse every connection — far likelier a typo than an intent.
+    w.clear();
+    let none_at_all = policy(&mut w, None, Some(0));
+    assert!(
+        none_at_all.max_connections().is_none(),
+        "the built-in cap stays"
+    );
+    assert!(
+        w.iter().any(|m| m.contains("max_connections = 0")),
+        "the warning must name the value it refused: {w:?}"
+    );
+
+    // A malformed duration falls back to the built-in, warned, and never fails the launch.
+    w.clear();
+    let junk = policy(&mut w, Some("soon"), None);
+    assert!(junk.idle_timeout().is_none());
+    assert!(
+        w.iter().any(|m| m.contains("invalid `idle_timeout`")),
+        "a malformed duration must say so: {w:?}"
+    );
+}
+
+#[test]
 fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_typo() {
     use crate::sandbox::control::CaptureLevel;
     let capture_table = |level: Option<&str>, kb: Option<u64>| {
@@ -1355,6 +1457,8 @@ fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_ty
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })
     };
@@ -1412,6 +1516,8 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })),
         ..RawConfig::default()
@@ -1438,6 +1544,8 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })),
         ..RawConfig::default()
@@ -1505,6 +1613,8 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })
     };
@@ -1548,6 +1658,8 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
         default_methods: None,
         dns_cache_ttl: None,
         pool: None,
+        idle_timeout: None,
+        max_connections: None,
         ca_roots: None,
     });
     let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
@@ -1575,6 +1687,8 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })
     };
@@ -1610,6 +1724,8 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
         default_methods: None,
         dns_cache_ttl: None,
         pool: None,
+        idle_timeout: None,
+        max_connections: None,
         ca_roots: None,
     });
     let _ = validate_network(&mut w, GLOBAL_CONFIG, moot).unwrap();
@@ -3166,6 +3282,8 @@ fn a_baseline_default_methods_is_ignored_with_a_warning() {
             default_methods: Some(vec!["GET".into()]),
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })),
         ..RawConfig::default()
@@ -5505,6 +5623,8 @@ fn an_unknown_network_mode_is_dropped_with_a_warning() {
                 default_methods: None,
                 dns_cache_ttl: None,
                 pool: None,
+                idle_timeout: None,
+                max_connections: None,
                 ca_roots: None,
             })),
             ..RawConfig::default()
@@ -5616,6 +5736,8 @@ fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConf
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })),
         secret: Some(raw_secret_section(secrets)),
@@ -6180,6 +6302,8 @@ fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })),
         ..RawConfig::default()
@@ -6331,6 +6455,8 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
             default_methods: None,
             dns_cache_ttl: None,
             pool: None,
+            idle_timeout: None,
+            max_connections: None,
             ca_roots: None,
         })),
     );
@@ -6434,6 +6560,8 @@ fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
         default_methods: None,
         dns_cache_ttl: None,
         pool: None,
+        idle_timeout: None,
+        max_connections: None,
         ca_roots: None,
     }))
 }

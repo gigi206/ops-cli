@@ -57,6 +57,8 @@ for the full semantics.
 | `stats` | `false` turns off the per-host decision counters ([`sbx net stats`](../networking/observability)) |
 | `dns_cache_ttl` | seconds the proxy caches a host's resolved address (default `60`; `0` disables the cache) |
 | `pool` | `false` stops the proxy carrying a request over a connection an earlier request left behind, on either leg (default `true`): see below |
+| `idle_timeout` | how long a connection with nothing to carry is kept, as a duration (`"30s"`, `"2m"`; default 10 seconds): see below |
+| `max_connections` | the most client connections the proxy serves at once (default `512`): see below |
 | `ca_roots` | `false` hands the cage the session CA alone instead of pairing it with the public roots (default `true`): see below |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
@@ -147,19 +149,6 @@ pool  = false   # every request opens its own connection, on both legs
 Because it is on by default, [`sbx config`](../cli/config) prints a line only for a launch that
 turned it **off**; `sbx config show --details` states the posture either way.
 
-Measured on loopback, with the client side unchanged, a small request costs about **470 µs**
-with reuse against **730 µs** without it. Against a real host the saving is far larger,
-because each avoided handshake also avoids its round trips: two thousand requests to a CDN
-took **15.1 s with reuse against 48.9 s without**, or 7.4 ms against 24.5 ms each, on a
-request the host serves in 6.0 ms with no sandbox at all. Reuse is most of what separates a
-filtered launch from an unfiltered one: about a millisecond and a half of overhead with it,
-about twenty without. Those are one link on one machine, so read them as a shape rather than
-a promise.
-
-Like the rest of the table this is trusted and global-only, so a global config can set it for
-a project that has no way to observe it: nothing in the cage can tell whether a connection
-was reused. Whenever a layer turns it off, [`sbx config`](../cli/config) says so.
-
 ### What it does not change
 
 Reuse decides how a permitted request is carried, never whether it is permitted. Every check
@@ -216,6 +205,66 @@ that fails on a fresh connection too, which would have failed without reuse anyw
 why reuse is on by default. It was not at first, and what changed the default was measuring
 what refusing it cost: 12 300 requests across a burst of four thousand and a ten-minute pass
 of one every two seconds, on one CDN over one link, produced no failure of any kind.
+
+### How long a connection is kept (`idle_timeout`)
+
+A connection with nothing to carry is not kept forever. `idle_timeout` is how long it may
+sit, and it is one question asked of both legs: how long the cage's tunnel waits for the
+next request before closing, and how stale a connection to the real server may be and
+still be handed to one. The default is ten seconds.
+
+```toml
+[network]
+mode  = "deny"
+allow = ["api.example.com"]
+idle_timeout = "60s"   # default "10s"
+```
+
+Longer suits a caller that comes back after thinking: an agent between API calls keeps its
+tunnel instead of paying for a new handshake. It costs a host thread and a descriptor per
+idle connection, bounded by `max_connections` below, and slightly widens the window in
+which a server closes a kept connection before the proxy uses it. That request is answered
+`502 upstream-closed`, never silently. Shorter gives those back and re-handshakes more
+often.
+
+The bound is also what the cage is told: a kept tunnel's response carries sbx's own
+`Keep-Alive`, so a client waits exactly as long as sbx will. Inert under `pool = false`,
+which keeps nothing on either leg. A zero or malformed value is warned and ignored, because
+`pool = false` is how reuse is turned off.
+
+### How many connections at once (`max_connections`)
+
+The proxy serves this many client connections at once; one beyond it is refused with a
+`503` naming `connection-cap` rather than queued. What it bounds is the host threads and
+descriptors an in-cage caller can tie up.
+
+```toml
+[network]
+mode  = "deny"
+allow = ["cache.nixos.org"]
+max_connections = 1024   # default 512
+```
+
+A tunnel that serves several requests holds one connection for all of them, so this counts
+callers rather than requests, and the default is far above any realistic parallel fetch
+from one cage. Raise it for a workload that genuinely fetches in that much parallel and is
+being refused for it, and [`sbx net logs`](../networking/observability) names that refusal.
+Leave it alone otherwise: the direction that matters is up, and raising it raises exactly
+what the cap bounds. Zero is warned and ignored; a cage that should reach nothing is
+`network = "none"`.
+
+Measured on loopback, with the client side unchanged, a small request costs about **470 µs**
+with reuse against **730 µs** without it. Against a real host the saving is far larger,
+because each avoided handshake also avoids its round trips: two thousand requests to a CDN
+took **15.1 s with reuse against 48.9 s without**, or 7.4 ms against 24.5 ms each, on a
+request the host serves in 6.0 ms with no sandbox at all. Reuse is most of what separates a
+filtered launch from an unfiltered one: about a millisecond and a half of overhead with it,
+about twenty without. Those are one link on one machine, so read them as a shape rather than
+a promise.
+
+Like the rest of the table this is trusted and global-only, so a global config can set it for
+a project that has no way to observe it: nothing in the cage can tell whether a connection
+was reused. Whenever a layer turns it off, [`sbx config`](../cli/config) says so.
 
 ## The cage trust anchor (`ca_roots`)
 

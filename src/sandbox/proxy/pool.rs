@@ -21,9 +21,10 @@
 //!   where its framing said, with nothing left buffered anywhere — see [`UpstreamPool::park`].
 //! - **Bounded in count, not in time.** A parked connection is a held host fd with no thread behind
 //!   it, so it sits outside the connection-thread cap that bounds every other holder. [`MAX_PARKED`]
-//!   and [`MAX_PER_KEY`] are that bound, in the same shape the rest of the proxy uses. [`MAX_IDLE`]
-//!   is a separate question and answers a different one: how stale a connection may be and still be
-//!   handed over.
+//!   and [`MAX_PER_KEY`] are that bound, in the same shape the rest of the proxy uses. How stale a
+//!   connection may be and still be handed over is a separate question, answered by the launch's
+//!   idle bound (`[network] idle_timeout`) — the same one the client's tunnel is held for, because
+//!   it is the same question asked of the other leg.
 //!
 //! The residual, stated plainly: an upstream may close a parked connection at any moment. The
 //! checkout probe catches that whenever the close has already arrived, which is the overwhelmingly
@@ -42,12 +43,6 @@ use rustls::{ClientConnection, StreamOwned};
 
 /// A validated TLS connection to a real upstream — what the pool holds and hands out.
 pub(super) type UpstreamTls = StreamOwned<ClientConnection, TcpStream>;
-
-/// How long a connection may have been waiting and still be reused. Deliberately short: upstream
-/// keep-alive timeouts run from a few seconds (Apache's default is 5) to minutes, and a workload that
-/// reuse actually helps — a build fetching from one host — comes back in milliseconds. Waiting longer
-/// would buy nothing and would only widen the window in which the far side closes.
-const MAX_IDLE: Duration = Duration::from_secs(10);
 
 /// Parked connections per `(host, port, credentials)` key.
 const MAX_PER_KEY: usize = 4;
@@ -89,12 +84,19 @@ struct Parked {
 /// The parked upstream connections of one launch, shared across every connection thread.
 pub(super) struct UpstreamPool {
     idle: Mutex<HashMap<PoolKey, Vec<Parked>>>,
+    /// How long a connection may have been waiting and still be reused, from the launch's
+    /// `[network] idle_timeout`. Deliberately short by default: upstream keep-alive timeouts run
+    /// from a few seconds (Apache's default is 5) to minutes, and a workload that reuse actually
+    /// helps — a build fetching from one host — comes back in milliseconds. Waiting longer buys
+    /// nothing and only widens the window in which the far side closes first.
+    max_idle: Duration,
 }
 
 impl UpstreamPool {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(max_idle: Duration) -> Self {
         Self {
             idle: Mutex::new(HashMap::new()),
+            max_idle,
         }
     }
 
@@ -106,7 +108,7 @@ impl UpstreamPool {
     /// connection that fails the probe is dropped here rather than returned to the pool.
     pub(super) fn checkout(&self, key: &PoolKey) -> Option<UpstreamTls> {
         let mut idle = self.idle.lock().ok()?;
-        Self::sweep(&mut idle);
+        Self::sweep(&mut idle, self.max_idle);
         let slot = idle.get_mut(key)?;
         while let Some(parked) = slot.pop() {
             if still_live(&parked.stream.sock) {
@@ -137,7 +139,7 @@ impl UpstreamPool {
         let Ok(mut idle) = self.idle.lock() else {
             return;
         };
-        Self::sweep(&mut idle);
+        Self::sweep(&mut idle, self.max_idle);
         if idle.values().map(Vec::len).sum::<usize>() >= MAX_PARKED {
             return;
         }
@@ -151,15 +153,16 @@ impl UpstreamPool {
         });
     }
 
-    /// Drop everything that has waited longer than [`MAX_IDLE`], and any key left with nothing under
-    /// it. It walks every key rather than the one being asked for, so any use of the pool clears the
-    /// connections a host visited once left behind. What it deliberately is not is a timer: a pool
-    /// nobody touches again keeps what it holds, and [`MAX_PARKED`] rather than the clock is what
-    /// bounds that. Time decides what may be *reused*; count decides what may be *held*.
-    fn sweep(idle: &mut HashMap<PoolKey, Vec<Parked>>) {
+    /// Drop everything that has waited longer than [`Self::max_idle`], and any key left with nothing
+    /// under it. It walks every key rather than the one being asked for, so any use of the pool
+    /// clears the connections a host visited once left behind. What it deliberately is not is a
+    /// timer: a pool nobody touches again keeps what it holds, and [`MAX_PARKED`] rather than the
+    /// clock is what bounds that. Time decides what may be *reused*; count decides what may be
+    /// *held*.
+    fn sweep(idle: &mut HashMap<PoolKey, Vec<Parked>>, max_idle: Duration) {
         let now = Instant::now();
         idle.retain(|_, slot| {
-            slot.retain(|p| now.duration_since(p.since) < MAX_IDLE);
+            slot.retain(|p| now.duration_since(p.since) < max_idle);
             !slot.is_empty()
         });
     }

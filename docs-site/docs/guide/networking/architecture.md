@@ -355,9 +355,24 @@ The tunnel is offered another request only when all of these hold:
 What the client is told is sbx's own answer, never the upstream's: the `Connection` and
 `Keep-Alive` headers a server sent describe the server's socket, and are replaced rather
 than relayed. A tunnel that has answered a request and is waiting for the next is closed
-after ten idle seconds, the same bound the upstream leg uses and for the same reason: a
-client that has another request to send has already decided to. One that comes back later
-simply opens a tunnel again.
+after ten idle seconds by default, the same bound the upstream leg uses and for the same
+reason: a client that has another request to send has already decided to. One that comes
+back later simply opens a tunnel again.
+[`[network] idle_timeout`](../configuration/network#how-long-a-connection-is-kept-idle_timeout)
+moves that bound, on both legs at once, since it is one question asked twice.
+
+#### How many connections at a time
+
+The proxy serves a bounded number of client connections at once, and refuses a further one
+with a `503` naming `connection-cap` rather than queueing it. What it bounds is the host
+threads and descriptors an in-cage caller can tie up, including a caller that opens
+connections faster than they complete and one that abandons a tunnel mid-idle. A tunnel
+that serves several requests holds one connection for all of them, so the bound counts
+callers rather than requests.
+[`[network] max_connections`](../configuration/network#how-many-connections-at-once-max_connections)
+moves it. The refusal is answered before anything is read, so it reaches the caller
+followed by a connection reset: an HTTP client reads the response and reports it, which is
+the point, since a dropped connection would have said nothing at all.
 
 **On the HTTP/2 plane it is sharing rather than take-and-return.** HTTP/2 multiplexes,
 so a connection there is handed to every stream that may use it at once and none of them
@@ -424,7 +439,7 @@ per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text
 never disclosed, so a global-config rule the cage cannot read does not leak),
 `denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,
 `outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
-`injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
+`connection-cap`, `injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
 `upstream-cert-rejected`, `upstream-http2-unsupported`, and `upstream-closed`. A genuine
 upstream status (a real `404`) is relayed verbatim with no such header.
 

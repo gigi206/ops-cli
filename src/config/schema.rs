@@ -1316,6 +1316,33 @@ pub(crate) struct NetworkTable {
     /// to repeat it with the client. Trusted/global-only like the rest of the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pool: Option<bool>,
+    /// How long a connection may sit idle before the egress proxy lets it go, as a duration
+    /// (`"30s"`, `"2m"`). It answers one question on both of a request's legs: how long the cage's
+    /// tunnel waits for the next request before closing, and how stale a parked upstream connection
+    /// may be and still be handed to one. Absent means the default (10 seconds).
+    ///
+    /// Longer suits a caller that comes back after thinking — an agent between API calls keeps its
+    /// tunnel instead of paying for a new handshake — at the price of a host thread and a descriptor
+    /// held per idle connection, bounded by `max_connections`, and of a slightly wider window in
+    /// which an upstream closes a parked connection before the proxy uses it (that request gets a
+    /// `502 upstream-closed`, never a silent failure). Shorter gives those back and re-handshakes
+    /// more often. Inert when `pool = false`, which holds nothing on either leg. A zero or malformed
+    /// value is warned and ignored (`pool = false` is how reuse is turned off). Trusted/global-only
+    /// like the rest of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) idle_timeout: Option<String>,
+    /// The most client connections the egress proxy serves at once. Absent means the default (512).
+    /// A connection beyond the cap is refused with a `503` naming `connection-cap` rather than
+    /// queued, so an in-cage caller cannot exhaust host threads and descriptors by opening
+    /// connections faster than they complete.
+    ///
+    /// The direction that matters is up: raising it raises exactly what the cap bounds. It is worth
+    /// raising for a workload that genuinely fetches in that much parallel and is being refused for
+    /// it — `sbx net logs` names the refusal — and worth leaving alone otherwise. A tunnel that
+    /// serves several requests holds one connection for all of them, so this counts callers rather
+    /// than requests. Zero is warned and ignored. Trusted/global-only like the rest of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_connections: Option<usize>,
     /// Whether the cage's CA bundle carries the public root certificates after the per-session MITM
     /// CA. **On by default**; set it to `false` to hand the cage the MITM CA alone. Under a filtering
     /// posture the MITM CA is the only anchor that verifies anything: every byte the cage receives is
@@ -2147,6 +2174,8 @@ mod tests {
                 default_methods: None,
                 dns_cache_ttl: None,
                 pool: None,
+                idle_timeout: None,
+                max_connections: None,
                 ca_roots: None,
             }))
         );
@@ -2171,6 +2200,8 @@ mod tests {
                 default_methods: None,
                 dns_cache_ttl: None,
                 pool: None,
+                idle_timeout: None,
+                max_connections: None,
                 ca_roots: None,
             }))
         );
@@ -2197,6 +2228,8 @@ mod tests {
                 default_methods: None,
                 dns_cache_ttl: None,
                 pool: None,
+                idle_timeout: None,
+                max_connections: None,
                 ca_roots: None,
             }))
         );

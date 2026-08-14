@@ -456,13 +456,13 @@ pub(super) fn force_close_in_head(head: &[u8]) -> Vec<u8> {
 ///
 /// Replacing rather than passing through is what keeps the two legs' hop parameters from being
 /// mistaken for one. An upstream's `Keep-Alive: timeout=60` describes the upstream's socket; relayed
-/// unchanged it would tell the client it has a minute on a tunnel sbx holds for
-/// [`CLIENT_IDLE`](super::CLIENT_IDLE), and a client that believed it would send its next request
-/// into a connection already gone.
-pub(super) fn offer_reuse_in_head(head: &[u8]) -> Vec<u8> {
+/// unchanged it would tell the client it has a minute on a tunnel sbx holds for `idle`, and a client
+/// that believed it would send its next request into a connection already gone. `idle` is the
+/// launch's own bound (`[network] idle_timeout`), so what is announced is what will be honored.
+pub(super) fn offer_reuse_in_head(head: &[u8], idle: Duration) -> Vec<u8> {
     let replacement = format!(
         "Connection: keep-alive\r\nKeep-Alive: timeout={}\r\n",
-        super::CLIENT_IDLE.as_secs()
+        idle.as_secs()
     );
     rewrite_client_connection(head, replacement.as_bytes())
 }

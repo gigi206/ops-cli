@@ -4745,6 +4745,34 @@ fn validate_network_table(
     if let Some(pool) = table.pool {
         policy = policy.with_pool(pool);
     }
+    // How long an idle connection is kept, on either leg. A zero is refused rather than honored:
+    // "hold nothing" is what `pool = false` says, and reading it here as an idle bound would leave
+    // a launch reusing connections it closes immediately. Malformed falls back to the default,
+    // warned, never a hard config failure — the same shape as `ask_timeout`.
+    if let Some(raw) = &table.idle_timeout {
+        match parse_duration(raw) {
+            Ok(Some(idle)) => policy = policy.with_idle_timeout(Some(idle)),
+            Ok(None) => warnings.push(format!(
+                "{source_label}: ignoring `idle_timeout = \"{raw}\"` — a zero idle bound is \
+                 `pool = false`, which turns connection reuse off on both legs"
+            )),
+            Err(reason) => warnings.push(format!(
+                "{source_label}: ignoring invalid `idle_timeout` — {reason}; the built-in bound \
+                 stays"
+            )),
+        }
+    }
+    // How many client connections the proxy serves at once. Zero would refuse every connection and
+    // is far likelier a typo than an intent, so it is warned and dropped (fail-closed: the built-in
+    // cap stays).
+    match table.max_connections {
+        Some(0) => warnings.push(format!(
+            "{source_label}: ignoring `max_connections = 0` — it would refuse every connection; \
+             use `network = \"none\"` for a cage with no egress"
+        )),
+        Some(max) => policy = policy.with_max_connections(Some(max)),
+        None => {}
+    }
     // What the cage's CA bundle contains. Never a verdict — it decides which anchors the cage trusts,
     // not which requests are permitted, and dropping the roots only ever narrows that trust. The one
     // case where they are load-bearing is a splice: `tcp://` hands the stream through untouched, so

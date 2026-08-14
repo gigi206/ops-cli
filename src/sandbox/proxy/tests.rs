@@ -3512,6 +3512,133 @@ fn spawn_counting_forwarder(uds: &std::path::Path) -> (SocketAddr, Arc<AtomicUsi
     (addr, accepted)
 }
 
+/// The idle bound a launch configures is the bound the client is told about. Two numbers that could
+/// drift — what the tunnel is held for, and what its `Keep-Alive` announces — read from one place,
+/// which is the only reason a client can act on the announcement.
+#[test]
+fn a_configured_idle_bound_is_the_one_the_tunnel_announces() {
+    let (addr, upstream_ca, _upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            proxy_ca,
+            policy(&["upstream.test:*"])
+                .with_pool(true)
+                .with_idle_timeout(Some(Duration::from_secs(42))),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let got = through_one_tunnel(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n"],
+        false,
+    )
+    .unwrap();
+    let head = got[0].split("\r\n\r\n").next().unwrap().to_lowercase();
+    assert!(
+        head.contains("keep-alive: timeout=42"),
+        "the launch's own bound is what the client is told: {:?}",
+        got[0]
+    );
+}
+
+/// A connection over the cap is refused with a reason, not dropped.
+///
+/// The raw-splice cap has always answered `503 splice-cap`, and a caller that hits the connection
+/// cap has exactly the same question. Dropped, it reaches the cage as a connection reset with
+/// nothing anywhere to explain it — and this cap is the one an ordinary workload can reach, so the
+/// answer has to name itself and name the setting that moves it.
+#[test]
+fn a_connection_over_the_cap_is_told_why() {
+    let (addr, upstream_ca, _upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let log = Arc::new(crate::sandbox::control::LogRing::new(
+        crate::sandbox::control::LOG_RING_CAP,
+    ));
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            proxy_ca,
+            policy(&["upstream.test:*"]).with_max_connections(Some(1)),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+        .with_log(log.clone()),
+    );
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let _ = serve(listener, ctx);
+    });
+
+    // One connection that is accepted and then holds its thread: the CONNECT is answered, and the
+    // handler waits for a TLS ClientHello that never comes. Reading the `200` is what makes the
+    // hold observable — the slot is taken before the handler is spawned.
+    let mut held = UnixStream::connect(&path).unwrap();
+    write!(
+        held,
+        "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
+        addr.port()
+    )
+    .unwrap();
+    held.flush().unwrap();
+    let established = read_until_blank(&mut held).unwrap();
+    assert!(established.contains("200 Connection established"));
+
+    let mut over = UnixStream::connect(&path).unwrap();
+    write!(
+        over,
+        "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
+        addr.port()
+    )
+    .unwrap();
+    over.flush().ok();
+    // Read tolerantly: the proxy answers and closes at once, and a stream socket closed with the
+    // caller's own request still unread reports that to the caller as a reset — after handing over
+    // the bytes that did arrive, which is what an HTTP client reads its response from.
+    let mut raw = Vec::new();
+    let _ = over.read_to_end(&mut raw);
+    let refusal = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        refusal.contains("503") && refusal.contains("connection-cap"),
+        "the connection over the cap must be told what refused it: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("max_connections"),
+        "and which setting moves it: {refusal:?}"
+    );
+    assert!(
+        log.snapshot(None, None, false)
+            .events
+            .iter()
+            .any(|e| e.reason == "connection-cap"),
+        "and it must be visible in `sbx net logs`"
+    );
+}
+
 /// The claim the whole increment rests on, asked of a real client rather than of sbx: an ordinary
 /// HTTP client fetching two URLs from one host through the proxy opens **one** connection to it.
 ///
@@ -3732,7 +3859,7 @@ fn a_client_that_asks_to_close_is_not_offered_another_request() {
 /// The trap that makes reuse a regression if it is missed: the upstream's `Connection` and
 /// `Keep-Alive` describe the *upstream* leg, and both legs are held on terms of their own. Relayed
 /// unchanged, a `Keep-Alive: timeout=60` would tell the client it has a minute on a tunnel sbx holds
-/// for [`CLIENT_IDLE`] — so the client's next request would go into a connection already gone: an
+/// for its idle bound — so the client's next request would go into a connection already gone: an
 /// idempotent one silently retried (doubling the traffic reuse was meant to save), a `POST` failed.
 #[test]
 fn the_client_leg_is_held_on_sbx_terms_not_the_upstream_leg_s() {
@@ -3755,7 +3882,10 @@ fn the_client_leg_is_held_on_sbx_terms_not_the_upstream_leg_s() {
         got[0]
     );
     assert!(
-        head.contains(&format!("keep-alive: timeout={}", CLIENT_IDLE.as_secs())),
+        head.contains(&format!(
+            "keep-alive: timeout={}",
+            crate::allowlist::DEFAULT_IDLE_TIMEOUT.as_secs()
+        )),
         "on sbx's own idle bound: {:?}",
         got[0]
     );

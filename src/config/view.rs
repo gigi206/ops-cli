@@ -347,6 +347,14 @@ pub(crate) enum NetworkView {
         /// the same reason: it decides how long an address stands, and nothing in the cage observes
         /// it.
         dns_cache_ttl: Option<u64>,
+        /// How long an idle connection is kept, in seconds, when a layer set `idle_timeout` —
+        /// `None` when none did and the built-in bound applies. Surfaced alongside `pool` for the
+        /// same reason, and it is the same question asked of both legs.
+        idle_timeout: Option<u64>,
+        /// The most client connections the proxy serves at once, when a layer set
+        /// `max_connections` — `None` when none did. Surfaced because a refused connection is
+        /// reported to the cage as a `503`, and the number that refused it lives only here.
+        max_connections: Option<usize>,
         builtin: Vec<String>,
     },
 }
@@ -1165,6 +1173,8 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             // cage will actually hold rather than the preference that was written.
             ca_roots: a.ca_roots() || a.splices_any(),
             dns_cache_ttl: a.dns_cache_ttl().map(|d| d.as_secs()),
+            idle_timeout: a.idle_timeout().map(|d| d.as_secs()),
+            max_connections: a.max_connections(),
             builtin: sandbox::builtin_allow_rules()
                 .iter()
                 .map(|r| r.to_string())
@@ -1746,6 +1756,8 @@ mod tests {
                 pool: true,
                 ca_roots: true,
                 dns_cache_ttl: Some(30),
+                idle_timeout: None,
+                max_connections: None,
                 builtin: vec!["cache.nixos.org".into()],
             },
             network_origin: ProvenanceView::Project,

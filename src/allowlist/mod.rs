@@ -807,6 +807,26 @@ impl Http2Host {
 /// lie about what the cage does.
 pub(crate) const DEFAULT_DNS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a connection may sit idle before the proxy lets it go, when no layer set `[network]
+/// idle_timeout`.
+///
+/// One number for both of a request's legs, because it answers one question twice: how long the
+/// cage's tunnel waits for the next request, and how stale a parked upstream connection may be and
+/// still be handed to one. Short on purpose — the workload reuse actually helps comes back in
+/// milliseconds, and waiting longer only widens the window in which the far side closes first while
+/// holding a host thread meanwhile. Named here for the same reason as
+/// [`DEFAULT_DNS_CACHE_TTL`]: the proxy enforces it, `sbx config show --details` reports it.
+pub(crate) const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most client connections the proxy serves at once, when no layer set `[network]
+/// max_connections`.
+///
+/// A connection beyond it is refused rather than spawned, bounding the host threads and descriptors
+/// an in-cage caller can tie up — including a slowloris drip-feed that holds each thread through the
+/// per-read timeout window, and a tunnel abandoned mid-idle. Far above any realistic concurrent-fetch
+/// workload from a single cage.
+pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 512;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,
@@ -847,6 +867,16 @@ pub(crate) struct EgressPolicy {
     /// ever as a preference: a policy that splices needs the roots whatever this says, because a
     /// spliced stream is authenticated by the client against the real server.
     ca_roots: bool,
+    /// How long a connection may sit idle before the proxy lets it go (`[network] idle_timeout`),
+    /// on both of a request's legs. `None` means the proxy's own default is applied at its build
+    /// site. Never a verdict — it decides how long a connection that is already permitted is kept,
+    /// not whether it was. Read via [`Self::idle_timeout`].
+    idle_timeout: Option<std::time::Duration>,
+    /// The most client connections the proxy serves at once (`[network] max_connections`). `None`
+    /// means the proxy's own default. A resource bound rather than a verdict, but the one direction
+    /// that matters is up: raising it raises how many host threads and descriptors an in-cage caller
+    /// can tie up. Read via [`Self::max_connections`].
+    max_connections: Option<usize>,
 }
 
 impl Default for EgressPolicy {
@@ -879,7 +909,23 @@ impl EgressPolicy {
             capture_body_kb: None,
             pool: true,
             ca_roots: true,
+            idle_timeout: None,
+            max_connections: None,
         }
+    }
+
+    /// Replace the allow and deny rule lists, leaving every other setting exactly as it is
+    /// (builder style).
+    ///
+    /// This exists so the two places that *amend* a policy — the built-in self-equip union, and a
+    /// live `--session` overlay — can do it without rebuilding one. A rebuild has to name every
+    /// setting it carries across, and the list is only correct until the next setting is added:
+    /// each one is a field that silently reverts to its default at the rebuild, discovered later by
+    /// whatever stopped working. Amending carries them by construction.
+    pub(crate) fn with_rules(mut self, allow: Vec<Rule>, deny: Vec<Rule>) -> Self {
+        self.allow = allow;
+        self.deny = deny;
+        self
     }
 
     /// Attach the log-suppression (`mute`) rules, returning the policy (builder style). A denied
@@ -954,6 +1000,32 @@ impl EgressPolicy {
     /// Whether the proxy may reuse a validated upstream connection across requests.
     pub(crate) fn pool(&self) -> bool {
         self.pool
+    }
+
+    /// How long an idle connection is kept, from `[network] idle_timeout`. Never a verdict — see
+    /// the field.
+    pub(crate) fn with_idle_timeout(mut self, idle: Option<std::time::Duration>) -> Self {
+        self.idle_timeout = idle;
+        self
+    }
+
+    /// The **configured** idle bound, raw: `None` says no layer set one, not that connections are
+    /// never held. Kept distinct from the effective value for the same reason
+    /// [`Self::dns_cache_ttl`] is — a reader reporting the posture has to tell "unset" from "set to
+    /// the same number".
+    pub(crate) fn idle_timeout(&self) -> Option<std::time::Duration> {
+        self.idle_timeout
+    }
+
+    /// How many client connections the proxy serves at once, from `[network] max_connections`.
+    pub(crate) fn with_max_connections(mut self, max: Option<usize>) -> Self {
+        self.max_connections = max;
+        self
+    }
+
+    /// The **configured** connection cap, raw: `None` says no layer set one.
+    pub(crate) fn max_connections(&self) -> Option<usize> {
+        self.max_connections
     }
 
     /// Pair the cage's MITM CA with the public roots, or hand it the MITM CA alone, from
