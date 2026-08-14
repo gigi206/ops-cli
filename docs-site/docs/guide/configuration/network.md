@@ -133,6 +133,13 @@ and validates its own connection and gets a tunnel of its own, which on a worklo
 small fetches (a `nix` build pulling thousands of paths from `cache.nixos.org`) is where
 most of the time goes.
 
+What it buys is the handshake, and on a small request the handshake is most of the cost. So
+this is a setting whose effect is a property of the workload: many small fetches to one host
+is where it shows, a few large transfers is where it does not. Against a real host the saving
+is larger than anything a loopback measurement suggests, because every handshake avoided also
+avoids its round trips, and it grows with the distance to the host. On a fetch-heavy launch
+reuse is most of what separates a filtered one from an unfiltered one.
+
 Reuse changes nothing about what is allowed. Every request runs the whole check (the
 allowlist, the `Host`/SNI agreement, the address guard, the secret tripwires) whichever
 connection it arrives on or leaves by; see
@@ -252,15 +259,6 @@ being refused for it, and [`sbx net logs`](../networking/observability) names th
 Leave it alone otherwise: the direction that matters is up, and raising it raises exactly
 what the cap bounds. Zero is warned and ignored; a cage that should reach nothing is
 `network = "none"`.
-
-Measured on loopback, with the client side unchanged, a small request costs about **470 µs**
-with reuse against **730 µs** without it. Against a real host the saving is far larger,
-because each avoided handshake also avoids its round trips: two thousand requests to a CDN
-took **15.1 s with reuse against 48.9 s without**, or 7.4 ms against 24.5 ms each, on a
-request the host serves in 6.0 ms with no sandbox at all. Reuse is most of what separates a
-filtered launch from an unfiltered one: about a millisecond and a half of overhead with it,
-about twenty without. Those are one link on one machine, so read them as a shape rather than
-a promise.
 
 Like the rest of the table this is trusted and global-only, so a global config can set it for
 a project that has no way to observe it: nothing in the cage can tell whether a connection

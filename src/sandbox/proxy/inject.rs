@@ -567,15 +567,15 @@ impl Credentials {
     /// outbound leak. That is the exact shape of the intended setup, where an application holds a
     /// worthless value and sbx substitutes the real one on every request: observing the placeholder
     /// would break the design it exists to protect.
-    pub(crate) fn observe_head(&self, headers: &[(String, String)], injected: &[&str]) -> usize {
-        headers
+    /// Reads through a [`HeaderLookup`] so every plane can call it with what it already holds: the
+    /// HTTP/1.1 planes' parsed pairs, and the HTTP/2 plane's decoded header map. The alternative was
+    /// a signature only one plane could satisfy, which is how this ended up running on one plane out
+    /// of three in the first place.
+    pub(crate) fn observe_head(&self, headers: &dyn HeaderLookup, injected: &[&str]) -> usize {
+        OBSERVED_AUTH_HEADERS
             .iter()
-            .filter(|(name, _)| {
-                OBSERVED_AUTH_HEADERS
-                    .iter()
-                    .any(|known| name.eq_ignore_ascii_case(known))
-                    && !injected.iter().any(|inj| name.eq_ignore_ascii_case(inj))
-            })
+            .filter(|name| !injected.iter().any(|inj| name.eq_ignore_ascii_case(inj)))
+            .filter_map(|name| headers.get(name).map(|value| (*name, value)))
             .filter(|(name, value)| self.observe(name, value))
             .count()
     }
@@ -1112,7 +1112,7 @@ mod tests {
     fn only_the_named_auth_headers_are_observed() {
         let creds = default_creds(Vec::new(), Vec::new());
         let kept = creds.observe_head(
-            &[
+            &vec![
                 ("X-Request-Id".into(), "req-0123456789abcdef".into()),
                 (
                     "User-Agent".into(),
@@ -1137,7 +1137,7 @@ mod tests {
     fn a_header_that_will_be_injected_is_never_observed() {
         let creds = default_creds(Vec::new(), Vec::new());
         let kept = creds.observe_head(
-            &[(
+            &vec![(
                 "Authorization".into(),
                 "Bearer sbx-placeholder-not-a-real-credential".into(),
             )],

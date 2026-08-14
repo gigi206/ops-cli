@@ -2403,6 +2403,15 @@ fn handle_https_forward(
         }
     };
 
+    // 7b. Remember any credential the cage sent for itself, on the same terms and in the same place
+    //     as the tunneled path — after the verdict, after the outbound scan, after the injection
+    //     match. This plane is where it matters most: it exists for a client whose only egress
+    //     transport is the absolute form, and the traffic that brought it here was an OAuth token
+    //     exchange. A credential acquired that way and never observed is one the tripwires do not
+    //     cover afterwards, on any plane.
+    let injected_names = injected_names(&creds, &injected_ids);
+    ctx.credentials.observe_head(&head.headers, &injected_names);
+
     // 7a. Whether this request may share its upstream leg with others, on the same terms as the
     //     tunneled path: the launch has to have asked for reuse, and the request has to be HTTP/1.1.
     //     Only a request the proxy can send again takes a parked connection.

@@ -6808,6 +6808,51 @@ fn run_with_refresh(
     (credentials, calls)
 }
 
+/// The same, asked of the **absolute-form `https://`** plane, which is the one where it matters
+/// most: that plane exists for a client whose only egress transport is this form, and the traffic
+/// that put it there was an OAuth token exchange. A credential acquired that way and never observed
+/// is one the tripwires do not cover afterwards, on any plane, because the scan set is shared.
+///
+/// It ran on one plane out of three until this test asked the other two.
+#[test]
+fn the_absolute_form_plane_observes_a_credential_the_cage_sent_itself() {
+    let (addr, upstream_ca, _up) = spawn_upstream(
+        "host.test",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let ctx = Arc::new(
+        ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&["host.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let credentials = ctx.credentials.clone();
+    let request = format!(
+        "POST https://host.test:{}/oauth/token HTTP/1.1\r\nHost: host.test\r\n\
+         Authorization: Bearer acquired-by-its-own-signin\r\nContent-Length: 0\r\n\r\n",
+        addr.port()
+    );
+    let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+    assert!(
+        resp.contains("200"),
+        "the request that teaches the value is not itself refused: {resp:?}"
+    );
+    let set = credentials.snapshot();
+    assert!(
+        set.needles
+            .iter()
+            .any(|n| n.as_bytes() == b"acquired-by-its-own-signin"),
+        "the credential the cage sent must join the scan set"
+    );
+}
+
 /// What observing buys, end to end. A token the cage obtained by its own sign-in belongs to no
 /// declaration, so nothing used to refuse it on the way out. Once the proxy has seen the cage send
 /// it to an allowed host, re-sending it anywhere is refused like a declared secret's — the same

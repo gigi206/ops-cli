@@ -400,6 +400,15 @@ async fn relay(
         }
     };
 
+    // Remember any credential the cage sent for itself, on the same terms and in the same place as
+    // both HTTP/1.1 planes: after the verdict, after the outbound tripwire, after the injection
+    // match. The scan set is shared across every plane, so a token a gRPC client acquired here is
+    // one the tripwires cover everywhere afterwards — and one this plane never observed would be a
+    // hole in all three.
+    let injected_names = super::injected_names(&creds, &injected_ids);
+    ctx.credentials
+        .observe_head(&H2Headers(req.headers()), &injected_names);
+
     // The upstream this stream will ride: one this tunnel already opened for the same credential
     // set, or a new one. HTTP/2 multiplexes, so a connection here is **shared** rather than taken
     // and returned: several streams use it at once and none of them gives it back.
@@ -1917,6 +1926,45 @@ mod tests {
     /// stream that does not receive the same one. Everything else a stream is checked for happens
     /// before the pool is consulted at all, per stream, so reuse cannot skip it: the `:authority`
     /// re-check, the outbound tripwire, the verdict, the resolution and the address guard.
+    /// The third plane's share of the observed-credential scan set. A gRPC client that authenticates
+    /// with a token of its own teaches sbx that token here, exactly as the two HTTP/1.1 planes do,
+    /// and the set is shared — so a plane that never observed would be a hole in all three rather
+    /// than in one.
+    #[test]
+    fn a_grpc_client_s_own_credential_joins_the_shared_scan_set() {
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            2,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let credentials = ctx.credentials.clone();
+        let answers = through_h2_proxy_streams(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            vec![(
+                grpc_request(&[("authorization", "Bearer grpc-acquired-by-the-client")]),
+                None,
+            )],
+            &trace,
+        );
+        assert!(
+            answers.iter().all(|a| a.status == StatusCode::OK),
+            "the request that teaches the value is not itself refused: {}",
+            trace.render()
+        );
+        let set = credentials.snapshot();
+        assert!(
+            set.needles
+                .iter()
+                .any(|n| n.as_bytes() == b"grpc-acquired-by-the-client"),
+            "the credential the cage sent must join the scan set"
+        );
+    }
+
     #[test]
     fn streams_share_an_upstream_only_with_the_credential_set_they_share() {
         use crate::allowlist::classify;

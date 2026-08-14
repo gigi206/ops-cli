@@ -186,6 +186,11 @@ proxy already *saw* it in any case, being the thing that terminates the cage's T
 The choice is only whether it remembers what it has seen, and remembering is what
 lets it protect the credential at all.
 
+Every inspected plane observes: a request through the cage's tunnel, one sent in the
+absolute form a client uses when it treats the proxy as a forward proxy, and a gRPC
+stream. The scan set is shared, so a token learned on any of them is covered on all of
+them; a plane that watched and never learned would be a gap in each.
+
 Four bounds keep this narrow:
 
 - only an **allowed** request is observed, so an agent cannot seed the scan set by
