@@ -64,6 +64,25 @@ zbus = { version = "5", default-features = false, features = ["async-io"] }
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 memchr = "2.8.3"
 
+# No `#[global_allocator]`, and the measurement behind that is worth recording so it is not redone.
+# The static musl build's allocator does not hand back what the TLS path frees: a launch's
+# supervisor grows by about the size of one TLS record buffer per connection served, linearly, with
+# no plateau seen over several hundred connections. It is the allocator and not a leak — the same
+# code built against glibc stays flat on the same load, the growth is independent of how many
+# connections run at once, and `smaps` shows a proliferation of fixed-size anonymous mappings rather
+# than one structure growing.
+#
+# mimalloc removes the growth for about 2% of binary size, so the refusal is not about cost. An
+# allocator sits on *every* allocation path, including the ones holding credentials and request
+# bodies, which makes it the most transverse third-party surface this binary could take on; and
+# mimalloc, jemalloc and snmalloc all carry C or C++ into a build kept pure Rust for the reason
+# given on `miniz_oxide` above.
+#
+# What reopens it: a real session observed holding hundreds of MiB in the supervisor. Reusing a
+# connection costs nothing here (the growth follows connections, not requests), so an agent talking
+# to one API over a kept-alive connection never meets this; a workload opening fresh connections in
+# series for hours is the shape that would.
+
 [build-dependencies]
 # Hash the embedded engines (nix, bwrap) at build time (same crate as the runtime dep,
 # so no new third-party surface). Used only when a `bundled-*` feature is enabled.
