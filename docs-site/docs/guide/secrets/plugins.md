@@ -11,6 +11,9 @@ adds and what it refuses. What all three genuinely share is everything around th
 plugin rather than inside it: how it is installed and trusted, the sandbox it runs
 in, the manifest's `[sandbox]` grant, and the store it can come from.
 
+Where the three stop is [collected further down](#what-no-plugin-can-do), with the
+reason for each boundary and what would justify moving it.
+
 The secret-source space is open-ended: any well-known secret-manager backend,
 a cloud KMS, a third-party vault app, a
 keyring, so `sbx` keeps the **resolver** (SOURCE) layer *pluggable*. A resolver
@@ -806,6 +809,52 @@ and service a signature was scoped to, the identity it signed as). It is appende
 what sbx observed, never before, and the whole line is scrubbed of every credential the
 launch declared: a plugin that echoed the key it was handed writes `${name}` into the
 record, not the key.
+
+## What no plugin can do
+
+Three kinds exist and the set is closed. Each is admissible **because of what it cannot do**, so
+the boundary is part of the design rather than a list of things not yet built. What follows says
+where the boundary is, why it is there, and what would justify moving it. A limit with no stated
+trigger is one nobody should move on a hunch.
+
+- **There is no fourth kind.** A resolver, a broker and a signer each refuse specific grants in
+  their own words, and those refusals are what make the type safe to install. A general "plugin"
+  holding the union of the three grants would have no such argument to make. What would justify a
+  fourth: a contract statable as narrowly as these three, with its own refusals, rather than one
+  described as a resolver that also does something else.
+
+- **No plugin rules on decrypted HTTP in general.** sbx decrypts at the egress proxy, so the
+  attachment point exists, and a general layer-7 decider was considered. What shipped instead is
+  the signer, named by a `[secret]` and bounded to the one concrete host that declaration names.
+  Two reasons the general form did not follow. HTTP is not framed, it is *parsed*, so the closed
+  framing set below does not apply and what a plugin would see is a request sbx already took apart.
+  And the bound would have to be invented: a signer inherits its host bound from the declaration
+  that reaches it, while a general decider would need one written from scratch. What would justify
+  it: a protocol under TLS needing a credential injected that cannot be expressed as a signer on a
+  concrete host.
+
+- **A broker's framing is one of three** (`length-u32-be`, `line`, `pgwire`). A framing is how sbx
+  knows where one message ends, which makes it sbx's to implement rather than a plugin's to
+  describe: a plugin handed an uncut stream would *be* the broker instead of ruling on it. One
+  protocol is known not to fit, the KeePassXC browser integration, whose JSON is unframed and whose
+  payloads are encrypted, so a plugin could only rule on the envelope. What would justify a fourth
+  framing: a **second** protocol that fits none of the three. One does not justify a mechanism.
+
+- **A resolver cannot ask you anything on the terminal.** Its standard input is closed, because a
+  resolver that read or blocked on sbx's own input would hang the launch, and anything it printed
+  would compete with what the cage is writing. A plugin that needs a human brings its own window or
+  talks to something already holding one, which is what the `keepassxc-browser://` resolver does.
+
+- **A plugin's own settings are environment variables.** `[plugin.<name>] env` supplies values for
+  the names a manifest declares in `allow_env`, and a name the manifest does not declare is refused
+  rather than passed. A typed settings table would carry the same values under a second set of
+  rules. What would justify one: a setting that cannot be a string, or one whose validation belongs
+  to sbx because getting it wrong is a security matter rather than a failure the plugin reports.
+
+- **Nothing outside this page is pluggable.** Package backends, the store layer, the seccomp
+  policy, app profiles and redaction are all first-party. Each decides what a sandbox may do, so a
+  plugin there would be pluggable *policy*, and the argument that admits a resolver, that it holds
+  a value and reaches nothing else, does not transfer to something that decides the reaching.
 
 ## An honest residual: a networked resolver reaches the host network
 
