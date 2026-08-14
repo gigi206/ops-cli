@@ -732,6 +732,13 @@ pub(crate) fn app(
     // to the launched program (e.g. `-c` to resume) without editing the profile.
     let mut cmd: Vec<OsString> = app.cmd.iter().map(OsString::from).collect();
     cmd.extend(extra);
+    // A bundle's install step runs BEFORE the app's command, in this same cage — same posture, same
+    // allowlist, same environment — and never in its place: the app's command stays its identity.
+    // Composed here rather than launched as a second cage, so the step sees exactly what the launch
+    // sees, and `&&` is what makes it fail closed: a step that exits non-zero never reaches `exec`.
+    if !app.provisions.is_empty() {
+        cmd = compose_provisioned_cmd(&app.provisions, cmd);
+    }
     let runtime = match app.home_scope {
         crate::config::AppHomeScope::Global => binds::Runtime::GlobalApp(name),
         crate::config::AppHomeScope::Project => binds::Runtime::ProjectApp(name),
@@ -5971,6 +5978,47 @@ enum EnvLayer {
     Config,
 }
 
+/// Chain a bundle's install steps ahead of the app's own command, in one cage.
+///
+/// The steps run in `use` order and the command runs last, as `exec` so the app keeps the process
+/// it would have had — the same pid, the same signals, the same exit status, which is what makes
+/// the composition invisible to everything downstream. `&&` between them is the fail-closed rule:
+/// a step that exits non-zero stops the chain, so a launch never reaches an agent whose install did
+/// not finish.
+///
+/// The app's argv is passed as positional parameters rather than pasted into the script: an argv
+/// element that contains a quote, a space or a `$` is data, and a shell that re-parses it would
+/// read it as syntax.
+fn compose_provisioned_cmd(
+    provisions: &[crate::config::BundleProvision],
+    cmd: Vec<OsString>,
+) -> Vec<OsString> {
+    let mut script = String::new();
+    for step in provisions {
+        // Each step is itself an argv. Rendered through `shell_quote` so a step's own arguments
+        // survive the shell that chains them, for the same reason the app's argv is not pasted.
+        let rendered: Vec<String> = step.argv.iter().map(|a| shell_quote(a)).collect();
+        script.push_str(&rendered.join(" "));
+        script.push_str(" && ");
+    }
+    script.push_str("exec \"$@\"");
+    let mut out: Vec<OsString> = vec![
+        OsString::from("bash"),
+        OsString::from("-c"),
+        OsString::from(script),
+        // `$0` for the composed script; the app's argv follows as `$1 …`.
+        OsString::from("sbx"),
+    ];
+    out.extend(cmd);
+    out
+}
+
+/// Quote one argv element for the shell that chains the install steps: single quotes, with an
+/// embedded single quote closed and re-opened around an escaped one.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
 /// Layer the cage's extra environment by [`EnvLayer`] precedence, lowest first.
 ///
 /// The caller may list its layers in any order — they are sorted here. Two entries carrying the
@@ -7393,6 +7441,70 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
                 "--rcfile".to_string(),
                 binds::SHELL_RC_INCAGE.to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn install_steps_run_in_order_ahead_of_the_command_and_stop_the_chain_on_failure() {
+        // The composition is what makes a bundle's install step reach a launch, and three
+        // properties of it are the contract: the steps run in the order they were folded, the app's
+        // command runs last and as `exec` (so the app keeps the process, its signals and its exit
+        // status), and `&&` joins them so a step that fails never reaches the command.
+        let steps = vec![
+            crate::config::BundleProvision {
+                bundle: "alpha".into(),
+                argv: vec!["bash".into(), "-c".into(), "first-step".into()],
+            },
+            crate::config::BundleProvision {
+                bundle: "beta".into(),
+                argv: vec!["second-step".into()],
+            },
+        ];
+        let cmd: Vec<OsString> = ["agent", "--flag"].iter().map(OsString::from).collect();
+
+        let out = compose_provisioned_cmd(&steps, cmd);
+        let script = out[2].to_string_lossy().to_string();
+        assert_eq!(out[0], OsString::from("bash"));
+        assert_eq!(out[1], OsString::from("-c"));
+        assert!(
+            script.starts_with("'bash' '-c' 'first-step' && 'second-step' && "),
+            "steps run in fold order, each still its own argv: {script}"
+        );
+        assert!(
+            script.ends_with("exec \"$@\""),
+            "the app's command runs last, and as exec: {script}"
+        );
+        // The app's argv is positional, never pasted into the script: `$0` then the command.
+        assert_eq!(
+            out[3..],
+            [
+                OsString::from("sbx"),
+                OsString::from("agent"),
+                OsString::from("--flag")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_install_step_argument_is_data_not_shell_syntax() {
+        // A step's own arguments reach the chaining shell as one word each, whatever they contain.
+        // Without quoting, a step carrying a space would split into two commands and one carrying a
+        // `$` or a backtick would be evaluated — a bundle author writing an argv would be writing
+        // shell by accident.
+        let steps = vec![crate::config::BundleProvision {
+            bundle: "quoting".into(),
+            argv: vec![
+                "installer".into(),
+                "--dir=/opt/a b".into(),
+                "$(whoami)".into(),
+                "it's".into(),
+            ],
+        }];
+        let out = compose_provisioned_cmd(&steps, vec![OsString::from("agent")]);
+        let script = out[2].to_string_lossy().to_string();
+        assert!(
+            script.starts_with("'installer' '--dir=/opt/a b' '$(whoami)' 'it'\\''s' && "),
+            "every element is one quoted word, an interior quote closed and reopened: {script}"
         );
     }
 

@@ -87,6 +87,32 @@ once. And like everything else a bundle brings, a step arrives only from a trust
 layer: an untrusted project's `use` is dropped whole, with the same per-app note it
 already gets.
 
+They run **before the app's command, in the same cage**, under that launch's posture and
+allowlist: a step that downloads needs its host in the bundle's own `allow`, and a step
+that fails stops the launch with its own exit status, so nothing reaches an agent whose
+install did not finish. The command then runs as `exec`, keeping the process, its signals
+and its exit status.
+
+### A step runs on every launch, so write it idempotent
+
+sbx does not remember that a step succeeded. It cannot: what proves an install finished is
+a path only the step knows — a rebuilt addon under a package's install directory, a binary
+under the app's home — and sbx would have to be told which, which is a second field that
+says what the step already knows. So the guard stays in the step, in the shape bundles
+already use:
+
+```toml
+provision = ["bash", "-c", "[ -e \"$HOME/.local/bin/tool\" ] || install-tool"]
+```
+
+Without that guard the step repeats on every launch: harmless for a rebuild that checks
+its own output, wasteful for a download, and slow either way. The guard also self-heals,
+which a remembered flag would not — delete what it guards and the next launch puts it
+back.
+
+This is the one part sbx does not own, and it would take one thing to change that: a way
+for a step to state the path it produces. Until then, the step owns its guard.
+
 `task` folds like the rest: a tool that ships a brokered operation (a fixed command
 run with a credential the caller never holds, see [`[task.<name>]`](task)) carries
 it into any app that names the bundle, exactly as its packages and credentials do.
