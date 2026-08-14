@@ -77,6 +77,87 @@ pub(super) fn head_carries_control_byte(head: &Head) -> bool {
     bad(&head.request_line) || head.headers.iter().any(|(k, v)| bad(k) || bad(v))
 }
 
+/// What a request's framing says, once every ambiguity a downstream parser could desync on has been
+/// refused. See [`inspect_framing`].
+pub(super) struct Framing {
+    /// Whether the body arrives `Transfer-Encoding: chunked`, so its length is discovered by
+    /// de-chunking rather than declared.
+    pub(super) chunked: bool,
+    /// The declared body length. Zero for a chunked request, which declares none, and zero for one
+    /// that carries no body.
+    pub(super) body_len: u64,
+}
+
+/// Why a request's framing was refused: the reason token that goes in the log and the
+/// `X-Sbx-Egress-Reason` header, and the sentence that goes in the body. Both static, because both
+/// are about the *shape* of the request rather than about anything in it.
+pub(super) struct FramingRefusal {
+    pub(super) reason: &'static str,
+    pub(super) detail: &'static str,
+}
+
+/// Read a request's framing, refusing every ambiguity that could desync a downstream parser.
+///
+/// **One function for every inspected plane**, and that is the point rather than a tidiness. This
+/// check was written out three times, once per plane, and the copies drifted: a bare CR reached two
+/// planes after being refused on the third, and the reason tokens diverged for years — each divergence
+/// found later, by someone looking, rather than by the code refusing to hold two answers.
+///
+/// What legitimately differs is `forwards_chunked`. The two inspected planes de-chunk a `chunked`
+/// body and re-frame it with a synthesized `Content-Length`, so no CL/TE ambiguity reaches the
+/// upstream; the cleartext plane forwards no chunked framing at all and refuses the coding outright.
+/// The refusal is the same token either way, since the caller's question is the same one, and only
+/// the sentence changes.
+pub(super) fn inspect_framing(
+    head: &Head,
+    forwards_chunked: bool,
+) -> Result<Framing, FramingRefusal> {
+    if head_carries_control_byte(head) {
+        return Err(FramingRefusal {
+            reason: "bad-request:control-char",
+            detail: super::CONTROL_BYTE_DETAIL,
+        });
+    }
+    let chunked = match head.header("transfer-encoding").map(str::trim) {
+        Some(v) if forwards_chunked && v.eq_ignore_ascii_case("chunked") => true,
+        Some(_) => {
+            return Err(FramingRefusal {
+                reason: "bad-request:transfer-encoding",
+                detail: if forwards_chunked {
+                    "the request carries a Transfer-Encoding coding other than `chunked`, which \
+                     this egress proxy does not forward"
+                } else {
+                    "the request carries a Transfer-Encoding, which this cleartext path does not \
+                     forward"
+                },
+            });
+        }
+        None => false,
+    };
+    if head.count("content-length") > 1 {
+        return Err(FramingRefusal {
+            reason: "bad-request:dup-content-length",
+            detail: "the request carries a duplicated Content-Length header",
+        });
+    }
+    if head.count("host") > 1 {
+        return Err(FramingRefusal {
+            reason: "bad-request:dup-host",
+            detail: "the request carries a duplicated Host header",
+        });
+    }
+    // Known up front only for a Content-Length-framed request; a chunked one's length is discovered
+    // by the de-chunker, so nothing is parsed for it here.
+    let body_len = match head.header("content-length").filter(|_| !chunked) {
+        Some(v) => v.trim().parse().map_err(|_| FramingRefusal {
+            reason: "bad-request:invalid-content-length",
+            detail: "the Content-Length header is not a valid number",
+        })?,
+        None => 0,
+    };
+    Ok(Framing { chunked, body_len })
+}
+
 /// The method and target of a request line, requiring all three space-separated tokens
 /// (`METHOD target HTTP/x`).
 pub(super) fn request_line_parts(line: &str) -> Option<(String, String)> {

@@ -91,7 +91,7 @@
 //! | `503` | `connection-cap`         | the proxy is already serving as many client connections as it will serve at once (`[network] max_connections`). Answered on the accept loop, before anything is read, so the caller's own request is still unread when the connection closes and the refusal arrives followed by a reset |
 //! | `503` | `body-buffer-cap`        | the proxy is already holding as much request-body data as it will hold at one time (retry when one in flight completes). Nothing is wrong with the request: it is a shared ceiling on host memory, since the proxy buffers host-side and the cage's own `MemoryMax` does not reach it |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
-//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
+//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. Every inspected plane reads the framing through one shared check ([`inspect_framing`]), so the same request is refused under the same reason whichever plane it arrived on. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
 //! | `405` | `method-not-allowed`     | a non-CONNECT request that is neither a routable `http://` nor `https://` absolute-form (a bare origin-form has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
@@ -601,34 +601,13 @@ fn serve_tunneled_request(
             "the tunneled request target must be origin-form (a path)",
         );
     }
-    // Anti request-smuggling, fail-closed. A duplicated Content-Length or Host is an unambiguous
-    // desync vector and is refused outright. A `Transfer-Encoding` is refused UNLESS it is exactly
-    // `chunked` — the one streaming coding the proxy de-chunks and re-frames with a synthesized
-    // Content-Length below (so no CL/TE ambiguity reaches the upstream); any other TE coding is
-    // unsupported and refused.
-    if head_carries_control_byte(&inner) {
-        ctx.push_log(
-            super::control::Proto::Https,
-            connect_host,
-            port,
-            Some(&imethod),
-            Some(&itarget),
-            super::control::LogVerdict::Blocked,
-            "bad-request:control-char",
-        );
-        return respond_refusal_tls(
-            &mut br,
-            "400 Bad Request",
-            "bad-request:control-char",
-            CONTROL_BYTE_DETAIL,
-        );
-    }
-    let te = inner.header("transfer-encoding");
-    let cl_count = inner.count("content-length");
-    let host_count = inner.count("host");
-    let chunked = match te.map(str::trim) {
-        Some(v) if v.eq_ignore_ascii_case("chunked") => true,
-        Some(_) => {
+    // Anti request-smuggling, fail-closed, through the check every inspected plane shares: a byte
+    // another parser could frame by, a coding this proxy does not forward, a duplicated
+    // Content-Length or Host, a length that is not a number. What it answers with is a reason and a
+    // sentence; where that answer is written is this plane's own.
+    let Framing { chunked, body_len } = match inspect_framing(&inner, true) {
+        Ok(framing) => framing,
+        Err(refusal) => {
             ctx.push_log(
                 super::control::Proto::Https,
                 connect_host,
@@ -636,68 +615,9 @@ fn serve_tunneled_request(
                 Some(&imethod),
                 Some(&itarget),
                 super::control::LogVerdict::Blocked,
-                "bad-request:transfer-encoding",
+                refusal.reason,
             );
-            return respond_refusal_tls(
-                &mut br,
-                "400 Bad Request",
-                "bad-request:transfer-encoding",
-                "the request carries a Transfer-Encoding coding other than `chunked`, which this \
-                 egress proxy does not forward",
-            );
-        }
-        None => false,
-    };
-    if cl_count > 1 || host_count > 1 {
-        let (reason, detail) = if cl_count > 1 {
-            (
-                "bad-request:dup-content-length",
-                "the request carries a duplicated Content-Length header",
-            )
-        } else {
-            (
-                "bad-request:dup-host",
-                "the request carries a duplicated Host header",
-            )
-        };
-        ctx.push_log(
-            super::control::Proto::Https,
-            connect_host,
-            port,
-            Some(&imethod),
-            Some(&itarget),
-            super::control::LogVerdict::Blocked,
-            reason,
-        );
-        return respond_refusal_tls(&mut br, "400 Bad Request", reason, detail);
-    }
-    // The body length is known up-front only for a Content-Length-framed request; a `chunked`
-    // request's length is discovered by de-chunking below, so no Content-Length is parsed here.
-    let body_len: u64 = if chunked {
-        0
-    } else {
-        match inner.header("content-length") {
-            Some(v) => match v.trim().parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    ctx.push_log(
-                        super::control::Proto::Https,
-                        connect_host,
-                        port,
-                        Some(&imethod),
-                        Some(&itarget),
-                        super::control::LogVerdict::Blocked,
-                        "bad-request:invalid-content-length",
-                    );
-                    return respond_refusal_tls(
-                        &mut br,
-                        "400 Bad Request",
-                        "bad-request:invalid-content-length",
-                        "the Content-Length header is not a valid number",
-                    );
-                }
-            },
-            None => 0,
+            return respond_refusal_tls(&mut br, "400 Bad Request", refusal.reason, refusal.detail);
         }
     };
 
@@ -1681,83 +1601,27 @@ fn handle_cleartext(
         }
     };
 
-    // 2. Anti request-smuggling, fail-closed — the same guards as the tunneled path: a byte another
-    //    parser could frame by, any Transfer-Encoding (no chunked framing in this path), or a
-    //    duplicated Content-Length / Host.
-    if head_carries_control_byte(head) {
-        ctx.push_log(
-            super::control::Proto::Http,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            super::control::LogVerdict::Blocked,
-            "bad-request:control-char",
-        );
-        return write_refusal(
-            &mut client,
-            "400 Bad Request",
-            "bad-request:control-char",
-            CONTROL_BYTE_DETAIL,
-        );
-    }
-    //    Each refusal names *which* framing problem it was, as both other planes do: the reason is
-    //    what `sbx net logs` records and what an agent reads off the header, and a caller debugging
-    //    one plane must not get less than a caller debugging another. This path is the stricter one
-    //    on `Transfer-Encoding` — it forwards no chunked framing at all, where the inspected planes
-    //    de-chunk and re-frame — so the token is the same and the sentence differs.
-    let (reason, detail) = if head.header("transfer-encoding").is_some() {
-        (
-            "bad-request:transfer-encoding",
-            "the request carries a Transfer-Encoding, which this cleartext path does not forward",
-        )
-    } else if head.count("content-length") > 1 {
-        (
-            "bad-request:dup-content-length",
-            "the request carries a duplicated Content-Length header",
-        )
-    } else if head.count("host") > 1 {
-        (
-            "bad-request:dup-host",
-            "the request carries a duplicated Host header",
-        )
-    } else {
-        ("", "")
-    };
-    if !reason.is_empty() {
-        ctx.push_log(
-            super::control::Proto::Http,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            super::control::LogVerdict::Blocked,
-            reason,
-        );
-        return write_refusal(&mut client, "400 Bad Request", reason, detail);
-    }
-    let body_len: u64 = match head.header("content-length") {
-        Some(v) => match v.trim().parse() {
-            Ok(n) => n,
-            Err(_) => {
-                ctx.push_log(
-                    super::control::Proto::Http,
-                    &host,
-                    port,
-                    Some(method),
-                    Some(&path),
-                    super::control::LogVerdict::Blocked,
-                    "bad-request:invalid-content-length",
-                );
-                return write_refusal(
-                    &mut client,
-                    "400 Bad Request",
-                    "bad-request:invalid-content-length",
-                    "the Content-Length header is not a valid number",
-                );
-            }
-        },
-        None => 0,
+    // 2. Anti request-smuggling, fail-closed, through the check every inspected plane shares. This
+    //    plane forwards no chunked framing at all, which is the one thing it says differently.
+    let Framing { body_len, .. } = match inspect_framing(head, false) {
+        Ok(framing) => framing,
+        Err(refusal) => {
+            ctx.push_log(
+                super::control::Proto::Http,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                super::control::LogVerdict::Blocked,
+                refusal.reason,
+            );
+            return write_refusal(
+                &mut client,
+                "400 Bad Request",
+                refusal.reason,
+                refusal.detail,
+            );
+        }
     };
 
     // 3. Anti-fronting collapses to one check with no CONNECT/SNI: the absolute-form URL host must
@@ -2092,31 +1956,11 @@ fn handle_https_forward(
         }
     };
 
-    // 2. Anti request-smuggling, fail-closed — the same guards, and the same sub-categorized
-    //    reasons, as the tunneled path. A duplicated Content-Length or Host is an unambiguous desync
-    //    vector and is refused outright; a `Transfer-Encoding` is refused UNLESS it is exactly
-    //    `chunked`, the one streaming coding the proxy de-chunks and re-frames with a synthesized
-    //    Content-Length below (so no CL/TE ambiguity reaches the upstream).
-    if head_carries_control_byte(head) {
-        ctx.push_log(
-            super::control::Proto::Https,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            super::control::LogVerdict::Blocked,
-            "bad-request:control-char",
-        );
-        return write_refusal(
-            &mut client,
-            "400 Bad Request",
-            "bad-request:control-char",
-            CONTROL_BYTE_DETAIL,
-        );
-    }
-    let chunked = match head.header("transfer-encoding").map(str::trim) {
-        Some(v) if v.eq_ignore_ascii_case("chunked") => true,
-        Some(_) => {
+    // 2. Anti request-smuggling, fail-closed, through the check every inspected plane shares. Like
+    //    the tunneled path this one de-chunks and re-frames, so `chunked` is forwardable here.
+    let Framing { chunked, body_len } = match inspect_framing(head, true) {
+        Ok(framing) => framing,
+        Err(refusal) => {
             ctx.push_log(
                 super::control::Proto::Https,
                 &host,
@@ -2124,68 +1968,14 @@ fn handle_https_forward(
                 Some(method),
                 Some(&path),
                 super::control::LogVerdict::Blocked,
-                "bad-request:transfer-encoding",
+                refusal.reason,
             );
             return write_refusal(
                 &mut client,
                 "400 Bad Request",
-                "bad-request:transfer-encoding",
-                "the request carries a Transfer-Encoding coding other than `chunked`, which this \
-                 egress proxy does not forward",
+                refusal.reason,
+                refusal.detail,
             );
-        }
-        None => false,
-    };
-    if head.count("content-length") > 1 || head.count("host") > 1 {
-        let (reason, detail) = if head.count("content-length") > 1 {
-            (
-                "bad-request:dup-content-length",
-                "the request carries a duplicated Content-Length header",
-            )
-        } else {
-            (
-                "bad-request:dup-host",
-                "the request carries a duplicated Host header",
-            )
-        };
-        ctx.push_log(
-            super::control::Proto::Https,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            super::control::LogVerdict::Blocked,
-            reason,
-        );
-        return write_refusal(&mut client, "400 Bad Request", reason, detail);
-    }
-    // The body length is known up-front only for a Content-Length-framed request; a `chunked`
-    // request's length is discovered by de-chunking below.
-    let body_len: u64 = if chunked {
-        0
-    } else {
-        match head.header("content-length") {
-            Some(v) => match v.trim().parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    ctx.push_log(
-                        super::control::Proto::Https,
-                        &host,
-                        port,
-                        Some(method),
-                        Some(&path),
-                        super::control::LogVerdict::Blocked,
-                        "bad-request:invalid-content-length",
-                    );
-                    return write_refusal(
-                        &mut client,
-                        "400 Bad Request",
-                        "bad-request:invalid-content-length",
-                        "the Content-Length header is not a valid number",
-                    );
-                }
-            },
-            None => 0,
         }
     };
 

@@ -6895,54 +6895,82 @@ fn run_with_refresh(
     (credentials, calls)
 }
 
-/// Every plane names the *same* framing problem the same way. The refusal reason is what
-/// `sbx net logs` records and what an agent reads off `X-Sbx-Egress-Reason`, so a caller debugging
-/// one plane must not get less than a caller debugging another: the cleartext path used to answer a
-/// bare `bad-request` for all four, which says a request was malformed without saying how.
+/// Every inspected plane refuses the same framing, and names it the same way.
 ///
-/// What the planes may legitimately differ on is the *sentence*, and here they do: this one forwards
-/// no chunked framing at all, where the inspected planes de-chunk and re-frame.
+/// This is the property the shared inspector exists for, asserted rather than assumed. The check was
+/// written out three times before, and the copies drifted twice: a bare CR was refused on one plane
+/// while two forwarded it, and the reason tokens diverged so that the cleartext path answered a bare
+/// `bad-request` for four distinct faults. Both were found by someone looking. This test is what
+/// looks now, and it fails the moment a plane grows an answer of its own.
+///
+/// The sentence may still differ — the cleartext path forwards no chunked framing at all, where the
+/// other two de-chunk and re-frame — and the token may not, because the token is what a caller
+/// matches on.
 #[test]
-fn the_cleartext_plane_names_which_framing_problem_it_refused() {
-    for (request, expected) in [
+fn every_inspected_plane_refuses_the_same_framing_with_the_same_reason() {
+    for (fault, expected) in [
+        ("X-Trace: before\rafter", "bad-request:control-char"),
+        ("Transfer-Encoding: gzip", "bad-request:transfer-encoding"),
         (
-            "GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
-             Transfer-Encoding: chunked\r\n\r\n",
-            "bad-request:transfer-encoding",
-        ),
-        (
-            "GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
-             Content-Length: 0\r\nContent-Length: 5\r\n\r\n",
+            "Content-Length: 0\r\nContent-Length: 5",
             "bad-request:dup-content-length",
         ),
+        ("Host: elsewhere.test", "bad-request:dup-host"),
         (
-            "GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
-             Host: elsewhere.test\r\n\r\n",
-            "bad-request:dup-host",
-        ),
-        (
-            "GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
-             Content-Length: twelve\r\n\r\n",
+            "Content-Length: twelve",
             "bad-request:invalid-content-length",
         ),
     ] {
-        let ctx = Arc::new(
-            ProxyCtx::new(
-                Arc::new(Ca::ephemeral().unwrap()),
-                policy(&["http://upstream.test"]),
-            )
-            .unwrap()
-            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
-        );
-        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
-        assert!(
-            resp.contains("400") && resp.contains(expected),
-            "expected `{expected}`: {resp:?}"
-        );
+        let ctx = || {
+            let ca = Arc::new(Ca::ephemeral().unwrap());
+            let der = ca.ca_cert_der();
+            let ctx = Arc::new(
+                ProxyCtx::new(ca, policy(&["host.test:*", "http://host.test"]))
+                    .unwrap()
+                    .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+            );
+            (ctx, der)
+        };
+        // The tunneled plane, inside its own TLS.
+        let (c, der) = ctx();
+        let tunneled = through_proxy(
+            c,
+            der,
+            "host.test",
+            "host.test",
+            8443,
+            format!("GET /p HTTP/1.1\r\nHost: host.test\r\n{fault}\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
+        // The two absolute-form planes, on the proxy's own socket.
+        let (c, _) = ctx();
+        let cleartext = through_cleartext(
+            c,
+            format!("GET http://host.test/p HTTP/1.1\r\nHost: host.test\r\n{fault}\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let (c, _) = ctx();
+        let forward = through_cleartext(
+            c,
+            format!("GET https://host.test/p HTTP/1.1\r\nHost: host.test\r\n{fault}\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        for (plane, resp) in [
+            ("tunneled", &tunneled),
+            ("cleartext", &cleartext),
+            ("absolute-form https", &forward),
+        ] {
+            assert!(
+                resp.contains("400") && resp.contains(expected),
+                "`{fault}` must read `{expected}` on the {plane} plane: {resp:?}"
+            );
+        }
     }
 }
 
-/// The same, asked of the **absolute-form `https://`** plane, which is the one where it matters
+/// The same, asked of the **absolute-form `https://`** plane, which is the one where it matters/// The same, asked of the **absolute-form `https://`** plane, which is the one where it matters
 /// most: that plane exists for a client whose only egress transport is this form, and the traffic
 /// that put it there was an OAuth token exchange. A credential acquired that way and never observed
 /// is one the tripwires do not cover afterwards, on any plane, because the scan set is shared.
