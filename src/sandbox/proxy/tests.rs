@@ -1,4 +1,5 @@
 use super::ca::CertResolver;
+use super::splice::{SpliceGuard, splice_copy};
 use super::*;
 use crate::allowlist::{DefaultAction, EgressPolicy, classify};
 use crate::testutil::TmpDir;

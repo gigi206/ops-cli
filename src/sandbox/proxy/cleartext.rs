@@ -1,0 +1,342 @@
+//! The inspected-cleartext (`http://`) plane.
+//!
+//! A client whose `http_proxy` points here sends an absolute-form request with no CONNECT, and an
+//! `http://` allow rule may permit it. The same HTTP policy as the tunneled plane, on a connection
+//! that was never encrypted.
+
+use super::*;
+
+/// Handle an **inspected-cleartext** (`http://`) request: the client sent an absolute-form request
+/// (`GET http://host/path HTTP/1.1`) because its `http_proxy` points here, and an `http://` allow
+/// rule may permit it. This is the plaintext sibling of the MITM path — the *same* HTTP policy (host
+/// / port / path / method / the outbound-secret tripwire / the SSRF guard), but on a connection with
+/// **no TLS**: no CONNECT tunnel, no leaf minted, no upstream certificate to validate, and — because
+/// a bearer must never travel in the clear — **no credential injection** (a secret host can only be
+/// an inspected-over-TLS `to`, so [`matching_injections`] is skipped entirely, not merely trusted to
+/// return empty). The request is forwarded to the origin server in **origin-form** with the client's
+/// own `Host`, and the one response is streamed back. Every failure path is fail-closed with the same
+/// [`write_refusal`] reason categories the MITM path uses, so the agent tells a policy refusal from an
+/// unreachable host. `head_bytes` is the raw head (for the byte-exact secret tripwire); `head` is its
+/// parse.
+pub(super) fn handle_cleartext(
+    mut client: UnixStream,
+    head: &Head,
+    head_bytes: &[u8],
+    method: &str,
+    target: &str,
+    ctx: &ProxyCtx,
+) -> io::Result<()> {
+    // One credential state for the whole exchange: taken once here so the value injected and
+    // the needle scanned for can never come from two different resolutions, even if a refresh
+    // lands mid-request. A later exchange picks up the newer state.
+    let creds = ctx.credentials.snapshot();
+    // 1. Parse the absolute-form `http://host[:port]/path` target into (host, port=80 default, path).
+    //    The host is canonicalized by the parser; the path is canonicalized inside `explain_clear`.
+    let (host, port, path) = match allowlist::parse_url_target(target) {
+        Ok(t) => t,
+        Err(_) => {
+            ctx.push_log(
+                crate::sandbox::control::Proto::Http,
+                "",
+                0,
+                Some(method),
+                Some(target),
+                crate::sandbox::control::LogVerdict::Blocked,
+                "bad-request",
+            );
+            return write_refusal(
+                &mut client,
+                "400 Bad Request",
+                "bad-request",
+                "the absolute-form request target is not a valid `http://` URL",
+            );
+        }
+    };
+
+    // 2. Anti request-smuggling, fail-closed, through the check every inspected plane shares. This
+    //    plane forwards no chunked framing at all, which is the one thing it says differently.
+    let Framing { body_len, .. } = match inspect_framing(head, false) {
+        Ok(framing) => framing,
+        Err(refusal) => {
+            ctx.push_log(
+                crate::sandbox::control::Proto::Http,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                crate::sandbox::control::LogVerdict::Blocked,
+                refusal.reason,
+            );
+            return write_refusal(
+                &mut client,
+                "400 Bad Request",
+                refusal.reason,
+                refusal.detail,
+            );
+        }
+    };
+
+    // 3. Anti-fronting collapses to one check with no CONNECT/SNI: the absolute-form URL host must
+    //    equal the `Host` header, so a request cannot claim one host in the line and another in the
+    //    header (the destination the policy checks is the URL host).
+    if head
+        .header("host")
+        .map(|h| allowlist::canonical_host(&strip_port(h)) != host)
+        .unwrap_or(true)
+    {
+        ctx.outcome(
+            crate::sandbox::control::Proto::Http,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "host-mismatch",
+        );
+        return write_refusal(
+            &mut client,
+            "421 Misdirected Request",
+            "host-mismatch",
+            "the Host header does not match the request-line host",
+        );
+    }
+
+    // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
+    //    configured secret verbatim. It matters more here than on the TLS path: a leaked secret sent
+    //    in the clear is exposed on the wire, not just to the destination.
+    if carries_secret(head_bytes, &creds.needles) {
+        ctx.outcome(
+            crate::sandbox::control::Proto::Http,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "outbound-secret",
+        );
+        return write_refusal(
+            &mut client,
+            "403 Forbidden",
+            "outbound-secret",
+            "the request carries a configured secret value (outbound credential leak refused)",
+        );
+    }
+
+    // 5. The verdict — cleartext is strictly opt-in, so only an explicit `http://` allow rule permits
+    //    it (`explain_clear` never consults the default action or parks; deny wins layer-agnostically).
+    //    Evaluated against the effective policy, so an `http://` rule loaded live with `sbx net allow
+    //    http://host --session` opens it too. The two denial shapes get distinct reasons, and the
+    //    `denied-default` suggestion names the `http://` scheme (a bare `sbx net allow host` would add
+    //    an https rule that does not open the clear).
+    let policy = effective_policy(ctx);
+    let deciding: Rule = match policy.explain_clear(&host, port, &path, method) {
+        Decision::AllowedBy(rule) => rule.clone(),
+        Decision::DeniedBy(_) => {
+            ctx.outcome(
+                crate::sandbox::control::Proto::Http,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                StatKind::Deny,
+                "denied-by-rule",
+            );
+            return write_refusal(
+                &mut client,
+                "403 Forbidden",
+                "denied-by-rule",
+                "this request matches a deny rule in the network policy",
+            );
+        }
+        // `DeniedDefault` (nothing opened it) — and, defensively, any verdict `explain_clear` does not
+        // return (it never yields an allow-default or ask): all fail closed as a deny-default refusal.
+        _ => {
+            let method_denied = policy.method_denied_clear(&host, port, &path, method);
+            let reason = if method_denied {
+                "denied-method"
+            } else {
+                "denied-default"
+            };
+            ctx.outcome(
+                crate::sandbox::control::Proto::Http,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                StatKind::Deny,
+                reason,
+            );
+            if method_denied {
+                return write_refusal(
+                    &mut client,
+                    "403 Forbidden",
+                    "denied-method",
+                    &format!(
+                        "the `{method}` method is not permitted to `http://{host}:{port}` by the \
+                         network policy"
+                    ),
+                );
+            }
+            return write_refusal(
+                &mut client,
+                "403 Forbidden",
+                "denied-default",
+                &format!(
+                    "cleartext `http://{host}:{port}` is not allowed by the network policy. \
+                     Allow it: {}",
+                    ctx.allow_suggestion(&format!("http://{host}"))
+                ),
+            );
+        }
+    };
+
+    // 6. Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata address
+    //    is refused unless the `http://` rule names this exact host). A resolution failure for an
+    //    allowed host is a clean 502, distinct from a refusal.
+    let ip = match resolve_checked(
+        ctx,
+        crate::sandbox::control::Proto::Http,
+        &host,
+        port,
+        Some(method),
+        Some(&path),
+        Some(&deciding),
+    ) {
+        Ok(ip) => ip,
+        Err(refusal) => {
+            return write_refusal(
+                &mut client,
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(&host),
+            );
+        }
+    };
+
+    // 7. Open the plaintext upstream to the checked address (no TLS, no certificate — an `http://`
+    //    connection is cleartext by definition; the empty netns + the allowlist are the boundary).
+    let mut upstream = match TcpStream::connect((ip, port)) {
+        Ok(s) => {
+            let _ = s.set_read_timeout(Some(ctx.timeout));
+            let _ = s.set_write_timeout(Some(ctx.timeout));
+            // Nagle off, for the reason `connect_upstream` states: this path writes a head and
+            // then streams a body, and the second write would wait on a delayed ACK.
+            let _ = s.set_nodelay(true);
+            s
+        }
+        Err(_) => {
+            ctx.push_log(
+                crate::sandbox::control::Proto::Http,
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                crate::sandbox::control::LogVerdict::Error,
+                "upstream-unreachable",
+            );
+            return write_refusal(
+                &mut client,
+                "502 Bad Gateway",
+                "upstream-unreachable",
+                &format!("`{host}:{port}` is allowed but could not be reached"),
+            );
+        }
+    };
+
+    // The request is permitted and the upstream is up — record the one `allow` outcome here.
+    let allow_seq = ctx.outcome_l7(
+        crate::sandbox::control::Proto::Http,
+        crate::sandbox::control::HttpVer::H1,
+        // Cleartext is always HTTP/1.1; a gRPC/Connect-streaming content-type still tags (rare over
+        // cleartext, but honest if it occurs).
+        crate::sandbox::control::RpcKind::from_content_type(
+            head.header("content-type").unwrap_or_default(),
+        ),
+        &host,
+        port,
+        Some(method),
+        Some(&path),
+        StatKind::Allow,
+        "allowed",
+    );
+
+    // Register the open cleartext tunnel for `sbx net live` until this function returns (the tunnel
+    // closes). This is inspected cleartext, so the byte counters reflect application data.
+    let flow = ctx.register_flow(&host, port, crate::sandbox::control::Proto::Http);
+
+    // Open the traffic capture. No credential is ever injected on a cleartext request, so the head
+    // recorded here is both what arrived and what is forwarded, and no injected names accompany it.
+    let capture = ctx.begin_capture(allow_seq);
+    if let Some(c) = &capture {
+        c.set_request(head_bytes, &[]);
+    }
+
+    // 8. Forward the request in **origin-form** (`GET /path HTTP/1.1`) with the client's `Host` — an
+    //    origin server, unlike a proxy, expects the path, not the absolute-form URL. No credential is
+    //    injected (a header secret never rides a cleartext request). `Connection: close` is forced so
+    //    the upstream closes after the one response (the reserializer strips hop-by-hop headers).
+    let version = head
+        .request_line
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("HTTP/1.1");
+    let origin = Head {
+        request_line: format!("{method} {path} {version}"),
+        headers: head.headers.clone(),
+    };
+    // Never reused: reuse exists to amortize a TLS handshake, and a cleartext leg has none to save.
+    let reserialized = reserialize_request(&origin, &[], None, false);
+    upstream.write_all(&reserialized)?;
+    flow.up
+        .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
+    if body_len > 0 && head_expects_continue(head) {
+        let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+        let _ = client.flush();
+    }
+    // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
+    match &capture {
+        Some(c) => copy_exact(
+            &mut CaptureReader::new(&mut client, c.request_body_sink()),
+            &mut upstream,
+            body_len,
+        )?,
+        None => copy_exact(&mut client, &mut upstream, body_len)?,
+    }
+    flow.up.fetch_add(body_len, Ordering::Relaxed);
+    upstream.flush().ok();
+
+    // The request is permitted and fully forwarded; the response may now idle between bursts, so
+    // lift the upstream read timeout for the relay below (same rationale as the tunneled path).
+    begin_response_stream(&upstream);
+
+    // 9. Relay the response head, then stream its framed body to the client and close. A cleartext
+    //    host is never a credential-injection target, so it can carry no *reflected* secret to mask —
+    //    the response is relayed unredacted (there is nothing this path could reflect that the
+    //    tripwire above did not already refuse outbound).
+    let mut up_br = BufReader::new(upstream);
+    let RelayedHead {
+        head: resp_head,
+        framing,
+        ..
+    } = relay_response_head(
+        &mut up_br,
+        &mut client,
+        &flow.down,
+        capture.as_ref(),
+        &[],
+        method,
+        ClientLeg::Verbatim,
+    )?;
+    if let Some(code) = parse_status_code(&resp_head)
+        && code >= 200
+    {
+        ctx.set_status(allow_seq, code);
+    }
+    // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
+    let response = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
+    let mut response: Box<dyn Read + '_> = match &capture {
+        Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
+        None => Box::new(response),
+    };
+    pump_to_eof(&mut response, &mut client)
+}
