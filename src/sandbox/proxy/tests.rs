@@ -3556,6 +3556,59 @@ fn a_configured_idle_bound_is_the_one_the_tunnel_announces() {
     );
 }
 
+/// The other consumer of the same bound, and the one a wire test cannot see: a parked upstream
+/// connection older than it is not handed to the next request.
+///
+/// One setting with two consumers is exactly the shape that had already gone wrong once here — the
+/// proxy applying a built-in bound while `sbx config show` reported the configured one — so the
+/// second consumer is asserted rather than assumed. The bound is a nanosecond, which makes "older
+/// than it" true of anything: what is being tested is that the pool reads the launch's number at
+/// all, not where a threshold falls.
+#[test]
+fn a_parked_connection_older_than_the_configured_bound_is_not_reused() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            proxy_ca,
+            policy(&["upstream.test:*"])
+                .with_pool(true)
+                .with_idle_timeout(Some(Duration::from_nanos(1))),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let got = through_proxy_repeatedly(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+    )
+    .unwrap();
+    for response in &got {
+        assert!(response.ends_with("hello"), "both are served: {response:?}");
+    }
+    assert_eq!(
+        upstream.connections(),
+        2,
+        "a connection stale by the launch's own bound is not handed to the next request"
+    );
+}
+
 /// A connection over the cap is refused with a reason, not dropped.
 ///
 /// The raw-splice cap has always answered `503 splice-cap`, and a caller that hits the connection
