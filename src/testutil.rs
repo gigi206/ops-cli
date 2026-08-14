@@ -218,6 +218,7 @@ pub(crate) fn resolved(
 /// own layer combine. `cmd` is a placeholder -- the overlay is never launched.
 pub(crate) fn app_with(packages: Vec<crate::config::Package>) -> crate::config::ResolvedApp {
     crate::config::ResolvedApp {
+        provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: None,

@@ -3266,6 +3266,68 @@ fn the_shipped_profiles_import_and_resolve() {
 }
 
 #[test]
+fn install_steps_arrive_in_use_order_and_name_the_bundle_that_declared_them() {
+    // A `provision` is not merged like a key: two bundles each finish their own tool, so both are
+    // carried, in the order the app named them. The bundle travels with each step because
+    // everything a launch will say about it — the note before it runs, the error if it fails —
+    // names it, and "an install step failed" with no author is not actionable.
+    let fx = Fixture::new();
+    fx.write_global(
+        r#"
+[bundle.alpha]
+packages = { alpha = "mise:aqua:example/alpha" }
+provision = ["bash", "-c", "alpha-postinstall"]
+
+[bundle.beta]
+packages = { beta = "mise:aqua:example/beta" }
+provision = ["bash", "-c", "beta-postinstall"]
+
+[bundle.plain]
+packages = { plain = "mise:aqua:example/plain" }
+"#,
+    );
+    fx.write_profile(
+        "orchestrator",
+        r#"
+cmd = "orchestrate"
+use = ["beta", "plain", "alpha"]
+[network]
+mode = "deny"
+"#,
+    );
+
+    let out = fx.run(&["config", "show", "--app", "orchestrator", "--json"]);
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let steps = doc["provisions"]
+        .as_array()
+        .expect("provisions in the view");
+
+    let named: Vec<(&str, &str)> = steps
+        .iter()
+        .map(|s| (s["bundle"].as_str().unwrap(), s["cmd"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("beta", "bash -c beta-postinstall"),
+            ("alpha", "bash -c alpha-postinstall"),
+        ],
+        "`use` order decides, and a bundle without a step contributes none:\n{doc:#}"
+    );
+
+    // The same fold is what a reader sees: the step is rendered beside the command, not buried in
+    // the bundle it came from.
+    let shown =
+        String::from_utf8_lossy(&fx.run(&["config", "show", "--app", "orchestrator"]).stdout)
+            .to_string();
+    assert!(
+        shown.contains("install: bash -c beta-postinstall") && shown.contains("from bundle beta"),
+        "the app's resolved shape shows the step and its author:\n{shown}"
+    );
+}
+
+#[test]
 fn a_bundle_folds_into_a_profile_and_the_profile_still_wins() {
     // The end-to-end shape the feature exists for: an orchestrator profile names one bundle and
     // gets that tool, its environment and its egress without restating them — while everything it

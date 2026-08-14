@@ -641,6 +641,12 @@ pub(crate) struct RawApp {
     /// silence. Export never produces that shape — the serializer emits values ahead of tables.
     #[serde(default, rename = "use", skip_serializing_if = "Vec::is_empty")]
     pub(crate) uses: Vec<String>,
+    /// The install steps the named bundles contribute, in `use` order, each stamped with the bundle
+    /// that brought it. Derived by the fold, never written or exported: a profile states `use`, and
+    /// what that pulls in is the bundle's business — which is why this is `serde(skip)` rather than
+    /// a field an app could set. See [`RawBundle::provision`].
+    #[serde(skip)]
+    pub(crate) provisions: Vec<super::BundleProvision>,
     /// Extra environment for this app, layered over the baseline (the app wins on a key
     /// collision). A free field, like the baseline `env`. Skipped when empty on serialize, so an
     /// exported profile carries no noise `[env]` table.

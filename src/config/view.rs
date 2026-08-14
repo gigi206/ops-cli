@@ -599,6 +599,17 @@ pub(crate) struct SecretView {
     pub(crate) sources: String,
 }
 
+/// One install step an app's bundles contribute, as a launch would run it. Both halves are shown:
+/// the command, because it runs in this cage, and the bundle that declared it, because that is
+/// where a reader goes to change it.
+#[derive(Serialize)]
+pub(crate) struct AppProvisionView {
+    /// The bundle that declared the step.
+    pub(crate) bundle: String,
+    /// The step's argv, joined for display.
+    pub(crate) cmd: String,
+}
+
 /// One environment entry an app overlay adds over the baseline. It carries no per-entry layer:
 /// the resolved overlay flattens its global and project sources into one list, so unlike the
 /// baseline `env` there is no single layer to attribute. The value is shown as-is — `env` is a
@@ -651,6 +662,11 @@ pub(crate) struct AppView {
     pub(crate) name: String,
     /// The argv joined for display, or `None` when no layer declared a command.
     pub(crate) cmd: Option<String>,
+    /// The install steps this app's bundles contribute, in the order a launch runs them — each the
+    /// bundle's name and the command it declared. Shown because a step is a command that will run
+    /// inside this cage: someone reading an app's resolved shape is entitled to see it here, not
+    /// only in the bundle it came from.
+    pub(crate) provisions: Vec<AppProvisionView>,
     /// Where the app's persistent home is keyed, as a human phrase.
     pub(crate) home_scope: String,
     /// The environment this overlay adds over the baseline (the app wins on a key collision when
@@ -732,6 +748,10 @@ pub(crate) struct AppDetailView {
     /// Which app layer set the command (`Global`/`Project`); never inherited (the baseline has no
     /// command of its own).
     pub(crate) cmd_origin: ProvenanceView,
+    /// The install steps this app's bundles contribute, in the order a launch runs them. Rendered
+    /// beside the command for the same reason it is carried at all: it is a command that runs in
+    /// this cage, and the app's resolved shape is where someone checks what that is.
+    pub(crate) provisions: Vec<AppProvisionView>,
     pub(crate) home_scope: String,
     /// `Default` for the built-in `global` scope, else which app layer set it.
     pub(crate) home_scope_origin: ProvenanceView,
@@ -1261,6 +1281,14 @@ fn app_view(
     AppView {
         name: name.to_string(),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
+        provisions: app
+            .provisions
+            .iter()
+            .map(|p| AppProvisionView {
+                bundle: p.bundle.clone(),
+                cmd: p.argv.join(" "),
+            })
+            .collect(),
         home_scope: match app.home_scope {
             super::AppHomeScope::Global => "global (shared across projects)".to_string(),
             super::AppHomeScope::Project => "per-project".to_string(),
@@ -1491,6 +1519,14 @@ fn app_detail_view(
         cwd: cwd.display().to_string(),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
         cmd_origin: app.cmd_origin.into(),
+        provisions: app
+            .provisions
+            .iter()
+            .map(|p| AppProvisionView {
+                bundle: p.bundle.clone(),
+                cmd: p.argv.join(" "),
+            })
+            .collect(),
         home_scope: match app.home_scope {
             super::AppHomeScope::Global => "global (shared across projects)".to_string(),
             super::AppHomeScope::Project => "per-project".to_string(),
@@ -1791,6 +1827,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
@@ -1979,6 +2016,7 @@ mod tests {
 
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
+            provisions: Vec::new(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: None,
@@ -2116,6 +2154,7 @@ mod tests {
         };
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
+            provisions: Vec::new(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: None,

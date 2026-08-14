@@ -75,10 +75,17 @@ provision = ["bash", "-c", "npm rebuild demo-addon"]
 ```
 
 What using it grants is stated where the decision is made: `sbx bundle` counts it in
-the summary and prints the command verbatim when a bundle is named, and
+the summary and prints the command verbatim when a bundle is named,
 `sbx bundle import` says an install step arrived alongside the egress and credential
-counts. A command that will run in your cage is not something to discover at the next
-launch.
+counts, and [`sbx config show --app <name>`](../cli/config) renders it beside that
+app's command, naming the bundle it came from. A command that will run in your cage is
+not something to discover at the next launch.
+
+Steps are **carried, not merged**: two bundles each finish their own tool, so both run,
+in the order the app named them in `use`. A bundle named by two layers contributes
+once. And like everything else a bundle brings, a step arrives only from a trusted
+layer: an untrusted project's `use` is dropped whole, with the same per-app note it
+already gets.
 
 `task` folds like the rest: a tool that ships a brokered operation (a fixed command
 run with a credential the caller never holds, see [`[task.<name>]`](task)) carries

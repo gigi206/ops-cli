@@ -427,6 +427,21 @@ pub(crate) enum AppHomeScope {
 }
 
 /// An app's resolved overlay over the sandbox baseline: the command to run plus the extra
+/// One bundle's install step, as the fold hands it to a launch: the step itself and the bundle
+/// that declared it.
+///
+/// The bundle's name travels with the command because everything a launch says about the step
+/// names it — the note before it runs, the error when it fails — and "an install step failed" with
+/// no author is a message a reader cannot act on. Same reason a folded [`RawTask`] carries
+/// `from_bundle`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BundleProvision {
+    /// The bundle that declared this step.
+    pub(crate) bundle: String,
+    /// The argv to run, exactly as the bundle wrote it.
+    pub(crate) argv: Vec<String>,
+}
+
 /// environment, binds, packages, network posture, and credentials it declares — each
 /// already gated by the trust of the layer that supplied it (the global config, trusted by
 /// location, or a project layer by its verdict). `sbx app <name>` folds this onto the
@@ -436,6 +451,10 @@ pub(crate) struct ResolvedApp {
     /// The argv to run. Empty when no layer declared a `cmd` — a launch error, never a
     /// silent default.
     pub(crate) cmd: Vec<String>,
+    /// The install steps this app's bundles contribute, in `use` order, each stamped with its
+    /// bundle. They run before [`Self::cmd`] and never in its place; an app declares none of its
+    /// own, which is why they arrive only through the fold.
+    pub(crate) provisions: Vec<BundleProvision>,
     /// Where this app's persistent home is keyed (`Global` by default). Integrity-gated like
     /// `cmd`: an untrusted project may set its own app's scope but not flip a trusted app from
     /// `Project` to `Global`.
@@ -2815,6 +2834,18 @@ fn resolve_app(
     let mut ssh_agent_origin = Provenance::Default;
     let mut ssh_agent_confirm = false;
     let mut cmd: Vec<String> = Vec::new();
+    // The install steps the layers' bundles contributed, in the order they were folded. A step is
+    // carried, never merged: two bundles each finish their own tool. The same bundle named by both
+    // layers contributes once — running one install twice is at best waste and at worst a fight
+    // over the same directory.
+    let mut provisions: Vec<BundleProvision> = Vec::new();
+    let absorb_provisions = |steps: Vec<BundleProvision>, provisions: &mut Vec<BundleProvision>| {
+        for step in steps {
+            if !provisions.contains(&step) {
+                provisions.push(step);
+            }
+        }
+    };
     // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
     // *own* app's command, but may not override the command of an app a trusted layer defined
     // — else `sbx app <name>` against an untrusted repo would silently run the repo's command
@@ -2849,6 +2880,7 @@ fn resolve_app(
     // The global layer — trusted by location, honored in full.
     if let Some(app) = global {
         let source = app_source(GLOBAL_CONFIG, name);
+        absorb_provisions(app.provisions, &mut provisions);
         apply_env(&mut env, None, &mut warnings, &source, app.env, false);
         apply_binds(&mut binds, None, &mut warnings, &source, app.binds);
         apply_tools(
@@ -3015,6 +3047,9 @@ fn resolve_app(
                 &mut warnings,
             );
         }
+        // Only a trusted layer was folded, so only a trusted layer can carry steps; the untrusted
+        // case is already reported above rather than silently dropped.
+        absorb_provisions(app.provisions, &mut provisions);
         apply_env(&mut env, None, &mut warnings, &source, app.env, !trusted);
         if !app.binds.is_empty() {
             if trusted {
@@ -3282,6 +3317,7 @@ fn resolve_app(
 
     ResolvedApp {
         cmd,
+        provisions,
         home_scope,
         env,
         binds,

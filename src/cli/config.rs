@@ -1386,6 +1386,16 @@ fn render_app_detail(
             let _ = writeln!(o, "  {h}cmd:{r}     {warn}(no command){r}");
         }
     }
+    // Ahead of the posture, beside the command: an install step runs in this cage before `cmd`, so
+    // it belongs where a reader looks for what this app executes, not among the fields that shape
+    // it.
+    for step in &view.provisions {
+        let _ = writeln!(
+            o,
+            "  {h}install:{r} {}  {dim}(from bundle {}, runs once before cmd){r}",
+            step.cmd, step.bundle
+        );
+    }
     let _ = writeln!(
         o,
         "  {h}home:{r}    {}{}",
@@ -3014,6 +3024,7 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let view = AppDetailView {
+            provisions: Vec::new(),
             fs_deny: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
@@ -3229,6 +3240,7 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let app = |name: &str, limits: Option<AppLimitsView>| AppView {
+            provisions: Vec::new(),
             fs_deny: Vec::new(),
             fs_readonly: Vec::new(),
             ssh_agent: Vec::new(),
@@ -3358,6 +3370,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
@@ -3469,6 +3482,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
@@ -3544,6 +3558,7 @@ mod tests {
         // with or without `--details` — the default render is enough to pin them.
         use config::view::*;
         let app = |name: &str, network: Option<AppNetworkView>, gui: Option<GuiView>| AppView {
+            provisions: Vec::new(),
             fs_deny: Vec::new(),
             fs_readonly: Vec::new(),
             ssh_agent: Vec::new(),
@@ -3700,6 +3715,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
@@ -3822,6 +3838,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),
@@ -3944,6 +3961,7 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
                 ssh_agent: Vec::new(),

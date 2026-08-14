@@ -656,6 +656,7 @@ fn raw_app(
             ))
         },
         uses: Vec::new(),
+        provisions: Vec::new(),
         env: env
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -3027,6 +3028,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
     // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
     base.dbus = false;
     let app = ResolvedApp {
+        provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: None,
@@ -3107,6 +3109,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
 fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: None,
@@ -3159,6 +3162,7 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
 fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: None,
@@ -3210,6 +3214,7 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     use crate::allowlist::{EgressPolicy, Methods, classify};
     let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
     let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
+        provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: None,
@@ -3359,6 +3364,7 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
+        provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: None,
@@ -3418,6 +3424,7 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         "the baseline-effective set is cleared under a shared posture"
     );
     let app = ResolvedApp {
+        provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: None,

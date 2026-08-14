@@ -6368,6 +6368,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         packages: Vec<crate::config::Package>,
     ) -> crate::config::ResolvedApp {
         crate::config::ResolvedApp {
+            provisions: Vec::new(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: None,

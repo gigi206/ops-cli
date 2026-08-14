@@ -903,6 +903,7 @@ fn expand_bundles(
         // Accumulate the named bundles in declaration order first (later wins), then fold the
         // result *under* the app, so the app's own entries win over every bundle uniformly.
         let mut acc = RawBundle::default();
+        let mut provisions = Vec::new();
         let notes = app_notes.entry(app_name.clone()).or_default();
         for name in &app.uses {
             if !is_valid_bundle_name(name) {
@@ -928,9 +929,19 @@ fn expand_bundles(
                     task.from_bundle = Some(name.clone());
                 }
             }
+            // An install step does not merge like a key: two bundles each finish their own tool, so
+            // both run, in the order the app named them. Collected here rather than in `acc`, which
+            // is a `RawBundle` and could hold only the last one.
+            if let Some(provision) = bundle.provision.take() {
+                provisions.push(crate::config::BundleProvision {
+                    bundle: name.clone(),
+                    argv: provision.into_argv(),
+                });
+            }
             absorb_bundle(&mut acc, bundle, notes);
         }
         fold_bundle_into_app(app, acc, notes);
+        app.provisions = provisions;
     }
 }
 
