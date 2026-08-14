@@ -83,9 +83,12 @@ On a **non-interactive foreground run** the process events are *also* echoed inl
 `[sbx:exec]` lines (the file feed is never inline: it is far too chatty for a run's output).
 
 - Scope: observation runs on any launch: a non-interactive run, an **interactive terminal**, or a
-  **detached** (`--detach`) one. Only the inline stderr echo is limited to the non-interactive
-  foreground run (an interactive `[sbx:exec]` stream would fight a TUI for the screen, and a
-  detached session has no terminal at all). In every other case watch the session from another
+  **detached** (`--detach`) one. Only the inline stderr echo is limited, to a non-interactive
+  foreground run under a non-enforcing `[proc]` mode: an interactive `[sbx:exec]` stream would fight
+  a TUI for the screen, a detached session has no terminal at all, and an enforcing mode reads exec
+  through the seccomp lens described below rather than the poll that feeds this echo. A launch that
+  cannot show the echo says so rather than accepting the flag silently. In every other case watch
+  the session from another
   terminal with [`sbx proc logs <id> -f`](proc#logs) / [`sbx fs logs <id> -f`](fs#logs), which, for a detached run, is the only way to see what it does.
 - Honest limit: the process feed polls, so a process shorter than a tick (~300 ms) is missed; the
   file feed sees a completed write-and-close, and only in the project tree (not `/tmp`, the store,

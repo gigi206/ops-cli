@@ -118,9 +118,9 @@ pub(crate) fn run(
     let interactive = !detach && unsafe { libc::isatty(0) } == 1;
 
     // Observation runs on any path where a parent sbx survives the cage. Its inline stderr feed rides
-    // only the non-tty foreground path; an interactive terminal (which would fight a TUI for the
-    // screen) is warned and watched out-of-band with `sbx proc logs`/`sbx proc live` instead.
-    warn_observe_interactive(observe, interactive);
+    // only the non-tty foreground path under a non-enforcing `[proc]` mode; the launches that take it
+    // away are told so, and pointed at `sbx proc logs`/`sbx proc live` for the same events.
+    warn_observe_feed_absent(observe, interactive, &prep.cfg.proc);
 
     if cmd.is_empty() {
         // No command: open the project shell. Interactive gets the full pty shell (mise activation
@@ -180,12 +180,50 @@ fn observation_flags(proc: &crate::proc_policy::ProcPolicy, observe: bool) -> (b
     (exec_poll, observe)
 }
 
-fn warn_observe_interactive(observe: bool, interactive: bool) {
-    if observe && interactive {
-        crate::diag::warn(
-            "--observe's inline feed is not shown for an interactive terminal — watch this session \
-             with `sbx proc logs`/`sbx proc live` from another terminal",
+/// Why `--observe`'s inline `[sbx:exec]` feed will not appear, or `None` when it will.
+///
+/// The feed rides one path only: a non-tty foreground launch whose exec observation is the poller.
+/// Two things take it away, and both otherwise leave the flag reading as applied — the launch
+/// accepts it, prints nothing, and streams nothing:
+///
+/// - an interactive terminal, where the feed would fight the command's own screen;
+/// - an enforcing `[proc]` mode, where the exec lens is the seccomp supervisor rather than the
+///   poller ([`observation_flags`] clears `exec_poll` for exactly this set of modes), so nothing
+///   feeds the inline stream.
+///
+/// The enforcing case is worth stating plainly rather than implying a loss: the lens then sees
+/// *more* than the poller ever does, intercepting every `execve` including processes far too
+/// short-lived to appear in a sampled snapshot of `/proc`. The events exist; only the inline path is
+/// missing. Both cases therefore point at the same place to read them.
+///
+/// Separated from the printing so the decision can be asserted without capturing stderr, and so the
+/// two launch paths that warn cannot drift apart.
+fn observe_feed_absent_reason(
+    observe: bool,
+    interactive: bool,
+    proc: &crate::proc_policy::ProcPolicy,
+) -> Option<&'static str> {
+    if !observe {
+        return None;
+    }
+    if proc.enforcing() {
+        return Some(
+            "an enforcing `[proc]` mode watches every exec through the seccomp lens instead of the \
+             inline feed",
         );
+    }
+    interactive.then_some("the inline feed is not shown for an interactive terminal")
+}
+
+fn warn_observe_feed_absent(
+    observe: bool,
+    interactive: bool,
+    proc: &crate::proc_policy::ProcPolicy,
+) {
+    if let Some(reason) = observe_feed_absent_reason(observe, interactive, proc) {
+        crate::diag::warn(&format!(
+            "--observe: {reason} — watch this session with `sbx proc logs`/`sbx proc live`"
+        ));
     }
 }
 
@@ -753,7 +791,7 @@ pub(crate) fn app(
 
     // SAFETY: `isatty` only inspects fd 0.
     let interactive = !detach && unsafe { libc::isatty(0) } == 1;
-    warn_observe_interactive(observe, interactive);
+    warn_observe_feed_absent(observe, interactive, &prep.cfg.proc);
 
     // `--net-learn`: run the app under its real (unchanged) posture, capture the egress it was
     // refused for lack of a rule, and hand the synthesized rules back for the caller to write. It is
@@ -6043,6 +6081,70 @@ mod tests {
     use std::path::PathBuf;
 
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
+
+    /// `--observe` is accepted on every launch, but its inline feed is emitted on one path only.
+    /// Every launch that takes the feed away has to say so, because a flag that prints nothing and
+    /// streams nothing is indistinguishable from one that worked.
+    ///
+    /// The enforcing case is the one this was written for: it is not one mode but three, and a check
+    /// that named `enforce` alone would leave `ask` and `confine` silently featureless. The pairing
+    /// with [`observation_flags`] is asserted rather than assumed — the warning has to fire exactly
+    /// when the poller that feeds the stream is off, or the two drift apart.
+    #[test]
+    fn a_launch_that_cannot_show_the_observe_feed_says_so() {
+        use crate::proc_policy::{ProcMode, ProcPolicy};
+
+        let with = |mode| ProcPolicy {
+            mode,
+            ..ProcPolicy::default()
+        };
+
+        // The path the feed rides: asked for, no terminal to fight, a mode that leaves the poller on.
+        for mode in [ProcMode::Off, ProcMode::Observe] {
+            let policy = with(mode);
+            assert_eq!(
+                observe_feed_absent_reason(true, false, &policy),
+                None,
+                "{mode:?}: the feed is emitted here, so there is nothing to warn about"
+            );
+            assert!(
+                observation_flags(&policy, true).0,
+                "{mode:?}: and the poller that feeds it is on"
+            );
+        }
+
+        // Every enforcing mode, not just the obvious one.
+        for mode in [ProcMode::Enforce, ProcMode::Ask, ProcMode::Confine] {
+            let policy = with(mode);
+            let reason = observe_feed_absent_reason(true, false, &policy)
+                .unwrap_or_else(|| panic!("{mode:?}: no feed and no warning is the silent case"));
+            assert!(
+                reason.contains("seccomp lens"),
+                "{mode:?}: the reason names where the events are instead: {reason}"
+            );
+            assert!(
+                !observation_flags(&policy, true).0,
+                "{mode:?}: the warning fires exactly when the poller is off"
+            );
+        }
+
+        // A terminal takes the inline feed away too, and keeps its own reason.
+        let interactive = observe_feed_absent_reason(true, true, &with(ProcMode::Observe))
+            .expect("an interactive terminal has no inline feed either");
+        assert!(interactive.contains("interactive terminal"));
+
+        // Enforcement is named first: it is the reason that holds whether or not there is a
+        // terminal, and the one a reader would otherwise not guess.
+        assert_eq!(
+            observe_feed_absent_reason(true, true, &with(ProcMode::Enforce)),
+            observe_feed_absent_reason(true, false, &with(ProcMode::Enforce))
+        );
+
+        // And nothing is said to a launch that never asked.
+        for mode in [ProcMode::Off, ProcMode::Observe, ProcMode::Enforce] {
+            assert_eq!(observe_feed_absent_reason(false, true, &with(mode)), None);
+        }
+    }
 
     /// Nothing a cage's environment carries may reach bubblewrap's **argument list**:
     /// `/proc/<pid>/cmdline` is mode `444`, so every uid on the machine could read it for as long as

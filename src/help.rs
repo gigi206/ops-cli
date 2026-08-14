@@ -96,8 +96,10 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--observe",
-                "stream a `[sbx:exec]` feed of the processes the command spawns, on stderr \
-                 (non-interactive runs only; watch an interactive terminal with `sbx proc live`)",
+                "stream a `[sbx:exec]` feed of the processes the command spawns, on stderr — \
+                 sampled, so a command shorter than a poll tick may not appear (non-interactive \
+                 runs under a non-enforcing `[proc]` mode only; watch anything else with `sbx proc \
+                 logs`/`sbx proc live`)",
             ),
             (
                 "--config <toml|@file>",
@@ -252,8 +254,10 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--observe",
-                "stream a `[sbx:exec]` feed of the processes the app spawns, on stderr \
-                 (non-interactive runs only; watch an interactive terminal with `sbx proc live`)",
+                "stream a `[sbx:exec]` feed of the processes the app spawns, on stderr — sampled, \
+                 so a command shorter than a poll tick may not appear (non-interactive runs under a \
+                 non-enforcing `[proc]` mode only; watch anything else with `sbx proc logs`/`sbx \
+                 proc live`)",
             ),
             (
                 "--net-learn[=domain|path|exact]",
