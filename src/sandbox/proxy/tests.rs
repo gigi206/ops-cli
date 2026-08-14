@@ -6808,6 +6808,53 @@ fn run_with_refresh(
     (credentials, calls)
 }
 
+/// Every plane names the *same* framing problem the same way. The refusal reason is what
+/// `sbx net logs` records and what an agent reads off `X-Sbx-Egress-Reason`, so a caller debugging
+/// one plane must not get less than a caller debugging another: the cleartext path used to answer a
+/// bare `bad-request` for all four, which says a request was malformed without saying how.
+///
+/// What the planes may legitimately differ on is the *sentence*, and here they do: this one forwards
+/// no chunked framing at all, where the inspected planes de-chunk and re-frame.
+#[test]
+fn the_cleartext_plane_names_which_framing_problem_it_refused() {
+    for (request, expected) in [
+        (
+            "GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
+             Transfer-Encoding: chunked\r\n\r\n",
+            "bad-request:transfer-encoding",
+        ),
+        (
+            "GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
+             Content-Length: 0\r\nContent-Length: 5\r\n\r\n",
+            "bad-request:dup-content-length",
+        ),
+        (
+            "GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
+             Host: elsewhere.test\r\n\r\n",
+            "bad-request:dup-host",
+        ),
+        (
+            "GET http://upstream.test/p HTTP/1.1\r\nHost: upstream.test\r\n\
+             Content-Length: twelve\r\n\r\n",
+            "bad-request:invalid-content-length",
+        ),
+    ] {
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["http://upstream.test"]),
+            )
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(
+            resp.contains("400") && resp.contains(expected),
+            "expected `{expected}`: {resp:?}"
+        );
+    }
+}
+
 /// The same, asked of the **absolute-form `https://`** plane, which is the one where it matters
 /// most: that plane exists for a client whose only egress transport is this form, and the traffic
 /// that put it there was an OAuth token exchange. A credential acquired that way and never observed

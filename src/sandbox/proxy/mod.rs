@@ -1701,10 +1701,30 @@ fn handle_cleartext(
             CONTROL_BYTE_DETAIL,
         );
     }
-    if head.header("transfer-encoding").is_some()
-        || head.count("content-length") > 1
-        || head.count("host") > 1
-    {
+    //    Each refusal names *which* framing problem it was, as both other planes do: the reason is
+    //    what `sbx net logs` records and what an agent reads off the header, and a caller debugging
+    //    one plane must not get less than a caller debugging another. This path is the stricter one
+    //    on `Transfer-Encoding` — it forwards no chunked framing at all, where the inspected planes
+    //    de-chunk and re-frame — so the token is the same and the sentence differs.
+    let (reason, detail) = if head.header("transfer-encoding").is_some() {
+        (
+            "bad-request:transfer-encoding",
+            "the request carries a Transfer-Encoding, which this cleartext path does not forward",
+        )
+    } else if head.count("content-length") > 1 {
+        (
+            "bad-request:dup-content-length",
+            "the request carries a duplicated Content-Length header",
+        )
+    } else if head.count("host") > 1 {
+        (
+            "bad-request:dup-host",
+            "the request carries a duplicated Host header",
+        )
+    } else {
+        ("", "")
+    };
+    if !reason.is_empty() {
         ctx.push_log(
             super::control::Proto::Http,
             &host,
@@ -1712,15 +1732,9 @@ fn handle_cleartext(
             Some(method),
             Some(&path),
             super::control::LogVerdict::Blocked,
-            "bad-request",
+            reason,
         );
-        return write_refusal(
-            &mut client,
-            "400 Bad Request",
-            "bad-request",
-            "the request has ambiguous framing (Transfer-Encoding, or a duplicated \
-             Content-Length or Host)",
-        );
+        return write_refusal(&mut client, "400 Bad Request", reason, detail);
     }
     let body_len: u64 = match head.header("content-length") {
         Some(v) => match v.trim().parse() {
@@ -1733,12 +1747,12 @@ fn handle_cleartext(
                     Some(method),
                     Some(&path),
                     super::control::LogVerdict::Blocked,
-                    "bad-request",
+                    "bad-request:invalid-content-length",
                 );
                 return write_refusal(
                     &mut client,
                     "400 Bad Request",
-                    "bad-request",
+                    "bad-request:invalid-content-length",
                     "the Content-Length header is not a valid number",
                 );
             }
