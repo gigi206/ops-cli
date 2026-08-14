@@ -14,6 +14,25 @@
 //! 3. **Substitution cannot restructure the argv.** A placeholder substitutes inside the element
 //!    that contains it; an unknown placeholder, or a missing value for a parameter with no
 //!    `default`, is an error rather than an empty substitution.
+//!
+//! The inverse of check 1 — letting the caller compose the program, so an agent needing fifteen
+//! subcommands of one tool stops needing fifteen declared tasks — is **held on an argument, not
+//! merely unbuilt**. Such a tier has to deem the credential disclosed to the caller, and the
+//! containment it would be argued from does not hold:
+//!
+//! - **The oracle.** A caller who writes the program encodes a byte of the credential in its exit
+//!   status, which `write_outcome` answers verbatim, one character per call. No packet leaves the
+//!   cage, so no allowlist bounds it. Under a *fixed* command that cannot happen: the caller never
+//!   authors the program, and every value it supplies is checked against its parameter's bound.
+//! - **The part that outlives the oracle**, and the real closer: once the caller holds the value,
+//!   this cage's narrow allowlist governs nothing, because the caller spends the credential through
+//!   its own, wider one. Lane separation protects a *careless* caller — a credential into a log or
+//!   a prompt — never a hostile one, and untrusted is the default posture.
+//!
+//! The nearest sound thing already ships: a parameterized fixed command. A use case that does not
+//! fit is usually one more `param`, not one more tier. Recorded here because the design note that
+//! carried this argument no longer exists, and the sentence it replaced — that only the egress
+//! allowlist and the empty netns contain the disclosure — reads as an invitation to build it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
