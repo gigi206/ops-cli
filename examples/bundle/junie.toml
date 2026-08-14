@@ -47,7 +47,11 @@ provision = [
     '''
 set -eu
 j="$(mise where 'npm:@jetbrains/junie')/lib/node_modules/@jetbrains/junie"
-if [ ! -x "$HOME/.local/bin/junie" ]; then
+# Guard on a version's CONTENTS, not on any path the vendor script creates early. Measured, twice:
+# the script writes the launcher shim first, then creates `versions/<v>/`, then downloads into it —
+# so a failed download leaves both the shim AND an empty version directory behind, and a guard
+# keyed on either skips the retry forever while the launch dies with "No version found".
+if [ -z "$(find "$HOME/.local/share/junie/versions" -mindepth 2 -print -quit 2>/dev/null)" ]; then
   echo "junie: running the vendor install step mise's --ignore-scripts skipped (downloads the release) …" >&2
   node "$j/postinstall.js"
 fi
@@ -70,6 +74,14 @@ mute = [
     "@npm-audit",              # npm's audit endpoint, POSTed by the install
     "youtrack.jetbrains.com",  # the issue tracker the app references; no session needs it
 ]
+
+[bundle.junie.env]
+# The vendor's postinstall downloads the real build with Node's built-in `fetch` (undici), which
+# does NOT honour the http_proxy/https_proxy variables sbx injects unless this is set. In the cage's
+# empty network namespace an unproxied fetch resolves the host itself and dies with
+# `EAI_AGAIN github.com` — measured: the install step failed there, and with it the launch, until
+# this was set.
+NODE_USE_ENV_PROXY = "1"
 
 [bundle.junie.packages]
 junie = "mise:npm:@jetbrains/junie"  # the shim package, from JetBrains' own npm scope

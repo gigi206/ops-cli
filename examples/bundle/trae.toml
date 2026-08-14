@@ -54,7 +54,14 @@ if [ ! -x "$bin_link" ] || [ -n "$TRAE_SBX_UPDATE" ]; then
   rm -rf "$src"
   git clone --depth 1 "$repo_url" "$src"
   cd "$src"
-  uv tool install --python python3.12 .
+  # `--with docker --with pexpect --with unidiff`: upstream's start-up path imports these
+  # unconditionally (`base_agent.py` → `docker_manager.py`) while declaring them only under the
+  # `evaluation` extra, so a default install resolves and then dies at `ModuleNotFoundError` before
+  # the CLI prints anything — measured, one module at a time. They are added individually rather
+  # than through the extra, which would also drag `datasets`; the cage has no Docker to talk to
+  # anyway, so what is needed is only that the imports succeed. Drop them once upstream makes that
+  # import optional or moves the dependencies.
+  uv tool install --python python3.12 --with docker --with pexpect --with unidiff .
 fi
 ''',
 ]

@@ -81,11 +81,12 @@
 # to disk under `trajectories/`. Nothing to mute on the telemetry front
 # (the cage's deny-default still keeps every other host refused).
 #
-# UNVERIFIED (like every profile until run with a real key): the live
-# bootstrap (the `git clone` + `uv sync` + `uv tool install` is the heaviest
-# first-launch of any profile — ~280 MiB of deps including `tree-sitter`
-# native modules, `textual`, `mcp`, `pyinstaller`), the `trae-cli run`
-# output, and the BYOK proxy injection. Grounded here: the source
+# UNVERIFIED (like every profile until run with a real key): the `trae-cli run` output and the BYOK
+# proxy injection. The install is no longer among them — the clone and `uv tool install` were
+# exercised in a cage and `trae-cli --help` answers. Getting there needed three modules the
+# start-up path imports while upstream declares them only under an extra; the bundle's install step
+# names them and says why. It stays the heaviest first launch of any profile here (a few hundred
+# MiB of wheels, `tree-sitter` native modules included). Grounded here: the source
 # `pyproject.toml` (name `trae-agent`, scripts `trae-cli =
 # trae_agent.cli:main`, requires-python `>=3.12`, deps
 # `openai>=1.86.0` + `anthropic>=0.54.0` + `google-genai>=1.24.0` +

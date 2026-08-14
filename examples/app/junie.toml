@@ -31,11 +31,14 @@
 # answers with the install directory, whose layout is `lib/node_modules/<scope>/<name>` — both
 # checked against a real scoped install rather than assumed.)
 #
-# THE HONEST CAVEAT, and it is bigger than for the other profiles here: the build Junie downloads
-# at runtime is a JVM application that sbx never patches (unlike a `nix:`/`deb:`/`tarball:`
-# package, which is autoPatchelf'd host-side). It runs through the cage's `nix-ld` shim, the same
-# path `cursor-agent`'s bootstrap binary takes — which works there, but has NOT been proven for
-# this JBR-bundled launcher. If it fails to start, that is the first thing to look at.
+# THE CAVEAT THAT WAS: the build Junie downloads at runtime is a JVM application sbx never patches
+# (unlike a `nix:`/`deb:`/`tarball:` package, autoPatchelf'd host-side), running through the cage's
+# `nix-ld` shim. That is now measured rather than feared — the install completes in-cage and
+# `junie --version` answers `26.8.10 (2651.6)`. Getting there took two fixes, both in the bundle:
+# the vendor's postinstall downloads with Node's `fetch`, which ignores the proxy without
+# `NODE_USE_ENV_PROXY` (it died on `EAI_AGAIN github.com`), and its install step must be guarded on
+# a version's CONTENTS — the script writes the shim and creates `versions/<v>/` before downloading
+# into it, so a failed download leaves both behind and any guard keyed on them never retries.
 #
 # CREDENTIAL POSTURE — three ways in, per JetBrains' own docs:
 #   - a **JetBrains account** (OAuth in a browser — the hermetic cage has none, so complete it on
@@ -46,8 +49,9 @@
 #   - **BYOK** against your own provider (Anthropic, OpenAI, Google, xAI, OpenRouter): add that
 #     provider's host to `allow` and its key the same way the BYOK profiles do (see `cline.toml`).
 #
-# UNVERIFIED (like every profile until run with a real account): the runtime download, the JVM
-# launch under nix-ld, the live authentication, and the model traffic through sbx's MITM.
+# UNVERIFIED (like every profile until run with a real account): the live authentication and the
+# model traffic through sbx's MITM. The runtime download and the JVM launch under nix-ld are not
+# among them any more — both were exercised in a cage.
 # Grounded here: the packaging and its postinstall trap (read out of the published package and the
 # vendor installer), the auth methods (JetBrains' README + CLI docs), and the JetBrains hosts (read
 # out of the shipped application).
