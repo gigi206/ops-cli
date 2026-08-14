@@ -999,6 +999,69 @@ fn every_kind_of_plugin_shows_the_grant_it_declared() {
     }
 }
 
+/// The completion oracle answers `<name>` with the registry the page is about.
+///
+/// Two ways it did not. A broker and a signer claim no `scheme://`, so their name is the only
+/// token that reaches them, and it was the token completion withheld: the vocabulary enumerated
+/// resolvers alone. And `plugins rm|upgrade|verify <name>` was answered with **store** names,
+/// because the page-context override that gives `plugins store list <name>` its stores was keyed
+/// on the `plugins` verb rather than on the `store` page, so it swallowed the sibling pages whose
+/// `<name>` is an installed plugin.
+///
+/// Driven through the real oracle against a real registry: the mapping is derived from the help
+/// pages, so only the emitted answer says which registry a page ended up pointed at.
+#[test]
+fn completing_a_plugin_name_offers_every_kind_and_never_a_store() {
+    let home = TmpDir::new();
+    let src = TmpDir::new();
+    let sources = [
+        local_plugin(src.path(), "demo-resolver", "demo"),
+        local_signer(src.path(), "demo-signer", "Authorization", ""),
+        local_broker(src.path(), "demo-broker", ""),
+    ];
+    for source in &sources {
+        run(
+            &["plugins", "install", source.to_str().unwrap()],
+            home.path(),
+        );
+    }
+
+    for page in [
+        ["plugins", "info"],
+        ["plugins", "rm"],
+        ["plugins", "upgrade"],
+        ["plugins", "verify"],
+    ] {
+        let offered: Vec<String> = run(&["__complete", "--", page[0], page[1], ""], home.path())
+            .lines()
+            .filter_map(|l| l.split('\t').next().map(str::to_string))
+            .collect();
+        assert_eq!(
+            offered,
+            ["demo-broker", "demo-resolver", "demo-signer"],
+            "`sbx {} {}` completes every installed plugin, whatever its kind",
+            page[0],
+            page[1]
+        );
+    }
+
+    // The other side of the same override: a `store` page still answers with stores, so widening
+    // the sibling pages did not widen these. No store is configured here, and a plugin name
+    // appearing would be the over-correction.
+    for page in [["store", "list"], ["store", "rm"], ["store", "rekey"]] {
+        let offered = run(
+            &["__complete", "--", "plugins", page[0], page[1], ""],
+            home.path(),
+        );
+        assert!(
+            !offered.contains("demo-"),
+            "`sbx plugins {} {}` names a store, never an installed plugin:\n{offered}",
+            page[0],
+            page[1]
+        );
+    }
+}
+
 /// The one signer manifest field that changes how sbx **forwards** a request rather than what the
 /// plugin is shown: declaring it means request bodies to this destination are held before they
 /// leave, so it belongs on the page someone reads before installing.

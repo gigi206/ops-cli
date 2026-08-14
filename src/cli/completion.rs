@@ -356,8 +356,16 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
             let mut warnings = Vec::new();
             let registry =
                 plugins::PluginRegistry::load_quiet(&layout.plugins_dir(), &mut warnings);
-            for p in registry.resolvers() {
-                out.push((p.name.clone(), String::new()));
+            // Every kind, because the verbs that take this value take a plugin whatever it
+            // does — and a broker and a signer claim no scheme, so the name completion
+            // withholds is the only token that reaches them.
+            for name in registry
+                .resolvers()
+                .map(|p| &p.name)
+                .chain(registry.brokers().map(|p| &p.name))
+                .chain(registry.signers().map(|p| &p.name))
+            {
+                out.push((name.clone(), String::new()));
             }
             out.sort();
         }
@@ -634,9 +642,15 @@ fn kind_of_metavar(name: &str, path: &[&str]) -> Option<ValueKind> {
     }
     // Page-context overrides: the same metavariable means a different registry page
     // by page.
-    if path.len() >= 2 && path[0] == "plugins" && name == "name" {
-        // `plugins store list <name>`: a configured store, not an app.
-        return Some(ValueKind::Stores);
+    if path.first() == Some(&"plugins") && name == "name" {
+        // `<name>` means two registries under this verb, and neither is the app it means
+        // everywhere else: a configured store on the `store` pages, an installed plugin on
+        // `plugins rm|upgrade|verify`. Keyed on the page rather than on the verb, because the
+        // set of pages on each side grows.
+        return Some(match path.get(1) {
+            Some(&"store") => ValueKind::Stores,
+            _ => ValueKind::Plugins,
+        });
     }
     if path.first() == Some(&"projects") && (name == "id" || name == "project") {
         // `projects show|rm <id>`: a project tree, not a session.
