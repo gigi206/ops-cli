@@ -914,6 +914,41 @@ impl Head {
 /// instead of leaving it to be discovered by division.
 pub(crate) const CONCURRENT_CHUNKED_UPLOADS: u64 = 16;
 
+/// The share of host RAM the budget will not exceed, as a divisor.
+///
+/// The multiple above answers "how many uploads at once". It does not answer "on what machine": a
+/// launch on a workstation and one on a small laptop derive the same absolute ceiling from it, and
+/// these bytes are reached from inside the cage but allocated outside its cgroup, so on the small
+/// host the same in-cage caller takes a far larger share of what the host has. The cage's own limits
+/// are already stated as fractions of RAM for that reason (see [`crate::sandbox::cgroup`]), and this
+/// states the host-side budget the same way, so the two read alike.
+///
+/// **Where this bites, stated rather than left to be divided out**: it equals
+/// [`CONCURRENT_CHUNKED_UPLOADS`], so with the default `body_max_mb` the two agree at exactly 16 GiB
+/// of host RAM. Above that the multiple decides and this changes nothing; below it, this does. That
+/// is the intent and not a coincidence: what makes the budget worth bounding is the share of the
+/// host it can take, and a gibibyte is a rounding error on a workstation and an eighth of a small
+/// laptop. A smaller divisor would trim the budget on machines where it was never the problem, and
+/// buy a bound on a poste that is already small there.
+///
+/// What it bounds is **concurrency, not the peak**: the floor in [`BodyLimits::sized`] always admits
+/// one body, so a launch that raises `body_max_mb` past this whole share still holds that one body.
+/// The share decides how many at once, and `body_max_mb` decides how large one may be.
+const BODY_BUDGET_RAM_SHARE: u64 = 16;
+
+/// Total usable RAM in bytes, or `None` when `/proc/meminfo` cannot be read or parsed.
+fn host_ram() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1024)
+}
+
 /// What one launch will hold in request-body buffers: one body's ceiling, and the sum across every
 /// connection. Resolved once from `[network] body_max_mb` and carried on the context, so the check
 /// that refuses a body, the reservation that admits one, and the message that explains the refusal
@@ -924,16 +959,34 @@ pub(super) struct BodyLimits {
     /// buffered to be re-framed, and by one a signer asked for a digest over.
     per_request: u64,
     /// The bytes held at one moment across every connection — [`CONCURRENT_CHUNKED_UPLOADS`] times
-    /// the above, for the reason given there.
+    /// the above, for the reason given there, but never more than
+    /// [`BODY_BUDGET_RAM_SHARE`] of what the host has.
     total: u64,
 }
 
 impl BodyLimits {
     pub(super) fn new(per_request: u64) -> Self {
-        Self {
-            per_request,
-            total: per_request.saturating_mul(CONCURRENT_CHUNKED_UPLOADS),
-        }
+        Self::sized(per_request, host_ram())
+    }
+
+    /// [`Self::new`] with the host's RAM supplied rather than read, so the arithmetic can be
+    /// exercised for a machine of any size — including the one where the share bites, which is not
+    /// the machine the tests happen to run on.
+    ///
+    /// A host whose RAM cannot be read gets the multiple alone: that was the whole bound until now,
+    /// and failing open here keeps a launch working where `/proc` is not readable rather than
+    /// silently shrinking its budget to zero.
+    ///
+    /// The floor is one body. A budget below `per_request` would refuse every chunked upload
+    /// outright, which turns a bound on *concurrency* into a switch that turns the feature off, and
+    /// would make `body_max_mb` mean the opposite of what it says: raising it would forbid more.
+    fn sized(per_request: u64, ram: Option<u64>) -> Self {
+        let by_count = per_request.saturating_mul(CONCURRENT_CHUNKED_UPLOADS);
+        let total = match ram {
+            Some(ram) => by_count.min(ram / BODY_BUDGET_RAM_SHARE).max(per_request),
+            None => by_count,
+        };
+        Self { per_request, total }
     }
 }
 

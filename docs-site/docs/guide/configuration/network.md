@@ -265,6 +265,16 @@ Like the rest of the table this is trusted and global-only, so a global config c
 a project that has no way to observe it: nothing in the cage can tell whether a connection
 was reused. Whenever a layer turns it off, [`sbx config`](../cli/config) says so.
 
+One property of serving a connection is worth knowing before a long session, because this
+cap bounds how many are served at once but not how many are served in total. Each TLS
+connection leaves a small footprint in the launch process that the allocator does not
+return to the system afterwards, so a session's own memory grows with the number of
+connections it has served and settles rather than falling back. It follows connections and
+not requests: a client that keeps one connection open for a hundred exchanges pays it once,
+while a workload that opens a fresh connection per fetch pays it per fetch. Nothing here is
+unbounded within a session that reuses its connections, and a session ends by exiting, but
+a long run that opens connections in series is the shape that grows.
+
 ### How much of a body is held (`body_max_mb`)
 
 Most request bodies pass straight through: the proxy forwards a declared `Content-Length`
@@ -290,8 +300,12 @@ send). Raise it for a workload that genuinely streams uploads that large.
 
 Note what it multiplies. The proxy runs host-side, outside the cage's memory cgroup, so the
 cage's own memory limit does not reach these buffers; what bounds them is a second ceiling
-on the **sum** across every connection, a fixed multiple of this number. Raising one raises
-both. A request that meets the shared ceiling rather than its own is answered `503`
+on the **sum** across every connection. That ceiling is the smaller of two things: a fixed
+multiple of this number, and a share of what the host machine has. On a roomy host the
+multiple decides, so raising one raises both. On a small one the share decides instead, and
+raising this number then buys a larger single upload rather than a larger sum, because the
+bytes it bounds are the ones an in-cage caller can make the host hold outside the cage's own
+limit. One body always fits, whatever this is set to. A request that meets the shared ceiling rather than its own is answered `503`
 (`body-buffer-cap`): nothing is wrong with it, and the same request is taken once one in
 flight completes. Zero is warned and ignored.
 

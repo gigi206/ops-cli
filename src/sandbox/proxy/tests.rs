@@ -4475,7 +4475,10 @@ fn the_body_buffer_budget_is_shared_and_released() {
     use std::sync::atomic::AtomicU64;
 
     let budget = AtomicU64::new(0);
-    let limits = BodyLimits::new(crate::allowlist::DEFAULT_BODY_MAX);
+    // No host RAM supplied: this test is about the multiple, and reading the running machine's RAM
+    // would make the count below depend on how large that machine is. The share that bounds the
+    // multiple on a small host has its own test.
+    let limits = BodyLimits::sized(crate::allowlist::DEFAULT_BODY_MAX, None);
     // A chunked request cannot say how much it will read, so it reserves the per-request ceiling —
     // which makes this the number of concurrent chunked uploads, and why that is the named constant.
     assert_eq!(
@@ -4531,6 +4534,58 @@ fn the_body_buffer_budget_is_shared_and_released() {
         })
         .collect();
     assert_eq!(small.len(), 1000);
+}
+
+/// The budget is a share of the host as well as a multiple of the per-request ceiling, and on a
+/// small host the share is what a caller meets.
+///
+/// The buffers are allocated host-side, outside the cage's cgroup, so the cage's `MemoryMax` does
+/// not reach them: what an in-cage caller can make the host hold has to be stated against the host,
+/// not as an absolute figure that means one thing on a workstation and another on a laptop.
+///
+/// Every expectation here is a literal. Deriving them from the constants would make the test agree
+/// with whatever the code computes, including a wrong answer.
+#[test]
+fn the_body_budget_is_bounded_by_a_share_of_host_ram() {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    // 64 GiB: sixteen 64 MiB bodies is 1 GiB, well under the host's share (4 GiB), so the multiple
+    // is what bounds it and nothing about the budget changes on a large machine.
+    let big = BodyLimits::sized(64 * MIB, Some(64 * GIB));
+    assert_eq!(big.total, GIB);
+
+    // 8 GiB: the share is 512 MiB, below the same 1 GiB, so it is the share that bounds the budget —
+    // eight concurrent chunked uploads instead of sixteen.
+    let small = BodyLimits::sized(64 * MIB, Some(8 * GIB));
+    assert_eq!(small.total, 512 * MIB);
+    assert_eq!(small.total / small.per_request, 8);
+
+    // A raised `body_max_mb` on a small host is bounded by the same share: raising the per-request
+    // ceiling buys a larger single upload, not a larger sum.
+    let raised = BodyLimits::sized(256 * MIB, Some(8 * GIB));
+    assert_eq!(raised.total, 512 * MIB);
+
+    // The floor is one body, so a per-request ceiling above the whole share still admits one upload.
+    // Anything less would turn `body_max_mb` upside down: raising it would forbid more.
+    let over = BodyLimits::sized(2 * GIB, Some(8 * GIB));
+    assert_eq!(over.total, 2 * GIB);
+
+    // An unreadable /proc/meminfo leaves the multiple alone rather than shrinking the budget to
+    // nothing: it was the whole bound until the share existed.
+    let unknown = BodyLimits::sized(64 * MIB, None);
+    assert_eq!(unknown.total, GIB);
+
+    // Everything above supplies the RAM, so nothing above reads the machine. That leaves the one
+    // step that talks to the host untested, and its failure mode is quiet: a `MemTotal` line parsed
+    // into `Some(0)` would floor every budget at a single body, and a launch would refuse
+    // concurrent uploads for a reason no message names. The bound is loose on purpose — this asserts
+    // that the read works, not how large this particular machine is.
+    let read = host_ram().expect("MemTotal is readable on a Linux host");
+    assert!(
+        read >= 256 * MIB,
+        "host_ram() parsed {read} bytes, which no machine that can run a sandbox actually has"
+    );
 }
 
 /// The refusal the ceiling issues, through the real proxy, at **every** site that reserves.
