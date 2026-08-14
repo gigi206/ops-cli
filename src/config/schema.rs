@@ -274,6 +274,9 @@ pub(crate) struct RawConfig {
 /// environment, its egress and its credential; it can never widen what the cage exposes of the
 /// host.
 ///
+/// It may carry the one-time step that finishes an install ([`RawBundle::provision`]) but never
+/// the command an app launches: `provision` runs before that command and cannot replace it.
+///
 /// A bundle may not name another bundle: there is no `use` field here, so nesting — and with it
 /// any cycle — is impossible by construction, the same way a `[net.groups]` entry may not be a
 /// `@other` reference. Its `allow`/`deny`/`mute` entries *may* be `@group` references, because
@@ -302,6 +305,23 @@ pub(crate) struct RawBundle {
     /// app's `[secret]` section — effective only under a network allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) secret: Option<RawSecretSection>,
+    /// The one-time step that finishes installing this tool, as an argv — a vendor postinstall
+    /// mise's `--ignore-scripts` skips, a native addon with no prebuilt binary, a source build.
+    ///
+    /// It exists because a bundle carries what a tool *needs* but could not carry the *act* of
+    /// installing when that act is a command, which left a consuming app with a package it cannot
+    /// start and an install step to hand-copy — the drift a bundle exists to remove.
+    ///
+    /// **Not a second [`RawApp::cmd`].** It never replaces the app's command: an app's command is
+    /// its identity, and inheriting one from a shared artifact would be an integrity hijack. It
+    /// runs BEFORE that command, in the same cage, under the same posture and allowlist, with no
+    /// privilege the launch does not already have — so a step that downloads needs its host in this
+    /// bundle's own `allow`, visible rather than implied.
+    ///
+    /// Bundle-only: an app writes its own `cmd`, and a second way to say the same thing would be
+    /// one too many.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provision: Option<RawCmd>,
     /// Declared operations this bundle contributes, `[bundle.<name>.task.<task>]`. Folded into any
     /// app that names the bundle in `use`, like its packages and credentials — a tool that ships a
     /// brokered operation carries it with the rest of what it needs.

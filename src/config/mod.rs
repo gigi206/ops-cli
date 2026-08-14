@@ -34,6 +34,10 @@ pub(crate) use load::{
 };
 pub(crate) use overrides::{CliOverrides, Override};
 pub(crate) use schema::RawBundle;
+/// The command form a bundle's install step is written in. Named here only where a test
+/// constructs one; the renderer reaches it through [`schema::RawCmd::into_argv`].
+#[cfg(test)]
+pub(crate) use schema::RawCmd;
 // Consumed by the resolution engine that stays in this file (and `global_path` by `manage`).
 use load::{canonicalize_binds, global_path, read_global, sbx_control_plane_roots};
 // The secret source/validation machinery the resolution engine folds into the resolved set.

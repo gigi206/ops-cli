@@ -160,6 +160,9 @@ fn render_bundles(
             if let Some(creds) = b.secret.as_ref().map(|s| s.hosts.len()).filter(|c| *c > 0) {
                 parts.push(format!("{creds} credential(s)"));
             }
+            if b.provision.is_some() {
+                parts.push("an install step".to_string());
+            }
             if parts.is_empty() {
                 parts.push("empty".to_string());
             }
@@ -188,6 +191,14 @@ fn render_bundles(
             for host in secret.hosts.keys() {
                 out.push_str(&format!("  secret   {host} (injected host-side)\n"));
             }
+        }
+        // Printed in full, unlike an env value: this one is a command that will run in the cage,
+        // and a reader deciding whether to name this bundle is deciding about exactly these words.
+        if let Some(provision) = &b.provision {
+            out.push_str(&format!(
+                "  install  {} (runs once, before the app's own command)\n",
+                provision.clone().into_argv().join(" ")
+            ));
         }
     }
     out
@@ -347,14 +358,22 @@ fn bundle_import(args: &[OsString]) -> ExitCode {
                 .filter_map(|(name, b)| {
                     let rules = b.allow.len() + b.deny.len() + b.mute.len();
                     let creds = b.secret.as_ref().map(|s| s.hosts.len()).unwrap_or(0);
-                    (rules > 0 || creds > 0)
-                        .then(|| format!("{name} ({rules} egress rule(s), {creds} credential(s))"))
+                    // An install step is named apart from the counts: it is a command that will run
+                    // in the consuming app's cage, which is a different kind of grant from a host
+                    // or a key, and the one a reader is least likely to expect.
+                    let step = b.provision.is_some().then_some(", an install step");
+                    (rules > 0 || creds > 0 || step.is_some()).then(|| {
+                        format!(
+                            "{name} ({rules} egress rule(s), {creds} credential(s){})",
+                            step.unwrap_or("")
+                        )
+                    })
                 })
                 .collect();
             if !granting.is_empty() {
                 diag::warn(&format!(
-                    "an app that names these gains their egress and credentials: {} — inspect \
-                     with `sbx bundle <name>`",
+                    "an app that names these gains their egress, credentials and install steps: \
+                     {} — inspect with `sbx bundle <name>`",
                     granting.join(", ")
                 ));
             }
@@ -410,6 +429,41 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("package  demo = mise:demo"), "{shown}");
+    }
+
+    #[test]
+    fn an_install_step_is_named_in_the_summary_and_printed_in_full_when_shown() {
+        // A `provision` runs a command inside the cage before the app's own, so a reader deciding
+        // whether to name this bundle is deciding about exactly those words: the summary must say
+        // one exists, and the full listing must print it rather than counting it.
+        let pal = style::Palette::plain();
+        let mut b = bundle_of(&[("demo", "mise:demo")], &[]);
+        b.provision = Some(config::RawCmd::Argv(vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "npm rebuild demo-addon".to_string(),
+        ]));
+        let name = "with-install".to_string();
+
+        let summary = render_bundles(&[(&name, &b)], true, &pal);
+        assert!(
+            summary.contains("1 package(s), an install step"),
+            "the summary says a step exists: {summary}"
+        );
+        assert!(
+            !summary.contains("npm rebuild"),
+            "but does not print it: {summary}"
+        );
+
+        let shown = render_bundles(&[(&name, &b)], false, &pal);
+        assert!(
+            shown.contains("install  bash -c npm rebuild demo-addon"),
+            "the full listing prints the command verbatim: {shown}"
+        );
+        assert!(
+            shown.contains("before the app's own command"),
+            "and says when it runs, since that is what distinguishes it from a `cmd`: {shown}"
+        );
     }
 
     #[test]

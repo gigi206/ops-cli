@@ -52,6 +52,7 @@ the map-side companion, and it carries the egress along.
 | `secret` | another bundle (`use`) |
 | `task` (declared operations, `[bundle.<name>.task.<task>]`) | |
 | `flakes`, `tarball`, `deb`, `appimage` (the resolver tables that pair with a package) | |
+| `provision` (the one-time step that finishes an install) | |
 
 The line is the design, not a shortlist. A bundle describes **a tool**; it says
 nothing about **the shape of the cage**. So using one can add a tool, its
@@ -59,6 +60,25 @@ environment, its egress and its credential: it can never widen what the cage exp
 of your host, and it can never silently switch on a microphone or a display because
 the tool it packages can use one. There is no `cmd` because an app's command is its
 identity: inheriting one would be an integrity hijack.
+
+`provision` is the one thing a bundle carries that is a **command**, and it is not an
+exception to that rule: it is the step that finishes installing the tool, it runs
+before the app's own command, and it can never replace it. It exists because a bundle
+could describe what a tool needs but not the act of installing it when that act is a
+command, which left a consuming app with a package it cannot start and an install step
+to hand-copy. Declared as an argv, like `cmd`:
+
+```toml
+[bundle.demo]
+packages  = { demo = "mise:npm:demo" }
+provision = ["bash", "-c", "npm rebuild demo-addon"]
+```
+
+What using it grants is stated where the decision is made: `sbx bundle` counts it in
+the summary and prints the command verbatim when a bundle is named, and
+`sbx bundle import` says an install step arrived alongside the egress and credential
+counts. A command that will run in your cage is not something to discover at the next
+launch.
 
 `task` folds like the rest: a tool that ships a brokered operation (a fixed command
 run with a credential the caller never holds, see [`[task.<name>]`](task)) carries
