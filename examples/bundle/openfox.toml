@@ -21,6 +21,34 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.openfox]
+# The install step mise's `--ignore-scripts` leaves undone, and the reason this bundle is complete
+# rather than a package a consuming app cannot start. OpenFox depends on two NATIVE node addons —
+# `better-sqlite3` (its session DB) and `node-pty` (its integrated terminal) — whose compiled
+# `.node` binaries are placed by a package install script, which mise deliberately does not run. A
+# plain install therefore leaves them absent and the agent exits at startup with "Could not locate
+# the bindings file … better_sqlite3.node".
+#
+# `npm rebuild` DOWNLOADS the prebuilt binaries rather than compiling them (they are published for
+# this platform), so no C++ toolchain is needed — but it does fetch, which is why the npm registry
+# is in the consuming app's reach. It runs inside the cage, under that app's own posture.
+#
+# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
+# remember that one succeeded. Keying on the artifact also self-heals — after `sbx upgrade mise`
+# rolls openfox into a fresh install directory the marker is absent again, so the addons are rebuilt
+# for the new tree.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -eu
+of="$(mise where 'npm:openfox')/lib/node_modules/openfox"
+marker="$of/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+if [ ! -e "$marker" ]; then
+  echo "openfox: building native addons (better-sqlite3, node-pty) that mise's --ignore-scripts skips …" >&2
+  ( cd "$of" && npm rebuild better-sqlite3 node-pty )
+fi
+''',
+]
 
 [bundle.openfox.packages]
 nodejs = "nix:nodejs"  # mise's npm backend needs a node runtime inside the cage

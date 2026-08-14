@@ -34,14 +34,14 @@
 # `@deepseek-ai/node-addon-landlock-run`, `node-addon-require-builtin`, and `@vscode/ripgrep` 1.18
 # (the file-search tool's own ripgrep, resolved lazily at the first search rather than at load).
 #
-# The fourth is `node-pty` 1.1.0, the terminal's pseudo-terminal binding, and it is the first of
-# two reasons `cmd` below is a wrapper rather than a bare `dsh`. Its tarball ships prebuilds for macOS and
+# The fourth is `node-pty` 1.1.0, the terminal's pseudo-terminal binding, and it is carried by the
+# BUNDLE rather than by this command. Its tarball ships prebuilds for macOS and
 # Windows only; on Linux its `install` script falls through to `node-gyp rebuild`, so an install
 # that skips scripts leaves `build/Release/pty.node` absent — and the web profile loads node-pty at
-# BOOT, so `dsh web` dies in its loader before serving anything. The wrapper heals that the way
-# `openfox.toml` does: on first launch, and again after `sbx upgrade mise` rolls dsh into a fresh
-# install directory, it runs `npm rebuild node-pty` inside the install tree and then execs the
-# server. Two details keep that honest — the guard skips the build once the binary exists, and
+# BOOT, so `dsh web` dies in its loader before serving anything. The bundle's `provision` heals
+# that, and sbx runs it before this command, in this cage: on first launch, and again after
+# `sbx upgrade mise` rolls dsh into a fresh install directory. Two details keep that honest — the
+# step's guard skips the build once the binary exists, and
 # `--nodedir` points node-gyp at the node package's own headers instead of letting it download a
 # header tarball. That is why `nodejs.org` is in no allowlist here; it was measured on a nixpkgs
 # node package, not on the exact node this channel resolves, so if a future one ever ships without
@@ -50,7 +50,7 @@
 # compiler) rides the bundle, alongside the harness itself. Upstream requires Node
 # `^22.19.0 || >=24.0.0`; the unversioned `nix:nodejs` satisfies it.
 #
-# THE SECOND REASON: `--expose-internals`, and it is about THIS cage's node build. After boot, the
+# WHY `cmd` IS STILL A WRAPPER: `--expose-internals`, and it is about THIS cage's node build. After boot, the
 # launcher mounts a reload plugin whenever no `hmr` service is present — which is exactly this
 # profile's case, since the web layer disables the bundle's own `hmr` row — and that plugin needs
 # Node's internal module loader. The loader reaches it two ways: directly when `--expose-internals`
@@ -154,14 +154,6 @@ cmd = [
     """
 set -eu
 dsh_dir="$(mise where 'npm:@deepseek-ai/dsh')/lib/node_modules/@deepseek-ai/dsh"
-# The one addon mise's --ignore-scripts leaves unbuilt: node-pty ships no Linux prebuild, and the
-# web profile loads it at boot. Build it once per install directory, against the nix node package's
-# own headers so node-gyp fetches nothing.
-if [ ! -e "$dsh_dir/node_modules/node-pty/build/Release/pty.node" ]; then
-  echo "deepseek-harness: building node-pty, the addon the script-free install leaves out …" >&2
-  node_prefix="$(dirname "$(dirname "$(command -v node)")")"
-  ( cd "$dsh_dir" && npm rebuild node-pty --nodedir="$node_prefix" )
-fi
 # `--expose-internals` instead of a bare `dsh`: the loader reaches Node's internal module loader
 # either through that flag or through a native addon, and the addon refuses this cage's node build
 # (see the header). Without it the boot dies applying the reload plugin.

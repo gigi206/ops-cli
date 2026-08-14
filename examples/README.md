@@ -99,18 +99,24 @@ the test above requires a namesake profile to name its own bundle **and only it*
 cannot both publish and consume. If an app ever needs both, that assertion is the one line to
 change.
 
-**When the install needs a `cmd`, the bundle still ships — and says so.** Three shapes need a step
-only a wrapper can perform: a vendor postinstall mise's `--ignore-scripts` skips (`amp`, `junie`),
-a native addon with no prebuilt binary for this platform (`deepseek-harness`), and a whole agent
-whose artifact no backend fits (`cursor-agent`, a JavaScript tree with no binary to wrap; `muse`, a
-bare binary rather than an archive; `prime-agent`, a packed npm tarball) or that is built from a
-source checkout (`odysseus`, `trae`). Four profiles left this list once their artifact was measured
-rather than assumed: `devin` and `warp` moved to `tarball:resolve`, `pool` too, and `rovo` to the
-nixpkgs attribute that now exists. A bundle cannot carry a `cmd`, so those bundles
-carry the fetch tooling, the environment and the hosts, and their headers state plainly what is
-missing: name one alone and you equip a cage that can reach the agent's service but has no agent in
-it. That is a warning where silence used to be — and it is what lets an app like `t3code` declare
-any of them with `use` and then reproduce the install step deliberately.
+**When the install is a command, the bundle carries it too.** Some tools are not finished by
+unpacking a package: a vendor postinstall mise's `--ignore-scripts` skips (`junie`), a native addon
+with no prebuilt binary for this platform (`deepseek-harness`, `openfox`), a source checkout that
+has to be cloned and built (`odysseus`, `trae`). Those bundles declare that one-time step as
+[`provision`](../docs-site/docs/guide/configuration/bundles.md), and sbx runs it in the consuming
+app's own cage, before that app's command and never in its place. So the bundle is complete: name
+it and you get the agent, not a package that cannot start.
+
+A step runs on every launch and guards itself — sbx does not remember that one succeeded, because
+what proves an install finished is a path only the step knows. That is also what makes it
+self-healing: delete what it produced and the next launch puts it back.
+
+Four profiles left this shape entirely once their artifact was measured rather than assumed:
+`devin` and `warp` moved to `tarball:resolve`, `pool` too, and `rovo` to the nixpkgs attribute that
+now exists. Three keep a `cmd` that installs, because no backend fits their artifact and the step
+is not a one-time install but the launch itself: `cursor-agent` (a JavaScript tree with no binary
+to wrap), `muse` (a bare binary rather than an archive) and `prime-agent` (a packed npm tarball).
+Their headers say which, measured rather than assumed.
 
 A related discriminator is worth keeping in mind: "is a postinstall skipped" is not the question —
 **can the tool still find what that postinstall would have placed** is. An agent that looks its
@@ -292,15 +298,14 @@ to roll, so each exposes an explicit, one-launch refresh through a one-shot env 
 | Profile | Refresh |
 | ------- | ------- |
 | `cursor-agent` | `sbx app run cursor-agent --env CURSOR_AGENT_SBX_UPDATE=1` |
-| `devin` | `sbx app run devin --env DEVIN_REINSTALL=1` |
 | `muse` | `sbx app run muse --env MUSE_SBX_UPDATE=1` |
 | `odysseus` | `sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1` |
 | `open-design` | `sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1` |
-| `pool` | `sbx app run pool --env POOL_SBX_UPDATE=1` |
 | `prime-agent` | `sbx app run prime-agent --env PRIME_AGENT_SBX_UPDATE=1` |
-| `rovo` | `sbx app run rovo --env ACLI_REINSTALL=1` |
-| `trae` | `sbx app run trae --env TRAE_REINSTALL=1` |
-| `warp` | `sbx app run warp --env WARP_REINSTALL=1` |
+| `trae` | `sbx app run trae --env TRAE_SBX_UPDATE=1` |
+
+`devin`, `pool`, `rovo` and `warp` used to be in that table and are not any more: their artifact
+turned out to fit a backend, so `sbx upgrade` rolls them like every other package.
 
 `--env` is authoritative and read on the host, so these keep the same contract as `sbx upgrade`:
 **the version moves only when you ask**, never on a launch and never on an sbx binary update.

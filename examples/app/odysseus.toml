@@ -28,7 +28,9 @@
 # UPGRADE — explicit, never automatic. Odysseus publishes no release artifact and is
 # not a pip-installable package, so it rides no `[packages]` backend and `sbx upgrade`
 # has nothing to roll: the checkout would stay pinned to whatever `main` was on the
-# first launch. Refresh it for ONE launch with
+# first launch. The clone and the install are the `odysseus` bundle's install step,
+# which sbx runs before this command; what stays here is what shapes the running
+# process. Refresh it for ONE launch with
 #     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
 # which fetches `main`, hard-resets the checkout, and re-installs the dependencies
 # (the install is keyed on the commit, so it re-runs exactly when the source moved).
@@ -76,88 +78,23 @@ cmd = [
     "-c",
     '''
 set -e
-cd "$HOME"
-# Clone the curated `main` branch (Odysseus' own README marks `dev` as
-# possibly-unstable and recommends `main`); reuse the persistent app home
-# on later launches. A bare `git clone` follows the repo default, which
-# upstream really does set to `dev`, so pin the branch explicitly.
-if [ ! -d odysseus ]; then
-  git clone -b main --depth 1 https://github.com/odysseus-dev/odysseus.git
-fi
-cd odysseus
-
-# UPGRADE. Odysseus publishes no release artifact and is not a pip-installable
-# package, so it rides no sbx `[packages]` backend and `sbx upgrade` cannot roll
-# it forward — the checkout would otherwise stay frozen at whatever `main` was on
-# the first launch, forever. Refresh it deliberately, one launch at a time:
-#     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
-# `--env` is an authoritative one-shot override read on the HOST, so this moves
-# the version only when you ask — the same "versions move only on an explicit
-# upgrade" contract `sbx upgrade` gives the managed backends. `reset --hard`
-# discards the local patch below (it is re-applied right after) and any other
-# in-tree edit; app DATA lives outside the checkout, so nothing you own is lost.
-if [ -n "$ODYSSEUS_SBX_UPDATE" ]; then
-  echo "sbx: refreshing the Odysseus checkout (ODYSSEUS_SBX_UPDATE is set) …" >&2
-  git fetch --depth 1 origin main
-  git reset --hard FETCH_HEAD
-fi
-
-# WORKAROUND (upstream bug, both `main` and `dev`): `src/agent_loop.py` uses
-# `Any` in annotations (e.g. `dict[str, Any]` at the `_resolved_tool_event_name`
-# def) but never imports it — line 15 is `from typing import AsyncGenerator, List,
-# Dict, Optional, Set` with no `Any`. Importing the module raises
-# `NameError: name 'Any' is not defined`, so the app never starts. Patch it
-# idempotently in this clone (not in the profile logic): add `Any` to that import
-# when it is missing. The `0,/…/` address bounds the substitution to the FIRST
-# matching line, so a file that grows a second `from typing import` is not
-# rewritten twice. Runs after every refresh, so it survives an update; drop this
-# block once upstream merges a fix (the guard already makes it a no-op then).
-if ! grep -q 'from typing import.*\bAny\b' src/agent_loop.py; then
-  sed -i '0,/^from typing import /s/^from typing import \(.*\)$/from typing import \1, Any/' src/agent_loop.py
-fi
-
-# Venv + install, keyed on the CHECKED-OUT COMMIT. `uv pip install` re-resolves
-# against PyPI on every call, so running it unconditionally would make each
-# launch depend on the network (and cost seconds) even with nothing to do. The
-# stamp records the commit the venv was built for, so a warm launch really does
-# go straight to the server — and a refresh above, which moves the commit,
-# re-installs by construction (a bare marker file would not).
-[ -d .venv ] || python -m venv .venv
+# The clone, the venv, its dependencies and Odysseus' own setup are the `odysseus` bundle's
+# `provision`, and sbx has already run it by the time this starts. What is left here is everything
+# that shapes the RUNNING process, which a step that exits could not do.
+cd "$HOME/odysseus"
 . .venv/bin/activate
-rev="$(git rev-parse HEAD)"
-stamp="$HOME/.odysseus-installed-rev"
-if [ "$(cat "$stamp" 2>/dev/null)" != "$rev" ]; then
-  echo "sbx: installing Odysseus dependencies for $rev (first launch or after an update) …" >&2
-  uv pip install -r requirements.txt
-  # ChromaDB vector store (Odysseus' document RAG + memory). It is a native
-  # server (no Docker in the cage); installed here so the profile is self-contained
-  # even if Odysseus' requirements.txt ever drops it. Idempotent if already present.
-  uv pip install chromadb
-  printf '%s\n' "$rev" > "$stamp"
-fi
-# Odysseus' own setup step (creates the db / directories it expects). Left
-# UNGUARDED on purpose: it is idempotent and needs no network, and guarding it
-# would skip the re-create if you ever wipe the app's data.
-python setup.py
-# Expose the C++ runtime the provisioned `nix:libstdc++` carries. manylinux wheels
-# (numpy, …) link libstdc++.so.6, which is absent from the cage's glibc — without
-# this, importing Odysseus dies at `import numpy` with
-# `libstdc++.so.6: cannot open shared object file`. The store path is hash-addressed,
-# so discover it under /nix/store at launch (pure glob, no `find` needed) rather than
-# hardcoding the hash. The provisioned package is `gcc.cc` (see [packages]); its
-# store path is `…-gcc-<ver>-lib/lib`, so glob that. The second/third globs
-# are harmless legacy aliases in case a pin names it differently. Extend the glob
-# list if another scientific wheel needs more (libgfortran/libgomp/…): add its
-# `nix:` package and a matching `*pkg*/lib` here.
+# Expose the C++ runtime the provisioned `nix:gcc.cc` carries. manylinux wheels (numpy, …) link
+# libstdc++.so.6, which is absent from the cage's glibc — without this, importing Odysseus dies at
+# `import numpy` with `libstdc++.so.6: cannot open shared object file`. The store path is
+# hash-addressed, so discover it under /nix/store at launch rather than hardcoding the hash. Extend
+# the glob list if another scientific wheel needs more (libgfortran/libgomp/…).
 for d in /nix/store/*gcc-*-lib/lib /nix/store/*libstdcxx*/lib /nix/store/*libstdc++*/lib; do
   [ -e "$d/libstdc++.so.6" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 done
-# Point Odysseus' built-in Browser MCP at sbx's provisioned Chromium. Odysses reads
-# ODYSSEUS_BROWSER_EXECUTABLE and passes `--executable-path` to @playwright/mcp,
-# so Playwright uses this binary instead of downloading its own. Odysses adds
-# `--no-sandbox` itself (see [env]); wrap the binary to also pass the flags its env
-# surface cannot express: --disable-dev-shm-usage (cage /dev/shm is small) and
-# --disable-gpu (headless). The store path is hash-addressed, so resolve it via glob.
+# Point Odysseus' built-in Browser MCP at sbx's provisioned Chromium: it reads
+# ODYSSEUS_BROWSER_EXECUTABLE and passes `--executable-path` to @playwright/mcp, so Playwright uses
+# this binary instead of downloading its own. The wrapper adds the flags Odysseus' env surface
+# cannot express: --disable-dev-shm-usage (the cage's /dev/shm is small) and --disable-gpu.
 for c in /nix/store/*chromium*/bin/chromium; do
   [ -x "$c" ] || continue
   cat > "$HOME/chromium-wrap.sh" <<WRAP
@@ -168,29 +105,17 @@ WRAP
   export ODYSSEUS_BROWSER_EXECUTABLE="$HOME/chromium-wrap.sh"
   break
 done
-# Vector memory (ChromaDB) — Odysseus expects it beside the app on :8100 and
-# degrades (warns, retries) if it is absent. sbx can't run Docker, so launch
-# ChromaDB natively in the cage. It persists to $HOME/chroma-data so the
-# vector store survives restarts. Odysseus connects via CHROMADB_HOST/PORT
-# (default localhost:8100). We bind the server on 0.0.0.0 (all cage
-# interfaces) and set CHROMADB_HOST=127.0.0.1 explicitly (see [env]) so Odysses
-# reaches the literal IPv4 loopback — this avoids a localhost->::1 (IPv6)
-# resolution in the cage that would silently refuse the connection while the
-# server is up on 127.0.0.1. nohup + `&` keeps it alive after `exec uvicorn`
-# replaces this shell.
-# NOTE: modern chromadb (1.x, what Odysseus' `chromadb-client` resolves to)
-# installs its server binary as `chroma` (entry point `chroma = chromadb.cli.cli:app`),
-# NOT `chromadb` — `chromadb run` is a command-not-found that silently kills the
-# background server. The full `chromadb` package (installed via `uv pip install
-# chromadb` above) provides the `chroma` binary; Odysseus' own `chromadb-client`
-# pin is client-only and does not ship the server.
+# Vector memory (ChromaDB) — Odysseus expects it beside the app on :8100 and degrades if it is
+# absent. It persists to $HOME/chroma-data so the store survives restarts. The server binds
+# 0.0.0.0 (all cage interfaces) while `[env]` sets CHROMADB_HOST=127.0.0.1, so Odysseus reaches the
+# literal IPv4 loopback: a `localhost` that resolved to ::1 in the cage would refuse silently while
+# the server is up. `nohup` + `&` keeps it alive after `exec uvicorn` replaces this shell.
+# NOTE: modern chromadb installs its server as `chroma`, NOT `chromadb` — `chromadb run` is a
+# command-not-found that silently kills the background server.
 mkdir -p "$HOME/chroma-data"
 nohup chroma run --host 0.0.0.0 --port 8100 --path "$HOME/chroma-data" > "$HOME/chroma.log" 2>&1 &
-# Give ChromaDB a moment to bind :8100 (Odysseus retries anyway, this just
-# avoids the startup "not reachable" warning). Wait up to ~15s for the port.
-# The probe must NOT trip `set -e`: run it inside `if` so a closed port (the
-# normal case on first launch, before ChromaDB binds) doesn't abort the script
-# before `exec uvicorn`.
+# Give ChromaDB a moment to bind :8100 (Odysseus retries anyway; this avoids the startup warning).
+# The probe runs inside `if` so a closed port does not trip `set -e` before `exec uvicorn`.
 for _ in $(seq 1 30); do
   if python - <<'PY' >/dev/null 2>&1
 import socket; socket.create_connection(("127.0.0.1", 8100), timeout=1)

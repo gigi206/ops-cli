@@ -21,16 +21,15 @@
 # persistent isolated home here. `sbx upgrade mise` rolls the shim package; the shim itself
 # manages its own release channels afterwards (`junie --eap`, `--nightly`, …).
 #
-# WHY `cmd` IS A WRAPPER, NOT A BARE `junie`. mise's npm backend installs with
+# WHY THE BUNDLE CARRIES AN INSTALL STEP. mise's npm backend installs with
 # `--ignore-scripts=true` — a deliberate security default: it will not run arbitrary package
 # scripts — so the vendor's postinstall never runs and a plain `junie` exits with
-# "[Junie] Shim not found at …". The wrapper below runs that same vendor script once, on the first
-# launch, then execs the CLI; the guard (the shim's existence in the persistent home) makes it
-# idempotent, and the extraction is pure JavaScript (the package bundles `yauzl`), so the cage
-# needs no `unzip`. Same shape as `amp.toml` / `openfox.toml`. (`mise where` accepts a SCOPED
-# package name and answers with the install directory, whose layout is
-# `lib/node_modules/<scope>/<name>` — both checked against a real scoped install rather than
-# assumed.)
+# "[Junie] Shim not found at …". The `junie` bundle declares that vendor script as its `provision`,
+# and sbx runs it before this command, in this cage; the step's own guard (the shim's existence in
+# the persistent home) is what keeps it to once, and the extraction is pure JavaScript (the package
+# bundles `yauzl`), so the cage needs no `unzip`. (`mise where` accepts a SCOPED package name and
+# answers with the install directory, whose layout is `lib/node_modules/<scope>/<name>` — both
+# checked against a real scoped install rather than assumed.)
 #
 # THE HONEST CAVEAT, and it is bigger than for the other profiles here: the build Junie downloads
 # at runtime is a JVM application that sbx never patches (unlike a `nix:`/`deb:`/`tarball:`
@@ -52,20 +51,7 @@
 # Grounded here: the packaging and its postinstall trap (read out of the published package and the
 # vendor installer), the auth methods (JetBrains' README + CLI docs), and the JetBrains hosts (read
 # out of the shipped application).
-cmd = [
-    "bash",
-    "-c",
-    """
-set -eu
-j="$(mise where 'npm:@jetbrains/junie')/lib/node_modules/@jetbrains/junie"
-if [ ! -x "$HOME/.local/bin/junie" ]; then
-  echo "junie: running the vendor install step mise's --ignore-scripts skipped (downloads the release) …" >&2
-  node "$j/postinstall.js"
-fi
-exec junie "$@"
-""",
-    "junie",
-]
+cmd = "junie"
 
 # Your host Junie install/config, mounted read-write at its real absolute path. `binds` is a
 # security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
@@ -79,8 +65,8 @@ exec junie "$@"
 # --- The agent's requirements come from its bundle ------------------------------------------------
 # `use` pulls in the `junie` BUNDLE — the package(s), the hosts it must reach, and its mutes — from
 # one declaration shared with the bundle file itself, so this profile cannot fall behind when the
-# agent's requirements change. What the bundle cannot carry is the install repair: that is the
-# wrapper in `cmd` above, and it stays here with the rest of this app's posture.
+# agent's requirements change — including the install step that turns the shim into a working
+# agent, which sbx runs before `cmd`. The bundle is COMPLETE: an app that names it gets the agent.
 #
 # IMPORT THE BUNDLE FIRST — it is not in this file:
 #     sbx bundle import examples/bundle/junie.toml

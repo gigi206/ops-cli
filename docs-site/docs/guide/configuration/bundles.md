@@ -215,7 +215,7 @@ The 62 shipped bundles, and what each carries:
 | `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
 | `cursor-agent` | 2 (`nix:`) | 5 egress entries, 1 env var | none |
 | `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
-| `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries | `npm-audit`, `npm-registry` |
+| `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries, an install step | `npm-audit`, `npm-registry` |
 | `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
 | `dirac` | 3 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-registry` |
@@ -227,7 +227,7 @@ The 62 shipped bundles, and what each carries:
 | `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-registry` |
 | `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 21 egress entries, 1 env var | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-registry` |
 | `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
-| `junie` | 2 (`mise:`, `nix:`) | 7 egress entries | `npm-audit`, `npm-registry` |
+| `junie` | 2 (`mise:`, `nix:`) | 7 egress entries, an install step | `npm-audit`, `npm-registry` |
 | `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
 | `kimi` | 2 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-registry` |
 | `kiro` | 2 (`nix:`) | 34 egress entries | `chromium-background`, `google-signin-incage` |
@@ -236,13 +236,13 @@ The 62 shipped bundles, and what each carries:
 | `muse` | 1 (`nix:`) | 4 egress entries, 1 env var | none |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `nova` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
-| `odysseus` | 6 (`nix:`) | 6 egress entries, 3 env vars | `npm-audit`, `npm-registry`, `pypi` |
+| `odysseus` | 6 (`nix:`) | 6 egress entries, 3 env vars, an install step | `npm-audit`, `npm-registry`, `pypi` |
 | `omp` | 1 (`mise:`) | 1 egress entry | none |
 | `openclaude` | 2 (`mise:`, `nix:`) | 1 egress entry | `npm-registry` |
 | `openclaw` | 2 (`mise:`, `nix:`) | 3 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `opencode` | 1 (`mise:`) | 3 egress entries | `models-catalog`, `npm-registry` |
 | `opencode-desktop` | 1 (`deb:`) | 4 egress entries | `models-catalog`, `npm-runtime` |
-| `openfox` | 2 (`mise:`, `nix:`) | none | none |
+| `openfox` | 2 (`mise:`, `nix:`) | an install step | none |
 | `pi` | 1 (`mise:`) | 1 egress entry | none |
 | `pool` | 1 (`tarball:`) | 1 egress entry, a `tarball:` resolver | none |
 | `prime-agent` | 5 (`nix:`) | 4 egress entries, 1 env var | `npm-registry`, `pypi` |
@@ -254,7 +254,7 @@ The 62 shipped bundles, and what each carries:
 | `sigit` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `snow` | 2 (`mise:`, `nix:`) | 2 egress entries | `npm-audit`, `npm-registry` |
 | `stakpak` | 1 (`mise:`) | 4 egress entries | none |
-| `trae` | 2 (`nix:`) | 2 egress entries | `github`, `pypi` |
+| `trae` | 2 (`nix:`) | 2 egress entries, an install step | `github`, `pypi` |
 | `vibe` | 4 (`mise:`, `nix:`) | 12 egress entries | `chromium-background`, `pypi` |
 | `vtcode` | 3 (`mise:`, `nix:`) | none | none |
 | `warp` | 1 (`tarball:`) | 6 egress entries, a `tarball:` resolver | none |
@@ -270,9 +270,11 @@ name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profi
 one-step import any more: importing one alone leaves its bundle (and any group that
 bundle REQUIRES) undeclared, and the launch warns.
 
-Five of those bundles carry the **fetch tooling** rather than the agent: `cursor-agent`, `muse`,
-`odysseus`, `prime-agent` and `trae` install through their profile's own `cmd` — a vendor bootstrap
-whose artifact no backend fits, or a source checkout — which a bundle cannot carry.
+Five bundles carry an **install step** (`provision`) beside their packages: `deepseek-harness`,
+`junie`, `odysseus`, `openfox` and `trae` are finished by a command rather than by unpacking, and
+sbx runs it before the consuming app's own. Three others still install from their profile's `cmd`,
+because no backend fits their artifact and the step is the launch rather than a one-time install:
+`cursor-agent`, `muse` and `prime-agent`.
 Their headers say so: naming one equips a cage that can reach the agent's service but has
 no agent in it until the consuming app reproduces that install step.
 

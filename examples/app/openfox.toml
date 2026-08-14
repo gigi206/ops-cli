@@ -59,38 +59,20 @@
 # runs can reach any network your host can. Diagnose first with `sbx net logs -a openfox`: a named
 # deny is a port to add to `allow`, not a reason to drop the allowlist.
 #
-# NATIVE ADDONS — why `cmd` is a wrapper, not a bare `openfox`. OpenFox depends on two NATIVE
-# node addons — `better-sqlite3` (its session DB) and `node-pty` (its integrated terminal). Their
-# compiled `.node` binary is fetched by a package *install script* (`prebuild-install`). mise's
-# npm backend installs with `--ignore-scripts=true` (a deliberate security default — it will not
-# run arbitrary package scripts), so `mise use -g` places openfox WITHOUT those binaries and it
-# crashes at startup with "Could not locate the bindings file … better_sqlite3.node". The wrapper
-# below heals that: on first launch (and again after `sbx upgrade mise` rolls openfox to a new
-# version, whose fresh install dir has no `.node` yet) it runs `npm rebuild better-sqlite3 node-pty`
-# inside openfox's install tree, which DOWNLOADS the prebuilt binaries (no compiler needed — they
-# are published for Node 24 / this platform) and then execs openfox. That fetch runs INSIDE the
-# cage, so it needs the npm registry in `allow` below (the release assets it pulls next ride the
-# built-in github allow-set); it is idempotent (the guard skips it once the binary exists).
-# Keeping openfox as a `mise:npm:` entry in its bundle means `sbx upgrade mise` still rolls it.
+# NATIVE ADDONS — carried by the bundle, not by this command. OpenFox depends on two NATIVE node
+# addons — `better-sqlite3` (its session DB) and `node-pty` (its integrated terminal) — whose
+# compiled `.node` binaries are placed by a package install script that mise deliberately does not
+# run, so a plain install leaves the agent crashing at startup with "Could not locate the bindings
+# file … better_sqlite3.node". The `openfox` bundle declares the `npm rebuild` that heals it as its
+# `provision`, and sbx runs that before this command, in this cage: the fetch is therefore subject
+# to the allowlist below, and the step is skipped once the binary exists. `cmd` is back to being
+# what this app runs. Keeping openfox as a `mise:npm:` entry in its bundle means `sbx upgrade mise`
+# still rolls it, and the fresh install directory that follows is what makes the step run again.
 #
 # The web server auto-opens a browser by default; the hermetic cage has none, so `cmd` passes
 # `--no-browser` and you open the URL yourself. Do NOT set OPENFOX_HOST=0.0.0.0 (that exposes the
 # UI to your LAN); keep the 127.0.0.1 default.
-cmd = [
-    "bash",
-    "-c",
-    """
-set -eu
-of="$(mise where 'npm:openfox')/lib/node_modules/openfox"
-marker="$of/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
-if [ ! -e "$marker" ]; then
-  echo "openfox: building native addons (better-sqlite3, node-pty) that mise's --ignore-scripts skips …" >&2
-  ( cd "$of" && npm rebuild better-sqlite3 node-pty )
-fi
-exec openfox --no-browser "$@"
-""",
-    "openfox",
-]
+cmd = ["openfox", "--no-browser"]
 
 # The INBOUND crossing: your browser's `http://127.0.0.1:10369` is bridged into the cage, where
 # openfox serves the UI on the same port. Keep this in step with OPENFOX_PORT if you change it.

@@ -28,16 +28,40 @@
 # THE TOOLCHAIN IS PART OF THE INSTALL, not of the cage's shape. Three of the four native pieces in
 # dsh's closure arrive as platform optional dependencies, which mise places even under
 # `--ignore-scripts`. The fourth, `node-pty`, ships no Linux prebuild and builds from source, so
-# python3, make and a C++ compiler belong to what "installed" means for this agent — every
-# consuming app needs them. What a bundle CANNOT carry is the build step itself: that lives in the
-# consuming app's `cmd`, and `examples/app/deepseek-harness.toml` shows the guarded wrapper to
-# copy. A profile that names this bundle and execs `dsh` directly gets an install that cannot boot.
+# python3, make and a C++ compiler belong to what "installed" means for this agent — and the build
+# itself is the `provision` below, which sbx runs before the
+# consuming app's `cmd`. What that app still owes is the `--expose-internals` flag the loader needs
+# on this cage's node build — see `examples/app/deepseek-harness.toml`; a profile that names this
+# bundle and execs a bare `dsh` gets a server that prints its URL and exits.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.deepseek-harness]
+# The one install step the script-free npm install leaves undone, and the reason this bundle is
+# complete rather than a package whose loader dies at boot. `node-pty` ships no Linux prebuild and
+# builds from source, so `--ignore-scripts` leaves `pty.node` absent — and the web profile loads
+# node-pty at BOOT, so the launch prints its URL and then exits, which reads like a working start.
+# `--nodedir` points node-gyp at the node package's own headers, so the build fetches nothing and
+# `nodejs.org` stays out of every allowlist.
+#
+# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
+# remember that one succeeded. Keying on the built artifact also self-heals — `sbx upgrade mise`
+# lands a fresh install directory with no `pty.node`, so the next launch rebuilds it there.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -eu
+dsh_dir="$(mise where 'npm:@deepseek-ai/dsh')/lib/node_modules/@deepseek-ai/dsh"
+if [ ! -e "$dsh_dir/node_modules/node-pty/build/Release/pty.node" ]; then
+  echo "deepseek-harness: building node-pty, the addon the script-free install leaves out …" >&2
+  node_prefix="$(dirname "$(dirname "$(command -v node)")")"
+  ( cd "$dsh_dir" && npm rebuild node-pty --nodedir="$node_prefix" )
+fi
+''',
+]
 allow = [
     # Install-time (mise's npm backend): the packument, the dsh tarballs, and the platform
     # packages carrying the native binaries — the shared `@npm-registry` group. The in-cage

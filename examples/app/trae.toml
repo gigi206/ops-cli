@@ -36,7 +36,7 @@
 #
 # Installed once on the first launch; persistent across projects (the same
 # isolated home). Re-run the bootstrap to advance: `sbx app run trae --env
-# TRAE_REINSTALL=1` (the `--env` override is read on the HOST and authoritative
+# TRAE_SBX_UPDATE=1` (the `--env` override is read on the HOST and authoritative
 # for that one launch — the binary moves only when you ask, matching the
 # "versions move only on an explicit upgrade" contract).
 #
@@ -97,37 +97,11 @@ cmd = [
     "bash",
     "-c",
     '''
-set -eo pipefail
-
-# --- locate platform-independent install paths inside the app's persistent
-#     isolated home ---
-src="$HOME/.trae/src"
-bin_link="$HOME/.local/bin/trae-cli"
-repo_url="https://github.com/bytedance/trae-agent.git"
-
-if [ ! -x "$bin_link" ] || [ -n "$TRAE_REINSTALL" ]; then
-  # The repo ships an `uv`-managed venv + a `Makefile` + a `pyproject.toml` with
-  # a `trae-cli` script entrypoint. `uv tool install .` builds an ISOLATED env
-  # (so the deps never collide with anything else in the cage) and drops
-  # `trae-cli` on `~/.local/bin/`. `uv tool` is the upstream-recommended install
-  # path; `uv sync --all-extras` works too, but only `uv tool install` puts the
-  # bin on PATH.
-  git clone --depth 1 "$repo_url" "$src"
-  cd "$src"
-  # `uv tool install --python python3.12 .` — pin to a modern Python (the
-  # `pyproject.toml` requires `>=3.12`); the cage ships a `nix:python312`
-  # (see [packages]) so `python3.12` is on PATH.
-  uv tool install --python python3.12 .
-fi
-
-# Always export the install dir on PATH (in case downstream tools shell out
-# to `trae-cli` from a sub-process spawned outside the wrapper).
+# The install lives in the `trae` bundle and has already run by the time this does. What stays here
+# is the PATH the isolated `uv tool install` writes to, which the launch does not export on its own.
 export PATH="$HOME/.local/bin:$PATH"
 exec trae-cli "$@"
     ''',
-    # `$0` placeholder: `sbx app run trae -- <args>` appends <args> to this
-    # cmd array, so they arrive as `$1 $2 …` and reach the agent verbatim
-    # via `exec … "$@"`.
     "trae-cli",
 ]
 

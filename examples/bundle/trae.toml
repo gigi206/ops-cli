@@ -28,6 +28,36 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.trae]
+# The install step itself: Trae Agent is published as a source repository rather than a package, so
+# what "installed" means here is a clone plus an isolated `uv tool install`, which puts `trae-cli`
+# on PATH. That is why this bundle is complete where a package declaration alone could not be — and
+# why it names `uv` and an interpreter rather than the agent.
+#
+# `uv tool install .` builds an ISOLATED environment, so the agent's dependencies never collide with
+# anything else in the cage, and it is the upstream-recommended path (`uv sync --all-extras` works
+# too but leaves nothing on PATH). The Python is pinned to 3.12 because the project's
+# `pyproject.toml` requires `>=3.12`.
+#
+# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
+# remember that one succeeded. Keying on the installed entry point also self-heals — remove the
+# isolated home and the next launch clones and builds again. To move the checkout forward
+# deliberately, launch once with `--env TRAE_SBX_UPDATE=1`.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+src="$HOME/.trae/src"
+bin_link="$HOME/.local/bin/trae-cli"
+repo_url="https://github.com/bytedance/trae-agent.git"
+if [ ! -x "$bin_link" ] || [ -n "$TRAE_SBX_UPDATE" ]; then
+  rm -rf "$src"
+  git clone --depth 1 "$repo_url" "$src"
+  cd "$src"
+  uv tool install --python python3.12 .
+fi
+''',
+]
 allow = [
     # The clone, and the wheels `uv tool install` resolves. No provider host: Trae is BYOK across
     # many providers, so the consuming app opens the one it uses and supplies the key.

@@ -28,6 +28,71 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.odysseus]
+# The install step itself: Odysseus is published as a source repository, so what "installed" means
+# here is a clone, a venv, its dependencies and the project's own setup — which is why this bundle
+# names a toolchain rather than an agent, and why it is complete all the same.
+#
+# What stays with the consuming app is everything that is not installation: the library path its
+# native wheels need, the browser wrapper its MCP reads, and the vector store it talks to. Those
+# shape a running process and cannot be done by a step that exits.
+#
+# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
+# remember that one succeeded. It is keyed on the CHECKED-OUT COMMIT rather than on a bare marker,
+# because `uv pip install` re-resolves against PyPI on every call: a warm launch must not depend on
+# the network, and a refresh that moves the commit must re-install by construction.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -e
+cd "$HOME"
+# Clone the curated `main` branch (upstream marks `dev` as possibly-unstable and the repo default
+# really is `dev`, so the branch is pinned explicitly); reuse the persistent app home afterwards.
+if [ ! -d odysseus ]; then
+  git clone -b main --depth 1 https://github.com/odysseus-dev/odysseus.git
+fi
+cd odysseus
+
+# Odysseus publishes no release artifact and is not a pip-installable package, so it rides no sbx
+# backend and `sbx upgrade` cannot roll it: the checkout would stay at whatever `main` was on the
+# first launch. Refresh it deliberately, one launch at a time:
+#     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
+# `reset --hard` discards the local patch below (re-applied right after) and any other in-tree edit;
+# app DATA lives outside the checkout, so nothing you own is lost.
+if [ -n "$ODYSSEUS_SBX_UPDATE" ]; then
+  echo "sbx: refreshing the Odysseus checkout (ODYSSEUS_SBX_UPDATE is set) …" >&2
+  git fetch --depth 1 origin main
+  git reset --hard FETCH_HEAD
+fi
+
+# WORKAROUND (upstream bug, both `main` and `dev`): `src/agent_loop.py` annotates with `Any` but
+# never imports it, so importing the module raises `NameError: name 'Any' is not defined` and the
+# app never starts. Patched idempotently in this clone; the `0,/…/` address bounds the substitution
+# to the FIRST matching line. Drop this block once upstream merges a fix — the guard already makes
+# it a no-op then.
+if ! grep -q 'from typing import.*\bAny\b' src/agent_loop.py; then
+  sed -i '0,/^from typing import /s/^from typing import \(.*\)$/from typing import \1, Any/' src/agent_loop.py
+fi
+
+# Venv + install, keyed on the checked-out commit (see the note above).
+[ -d .venv ] || python -m venv .venv
+. .venv/bin/activate
+rev="$(git rev-parse HEAD)"
+stamp="$HOME/.odysseus-installed-rev"
+if [ "$(cat "$stamp" 2>/dev/null)" != "$rev" ]; then
+  echo "sbx: installing Odysseus dependencies for $rev (first launch or after an update) …" >&2
+  uv pip install -r requirements.txt
+  # ChromaDB vector store (Odysseus' document RAG + memory), a native server since the cage has no
+  # Docker. Installed here so the app is self-contained even if upstream's requirements ever drop
+  # it: the `chromadb-client` pin they carry is client-only and ships no server binary.
+  uv pip install chromadb
+  printf '%s\n' "$rev" > "$stamp"
+fi
+# Odysseus' own setup step (creates the db / directories it expects). Unguarded on purpose: it is
+# idempotent and needs no network, and guarding it would skip the re-create if you wipe the data.
+python setup.py
+''',
+]
 allow = [
     # The repo clone over smart HTTP: github.com is already readable through sbx's built-in set, so
     # only the upload-pack POST is authorized, as the EXACT URL.

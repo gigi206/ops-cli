@@ -31,6 +31,28 @@
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.junie]
+# The vendor install step mise's `--ignore-scripts` leaves undone, and the reason this bundle is
+# complete rather than a shim a consuming app cannot start. The npm package is only a SHIM: its
+# `postinstall` downloads the real JVM build and installs a launcher at `~/.local/bin/junie`. mise
+# does not run package scripts, so a plain install leaves the shim alone and `junie` exits with
+# "[Junie] Shim not found at …". This runs the vendor's own script, once, inside the cage — which
+# is why the release hosts are in the egress below.
+#
+# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
+# remember that one succeeded. Keying on the launcher's existence also self-heals — remove the
+# isolated home and the next launch reinstalls.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -eu
+j="$(mise where 'npm:@jetbrains/junie')/lib/node_modules/@jetbrains/junie"
+if [ ! -x "$HOME/.local/bin/junie" ]; then
+  echo "junie: running the vendor install step mise's --ignore-scripts skipped (downloads the release) …" >&2
+  node "$j/postinstall.js"
+fi
+''',
+]
 allow = [
     # Install: the shim package from npm. The release zip itself (github.com + the
     # *.githubusercontent.com asset host) and the installer's update index on
