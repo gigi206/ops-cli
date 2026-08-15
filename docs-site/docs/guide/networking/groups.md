@@ -102,6 +102,16 @@ there is no interactive prompt. A name that already exists is **refused** unless
 resolve (malformed or nested) is flagged after the import; inspect it with
 `sbx net groups <name>`.
 
+A forced overwrite is the one import that can lose work, since a declared group may carry
+an entry added by hand on this machine, and a group is policy: dropping an entry narrows
+what an app may reach, adding one widens it. So it names what the incoming fragment no
+longer declares, and keeps the group it replaced beside the config as
+`<name>.group.replaced`. That copy is the same portable form `sbx net groups export`
+writes, so putting the entry back is `sbx net groups import --force` on it. A group lives
+in a key of the shared config rather than a file of its own, which is why the copy exists:
+there is no per-group file to keep. A re-import that declares exactly what is already there
+keeps no copy and reports no loss.
+
 Imported groups are **inert** until a `[network]` `allow`/`deny` list references them
 with `@name`.
 

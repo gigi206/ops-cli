@@ -80,6 +80,14 @@ through `run`, so an app is never confused with a subcommand and **may be named 
 cage cannot run it, and the profile stays inert until `sbx app run <name>`. See
 [Portable profiles](../apps/profiles).
 
+Importing over a profile that already exists needs `--force`; without it the existing file
+is refused, not replaced. A forced import is the one import that can lose work, since the
+profile on disk may carry a rule, a credential or a package added by hand on this machine.
+So it names the settings the incoming file no longer sets, and keeps the bytes it replaced
+beside the profile as `<name>.toml.replaced`, to read a per-machine setting back from. That
+copy is not itself a profile (only `*.toml` files are read as profiles) and goes away with
+`sbx app rm <name>`. A re-import of an identical file keeps no copy and reports no loss.
+
 ### Listing apps
 
 `sbx app list` (alias `sbx app ls`) shows one row per app with its `HOME` column: the total

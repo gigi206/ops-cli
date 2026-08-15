@@ -3045,6 +3045,82 @@ fn sbx_app_import_places_validates_renames_and_removes_a_profile() {
     );
 }
 
+/// A `--force` import is the one import that can lose work: the profile on disk may carry a rule,
+/// a credential or a package the machine's owner added by hand. It must say what the incoming file
+/// no longer sets, and keep the bytes it replaced — an overwrite the user only notices later is the
+/// same as a silent one.
+#[test]
+fn a_forced_import_names_what_it_dropped_and_keeps_the_profile_it_replaced() {
+    let fx = Fixture::new();
+    std::fs::write(
+        fx.proj.path().join("demo-app.toml"),
+        "cmd = \"demo-app\"\n[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n",
+    )
+    .unwrap();
+    assert!(fx.run(&["app", "import", "demo-app.toml"]).status.success());
+
+    // The machine's owner adds a rule of their own to the placed profile.
+    let placed = fx
+        .config_home
+        .path()
+        .join("sbx")
+        .join("apps")
+        .join("demo-app.toml");
+    let local = "cmd = \"demo-app\"\n[network]\nmode = \"deny\"\nallow = [\n    \"api.example.com\",\n    \"local.example.org\",\n]\n";
+    std::fs::write(&placed, local).unwrap();
+
+    // Re-importing the pristine file overwrites that edit — and says so, by name.
+    let forced = fx.run(&["app", "import", "demo-app.toml", "--force"]);
+    assert!(forced.status.success());
+    let err = String::from_utf8_lossy(&forced.stderr).to_string();
+    assert!(
+        err.contains("local.example.org"),
+        "the dropped rule must be named:\n{err}"
+    );
+    assert!(
+        err.contains("demo-app.toml.replaced"),
+        "the kept copy must be named:\n{err}"
+    );
+
+    // The replaced bytes are readable, so the setting can be put back.
+    let kept = placed.with_extension("toml.replaced");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), local);
+
+    // It is NOT a second profile: the scan takes `*.toml` only, so nothing new appears.
+    let listed = String::from_utf8_lossy(&fx.run(&["app", "list"]).stdout).to_string();
+    assert!(!listed.contains("replaced"), "{listed}");
+
+    // A re-import that changes nothing keeps no copy and reports no loss.
+    std::fs::remove_file(&kept).unwrap();
+    let same = fx.run(&["app", "import", "demo-app.toml", "--force"]);
+    assert!(same.status.success());
+    assert!(
+        !kept.exists(),
+        "an identical re-import must not keep a copy"
+    );
+    assert!(
+        !String::from_utf8_lossy(&same.stderr).contains("replaced a profile"),
+        "an identical re-import must report no loss"
+    );
+
+    // Removing the app takes the copy with it — it belongs to the profile, not to the directory.
+    std::fs::write(&kept, local).unwrap();
+    assert!(fx.run(&["app", "rm", "demo-app"]).status.success());
+    assert!(!kept.exists(), "the kept copy must go with the profile");
+
+    // …and so does `--purge`, which removes more, not less. Checked separately because it is a
+    // different removal path: one that cleaned up and one that did not would leave a copy behind
+    // exactly when the user asked for the most thorough removal.
+    assert!(fx.run(&["app", "import", "demo-app.toml"]).status.success());
+    std::fs::write(&kept, local).unwrap();
+    assert!(
+        fx.run(&["app", "rm", "demo-app", "--purge"])
+            .status
+            .success()
+    );
+    assert!(!kept.exists(), "--purge must take the kept copy too");
+}
+
 #[test]
 fn sbx_app_import_refuses_a_wrapped_profile_and_an_invalid_name() {
     let fx = Fixture::new();
@@ -3405,6 +3481,86 @@ allow = ["{*} https://orchestrator.example.com"]
             .iter()
             .any(|e| e["key"] == "DEMO_AGENT_TELEMETRY"),
         "the bundle's environment lands too:\n{doc:#}"
+    );
+}
+
+/// The bundle counterpart of a forced profile import: a bundle already declared may carry an entry
+/// added by hand on this machine, and `--force` replaces it. It must name what the incoming
+/// fragment no longer declares, and keep the previous bundle in the portable form that imports back.
+#[test]
+fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced() {
+    let fx = Fixture::new();
+    let frag = fx.proj.path().join("fragment.toml");
+    std::fs::write(
+        &frag,
+        "[bundle.demo-agent]\nallow = [\"{GET} https://api.example.com\"]\n\
+         [bundle.demo-agent.packages]\ndemo-agent = \"nix:hello\"\n",
+    )
+    .unwrap();
+    assert!(
+        fx.run(&["bundle", "import", frag.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    // The machine's owner adds a rule of their own to the declared bundle.
+    let local = fx.proj.path().join("local.toml");
+    std::fs::write(
+        &local,
+        "[bundle.demo-agent]\nallow = [\"{GET} https://api.example.com\", \
+         \"{GET} https://local.example.org\"]\n\
+         [bundle.demo-agent.packages]\ndemo-agent = \"nix:hello\"\n",
+    )
+    .unwrap();
+    assert!(
+        fx.run(&["bundle", "import", "--force", local.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    // Re-importing the pristine fragment drops that rule — and says so, by name.
+    let forced = fx.run(&["bundle", "import", "--force", frag.to_str().unwrap()]);
+    assert!(forced.status.success());
+    let err = String::from_utf8_lossy(&forced.stderr).to_string();
+    assert!(
+        err.contains("local.example.org"),
+        "the dropped rule must be named:\n{err}"
+    );
+    assert!(
+        err.contains("demo-agent.bundle.replaced"),
+        "the kept fragment must be named:\n{err}"
+    );
+
+    // The kept fragment is portable: importing it back restores the entry.
+    let kept = fx
+        .config_home
+        .path()
+        .join("sbx")
+        .join("demo-agent.bundle.replaced");
+    assert!(kept.exists(), "the previous bundle must be kept");
+    assert!(
+        fx.run(&["bundle", "import", "--force", kept.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let listed = fx.run(&["bundle", "demo-agent"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("local.example.org"),
+        "re-importing the kept fragment restores the entry"
+    );
+
+    // A re-import that changes nothing keeps no copy and reports no loss: `local.toml` now declares
+    // exactly what the config holds.
+    std::fs::remove_file(&kept).unwrap();
+    let again = fx.run(&["bundle", "import", "--force", local.to_str().unwrap()]);
+    assert!(again.status.success());
+    assert!(
+        !kept.exists(),
+        "an identical re-import must not keep a copy"
+    );
+    assert!(
+        !String::from_utf8_lossy(&again.stderr).contains("replaced bundle"),
+        "an identical re-import must report no loss"
     );
 }
 

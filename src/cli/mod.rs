@@ -219,6 +219,28 @@ pub(crate) fn one_file(
 /// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single
 /// removal, keeping the order the user typed. Without this the second pass over a name finds
 /// nothing left to remove and reports a phantom failure over work that in fact succeeded.
+/// The settings a replaced file carried that the incoming one does not — what a `--force` import
+/// drops, whether the file is an app profile or a bundle fragment.
+///
+/// Blank lines and comments are skipped: prose is rewritten constantly and reporting it would bury
+/// the one thing that matters, a value the new text no longer sets. A line counts as kept if it
+/// appears anywhere in the incoming text, so a setting that merely MOVED (a table reordered, a rule
+/// pulled into another slot) is not reported as lost. Comparison is on the trimmed line, so
+/// re-indentation alone is not a loss either.
+pub(crate) fn settings_dropped_by(previous: &str, incoming: &str) -> Vec<String> {
+    let kept: std::collections::HashSet<&str> = incoming.lines().map(str::trim).collect();
+    let mut out: Vec<String> = Vec::new();
+    for line in previous.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || kept.contains(line) {
+            continue;
+        }
+        if !out.iter().any(|s| s == line) {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
 pub(crate) fn dedupe_names(names: &mut Vec<&str>) {
     let mut seen = std::collections::HashSet::new();
     names.retain(|name| seen.insert(*name));

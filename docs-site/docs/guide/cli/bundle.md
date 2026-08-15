@@ -77,6 +77,23 @@ the cage cannot run it), so there is no prompt.
 A name that already exists is refused unless `--force`, and the merge is
 **all-or-nothing**: a refused import writes nothing.
 
+A forced overwrite is the one import that can lose work, since a declared bundle may carry
+an entry added by hand on this machine. So it names what the incoming fragment no longer
+declares, and keeps the bundle it replaced beside the config as `<name>.bundle.replaced`:
+
+```
+sbx: warning: replaced bundle `demo`, which declared 1 line the new one does not:
+     `allow = ["{GET} https://example.com", "{GET} https://local.example.org"]` — the
+     previous fragment is kept at ~/.config/sbx/demo.bundle.replaced, so a per-machine
+     entry can be read back and re-imported
+```
+
+That copy is the same portable form `sbx bundle export` writes, so putting the entry back is
+`sbx bundle import --force ~/.config/sbx/demo.bundle.replaced`. A bundle lives in a table of
+the shared config rather than a file of its own, which is why the copy exists at all: there
+is no per-bundle file to keep. A re-import that declares exactly what is already there keeps
+no copy and reports no loss.
+
 Because an import is the one moment you consciously take in another author's data, a
 bundle that would grant **egress or a credential** is named right after the import:
 

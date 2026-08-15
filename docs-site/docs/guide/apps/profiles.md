@@ -49,7 +49,11 @@ sbx app import <file> [--as <name>] [--force]
 - The file must have a `cmd` (an empty parse is the tell-tale of a wrongly
   `[app.<name>]`-wrapped file, refused with a hint).
 - `--as` renames the imported app (default: the file's stem); `--force` overwrites an
-  existing profile.
+  existing profile. Without it the existing file is refused, not replaced. A forced import
+  names the settings the incoming file no longer sets, and keeps what it replaced beside
+  the profile as `<name>.toml.replaced`, so a rule or credential added by hand on this
+  machine can be read back and re-applied. That copy is not a profile (only `*.toml` is
+  read as one) and is removed with the app.
 - The bytes are copied verbatim (comments preserved).
 
 ## Export

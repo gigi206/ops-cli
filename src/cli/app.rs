@@ -406,6 +406,27 @@ fn app_import(args: &[OsString]) -> ExitCode {
         ));
         return ExitCode::FAILURE;
     }
+    // `--force` replaces a file the user may have edited: a per-machine allow rule, a `[secret]`
+    // block, a package they swapped. Keep the previous bytes beside the profile BEFORE the write,
+    // so the settings survive the overwrite that is about to drop them, and report what went.
+    let replaced = match std::fs::read(&dest) {
+        Ok(previous) if previous != bytes => {
+            let kept = dir.join(format!("{name}.toml.replaced"));
+            match write_profile_file(&dir, &kept, &previous) {
+                Ok(()) => Some((previous, kept)),
+                Err(e) => {
+                    diag::error(&format!(
+                        "sbx: cannot keep the profile being replaced at {}: {e} — nothing was \
+                         overwritten",
+                        kept.display()
+                    ));
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        // Same bytes (a re-import that changes nothing), or no previous file at all.
+        _ => None,
+    };
     if let Err(e) = write_profile_file(&dir, &dest, &bytes) {
         diag::error(&format!("sbx: cannot write {}: {e}", dest.display()));
         return ExitCode::FAILURE;
@@ -416,6 +437,16 @@ fn app_import(args: &[OsString]) -> ExitCode {
         "{}",
         render_app_imported(&name, &dest, &preview.summary, &pal)
     );
+    // An overwrite is the one import that can LOSE something. Name what the incoming profile no
+    // longer carries — a diff of the two files would bury it in prose, and the settings are what a
+    // reader stands to lose — and point at the copy kept beside it.
+    if let Some((previous, kept)) = replaced {
+        let dropped = super::settings_dropped_by(
+            &String::from_utf8_lossy(&previous),
+            &String::from_utf8_lossy(&bytes),
+        );
+        diag::warn(&render_replaced_profile(&dropped, &kept));
+    }
     // A profile that names a bundle is NOT self-contained, and a bundle that is not declared leaves
     // the app short of a tool and its egress — which surfaces later only as an app that quietly does
     // nothing. Import is the moment to say so: it is when the user is holding the file and can act.
@@ -442,6 +473,16 @@ fn app_import(args: &[OsString]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Remove the copy a `--force` import kept, if there is one. Called from every path that removes a
+/// profile: the copy belongs to the profile, not to the directory, and one left behind would
+/// outlive the app and read as a profile that is still there. Best-effort — a missing copy is the
+/// common case, and a removal that fails must not fail the removal of the app.
+fn drop_replaced_copy(name: &str) {
+    if let Some(dir) = config::profiles_dir() {
+        let _ = std::fs::remove_file(dir.join(format!("{name}.toml.replaced")));
+    }
 }
 
 /// Write a profile's bytes to `dest`, owner-only, creating the profiles directory owner-only if
@@ -473,6 +514,41 @@ fn write_profile_file(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<
         return Err(e);
     }
     Ok(())
+}
+
+/// The overwrite warning: what the replacement no longer carries, and where the previous bytes are.
+/// A few dropped settings are named in full (the point is to recognize one's own edit); beyond that
+/// the count stands in, because the file itself is kept and is the better place to read the rest.
+fn render_replaced_profile(dropped: &[String], kept: &Path) -> String {
+    const NAMED: usize = 3;
+    let kept = kept.display();
+    if dropped.is_empty() {
+        return format!(
+            "replaced a profile that differed only in comments or layout — the previous file is \
+             kept at {kept}"
+        );
+    }
+    let named = dropped
+        .iter()
+        .take(NAMED)
+        .map(|l| format!("`{l}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = dropped.len().saturating_sub(NAMED);
+    let more = if rest > 0 {
+        format!(" (and {rest} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "replaced a profile carrying {} the new one does not set: {named}{more} — the previous \
+         file is kept at {kept}, so a per-machine setting can be read back and re-applied",
+        if dropped.len() == 1 {
+            "1 line".to_string()
+        } else {
+            format!("{} lines", dropped.len())
+        },
+    )
 }
 
 /// `sbx app export <name> [--out <file>]`: write a named app out as a portable profile — an
@@ -669,7 +745,10 @@ fn app_rm_profiles(names: &[&str]) -> ExitCode {
     for name in names {
         let path = dir.join(format!("{name}.toml"));
         match std::fs::remove_file(&path) {
-            Ok(()) => println!("{}", render_removed(Some("app profile"), name, &pal)),
+            Ok(()) => {
+                drop_replaced_copy(name);
+                println!("{}", render_removed(Some("app profile"), name, &pal));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 diag::error(&format!(
                     "sbx: no imported profile '{name}' (a project [app.{name}] overlay lives in a \
@@ -836,6 +915,7 @@ fn app_rm_purge_one(
     let profile_removed = match config::profile_path(name) {
         Some(path) => match std::fs::remove_file(&path) {
             Ok(()) => {
+                drop_replaced_copy(name);
                 println!("{}", render_removed(Some("app profile"), name, pal));
                 true
             }
@@ -1677,6 +1757,58 @@ mod tests {
         assert_eq!(
             parse_rm_ok(&[os("demo-app"), os("demo-app")]),
             (false, false, names(&["demo-app", "demo-app"]))
+        );
+    }
+
+    #[test]
+    fn a_replaced_profile_reports_settings_and_ignores_prose() {
+        let previous = "# an old comment\ncmd = \"demo-app\"\n[network]\nmode = \"deny\"\n    \
+                        allow = [\"api.example.com\"]\nforward = [7000]\n";
+        // Same settings, rewritten prose and re-indented: nothing was lost.
+        let reworded = "# a NEW comment, rewritten wholesale\ncmd = \"demo-app\"\n[network]\n\
+                        mode = \"deny\"\nallow = [\"api.example.com\"]\n  forward = [7000]\n";
+        assert!(
+            super::super::settings_dropped_by(previous, reworded).is_empty(),
+            "comments and indentation are not settings"
+        );
+        // A value the incoming profile no longer sets IS a loss, and only that value is named.
+        let without =
+            "cmd = \"demo-app\"\n[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n";
+        assert_eq!(
+            super::super::settings_dropped_by(previous, without),
+            vec!["forward = [7000]"]
+        );
+        // A setting that merely moved elsewhere in the file is not a loss.
+        let moved = "forward = [7000]\ncmd = \"demo-app\"\n[network]\nmode = \"deny\"\n\
+                     allow = [\"api.example.com\"]\n";
+        assert!(super::super::settings_dropped_by(previous, moved).is_empty());
+    }
+
+    #[test]
+    fn the_overwrite_warning_names_a_few_losses_and_counts_the_rest() {
+        let kept = Path::new("/config/sbx/apps/demo-app.toml.replaced");
+        let one = render_replaced_profile(&["forward = [7000]".to_string()], kept);
+        assert!(
+            one.contains("1 line") && one.contains("`forward = [7000]`"),
+            "{one}"
+        );
+        assert!(one.contains("demo-app.toml.replaced"), "{one}");
+        // Beyond a few, the count stands in — the kept file is where the rest is read.
+        let many: Vec<String> = (0..5).map(|i| format!("k{i} = {i}")).collect();
+        let lots = render_replaced_profile(&many, kept);
+        assert!(
+            lots.contains("5 lines") && lots.contains("(and 2 more)"),
+            "{lots}"
+        );
+        assert!(
+            lots.contains("`k0 = 0`") && !lots.contains("`k4 = 4`"),
+            "{lots}"
+        );
+        // A file that differs only in prose still names where the previous bytes went.
+        let none = render_replaced_profile(&[], kept);
+        assert!(
+            none.contains("comments or layout") && none.contains(".replaced"),
+            "{none}"
         );
     }
 

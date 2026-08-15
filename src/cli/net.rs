@@ -2376,6 +2376,99 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// Keep every egress group a forced import is about to replace, and say what the incoming fragment
+/// no longer declares. Returns one warning per replaced group, for the caller to surface once the
+/// write succeeded.
+///
+/// A group is a key inside the shared global config, not a file of its own, so what stands in for a
+/// per-file copy is the fragment `sbx net groups export` already emits: the replaced group is
+/// written back out in the same portable form, as `<name>.group.replaced` beside the config, so
+/// re-declaring it is `sbx net groups import` on that file. The name is read as configuration by
+/// nothing (the loader reads `sbx.toml` and `apps/*.toml`).
+///
+/// Only a group whose entries actually CHANGE is kept: re-importing an identical fragment leaves no
+/// copy and reports nothing. An error here fails the import closed, before the write, so a group is
+/// never overwritten with no way back. The bundle importer does the same thing for the same reason
+/// — see `cli::bundle::keep_replaced_bundles`.
+fn keep_replaced_groups(
+    config_path: &std::path::Path,
+    incoming: &std::collections::BTreeMap<String, Vec<String>>,
+    force: bool,
+) -> Result<Vec<String>, String> {
+    if !force {
+        return Ok(Vec::new());
+    }
+    let Some(dir) = config_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let (declared, _) = config::net_groups();
+    let mut notes = Vec::new();
+    for (name, new) in incoming {
+        let Some(old) = declared.get(name) else {
+            continue; // added, not replaced
+        };
+        let one = |entries: &Vec<String>| {
+            config::manage::export_net_groups(&std::collections::BTreeMap::from([(
+                name.clone(),
+                entries.clone(),
+            )]))
+        };
+        let (before, after) = (one(old), one(new));
+        if before == after {
+            continue;
+        }
+        let kept = dir.join(format!("{name}.group.replaced"));
+        std::fs::write(&kept, &before).map_err(|e| {
+            format!(
+                "cannot keep the group being replaced at {}: {e}",
+                kept.display()
+            )
+        })?;
+        notes.push(render_replaced_group(
+            name,
+            &crate::cli::settings_dropped_by(&before, &after),
+            &kept,
+        ));
+    }
+    Ok(notes)
+}
+
+/// The overwrite warning for one egress group: the entries its replacement no longer declares, and
+/// where the previous fragment is. A few are named in full (the point is to recognize one's own
+/// edit); beyond that the count stands in, because the kept fragment holds the rest.
+fn render_replaced_group(name: &str, dropped: &[String], kept: &std::path::Path) -> String {
+    const NAMED: usize = 3;
+    let kept = kept.display();
+    if dropped.is_empty() {
+        return format!(
+            "replaced egress group `{name}`, which differed only in layout — the previous fragment \
+             is kept at {kept}"
+        );
+    }
+    let named = dropped
+        .iter()
+        .take(NAMED)
+        .map(|l| format!("`{l}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = dropped.len().saturating_sub(NAMED);
+    let more = if rest > 0 {
+        format!(" (and {rest} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "replaced egress group `{name}`, which declared {} the new one does not: {named}{more} — \
+         the previous fragment is kept at {kept}, so a per-machine entry can be read back and \
+         re-imported",
+        if dropped.len() == 1 {
+            "1 line".to_string()
+        } else {
+            format!("{} lines", dropped.len())
+        },
+    )
+}
+
 /// `sbx net groups import <file> [--force]`: merge a portable `[net.groups]` fragment into the
 /// global config, preserving every existing group and comment (`toml_edit`). Groups are global-only,
 /// so the target is always the global config; the deliberate command is the consent (an agent in the
@@ -2419,8 +2512,24 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // `--force` replaces groups that are already declared, and one may carry an entry added by hand
+    // on this machine — an egress group is policy, so a silent drop widens or narrows what an app
+    // may reach. Keep each replaced group beside the config BEFORE the write, and report what the
+    // incoming fragment no longer declares.
+    let replaced = match keep_replaced_groups(&path, &groups, force) {
+        Ok(kept) => kept,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: net groups import: {e} — nothing was overwritten"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
     match config::manage::import_net_groups(&path, &groups, force) {
         Ok(outcome) => {
+            for note in &replaced {
+                diag::warn(note);
+            }
             let mut parts = Vec::new();
             if !outcome.added.is_empty() {
                 parts.push(format!("added {}", outcome.added.join(", ")));
@@ -3363,6 +3472,29 @@ fn persist_egress_removal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overwrite warning: a few dropped entries named in full, the rest counted, and always
+    /// the path the previous fragment went to — a group lives in a shared file, so that path is the
+    /// only way back.
+    #[test]
+    fn the_group_overwrite_warning_names_a_few_losses_and_counts_the_rest() {
+        let kept = std::path::Path::new("/config/sbx/ci.group.replaced");
+        let one = render_replaced_group("ci", &["\"{GET} https://x\",".to_string()], kept);
+        assert!(one.contains("`ci`") && one.contains("1 line"), "{one}");
+        assert!(one.contains("ci.group.replaced"), "{one}");
+        let many: Vec<String> = (0..5).map(|i| format!("\"e{i}\",")).collect();
+        let lots = render_replaced_group("ci", &many, kept);
+        assert!(
+            lots.contains("5 lines") && lots.contains("(and 2 more)"),
+            "{lots}"
+        );
+        // A group that differs only in layout still names where the previous fragment went.
+        let none = render_replaced_group("ci", &[], kept);
+        assert!(
+            none.contains("only in layout") && none.contains(".replaced"),
+            "{none}"
+        );
+    }
 
     #[test]
     fn net_rules_render_tags_each_rule_by_source_and_kind() {

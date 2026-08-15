@@ -1000,6 +1000,91 @@ fn net_groups_export_import_round_trips_between_configs() {
     );
 }
 
+/// An egress group is policy: an entry added by hand on this machine widens or narrows what an app
+/// may reach, and `--force` replaces the whole group. It must name what the incoming fragment no
+/// longer declares, and keep the previous group in the portable form that imports back — the same
+/// contract `sbx app import` and `sbx bundle import` carry.
+#[test]
+fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced() {
+    let fx = Fixture::new();
+    let frag = fx.proj.path().join("group.toml");
+    std::fs::write(
+        &frag,
+        "[net.groups]\nci = [\"{GET} https://api.example.com\"]\n",
+    )
+    .unwrap();
+    assert!(
+        fx.run(&["net", "groups", "import", frag.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    // The machine's owner adds an entry of their own.
+    let local = fx.proj.path().join("local.toml");
+    std::fs::write(
+        &local,
+        "[net.groups]\nci = [\"{GET} https://api.example.com\", \"{GET} https://local.example.org\"]\n",
+    )
+    .unwrap();
+    assert!(
+        fx.run(&[
+            "net",
+            "groups",
+            "import",
+            "--force",
+            local.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+
+    // Re-importing the pristine fragment drops that entry — and says so, by name.
+    let forced = fx.run(&["net", "groups", "import", "--force", frag.to_str().unwrap()]);
+    assert!(forced.status.success());
+    let err = String::from_utf8_lossy(&forced.stderr).to_string();
+    assert!(
+        err.contains("local.example.org"),
+        "the dropped entry must be named:\n{err}"
+    );
+    assert!(
+        err.contains("ci.group.replaced"),
+        "the kept fragment must be named:\n{err}"
+    );
+
+    // The kept fragment is portable: importing it back restores the entry.
+    let kept = fx.config_home.path().join("sbx").join("ci.group.replaced");
+    assert!(kept.exists(), "the previous group must be kept");
+    assert!(
+        fx.run(&["net", "groups", "import", "--force", kept.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let listed = fx.run(&["net", "groups", "ci"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("local.example.org"),
+        "re-importing the kept fragment restores the entry"
+    );
+
+    // A re-import that changes nothing keeps no copy and reports no loss.
+    std::fs::remove_file(&kept).unwrap();
+    let again = fx.run(&[
+        "net",
+        "groups",
+        "import",
+        "--force",
+        local.to_str().unwrap(),
+    ]);
+    assert!(again.status.success());
+    assert!(
+        !kept.exists(),
+        "an identical re-import must not keep a copy"
+    );
+    assert!(
+        !String::from_utf8_lossy(&again.stderr).contains("replaced egress group"),
+        "an identical re-import must report no loss"
+    );
+}
+
 #[test]
 fn net_groups_import_flags_entries_that_will_not_resolve() {
     let fx = Fixture::new();

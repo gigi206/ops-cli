@@ -11,7 +11,7 @@
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::{config, diag, help, style};
@@ -287,6 +287,100 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Keep every bundle a forced import is about to replace, and say what the incoming fragment no
+/// longer declares. Returns one warning per replaced bundle, for the caller to surface once the
+/// write succeeded.
+///
+/// A bundle is a table inside the shared global config, not a file of its own, so the copy an app
+/// profile gets (`<name>.toml.replaced`, beside it) has no equivalent here. What stands in for it is
+/// the fragment `sbx bundle export` already emits: the replaced bundle is written back out in the
+/// same portable form, as `<name>.bundle.replaced` beside the config, so re-declaring it is
+/// `sbx bundle import` on that file. The name ends in neither `.toml` nor a profile path, so
+/// nothing reads it as configuration.
+///
+/// Only a bundle whose declaration actually CHANGES is kept: re-importing an identical fragment
+/// leaves no copy and reports nothing. An error here fails the import closed, before the write, so
+/// a bundle is never overwritten with no way back.
+fn keep_replaced_bundles(
+    config_path: &Path,
+    incoming: &std::collections::BTreeMap<String, config::RawBundle>,
+    force: bool,
+) -> Result<Vec<String>, String> {
+    if !force {
+        return Ok(Vec::new());
+    }
+    let Some(dir) = config_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let (declared, _) = config::bundles();
+    let mut notes = Vec::new();
+    for (name, new) in incoming {
+        let Some(old) = declared.get(name) else {
+            continue; // added, not replaced
+        };
+        let one = |n: &String, b: &config::RawBundle| {
+            config::manage::export_bundles(&std::collections::BTreeMap::from([(
+                n.clone(),
+                b.clone(),
+            )]))
+        };
+        let (before, after) = (one(name, old)?, one(name, new)?);
+        if before == after {
+            continue;
+        }
+        let kept = dir.join(format!("{name}.bundle.replaced"));
+        std::fs::write(&kept, &before).map_err(|e| {
+            format!(
+                "cannot keep the bundle being replaced at {}: {e}",
+                kept.display()
+            )
+        })?;
+        notes.push(render_replaced_bundle(
+            name,
+            &crate::cli::settings_dropped_by(&before, &after),
+            &kept,
+        ));
+    }
+    Ok(notes)
+}
+
+/// The overwrite warning for one bundle: what its replacement no longer declares, and where the
+/// previous fragment is. A few dropped lines are named in full (the point is to recognize one's own
+/// edit); beyond that the count stands in, because the kept fragment is the better place to read
+/// the rest.
+fn render_replaced_bundle(name: &str, dropped: &[String], kept: &Path) -> String {
+    const NAMED: usize = 3;
+    let kept = kept.display();
+    if dropped.is_empty() {
+        return format!(
+            "replaced bundle `{name}`, which differed only in layout — the previous fragment is \
+             kept at {kept}"
+        );
+    }
+    let named = dropped
+        .iter()
+        .take(NAMED)
+        .map(|l| format!("`{l}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = dropped.len().saturating_sub(NAMED);
+    let more = if rest > 0 {
+        format!(" (and {rest} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "replaced bundle `{name}`, which declared {} the new one does not: {named}{more} — the \
+         previous fragment is kept at {kept}, so a per-machine entry can be read back and \
+         re-imported",
+        if dropped.len() == 1 {
+            "1 line".to_string()
+        } else {
+            format!("{} lines", dropped.len())
+        },
+    )
+}
+
 /// `sbx bundle import <file> [--force]`: merge a portable `[bundle.<name>]` fragment into the
 /// global config, preserving every existing bundle and comment. Bundles are global-only, so the
 /// target is always the global config; the deliberate command is the consent (an agent in the cage
@@ -331,8 +425,23 @@ fn bundle_import(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // `--force` replaces bundles that are already declared, and one may carry a rule or a package
+    // added by hand on this machine. Keep each replaced bundle beside the config BEFORE the write,
+    // and report what the incoming fragment no longer declares.
+    let replaced = match keep_replaced_bundles(&path, &bundles, force) {
+        Ok(kept) => kept,
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: bundle import: {e} — nothing was overwritten"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
     match config::manage::import_bundles(&path, &bundles, force) {
         Ok(outcome) => {
+            for note in &replaced {
+                diag::warn(note);
+            }
             let mut parts = Vec::new();
             if !outcome.added.is_empty() {
                 parts.push(format!("added {}", outcome.added.join(", ")));
@@ -399,6 +508,33 @@ mod tests {
             allow: allow.iter().map(|s| s.to_string()).collect(),
             ..config::RawBundle::default()
         }
+    }
+
+    /// The overwrite warning: a few dropped lines named in full, the rest counted, and always the
+    /// path the previous fragment went to — a bundle lives in a shared file, so that path is the
+    /// only way back.
+    #[test]
+    fn the_bundle_overwrite_warning_names_a_few_losses_and_counts_the_rest() {
+        let kept = Path::new("/config/sbx/demo.bundle.replaced");
+        let one = render_replaced_bundle("demo", &["allow = [\"x\"]".to_string()], kept);
+        assert!(one.contains("`demo`") && one.contains("1 line"), "{one}");
+        assert!(one.contains("demo.bundle.replaced"), "{one}");
+        let many: Vec<String> = (0..5).map(|i| format!("k{i} = {i}")).collect();
+        let lots = render_replaced_bundle("demo", &many, kept);
+        assert!(
+            lots.contains("5 lines") && lots.contains("(and 2 more)"),
+            "{lots}"
+        );
+        assert!(
+            lots.contains("`k0 = 0`") && !lots.contains("`k4 = 4`"),
+            "{lots}"
+        );
+        // A bundle that differs only in layout still names where the previous fragment went.
+        let none = render_replaced_bundle("demo", &[], kept);
+        assert!(
+            none.contains("only in layout") && none.contains(".replaced"),
+            "{none}"
+        );
     }
 
     #[test]
