@@ -3663,12 +3663,16 @@ fn a_connection_over_the_cap_is_told_why() {
     assert!(established.contains("200 Connection established"));
 
     let mut over = UnixStream::connect(&path).unwrap();
-    write!(
+    // Written tolerantly, for the same reason the read below is: the cap is checked when the
+    // connection is accepted, so the proxy can answer and close before this request is fully
+    // written, and the write then reports a broken pipe. That is the refusal working, not a
+    // failure — and nothing is masked by allowing it, because the assertions below still have to
+    // find the 503 and its reason in what came back.
+    let _ = write!(
         over,
         "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
         addr.port()
-    )
-    .unwrap();
+    );
     over.flush().ok();
     // Read tolerantly: the proxy answers and closes at once, and a stream socket closed with the
     // caller's own request still unread reports that to the caller as a reset — after handing over

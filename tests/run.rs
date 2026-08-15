@@ -2536,14 +2536,14 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
     // reachable — `network = "none"`, empty netns) the notifications name must have an OWNER (the
     // relay; without it the name is unowned, as the in-cage portal serves only the portal), and
     // `GetServerInformation` on it must return the HOST daemon's info (a forward can only succeed if
-    // the relay bridged the private bus to the host). A retry absorbs the startup race — the relay
-    // attaches within milliseconds when the host is idle, but the window is deliberately long (600
-    // polls, a minute or so) so a host-side relay that is merely slow to be scheduled is not
-    // mistaken for one that never attached. Twenty seconds was not enough: a full parallel suite
-    // provisions from the binary cache while this runs, and the relay lost the race for the CPU. `gdbus` comes from the project's own `nix:glib.bin`. It exits the
-    // loop the instant the name has an owner, so a healthy run is unaffected. Skips (never fails) when
-    // the host cannot sandbox,
-    // has no compositor, no session bus, or the cache is unreachable.
+    // the relay bridged the private bus to the host). Two things keep the startup race out of the
+    // verdict, and they do different jobs: a warm-up launch below provisions this cage's closure
+    // before anything is timed, which is what the relay was actually losing the CPU to; the poll
+    // loop then absorbs the milliseconds the relay needs on an idle host, over a window long enough
+    // (600 polls, a minute or so) that a merely slow host is not mistaken for one where the relay
+    // never attached. It exits the instant the name has an owner, so a healthy run is unaffected.
+    // `gdbus` comes from the project's own `nix:glib.bin`. Skips (never fails) when the host cannot
+    // sandbox, has no compositor, no session bus, or the cache is unreachable.
     let project = TmpDir::new("relay-proj");
     let data = TmpDir::new("relay-data");
     let state = TmpDir::new("relay-state");
@@ -2586,6 +2586,24 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
         trusted.status.success(),
         "sbx trust failed: {}",
         String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // Provision FIRST, outside the window. The relay is a host-side process, and the thing it loses
+    // the CPU race to is this cage's own portal/GTK closure being copied from the binary cache: the
+    // probe above ran before `sbx trust`, so `gui`/`dbus` were withheld and nothing was fetched for
+    // them. A warm-up launch pays that cost with nothing timed, so the poll loop below measures the
+    // relay attaching rather than the store filling. This removes the race instead of widening the
+    // window, which has already been widened once.
+    let warmed = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    assert!(
+        warmed.status.success(),
+        "the warm-up launch failed, so the timed run below would only report that: {}",
+        String::from_utf8_lossy(&warmed.stderr)
     );
 
     // Retry GetNameOwner until the relay has claimed the name (the startup race), then read the
