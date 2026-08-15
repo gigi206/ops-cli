@@ -11,18 +11,48 @@
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
 #
-# WHAT THIS BUNDLE DOES NOT GIVE YOU — read this before naming it. The agent itself is a VENDOR BOOTSTRAP download, which is why `[packages]` names no CLI. What it
-# does name is the zone database: the tool reads local time and a cage ships none.
-# A bundle cannot carry a `cmd`, so what is here is the FETCH TOOLING plus the hosts and
-# environment the agent needs once installed. A consuming app must reproduce the install step from
-# `examples/app/muse.toml`; naming this bundle alone equips a cage that can reach the agent's
-# service but has no agent in it.
+# THE AGENT IS A VENDOR BOOTSTRAP, and the bundle carries it. Meta publishes no package sbx could
+# ride, only an installer script, which is why `[packages]` names no CLI: the download is the
+# `provision` below, the one-time step sbx runs before the consuming app's `cmd`. What `[packages]`
+# does name is the zone database, because the tool reads local time and a cage ships none.
+#
+# What the app still owes is its own `cmd`, and here it is more than a PATH export: the cage's /etc
+# is synthesized per launch, so the `/etc/localtime` links the CLI's cron store needs cannot be laid
+# down by a step that exited. They live in `examples/app/muse.toml`, beside the launch they shape.
+#
+# UPGRADE. A bootstrap install rides no `[packages]` backend, so there is no lock to roll: what
+# advances the CLI is running its installer again, which always resolves the current channel.
+#     sbx upgrade provision
+# re-runs this step in the app's cage with SBX_UPGRADE set, and the guard below yields to it. For
+# one launch only: `sbx app run muse --env MUSE_SBX_UPDATE=1`.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.muse]
+# Meta's official installer, run once inside the cage, so the per-project build that `mise:`
+# backends automate is instead carried by the vendor's own script. `MUSE_INSTALL_DIR` pins the
+# launcher to ~/.local/bin; `MUSE_NO_MODIFY_PATH=1` stops the installer from editing shell rc files
+# (the consuming app exports PATH for the launch anyway). Both sit on the `bash` that runs the
+# script, NOT in front of `curl`: an environment prefix binds to its own command, so on the left of
+# the pipe the installer would see neither, and it would append its own PATH line to the isolated
+# home's `~/.profile`.
+#
+# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
+# remember that one succeeded. Keying it on the installed launcher also self-heals — remove it and
+# the next launch installs again.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+if [ ! -x "$HOME/.local/bin/muse" ] || [ -n "${SBX_UPGRADE:-}${MUSE_SBX_UPDATE:-}" ]; then
+  curl -fsSL https://dev.meta.ai/install.sh \
+    | MUSE_INSTALL_DIR="$HOME/.local/bin" MUSE_NO_MODIFY_PATH=1 bash
+fi
+''',
+]
 allow = [
     # The release channel, the model API, the asset host and the account login.
     "{GET} https://dev.meta.ai",

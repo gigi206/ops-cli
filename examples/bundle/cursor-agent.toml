@@ -11,18 +11,43 @@
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
 #
-# WHAT THIS BUNDLE DOES NOT GIVE YOU — read this before naming it. The agent itself is a VENDOR BOOTSTRAP download: the profile's `cmd` fetches and unpacks it on
-# first launch, which is why `[packages]` names an archiver rather than the CLI.
-# A bundle cannot carry a `cmd`, so what is here is the FETCH TOOLING plus the hosts and
-# environment the agent needs once installed. A consuming app must reproduce the install step from
-# `examples/app/cursor-agent.toml`; naming this bundle alone equips a cage that can reach the agent's
-# service but has no agent in it.
+# THE AGENT IS A VENDOR BOOTSTRAP, and the bundle carries it. Cursor publishes no package sbx could
+# ride, only an installer script, which is why `[packages]` names an archiver rather than the CLI:
+# the download itself is the `provision` below, the one-time step sbx runs before the consuming
+# app's `cmd`. Naming this bundle gets the agent. What the app still owes is its own `cmd`: the
+# installer writes into the app's home, and a step is a separate process, so the launch is what puts
+# that directory on PATH.
+#
+# UPGRADE. A bootstrap install rides no `[packages]` backend, so there is no lock to roll. The
+# installer carries no update logic of its own either — it always downloads and overwrites with the
+# version `cursor.com/install` currently serves — so re-running it IS the upgrade:
+#     sbx upgrade provision
+# re-runs this step in the app's cage with SBX_UPGRADE set, and the guard below yields to it. For
+# one launch only: `sbx app run cursor-agent --env CURSOR_AGENT_SBX_UPDATE=1`. The login lives
+# elsewhere in the app home and is untouched either way.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.cursor-agent]
+# Cursor's official installer, run once inside the cage — contained by bubblewrap + seccomp + the
+# empty netns + the allowlist below — into the app's isolated home. `pipefail` makes a failed
+# `curl … | bash` surface as a clean install error rather than later as `cursor-agent: not found`.
+#
+# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
+# remember that one succeeded. Keying it on the installed binary also self-heals — remove it and the
+# next launch installs again.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+if [ ! -x "$HOME/.local/bin/cursor-agent" ] || [ -n "${SBX_UPGRADE:-}${CURSOR_AGENT_SBX_UPDATE:-}" ]; then
+  curl https://cursor.com/install -fsS | bash
+fi
+''',
+]
 allow = [
     # The vendor site and its download host (the bootstrap fetch), then the agent's own backends.
     "{GET} https://cursor.com",

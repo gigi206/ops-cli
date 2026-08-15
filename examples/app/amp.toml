@@ -37,9 +37,10 @@
 # `argv` straight to the native binary. The same shape works whether or not `install.cjs` ever
 # ran (e.g. after a future `sbx upgrade mise` that re-fetches the wrapper with a fresh
 # placeholder). `mise where` accepts a SCOPED package name and answers with the install
-# directory, whose layout is `lib/node_modules/<scope>/<name>` — verified against a real scoped
-# install. If the query ever fails, `set -eu` aborts the launch with mise's own message instead
-# of running a half-installed CLI.
+# directory. What it lays out under that directory is NOT fixed: both
+# `lib/node_modules/<scope>/<name>` and `node_modules/<scope>/<name>` have shipped, so the command
+# below finds the one that is there instead of naming one. If the query itself ever fails,
+# `set -eu` aborts the launch with mise's own message instead of running a half-installed CLI.
 #
 # CREDENTIAL POSTURE — an Amp account, with a headless key. `amp login` opens a browser (which the
 # hermetic cage does not have), so the practical path is `AMP_API_KEY`, documented in the Amp
@@ -60,7 +61,13 @@ cmd = [
     "-c",
     """
 set -eu
-amp="$(mise where 'npm:@ampcode/cli')/lib/node_modules/@ampcode/cli"
+# The package directory inside a `mise:npm:` install, without assuming which layout mise wrote:
+# it has published both `<install>/lib/node_modules/<pkg>` and `<install>/node_modules/<pkg>`, so a
+# hardcoded one stops resolving the day an upgrade lands the other and the launch dies on a missing
+# wrapper. Newest layout first.
+amp_root="$(mise where 'npm:@ampcode/cli')"
+amp="$amp_root/node_modules/@ampcode/cli"
+[ -d "$amp" ] || amp="$amp_root/lib/node_modules/@ampcode/cli"
 # Skip the vendor's postinstall (mise blocks scripts on purpose) and use the package's own JS
 # fallback, which require.resolve's the platform optional dep and spawns the native binary
 # directly. No placement, no network — the binary is already on disk beside it.

@@ -23,14 +23,22 @@
 [bundle.openfox]
 # The install step mise's `--ignore-scripts` leaves undone, and the reason this bundle is complete
 # rather than a package a consuming app cannot start. OpenFox depends on two NATIVE node addons —
-# `better-sqlite3` (its session DB) and `node-pty` (its integrated terminal) — whose compiled
-# `.node` binaries are placed by a package install script, which mise deliberately does not run. A
-# plain install therefore leaves them absent and the agent exits at startup with "Could not locate
-# the bindings file … better_sqlite3.node".
+# `better-sqlite3` (its session DB), whose compiled `.node` binary is placed by a package install
+# script, which mise deliberately does not run. A plain install therefore leaves it absent and the
+# agent exits at startup with "Could not locate the bindings file … better_sqlite3.node".
 #
-# `npm rebuild` DOWNLOADS the prebuilt binaries rather than compiling them (they are published for
-# this platform), so no C++ toolchain is needed — but it does fetch, which is why the npm registry
-# is in the consuming app's reach. It runs inside the cage, under that app's own posture.
+# `npm rebuild` DOWNLOADS the prebuilt binary rather than compiling it (better-sqlite3's install
+# script is `prebuild-install || node-gyp rebuild`, and the download reaches GitHub releases, which
+# sbx's built-in set already allows), so no C++ toolchain is needed — but it does fetch, which is
+# why the npm registry is in the consuming app's reach. It runs inside the cage, under that app's
+# own posture.
+#
+# Only better-sqlite3 is rebuilt. `node-pty` ships `prebuilds/linux-x64/pty.node` in the tree, so
+# there is nothing to build for it — and rebuilding it FAILS by construction: its `prepare` script
+# runs `tsc -b ./src/tsconfig.json` while the published tarball carries `src/unix` and `src/win`
+# without that tsconfig, so npm aborts the whole rebuild on a TypeScript error and takes
+# better-sqlite3 down with it. Asking for the addon that is genuinely missing, and only that one,
+# is what keeps this step honest.
 #
 # The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
 # remember that one succeeded. Keying on the artifact also self-heals — after `sbx upgrade mise`
@@ -41,11 +49,35 @@ provision = [
     "-c",
     '''
 set -eu
-of="$(mise where 'npm:openfox')/lib/node_modules/openfox"
-marker="$of/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
-if [ ! -e "$marker" ]; then
-  echo "openfox: building native addons (better-sqlite3, node-pty) that mise's --ignore-scripts skips …" >&2
-  ( cd "$of" && npm rebuild better-sqlite3 node-pty )
+# The two directories this step needs are FOUND, never assumed: a `mise:npm:` install has carried
+# more than one layout (the package beside its dependencies under `lib/node_modules/<pkg>`, and a
+# pnpm-style store under `node_modules/.mise/`), and hardcoding one is what silently broke this step
+# before — npm printed "rebuilt dependencies successfully" while building nothing.
+root="$(mise where 'npm:openfox')"
+bs="$(find "$root" -maxdepth 6 -type d -path '*/node_modules/better-sqlite3' -print -quit)"
+if [ -z "$bs" ]; then
+  echo "openfox: cannot find better-sqlite3 under $root — the install layout changed again" >&2
+  exit 1
+fi
+marker="$bs/build/Release/better_sqlite3.node"
+# `sbx upgrade provision` raises SBX_UPGRADE to ask for a re-install; without it the guard
+# below keeps the fetch to once.
+if [ ! -e "$marker" ] || [ -n "${SBX_UPGRADE:-}" ]; then
+  echo "openfox: fetching the better-sqlite3 binding that mise's --ignore-scripts skips …" >&2
+  # `prebuild-install` is run DIRECTLY rather than through `npm rebuild`, because the pnpm-style
+  # layout links no `node_modules/.bin`: npm cannot find the helper its own install script names,
+  # falls back to `node-gyp rebuild`, and dies for want of a Python and a C++ toolchain the cage has
+  # no reason to carry. The helper is in the tree — it is a dependency of better-sqlite3 — so
+  # invoking it by path does the one thing that is actually needed: download the binding published
+  # for this platform.
+  pbi="$(find "$root" -maxdepth 6 -type f -path '*/prebuild-install/bin.js' -print -quit)"
+  if [ -z "$pbi" ]; then
+    echo "openfox: prebuild-install is not in the install tree under $root" >&2
+    exit 1
+  fi
+  ( cd "$bs" && node "$pbi" )
+  # The binding is the point, so a silent no-op is a failure: the helper reports success either way.
+  [ -e "$marker" ] || { echo "openfox: no better_sqlite3.node was produced in $bs" >&2; exit 1; }
 fi
 ''',
 ]

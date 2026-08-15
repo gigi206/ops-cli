@@ -133,21 +133,11 @@ if [ ! -e /etc/localtime ]; then
     break
   done
 fi
-# First launch only: run Meta's official installer into the isolated home
-# (contained by the sandbox + the egress allowlist), so the per-project build
-# that `mise:` backends automate is instead carried by the vendor's own script.
-# `MUSE_INSTALL_DIR` pins the launcher to ~/.local/bin; `MUSE_NO_MODIFY_PATH=1`
-# stops the installer from editing shell rc files (there is nothing worth adding
-# PATH to — the profile exports it below anyway). Both sit on the `bash` that runs
-# the script, NOT in front of `curl`: an environment prefix binds to its own
-# command, so on the left of the pipe the installer would never see either, and it
-# would append its own PATH line to the isolated home's `~/.profile`. Later
-# launches reuse the installed launcher. If the installer script changes upstream,
-# only this line changes; the launcher + binary resolve themselves from the channel.
-if [ ! -x "$bin" ] || [ -n "$MUSE_SBX_UPDATE" ]; then
-  curl -fsSL https://dev.meta.ai/install.sh \
-    | MUSE_INSTALL_DIR="$HOME/.local/bin" MUSE_NO_MODIFY_PATH=1 bash
-fi
+# The install is the `muse` bundle's `provision`, and sbx has already run it by the
+# time this starts; what stays here is the launch. The timezone links above are it:
+# the cage's /etc is synthesized per launch, so they cannot be laid down by a step
+# that exited. A `provision` is a separate process, so its PATH export does not
+# reach this shell either.
 export PATH="$HOME/.local/bin:$PATH"
 exec "$bin" "$@"
     ''',

@@ -15,18 +15,54 @@
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
 #
-# WHAT THIS BUNDLE DOES NOT GIVE YOU — read this before naming it. The agent itself is a VENDOR BOOTSTRAP download (`curl … install.sh`), which is why `[packages]`
-# names a runtime and the tools the agent looks up on PATH rather than the agent.
-# A bundle cannot carry a `cmd`, so what is here is the FETCH TOOLING plus the hosts and
-# environment the agent needs once installed. A consuming app must reproduce the install step from
-# `examples/app/prime-agent.toml`; naming this bundle alone equips a cage that can reach the agent's
-# service but has no agent in it.
+# THE AGENT IS A VENDOR BOOTSTRAP, and the bundle carries it. Prime Intellect publishes no package
+# sbx could ride, only an installer script, so `[packages]` names the runtime and the tools the
+# agent looks up on PATH, and the install itself is the `provision` below — the one-time step sbx
+# runs before the consuming app's `cmd`. Naming this bundle gets the agent, not just the hosts it
+# reaches. What the app still owes is its own `cmd`: the installer writes into a prefix under the
+# app's home, so the launch puts that prefix on PATH before exec'ing the agent (the step is a
+# separate process, so nothing it exports survives into the command).
+#
+# UPGRADE. A bootstrap install rides no `[packages]` backend, so there is no lock to roll: what
+# advances the agent is running its installer again, which always resolves the current release.
+#     sbx upgrade provision
+# re-runs this step in the app's cage with SBX_UPGRADE set, and the guard below yields to it. For
+# one launch only: `sbx app run prime-agent --env PRIME_AGENT_SBX_UPDATE=1`. Auth, sessions and
+# harness state live elsewhere in the app home and are untouched either way.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.prime-agent]
+# The vendor installer, run once inside the cage. `pipefail` surfaces a failed `curl … | bash` as a
+# clean install error rather than later as `prime-agent: not found`. Node and uv are already on PATH
+# from `[packages]`, so the installer's interactive offers to install them are never reached; it
+# still asks once, on a terminal, before installing ("Install? [Y/n]") — with no terminal it
+# proceeds without asking. `PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL` answers its SECOND question, so
+# the Python kernel is prepared during the install rather than on the first use of the tool. It is
+# `export`ed rather than written as a `VAR=1 curl …` prefix, which would bind to `curl` and never
+# reach the shell reading the script.
+#
+# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
+# remember that one succeeded. Keying it on the installed binary also self-heals — remove the prefix
+# and the next launch installs again.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -eo pipefail
+# `npm install -g` needs a writable prefix, and the nix node's own prefix lives in the read-only
+# store, so the global install is pinned into the app's isolated home. The consuming app puts the
+# same prefix on PATH for the launch.
+export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+if [ ! -x "$NPM_CONFIG_PREFIX/bin/prime-agent" ] || [ -n "${SBX_UPGRADE:-}${PRIME_AGENT_SBX_UPDATE:-}" ]; then
+  export PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1
+  curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | bash
+fi
+''',
+]
 allow = [
     # The installer script's host and the release bucket it pulls the build from.
     "{GET} https://app.primeintellect.ai",

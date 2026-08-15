@@ -26,11 +26,13 @@
 # `opencode-web` / `hermes-web` (no Electron, no in-cage browser, no `gui` hole).
 #
 # UPGRADE — explicit, never automatic. Odysseus publishes no release artifact and is
-# not a pip-installable package, so it rides no `[packages]` backend and `sbx upgrade`
-# has nothing to roll: the checkout would stay pinned to whatever `main` was on the
+# not a pip-installable package, so it rides no `[packages]` backend and no lock
+# rewrite can roll it: the checkout would stay pinned to whatever `main` was on the
 # first launch. The clone and the install are the `odysseus` bundle's install step,
 # which sbx runs before this command; what stays here is what shapes the running
-# process. Refresh it for ONE launch with
+# process. Roll it with
+#     sbx upgrade provision
+# which re-runs that step in this app's cage, or refresh it for ONE launch with
 #     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
 # which fetches `main`, hard-resets the checkout, and re-installs the dependencies
 # (the install is keyed on the commit, so it re-runs exactly when the source moved).

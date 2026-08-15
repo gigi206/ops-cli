@@ -13,9 +13,15 @@
 # xAI publishes the CLI as a single static release binary in its own public artifact bucket
 # (`storage.googleapis.com/grok-build-public-artifacts/cli/grok-<version>-linux-x86_64`), which is
 # what mise's `aqua` backend fetches through the aqua registry entry `x.ai/cli/grok` — no node
-# runtime, no third-party mirror. It lands in the app's persistent isolated home, equipped at the
-# latest upstream version on the first launch in a project and then pinned; advance it with
-# `sbx upgrade mise`.
+# runtime, no third-party mirror. It lands in the app's persistent isolated home on the first launch
+# in a project.
+#
+# THIS ONE DOES NOT ROLL FORWARD BY ITSELF, unlike every other agent here. That registry entry is
+# `type: http`: it templates the download URL and names no repository and no version source, so mise
+# has nowhere to ask what versions exist and an unversioned request finds none — the launch fails
+# before the agent is reached. The bundle therefore names a version, and `sbx upgrade mise` cannot
+# advance it because rolling asks the same unanswerable question. The bundle carries the reasoning
+# and the trigger that would retire the pin; bump it there.
 #
 # TWO AUTHENTICATION PATHS, and they use DIFFERENT hosts — pick one and open only its host:
 #
@@ -84,9 +90,11 @@ allow = [
 mute = []
 
 [env]
-# sbx owns upgrades (`sbx upgrade mise`), so tell the CLI not to replace its own binary underneath
-# the pinned install. Belt and braces: even if the value is not honored, the allowlist above admits
-# only GETs to the artifact prefix, and a warm launch reuses the pinned version offline.
+# sbx owns the install, so tell the CLI not to replace its own binary underneath the pinned one.
+# It matters more here than elsewhere: this package is version-pinned in its bundle (see above), so
+# a self-update would put the cage on a build sbx does not know it is running. Belt and braces: even
+# if the value is not honored, the allowlist above admits only GETs to the artifact prefix, and a
+# warm launch reuses the pinned version offline.
 
 # --- BYOK (commented) — uncomment together with the `{*} https://api.x.ai` allow line above. The
 # in-cage placeholder lets the CLI start and issue its request; the proxy strips it and substitutes

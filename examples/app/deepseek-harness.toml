@@ -153,7 +153,13 @@ cmd = [
     "-c",
     """
 set -eu
-dsh_dir="$(mise where 'npm:@deepseek-ai/dsh')/lib/node_modules/@deepseek-ai/dsh"
+# The package directory inside a `mise:npm:` install, without assuming which layout mise wrote:
+# it has published both `<install>/lib/node_modules/<pkg>` and `<install>/node_modules/<pkg>`, so a
+# hardcoded one stops resolving the day an upgrade lands the other and the launch dies on a missing
+# entry point. Newest layout first. The bundle's install step picks its directory the same way.
+dsh_root="$(mise where 'npm:@deepseek-ai/dsh')"
+dsh_dir="$dsh_root/node_modules/@deepseek-ai/dsh"
+[ -d "$dsh_dir" ] || dsh_dir="$dsh_root/lib/node_modules/@deepseek-ai/dsh"
 # `--expose-internals` instead of a bare `dsh`: the loader reaches Node's internal module loader
 # either through that flag or through a native addon, and the addon refuses this cage's node build
 # (see the header). Without it the boot dies applying the reload plugin.

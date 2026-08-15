@@ -35,10 +35,11 @@
 # `cursor-agent.toml` and `prime-agent.toml` use, generalised to a source build.
 #
 # Installed once on the first launch; persistent across projects (the same
-# isolated home). Re-run the bootstrap to advance: `sbx app run trae --env
-# TRAE_SBX_UPDATE=1` (the `--env` override is read on the HOST and authoritative
-# for that one launch — the binary moves only when you ask, matching the
-# "versions move only on an explicit upgrade" contract).
+# isolated home). Trae rides no `[packages]` backend, so what advances it is running its install
+# again: `sbx upgrade provision`, the channel for exactly this shape. For one launch only, `sbx
+# app run trae --env TRAE_SBX_UPDATE=1` does the same (the `--env` override is read on the HOST
+# and authoritative for that launch). Either way the version moves only when you ask, matching
+# the "versions move only on an explicit upgrade" contract.
 #
 # CREDENTIAL POSTURE — multi-provider BYOK, the same shape as `crush` /
 # `aider` / `vibe` / `command-code`. Trae Agent supports OpenAI, Anthropic,

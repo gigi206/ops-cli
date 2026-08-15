@@ -54,13 +54,16 @@ fi
 cd odysseus
 
 # Odysseus publishes no release artifact and is not a pip-installable package, so it rides no sbx
-# backend and `sbx upgrade` cannot roll it: the checkout would stay at whatever `main` was on the
-# first launch. Refresh it deliberately, one launch at a time:
+# backend and no lock rewrite can roll it: the checkout would stay at whatever `main` was on the
+# first launch. What advances it is running this install again, which is what the `provision`
+# channel does (it raises SBX_UPGRADE for every app's install step):
+#     sbx upgrade provision
+# For one launch only, the app-specific ask does the same:
 #     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
 # `reset --hard` discards the local patch below (re-applied right after) and any other in-tree edit;
 # app DATA lives outside the checkout, so nothing you own is lost.
-if [ -n "$ODYSSEUS_SBX_UPDATE" ]; then
-  echo "sbx: refreshing the Odysseus checkout (ODYSSEUS_SBX_UPDATE is set) …" >&2
+if [ -n "${SBX_UPGRADE:-}${ODYSSEUS_SBX_UPDATE:-}" ]; then
+  echo "sbx: refreshing the Odysseus checkout …" >&2
   git fetch --depth 1 origin main
   git reset --hard FETCH_HEAD
 fi
@@ -75,10 +78,21 @@ if ! grep -q 'from typing import.*\bAny\b' src/agent_loop.py; then
 fi
 
 # Venv + install, keyed on the checked-out commit (see the note above).
-[ -d .venv ] || python -m venv .venv
+#
+# The guard RUNS the interpreter rather than testing the directory. A venv's `bin/python` is a
+# symlink into the nix store, so an interpreter that moves — which is what `sbx upgrade nix` does —
+# leaves the directory in place around a dead link: a guard keyed on `-d .venv` passes forever
+# while every `uv pip install` below fails with "Broken symlink at .venv/bin/python3", and the app
+# never starts again. Running it covers the absent, the half-created and the stale venv at once.
+# The rebuild takes the stamp with it: a fresh venv holds no packages, and a stamp left behind
+# would skip the install and leave the app importing modules that are no longer there.
+stamp="$HOME/.odysseus-installed-rev"
+if ! .venv/bin/python -c '' 2>/dev/null; then
+  rm -rf .venv "$stamp"
+  python -m venv .venv
+fi
 . .venv/bin/activate
 rev="$(git rev-parse HEAD)"
-stamp="$HOME/.odysseus-installed-rev"
 if [ "$(cat "$stamp" 2>/dev/null)" != "$rev" ]; then
   echo "sbx: installing Odysseus dependencies for $rev (first launch or after an update) …" >&2
   uv pip install -r requirements.txt

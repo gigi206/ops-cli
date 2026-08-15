@@ -54,8 +54,16 @@ provision = [
     "-c",
     '''
 set -eu
-dsh_dir="$(mise where 'npm:@deepseek-ai/dsh')/lib/node_modules/@deepseek-ai/dsh"
-if [ ! -e "$dsh_dir/node_modules/node-pty/build/Release/pty.node" ]; then
+# The package directory inside a `mise:npm:` install, without assuming which layout mise wrote.
+# It has published both — `<install>/lib/node_modules/<pkg>` and `<install>/node_modules/<pkg>` —
+# so a step that hardcodes one starts failing the day an upgrade lands the other, with a `cd` into
+# a path that is not there. Both are checked, newest layout first.
+dsh_root="$(mise where 'npm:@deepseek-ai/dsh')"
+dsh_dir="$dsh_root/node_modules/@deepseek-ai/dsh"
+[ -d "$dsh_dir" ] || dsh_dir="$dsh_root/lib/node_modules/@deepseek-ai/dsh"
+# `sbx upgrade provision` raises SBX_UPGRADE to ask for a re-install; without it the guard
+# below keeps the build to once.
+if [ ! -e "$dsh_dir/node_modules/node-pty/build/Release/pty.node" ] || [ -n "${SBX_UPGRADE:-}" ]; then
   echo "deepseek-harness: building node-pty, the addon the script-free install leaves out …" >&2
   node_prefix="$(dirname "$(dirname "$(command -v node)")")"
   ( cd "$dsh_dir" && npm rebuild node-pty --nodedir="$node_prefix" )

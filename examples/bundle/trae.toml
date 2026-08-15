@@ -41,7 +41,8 @@
 # The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
 # remember that one succeeded. Keying on the installed entry point also self-heals — remove the
 # isolated home and the next launch clones and builds again. To move the checkout forward
-# deliberately, launch once with `--env TRAE_SBX_UPDATE=1`.
+# deliberately, roll it with `sbx upgrade provision` (which raises SBX_UPGRADE for every app's
+# install step), or ask for this one alone with `sbx app run trae --env TRAE_SBX_UPDATE=1`.
 provision = [
     "bash",
     "-c",
@@ -50,7 +51,7 @@ set -eo pipefail
 src="$HOME/.trae/src"
 bin_link="$HOME/.local/bin/trae-cli"
 repo_url="https://github.com/bytedance/trae-agent.git"
-if [ ! -x "$bin_link" ] || [ -n "$TRAE_SBX_UPDATE" ]; then
+if [ ! -x "$bin_link" ] || [ -n "${SBX_UPGRADE:-}${TRAE_SBX_UPDATE:-}" ]; then
   rm -rf "$src"
   git clone --depth 1 "$repo_url" "$src"
   cd "$src"

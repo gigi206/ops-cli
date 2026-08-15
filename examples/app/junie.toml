@@ -28,8 +28,9 @@
 # and sbx runs it before this command, in this cage; the step's own guard (the shim's existence in
 # the persistent home) is what keeps it to once, and the extraction is pure JavaScript (the package
 # bundles `yauzl`), so the cage needs no `unzip`. (`mise where` accepts a SCOPED package name and
-# answers with the install directory, whose layout is `lib/node_modules/<scope>/<name>` — both
-# checked against a real scoped install rather than assumed.)
+# answers with the install directory; what sits under it is not fixed — both
+# `lib/node_modules/<scope>/<name>` and `node_modules/<scope>/<name>` have shipped — so the step
+# finds the one that is present rather than naming one.)
 #
 # THE CAVEAT THAT WAS: the build Junie downloads at runtime is a JVM application sbx never patches
 # (unlike a `nix:`/`deb:`/`tarball:` package, autoPatchelf'd host-side), running through the cage's
