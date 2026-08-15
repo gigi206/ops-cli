@@ -1,0 +1,103 @@
+# `atomic-agent` — Atomic Agent's CLI/TUI: the agent itself, auto-upgraded, plus the hosts it reaches.
+#
+#   sbx bundle import examples/bundle/atomic-agent.toml
+#   # then in an app profile:   use = ["atomic-agent"]
+#
+# Derived from `examples/app/atomic-agent.toml`, whose namesake profile names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for what this agent needs, while the
+# profile keeps its own command, posture and provider choices. A test pins the two artifacts
+# together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# THE ARTIFACT. A Node SEA binary — `atomic-agent` — that is NOT alone in its archive: the release
+# tarball also carries `grammars/` (the GBNF the tool-call decoder is constrained by),
+# `starter-skills/` (17 playbooks copied into the state dir on every boot), `node_modules/` (the
+# `better-sqlite3` native addon the memory and session stores load through `createRequire`, plus
+# `playwright-core`) and `vendor/rg` (the pinned ripgrep behind `os.fs.grep`). The runtime resolves
+# every one of them RELATIVE TO THE BINARY, so the whole tree has to land together — which is what
+# `tarball:` does, and why the plainer `binary:` backend does not fit a program that is a directory.
+#
+# ARCHITECTURE: the resolver names the `linux-x64` build, following the vendor's own slug. On
+# aarch64 change that one token to `linux-arm64` — but read the managed-models note in the app
+# profile first: upstream ships the managed llama.cpp runtime for x64 only.
+#
+# NOT carried, deliberately: `chromium`. The browser tool family needs a Chromium-family binary,
+# which upstream does not bundle, and that stack is only useful under a `gui` posture a bundle
+# cannot set — plus it is a large closure to pull in unasked. The app profile adds it beside its
+# own `gui` line, together with the executable path that points the agent at it.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.atomic-agent]
+allow = [
+    # Web search, the shipped default: Exa's keyless MCP endpoint, which the `os.web.search` tool
+    # speaks Streamable HTTP to. Left method-open because an MCP session is not one verb — it POSTs
+    # the calls, GETs the event stream and DELETEs the session — and pinning the wrong subset
+    # breaks the tool rather than bounding it. Set `EXA_API_KEY` instead and the tool switches to
+    # `api.exa.ai`, which is NOT opened here: a key is a deliberate step, and so is its host.
+    "{*} https://mcp.exa.ai",
+    # The search fallback the default provider drops to, keyless: DuckDuckGo's HTML endpoint.
+    "{GET,POST} https://html.duckduckgo.com",
+    # Managed local models (`atomic-agent models pull …`): the GGUF weights, read-only. Hugging
+    # Face serves the metadata and redirects the blobs to its Xet CDN, so both hosts are needed —
+    # the second is where the gigabytes actually come from. The llama.cpp runtime that runs them is
+    # a GitHub release, already covered by sbx's built-in `{GET,HEAD}` self-equip lane.
+    "{GET,HEAD} https://huggingface.co",
+    "{GET,HEAD} https://*.xethub.hf.co",
+]
+# Telemetry, on by default upstream and refused here — the allowlist IS the privacy switch, and
+# these entries only keep the per-turn refusals from drowning the actionable ones in
+# `sbx net logs` (still denied, still counted in `sbx net stats`, still visible with `--all`).
+# Anonymous usage analytics goes to PostHog and crash reports to Sentry on the same toggle; the
+# agent degrades quietly when both are unreachable. Turn them off at the source as well with
+# `/privacy analytics off` in the TUI, which writes the setting into the app's own config.
+# A mute is read only on a DENIED request, which is what these are: none of them is in `allow`, so
+# each is refused first and quietened second. The Sentry line is the one that can go stale on its
+# own: it is the ingest host of the DSN compiled into the shipped binary, so a project rotation
+# upstream changes it and the refusals become loud again. Nothing breaks when that happens, and
+# `sbx net logs -a <app> --all` is where you would see it.
+mute = [
+    "us.i.posthog.com",             # product analytics: provider/model names, install id, turn shapes
+    "us-assets.i.posthog.com",      # the PostHog remote-config fetch that precedes them
+    "o4511710615699456.ingest.us.sentry.io",  # crash reports, on the analytics toggle
+]
+
+[bundle.atomic-agent.packages]
+# The agent itself, auto-upgraded through the resolver below.
+atomic-agent = "tarball:resolve"
+
+[bundle.atomic-agent.env]
+# The startup version check, off. It is a plain GET to the GitHub releases API and it only
+# notifies — but what it offers cannot be taken: the update it invokes re-runs the vendor's
+# `install.sh` against the directory holding `process.execPath`, and under sbx that directory is a
+# read-only store path. `sbx upgrade tarball` is the verb that rolls this agent forward, and the
+# artifact you pinned is the artifact that runs.
+ATOMIC_AGENT_UPDATE_CHECK_ON_STARTUP = "false"
+# Chromium's own SUID/userns sandbox cannot come up in the cage (sbx's seccomp denylist blocks
+# `clone(CLONE_NEWUSER)`), so a browser launched without this aborts at startup and every browser
+# tool fails with it. Dropping that inner sandbox is acceptable because bubblewrap + seccomp + the
+# empty netns IS the boundary. Inert until the consuming app supplies a browser.
+ATOMIC_AGENT_BROWSER_NO_SANDBOX = "1"
+
+# The `tarball:resolve` command. sbx runs it in a hermetic sandbox (its own base tools; the HOST
+# network, because provisioning is host-side and an allowlist governs runtime egress), captures the
+# URL it prints, validates it is an https `.tar.gz`, and pins it with its content hash. A warm
+# launch reuses the pin offline and never re-runs this.
+#
+# It reads the current tag out of the redirect GitHub answers for `/releases/latest`, then composes
+# the versioned asset path. The vendor also publishes a stable
+# `/releases/latest/download/<asset>` alias, and that is the shape NOT taken, for the reason
+# `examples/README.md` gives: a pin is a content hash, so a URL whose bytes move under it breaks the
+# next launch with a hash mismatch the moment upstream releases. Resolving the tag names an
+# immutable asset instead, and it also keeps the upgrade cheap: an unchanged URL lets `sbx upgrade`
+# skip re-fetching the artifact, which a constant alias never can.
+[bundle.atomic-agent.tarball.atomic-agent]
+resolve = [
+    "sh",
+    "-c",
+    "tag=$(curl -fsS -o /dev/null -w '%{url_effective}' -L https://github.com/AtomicBot-ai/atomic-agent/releases/latest); printf 'https://github.com/AtomicBot-ai/atomic-agent/releases/download/%s/atomic-agent-linux-x64.tar.gz' \"${tag##*/}\"",
+]

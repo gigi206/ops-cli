@@ -342,9 +342,17 @@ offline-reusable. Pairs with [`gui = "wayland"`](gui), [`gpu = true`](gpu), and
   the `cmd` a profile writes is that key whatever the vendor named the file inside the archive.
 
 Anything else fails the build with a message naming what it found: two executables at the root is an
-ambiguity, not a pick-the-first situation, and an archive that unpacks into a versioned
-sub-directory is not reached into. The same three shapes apply to `deb:` and `appimage:`, which share
-this install phase.
+ambiguity, not a pick-the-first situation. The same three shapes apply to `deb:` and `appimage:`,
+which share this install phase.
+
+`tarball:` alone corrects one thing before those shapes are tried. An archive whose root is a
+**single directory** (the platform slug, or the `<name>-<version>/` prefix a vendor commonly wraps
+its tree in) is **hoisted**: its contents become the root the shapes above scan, so a program that
+sits one level down is still found, together with the support files it reads beside itself. The
+condition is "exactly one entry, and it is a directory", which is unambiguous by construction, so it
+needs no declaration of its own; every other root is copied unchanged. `atomic-agent` is the shipped
+example, its release tarball unpacking into `linux-x64/`. `deb:` and `appimage:` do not hoist,
+because a single directory at their root means something else.
 
 The second shape has one wrinkle worth knowing. An archive whose *own* root is an FHS tree — the
 `bin/<tool>` + `share/` layout a self-contained CLI with man pages ships in — lands its program on

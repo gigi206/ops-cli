@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's `examples/app/` directory ships **70 importable
+The repository's `examples/app/` directory ships **71 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -15,7 +15,7 @@ terminal agent, a desktop window, or a UI served in your host browser. Each prof
 header carries its packaging specifics; how the artifacts are built and fit together, and
 the "not here yet, and why" triage, live in `examples/README.md`.
 
-## Terminal agents (49)
+## Terminal agents (50)
 
 The common case: a CLI or TUI that runs in the terminal you launched it from.
 
@@ -25,6 +25,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `aider` | `mise:pipx:aider-chat` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenAI / Anthropic / Gemini / any OpenAI-compatible) |
 | `amp` | `nix:nodejs` (+ `mise:npm:@ampcode/cli`) | `ampcode.com` (account / `AMP_API_KEY`) |
 | `ante` | `mise:github:AntigmaLabs/ante-preview` | provider-dependent (BYOK) or local (`/offline-mode` llama.cpp) |
+| `atomic-agent` | `tarball:resolve` (the tag behind GitHub's `releases/latest` redirect) (+ `nix:chromium`) | local first: a `llama.cpp` server on the host loopback, or weights the agent manages in-cage; BYOK cloud optional |
 | `auggie` | `nix:nodejs` (+ `mise:npm:@augmentcode/auggie`) | `*.api.augmentcode.com` (`AUGMENT_API_TOKEN`) |
 | `autohand` | `nix:nodejs` (+ `mise:npm:autohand-cli`) | `api.autohand.ai` + `code.autohand.ai` (Autohand account) |
 | `claude-code` | `mise:aqua:anthropics/claude-code` | `api.anthropic.com` (BYOK) |
@@ -119,7 +120,7 @@ default (`home_scope = "global"`).
 ## Bundles: the shared pieces
 
 Beyond the app profiles, `examples/bundle/`
-ships **63 reusable tool bundles**: a named set of packages and egress rules that
+ships **64 reusable tool bundles**: a named set of packages and egress rules that
 profiles pull in with `use = [...]` instead of restating it: the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as

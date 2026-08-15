@@ -1,0 +1,208 @@
+# Atomic Agent — the local-first agent runtime (AtomicBot-ai/atomic-agent), sandboxed by sbx.
+#
+#   sbx app import examples/app/atomic-agent.toml
+#   sbx app run atomic-agent
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package, its auto-upgrade resolver and
+# the hosts it reaches come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/atomic-agent.toml
+#     sbx app import    examples/app/atomic-agent.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
+# Atomic Agent runs the agent LOOP and all its state on your machine: sessions, memory, tasks,
+# traces, skills and config are plain files and SQLite databases under a state directory, and the
+# model can be a local `llama.cpp` server rather than a vendor API. That is a claim about where the
+# CONTROL PLANE lives, not about where packets go — the agent still browses, searches, calls HTTP
+# endpoints and reaches whatever provider you point it at. This profile is the second half of that
+# story: confined by sbx it sees only the cage filesystem (the project you launch it from, its own
+# persistent isolated home, and any `binds` below), reaches only the hosts you allow, and its powers
+# stop at the sandbox boundary (bubblewrap + seccomp + an empty netns + the egress allowlist).
+#
+# `sbx app run atomic-agent` opens the TUI. Every other verb is one `--` away and reaches the CLI
+# verbatim: `sbx app run atomic-agent -- models list`, `-- skill list`, `-- trace list --limit 10`.
+#
+# WHERE THE MODEL COMES FROM — the one choice this profile cannot make for you, and the one that
+# decides the allowlist. Upstream's default mode is `external`: the agent expects a `llama-server`
+# it does not manage. Under sbx that splits into three, in rough order of how well they fit a cage:
+#
+#   1. A `llama-server` ON YOUR HOST, and the shipped default already points at it: the agent's own
+#      default is `http://127.0.0.1:8080`, and a `tcp://localhost:8080` allow rule puts a listener on
+#      exactly that address inside the cage, relaying to the same port on YOUR loopback. Uncomment
+#      that one rule and a host server on 8080 answers, with no environment variable to set (a
+#      different port needs `ATOMIC_AGENT_LLAMA_URL` too, in `[env]` below). This is the setup that
+#      keeps your GPU: the server runs outside the sandbox, on your own driver stack.
+#   2. MANAGED, in-cage (`atomic-agent models pull <model>` → `models use <model>`). The agent
+#      fetches a pinned llama.cpp runtime (a GitHub release, already covered by sbx's built-in
+#      self-equip lane) and the GGUF weights (Hugging Face, allowed by the bundle) into its own
+#      home, and serves them on the CAGE's own loopback — intra-cage traffic, so the serving needs
+#      no rule at all. Two things to know before you choose it. It runs on the CPU: the GPU offload
+#      upstream documents for Linux is Vulkan, and sbx's `gpu = true` hole provisions mesa's
+#      GL/EGL/GBM drivers and the render node, not a Vulkan loader and ICD — which is why
+#      `gpu = true` is deliberately absent here rather than present and inert. And the weights are
+#      gigabytes: they land in the app's home, where `home_scope = "global"` below is what stops
+#      that from becoming one download per project. Upstream ships this runtime for x64 only.
+#      NOT MEASURED HERE: this profile was verified up to the launch, not through a model pull.
+#   3. A CLOUD provider (OpenAI-compatible, OpenRouter, AI/ML API). Allow its host in `[network]`
+#      below and give the agent a key — or better, keep the key out of the cage entirely with the
+#      `[secret]` block at the end of this file.
+#
+# WHAT DOES NOT WORK IN THE CAGE, and why. The agent ships a broad desktop tool surface, and the
+# parts of it that reach for a session bus or an X11 window manager have nothing to reach:
+# `os.window.*` needs `wmctrl` talking to an X11/XWayland WM (this cage has neither), clipboard
+# read/write needs `xclip`/`wl-clipboard` against a real display, `os.notify` needs a session bus
+# (`dbus = true` would give the cage its own — it is off here because a terminal agent does not need
+# notifications, and the bus is a security field), and `os.fs.trash` needs `gio` or `trash-cli`. Each
+# fails on its own and nothing else degrades with it. What DOES work unchanged: files, shell,
+# documents, memory, tasks, traces, skills, MCP, and `os.fs.grep` — the release tarball ships its
+# own pinned `ripgrep` beside the binary, so that one needs nothing from the cage at all.
+cmd = [
+    "bash",
+    "-c",
+    '''
+set -e
+# Name the in-cage Chromium: the agent's auto-detect walks ABSOLUTE host paths (/usr/bin/chromium
+# and friends), where a nix-provisioned browser never is. Guarded, so dropping the package below
+# still leaves a launch that starts. See `gui = "offscreen"` for the rest of that story.
+chromium_bin="$(command -v chromium || true)"
+if [ -n "$chromium_bin" ]; then
+  export ATOMIC_AGENT_BROWSER_EXECUTABLE_PATH="$chromium_bin"
+fi
+
+# The TUI is the default surface; `sbx app run atomic-agent -- <args>` reaches the CLI verbatim.
+if [ "$#" -gt 0 ]; then
+  exec atomic-agent "$@"
+fi
+exec atomic-agent tui
+''',
+    # `$0` placeholder: `sbx app run atomic-agent -- <args>` appends <args> to this cmd array, so they
+    # arrive as `$1 $2 …` (this element fills `$0`) and reach the agent verbatim via `exec … "$@"`.
+    "atomic-agent",
+]
+# One memory, one model catalogue, one set of skills, shared across the projects you launch from:
+# the agent's state (sessions, memory and its SQLite stores, tasks, traces, skills, the browser
+# profile, and any managed GGUF weights) lives in a dedicated persistent isolated home rather than
+# one per project. For an agent whose whole pitch is state that outlives a session, and whose
+# managed models are measured in gigabytes, a per-project home would be the wrong default twice.
+home_scope = "global"
+
+# BROWSER TOOLSET — `gui = "offscreen"` is what makes the browser tools usable. They stay in the
+# model's tool schema either way (unlike some agents, this one does not quietly drop them), so
+# without a browser they fail at call time with "Could not find a Chromium-family browser" — a loud
+# failure, but a failure. The `nix:chromium` package below supplies the binary; this posture
+# supplies the two things a browser engine needs that a hermetic cage lacks: fonts (without them
+# Chromium dies the moment it renders a real page) and the egress proxy's CA in the cage's NSS store
+# (Chromium reads its own store, not the CA-file env vars sbx sets, so every page would fail
+# ERR_CERT_AUTHORITY_INVALID under the allowlist). It renders OFF-SCREEN: no window, no compositor
+# socket, no host access at all — strictly less exposure than `gui = "wayland"` for the same
+# capability. A trusted-only security field. Drop this line and the package below if you do not want
+# the browser tools.
+#
+# Note what the sandbox does NOT change: the browser reaches only what the allowlist below allows,
+# so a page on any other host is refused (and its subresources with it — a real site pulls from many
+# hosts). The proxy names what it blocked, so open a site you actually want with
+# `sbx net allow -a atomic-agent <url>`. This is the deliberate posture: browsing is not opened
+# wholesale.
+gui = "offscreen"
+
+# The agent works on your files: the directory you launch from is the one it sees. `binds` is what
+# adds another. It is a security field, honored only because this profile lives in your trusted
+# config dir. Uncomment and point at the directory holding the work you want the agent to touch
+# (read/write at its real absolute path).
+#binds = [
+#    { path = "~/work", mode = "rw" },
+#]
+
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `atomic-agent` BUNDLE — the release tarball and its auto-upgrade resolver, the
+# search and model-download hosts, the environment the cage needs, and the telemetry mutes — from
+# one declaration shared with the bundle file itself, so this profile cannot fall behind when the
+# agent's requirements change.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/atomic-agent.toml
+# Without it the launch warns that the bundle is undeclared and the agent is simply absent.
+use = ["atomic-agent"]
+
+[packages]
+# The browser the tools drive (see `gui = "offscreen"` above). Chromium is HEAVY — a large closure
+# that lands in the project store on the first launch — and it is here rather than in the bundle
+# because it is only useful under a posture a bundle may not set. The agent speaks CDP to it through
+# the bundled `playwright-core`; upstream bundles no browser binary of its own, on any platform.
+chromium = "nix:chromium"
+
+[env]
+# Which Chromium family this profile supplies. The explicit executable path the `cmd` wrapper
+# exports overrides the auto-detect that reads this — but stating it keeps `sbx config show --app
+# atomic-agent` honest about what is in the cage, and it is what the agent falls back to reporting.
+ATOMIC_AGENT_BROWSER_CHANNEL = "chromium"
+# A `llama-server` on your host, on a port other than 8080 — option 1 in the header. On 8080 this
+# line is unnecessary: the agent already defaults to `http://127.0.0.1:8080`, which is exactly where
+# the `tcp://localhost:8080` rule below puts its in-cage listener. Change the port here and in that
+# rule together, or leave both alone for managed in-cage models (option 2) or a cloud provider
+# (option 3).
+#ATOMIC_AGENT_LLAMA_URL = "http://127.0.0.1:11434"
+
+[network]
+mode = "deny"
+# The agent's OWN hosts — web search, the managed-model downloads — arrive with the `atomic-agent`
+# bundle (`use` above) and are unioned into this list at resolution: inspect them with
+# `sbx bundle atomic-agent`, and see the launch's own view with `sbx config show --app atomic-agent`.
+# What belongs HERE is what this profile cannot choose for you. If a request is blocked, the proxy
+# names the host it refused — add it with `sbx net allow -a atomic-agent <url>` (or check ahead with
+# `sbx test net <url>`). `sbx app run atomic-agent --net shared` remains the one-launch escape hatch,
+# and it leaves the profile filtered.
+allow = [
+    # THE MODEL. Uncomment exactly one path.
+    #
+    # 1. A llama-server on the HOST loopback, which is where the agent's shipped default already
+    #    looks. `localhost` is the one name the cage already resolves, so this listener lands on
+    #    127.0.0.1:8080 in-cage rather than on an address of its own: uncommenting this line is the
+    #    whole setup. Another port needs ATOMIC_AGENT_LLAMA_URL above, changed to match.
+    #"tcp://localhost:8080",
+    #
+    # 3. A cloud provider. Each is an OpenAI-compatible endpoint you configure in the TUI's LLM
+    #    panel (`/model`), which also fetches that provider's live model catalogue.
+    #"@openrouter",                                    # needs: sbx net groups import examples/net-groups/openrouter.toml
+    #"{*} https://api.openai.com",
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.aimlapi.com",
+
+    # SKILLS FROM CLAWHUB — off by default, and that is a supply-chain call, not an oversight.
+    # The agent ships 17 starter skills inside its own artifact (copied into the state dir on every
+    # boot, no network), and `skill install` can pull more from the hub. A skill is a Markdown
+    # playbook that may carry scripts, so opening this host lets the agent fetch instructions it
+    # will later run — approval-gated, but fetched. Uncomment if you want the hub.
+    #"{GET,POST} https://clawhub.ai",
+
+    # TELEGRAM — off upstream and off here. Enabling the channel in the app's config makes the bot
+    # exchange messages with your paired chat, which is a remote control surface for the agent.
+    #"{*} https://api.telegram.org",
+
+    # WEB SEARCH WITH A KEY. The keyless default (Exa's MCP endpoint, DuckDuckGo as fallback)
+    # arrives with the bundle. These are the keyed providers, each reached only once you set its
+    # key: EXA_API_KEY, BRAVE_SEARCH_API_KEY, or a SearXNG instance URL of your own.
+    #"{*} https://api.exa.ai",
+    #"{GET} https://api.search.brave.com",
+
+    # MCP SERVERS are refused by default rather than pre-opened: a remote server is a host this
+    # profile cannot guess, and a stdio one that fetches its own package (npx, uvx) reaches a
+    # registry. Add the one you connect, named by the refusal in `sbx net logs -a atomic-agent`.
+]
+
+# CREDENTIAL POSTURE — a provider key that never enters the cage.
+# The agent reads secrets for skills and channels from a `.env` in its state dir, which is inside
+# the cage: a key you put there is a key the agent, its skills and its shell commands can all read.
+# The injected path avoids that entirely — the in-cage placeholder lets the agent start and issue
+# the request, and the egress proxy substitutes the real value on the wire. Uncomment both blocks,
+# uncomment the matching host in `allow` above, and provide $OPENROUTER_API_KEY on the host. For a
+# different provider, change the host, the header and the env var: Anthropic is
+# (api.anthropic.com, ANTHROPIC_API_KEY, header "x-api-key", type "raw"), OpenAI is
+# (api.openai.com, OPENAI_API_KEY, header "Authorization", type "bearer").
+#[env]
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+#
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

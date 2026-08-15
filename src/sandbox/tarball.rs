@@ -11,6 +11,12 @@
 //! namespace op), which is the only mechanism that works in-cage — the cage's seccomp denylist blocks
 //! the FUSE/namespace self-mount an AppImage-style runtime extraction would need.
 //!
+//! One shape correction happens between the unpack and the shared install phase: an archive whose
+//! root is a **single directory** — the platform slug or `<name>-<version>/` prefix a vendor
+//! commonly wraps its tree in — is hoisted, so the program lands at the root the install phase
+//! scans. It is the one unambiguous case (exactly one entry, and a directory), which is why it
+//! needs no per-package declaration.
+//!
 //! Two source forms:
 //! * `tarball:<https url>` — a direct `.tar.gz`/`.tgz` URL. A version-stamped vendor URL does not
 //!   roll forward on its own (only a stable "latest" alias would).
@@ -142,7 +148,19 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   dontBuild = true;
   installPhase = ''
     mkdir -p $out
-    cp -r extracted/. "$out"
+    # Hoist a lone top-level directory. A vendor tarball routinely unpacks into ONE directory —
+    # a platform slug (`linux-x64/`), a `<name>-<version>/` prefix — instead of spilling its tree
+    # at the archive root, and the generic install phase below scans `$out` itself: without this
+    # the program sits one level too deep and the build refuses it. The condition is "exactly one
+    # entry, and it is a directory", which is unambiguous by construction — there is nothing to
+    # guess, so it needs no per-package knob. Every other root (a bare binary beside its data
+    # files, an FHS tree, an Electron bundle) has more than one entry and is copied unchanged.
+    root=extracted
+    only=$(find extracted -mindepth 1 -maxdepth 1)
+    if [ "$(printf '%s\n' "$only" | wc -l)" -eq 1 ] && [ -d "$only" ]; then
+      root=$only
+    fi
+    cp -r "$root"/. "$out"
 @WRAP@
   '';
   meta.mainProgram = "@NAME@";
@@ -251,6 +269,166 @@ mod tests {
     use crate::testutil::{TmpDir, app_with, resolved};
 
     const HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
+
+    /// Run the generated `installPhase` against a real `extracted/` tree and report what it wrapped.
+    ///
+    /// The text assertions elsewhere pin the expression; this runs the half of it that decides
+    /// where the program ends up. `makeWrapper` is a shell function printing its source, `$out` is
+    /// a plain directory and nix's `${…}` interpolations are flattened to a literal path —
+    /// everything else (the hoist, the `find` passes, the refusals) is the shipped snippet
+    /// verbatim, so a layout that breaks here breaks a real build.
+    fn install_on(work: &Path, files: &[(&str, bool)]) -> Result<String, String> {
+        use std::os::unix::fs::PermissionsExt;
+        for (rel, executable) in files {
+            let path = work.join("extracted").join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            let mode = if *executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let expr = derivation_expr(
+            "github:NixOS/nixpkgs/abc",
+            "x86_64-linux",
+            NAME,
+            URL,
+            HASH,
+            &[],
+        );
+        let body = expr
+            .split_once("installPhase = ''\n")
+            .expect("the expression carries an installPhase")
+            .1
+            .split_once("\n  '';")
+            .expect("the installPhase is terminated")
+            .0;
+        let script = format!(
+            "set -e\ncd {}\nout=$PWD/out\nmakeWrapper() {{ echo \"WRAPPED $1\"; }}\n{}\n",
+            work.display(),
+            flatten_nix_interpolations(body),
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("bash runs");
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+        if out.status.success() {
+            Ok(text(&out.stdout).replace(&format!("{}/", work.display()), ""))
+        } else {
+            Err(text(&out.stderr).replace(&format!("{}/", work.display()), ""))
+        }
+    }
+
+    /// Replace every `${…}` (the wrapper's four nixpkgs search paths) with a literal, so the
+    /// snippet is runnable shell. Nix does not nest braces inside these, so the first `}` closes.
+    fn flatten_nix_interpolations(snippet: &str) -> String {
+        let mut out = String::new();
+        let mut rest = snippet;
+        while let Some((before, after)) = rest.split_once("${") {
+            out.push_str(before);
+            out.push_str("/lib");
+            rest = after.split_once('}').expect("a closed interpolation").1;
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The `[packages]` key the install phase wraps, and a source URL, for the tests that build a
+    /// whole expression. Both are arbitrary; only the shapes around them are under test.
+    const NAME: &str = "demo-app";
+    const URL: &str = "https://example.com/x/1.0/linux-x64/Demo%20App.tar.gz";
+
+    /// The shape this backend refused before the hoist, and the three it must keep resolving the
+    /// way it already did. Every case is a layout a vendor actually ships.
+    #[test]
+    fn the_install_phase_hoists_a_lone_top_level_directory_and_leaves_every_other_root_alone() {
+        let tmp = TmpDir::new();
+
+        // (a) The shape the hoist exists for: one directory at the archive root, holding the
+        // program beside its support files. Without the hoist the program sits at depth 2 and the
+        // root scan finds nothing to wrap.
+        let slug = tmp.join("slug");
+        assert_eq!(
+            install_on(
+                &slug,
+                &[
+                    ("linux-x64/demo-app", true),
+                    ("linux-x64/README.txt", false),
+                    ("linux-x64/vendor/rg", true),
+                ]
+            ),
+            Ok("WRAPPED out/demo-app".to_string()),
+            "a lone top-level directory must be hoisted into $out"
+        );
+        // The support files come with it — a program that reads its siblings by relative path
+        // (a grammar, a bundled tool) is why the hoist copies the directory rather than the binary.
+        assert!(slug.join("out/vendor/rg").exists());
+        assert!(!slug.join("out/linux-x64").exists());
+
+        // (b) A root with more than one entry is not the hoist's case, and takes the path it
+        // always took: the single executable at the root gets wrapped.
+        let flat = tmp.join("flat");
+        assert_eq!(
+            install_on(&flat, &[("demo-app", true), ("README", false)]),
+            Ok("WRAPPED out/demo-app".to_string())
+        );
+
+        // (c) A root holding one FILE — the plainest archive of all — is not a directory, so the
+        // hoist declines it. The refusal has to be a decline, not a build abort: the shell runs
+        // under `set -e`, where a bare `[ -d … ] && …` would have taken the whole build down.
+        let lone = tmp.join("lone");
+        assert_eq!(
+            install_on(&lone, &[("demo-app", true)]),
+            Ok("WRAPPED out/demo-app".to_string())
+        );
+
+        // (d) An Electron bundle wrapped in its own directory resolved BEFORE the hoist (that pass
+        // has no depth limit) and must still resolve to the same launcher after it.
+        let electron = tmp.join("electron");
+        assert_eq!(
+            install_on(
+                &electron,
+                &[
+                    ("Demo App/resources/app.asar", false),
+                    ("Demo App/demo-app", true),
+                    ("Demo App/chrome-sandbox", true),
+                ]
+            ),
+            Ok("WRAPPED out/demo-app".to_string())
+        );
+
+        // (e) An FHS tree wrapped in its own directory also resolved before the hoist, via the
+        // `*/bin/<name>` pass. Hoisting moves it onto `$out/bin/<name>` — the one path that pass
+        // excludes, because the wrapper's own destination is there — so it lands in the arm that
+        // moves the program to `libexec` and wraps it from there. Same program, and its siblings
+        // are still one level up from it.
+        let fhs = tmp.join("fhs");
+        assert_eq!(
+            install_on(
+                &fhs,
+                &[
+                    ("demo-1.2/bin/demo-app", true),
+                    ("demo-1.2/lib/support.so", false),
+                ]
+            ),
+            Ok("WRAPPED out/libexec/demo-app".to_string())
+        );
+        assert!(fhs.join("out/lib/support.so").exists());
+
+        // (f) The ambiguity the install phase refuses is untouched: hoisting a directory that
+        // holds two executables still leaves two candidates, and picking one is the silent
+        // mis-wrap this whole snippet is written to avoid.
+        let ambiguous = tmp.join("ambiguous");
+        let refusal = install_on(
+            &ambiguous,
+            &[("pkg/demo-app", true), ("pkg/demo-helper", true)],
+        )
+        .expect_err("two executables at the hoisted root is an ambiguity");
+        assert!(
+            refusal.contains("2 executables at the archive root"),
+            "the refusal must name what it found:\n{refusal}"
+        );
+    }
 
     #[test]
     fn the_generated_derivation_pins_the_source_and_wraps_the_electron_launcher() {
