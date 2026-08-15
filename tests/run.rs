@@ -2700,6 +2700,23 @@ fn a_keyfile_rewrite_makes_the_in_cage_portal_re_emit_setting_changed() {
         String::from_utf8_lossy(&trusted.stderr)
     );
 
+    // Provision FIRST, outside the window, for the reason the relay test above warms up: the probe
+    // ran before `sbx trust`, so `gui`/`dbus` were withheld and this cage's closure was never
+    // fetched. The script below then runs on fixed sleeps, and a portal still waiting on glib being
+    // copied from the binary cache misses them — the failure reads as "the portal did not re-emit"
+    // while the store was simply still filling.
+    let warmed = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["run", "--", "true"],
+    );
+    assert!(
+        warmed.status.success(),
+        "the warm-up launch failed, so the timed run below would only report that: {}",
+        String::from_utf8_lossy(&warmed.stderr)
+    );
+
     // Activate the portal (so its GTK backend is running and watching GSettings), subscribe to its
     // SettingChanged on the private bus, then rewrite the keyfile to both schemes. `>` truncates the
     // file in place. At least one write differs from the at-launch seed, so the portal must emit.
