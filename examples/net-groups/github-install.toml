@@ -1,4 +1,4 @@
-# `github-install` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# `github-install` — a shared egress GROUP (`[network.groups]`), not a bundle: it carries egress
 # entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
 # app's — or a bundle's — allow list.
 #
@@ -11,7 +11,7 @@
 # declarations the profiles shipped.) Groups are global-only (like bundles): an app's or
 # bundle's lists may reference one, a project may not define one.
 
-[net.groups]
+[network.groups]
 github-install = [
     "{GET} https://github.com",
     "{GET} https://api.github.com",

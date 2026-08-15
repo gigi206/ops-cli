@@ -91,7 +91,7 @@ pub(crate) struct Rule {
     pub(crate) kind: RuleKind,
     pub(crate) methods: Methods,
     pub(crate) layer: Layer,
-    /// The `[net.groups]` group this rule was expanded from (`@<name>`), or `None` for a
+    /// The `[network.groups]` group this rule was expanded from (`@<name>`), or `None` for a
     /// directly-written or built-in rule. Display-only provenance for `sbx net rules` — it names
     /// where a rule came from, and is deliberately **excluded from equality** (a rule's identity is
     /// its match, not its origin), so adding it changes no matching, dedup, or policy-comparison
@@ -1506,7 +1506,7 @@ mod tests {
 
     #[test]
     fn rule_equality_ignores_group_provenance() {
-        // A rule's identity is its match (kind/methods/layer), not which `[net.groups]` group it was
+        // A rule's identity is its match (kind/methods/layer), not which `[network.groups]` group it was
         // expanded from — so a `group` tag never affects equality (and thus never affects dedup or an
         // `EgressPolicy` comparison). This is the load-bearing property that lets provenance travel
         // on the rule without disturbing matching.

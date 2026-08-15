@@ -165,6 +165,19 @@ what `sbx net logs` records). An `allow=` naming **no** host stays a hard error 
 than a silent all-deny. Carve-out lists on top of a posture need a `--config` blob's
 `[network]` table.
 
+An entry in either list may be an [`@<group>` reference](../networking/groups):
+
+```bash
+sbx run --net allow=@ci-hosts,api.example.com -- ./build.sh
+```
+
+The name resolves against the groups the **global** config declares, the same vocabulary
+[`sbx net groups`](../cli/net) prints. An override defines no group of its own, so this
+grants nothing new: the invoker could always have typed the hosts out. What it buys is
+that a one-shot widening names the set the policy already names, which is what makes the
+launch line readable against it afterwards. A name no group defines is dropped with a
+warning, so an `allow` list built on a typo opens nothing.
+
 #### The `--bind` mode
 
 The mode is the suffix after the **last** `:`, and only when it is exactly `ro` or
@@ -255,5 +268,6 @@ environment would do.
   [`default_methods`](network#default_methods-apps) → all-verbs (an override posture
   is Mode-A-like). Scope it with `{GET,HEAD}` rules in a `--config` `[network]` if you
   need to keep the read-only default.
-- `[net.groups]` and `[app.*]` in an override are ignored with a notice (they are not
-  single-launch concepts).
+- A `groups` table under `[network]`, and `[app.*]`, are ignored in an override with a
+  notice (they are not single-launch concepts). An override *references* a global group
+  with `@<name>`; it defines none.

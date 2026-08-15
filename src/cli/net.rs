@@ -2200,7 +2200,7 @@ fn net_groups(args: &[OsString]) -> ExitCode {
 }
 
 /// `sbx net groups [<name>…] [--json]`: list the reusable egress groups declared in the global
-/// config (`[net.groups]`), or resolve named ones to their entries. Groups are global-only (the
+/// config (`[network.groups]`), or resolve named ones to their entries. Groups are global-only (the
 /// resolver honors them only from the global config), so there is no scope flag — this always reads
 /// the global config. Read-only, network-free. With no name it lists each group and its entry count;
 /// with names it prints each named group's authored entries, flagging a malformed or nested one.
@@ -2245,7 +2245,7 @@ fn net_groups_list(args: &[OsString]) -> ExitCode {
             ));
             if groups.is_empty() {
                 diag::error(
-                    "sbx: no egress groups are defined — declare them under [net.groups] in the \
+                    "sbx: no egress groups are defined — declare them under [network.groups] in the \
                      global config",
                 );
             } else {
@@ -2286,7 +2286,7 @@ fn net_groups_list(args: &[OsString]) -> ExitCode {
 }
 
 /// `sbx net groups export [<name>…] [--out <file>]`: write the reusable egress groups as a portable
-/// `[net.groups]` TOML fragment — every group, or the named subset — to stdout (the default,
+/// `[network.groups]` TOML fragment — every group, or the named subset — to stdout (the default,
 /// composable and clobber-safe: `sbx net groups export > groups.toml`) or to `--out <file>`. The
 /// inverse of `import`. Read-only on the config; no launch, no nix.
 fn net_groups_export(args: &[OsString]) -> ExitCode {
@@ -2347,7 +2347,7 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
     if selected.is_empty() {
         diag::error(
             "sbx: net groups export: no egress groups to export (none are defined under \
-             [net.groups] in the global config)",
+             [network.groups] in the global config)",
         );
         return ExitCode::from(2);
     }
@@ -2469,7 +2469,7 @@ fn render_replaced_group(name: &str, dropped: &[String], kept: &std::path::Path)
     )
 }
 
-/// `sbx net groups import <file> [--force]`: merge a portable `[net.groups]` fragment into the
+/// `sbx net groups import <file> [--force]`: merge a portable `[network.groups]` fragment into the
 /// global config, preserving every existing group and comment (`toml_edit`). Groups are global-only,
 /// so the target is always the global config; the deliberate command is the consent (an agent in the
 /// cage cannot run it), and the global config is trusted by location, so there is no prompt. A name
@@ -2608,7 +2608,7 @@ fn render_net_groups(
         if groups.is_empty() {
             let _ = writeln!(
                 o,
-                "  {dim}none defined — declare them under [net.groups] in the global config{r}"
+                "  {dim}none defined — declare them under [network.groups] in the global config{r}"
             );
             return o;
         }
@@ -2902,7 +2902,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         Err(code) => return code,
     };
     // Validate the rule before touching any file or session (fail-closed). A `@<name>` group reference
-    // is an alias for a `[net.groups]` group, expanded at load time — not itself a classifiable rule —
+    // is an alias for a `[network.groups]` group, expanded at load time — not itself a classifiable rule —
     // so it is validated as a group name rather than through `classify` (which would reject the `@`).
     // An undefined reference is not a write-time error (the group may be defined later); it warns
     // loudly on the next load. Any other entry is classified: a `*` catch-all, a scheme, or an

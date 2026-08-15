@@ -91,7 +91,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[task.<name>]` | security | [task](task), and [Declared operations](../tasks/) |
 | `[app.<name>]` | security overlay | [apps](apps) |
 | `[plugin.<name>]` | security | [resolver plugins](../secrets/plugins#configuring-a-plugin-from-your-own-config) |
-| `[net.groups]` | security (global-only) | [Egress groups](../networking/groups) |
+| `[network.groups]` | security (global-only) | [Egress groups](../networking/groups) |
 | `[bundle.<name>]` | security (global-only) | [bundles](bundles) |
 | `use` | security | [bundles](bundles) |
 

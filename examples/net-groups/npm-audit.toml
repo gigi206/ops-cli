@@ -1,4 +1,4 @@
-# `npm-audit` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# `npm-audit` — a shared egress GROUP (`[network.groups]`), not a bundle: it carries egress
 # entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
 # app's — or a bundle's — mute list.
 #
@@ -12,7 +12,7 @@
 # cannot share one group. Groups are global-only (like bundles): an app's or bundle's lists may
 # reference one, a project may not define one.
 
-[net.groups]
+[network.groups]
 npm-audit = [
     "{POST} https://registry.npmjs.org/-/npm/v1/security/advisories/*",
 ]

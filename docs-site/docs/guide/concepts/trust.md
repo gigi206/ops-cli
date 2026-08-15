@@ -12,12 +12,12 @@ The config schema is split by the trust gate, not by two schemas:
 
 | | Free | Closing | Security |
 |---|---|---|---|
-| Fields | `env` | `[fs]` | `binds`, `network`, `secret`, `packages`, `nixpkgs`, `forward`, `gui`, `gpu`, `audio`, `dbus`, `[proc]`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[notify]`, `[task.<name>]`, `[app.<name>]`, `[net.groups]`, `[bundle.<name>]` |
+| Fields | `env` | `[fs]` | `binds`, `network`, `secret`, `packages`, `nixpkgs`, `forward`, `gui`, `gpu`, `audio`, `dbus`, `[proc]`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[notify]`, `[task.<name>]`, `[app.<name>]`, `[network.groups]`, `[bundle.<name>]` |
 | From an untrusted project | applied (minus a reserved-key denylist) | applied | **dropped**, with a warning |
 | From the global config | applied | applied | applied (trusted by location) |
 | From a trusted project | applied | applied | applied¹ |
 
-¹ Two are **global-only** rather than merely trusted-only: `[net.groups]` and
+¹ Two are **global-only** rather than merely trusted-only: `[network.groups]` and
 `[bundle.<name>]` are ignored from *any* project, trusted or not. They are declared once
 where the user owns them, and referenced (`@group`, `use`) from anywhere.
 

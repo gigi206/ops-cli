@@ -37,7 +37,7 @@ sbx net rules --json
 
 Each rule names its layer: an inspected **L7** rule shows `https://` (a bare host is
 https on 443), a raw **L4** rule shows `tcp://`; a `re:` regex shows neither (its
-pattern carries its own scheme). A rule that came from a [`[net.groups]`](groups)
+pattern carries its own scheme). A rule that came from a [`[network.groups]`](groups)
 group shows as a single `@name` reference; `--expand` unfolds it to its hosts, each
 tagged with its `@group` origin. `--filter <substr>` implies `--expand`, so a host
 *inside* a group still matches.

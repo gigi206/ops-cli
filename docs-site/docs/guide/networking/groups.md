@@ -1,13 +1,13 @@
-# Egress groups (`[net.groups]`)
+# Egress groups (`[network.groups]`)
 
-A `[net.groups]` group is a **named set of egress entries**, declared once and
+A `[network.groups]` group is a **named set of egress entries**, declared once and
 referenced from any [`allow`/`deny` list](rules) with `@name`. Instead of
 copying the same hosts into every app profile, you declare them in one place and
 share them:
 
 ```toml
 # global sbx.toml
-[net.groups]
+[network.groups]
 ci-hosts   = ["github.com", "api.github.com", "codeload.github.com"]
 anthropic  = ["api.anthropic.com"]
 telemetry  = ["*.doubleclick.net", "telemetry.example.com"]
@@ -29,14 +29,45 @@ prefix. (See the [rule grammar](rules).)
 
 ---
 
+## Groups live under the posture, and commit it to its table form
+
+A group is a **vocabulary**: it says what a name stands for, and grants nothing on its
+own. It sits under the same `[network]` as the posture that references it, so one
+namespace answers "where may this cage go" and there is no second place to look.
+
+That nesting has one consequence worth knowing before you write the file. TOML cannot
+extend a string with a sub-table, so a config that declares groups writes its posture in
+the [table form](../configuration/network#the-two-forms):
+
+```toml
+# global sbx.toml
+[network]
+mode = "deny"
+
+[network.groups]
+ci-hosts = ["github.com", "api.github.com"]
+```
+
+Writing `network = "deny"` above a `[network.groups]` table is not valid TOML, and a
+config file that does not parse is **ignored in full**, with a warning naming the line.
+Every other layer, a project config, an app profile, a `--config` blob, is free to keep
+the bare-string form: only the file that defines groups has to spell out its posture.
+
+---
+
 ## Global-only
 
 Groups are a security-relevant input, they expand into egress rules, so they are
-honored **only from the global config** (trusted by its location). A project's
-`[net.groups]` is **ignored** with a warning; a project may *reference* a
-global group with `@name`, but it cannot *define* one. This is why the
+honored **only from the top-level `[network]` of the global config** (trusted by its
+location). A project's `[network.groups]` is **ignored** with a warning; a project may
+*reference* a global group with `@name`, but it cannot *define* one. This is why the
 [`sbx net groups`](observability) command has no scope flag: it always reads the
 global config.
+
+The same holds for every other layer that has a `[network]` of its own. An
+`[app.<name>.network]` and a `--config` blob are postures, not vocabularies: a `groups`
+table written in either is ignored with a warning naming it, and the layer references a
+global group with `@name` instead.
 
 ---
 
@@ -81,12 +112,12 @@ its `@name` origin.
 Export and import let you share a curated group set:
 
 ```bash
-sbx net groups export > groups.toml        # every group, as a [net.groups] fragment
+sbx net groups export > groups.toml        # every group, as a [network.groups] fragment
 sbx net groups export ci-hosts anthropic   # only these groups
 sbx net groups export -o groups.toml       # to a file
 ```
 
-`export` emits a portable `[net.groups]` TOML fragment (a group is data, so source
+`export` emits a portable `[network.groups]` TOML fragment (a group is data, so source
 comments are not carried).
 
 ```bash

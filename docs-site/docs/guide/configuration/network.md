@@ -8,7 +8,7 @@ mode does, the rule grammar, ask mode, and observability, see the
 project, ignored from an untrusted one: since narrowing or widening the network is a
 confidentiality choice an untrusted project may not make.
 
-See also: [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [`[net.groups]`](../networking/groups) · [`[secret]`](secret).
+See also: [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [`[network.groups]`](../networking/groups) · [`[secret]`](secret).
 
 ## The two forms
 
@@ -30,6 +30,15 @@ mode  = "deny"
 allow = ["api.github.com", "*.nixos.org", "@ci-hosts"]
 deny  = ["evil.example.com"]
 ```
+
+The two forms are interchangeable wherever a posture is written, with one exception: a
+config that also declares [egress groups](../networking/groups) must use the table form,
+since TOML cannot extend the bare string with a `[network.groups]` sub-table. That
+applies to the global config, the only layer where a group may be defined.
+
+A key `[network]` does not know is **ignored and named** in the launch warnings, the same
+contract every table follows: a config written for a newer sbx still loads, and a
+misspelled field is not left to read as a rule in force.
 
 ## The modes
 
@@ -69,7 +78,7 @@ for the full semantics.
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules): a host,
 `*.domain`, `host/path`, an IP, `re:<regex>`, `http://host` (inspected cleartext),
 `tcp://host:port` (raw), an optional `{GET,POST}` verb prefix, or `@<group>`
-referencing a [`[net.groups]`](../networking/groups).
+referencing a [`[network.groups]`](../networking/groups).
 
 ## Seeing the traffic (`capture`)
 

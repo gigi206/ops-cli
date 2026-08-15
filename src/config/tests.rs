@@ -59,7 +59,7 @@ fn a_mise_nix_package_warns_to_use_the_plain_nix_backend() {
 /// Test shim: [`super::validate_network`] with no egress groups and the built-in `Shared`
 /// default as the inheritance parent — the common case in these unit tests. It shadows the
 /// glob-imported real function so the many bare 3-argument calls read as before; the
-/// `[net.groups]` expansion and the mode-inheritance tests call `super::validate_network`
+/// `[network.groups]` expansion and the mode-inheritance tests call `super::validate_network`
 /// directly with a populated group table or a specific parent posture.
 fn validate_network(
     warnings: &mut Vec<String>,
@@ -110,20 +110,43 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
         devices: None,
         ssh_agent: None,
         proc: None,
-        net: Default::default(),
     }
 }
 
-/// Build a `[network]` field in table form for the egress-group tests.
-fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
-    NetworkField::Table(NetworkTable {
+/// Declare egress groups on a raw layer, in the one place they live: the `groups` table of its
+/// `[network]`. A layer with no posture yet gains the table form, since that is the only shape
+/// with room for the sub-table.
+fn declare_groups(raw: &mut RawConfig, defs: &[(&str, &[&str])]) {
+    let table = match raw
+        .network
+        .get_or_insert_with(|| net_field("deny", &[], &[]))
+    {
+        NetworkField::Table(t) => t,
+        NetworkField::Posture(p) => panic!("`network = \"{p}\"` has no room for a groups table"),
+    };
+    for (name, entries) in defs {
+        table.groups.insert(
+            (*name).to_string(),
+            entries.iter().map(|s| (*s).to_string()).collect(),
+        );
+    }
+}
+
+/// An all-absent `[network]` table, to be spread over by a test that cares about two of its
+/// fields. `NetworkTable` deliberately derives no `Default`: a literal that names every field is
+/// what makes the compiler refuse the next schema addition until each site says what it does with
+/// it. That guard belongs on the resolver, not on a test spelling out sixteen `None`s to reach one.
+fn net_table_defaults() -> NetworkTable {
+    NetworkTable {
+        mode: None,
+        allow: vec![],
+        deny: vec![],
         mute: vec![],
         http2: vec![],
         capture: None,
         capture_max_kb: None,
-        mode: Some(mode.into()),
-        allow: allow.iter().map(|s| s.to_string()).collect(),
-        deny: deny.iter().map(|s| s.to_string()).collect(),
+        groups: Default::default(),
+        rest: Default::default(),
         ask_timeout: None,
         ask_notice: None,
         stats: None,
@@ -134,10 +157,20 @@ fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
         max_connections: None,
         body_max_mb: None,
         ca_roots: None,
+    }
+}
+
+/// Build a `[network]` field in table form for the egress-group tests.
+fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
+    NetworkField::Table(NetworkTable {
+        mode: Some(mode.into()),
+        allow: allow.iter().map(|s| s.to_string()).collect(),
+        deny: deny.iter().map(|s| s.to_string()).collect(),
+        ..net_table_defaults()
     })
 }
 
-/// Build and pre-classify a `[net.groups]` table from `(name, entries)` pairs, returning the
+/// Build and pre-classify a `[network.groups]` table from `(name, entries)` pairs, returning the
 /// map and any warnings `build_net_groups` emitted.
 fn make_groups(defs: &[(&str, &[&str])]) -> (NetGroups, Vec<String>) {
     let mut w = Vec::new();
@@ -201,6 +234,8 @@ fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
         http2: vec![],
         capture: None,
         capture_max_kb: None,
+        groups: Default::default(),
+        rest: Default::default(),
         ask_timeout: None,
         ask_notice: None,
         stats: None,
@@ -360,12 +395,9 @@ fn an_app_references_a_global_egress_group() {
     // `@name` from an app declared in a *trusted project*, and the app's effective policy carries
     // the group's expanded rules — so a set of hosts is shared, not rewritten per app.
     let mut global = RawConfig::default();
-    global.net.groups.insert(
-        "mcp".into(),
-        vec![
-            "{*} a.example.com:443".into(),
-            "{*} b.example.com:443".into(),
-        ],
+    declare_groups(
+        &mut global,
+        &[("mcp", &["{*} a.example.com:443", "{*} b.example.com:443"])],
     );
     let app = raw_app(
         &["true"],
@@ -390,16 +422,60 @@ fn an_app_references_a_global_egress_group() {
 }
 
 #[test]
+fn an_apps_own_network_table_defines_no_group() {
+    // An `[app.<name>.network]` is a posture, not a vocabulary. It sits under the same `[network]`
+    // shape as the baseline's, so a `groups` table is expressible there and has to be answered:
+    // ignored, named, and pointed at the reference form. The app is declared in the GLOBAL config —
+    // the trusted layer — so the drop is about *where a group may be defined*, not about trust.
+    let mut global = RawConfig::default();
+    declare_groups(&mut global, &[("ci", &["{*} a.example.com:443"])]);
+    let mut app_net = NetworkTable {
+        mode: Some("deny".into()),
+        allow: vec!["@ci".into()],
+        ..net_table_defaults()
+    };
+    app_net
+        .groups
+        .insert("smuggled".into(), vec!["evil.example.com:443".into()]);
+    global.app.insert(
+        "demo".into(),
+        raw_app(&["true"], &[], &[], &[], Some(NetworkField::Table(app_net))),
+    );
+
+    let r = resolve_no_plugins(global, None);
+    // An app reports against itself, so the drop is named where the app is read.
+    let demo = r.apps.get("demo").expect("the app resolves");
+    assert!(
+        demo.warnings
+            .iter()
+            .any(|w| w.contains("`groups` under `[network]`")),
+        "an app's groups table must be named: {:?}",
+        demo.warnings
+    );
+    // The app keeps what it may have: the reference to the global group resolves, its own
+    // definition does not.
+    let Some(NetworkPolicy::Allowlist(policy)) = &demo.network else {
+        panic!("a filtering posture: {:?}", demo.network);
+    };
+    let hosts: Vec<String> = policy.allow_rules().iter().map(|r| r.to_string()).collect();
+    assert!(
+        hosts.iter().any(|h| h.contains("a.example.com")),
+        "the `@ci` reference resolves: {hosts:?}"
+    );
+    assert!(
+        !hosts.iter().any(|h| h.contains("evil.example.com")),
+        "and the app-defined group opens nothing: {hosts:?}"
+    );
+}
+
+#[test]
 fn a_project_net_groups_is_ignored_with_a_warning_even_when_trusted() {
-    // Groups are global-only: a project's `[net.groups]` is not honored — even from a TRUSTED
+    // Groups are global-only: a project's `[network.groups]` is not honored — even from a TRUSTED
     // project — so it warns, and a `@ref` to a project-defined group does not resolve (it is
     // undefined). This is the security property: a project cannot smuggle a group definition into
     // an app's egress, only reference one the global config already trusts.
     let mut project = RawConfig::default();
-    project
-        .net
-        .groups
-        .insert("evil".into(), vec!["evil.example.com:443".into()]);
+    declare_groups(&mut project, &[("evil", &["evil.example.com:443"])]);
     // An app in the same (trusted) project references its own project-defined group.
     project.app.insert(
         "demo".into(),
@@ -413,12 +489,12 @@ fn a_project_net_groups_is_ignored_with_a_warning_even_when_trusted() {
     );
 
     let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
-    // The baseline warns that the project's `[net.groups]` is ignored.
+    // The baseline warns that the project's `[network.groups]` is ignored.
     assert!(
         r.warnings
             .iter()
-            .any(|w| w.contains("[net.groups]") && w.contains("global config only")),
-        "a project's [net.groups] must warn: {:?}",
+            .any(|w| w.contains("`groups` under `[network]`") && w.contains("global config only")),
+        "a project's [network.groups] must warn: {:?}",
         r.warnings
     );
     // The app's `@evil` reference resolves to nothing (the group is undefined from a project),
@@ -450,10 +526,8 @@ fn a_bare_group_entry_inherits_the_apps_read_by_default_posture() {
     // entry would have kept read-only. `apply_default_methods` runs in `merge_app`, so this drives
     // the full resolve → merge_app path (past where the DRY test above stops, at `resolve_app`).
     let mut global = RawConfig::default();
-    global
-        .net
-        .groups
-        .insert("mcp".into(), vec!["m.example.com:443".into()]); // bare: no `{VERB}` prefix
+    // bare entry: no `{VERB}` prefix
+    declare_groups(&mut global, &[("mcp", &["m.example.com:443"])]);
     let app = raw_app(
         &["true"],
         &[],
@@ -481,16 +555,20 @@ fn a_bare_group_entry_inherits_the_apps_read_by_default_posture() {
 fn read_net_groups_fragment_reads_groups_and_rejects_a_groupless_file() {
     let tmp = TmpDir::new();
     let good = tmp.path().join("frag.toml");
-    std::fs::write(&good, "[net.groups]\nmcp = [\"{*} a.example.com:443\"]\n").unwrap();
-    let g = read_net_groups_fragment(&good).expect("a `[net.groups]` fragment reads");
+    std::fs::write(
+        &good,
+        "[network.groups]\nmcp = [\"{*} a.example.com:443\"]\n",
+    )
+    .unwrap();
+    let g = read_net_groups_fragment(&good).expect("a `[network.groups]` fragment reads");
     assert_eq!(g.get("mcp").map(|v| v.len()), Some(1));
 
-    // A file with no `[net.groups]` is the tell-tale of the wrong file — refused, not a silent
+    // A file with no `[network.groups]` is the tell-tale of the wrong file — refused, not a silent
     // empty import.
     let bad = tmp.path().join("nope.toml");
     std::fs::write(&bad, "[env]\nFOO = \"bar\"\n").unwrap();
     let err = read_net_groups_fragment(&bad).unwrap_err();
-    assert!(err.contains("no `[net.groups]`"), "{err}");
+    assert!(err.contains("no `[network.groups]`"), "{err}");
 }
 
 /// A resolved read-only bind at `path` (what `resolve` produces from a bare-string bind,
@@ -545,6 +623,8 @@ fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".to_string()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -788,6 +868,8 @@ fn an_untrusted_project_app_cannot_widen_its_default_methods() {
         http2: vec![],
         capture: None,
         capture_max_kb: None,
+        groups: Default::default(),
+        rest: Default::default(),
         mode: Some("deny".into()),
         allow: vec!["x.com".into()],
         deny: vec![],
@@ -936,6 +1018,8 @@ fn network_modes_set_the_egress_default_action() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some(mode.into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -1041,6 +1125,8 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: None,
             allow: vec!["api.foo.com".to_string()],
             deny: vec![],
@@ -1104,6 +1190,8 @@ fn a_mode_less_project_network_table_inherits_the_global_mode() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: None,
             allow: vec!["api.proj.com".to_string()],
             deny: vec![],
@@ -1147,6 +1235,8 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
                 http2: vec![],
                 capture: None,
                 capture_max_kb: None,
+                groups: Default::default(),
+                rest: Default::default(),
                 mode: None,
                 allow: vec!["api.app.com".to_string()],
                 deny: vec![],
@@ -1189,6 +1279,8 @@ fn the_pool_toggle_defaults_on_and_is_gated_trusted_only() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["api.example.com".into()],
             deny: vec![],
@@ -1256,6 +1348,8 @@ fn ca_roots_defaults_on_and_a_splice_overrides_a_request_to_drop_them() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec![entry.into()],
             deny: vec![],
@@ -1342,6 +1436,8 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["cache.nixos.org".into()],
             deny: vec![],
@@ -1381,6 +1477,8 @@ fn the_connection_settings_flow_from_the_table_and_fail_closed_on_a_value_that_w
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["api.example.com".into()],
             deny: vec![],
@@ -1478,6 +1576,8 @@ fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_ty
             http2: vec![],
             capture: level.map(str::to_string),
             capture_max_kb: kb,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["api.example.com".into()],
             deny: vec![],
@@ -1538,6 +1638,8 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
             http2: vec![],
             capture: Some("bodies".into()),
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["api.example.com".into()],
             deny: vec![],
@@ -1567,6 +1669,8 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["api.example.com".into()],
             deny: vec![],
@@ -1637,6 +1741,8 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("ask".into()),
             allow: vec![],
             deny: vec![],
@@ -1683,6 +1789,8 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
         http2: vec![],
         capture: None,
         capture_max_kb: None,
+        groups: Default::default(),
+        rest: Default::default(),
         mode: Some("deny".into()),
         allow: vec![],
         deny: vec![],
@@ -1713,6 +1821,8 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("ask".into()),
             allow: vec![],
             deny: vec![],
@@ -1751,6 +1861,8 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
         http2: vec![],
         capture: None,
         capture_max_kb: None,
+        groups: Default::default(),
+        rest: Default::default(),
         mode: Some("deny".into()),
         allow: vec![],
         deny: vec![],
@@ -3314,6 +3426,8 @@ fn a_baseline_default_methods_is_ignored_with_a_warning() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["h.test".into()],
             deny: vec![],
@@ -5696,6 +5810,8 @@ fn an_unknown_network_mode_is_dropped_with_a_warning() {
                 http2: vec![],
                 capture: None,
                 capture_max_kb: None,
+                groups: Default::default(),
+                rest: Default::default(),
                 mode: Some("bogus".into()),
                 allow: vec![],
                 deny: vec![],
@@ -5810,6 +5926,8 @@ fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConf
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: vec![],
@@ -5958,6 +6076,112 @@ fn with_override(mut resolved: Resolved, raw: RawConfig) -> Resolved {
         .apply_override(Override::for_test(raw))
         .expect("the override applies");
     resolved
+}
+
+#[test]
+fn a_one_shot_override_resolves_global_egress_groups() {
+    // An override is the invoker's word, and it outranks every config layer — so it could always
+    // have written a group's hosts out by hand. What it gains here is the *name*: `@ci` on a launch
+    // line reads against the same vocabulary `sbx net groups` prints, which is what makes a
+    // one-shot widening auditable afterwards. The vocabulary still comes from the global config;
+    // the override defines nothing.
+    //
+    // Several references in one list, mixed with a literal host, because that is how a launch line
+    // is actually written: each entry is expanded on its own, so the list is the union of every
+    // group it names plus whatever it spells out.
+    let mut global = RawConfig::default();
+    declare_groups(
+        &mut global,
+        &[
+            ("ci", &["{*} a.example.com:443", "{*} b.example.com:443"]),
+            ("mirror", &["{*} c.example.org:443"]),
+        ],
+    );
+    let base = resolve_no_plugins(global, None);
+    let r = with_override(
+        base,
+        RawConfig {
+            network: Some(net_field(
+                "deny",
+                &["@ci", "@mirror", "{*} direct.example.net:443"],
+                &[],
+            )),
+            ..RawConfig::default()
+        },
+    );
+    let NetworkPolicy::Allowlist(policy) = &r.network else {
+        panic!("a filtering posture: {:?}", r.network);
+    };
+    let hosts: Vec<String> = policy.allow_rules().iter().map(|r| r.to_string()).collect();
+    for host in [
+        "a.example.com",
+        "b.example.com",
+        "c.example.org",
+        "direct.example.net",
+    ] {
+        assert!(
+            hosts.iter().any(|h| h.contains(host)),
+            "the list must carry {host}: {hosts:?}"
+        );
+    }
+}
+
+#[test]
+fn one_undefined_reference_does_not_take_its_neighbours_down() {
+    // The drop is per entry, not per list: a typo among several references must cost exactly the
+    // group it names. Losing the whole list would be the fail-open direction on a `deny`, and on an
+    // `allow` it would silently close doors the launch asked for by name.
+    let mut global = RawConfig::default();
+    declare_groups(&mut global, &[("ci", &["{*} a.example.com:443"])]);
+    let base = resolve_no_plugins(global, None);
+    let r = with_override(
+        base,
+        RawConfig {
+            network: Some(net_field("deny", &["@nope", "@ci"], &[])),
+            ..RawConfig::default()
+        },
+    );
+    let NetworkPolicy::Allowlist(policy) = &r.network else {
+        panic!("a filtering posture: {:?}", r.network);
+    };
+    let hosts: Vec<String> = policy.allow_rules().iter().map(|r| r.to_string()).collect();
+    assert!(
+        hosts.iter().any(|h| h.contains("a.example.com")),
+        "the defined group survives its neighbour: {hosts:?}"
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("@nope")),
+        "and the miss is still named: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn an_override_reference_to_an_undefined_group_is_dropped_with_a_warning() {
+    // The other half of the contract: the override reads the global vocabulary, it does not get a
+    // private one. A name no group defines is dropped and named, so an `allow` list that meant to
+    // open something ends up opening nothing rather than opening it by accident.
+    let base = resolve_no_plugins(RawConfig::default(), None);
+    let r = with_override(
+        base,
+        RawConfig {
+            network: Some(net_field("deny", &["@nope"], &[])),
+            ..RawConfig::default()
+        },
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("@nope")),
+        "the undefined reference must be named: {:?}",
+        r.warnings
+    );
+    let NetworkPolicy::Allowlist(policy) = &r.network else {
+        panic!("a filtering posture: {:?}", r.network);
+    };
+    assert!(
+        policy.allow_rules().is_empty(),
+        "and nothing opened: {:?}",
+        policy.allow_rules()
+    );
 }
 
 #[test]
@@ -6377,6 +6601,8 @@ fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["github.com".into()],
             deny: vec![],
@@ -6531,6 +6757,8 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
             http2: vec![],
             capture: None,
             capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
             mode: Some("deny".into()),
             allow: vec!["api.example.com".into()],
             deny: vec![],
@@ -6637,6 +6865,8 @@ fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
         http2: vec![],
         capture: None,
         capture_max_kb: None,
+        groups: Default::default(),
+        rest: Default::default(),
         mode: Some("deny".into()),
         allow: allow.iter().map(|s| s.to_string()).collect(),
         deny: vec![],
@@ -8549,32 +8779,80 @@ fn an_unknown_key_is_named_rather_than_passed_over_in_silence() {
 }
 
 #[test]
-fn a_posture_written_under_net_instead_of_network_is_named() {
-    // `[net]` and `[network]` both exist and mean different things: the first holds the egress
-    // groups, the second the posture. So a posture written under `[net]` is not an unknown section
-    // the top-level catch-all would name — it is an unknown key inside a section that exists, and
-    // the mode and allowlist it carries govern nothing at all.
+fn an_unknown_key_under_network_is_named() {
+    // `[network]` is the largest table in the schema and the one most often written by hand, so a
+    // key it does not know is the one most likely to read as a rule in force while deciding
+    // nothing. Ignoring it is the forward-compatibility contract; passing over it in silence is
+    // not, and this table carried no report of its own until it held the egress groups.
     let raw = RawConfig {
-        net: schema::RawNet {
-            rest: [
-                ("mode".to_string(), schema::RawIgnored),
-                ("allow".to_string(), schema::RawIgnored),
-            ]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        },
+        network: Some(NetworkField::Table(NetworkTable {
+            mode: Some("deny".into()),
+            rest: [("alow".to_string(), schema::RawIgnored)]
+                .into_iter()
+                .collect(),
+            ..net_table_defaults()
+        })),
         ..RawConfig::default()
     };
     let r = resolve_no_plugins(raw, None);
-    for key in ["`mode`", "`allow`"] {
-        let w = r
-            .warnings
-            .iter()
-            .find(|w| w.contains(key))
-            .unwrap_or_else(|| panic!("{key} must be named: {:?}", r.warnings));
-        assert!(w.contains("[net]"), "and placed in its table: {w}");
-    }
+    let w = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("`alow`"))
+        .unwrap_or_else(|| panic!("the key must be named: {:?}", r.warnings));
+    assert!(w.contains("[network]"), "and placed in its table: {w}");
+    // The layer still loads: the mode written beside the typo is in effect.
+    assert!(
+        matches!(r.network, NetworkPolicy::Allowlist(_)),
+        "{:?}",
+        r.network
+    );
+}
+
+#[test]
+fn an_unknown_key_under_network_is_named_even_under_a_non_filtering_posture() {
+    // `none`/`shared` return before any rule is classified, so a report placed with the rules would
+    // never run for them — the posture that carries no lists is exactly where a stray key is
+    // hardest to notice.
+    let raw = RawConfig {
+        network: Some(NetworkField::Table(NetworkTable {
+            mode: Some("shared".into()),
+            rest: [("alow".to_string(), schema::RawIgnored)]
+                .into_iter()
+                .collect(),
+            ..net_table_defaults()
+        })),
+        ..RawConfig::default()
+    };
+    let r = resolve_no_plugins(raw, None);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("`alow`")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(
+        matches!(r.network, NetworkPolicy::Shared),
+        "{:?}",
+        r.network
+    );
+}
+
+#[test]
+fn a_net_table_is_an_unknown_section_like_any_other() {
+    // There is one network namespace, `[network]`. `[net]` is not a second spelling of it and gets
+    // no hint pointing at one: it lands in the top-level catch-all, named the way any unknown
+    // section is, and nothing it holds is read.
+    let raw = schema::parse(b"[net.groups]\nci = [\"github.com\"]\n").expect("parses");
+    let r = resolve_no_plugins(raw, None);
+    let w = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("`net`"))
+        .unwrap_or_else(|| panic!("the section must be named: {:?}", r.warnings));
+    assert!(
+        !w.contains("network.groups"),
+        "no hint pointing at the new spelling: {w}"
+    );
 }
 
 #[test]

@@ -55,7 +55,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [`[task.<name>]`](configuration/task): the field reference for a declared operation,
   trusted-only (links to [Declared operations](tasks/)).
 - [`[app.<name>]`](configuration/apps): named launch profiles (links to [Apps](apps/)).
-- [`[net.groups]`](networking/groups): reusable egress groups.
+- [`[network.groups]`](networking/groups): reusable egress groups.
 - [`[bundle.<name>]`](configuration/bundles): reusable tool bundles an app names with `use`.
 - [One-shot overrides](configuration/overrides): `--config`/`--env`/`--net`/… and `SBX_*`.
 
@@ -102,7 +102,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [Architecture: Model B](networking/architecture): how a filtering posture works under the hood.
 - [Network modes](networking/modes): `none` / `shared` / `deny` / `allow` / `ask`.
 - [Rule grammar](networking/rules): hosts, `*.domain`, URLs, `re:`, `tcp://`, ports, `{VERB}`.
-- [Egress groups](networking/groups): reusable `[net.groups]` referenced by `@name`.
+- [Egress groups](networking/groups): reusable `[network.groups]` referenced by `@name`.
 - [Ask mode](networking/ask): park-and-confirm requests with `sbx net pending`.
 - [Inbound forwarding](networking/forward): `forward`, host loopback ports into the cage.
 - [Observability](networking/observability): `sbx net rules` / `stats` / `logs` / `live`, `sbx test net`.

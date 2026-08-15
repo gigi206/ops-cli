@@ -243,17 +243,9 @@ pub(crate) struct RawConfig {
     /// untrusted one: raising the floor drops credentials out of the leak tripwires, a choice an
     /// untrusted project may not make. Absent leaves the built-in floor.
     pub(crate) redact: Option<RawRedact>,
-    /// Network-scoped config that is not itself a posture — currently the reusable egress
-    /// groups (`[net.groups]`). A group is a named list of egress entries that any `[network]`
-    /// `allow`/`deny` list may reference with `@<name>`, so a set of hosts is declared once and
-    /// shared across apps instead of being rewritten per profile. Groups are a security-relevant
-    /// input (they expand to egress rules), so they are honored only from the global config
-    /// (trusted by location); a project's `[net.groups]` is ignored.
-    #[serde(default)]
-    pub(crate) net: RawNet,
     /// Reusable tool bundles, `[bundle.<name>]` — everything one tool needs to be *installed* and
     /// to *reach its own services*, declared once and folded into any app that names it in `use`.
-    /// A bundle is the map-side companion of a `[net.groups]` group: a group factors out egress
+    /// A bundle is the map-side companion of a `[network.groups]` group: a group factors out egress
     /// entries, which are list items a `@<name>` reference can expand into, while `packages`/`env`
     /// are maps with no slot for such a reference. Bundles are a security-relevant input (they add
     /// tools, environment, egress rules, and credentials), so they are honored only from the global
@@ -287,7 +279,7 @@ pub(crate) struct RawConfig {
 /// the command an app launches: `provision` runs before that command and cannot replace it.
 ///
 /// A bundle may not name another bundle: there is no `use` field here, so nesting — and with it
-/// any cycle — is impossible by construction, the same way a `[net.groups]` entry may not be a
+/// any cycle — is impossible by construction, the same way a `[network.groups]` entry may not be a
 /// `@other` reference. Its `allow`/`deny`/`mute` entries *may* be `@group` references, because
 /// those are reference sites like an app's own lists: the bundle is folded into the app before
 /// classification, so the group expansion still runs exactly once.
@@ -351,25 +343,6 @@ pub(crate) struct RawBundle {
     /// Auto-upgrade resolvers pairing with this bundle's `binary:resolve` packages.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) binary: BTreeMap<String, RawResolve>,
-}
-
-/// The `[net]` table: config under the `net` namespace that is not a per-launch posture. For now
-/// it carries only `[net.groups]`. Kept a distinct struct (rather than folding `groups` onto
-/// `RawConfig`) so the `net` namespace can grow without crowding the top level.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct RawNet {
-    /// Named reusable egress groups, `[net.groups]` — each `name = [ "<entry>", … ]`, where an
-    /// entry is any egress rule string the `allow`/`deny` lists accept (an IP, host, `*.domain`,
-    /// exact URL, `re:` regex, or `tcp://` L4 target, with an optional `{VERB,…}` method prefix).
-    /// A `[network]` list references a group by `@<name>`; the reference expands to these entries.
-    #[serde(default)]
-    pub(crate) groups: BTreeMap<String, Vec<String>>,
-    /// Unknown keys in this table, kept so they can be reported. This one earns the capture more
-    /// than most: `[net]` and `[network]` both exist and mean different things, so a posture
-    /// written under `[net]` lands here rather than in the top-level catch-all, and the reader
-    /// gets no hint that the mode and the allowlist they wrote govern nothing.
-    #[serde(flatten)]
-    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// One `binds` entry: a bare path string (bound **read-only**, the default) or a table
@@ -1449,6 +1422,33 @@ pub(crate) struct NetworkTable {
     /// (Mode A) stays all-verbs. Absent means the built-in `["GET","HEAD"]` app default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_methods: Option<Vec<String>>,
+    /// Named reusable egress groups, `[network.groups]` — each `name = [ "<entry>", … ]`, where an
+    /// entry is any egress rule string the `allow`/`deny` lists accept (an IP, host, `*.domain`,
+    /// exact URL, `re:` regex, or `tcp://` L4 target, with an optional `{VERB,…}` method prefix).
+    /// An `allow`/`deny`/`mute` list references a group by `@<name>`; the reference expands to
+    /// these entries.
+    ///
+    /// A group is a *vocabulary*, not a posture: it declares what a name stands for and grants
+    /// nothing on its own. Groups expand into egress rules, so they are read **only from the
+    /// top-level `[network]` of the global config** (trusted by its location). Declared anywhere
+    /// else — a project, an `[app.<name>.network]`, a one-shot override — the table is ignored with
+    /// a warning; those layers reference a global group with `@<name>` instead.
+    ///
+    /// Declaring a group commits the file to the table form of `network`: TOML cannot extend the
+    /// bare-string `network = "deny"` with a `[network.groups]` sub-table, so a config that defines
+    /// groups writes its posture as `[network] mode = "…"`.
+    ///
+    /// Last of the ordinary fields because it is the only sub-table: TOML emits a nested table after
+    /// the scalars of its parent, so a field declared below it would serialize into the group table.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) groups: BTreeMap<String, Vec<String>>,
+    /// Unknown keys in this table, kept so they can be reported. `[network]` is the largest table in
+    /// the schema and the one most often written by hand, so a key that lands here — a misspelling,
+    /// or a field placed at the wrong depth — is a rule the reader believes governs a launch and
+    /// which governs nothing. Ignoring it is the deliberate forward-compatibility policy (a config
+    /// written for a newer sbx must still load); saying nothing about it is not.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The two shapes the `proc` field accepts: a bare mode string, or a table for the exec-target
@@ -2216,6 +2216,8 @@ mod tests {
                 http2: vec![],
                 capture: None,
                 capture_max_kb: None,
+                groups: Default::default(),
+                rest: Default::default(),
                 mode: Some("deny".into()),
                 allow: vec![
                     "github.com".into(),
@@ -2248,6 +2250,8 @@ mod tests {
                 http2: vec![],
                 capture: None,
                 capture_max_kb: None,
+                groups: Default::default(),
+                rest: Default::default(),
                 mode: Some("deny".into()),
                 allow: vec![],
                 deny: vec![],
@@ -2277,6 +2281,8 @@ mod tests {
                 http2: vec![],
                 capture: None,
                 capture_max_kb: None,
+                groups: Default::default(),
+                rest: Default::default(),
                 mode: None,
                 allow: vec!["api.foo.com".into()],
                 deny: vec![],

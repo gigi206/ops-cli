@@ -69,7 +69,7 @@ pasta NAT) are in [architecture](architecture) (the section above).
 - **[Rule grammar](rules)**: the full syntax of an allow/deny entry: hosts,
   `*.domain`, exact URLs, IP literals, `re:` regexes, ports, `{VERB}` method
   scoping, and the raw `tcp://` L4 splice. Deny always wins. The reference page.
-- **[Egress groups](groups)**: `[net.groups]`: declare a set of hosts once,
+- **[Egress groups](groups)**: `[network.groups]`: declare a set of hosts once,
   reference it from any allow/deny list with `@name`.
 - **[Ask mode](ask)**: the park-and-confirm workflow end to end, with
   `sbx net pending` and `sbx net pending watch`.

@@ -153,7 +153,7 @@ Every field of the schema, and the verb that edits it. `<name>` is yours to choo
 | `ssh_agent.allow` | agent key names the cage may sign with |
 | `forward` | host loopback ports |
 | `binds` | host paths; `add` writes the read-only form, and a read-write one goes through `set binds '[{ path = "/opt/data", mode = "rw" }]'` |
-| `net.groups.<name>` | egress entries of a reusable group |
+| `network.groups.<name>` | egress entries of a reusable group |
 | `network.http2`, `network.default_methods` | hosts, HTTP verbs |
 | `app.<name>.uses` | bundle names the app folds in |
 | `task.<name>.cmd`, `.unmask`, `.env_allow`, `.allow`, `.deny`, `.network`, `.packages` | the operation's own lists |

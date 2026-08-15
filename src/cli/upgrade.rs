@@ -1255,6 +1255,7 @@ mod tests {
         let rev_b = "b".repeat(40);
         let cfg = |global: &str| config::Resolved {
             plugin: Default::default(),
+            net_groups: Default::default(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: Default::default(),

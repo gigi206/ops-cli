@@ -69,7 +69,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // Fold each app's `use = [<bundle>, …]` before resolution, so a bundle's contribution is
     // indistinguishable downstream from an entry the app wrote itself — `resolve_app` then gates
     // and layers it with no special casing, exactly as imported profiles ride the global app layer.
-    // Bundles are global-only (like `[net.groups]`): they are honored from the global config, which
+    // Bundles are global-only (like `[network.groups]`): they are honored from the global config, which
     // is trusted by its location.
     let bundles = std::mem::take(&mut global.bundle);
     // What the fold could not do is reported PER APP, not globally: `sbx config show --app <name>`
@@ -396,15 +396,25 @@ pub(super) fn read_global(warnings: &mut Vec<String>) -> RawConfig {
     read_layer(&path, warnings).unwrap_or_default()
 }
 
-/// The reusable egress groups declared in the global config (`[net.groups]`), as their raw authored
-/// entries keyed by name, plus any load warnings. Global-only — matching the resolver, which honors
-/// groups only from the global config — so this lists exactly the set a `@<name>` reference can
-/// resolve to. A read-only, network-free view for `sbx net groups`; entries are returned verbatim
-/// (unclassified), so the caller displays them as declared and may flag a malformed one on its own.
+/// The reusable egress groups declared in the global config (`[network.groups]`), as their raw
+/// authored entries keyed by name, plus any load warnings. Global-only — matching the resolver,
+/// which honors groups only from the global config — so this lists exactly the set a `@<name>`
+/// reference can resolve to. A read-only, network-free view for `sbx net groups`; entries are
+/// returned verbatim (unclassified), so the caller displays them as declared and may flag a
+/// malformed one on its own.
 pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     let mut warnings = Vec::new();
     let global = read_global(&mut warnings);
-    (global.net.groups, warnings)
+    (groups_of(global.network), warnings)
+}
+
+/// The `groups` table a raw `network` field carries, or an empty map when the field is absent or
+/// written in its bare-string form (which has no room for a sub-table).
+fn groups_of(field: Option<schema::NetworkField>) -> BTreeMap<String, Vec<String>> {
+    match field {
+        Some(schema::NetworkField::Table(table)) => table.groups,
+        _ => BTreeMap::new(),
+    }
 }
 
 /// The tool bundles declared in the global config (`[bundle.<name>]`), plus any load warnings.
@@ -435,24 +445,27 @@ pub(crate) fn read_bundle_fragment(path: &Path) -> Result<BTreeMap<String, RawBu
     Ok(raw.bundle)
 }
 
-/// Read a portable `[net.groups]` fragment from `path` (the file `sbx net groups import` is given),
-/// returning its groups. The file goes through the same safety gate as any config (owner-owned,
-/// non-world-writable, a plain regular file). An error names why: unsafe/unreadable, not valid TOML,
-/// or carrying no `[net.groups]` (the tell-tale of the wrong file). The entries are returned
-/// verbatim — the caller validates the group names before writing them, and a malformed entry is
-/// flagged at load like any other, so the import is deliberately not a second validation surface.
+/// Read a portable `[network.groups]` fragment from `path` (the file `sbx net groups import` is
+/// given), returning its groups. The file goes through the same safety gate as any config
+/// (owner-owned, non-world-writable, a plain regular file). An error names why: unsafe/unreadable,
+/// not valid TOML, or carrying no `[network.groups]` (the tell-tale of the wrong file). The entries
+/// are returned verbatim — the caller validates the group names before writing them, and a malformed
+/// entry is flagged at load like any other, so the import is deliberately not a second validation
+/// surface.
 pub(crate) fn read_net_groups_fragment(
     path: &Path,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
     let bytes = safety::read_safe_bytes(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let raw = schema::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    if raw.net.groups.is_empty() {
+    let groups = groups_of(raw.network);
+    if groups.is_empty() {
         return Err(format!(
-            "{} has no `[net.groups]` table to import (is it an export of `sbx net groups export`?)",
+            "{} has no `[network.groups]` table to import (is it an export of \
+             `sbx net groups export`?)",
             path.display()
         ));
     }
-    Ok(raw.net.groups)
+    Ok(groups)
 }
 
 /// Read the project config and decide its trust on the *same bytes* it parses, so
@@ -1106,7 +1119,7 @@ fn extend_deduped(into: &mut Vec<String>, add: Vec<String>) {
 }
 
 /// Whether a `[bundle.<name>]` name is a safe, referenceable identifier — the same rule as a
-/// `[net.groups]` name, for the same reasons: a bundle name is not a path component, so it needs
+/// `[network.groups]` name, for the same reasons: a bundle name is not a path component, so it needs
 /// only to be unambiguous in a `use` list and to render cleanly in a warning.
 pub(crate) fn is_valid_bundle_name(name: &str) -> bool {
     is_valid_group_name(name)

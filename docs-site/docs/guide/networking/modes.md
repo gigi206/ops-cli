@@ -16,6 +16,9 @@ network = "allow"    # denylist: every public host reaches except what you deny
 network = "ask"      # park-and-confirm: undecided hosts block for your answer
 ```
 
+A config that declares [egress groups](groups) writes its posture in the table form
+below instead: TOML cannot extend the bare string with a `[network.groups]` sub-table.
+
 A filtering posture usually needs carve-out lists, so it is more often written as
 the **table form**:
 

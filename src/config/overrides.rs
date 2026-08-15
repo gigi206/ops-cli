@@ -295,12 +295,16 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
     // unknown-key bag with them. Reported rather than refused, for the reason a file's are —
     // that is what lets a blob written for a newer sbx run on an older one.
     let mut unknown = Vec::new();
+    // Whether any blob declared egress groups, recorded per blob for the same reason: `network` is
+    // a scalar field, so the blob that loses the merge takes its `groups` table out of sight with it.
+    let mut blob_groups = false;
 
     // Tier 0 — the environment blob.
     let t0 = match &ambient.config {
         Some(s) => {
             let parsed = parse_blob(s).map_err(|e| format!("{SBX_CONFIG}: {e}"))?;
             super::warn_unknown_keys(&mut unknown, SBX_CONFIG, &parsed);
+            blob_groups |= declares_net_groups(&parsed);
             parsed
         }
         None => RawConfig::default(),
@@ -329,6 +333,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
     for (i, c) in cli.config.iter().enumerate() {
         let parsed = parse_blob(c).map_err(|e| format!("--config (#{}): {e}", i + 1))?;
         super::warn_unknown_keys(&mut unknown, &format!("--config (#{})", i + 1), &parsed);
+        blob_groups |= declares_net_groups(&parsed);
         t2 = overlay_into(t2, parsed);
     }
     // Tier 3 — the CLI's typed fragments.
@@ -360,10 +365,14 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
     let cli_side = overlay_into(t2, t3);
 
     let mut notices = unknown;
-    push_ignored_field_notices(&env_side, &cli_side, &mut notices);
+    push_ignored_field_notices(&env_side, &cli_side, blob_groups, &mut notices);
     push_env_source_notices(&env_side, &cli_side, &mut notices);
 
-    let merged = overlay_into(env_side, cli_side);
+    let mut merged = overlay_into(env_side, cli_side);
+    // Drop the groups the notice above just accounted for, so the posture that reaches
+    // `apply_override` carries only one-shot launch fields. Left in place they would be reported a
+    // second time downstream, where every layer that may not define a group is reported.
+    super::take_net_groups(&mut merged.network);
     Ok(Override {
         raw: merged,
         notices,
@@ -373,14 +382,20 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
 /// Note the fields an override carries that are not one-shot launch concepts: egress groups are a
 /// global-config affordance, and an override shapes *the* launch rather than defining apps. They are
 /// dropped (ignored downstream), so the notice is the only signal.
+///
+/// `blob_groups` is decided per blob by the caller rather than read off the merged sides, for the
+/// reason an unknown key is: `network` is a **scalar** field, so a later blob's posture replaces an
+/// earlier one's table outright, and a `groups` declaration in the blob that lost would reach here
+/// as an absence indistinguishable from never having been written.
 fn push_ignored_field_notices(
     env_side: &RawConfig,
     cli_side: &RawConfig,
+    blob_groups: bool,
     notices: &mut Vec<String>,
 ) {
-    if !env_side.net.groups.is_empty() || !cli_side.net.groups.is_empty() {
+    if blob_groups {
         notices.push(
-            "ignoring `[net.groups]` in the override — it is not a one-shot launch field"
+            "ignoring `groups` under `[network]` in the override — it is not a one-shot launch field"
                 .to_string(),
         );
     }
@@ -396,6 +411,12 @@ fn push_ignored_field_notices(
                 .to_string(),
         );
     }
+}
+
+/// Whether an override blob declares egress groups — only the table form of `network` can carry
+/// them, the bare-string posture having nowhere to put a sub-table.
+fn declares_net_groups(raw: &RawConfig) -> bool {
+    matches!(&raw.network, Some(schema::NetworkField::Table(t)) if !t.groups.is_empty())
 }
 
 /// Push a notice for each **security** field whose value the environment (either the `SBX_CONFIG`
@@ -467,7 +488,7 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
 /// Merge `higher` onto `base` per the uniform rule: a scalar field is replaced when `higher` sets
 /// it; a collection field is unioned, `higher` winning per key/entry. This is the one merge — used
 /// for repeated `--config` blobs, for folding a typed fragment onto a blob, and for merging the two
-/// precedence sides. `[net.groups]`/`[app.*]` ride along (ignored downstream but noticed).
+/// precedence sides. `[app.*]` rides along (ignored downstream but noticed).
 fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     // `higher` is destructured **exhaustively**, and that is the point of writing it this way. This
     // fold is a hand-written list of fields with nothing above it checking the list is complete, and
@@ -497,7 +518,6 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         ssh_agent,
         fs,
         redact,
-        net,
         bundle,
         // Carried no further on purpose: `apply_override` refuses each of these outright, so folding
         // them would only move the drop to a later line. An inline `flake.nix`, an auto-upgrade
@@ -559,7 +579,6 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     base.seccomp = union_allow_opt(base.seccomp, seccomp, |s| &mut s.allow);
     base.devices = union_allow_opt(base.devices, devices, |d| &mut d.allow);
     base.ssh_agent = union_allow_opt(base.ssh_agent, ssh_agent, |s| &mut s.allow);
-    base.net.groups.extend(net.groups);
     base.app.extend(app);
     base.bundle.extend(bundle);
     base
@@ -885,6 +904,10 @@ fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField 
         ca_roots: None,
         capture: None,
         capture_max_kb: None,
+        // A typed `--net` fragment defines no vocabulary and carries no unknown keys: it is built
+        // here from five known postures, not parsed from what someone wrote.
+        groups: Default::default(),
+        rest: Default::default(),
     })
 }
 
@@ -1048,7 +1071,6 @@ mod tests {
     /// assert the opposite of the documented fail-closed behavior.
     const FULLY_POPULATED_BLOB: &str = r#"
         nixpkgs = "nixos-23.11"
-        network = "none"
         gui = "wayland"
         proc = "enforce"
         notify = "once"
@@ -1076,7 +1098,9 @@ mod tests {
         from = "env://K"
         header = "X"
         type = "raw"
-        [net.groups]
+        [network]
+        mode = "none"
+        [network.groups]
         infra = ["example.com"]
         [app.demo]
         network = "none"
@@ -1289,23 +1313,20 @@ mod tests {
     }
 
     #[test]
-    fn a_posture_written_under_net_in_a_blob_is_named() {
-        // `[net]` and `[network]` are both real and mean different things, so this one is not an
-        // unknown section but an unknown key inside a section that exists — the shape that reaches
-        // no catch-all and governs nothing.
+    fn a_net_table_in_a_blob_is_an_unknown_section_like_any_other() {
+        // There is one network namespace, `[network]`. A blob writing `[net]` gets the same
+        // treatment as any unknown section — named, ignored, and given no hint pointing anywhere.
         let ov = collect_cli(Cli {
-            config: &["[net]\nmode = \"deny\"\nallow = [\"demo.test\"]"],
+            config: &["[net]\nmode = \"deny\""],
             ..Default::default()
         })
         .unwrap();
-        for key in ["`mode`", "`allow`"] {
-            let n = ov
-                .notices()
-                .iter()
-                .find(|n| n.contains(key))
-                .unwrap_or_else(|| panic!("{key} must be named: {:?}", ov.notices()));
-            assert!(n.contains("[net]"), "and placed in its table: {n}");
-        }
+        let n = ov
+            .notices()
+            .iter()
+            .find(|n| n.contains("`net`"))
+            .unwrap_or_else(|| panic!("the section must be named: {:?}", ov.notices()));
+        assert!(!n.contains("network.groups"), "and no migration hint: {n}");
     }
 
     #[test]
@@ -1479,13 +1500,41 @@ mod tests {
     #[test]
     fn net_groups_and_apps_in_an_override_are_ignored_with_a_notice() {
         let ov = collect_cli(Cli {
-            config: &["[net.groups]\nx = [\"a.example.com\"]\n[app.demo]\ncmd = \"demo\""],
+            config: &["[network.groups]\nx = [\"a.example.com\"]\n[app.demo]\ncmd = \"demo\""],
             ..Default::default()
         })
         .unwrap();
         let text = ov.notices().join("\n");
-        assert!(text.contains("[net.groups]"), "{text}");
+        assert!(text.contains("`groups` under `[network]`"), "{text}");
         assert!(text.contains("[app.*]"), "{text}");
+        // Noticed *and* dropped: the posture handed to the launch carries no group table, so the
+        // layer that may not define one is not asked about it a second time downstream.
+        assert!(
+            !declares_net_groups(&ov.raw),
+            "the groups must not ride along"
+        );
+    }
+
+    #[test]
+    fn groups_in_a_blob_that_loses_the_merge_are_still_noticed() {
+        // `network` is a scalar field: a later blob's posture replaces an earlier one's table
+        // outright. Reading the notice off the merged result would then mistake a declaration that
+        // was overwritten for one that was never written.
+        let ov = collect_cli(Cli {
+            config: &[
+                "[network.groups]\nx = [\"a.example.com\"]",
+                "network = \"none\"",
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            ov.notices()
+                .iter()
+                .any(|n| n.contains("`groups` under `[network]`")),
+            "{:?}",
+            ov.notices()
+        );
     }
 
     #[test]
@@ -1550,6 +1599,40 @@ mod tests {
             Some(NetworkField::Table(t)) => {
                 assert_eq!(t.mode.as_deref(), Some("allow"));
                 assert_eq!(t.deny, vec!["x.example.com"]);
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_references_reach_the_list_intact() {
+        // `@<name>` is one of the entry forms the lists take, so it must arrive at the resolver
+        // spelled as written: the split is on commas, and a reference carries none. The name is
+        // resolved there, against the groups the global config declares — this side only has to
+        // avoid mangling it. Several of them, mixed with a literal host, is the shape a launch line
+        // takes when it opens a build's worth of destinations at once.
+        let ov = collect_cli(Cli {
+            net: &["allow=@ci-hosts, @mirror ,direct.example.com"],
+            ..Default::default()
+        })
+        .unwrap();
+        match ov.raw.network {
+            Some(NetworkField::Table(t)) => {
+                assert_eq!(t.mode.as_deref(), Some("deny"));
+                assert_eq!(t.allow, vec!["@ci-hosts", "@mirror", "direct.example.com"]);
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+        // The same on the other side: a denylist names groups too.
+        let ov = collect_cli(Cli {
+            net: &["deny=@telemetry,@ads"],
+            ..Default::default()
+        })
+        .unwrap();
+        match ov.raw.network {
+            Some(NetworkField::Table(t)) => {
+                assert_eq!(t.mode.as_deref(), Some("allow"));
+                assert_eq!(t.deny, vec!["@telemetry", "@ads"]);
             }
             other => panic!("expected a table, got {other:?}"),
         }

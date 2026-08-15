@@ -133,7 +133,7 @@ sbx net groups                                                # what each expand
 Egress-only sharing, kept separate from bundles because a group is a *flat list of entries*, not a
 tool: it carries no package, no environment, no credential. It exists for host sets shared verbatim
 across several profiles and not tied to one agent. An app's, **or a bundle's**, `allow`/`mute`/`deny`
-references one with `@<name>`, and the entries expand at resolution (see `[net.groups]` in the
+references one with `@<name>`, and the entries expand at resolution (see `[network.groups]` in the
 configuration guide).
 
 Because a group expands into the list that references it, a group is **slot-pure**: an allow group

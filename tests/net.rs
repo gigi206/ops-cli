@@ -809,7 +809,7 @@ fn net_allow_global_writes_the_global_config_without_a_trust_gate() {
 #[test]
 fn net_allow_accepts_a_group_reference_and_persists_it_verbatim() {
     let fx = Fixture::new();
-    // A `@<group>` reference is an alias for a `[net.groups]` group (expanded at load time), not a
+    // A `@<group>` reference is an alias for a `[network.groups]` group (expanded at load time), not a
     // classifiable host rule, so the write path validates it as a group *name* rather than through
     // `classify` (which rejects the `@`) and persists it verbatim — a group can be added the same
     // way a host is.
@@ -840,10 +840,38 @@ fn net_allow_accepts_a_group_reference_and_persists_it_verbatim() {
 }
 
 #[test]
+fn a_net_table_defines_no_group_and_is_named_as_an_unknown_section() {
+    // One network namespace: groups live under the posture, in `[network]`. A `[net]` table is an
+    // unknown section like any other — named, ignored, and pointed nowhere in particular.
+    let fx = Fixture::new();
+    fx.write_global("[net.groups]\nmcp = [\"{*} mcp.context7.com:443\"]\n");
+
+    let out = fx.run(&["net", "groups"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("mcp"),
+        "nothing under `[net]` is read:\n{stdout}"
+    );
+
+    // And the resolved view names the section it passed over, with no hint pointing anywhere.
+    let shown = fx.run(&["config", "show"]);
+    let stderr = String::from_utf8_lossy(&shown.stderr);
+    assert!(
+        stderr.contains("unknown key `net`"),
+        "the section must be named:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("network.groups"),
+        "and given no migration hint:\n{stderr}"
+    );
+}
+
+#[test]
 fn net_groups_lists_resolves_and_errors_on_unknown() {
     let fx = Fixture::new();
     fx.write_global(
-        "[net.groups]\n\
+        "[network.groups]\n\
          mcp = [\"{*} mcp.context7.com:443\", \"{*} mcp.exa.ai:443\"]\n\
          telemetry = [\"*.datadoghq.com:*\"]\n",
     );
@@ -897,7 +925,9 @@ fn net_groups_lists_resolves_and_errors_on_unknown() {
 fn net_rules_collapses_a_group_and_expands_on_demand() {
     let fx = Fixture::new();
     // A group defined globally, referenced by an app profile beside it.
-    fx.write_global("[net.groups]\nmcp = [\"{*} mcp.context7.com:443\", \"{*} mcp.exa.ai:443\"]\n");
+    fx.write_global(
+        "[network.groups]\nmcp = [\"{*} mcp.context7.com:443\", \"{*} mcp.exa.ai:443\"]\n",
+    );
     fx.write_profile(
         "demo",
         "cmd = \"true\"\n\
@@ -949,7 +979,7 @@ fn net_rules_collapses_a_group_and_expands_on_demand() {
 fn net_groups_export_import_round_trips_between_configs() {
     let src = Fixture::new();
     src.write_global(
-        "[net.groups]\n\
+        "[network.groups]\n\
          mcp = [\"{*} mcp.context7.com:443\"]\n\
          telemetry = [\"*.datadoghq.com:*\"]\n",
     );
@@ -1010,7 +1040,7 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
     let frag = fx.proj.path().join("group.toml");
     std::fs::write(
         &frag,
-        "[net.groups]\nci = [\"{GET} https://api.example.com\"]\n",
+        "[network.groups]\nci = [\"{GET} https://api.example.com\"]\n",
     )
     .unwrap();
     assert!(
@@ -1023,7 +1053,7 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
     let local = fx.proj.path().join("local.toml");
     std::fs::write(
         &local,
-        "[net.groups]\nci = [\"{GET} https://api.example.com\", \"{GET} https://local.example.org\"]\n",
+        "[network.groups]\nci = [\"{GET} https://api.example.com\", \"{GET} https://local.example.org\"]\n",
     )
     .unwrap();
     assert!(
@@ -1093,7 +1123,7 @@ fn net_groups_import_flags_entries_that_will_not_resolve() {
     let frag = fx.proj.path().join("frag.toml");
     std::fs::write(
         &frag,
-        "[net.groups]\ngood = [\"github.com:443\"]\nbad = [\"https://*\", \"@nested\"]\n",
+        "[network.groups]\ngood = [\"github.com:443\"]\nbad = [\"https://*\", \"@nested\"]\n",
     )
     .unwrap();
     let out = fx.run(&["net", "groups", "import", frag.to_str().unwrap()]);

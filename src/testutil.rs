@@ -167,6 +167,7 @@ pub(crate) fn resolved(
 ) -> crate::config::Resolved {
     crate::config::Resolved {
         plugin: Default::default(),
+        net_groups: Default::default(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: Default::default(),

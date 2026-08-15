@@ -383,7 +383,7 @@ pub(crate) enum RuleSourceView {
 }
 
 /// One egress rule projected for `sbx net rules`: its kind, its source, its display text, and — for
-/// a rule expanded from a `[net.groups]` group — the group's name (`None` otherwise). In the default
+/// a rule expanded from a `[network.groups]` group — the group's name (`None` otherwise). In the default
 /// (collapsed) view a contiguous run of one group's rules is a single row whose `rule` is `@<name>`;
 /// under `--expand` each rule is its own row carrying `group` so the renderer can note its origin.
 ///
@@ -2101,6 +2101,7 @@ mod tests {
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
             plugin: Default::default(),
+            net_groups: Default::default(),
             brokers: Vec::new(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,

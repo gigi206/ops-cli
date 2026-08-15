@@ -453,8 +453,8 @@ fn list_at<'d>(doc: &'d mut DocumentMut, key: &str) -> Result<&'d mut Array, Man
     for seg in parents.iter().map(String::as_str) {
         if !table.contains_key(seg) {
             // Implicit: a parent created only to reach the list must not render as an empty header
-            // of its own. Without this, `add net.groups.infra …` writes a bare `[net]` above
-            // `[net.groups]`, which reads like a table someone meant to fill.
+            // of its own. Without this, `add network.groups.infra …` writes a bare `[network]`
+            // above `[network.groups]`, which reads like a posture someone meant to fill in.
             let mut created = Table::new();
             created.set_implicit(true);
             table.insert(seg, Item::Table(created));
@@ -484,9 +484,10 @@ fn list_at<'d>(doc: &'d mut DocumentMut, key: &str) -> Result<&'d mut Array, Man
 /// Both `[network]` and `[proc]` gate their rules behind a posture, and the two dedicated verbs
 /// carry that matrix: an `allow` on a config with no posture bootstraps the restrictive one, a rule
 /// that would be inert under the current mode is refused rather than written, and a deliberate
-/// non-filtering choice is never flipped in silence. `[net.groups]` is deliberately absent: a group
-/// is a named set of entries with no posture of its own, so adding to one cannot produce an inert
-/// rule.
+/// non-filtering choice is never flipped in silence. `[network.groups]` is deliberately absent: a
+/// group is a named set of entries with no posture of its own, so adding to one cannot produce an
+/// inert rule. It is out of reach of the tail match too — `network.groups.<name>` leaves
+/// `groups.<name>` after the table prefix, never a bare verb.
 fn rule_list_verb(key: &str) -> Option<String> {
     for (table, verbs) in [
         ("network.", &["allow", "deny", "mute"][..]),
@@ -1266,7 +1267,7 @@ pub(crate) fn import_bundles(
     Ok(ImportOutcome { added, overwritten })
 }
 
-/// Serialize a set of egress groups as a portable `[net.groups]` TOML fragment — the value
+/// Serialize a set of egress groups as a portable `[network.groups]` TOML fragment — the value
 /// `sbx net groups export` writes. Fresh formatting (source comments are not carried); each name
 /// maps to its entries as a string array, in the map's (sorted) order. The inverse merge is
 /// [`import_net_groups`], and the fragment round-trips through [`super::read_net_groups_fragment`].
@@ -1281,12 +1282,14 @@ pub(crate) fn export_net_groups(
         }
         inner.insert(name, value(arr));
     }
-    // Nest as `[net.groups]`, marking `[net]` implicit so only the `[net.groups]` header is emitted.
-    let mut net = Table::new();
-    net.set_implicit(true);
-    net.insert("groups", Item::Table(inner));
+    // Nest as `[network.groups]`, marking `[network]` implicit so only the `[network.groups]` header
+    // is emitted: a fragment carries groups, and an empty `[network]` above them would read as a
+    // posture the import is about to set.
+    let mut network = Table::new();
+    network.set_implicit(true);
+    network.insert("groups", Item::Table(inner));
     let mut doc = DocumentMut::new();
-    doc.insert("net", Item::Table(net));
+    doc.insert("network", Item::Table(network));
     doc.to_string()
 }
 
@@ -1300,19 +1303,32 @@ pub(crate) fn import_net_groups(
     force: bool,
 ) -> Result<ImportOutcome, ManageError> {
     let mut doc = read_or_empty(path)?;
-    // Navigate to (creating if absent) the `[net.groups]` table, keeping `[net]` implicit.
-    let net = doc
+    // Navigate to (creating if absent) the `[network.groups]` table, through whichever shape
+    // `network` already has: a header table, or the inline `network = { … }` form that `set`/`add`
+    // descend into. Only a header table can be implicit, and only one created here — a posture the
+    // file already holds keeps its own rendering.
+    //
+    // A `network` holding the bare-string posture is the one shape with nowhere to put a sub-table,
+    // which is TOML's rule rather than sbx's, so it is refused by name instead of having the posture
+    // clobbered out from under it.
+    let created = !doc.as_table().contains_key("network");
+    let network = doc
         .as_table_mut()
-        .entry("net")
-        .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| ManageError::NotScalar("net".to_string()))?;
-    net.set_implicit(true);
-    let groups_tbl = net
-        .entry("groups")
-        .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| ManageError::NotScalar("net.groups".to_string()))?;
+        .entry("network")
+        .or_insert_with(|| Item::Table(Table::new()));
+    if created && let Some(table) = network.as_table_mut() {
+        table.set_implicit(true);
+    }
+    let network = network.as_table_like_mut().ok_or_else(|| {
+        ManageError::ParentNotTable("network".to_string(), "network.groups".to_string())
+    })?;
+    if !network.contains_key("groups") {
+        network.insert("groups", Item::Table(Table::new()));
+    }
+    let groups_tbl = network
+        .get_mut("groups")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| ManageError::NotScalar("network.groups".to_string()))?;
 
     // Collision check first, so a refused import writes nothing (all-or-nothing).
     if !force {
@@ -1631,7 +1647,7 @@ mod tests {
         );
         assert!(proc_err.to_string().contains("sbx proc deny"), "{proc_err}");
         // A group has no posture of its own, so it is not redirected.
-        assert!(add(&p, "net.groups.infra", "a.example.com").is_ok());
+        assert!(add(&p, "network.groups.infra", "a.example.com").is_ok());
         assert!(remove(&p, "network.allow", "a.example.com").unwrap());
         assert!(
             std::fs::read_to_string(&p)
@@ -1724,19 +1740,19 @@ mod tests {
 
     #[test]
     fn a_parent_created_only_to_reach_a_leaf_renders_no_empty_header() {
-        // `[task]` above `[task.build]`, or `[net]` above `[net.groups]`, reads like a table someone
-        // started and left blank. The parent exists to be walked through, so it is implicit.
+        // `[task]` above `[task.build]`, or `[network]` above `[network.groups]`, reads like a table
+        // someone started and left blank. The parent exists to be walked through, so it is implicit.
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
         assert!(set(&p, "task.build.description", "Build").is_ok());
-        assert!(add(&p, "net.groups.infra", "api.example.com").unwrap());
+        assert!(add(&p, "network.groups.infra", "api.example.com").unwrap());
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(
-            !after.contains("[task]\n") && !after.contains("[net]\n"),
+            !after.contains("[task]\n") && !after.contains("[network]\n"),
             "no empty parent header:\n{after}"
         );
         assert!(
-            after.contains("[task.build]") && after.contains("[net.groups]"),
+            after.contains("[task.build]") && after.contains("[network.groups]"),
             "{after}"
         );
     }
@@ -2093,8 +2109,8 @@ mod tests {
     fn export_net_groups_emits_a_net_groups_fragment() {
         let g = groups_of(&[("mcp", &["{*} a.example.com:443"]), ("t", &["*.x.com:*"])]);
         let out = export_net_groups(&g);
-        assert!(out.contains("[net.groups]"), "{out}");
-        // `[net]` is implicit — only the `[net.groups]` header is emitted.
+        assert!(out.contains("[network.groups]"), "{out}");
+        // `[net]` is implicit — only the `[network.groups]` header is emitted.
         assert!(
             !out.contains("[net]"),
             "the [net] header must stay implicit:\n{out}"
@@ -2104,11 +2120,57 @@ mod tests {
     }
 
     #[test]
+    fn import_net_groups_reaches_the_table_through_either_posture_shape() {
+        // Two commands write the same table: `sbx config add network.groups.<n>` walks there with
+        // `list_at`, and `sbx net groups import` merges a fragment into it. They must accept the
+        // same files, so the import descends through the inline `network = { … }` form the rest of
+        // this module treats as first-class rather than reporting it as a single value.
+        let tmp = crate::testutil::TmpDir::new();
+        let inline = doc_at(tmp.path(), "network = { mode = \"deny\" }\n");
+        import_net_groups(
+            &inline,
+            &groups_of(&[("mcp", &["{*} a.example.com:443"])]),
+            false,
+        )
+        .expect("an inline posture is a table, and carries the groups");
+        let body = std::fs::read_to_string(&inline).unwrap();
+        assert!(
+            body.contains("mode = \"deny\"") && body.contains("mcp"),
+            "the posture survives and the group lands:\n{body}"
+        );
+        // `add` agrees with it on the same shape.
+        assert!(add(&inline, "network.groups.ci", "b.example.com").unwrap());
+
+        // The bare-string posture is the one shape with no room for a sub-table. Refused by name,
+        // and the file is left exactly as it was.
+        let sub = tmp.path().join("scalar");
+        std::fs::create_dir_all(&sub).unwrap();
+        let scalar = doc_at(&sub, "network = \"deny\"\n");
+        let before = std::fs::read_to_string(&scalar).unwrap();
+        match import_net_groups(
+            &scalar,
+            &groups_of(&[("mcp", &["a.example.com:443"])]),
+            false,
+        ) {
+            Err(ManageError::ParentNotTable(parent, key)) => {
+                assert_eq!(parent, "network");
+                assert_eq!(key, "network.groups");
+            }
+            other => panic!("expected the parent refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&scalar).unwrap(),
+            before,
+            "a refused import writes nothing"
+        );
+    }
+
+    #[test]
     fn import_net_groups_merges_preserving_existing_and_refuses_collisions() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(
             tmp.path(),
-            "# keep me\n[net.groups]\n# existing\nother = [\"github.com:443\"]\n",
+            "# keep me\n[network.groups]\n# existing\nother = [\"github.com:443\"]\n",
         );
 
         // A fresh name is added; the existing group and its comment survive.

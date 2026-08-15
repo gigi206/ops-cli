@@ -14,7 +14,7 @@ See also: [The four lenses](../concepts/observability#the-four-lenses) · [Netwo
 | Subcommand | Purpose |
 |---|---|
 | [`rules`](#sbx-net-rules) | list the effective allow/deny rules by source |
-| [`groups`](#sbx-net-groups) | list reusable `[net.groups]`, or resolve one |
+| [`groups`](#sbx-net-groups) | list reusable `[network.groups]`, or resolve one |
 | [`allow`](#sbx-net-allow-and-deny) / [`deny`](#sbx-net-allow-and-deny) | persist a rule to config |
 | [`unallow`](#sbx-net-unallow-undeny-and-unmute) / [`undeny`](#sbx-net-unallow-undeny-and-unmute) | take a persisted rule back out |
 | [`mute`](#sbx-net-mute) / [`unmute`](#sbx-net-unallow-undeny-and-unmute) | add / remove a log-suppression (`dontaudit`) rule |
@@ -31,7 +31,7 @@ sbx net rules [-a|--app <name>] [-s|--source config|builtin|session] [-f|--filte
 
 Lists the allow/deny rules of the effective filtering posture, each tagged `config` or
 `built-in`, reflecting the trust gate. An inspected L7 rule shows `https://`, a raw L4
-rule shows `tcp://`; a `[net.groups]` group shows as one `@<name>` row (`--expand`
+rule shows `tcp://`; a `[network.groups]` group shows as one `@<name>` row (`--expand`
 unfolds it). `--app <name>` shows what `sbx app run <name>` would launch with. `--source
 session` queries live `ask`-session rules remembered from `--session` answers (`manual`
 is accepted as an alias). Under
@@ -51,7 +51,7 @@ sbx net groups export [<name>…] [-o|--out <file>]
 sbx net groups import <file> [-f|--force]
 ```
 
-A `[net.groups]` group is a named set of egress entries declared once in the global
+A `[network.groups]` group is a named set of egress entries declared once in the global
 config and referenced by `@<name>`. `sbx net groups` lists them; `sbx net groups
 <name>` resolves one; `export`/`import` move them between machines. Global-only (no
 scope flag). See [Egress groups](../networking/groups).

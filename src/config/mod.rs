@@ -276,6 +276,13 @@ pub(crate) struct Resolved {
     /// Which layer supplied the winning `network` posture (`Default` when neither config set it).
     /// A display affordance for `sbx config`; the launcher ignores it.
     pub(crate) network_origin: Provenance,
+    /// The egress groups the global config declared, pre-classified, as the vocabulary a `@<name>`
+    /// reference resolves against. Kept on the resolved config for one reason: a one-shot override
+    /// is applied *after* layering, and it references groups too. The names come from the global
+    /// config either way, so an override gains no reach by using one — it could always have written
+    /// the same hosts out by hand — it gains the ability to say them by the name the config already
+    /// uses, which is what keeps a launch line auditable against the policy it is bending.
+    pub(crate) net_groups: NetGroups,
     /// Whether the egress proxy records its per-host decision counters (`sbx net stats`). On by
     /// default; a trusted layer's `[network] stats = false` turns the audit off. Gated like the
     /// rest of `[network]` — an untrusted project's table (and so its `stats`) is dropped, so it
@@ -734,8 +741,8 @@ impl Resolved {
     /// sets is stamped
     /// [`Provenance::Override`] for `sbx config show`; its binds are canonicalized and its secret
     /// posture re-checked exactly as the layered fields are, so this is a faithful final layer, not
-    /// a raw assignment. `[net.groups]`/`[app.*]` in an override are ignored (noticed at collection
-    /// time), so they never reach here.
+    /// a raw assignment. `[network] groups`/`[app.*]` in an override are ignored (noticed at
+    /// collection time), so they never reach here.
     ///
     /// A set-but-invalid **scalar security posture** (`network`/`gui`/`[limits]`) is a **hard error**
     /// (`Err`, the launch aborts): there is no safe fallback — silently keeping the baseline could
@@ -779,7 +786,6 @@ impl Resolved {
             // where it is read and listed, not assembled on a command line for one launch.
             nixpkgs: _,
             task: _,
-            net: _,
             app: _,
             bundle: _,
             // `[plugin.*]` joins them, and for the sharpest version of the same reason: it can
@@ -811,6 +817,7 @@ impl Resolved {
             &self.network,
             &self.proc,
             &self.notify,
+            &self.net_groups,
             network,
             gui,
             proc,
@@ -1033,6 +1040,7 @@ impl Resolved {
             &self.network,
             &self.proc,
             &self.notify,
+            &self.net_groups,
             ov.raw.network.clone(),
             ov.raw.gui.clone(),
             ov.raw.proc.clone(),
@@ -1076,6 +1084,7 @@ fn build_override_scalars(
     baseline: &NetworkPolicy,
     baseline_proc: &crate::proc_policy::ProcPolicy,
     baseline_notify: &crate::notify::NotifyPolicy,
+    groups: &NetGroups,
     network: Option<NetworkField>,
     gui: Option<String>,
     proc: Option<schema::ProcField>,
@@ -1090,10 +1099,11 @@ fn build_override_scalars(
     if let Some(field) = network {
         let stats = network_stats_of(&field);
         warn_if_baseline_sets_default_methods(notes, OVERRIDE_SOURCE, &field);
-        // An override has no `@group` vocabulary (groups are a global-config concept), so a
-        // mode-less table inherits from `baseline` and an `@ref` fails closed at the matcher.
-        let groups = build_net_groups(notes, BTreeMap::new());
-        match validate_network(notes, OVERRIDE_SOURCE, field, &groups, baseline) {
+        // An override *references* the global config's groups and defines none of its own (its own
+        // `groups` table is dropped where the override is collected). A mode-less table inherits
+        // from `baseline`, and an `@ref` naming no group is dropped with a warning like anywhere
+        // else — fail-closed in an `allow` list, which is where a one-shot reference belongs.
+        match validate_network(notes, OVERRIDE_SOURCE, field, groups, baseline) {
             Some(policy) => scalars.network = Some((policy, stats)),
             None => fatal.push("network".to_string()),
         }
@@ -1426,14 +1436,17 @@ fn resolve(
 
     // Reusable egress groups are defined only in the global config (trusted by location) and
     // pre-classified once here; a `[network]` `allow`/`deny` list references one with `@<name>`.
-    // A project's `[net.groups]` is a security-relevant input it may not supply, so it is ignored.
-    let net_groups = build_net_groups(&mut warnings, std::mem::take(&mut global.net.groups));
-    if let Some((proj, _)) = &project
-        && !proj.net.groups.is_empty()
+    // A project's `[network.groups]` is a security-relevant input it may not supply, so it is
+    // ignored. Both are *taken* out of the raw layer: the only `groups` table that may be read is
+    // this one, so every table that still carries one when it reaches validation is declared at a
+    // layer that cannot define groups, and is reported there.
+    let net_groups = build_net_groups(&mut warnings, take_net_groups(&mut global.network));
+    if let Some((proj, _)) = &mut project
+        && !take_net_groups(&mut proj.network).is_empty()
     {
         warnings.push(format!(
-            "{PROJECT_CONFIG}: ignoring `[net.groups]` — egress groups are defined in the \
-                 global config only; a project's `[network]` may reference them with `@<name>`"
+            "{PROJECT_CONFIG}: ignoring `groups` under `[network]` — egress groups are defined in \
+             the global config only; a project's `[network]` may reference them with `@<name>`"
         ));
     }
 
@@ -2141,6 +2154,7 @@ fn resolve(
         mise: None,
         network,
         network_origin,
+        net_groups,
         egress_stats,
         redact_min_len,
         redact_min_len_origin,
@@ -2506,11 +2520,9 @@ pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &
     if let Some(fs) = &raw.fs {
         report(" under `[fs]`", &fs.rest);
     }
-    // `[net]` holds the egress groups and nothing else, while the posture lives under `[network]`.
-    // Both names are real, so a posture written under the shorter one is not an unknown *section*
-    // the catch-all above would name — it is an unknown key inside a section that exists, and
-    // without this the mode and the allowlist are dropped in silence.
-    report(" under `[net]`", &raw.net.rest);
+    // `[network]` is reported where it is validated, not here: its table form is one variant of an
+    // untagged enum, so the bare-string posture must stay a parse success, and the unknown keys are
+    // named alongside the mode and the rules that did take effect.
 }
 
 /// Validate a `[ssh_agent] allow` list into the entries the broker will match on, dropping a
@@ -4778,6 +4790,22 @@ fn validate_network_table(
     parent: &NetworkPolicy,
 ) -> Option<NetworkPolicy> {
     use crate::allowlist::DefaultAction;
+    // Report what this table carries and sbx will not apply, before any posture is decided: the
+    // `none`/`shared` arms below return early, and a key passed over in silence reads as a rule in
+    // force. A `groups` table surviving to here belongs to a layer that may not define one (the
+    // global's own is taken out before validation), so it is named as the scope error it is.
+    if !table.groups.is_empty() {
+        warnings.push(format!(
+            "{source_label}: ignoring `groups` under `[network]` — egress groups are defined once \
+             in the global config; reference one from this layer with `@<name>`"
+        ));
+    }
+    for key in table.rest.keys() {
+        warnings.push(format!(
+            "{source_label}: ignoring unknown key `{key}` under `[network]` — sbx does not know \
+             this field (check the spelling; a newer sbx's fields are ignored here on purpose)"
+        ));
+    }
     // The default action: from an explicit `mode`, or — when omitted — inherited from the parent
     // layer. `none`/`shared` are non-filtering postures that carry no rules, so they return early.
     let action = match table.mode.as_deref() {
@@ -4954,13 +4982,13 @@ fn parse_duration(raw: &str) -> Result<Option<std::time::Duration>, String> {
     Ok((secs > 0).then(|| std::time::Duration::from_secs(secs)))
 }
 
-/// Pre-classified reusable egress groups: each `[net.groups]` name mapped to the rules its
+/// Pre-classified reusable egress groups: each `[network.groups]` name mapped to the rules its
 /// entries classify to. Built once from the global config (trusted by location) and consulted
 /// when a `[network]` `allow`/`deny` list references a group with `@<name>`.
 type NetGroups = BTreeMap<String, Vec<crate::allowlist::Rule>>;
 
 /// Classify the entries of one egress list (`allow`, `deny`, or `mute`), expanding a leading
-/// `@<name>` into the rules of that named group (from `[net.groups]`). A malformed entry is dropped
+/// `@<name>` into the rules of that named group (from `[network.groups]`). A malformed entry is dropped
 /// with a warning that names which list it was in, and it is classified *as* that list, so a
 /// refusal that offers a way out (the bare `*` catch-all) offers the one this list's author wanted.
 /// An unknown `@<name>` reference is dropped with a *loud* warning — a miss in a `deny` list
@@ -4983,7 +5011,7 @@ fn classify_entries(
                 Some(group_rules) => rules.extend(group_rules.iter().cloned()),
                 None => warnings.push(format!(
                     "{source_label}: {list} references undefined group `@{name}` — define it under \
-                     `[net.groups]` in the global config, or remove the reference (the entry is \
+                     `[network.groups]` in the global config, or remove the reference (the entry is \
                      ignored, so nothing is {} for it)",
                     match slot {
                         Slot::Deny => "denied",
@@ -5002,7 +5030,22 @@ fn classify_entries(
     rules
 }
 
-/// Validate and pre-classify the global `[net.groups]` table into a [`NetGroups`] map. Each
+/// Take the `groups` table out of a raw `network` field, leaving the posture behind. Returns the
+/// groups when the layer wrote the table form and declared some, and an empty map otherwise (the
+/// bare-string posture has nowhere to put them: TOML cannot extend a string with a sub-table).
+///
+/// Taking rather than reading is what keeps the "declared once, in the global config" rule
+/// enforceable: the one caller allowed to define groups removes them here, so any `groups` still
+/// attached to a table further down is, by construction, one that layer may not define — and
+/// [`validate_network_table`] reports it rather than expanding it.
+fn take_net_groups(field: &mut Option<NetworkField>) -> BTreeMap<String, Vec<String>> {
+    match field {
+        Some(NetworkField::Table(table)) => std::mem::take(&mut table.groups),
+        _ => BTreeMap::new(),
+    }
+}
+
+/// Validate and pre-classify the global `[network.groups]` table into a [`NetGroups`] map. Each
 /// group's name is charset-validated (an invalid name is skipped with a warning), and each entry
 /// is classified like an `allow`/`deny` entry — a malformed one is dropped with a warning naming
 /// the group. A nested reference (`@other` inside a group) is rejected: a group is a flat list of
@@ -5053,7 +5096,7 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
     groups
 }
 
-/// Whether a `[net.groups]` name is a safe, referenceable identifier. A group name is not a path
+/// Whether a `[network.groups]` name is a safe, referenceable identifier. A group name is not a path
 /// component (unlike an app name), so `.`/`..` are harmless; it is charset- and length-bounded so
 /// a reference `@<name>` is unambiguous and the name renders cleanly in warnings and `sbx net`.
 /// Shared with the `sbx net allow/deny` write path so a persisted `@<name>` reference is validated

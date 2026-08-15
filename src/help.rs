@@ -113,7 +113,8 @@ const PAGES: &[Page] = &[
             (
                 "--net <posture>",
                 "one-shot network posture: none | shared | ask | allow | deny; the list forms \
-                 allow=host1,host2 | deny=host1,host2 mean the opposite of the bare word (below)",
+                 allow=host1,host2 | deny=host1,host2 mean the opposite of the bare word (below), \
+                 and each entry may be an `@<group>` reference",
             ),
             ("--gui <none|offscreen|wayland>", "one-shot display posture"),
             (
@@ -187,7 +188,11 @@ const PAGES: &[Page] = &[
             takes (`none`, `shared`, `ask`, `allow`, `deny`), plus two list shorthands that read\n\
             like two of them and mean the reverse: `allow=host1,host2` restricts egress to those\n\
             hosts (a deny-by-default allowlist) where bare `allow` opens by default with an empty\n\
-            deny list, and `deny=host1,host2` mirrors it. So `--net allow` is the posture to reach\n\
+            deny list, and `deny=host1,host2` mirrors it. An entry in either list may be an\n\
+            `@<group>` reference, resolved against the egress groups the global config declares\n\
+            (`sbx net groups`), so a launch names the set the policy already names instead of\n\
+            spelling its hosts out again; a name no group defines is dropped with a warning. So\n\
+            `--net allow` is the posture to reach\n\
             for — the catch-all `--net 'allow=re:.*'` opens the same doors the long way round, and\n\
             differs only in that each request then carries a visible deciding rule in\n\
             `sbx net logs` instead of an `allowed-by-default` verdict. A bare posture replaces the\n\
@@ -351,7 +356,7 @@ const PAGES: &[Page] = &[
         summary: "inspect the egress policy, its rules, and parked `ask` requests",
         options: &[],
         details: "The egress-policy surface. `rules` lists the effective allow/deny rules by source;\n\
-            `groups` lists the reusable `[net.groups]` egress groups (referenced by `@<name>`) and\n\
+            `groups` lists the reusable `[network.groups]` egress groups (referenced by `@<name>`) and\n\
             resolves one to its entries; `allow`/`deny <rule>` persist a rule to config and\n\
             `unallow`/`undeny` take one back out; `mute`/`unmute <rule>` add/remove a\n\
             log-suppression (`dontaudit`) rule; `pending`\n\
@@ -2039,7 +2044,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "-e, --expand",
-                "expand each `[net.groups]` group to its hosts (each tagged `@<group>`); by default a group shows as one `@<name>` row",
+                "expand each `[network.groups]` group to its hosts (each tagged `@<group>`); by default a group shows as one `@<name>` row",
             ),
             ("--json", "emit the mode and rules as JSON"),
         ],
@@ -2048,7 +2053,7 @@ const PAGES: &[Page] = &[
             rule names its layer: an inspected-over-TLS rule shows `https://` (a bare host is https on\n\
             443), an inspected-cleartext rule shows `http://` (default port 80), a raw L4 rule shows\n\
             `tcp://`; a `re:` regex shows neither (its pattern carries its own).\n\
-            A rule that came from a `[net.groups]` group shows as a single `@<name>` reference;\n\
+            A rule that came from a `[network.groups]` group shows as a single `@<name>` reference;\n\
             `--expand` unfolds it to its hosts, each noting its `@<group>` origin (resolve one\n\
             directly with `sbx net groups <name>`). Under `shared`/`none` there are no rules. `--app\n\
             <name>` shows what `sbx app <name>` would launch with — the same effective policy `sbx\n\
@@ -2078,7 +2083,7 @@ const PAGES: &[Page] = &[
             `gui`, `gpu`,\n\
             `audio`, `dbus`, `proc`, `home_scope`) — using one can add a tool, its environment, its\n\
             egress and its credential, never widen what the cage exposes of the host. Bundles are\n\
-            global-only (like `[net.groups]`), so this command has no scope flag. Read-only (except\n\
+            global-only (like `[network.groups]`), so this command has no scope flag. Read-only (except\n\
             `import`), no launch, no nix.",
     },
     Page {
@@ -2136,7 +2141,7 @@ const PAGES: &[Page] = &[
             ),
             ("--json", "emit the groups and their entries as JSON"),
         ],
-        details: "A `[net.groups]` group is a named set of egress entries declared once in the global\n\
+        details: "A `[network.groups]` group is a named set of egress entries declared once in the global\n\
             config and referenced from a `[network]` allow/deny list with `@<name>`, so a set of hosts\n\
             is shared across apps instead of rewritten per profile. Groups are global-only, so this\n\
             command has no scope flag — it always reads the global config. `sbx net groups` lists the\n\
@@ -2147,7 +2152,7 @@ const PAGES: &[Page] = &[
     Page {
         path: &["net", "groups", "export"],
         synopsis: "sbx net groups export [<name>…] [-o|--out <file>]",
-        summary: "write egress groups as a portable [net.groups] fragment",
+        summary: "write egress groups as a portable [network.groups] fragment",
         options: &[
             (
                 "<name>…",
@@ -2155,18 +2160,18 @@ const PAGES: &[Page] = &[
             ),
             ("-o, --out <file>", "write to <file> instead of stdout"),
         ],
-        details: "Emits the reusable egress groups as a portable `[net.groups]` TOML fragment — to stdout\n\
+        details: "Emits the reusable egress groups as a portable `[network.groups]` TOML fragment — to stdout\n\
             by default (`sbx net groups export > groups.toml`), or to `--out <file>`. The inverse of\n\
             `import`. Source comments are not carried (a group is data). Read-only, no launch.",
     },
     Page {
         path: &["net", "groups", "import"],
         synopsis: "sbx net groups import <file> [-f|--force]",
-        summary: "merge a [net.groups] fragment into the global config",
+        summary: "merge a [network.groups] fragment into the global config",
         options: &[
             (
                 "<file>",
-                "a `[net.groups]` fragment (e.g. from `sbx net groups export`)",
+                "a `[network.groups]` fragment (e.g. from `sbx net groups export`)",
             ),
             (
                 "-f, --force",
@@ -2195,7 +2200,7 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "<rule>",
-                "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch",
+                "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[network.groups]` group (defined in the global config), expanded to its entries at launch",
             ),
             ("-l, --local", "write the project .sbx.toml (the default)"),
             ("-g, --global", "write the global sbx.toml"),
@@ -2263,7 +2268,7 @@ const PAGES: &[Page] = &[
         options: &[
             (
                 "<rule>",
-                "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[net.groups]` group (defined in the global config), expanded to its entries at launch",
+                "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[network.groups]` group (defined in the global config), expanded to its entries at launch",
             ),
             ("-l, --local", "write the project .sbx.toml (the default)"),
             ("-g, --global", "write the global sbx.toml"),

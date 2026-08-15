@@ -1,4 +1,4 @@
-# `openrouter` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# `openrouter` — a shared egress GROUP (`[network.groups]`), not a bundle: it carries egress
 # entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an app's
 # allow list — a bundle exists to carry maps (`packages`/`env`/`[secret]`), which a pure host
 # set has none of.
@@ -15,7 +15,7 @@
 # the `OPENROUTER_API_KEY` env placeholder. Groups are global-only (like bundles): an app's
 # allow may reference one, a project may not define one.
 
-[net.groups]
+[network.groups]
 openrouter = [
     # All verbs: chat completions are a POST, the models catalogue and key check are GETs.
     "{*} https://openrouter.ai",

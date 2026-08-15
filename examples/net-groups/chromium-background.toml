@@ -1,4 +1,4 @@
-# `chromium-background` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# `chromium-background` — a shared egress GROUP (`[network.groups]`), not a bundle: it carries egress
 # entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
 # app's — or a bundle's — mute list.
 #
@@ -24,7 +24,7 @@
 # described once. A profile that embeds a browser engine and has not needed it yet simply does not
 # reference it: adding the reference is the way to quiet the lane, not a copy of the hosts.
 
-[net.groups]
+[network.groups]
 chromium-background = [
     "clients2.google.com",                  # component updater
     "android.clients.google.com",           # component / variations fetch

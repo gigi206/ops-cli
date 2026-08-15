@@ -26,7 +26,7 @@ mode  = "deny"
 allow = ["{*} https://orchestrator.example.com"]
 ```
 
-See also: [Apps](apps) · [`[packages]`](packages) · [`[net.groups]`](../networking/groups) · [`sbx bundle`](../cli/bundle).
+See also: [Apps](apps) · [`[packages]`](packages) · [`[network.groups]`](../networking/groups) · [`sbx bundle`](../cli/bundle).
 
 ## What it is for
 
@@ -37,7 +37,7 @@ profile already states. Copied by hand, the two drift: the copy misses a host th
 original added, and the sub-agent fails at runtime in a way that looks like a sandbox
 bug.
 
-A bundle is the one declaration both read. `[net.groups]` already does this for
+A bundle is the one declaration both read. `[network.groups]` already does this for
 egress entries, which are list items a `@<name>` reference can expand into;
 `packages` and `env` are **maps**, with no slot for such a reference: so a bundle is
 the map-side companion, and it carries the egress along.
@@ -163,7 +163,7 @@ Each folded operation is stamped with the bundle it came from, so the origin rea
 in [`sbx task show`](../cli/task)): the fold makes the entry look like the app's
 own, and the bundle is where a reader would go to change it.
 
-A bundle cannot name another bundle. There is no `use` field on a bundle, so nesting, and with it any cycle: is impossible by construction, exactly as a `[net.groups]`
+A bundle cannot name another bundle. There is no `use` field on a bundle, so nesting, and with it any cycle: is impossible by construction, exactly as a `[network.groups]`
 entry may not be a `@other` reference. A bundle's `allow`/`deny`/`mute` entries **may**
 be `@group` references: those are reference sites like an app's own lists, and the
 bundle is folded in before classification, so group expansion still runs once.
@@ -184,7 +184,7 @@ profile can adopt a bundle wholesale and still pin one of its packages.
 ## Global-only, and `use` is a security field
 
 Bundles are honored **only from the global config** (trusted by its location), like
-`[net.groups]`. A project's `[bundle]` is ignored with a warning.
+`[network.groups]`. A project's `[bundle]` is ignored with a warning.
 
 `use` is a **security field**. A bundle carries egress rules and credentials, so an
 untrusted project naming one would be choosing which trusted reach to graft onto an

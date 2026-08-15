@@ -1,4 +1,4 @@
-# `models-catalog` — a shared egress GROUP (`[net.groups]`), not a bundle: it carries egress
+# `models-catalog` — a shared egress GROUP (`[network.groups]`), not a bundle: it carries egress
 # entries ONLY, so the repo's native mechanism is a group referenced with `@<name>` in an
 # app's — or a bundle's — allow list.
 #
@@ -10,7 +10,7 @@
 # global-only (like bundles): an app's or bundle's lists may reference one, a project may not
 # define one.
 
-[net.groups]
+[network.groups]
 models-catalog = [
     "{GET} https://models.dev",
 ]
