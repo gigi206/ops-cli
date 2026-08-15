@@ -15,4 +15,18 @@ targetDir = "target/rust-analyzer"
 # Nothing under these is Rust the analyzer needs: the Docusaurus site, the example app
 # profiles (TOML), and the image assets. Paths are relative to the workspace root and
 # globs are not supported.
-excludeDirs = ["docs-site", "examples", "assets"]
+#
+# `target/test-tmp` is the cage suite's scratch root, and it is listed for a different
+# reason than the three above: not that watching it is useless, but that watching it is
+# harmful. Every run leaves a tree holding a copy of a nix store, a tree that outlives a
+# panic or an interrupted suite, and inotify spends one watch per DIRECTORY -- so the
+# analyzer walks into millions of them and exhausts `fs.inotify.max_user_watches` for the
+# whole machine. What breaks then is not the analyzer: systemd loses the watches it needs
+# to observe a cgroup, so a transient scope never learns its cage emptied, is never
+# collected, and the next invocation asking for that unit name is refused. The suite that
+# fills the directory is the suite the exhaustion breaks.
+#
+# That subtree only, never `target` itself: `targetDir` above puts the analyzer's own
+# build under `target/`, and four `include!(concat!(env!("OUT_DIR"), ...))` sites read
+# generated sources from it. Excluding the parent would hide them and break the crate.
+excludeDirs = ["docs-site", "examples", "assets", "target/test-tmp"]
