@@ -120,12 +120,15 @@ pub(crate) use gc::{
 pub(crate) use launch::{
     SessionHeader, app, attach, detach_log_path, effective_lock_target, gc, parse_session_header,
     projects_list, projects_rm, projects_show, rm_apply as projects_rm_apply, run, run_mise, stop,
-    superseded_reclaimable_hint, upgrade_mise_packages,
+    superseded_reclaimable_hint, upgrade_mise_packages, upgrade_provision_steps,
 };
 pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};
 pub(crate) use netns::run_holder;
 pub(crate) use nixhub::{ToolUpgrade, current_system, parse_nix_tools, upgrade_tools};
+/// The `mise:` tokens a set of packages equips, untrusted ones withheld. Re-exported so `sbx
+/// upgrade --app` can ask the same question the roll asks rather than a lookalike of its own.
+pub(crate) use packages::mise_packages;
 /// The one outcome type the three prebuilt backends share. `DebUpgrade` and its siblings are
 /// aliases of it, so a caller matching on outcomes names the variants through this — a `use` path
 /// resolves through modules, and an alias is not one.

@@ -1537,10 +1537,10 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball] [--project <path>]",
+        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|provision] [-a <name>] [--project <path>]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
-            ("all", "roll every managed channel (the default)"),
+            ("all", "roll every lock-rewriting channel (the default)"),
             (
                 "nix",
                 "the nixpkgs channel (base userland + native nix: packages)",
@@ -1554,12 +1554,39 @@ const PAGES: &[Page] = &[
             ("appimage", "the project's and apps' appimage: packages"),
             ("tarball", "the project's and apps' tarball: packages"),
             (
+                "provision",
+                "re-run the apps' bundle install steps in-cage (not part of `all`)",
+            ),
+            (
+                "-a, --app <name>",
+                "narrow `mise` or `provision` to one app's cage (leaves the engine, the project's nix: tools and the baseline alone)",
+            ),
+            (
                 "--project <path>",
                 "roll another project instead of the current directory",
             ),
         ],
         details: "Rolls managed channels forward by re-resolving and rewriting their locks, so\n\
             versions advance only here, never on an sbx binary update.\n\
+            \n\
+            `provision` is the channel for an agent that rides no `[packages]` backend: its\n\
+            bundle INSTALLS it (a clone and a build, a vendor script), so there is no lock to\n\
+            rewrite and what advances it is running that install again. Each such app's install\n\
+            step re-runs in the app's own cage — its home, packages, egress and environment —\n\
+            with `SBX_UPGRADE=1` set, which is what a step's own \"already installed\" guard\n\
+            yields to. The app's command never runs: the install is the point. It is NOT part of\n\
+            `all`, because unlike a lock rewrite it launches a cage per app and re-downloads;\n\
+            `all` names the apps it left instead.\n\
+            \n\
+            `-a, --app <name>` narrows a roll to one app's cage. It applies to the two in-cage\n\
+            rolls only — `provision` and `mise` — because those are the ones whose unit of work\n\
+            is already one app's own cage; every other target rewrites a project-wide lock\n\
+            host-side, where there is no per-app unit to select, and naming one there is a usage\n\
+            error rather than a flag that quietly rolls the project. Under `--app`, `mise` rolls\n\
+            that app's `mise:` packages and NOTHING else: not the engine, not the project's\n\
+            `nix:` tools, not the project baseline, all of which are project-wide. An app name\n\
+            that selects no work is refused with the reason — unknown, unlaunchable, or riding a\n\
+            backend instead — rather than reported as a clean roll of nothing.\n\
             \n\
             `--project <path>` retargets every roll at another project — exactly as running the\n\
             command from that directory would, with the same trust gate, pin, and locks. The path\n\
@@ -1828,11 +1855,20 @@ const PAGES: &[Page] = &[
                 "--as <name>",
                 "name the imported app (default: the source file's stem)",
             ),
-            ("--force", "overwrite an existing profile of the same name"),
+            (
+                "--force",
+                "overwrite an existing profile of the same name (naming what it drops)",
+            ),
         ],
         details: "The deliberate command IS the consent — an agent in the cage cannot run it, and the\n\
             profile stays inert until `sbx app <name>` launches it. The granted posture is\n\
-            printed so the act is informed. The bytes are copied verbatim.",
+            printed so the act is informed. The bytes are copied verbatim.\n\
+            \n\
+            Without --force, a profile of that name already on disk is refused rather than\n\
+            replaced. With it, the settings the incoming file no longer carries are named, and\n\
+            the bytes it replaced are kept beside it as `<name>.toml.replaced` — a per-machine\n\
+            rule or credential added by hand can be read back from there. That copy is not a\n\
+            profile (only `*.toml` is read) and is removed with `sbx app rm <name>`.",
     },
     Page {
         path: &["app", "export"],
@@ -2080,7 +2116,13 @@ const PAGES: &[Page] = &[
             `--force`; the merge is all-or-nothing. A bundle that would grant egress or a credential is\n\
             named after the import — inspect it with `sbx bundle <name>` before an app uses it. An\n\
             imported bundle is INERT until an app names it in `use`. An app *profile* is a different\n\
-            artifact: import that with `sbx app import`.",
+            artifact: import that with `sbx app import`.\n\
+            \n\
+            A forced overwrite names the entries the incoming fragment no longer declares, and\n\
+            keeps the bundle it replaced beside the config as `<name>.bundle.replaced` — the same\n\
+            portable form `sbx bundle export` writes, so a per-machine entry is read back by\n\
+            importing that file. A bundle lives in a table of the shared config rather than a file\n\
+            of its own, so that copy is the only way back to what was overwritten.",
     },
     Page {
         path: &["net", "groups"],
@@ -2137,7 +2179,13 @@ const PAGES: &[Page] = &[
             `--force`; the merge is all-or-nothing. A group carrying an entry that will not resolve (a\n\
             malformed or nested one) is flagged after the import — inspect it with `sbx net groups\n\
             <name>`. Imported groups are inert until referenced by a `[network]` allow/deny with\n\
-            `@<name>`.",
+            `@<name>`.\n\
+            \n\
+            A forced overwrite names the entries the incoming fragment no longer declares, and\n\
+            keeps the group it replaced beside the config as `<name>.group.replaced` — the same\n\
+            portable form `sbx net groups export` writes, so a per-machine entry is read back by\n\
+            importing that file. A group lives in a key of the shared config rather than a file of\n\
+            its own, so that copy is the only way back to what was overwritten.",
     },
     Page {
         path: &["net", "allow"],

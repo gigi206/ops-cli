@@ -1,7 +1,7 @@
 # `sbx upgrade`
 
 ```
-sbx upgrade [all|nix|mise|flake|deb|appimage|tarball] [--project <path>]
+sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|provision] [-a <name>] [--project <path>]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
@@ -9,16 +9,18 @@ advance **only here**, never on an `sbx` binary update.
 
 | Target | Rolls |
 |---|---|
-| `all` | every managed channel (the default) |
+| `all` | every lock-rewriting channel (the default); `provision` is not part of it |
 | `nix` | the nixpkgs channel (base userland + native `nix:` packages) |
 | `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the [task tool pool](../tasks/execution#the-task-tool-pool) |
 | `flake` | the project's and apps' `flake:` packages |
 | `deb` | the project's and apps' `deb:` packages |
 | `appimage` | the project's and apps' `appimage:` packages |
 | `tarball` | the project's and apps' `tarball:` packages |
+| `provision` | re-run the apps' [bundle install steps](../configuration/bundles#provision) in-cage |
 
 | Flag | Effect |
 |---|---|
+| `-a, --app <name>` | narrow `mise` or `provision` to one app's cage |
 | `--project <path>` | roll another project instead of the current directory |
 
 See also: [Upgrading toolchains](../concepts/upgrade) · [Provisioning](../concepts/provisioning) · [`nixpkgs`](../configuration/nixpkgs) · [`packages`](../configuration/packages).
@@ -35,11 +37,35 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
   packages (an in-cage `mise upgrade` per home) + the declared operations' tool pool
   (host-side, under a `task pool` line), leaving `nixpkgs.lock` intact.
 - `sbx upgrade flake` re-pins the project's and apps' `flake:` packages.
+- `sbx upgrade provision` re-runs the bundle install steps, one cage per app.
 
 A roll that fails with `403 rate limit exceeded` and `github auth: no` is not a
 misconfiguration: mise's `aqua:` backend reads the GitHub API, whose anonymous ceiling is
 60 requests an hour per IP, and a cage inherits no token from your shell by design. See
 [authenticating the GitHub API](../configuration/secret#worked-example-authenticating-the-github-api).
+
+### Rolling one app
+
+`-a, --app <name>` narrows a roll to a single app's cage:
+
+```
+sbx upgrade provision --app trae
+sbx upgrade mise --app openfox
+```
+
+It applies to the two **in-cage** rolls only, `provision` and `mise`, because those are
+the ones whose unit of work is already one app's own cage. Every other target rewrites a
+project-wide lock host-side, where there is no per-app unit to select, so naming an app
+there is a usage error rather than a flag that quietly rolls the whole project.
+
+Under `--app`, `mise` rolls that app's `mise:` packages and nothing else: not the engine,
+not the project's `nix:` tools, not the project baseline. All three are project-wide, and
+rolling them would make a per-app flag do project-wide work.
+
+An app name that selects no work is refused, with which of the three ways it selected
+none: no app carries that name, the app declares no command so it never launches, or it
+rides a `[packages]` backend and `sbx upgrade all` is what advances it. A clean roll of
+nothing would read as success.
 
 ### Targeting another project
 

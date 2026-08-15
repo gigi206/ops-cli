@@ -156,6 +156,11 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "LIBGL_DRIVERS_PATH"
                 | "GBM_BACKENDS_PATH"
                 | "__EGL_VENDOR_LIBRARY_DIRS"
+                // The signal `sbx upgrade provision` raises for a bundle's install step: set, it
+                // tells the step to re-install rather than honor its own "already there" guard. sbx
+                // sets it, so sbx protects it — an untrusted project could otherwise raise it on
+                // every launch and turn each one into a re-download.
+                | "SBX_UPGRADE"
         )
 }
 

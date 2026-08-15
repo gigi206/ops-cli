@@ -78,7 +78,7 @@ struct Prepared {
     /// host-side `[env]` driver.
     engine_ref: String,
     userland: Userland,
-    /// Suppress the per-launch "equipping … via mise use -g" informational line. Set on the batch
+    /// Suppress the per-launch "equipping app packages in-cage" informational line. Set on the batch
     /// `sbx upgrade` path, where it repeats for every app and buries the one thing that matters —
     /// which app actually rolled; left `false` for an ordinary launch, where it tells the user what
     /// is being equipped.
@@ -984,12 +984,13 @@ struct MiseGroup {
 /// by construction, since [`super::packages::mise_packages`] keeps only trusted tokens. Pure
 /// over the resolved config (it clones to merge each app), so the grouping is unit-tested
 /// without launching a cage.
-fn mise_package_groups(cfg: &crate::config::Resolved) -> Vec<MiseGroup> {
+fn mise_package_groups(cfg: &crate::config::Resolved, only: Option<&str>) -> Vec<MiseGroup> {
     let mut groups = Vec::new();
 
-    // The project baseline, equipped in the default shell home.
+    // The project baseline, equipped in the default shell home. Dropped under `--app`: the
+    // baseline is not an app, so keeping it would make the selector roll project-wide work.
     let baseline = super::packages::mise_packages(&cfg.packages);
-    if !baseline.is_empty() {
+    if !baseline.is_empty() && only.is_none() {
         groups.push(MiseGroup {
             home: GroupHome::ProjectDefault,
             cfg: cfg.clone(),
@@ -1000,6 +1001,9 @@ fn mise_package_groups(cfg: &crate::config::Resolved) -> Vec<MiseGroup> {
     // Each app, in its own home. Merging folds the baseline packages in (an app's cage equips
     // both layers), so the token set is exactly the one the app's launch equips.
     for (name, app) in &cfg.apps {
+        if only.is_some_and(|want| want != name) {
+            continue;
+        }
         if app.cmd.is_empty() {
             continue; // an unlaunchable app never equips anything
         }
@@ -1025,7 +1029,7 @@ fn mise_package_groups(cfg: &crate::config::Resolved) -> Vec<MiseGroup> {
 /// How many declared `mise:` packages are withheld for being untrusted — across the project
 /// baseline and each app's own overlay. Only a count: the per-package withholding reason is
 /// already warned on the launch path, so `sbx upgrade` just needs to not read as "none declared".
-fn withheld_mise_packages(cfg: &crate::config::Resolved) -> usize {
+fn withheld_mise_packages(cfg: &crate::config::Resolved, only: Option<&str>) -> usize {
     let untrusted_mise = |pkgs: &[crate::config::Package]| {
         pkgs.iter()
             .filter(|p| {
@@ -1034,12 +1038,24 @@ fn withheld_mise_packages(cfg: &crate::config::Resolved) -> usize {
             })
             .count()
     };
-    untrusted_mise(&cfg.packages)
-        + cfg
-            .apps
-            .values()
-            .map(|app| untrusted_mise(&app.packages))
-            .sum::<usize>()
+    // Under `--app`, count what that app's cage would have equipped and nothing else — both its own
+    // packages and the baseline it folds in. Reporting the project's total there would attribute
+    // another app's withheld package to this roll.
+    let baseline = untrusted_mise(&cfg.packages);
+    match only {
+        Some(name) => match cfg.apps.get(name) {
+            Some(app) => baseline + untrusted_mise(&app.packages),
+            None => 0,
+        },
+        None => {
+            baseline
+                + cfg
+                    .apps
+                    .values()
+                    .map(|app| untrusted_mise(&app.packages))
+                    .sum::<usize>()
+        }
+    }
 }
 
 /// The `mise upgrade <tokens>` command for one roll group. The rolled tokens are the group's
@@ -1051,6 +1067,38 @@ fn withheld_mise_packages(cfg: &crate::config::Resolved) -> usize {
 /// positionally (no shell injection — only the sbx-owned mise path and fixed cage data dir are
 /// interpolated), and `exec` keeps the roll the cage's main process. Other runtimes have a single
 /// pool (the home), already the ambient primary, so the plain command runs unwrapped.
+///
+/// `--bump` is the other half of the launch's `use -g --pin`. A plain `mise upgrade` keeps whatever
+/// range the config states, and after a pin that range is one exact version: the roll would report
+/// every tool as already up to date and move nothing, which is a shipped command going quiet.
+/// `--bump` takes the latest and rewrites the pin, so the version advances here and only here —
+/// which is the whole contract. Measured against a config still saying `latest` (every app before
+/// its first launch on this code): `--bump` behaves exactly as the plain form did, so the change
+/// carries no regression for a pool that has not been pinned yet.
+/// The mise invocation that equips an app's `[packages] mise:` tools, and the one that rolls them.
+///
+/// They are a pair and are kept side by side because neither is correct alone: `--pin` freezes the
+/// cage's config at the installed version (without it the tool's shim re-resolves on every exec and
+/// the app stops launching the day upstream publishes), and `--bump` is what still advances an
+/// exact pin (a plain `upgrade` keeps the config's range, and after a pin that range is one
+/// version, so the roll would report everything up to date and move nothing). Named constants
+/// rather than literals at the call sites, so the pairing is one thing a test can hold.
+const MISE_EQUIP_VERB: &str = "use -g --pin";
+const MISE_ROLL_FLAG: &str = "--bump";
+
+/// The line a launch prints before equipping an app's `mise:` tools.
+///
+/// Built here rather than formatted at the call site so the announcement and the invocation read
+/// from the same constant: a launch that names one command and runs another sends whoever reads the
+/// transcript looking for the wrong thing, and that is precisely what a hand-written copy of the
+/// verb drifts into.
+fn equip_announcement(tokens: &[String]) -> String {
+    format!(
+        "sbx: equipping app packages in-cage via mise {MISE_EQUIP_VERB}: {}",
+        tokens.join(", ")
+    )
+}
+
 fn mise_upgrade_cmd(
     runtime: binds::Runtime,
     mise: &Path,
@@ -1060,7 +1108,7 @@ fn mise_upgrade_cmd(
     if matches!(runtime, binds::Runtime::GlobalApp(_)) {
         let data_dir = binds::mise_app_global_data_dir();
         let script = format!(
-            "MISE_DATA_DIR='{data_dir}' exec {mise} upgrade \"$@\"",
+            "MISE_DATA_DIR='{data_dir}' exec {mise} upgrade {MISE_ROLL_FLAG} \"$@\"",
             mise = mise.to_string_lossy(),
         );
         let mut cmd = vec![
@@ -1073,16 +1121,22 @@ fn mise_upgrade_cmd(
         cmd.extend(tokens.iter().map(OsString::from));
         cmd
     } else {
-        let mut cmd = vec![mise.as_os_str().to_os_string(), OsString::from("upgrade")];
+        let mut cmd = vec![
+            mise.as_os_str().to_os_string(),
+            OsString::from("upgrade"),
+            OsString::from(MISE_ROLL_FLAG),
+        ];
         cmd.extend(tokens.iter().map(OsString::from));
         cmd
     }
 }
 
 /// Roll the project's and its apps' `mise:` `[packages]` forward, in-cage. A `mise:` package is
-/// equipped by `mise use -g <token>` at launch and then frozen at the installed version (the
-/// floating `latest` request stays satisfied, so a later launch does not re-resolve), so
-/// advancing it means running `mise upgrade <token>` in the same cage — the equip environment,
+/// equipped by `mise use -g --pin <token>` at launch and is frozen there at the installed version —
+/// frozen *because* of the pin, which writes the resolved version into the cage's config so a later
+/// launch has nothing left to resolve. A floating request would not have held: the tool on the PATH
+/// is a mise shim that re-resolves it on every exec. So advancing the version means running
+/// `mise upgrade --bump <token>` in the same cage — the equip environment,
 /// so the fetch rides the app's egress allowlist. Generic over [`mise_package_groups`]: the
 /// project baseline (its default home) and each app (its own home), no app special-cased.
 /// Trusted-only by construction. Returns whether every group rolled cleanly; a group that fails
@@ -1098,13 +1152,14 @@ pub(crate) fn upgrade_mise_packages(
     cwd: &Path,
     cfg: &crate::config::Resolved,
     pal: &crate::style::Palette,
+    only: Option<&str>,
 ) -> bool {
     let (h, warn, dim, r, ok_c) = (pal.head, pal.warn, pal.dim, pal.reset, pal.ok);
     println!("{h}sbx upgrade — mise packages{r}");
-    let groups = mise_package_groups(cfg);
+    let groups = mise_package_groups(cfg, only);
     // Surface withheld (untrusted) `mise:` packages so an untrusted project does not silently
     // read as "nothing declared" — parity with the `nix:` tools path, which warns the same.
-    let withheld = withheld_mise_packages(cfg);
+    let withheld = withheld_mise_packages(cfg, only);
     if withheld > 0 {
         println!(
             "{}",
@@ -1150,7 +1205,7 @@ pub(crate) fn upgrade_mise_packages(
         }
     };
 
-    // In this batch context the per-app "equipping … via mise use -g" line `build` prints repeats
+    // In this batch context the per-app "equipping app packages in-cage" line `build` prints repeats
     // for every app and buries the roll result — silence it (the report names each app anyway).
     prep.quiet_equip = true;
 
@@ -1333,6 +1388,209 @@ pub(crate) fn upgrade_mise_packages(
     };
     println!("  {hue}{recap}{r}");
     ok
+}
+
+/// One in-cage provision roll: the app whose bundles carry install steps, the merged config to
+/// launch it with, and the steps to re-run.
+struct ProvisionGroup {
+    home: GroupHome,
+    cfg: crate::config::Resolved,
+    steps: Vec<crate::config::BundleProvision>,
+}
+
+/// The apps whose `use`d bundles carry an install step. Only apps: a `provision` is a bundle's
+/// field, and a bundle only ever folds into an app, so there is no project-baseline group here —
+/// the shape [`mise_package_groups`] needs. An app with no command is omitted (it can never
+/// launch, so nothing installs for it), and the fold has already dropped the steps of an untrusted
+/// layer, so this is trusted-only by construction. Pure over the resolved config, so the grouping
+/// is unit-tested without launching a cage.
+fn provision_groups(cfg: &crate::config::Resolved, only: Option<&str>) -> Vec<ProvisionGroup> {
+    let mut groups = Vec::new();
+    for (name, app) in &cfg.apps {
+        if only.is_some_and(|want| want != name) {
+            continue;
+        }
+        if app.cmd.is_empty() || app.provisions.is_empty() {
+            continue;
+        }
+        let home = match app.home_scope {
+            crate::config::AppHomeScope::Global => GroupHome::GlobalApp(name.clone()),
+            crate::config::AppHomeScope::Project => GroupHome::ProjectApp(name.clone()),
+        };
+        let steps = app.provisions.clone();
+        let mut merged = cfg.clone();
+        merged.merge_app(app.clone());
+        groups.push(ProvisionGroup {
+            home,
+            cfg: merged,
+            steps,
+        });
+    }
+    groups
+}
+
+/// Re-run each app's bundle install steps with `SBX_UPGRADE` raised — the roll for an agent that
+/// rides no `[packages]` backend.
+///
+/// A `nix:`/`mise:`/`deb:` package advances by re-resolving a lock; an agent its bundle *installs*
+/// (a clone and a build, a vendor script) has no lock to rewrite, so what advances it is running
+/// that install again. The step already carries its own "already installed" guard — that is what
+/// keeps a launch from re-installing every time — so the roll raises `SBX_UPGRADE=1` in the cage
+/// and the step's guard is written to yield to it. A step that ignores the variable simply reports
+/// as up to date, which is honest: nothing moved.
+///
+/// The cage is the app's own (its home, packages, egress, environment), so what the roll installs
+/// is exactly what the next launch finds. The app's command never runs: the install is the point,
+/// and launching the agent would make a version roll a launch. Returns whether every group ran
+/// cleanly; a group that fails makes this `false` but never aborts the others.
+pub(crate) fn upgrade_provision_steps(
+    cwd: &Path,
+    cfg: &crate::config::Resolved,
+    pal: &crate::style::Palette,
+    only: Option<&str>,
+) -> bool {
+    let (h, warn, dim, r, ok_c) = (pal.head, pal.warn, pal.dim, pal.reset, pal.ok);
+    println!("{h}sbx upgrade — bundle install steps{r}");
+    let groups = provision_groups(cfg, only);
+    if groups.is_empty() {
+        println!("  {dim}no bundle install steps to re-run.{r}");
+        return true;
+    }
+
+    // Only now, with work to do, take on the sandbox prerequisites — against `cwd`, so `--project`
+    // retargets these cages the way it retargets every other roll.
+    let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none()) {
+        Ok(p) => p,
+        Err(_) => {
+            // prepare_in already printed the pointed reason (missing bwrap/userns/nix).
+            crate::diag::warn("install steps: skipped — no usable sandbox; see `sbx doctor`");
+            return true;
+        }
+    };
+    prep.quiet_equip = true;
+
+    let width = groups
+        .iter()
+        .map(|g| g.home.name().chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut ok = true;
+    let (mut ran, mut skipped, mut failed) = (Vec::new(), 0usize, 0usize);
+
+    for group in groups {
+        let ProvisionGroup { home, cfg, steps } = group;
+        let name = home.name();
+        // An isolated cage cannot fetch, and every install step fetches something. Skipping is the
+        // declared posture, not a failure — the same call `upgrade_mise_packages` makes.
+        if matches!(cfg.network, crate::config::NetworkPolicy::Isolated) {
+            println!(
+                "{}",
+                roll_line(
+                    &name,
+                    width,
+                    &format!("{dim}network \"none\" — skipped{r}"),
+                    pal
+                )
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let runtime = home.runtime();
+        let mut cfg = cfg;
+        cfg.warnings.clear();
+        // The signal the steps' guards read. It rides the app's `[env]` layer, so it reaches the
+        // cage the way every other declared variable does — never on the bwrap argv.
+        cfg.env.push(("SBX_UPGRADE".to_string(), "1".to_string()));
+        prep.cfg = cfg;
+
+        let (spec, guard) = match build(&prep, runtime, provision_only_cmd(&steps)) {
+            Ok(v) => v,
+            Err(_) => {
+                println!(
+                    "{}",
+                    roll_line(&name, width, &format!("{warn}failed to launch{r}"), pal)
+                );
+                failed += 1;
+                ok = false;
+                continue;
+            }
+        };
+        // Fork-and-wait so the next group runs; the guard holds the proxy/forwarder across the
+        // fetch. The output is captured and shown only on failure — an install is verbose, and on
+        // a clean run the line above already says what happened.
+        let (code, out) = run_captured(&prep.bwrap, &spec, &prep.cfg.limits);
+        drop(guard);
+        if code == 0 {
+            let bundles = step_bundles(&steps);
+            println!(
+                "{}",
+                roll_line(
+                    &name,
+                    width,
+                    &format!("{ok_c}re-installed ({bundles}){r}"),
+                    pal
+                )
+            );
+            ran.push(name);
+        } else {
+            println!(
+                "{}",
+                roll_line(
+                    &name,
+                    width,
+                    &format!("{warn}install step exited {code}{r}"),
+                    pal
+                )
+            );
+            crate::diag::warn(&format!("`{}`: install step exited {code}", home.label()));
+            for line in out.lines() {
+                eprintln!("       {line}");
+            }
+            failed += 1;
+            ok = false;
+        }
+    }
+
+    let recap = provision_roll_recap(&ran, skipped, failed);
+    let hue = if failed > 0 {
+        warn
+    } else if ran.is_empty() {
+        dim
+    } else {
+        ok_c
+    };
+    println!("  {hue}{recap}{r}");
+    ok
+}
+
+/// The bundles a group's steps came from, named in order and each named once — an app may `use`
+/// several bundles that install, and the roll line is where a reader learns which ran.
+fn step_bundles(steps: &[crate::config::BundleProvision]) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for step in steps {
+        if !names.contains(&step.bundle.as_str()) {
+            names.push(&step.bundle);
+        }
+    }
+    names.join(", ")
+}
+
+/// The closing line of a provision roll: which apps re-installed, and a tally of the rest.
+fn provision_roll_recap(ran: &[String], skipped: usize, failed: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if ran.is_empty() {
+        parts.push("nothing re-installed".to_string());
+    } else {
+        parts.push(format!("re-installed: {}", ran.join(", ")));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    parts.join(" · ")
 }
 
 /// The programs the in-cage task client is written against: the **cage's** shell, its `socat`, and
@@ -4137,6 +4395,12 @@ fn build(
                         wrap_mise_equip(
                             &prep.userland.mise_bin,
                             &prep.userland.shell_bin,
+                            // `install`, and deliberately no `--pin` here: this lane equips the
+                            // tools the PROJECT's own `.mise.toml` asks for, and that file belongs
+                            // to the user. `install` reads it and writes nothing; pinning would
+                            // rewrite a version the project chose to leave floating, in a file sbx
+                            // does not own. The pin belongs to lane 1 below, whose config file is
+                            // the cage's own and is sbx's to write.
                             "install",
                             &auto_equip,
                             // Lane 2 (project `.mise.toml` tools) runs under the ambient primary —
@@ -4159,10 +4423,7 @@ fn build(
             }
             if !global_mise.is_empty() {
                 if !prep.quiet_equip {
-                    eprintln!(
-                        "sbx: equipping app packages in-cage via mise use -g: {}",
-                        global_mise.join(", ")
-                    );
+                    eprintln!("{}", equip_announcement(&global_mise));
                 }
                 wraps.push((
                     WrapLayer::MiseEquip,
@@ -4170,7 +4431,18 @@ fn build(
                         wrap_mise_equip(
                             &prep.userland.mise_bin,
                             &prep.userland.shell_bin,
-                            "use -g",
+                            // `--pin` writes the RESOLVED version into the cage's mise config
+                            // instead of the floating request. Without it the config keeps saying
+                            // `latest`, and the tool on the cage PATH is a shim — a symlink back to
+                            // mise — which re-resolves that request on every exec: the day upstream
+                            // publishes a version the pool does not hold, the shim refuses to run
+                            // and the app stops launching, with nothing about the cage having
+                            // changed. Pinning is what actually freezes a launch at the installed
+                            // version. Its other half is `--bump` on the roll (see
+                            // [`mise_upgrade_cmd`]): an exact pin is a range `mise upgrade` would
+                            // consider already satisfied, so without it the roll would go quiet.
+                            // Neither half works alone.
+                            MISE_EQUIP_VERB,
                             &global_mise,
                             // Pin the install to the app-global home pool for a global app (see
                             // above); None for other runtimes, where the ambient primary is already
@@ -6031,15 +6303,7 @@ fn compose_provisioned_cmd(
     provisions: &[crate::config::BundleProvision],
     cmd: Vec<OsString>,
 ) -> Vec<OsString> {
-    let mut script = String::new();
-    for step in provisions {
-        // Each step is itself an argv. Rendered through `shell_quote` so a step's own arguments
-        // survive the shell that chains them, for the same reason the app's argv is not pasted.
-        let rendered: Vec<String> = step.argv.iter().map(|a| shell_quote(a)).collect();
-        script.push_str(&rendered.join(" "));
-        script.push_str(" && ");
-    }
-    script.push_str("exec \"$@\"");
+    let script = format!("{} && exec \"$@\"", provision_chain(provisions));
     let mut out: Vec<OsString> = vec![
         OsString::from("bash"),
         OsString::from("-c"),
@@ -6049,6 +6313,43 @@ fn compose_provisioned_cmd(
     ];
     out.extend(cmd);
     out
+}
+
+/// The install steps as one `&&` chain, without the app's command.
+///
+/// Each step is itself an argv, rendered through `shell_quote` so a step's own arguments survive
+/// the shell that chains them: an argument holding a space, a quote or a `$` is data, and a shell
+/// that re-parsed it would read it as syntax. `&&` carries the same fail-closed rule in both
+/// callers — a step that exits non-zero stops the chain.
+fn provision_chain(provisions: &[crate::config::BundleProvision]) -> String {
+    provisions
+        .iter()
+        .map(|step| {
+            step.argv
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+/// The install steps alone, as a cage command — what `sbx upgrade provision` runs.
+///
+/// The same chain the launch composes, minus the `exec "$@"` tail: the point of an upgrade run is
+/// the install, and running the agent afterwards would turn a version roll into a launch. The steps
+/// see the app's own cage (its home, packages, egress and environment), so what they install is
+/// what the next launch finds; `SBX_UPGRADE` is what tells them to re-install rather than honor
+/// their own "already installed" guard, and it is set by the caller, not here.
+fn provision_only_cmd(provisions: &[crate::config::BundleProvision]) -> Vec<OsString> {
+    vec![
+        OsString::from("bash"),
+        OsString::from("-c"),
+        OsString::from(provision_chain(provisions)),
+        // `$0` — a label; the chain takes no positional arguments.
+        OsString::from("sbx-provision"),
+    ]
 }
 
 /// Quote one argv element for the shell that chains the install steps: single quotes, with an
@@ -6560,6 +6861,112 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         }
     }
 
+    /// The roll's unit of work: only apps, only those whose bundles install, each in the home its
+    /// launch would use. A `provision` is a bundle's field and a bundle only folds into an app, so
+    /// unlike the `mise:` roll there is no project-baseline group to find here.
+    #[test]
+    fn provision_groups_takes_only_the_apps_whose_bundles_install() {
+        use crate::config::{AppHomeScope, BundleProvision};
+        let step = |bundle: &str| BundleProvision {
+            bundle: bundle.into(),
+            argv: vec!["bash".into(), "-c".into(), "install".into()],
+        };
+        let mut cfg = resolved(None, None);
+        let mut apps = std::collections::BTreeMap::new();
+
+        let mut installs = app_overlay(&["alpha"], AppHomeScope::Global, vec![]);
+        installs.provisions = vec![step("alpha-bundle")];
+        apps.insert("alpha".to_string(), installs);
+
+        // Rides a backend: nothing to re-run.
+        apps.insert(
+            "beta".to_string(),
+            app_overlay(&["beta"], AppHomeScope::Project, vec![]),
+        );
+
+        // Declares a step but has no command: never launchable, so nothing installs for it.
+        let mut unlaunchable = app_overlay(&[], AppHomeScope::Global, vec![]);
+        unlaunchable.provisions = vec![step("ghost")];
+        apps.insert("gamma".to_string(), unlaunchable);
+
+        // Two bundles that install, in `use` order, in a per-project home.
+        let mut two = app_overlay(&["delta"], AppHomeScope::Project, vec![]);
+        two.provisions = vec![step("first"), step("second")];
+        apps.insert("delta".to_string(), two);
+        cfg.apps = apps;
+
+        let groups = provision_groups(&cfg, None);
+        assert_eq!(groups.len(), 2, "only alpha and delta install");
+        assert!(matches!(&groups[0].home, GroupHome::GlobalApp(n) if n == "alpha"));
+        assert_eq!(groups[0].steps.len(), 1);
+        assert!(matches!(&groups[1].home, GroupHome::ProjectApp(n) if n == "delta"));
+        assert_eq!(
+            groups[1].steps.len(),
+            2,
+            "both bundles' steps, in use order"
+        );
+        assert_eq!(step_bundles(&groups[1].steps), "first, second");
+        // A bundle named twice contributes one name to the line, not two.
+        assert_eq!(step_bundles(&[step("dup"), step("dup")]), "dup");
+
+        // `--app <name>` narrows the roll to that app's cage and takes nothing else with it.
+        let only = provision_groups(&cfg, Some("delta"));
+        assert_eq!(only.len(), 1, "the selector takes one app, not two");
+        assert!(matches!(&only[0].home, GroupHome::ProjectApp(n) if n == "delta"));
+        assert_eq!(only[0].steps.len(), 2, "that app keeps all of its steps");
+        // A name the selector matches but that has nothing to roll still yields no group here; the
+        // CLI is what refuses it by name, so this stays a plain filter.
+        assert!(provision_groups(&cfg, Some("beta")).is_empty());
+        assert!(provision_groups(&cfg, Some("nope")).is_empty());
+    }
+
+    /// The roll runs the install and stops there: chaining the app's command onto it would make a
+    /// version roll a launch. The steps are quoted for the same reason the launch quotes them.
+    #[test]
+    fn an_install_roll_runs_the_steps_alone_and_never_the_app() {
+        use crate::config::BundleProvision;
+        let steps = vec![
+            BundleProvision {
+                bundle: "alpha".into(),
+                argv: vec!["bash".into(), "-c".into(), "first $HOME".into()],
+            },
+            BundleProvision {
+                bundle: "beta".into(),
+                argv: vec!["installer".into(), "it's here".into()],
+            },
+        ];
+        let cmd = provision_only_cmd(&steps);
+        assert_eq!(cmd[0], OsString::from("bash"));
+        assert_eq!(cmd[1], OsString::from("-c"));
+        let script = cmd[2].to_string_lossy().to_string();
+        assert!(
+            !script.contains("exec"),
+            "the app's command must not be chained on: {script}"
+        );
+        assert!(
+            script.contains("'first $HOME'") && script.contains(r#"'it'\''s here'"#),
+            "each argument stays data, not shell syntax: {script}"
+        );
+        assert_eq!(
+            script.matches("&&").count(),
+            1,
+            "two steps, one `&&` — a failed step stops the chain: {script}"
+        );
+        assert_eq!(cmd.len(), 4, "a label for $0 and nothing positional");
+    }
+
+    #[test]
+    fn the_install_roll_recap_names_what_ran_and_tallies_the_rest() {
+        assert_eq!(
+            provision_roll_recap(&["trae".to_string(), "odysseus".to_string()], 0, 0),
+            "re-installed: trae, odysseus"
+        );
+        assert_eq!(
+            provision_roll_recap(&[], 2, 1),
+            "nothing re-installed · 2 skipped · 1 failed"
+        );
+    }
+
     #[test]
     fn mise_package_groups_covers_the_baseline_and_each_app_generically() {
         use crate::config::AppHomeScope;
@@ -6599,7 +7006,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         );
         cfg.apps = apps;
 
-        let groups = mise_package_groups(&cfg);
+        let groups = mise_package_groups(&cfg, None);
         // Three groups: the project baseline plus each launchable app — beta inherits the
         // baseline `mise:` tool (an app's cage equips both layers), so even a nix-only app gets
         // a group. gamma has no command, so it is skipped.
@@ -6627,6 +7034,29 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
 
         // The command-less app produced no group.
         assert!(!groups.iter().any(|g| g.home.label().contains("gamma")));
+
+        // `--app <name>` narrows to that app's cage AND drops the project baseline, which is not
+        // an app: keeping it would make a per-app flag roll project-wide work. The app's own group
+        // still carries the merged token set, since its cage equips both layers.
+        let only = mise_package_groups(&cfg, Some("alpha"));
+        assert_eq!(only.len(), 1, "one app, and no baseline group beside it");
+        assert!(matches!(&only[0].home, GroupHome::GlobalApp(n) if n == "alpha"));
+        assert!(only[0].tokens.contains(&"other-tool".to_string()));
+        assert!(only[0].tokens.contains(&"aqua:foo".to_string()));
+        assert!(mise_package_groups(&cfg, Some("gamma")).is_empty());
+        assert!(mise_package_groups(&cfg, Some("nope")).is_empty());
+
+        // The withheld count follows the selector: a roll narrowed to one app must not report a
+        // package withheld from a different one, or the line contradicts what the roll just did.
+        // The fixture's untrusted `mise:` package is the project baseline's, which every app's
+        // cage folds in — so it counts for an app, and once, not once per app.
+        assert_eq!(withheld_mise_packages(&cfg, None), 1);
+        assert_eq!(withheld_mise_packages(&cfg, Some("alpha")), 1);
+        assert_eq!(
+            withheld_mise_packages(&cfg, Some("nope")),
+            0,
+            "a name no app carries withholds nothing"
+        );
     }
 
     #[test]
@@ -7039,6 +7469,74 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         assert_eq!(argv[5], OsString::from("demo-app"));
     }
 
+    /// The launch freezes a `mise:` package at its installed version and the roll is what moves it.
+    /// Both halves are needed and each breaks the other's guarantee when removed, so they are
+    /// asserted together rather than one per test.
+    #[test]
+    fn a_mise_package_is_pinned_at_equip_and_only_a_bump_roll_moves_it() {
+        // Equip: the resolved version is written into the cage's config. Without this the config
+        // keeps the floating request, the tool's mise shim re-resolves it on every exec, and the
+        // app stops launching as soon as upstream publishes a version the pool does not hold.
+        assert!(
+            MISE_EQUIP_VERB.contains("--pin"),
+            "the equip must pin, or a launch re-resolves: {MISE_EQUIP_VERB}"
+        );
+        assert!(
+            MISE_EQUIP_VERB.starts_with("use -g"),
+            "the app lane equips globally: {MISE_EQUIP_VERB}"
+        );
+
+        // Roll: an exact pin is a range a plain `mise upgrade` treats as already satisfied, so
+        // without `--bump` the shipped roll would report every tool up to date and move nothing.
+        let mise = PathBuf::from("/nix/store/mise/bin/mise");
+        let bash = PathBuf::from("/nix/store/bash/bin/bash");
+        let tokens = vec!["aqua:example/demo-tool".to_string()];
+
+        let plain = mise_upgrade_cmd(binds::Runtime::ProjectDefault, &mise, &bash, &tokens);
+        assert_eq!(plain[1], OsString::from("upgrade"));
+        assert_eq!(
+            plain[2],
+            OsString::from("--bump"),
+            "a pinned tool only advances with --bump"
+        );
+        assert_eq!(plain[3], OsString::from("aqua:example/demo-tool"));
+
+        // The same on the global-app lane, where the roll runs through a shell to pin the pool.
+        let global = mise_upgrade_cmd(binds::Runtime::GlobalApp("demo-app"), &mise, &bash, &tokens);
+        assert!(
+            global[2]
+                .to_string_lossy()
+                .contains("upgrade --bump \"$@\""),
+            "the global lane bumps too: {}",
+            global[2].to_string_lossy()
+        );
+    }
+
+    /// What the launch says it is about to do is what it does.
+    ///
+    /// The announcement carried a hand-written copy of the verb, so it kept saying `mise use -g`
+    /// after the equip started pinning: a reader who reproduced the printed command by hand got a
+    /// floating install and no hint that the two had parted. Reading both from one constant is the
+    /// fix; this holds it there.
+    #[test]
+    fn the_equip_line_names_the_invocation_it_runs() {
+        let line = equip_announcement(&[
+            "aqua:example/demo-tool".to_string(),
+            "npm:demo-cli".to_string(),
+        ]);
+
+        assert!(
+            line.contains(&format!("mise {MISE_EQUIP_VERB}:")),
+            "the printed verb must be the one the equip uses: {line}"
+        );
+        // The tools are named too, and separately: this line is how a user learns which package a
+        // slow launch is fetching.
+        assert!(
+            line.contains("aqua:example/demo-tool, npm:demo-cli"),
+            "{line}"
+        );
+    }
+
     #[test]
     fn wrap_mise_equip_pins_the_app_global_data_dir_for_the_global_lane() {
         // For a global app, Lane-1 `mise use -g` is pinned to the app-global home pool so the app
@@ -7099,7 +7597,11 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             let c = mise_upgrade_cmd(rt, &mise, &bash, &tokens);
             assert_eq!(c[0], OsString::from("/nix/store/mise/bin/mise"));
             assert_eq!(c[1], OsString::from("upgrade"));
-            assert_eq!(c[2], OsString::from("aqua:example/demo-tool"));
+            // `--bump` sits between the verb and the tokens on this lane too: the launch pins the
+            // config at the installed version, and a pinned range is one a plain roll would call
+            // already satisfied.
+            assert_eq!(c[2], OsString::from("--bump"));
+            assert_eq!(c[3], OsString::from("aqua:example/demo-tool"));
         }
     }
 

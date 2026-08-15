@@ -90,10 +90,28 @@ codex = "mise:aqua:openai/codex"
 tool  = "mise:npm:some-cli"
 ```
 
-Equipped **in-cage** with `mise use -g <token>` at launch, fetched upstream-direct
+Equipped **in-cage** with `mise use -g --pin <token>` at launch, fetched upstream-direct
 (so it is fresher than nixpkgs but the first launch needs network). Any mise backend
 works: `aqua:`, `github:`, `npm:`, `cargo:`, a plain registry token, etc. Advances
 with [`sbx upgrade mise`](../concepts/upgrade).
+
+**The equip pins; the roll is what moves the pin.** `--pin` writes the version it actually
+installed into the cage's own mise config, in place of the floating request you wrote. This
+matters because the tool on the cage's `PATH` is a mise *shim*, which re-resolves whatever
+that config says on every exec. Left floating, an app launches only for as long as
+upstream's current version is the one already in the pool, and stops launching the day a new
+one is published, with nothing about the cage having changed.
+[`sbx upgrade mise`](../concepts/upgrade) is the other half of the pair: it advances the pin
+when you ask it to, and only then.
+
+**The pin covers the tools the profile declares today.** A launch rewrites the entry for
+each tool it equips and leaves every other line of that config alone, including one an
+earlier version of the profile wrote. A tool you have since removed from `[packages]` (or
+from a [bundle](bundles) the profile stopped naming) therefore keeps its old floating entry,
+and its shim stays on the cage's `PATH`. That is deliberate: an agent may equip its own
+tools inside its cage, and a launch that pruned every line it did not recognise would delete
+them. To clear the residue, edit `.config/mise/config.toml` in the app's home (`sbx path`
+lists it) or rebuild the home from scratch with [`sbx app rm --purge`](../cli/app).
 
 Note: an `npm:` tool needs `/usr/bin/env` (the cage provides a synthetic one) and, if
 it is pure JS, a node runtime: declare `nodejs = "nix:nodejs"` alongside it.

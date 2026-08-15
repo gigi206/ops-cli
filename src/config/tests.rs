@@ -3850,6 +3850,9 @@ fn reserved_key_predicate_covers_the_ld_family_and_startup_hooks() {
         // lowercase variant), so an off-case spelling is reserved too.
         "ssl_cert_file",
         "Curl_CA_Bundle",
+        // the signal `sbx upgrade provision` raises for a bundle's install step: sbx sets it, so
+        // an untrusted project may not, or every launch would re-run the install as a download.
+        "SBX_UPGRADE",
     ] {
         assert!(is_reserved_env_key(k), "{k} should be reserved");
     }
@@ -8360,6 +8363,63 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
     assert!(
         checked >= 36,
         "expected the shipped agent bundles to be checked, saw {checked}"
+    );
+}
+
+#[test]
+fn every_shipped_install_step_yields_to_the_upgrade_signal() {
+    // `sbx upgrade provision` re-runs a bundle's install step in the app's cage with
+    // `SBX_UPGRADE=1` set. The step's own "already installed" guard is what keeps an ordinary
+    // launch from re-installing every time, so a step that never reads that variable takes the
+    // guard's short path and does nothing — while the roll, which only sees exit status 0, prints
+    // `re-installed`. The channel would be inert for that app and say the opposite, which is
+    // exactly what this guard exists to prevent for the steps this repository ships.
+    //
+    // The variable is looked for in the step's own argv rather than in the file text, and the
+    // script's whole-line shell comments are dropped before the search. Both filters are load
+    // bearing and were each proven by mutation: every bundle carrying a step explains the channel
+    // in a TOML comment above it *and* in a shell comment inside it, so a search over either the
+    // file or the raw script passes on a script whose guard no longer reads the variable. A
+    // trailing comment on a line of code is not stripped — it would take a shell parser to tell
+    // one from a `#` inside a string, and a guard that reads the variable on the same line is not
+    // the regression this is watching for.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0;
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+        let Some(provision) = raw
+            .bundle
+            .get(&name)
+            .and_then(|bundle| bundle.provision.clone())
+        else {
+            continue;
+        };
+        let script: String = provision
+            .into_argv()
+            .join(" ")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            script.contains("SBX_UPGRADE"),
+            "`examples/bundle/{name}.toml` carries a `provision` whose script never reads \
+             SBX_UPGRADE — `sbx upgrade provision` would run it, its own guard would skip the \
+             install, and the roll would still report it as re-installed"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 8,
+        "expected the shipped install steps to be checked, saw {checked}"
     );
 }
 

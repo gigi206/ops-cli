@@ -113,6 +113,48 @@ back.
 This is the one part sbx does not own, and it would take one thing to change that: a way
 for a step to state the path it produces. Until then, the step owns its guard.
 
+### Rolling an install step forward
+
+A step's guard is what keeps a launch from re-installing, which also means the agent it
+installs never moves. That is what [`sbx upgrade provision`](../cli/upgrade) is for: it
+re-runs each app's install steps in the app's own cage, with `SBX_UPGRADE=1` set. So the
+guard is written to yield to it:
+
+```toml
+provision = ["bash", "-c", "[ -e \"$HOME/.local/bin/tool\" ] && [ -z \"${SBX_UPGRADE:-}\" ] || install-tool"]
+```
+
+The app's command never runs during a roll: the install is the point. A step that ignores
+the variable simply reports as up to date, which is honest, nothing moved. `SBX_UPGRADE`
+is set by sbx, so it is a reserved environment key: an untrusted project cannot raise it
+and turn every launch into a re-download.
+
+The channel is deliberately **not** part of `sbx upgrade all`. Every other channel rewrites
+a lock; this one launches a cage per app and re-runs a clone, a build or a vendor script,
+so it is asked for by name. `all` names the apps it left behind instead.
+
+Guard on what has to **work**, not on what has to exist. A step's own guard is the only thing
+standing between a launch and a re-install, so it decides what counts as installed, and a path
+is a weak answer whenever the thing behind it points into the nix store. A Python virtualenv is
+the clear case: its `bin/python` is a symlink into the store, so an interpreter that moves, which
+is what `sbx upgrade nix` does, leaves the directory in place around a dead link. A guard keyed on
+the directory then passes forever while every install below it fails, and no roll repairs it. A
+guard that runs the interpreter covers the absent, the half-created and the stale tree at once:
+
+```toml
+provision = ["bash", "-c", "if ! .venv/bin/python -c '' 2>/dev/null; then rm -rf .venv; python -m venv .venv; fi"]
+```
+
+When such a rebuild empties what a later step installed, the stamp that records the install goes
+with it. A stamp left behind would skip the install and leave the app importing what is no longer
+there.
+
+One shape stays outside the channel: an app that installs itself from its own `cmd`. A
+`provision` is a bundle's field, and a profile that consumes **another** agent's bundle has
+none of its own to put one in. Among the shipped profiles that is `open-design` alone, which
+clones its own source, and it advances the way it always has, with
+`sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1`.
+
 `task` folds like the rest: a tool that ships a brokered operation (a fixed command
 run with a credential the caller never holds, see [`[task.<name>]`](task)) carries
 it into any app that names the bundle, exactly as its packages and credentials do.
@@ -270,13 +312,17 @@ name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profi
 one-step import any more: importing one alone leaves its bundle (and any group that
 bundle REQUIRES) undeclared, and the launch warns.
 
-Five bundles carry an **install step** (`provision`) beside their packages: `deepseek-harness`,
-`junie`, `odysseus`, `openfox` and `trae` are finished by a command rather than by unpacking, and
-sbx runs it before the consuming app's own. Three others still install from their profile's `cmd`,
-because no backend fits their artifact and the step is the launch rather than a one-time install:
-`cursor-agent`, `muse` and `prime-agent`.
-Their headers say so: naming one equips a cage that can reach the agent's service but has
-no agent in it until the consuming app reproduces that install step.
+Eight bundles carry an **install step** (`provision`) beside their packages, because their agent is
+finished by a command rather than by unpacking: `deepseek-harness`, `junie`, `odysseus`, `openfox`
+and `trae` build or extend what a backend delivered, and `cursor-agent`, `muse` and `prime-agent`
+are vendor bootstraps whose installer script is the only way the agent arrives at all. sbx runs the
+step before the consuming app's own command, so naming one of these bundles gets the agent, not
+just the hosts it reaches, and [`sbx upgrade provision`](../cli/upgrade) is what rolls it forward.
+
+What such an app still owes is its own `cmd`. A step is a separate process, so nothing it exports
+survives into the launch: an installer that writes into a prefix under the app's home leaves the
+launch to put that prefix back on PATH, and anything the cage rebuilds per launch (`muse`'s
+`/etc/localtime` links) cannot be laid down by a step that exited at all.
 
 ## Managing bundles
 

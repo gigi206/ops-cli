@@ -1258,8 +1258,13 @@ mod tests {
         // `completion` takes a shell; `upgrade` a closed set of targets.
         assert!(names_at(&["completion"], "b").contains(&"bash".to_string()));
         assert!(names_at(&["completion"], "").contains(&"zsh".to_string()));
+        // Every target the parser accepts, offered by the completion. The two come from
+        // independent sources — the parser reads `TARGETS`, the completion reads the help page's
+        // operand list — so walking one and asserting the other is a parity check, not a test
+        // computing its own expectation. A hand-kept literal here is what would silently miss a
+        // target added to both the parser and the page but forgotten in this list.
         let targets = names_at(&["upgrade"], "");
-        for want in ["all", "nix", "mise", "flake", "deb", "appimage", "tarball"] {
+        for want in super::super::upgrade::TARGETS {
             assert!(
                 targets.contains(&want.to_string()),
                 "upgrade does not offer {want:?}: {targets:?}"
@@ -1334,6 +1339,16 @@ mod tests {
             Some(ValueKind::Apps),
             "the short spelling of a valued flag must reach the same value as the long one"
         );
+        // The same for `upgrade`, whose `--app` narrows an in-cage roll: a page that declares the
+        // flag in the shared `-a, --app <name>` spelling gets the app-name value for free, so this
+        // is what would catch a row written in some other shape.
+        for spelling in [vec!["--app"], vec!["provision", "-a"]] {
+            assert_eq!(
+                cursor_value_kind(&["upgrade"], &words(&spelling)),
+                Some(ValueKind::Apps),
+                "upgrade --app must complete app names ({spelling:?})"
+            );
+        }
     }
 
     #[test]
