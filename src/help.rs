@@ -1537,7 +1537,7 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|provision] [-a <name>] [--project <path>]",
+        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision] [-a <name>] [--project <path>]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             ("all", "roll every lock-rewriting channel (the default)"),
@@ -1553,6 +1553,7 @@ const PAGES: &[Page] = &[
             ("deb", "the project's and apps' deb: packages"),
             ("appimage", "the project's and apps' appimage: packages"),
             ("tarball", "the project's and apps' tarball: packages"),
+            ("binary", "the project's and apps' binary: packages"),
             (
                 "provision",
                 "re-run the apps' bundle install steps in-cage (not part of `all`)",

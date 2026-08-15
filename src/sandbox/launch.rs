@@ -2111,6 +2111,9 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
                 Backend::Tarball(_) | Backend::TarballResolve { .. } => {
                     gcroot_set.contains(format!("tarball-{}", pkg.name).as_str())
                 }
+                Backend::Binary(_) | Backend::BinaryResolve { .. } => {
+                    gcroot_set.contains(format!("binary-{}", pkg.name).as_str())
+                }
                 // A remote `flake:` builds host-side under a bare-`<name>` data-dir gcroot, like
                 // `nix:`; an inline `[flakes.<name>]` builds in-cage and lands a warm out-link in the
                 // project home, so the home out-link is its realized signal.

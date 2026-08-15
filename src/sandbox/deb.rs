@@ -412,7 +412,9 @@ impl prebuilt::Kind for Deb {
             | crate::config::Backend::AppImage(_)
             | crate::config::Backend::AppImageResolve { .. }
             | crate::config::Backend::Tarball(_)
-            | crate::config::Backend::TarballResolve { .. } => None,
+            | crate::config::Backend::TarballResolve { .. }
+            | crate::config::Backend::Binary(_)
+            | crate::config::Backend::BinaryResolve { .. } => None,
         }
     }
 }

@@ -29,14 +29,20 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-/// The AppImage's own bundled legacy tray/indicator/GConf shims (`usr/lib/libappindicator.so.1`,
-/// `libindicator.so.7`, `libgconf-2.so.4`) reference these old GTK2-era libraries. The main Electron
-/// binary does not need them and a hermetic cage has no system tray, so they are ignored rather than
-/// dragging GTK2 + libdbusmenu + dbus-glib into the closure — the autoPatchelf equivalent of the
-/// `.deb`'s musl-loader ignore.
+/// The AppImage's own bundled legacy tray/indicator/GConf shims reference these old libraries. The
+/// main Electron binary does not need them and a hermetic cage has no system tray, so they are
+/// ignored rather than dragging GTK2 + libdbusmenu + dbus-glib into the closure — the autoPatchelf
+/// equivalent of the `.deb`'s musl-loader ignore.
+///
+/// Both shim generations must be covered, because which one an AppImage carries is decided by the
+/// packager's AppImage toolset, not by the app: the GTK2 set (`usr/lib/libappindicator.so.1`,
+/// `libindicator.so.7`) wants `libdbusmenu-gtk.so.4`, and the GTK3 set (`libappindicator3.so.1`,
+/// `libindicator3.so.7`) wants `libdbusmenu-gtk3.so.4`. Listing one alone still fails the build:
+/// autoPatchelf refuses on the unlisted name even though the shim beside it was ignored.
 const APPIMAGE_IGNORE_MISSING: &[&str] = &[
     "libc.musl-x86_64.so.1",
     "libdbusmenu-gtk.so.4",
+    "libdbusmenu-gtk3.so.4",
     "libdbusmenu-glib.so.4",
     "libgtk-x11-2.0.so.0",
     "libdbus-glib-1.so.2",
@@ -290,7 +296,9 @@ impl prebuilt::Kind for AppImage {
             | crate::config::Backend::Deb(_)
             | crate::config::Backend::DebResolve { .. }
             | crate::config::Backend::Tarball(_)
-            | crate::config::Backend::TarballResolve { .. } => None,
+            | crate::config::Backend::TarballResolve { .. }
+            | crate::config::Backend::Binary(_)
+            | crate::config::Backend::BinaryResolve { .. } => None,
         }
     }
 }
@@ -341,7 +349,10 @@ mod tests {
         assert!(expr.contains("dontBuild = true;"));
         // the shared Electron lib set + the AppImage-specific ignore of the bundled tray shims.
         assert!(expr.contains("nss") && expr.contains("gtk3") && expr.contains("libx11"));
+        // both shim generations: an AppImage carries the GTK2 set or the GTK3 one, and a build
+        // fails on whichever name is missing from the ignore list.
         assert!(expr.contains("\"libdbusmenu-gtk.so.4\""));
+        assert!(expr.contains("\"libdbusmenu-gtk3.so.4\""));
         // shared launcher-locating install phase, wrapped as bin/<name>, prepending the bundle root.
         assert!(expr.contains("app.asar"));
         assert!(expr.contains("! -name 'AppRun'"));

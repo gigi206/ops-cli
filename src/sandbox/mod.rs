@@ -26,6 +26,7 @@ pub(crate) mod taskpool;
 
 // Provisioning & packaging: the nix/mise engines, the package backends, the store.
 mod appimage;
+mod binary;
 /// The wire a broker plugin is driven over: sbx asks about one frame, the plugin answers a
 /// verdict. Kept apart from the declaration it serves ([`crate::plugins::broker`]) exactly as the
 /// resolver runner is kept apart from the manifest it runs.
@@ -102,6 +103,10 @@ mod observe_feed;
 pub(crate) use appimage::{
     AppImageUpgrade, pinned_hashes as appimage_pinned_hashes, upgrade_project as upgrade_appimage,
     withheld as withheld_appimage_packages,
+};
+pub(crate) use binary::{
+    BinaryUpgrade, pinned_hashes as binary_pinned_hashes, upgrade_project as upgrade_binary,
+    withheld as withheld_binary_packages,
 };
 pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};
 pub(crate) use cgroup::{LimitReport, probe as resource_limits};

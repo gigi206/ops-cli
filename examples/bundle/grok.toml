@@ -35,28 +35,36 @@ mute = [
 GROK_DISABLE_AUTOUPDATER = "1"  # sbx owns upgrades; the CLI must not replace its pinned install
 
 [bundle.grok.packages]
-# xAI's own release binary, fetched from its artifact bucket — and the ONE package in this
-# collection that names a version, because without it the agent does not start at all.
+# xAI's own release binary, taken from its artifact bucket host-side.
 #
-# The aqua registry entry for this tool is `type: http`: it builds the download URL from a template
+# NOT `mise:aqua:`, and the reason is worth stating because it looks like the obvious choice. The
+# aqua registry entry for this tool is `type: http`: it builds the download URL from a template
 # (`…/cli/grok-{{.Version}}-linux-x86_64`) and carries no `repo_owner`, no `repo_name` and no
-# `version_source`. mise therefore has nowhere to ask what versions exist, and an unversioned
-# request resolves to nothing: the launch fails with `no versions found for aqua:x.ai/cli/grok`
-# before the agent is ever reached. Naming a version skips the question mise cannot answer, and the
-# URL template does the rest.
+# `version_source`. mise therefore has nowhere to ask what versions exist, so an unversioned request
+# resolves to nothing and the launch fails with `no versions found` before the agent is reached,
+# while a versioned one pins the agent at a build a person has to bump by hand.
 #
-# THE COST, STATED PLAINLY: `sbx upgrade mise` cannot roll this one forward. It rolls a `mise:`
-# package by asking the backend for a newer version, which is the same question that has no answer
-# here. Nothing else on the vendor's side helps either, and this was checked rather than assumed:
-# the bucket refuses anonymous listing, and there is no `latest`/`stable` alias and no version
-# manifest beside the binaries. So this pin moves when a person moves it.
+# `binary:resolve` answers both halves. The artifact is a bare executable rather than an archive,
+# which is exactly what that backend is for, and the `resolve` command below asks the vendor what
+# the current version is, so `sbx upgrade binary` rolls this agent forward like every other.
+grok = "binary:resolve"
+
+# The vendor's own version source, and the whole of what sbx knows about xAI: the backend itself is
+# agnostic, so every fact about this vendor lives here rather than in sbx.
 #
-# THE TRIGGER THAT RETIRES THE PIN: either xAI publishes something enumerable (a listable bucket, a
-# `latest` alias, a version endpoint), or sbx grows a prebuilt backend for a RAW binary — today
-# `tarball:`/`deb:`/`appimage:` all unpack an archive, and this artifact is a bare executable, which
-# is why the `<backend>:resolve` family cannot serve it. Either one turns this back into an
-# unversioned request.
+# `…/cli/stable` is the channel file the CLI's own updater reads; it answers with the version and
+# nothing else (`1.0.4`). The command turns that into the download URL the same template the aqua
+# registry uses builds, and sbx re-validates the result before fetching it.
 #
-# Do not take the version from the aqua registry: it pins `0.2.2`, published in May, while the
-# bucket serves this one. Bump by probing the vendor's URL template for the next version.
-grok = "mise:aqua:x.ai/cli/grok@1.0.4"
+# `tr -d` guards the one thing that would break silently: the body arrives today with no trailing
+# newline, and a version with a stray one appended would produce a URL that 404s rather than an
+# error anyone could read.
+#
+# This runs host-side in sbx's hermetic resolve cage, not in the agent's cage, so it uses the host
+# network rather than the `allow` list above — that list governs the agent's own egress at runtime.
+[bundle.grok.binary.grok]
+resolve = [
+    "sh",
+    "-c",
+    'v=$(curl -fsSL https://storage.googleapis.com/grok-build-public-artifacts/cli/stable | tr -d "\r\n"); [ -n "$v" ] || { echo "grok: the vendor channel named no version" >&2; exit 1; }; echo "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-$v-linux-x86_64"',
+]

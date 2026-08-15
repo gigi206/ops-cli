@@ -221,7 +221,9 @@ impl prebuilt::Kind for Tarball {
             | crate::config::Backend::Deb(_)
             | crate::config::Backend::DebResolve { .. }
             | crate::config::Backend::AppImage(_)
-            | crate::config::Backend::AppImageResolve { .. } => None,
+            | crate::config::Backend::AppImageResolve { .. }
+            | crate::config::Backend::Binary(_)
+            | crate::config::Backend::BinaryResolve { .. } => None,
         }
     }
 }

@@ -144,7 +144,9 @@ pub(crate) fn provision(
             | Backend::AppImage(_)
             | Backend::AppImageResolve { .. }
             | Backend::Tarball(_)
-            | Backend::TarballResolve { .. } => continue,
+            | Backend::TarballResolve { .. }
+            | Backend::Binary(_)
+            | Backend::BinaryResolve { .. } => continue,
         };
         bins.push(logical.join(BIN));
         roots.push(logical);
@@ -175,7 +177,9 @@ pub(crate) fn mise_packages(packages: &[Package]) -> Vec<String> {
             | Backend::Tarball(_)
             | Backend::TarballResolve { .. }
             | Backend::DebResolve { .. }
-            | Backend::AppImageResolve { .. } => None,
+            | Backend::AppImageResolve { .. }
+            | Backend::Binary(_)
+            | Backend::BinaryResolve { .. } => None,
         })
         .collect()
 }
@@ -200,7 +204,9 @@ pub(crate) fn flake_packages(packages: &[Package]) -> Vec<(String, String)> {
             | Backend::Tarball(_)
             | Backend::TarballResolve { .. }
             | Backend::DebResolve { .. }
-            | Backend::AppImageResolve { .. } => None,
+            | Backend::AppImageResolve { .. }
+            | Backend::Binary(_)
+            | Backend::BinaryResolve { .. } => None,
         })
         .collect()
 }
@@ -237,6 +243,9 @@ pub(crate) fn project_gcroot_names(packages: &[Package]) -> Vec<String> {
             Backend::Tarball(_) | Backend::TarballResolve { .. } => {
                 Some(format!("{}-{}", super::tarball::Tarball.name(), p.name))
             }
+            Backend::Binary(_) | Backend::BinaryResolve { .. } => {
+                Some(format!("{}-{}", super::binary::Binary.name(), p.name))
+            }
             // `mise:` is equipped in-cage; an inline `[flakes.<name>]` roots in the project store as
             // `sbx-flake-<name>` — neither writes a data-dir out-link here.
             Backend::Mise(_) | Backend::FlakeInline { .. } => None,
@@ -266,7 +275,9 @@ pub(crate) fn flake_inline_packages(packages: &[Package]) -> Vec<(String, String
             | Backend::Tarball(_)
             | Backend::TarballResolve { .. }
             | Backend::DebResolve { .. }
-            | Backend::AppImageResolve { .. } => None,
+            | Backend::AppImageResolve { .. }
+            | Backend::Binary(_)
+            | Backend::BinaryResolve { .. } => None,
         })
         .collect()
 }

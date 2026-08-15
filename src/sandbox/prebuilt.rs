@@ -564,7 +564,7 @@ pub(crate) enum Form {
     Resolve(Vec<String>),
 }
 
-/// The three backends in the order a launch provisions their **direct** packages. Both arrays must
+/// The four backends in the order a launch provisions their **direct** packages. Both arrays must
 /// name every backend — one missing entry means its packages are silently never provisioned — and
 /// their order is load-bearing twice over: each provisioned `bin` directory is pushed onto the list
 /// that becomes the sandbox `PATH`, so this order arbitrates between two packages shipping the same
@@ -573,18 +573,20 @@ pub(crate) enum Form {
 /// direct package's bin on `PATH`. The two groups therefore cannot be interleaved into one walk.
 /// [`super::launch`]'s gc seed walks the same two arrays for consistency, but there the order is
 /// cosmetic: it collects store roots (a set), and its resolve path never builds a cage.
-pub(crate) const DIRECT_ORDER: [&dyn Kind; 3] = [
+pub(crate) const DIRECT_ORDER: [&dyn Kind; 4] = [
     &super::deb::Deb,
     &super::appimage::AppImage,
     &super::tarball::Tarball,
+    &super::binary::Binary,
 ];
 
-/// The three backends in the order a launch provisions their `<backend>:resolve` packages. Differs
+/// The four backends in the order a launch provisions their `<backend>:resolve` packages. Differs
 /// from [`DIRECT_ORDER`] — see there for what the order decides.
-pub(crate) const RESOLVE_ORDER: [&dyn Kind; 3] = [
+pub(crate) const RESOLVE_ORDER: [&dyn Kind; 4] = [
     &super::tarball::Tarball,
     &super::deb::Deb,
     &super::appimage::AppImage,
+    &super::binary::Binary,
 ];
 
 /// The host-side context every prebuilt package build shares: sbx's nix engine and store layout, the
@@ -1255,7 +1257,7 @@ mod tests {
     #[test]
     fn the_two_walk_orders_cover_every_backend_and_hold_their_path_precedence() {
         let packages = one_of_each_form();
-        let walk = |order: [&dyn Kind; 3], resolve: bool| -> Vec<String> {
+        let walk = |order: [&dyn Kind; 4], resolve: bool| -> Vec<String> {
             order
                 .into_iter()
                 .flat_map(|kind| {

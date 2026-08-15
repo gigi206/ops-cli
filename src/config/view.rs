@@ -893,6 +893,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     flake_pins.extend(sandbox::deb_pinned_hashes(cwd));
     flake_pins.extend(sandbox::appimage_pinned_hashes(cwd));
     flake_pins.extend(sandbox::tarball_pinned_hashes(cwd));
+    flake_pins.extend(sandbox::binary_pinned_hashes(cwd));
 
     let packages = resolved
         .packages
@@ -1057,6 +1058,10 @@ fn package_view(p: &super::Package, flake_pins: &BTreeMap<String, String>) -> Pa
         Backend::AppImageResolve { .. } => {
             "host-side from prebuilt AppImage (auto-upgrade), durable"
         }
+        Backend::Binary(_) => "host-side from a prebuilt program, durable",
+        Backend::BinaryResolve { .. } => {
+            "host-side from a prebuilt program (auto-upgrade), durable"
+        }
     };
     let trusted = p.state == TrustState::Trusted;
     PackageView {
@@ -1079,9 +1084,10 @@ fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) ->
     match backend {
         // Flake refs and deb/appimage/tarball URLs are all looked up by locator in the merged pin map.
         Backend::Flake(reference) => flake_pins.get(reference).cloned(),
-        Backend::Deb(url) | Backend::AppImage(url) | Backend::Tarball(url) => {
-            flake_pins.get(url).cloned()
-        }
+        Backend::Deb(url)
+        | Backend::AppImage(url)
+        | Backend::Tarball(url)
+        | Backend::Binary(url) => flake_pins.get(url).cloned(),
         // An inline flake floats — no persisted lock, so nothing to show. A `tarball:resolve`
         // package's pin is keyed by `resolve:<name>` (not a locator in this map), so its rev is not
         // surfaced here; it is reported by `sbx app show`/inspect from the per-project lock.
@@ -1090,7 +1096,8 @@ fn flake_pinned_rev(backend: &Backend, flake_pins: &BTreeMap<String, String>) ->
         | Backend::FlakeInline { .. }
         | Backend::TarballResolve { .. }
         | Backend::DebResolve { .. }
-        | Backend::AppImageResolve { .. } => None,
+        | Backend::AppImageResolve { .. }
+        | Backend::BinaryResolve { .. } => None,
     }
 }
 
@@ -1382,6 +1389,7 @@ pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> 
     flake_pins.extend(sandbox::deb_pinned_hashes(cwd));
     flake_pins.extend(sandbox::appimage_pinned_hashes(cwd));
     flake_pins.extend(sandbox::tarball_pinned_hashes(cwd));
+    flake_pins.extend(sandbox::binary_pinned_hashes(cwd));
     Some(app_detail_view(cwd, name, app, &resolved, &flake_pins))
 }
 

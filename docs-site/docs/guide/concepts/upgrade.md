@@ -66,6 +66,7 @@ dropped, so `upgrade` rolls the global channel and prints the config warning.
 | `deb:` | re-resolves each source to its current `.deb` URL + content hash | `deb-packages.lock` |
 | `appimage:` | the same, for a prebuilt `.AppImage` | `appimage-packages.lock` |
 | `tarball:` | the same, for a prebuilt `.tar.gz` | `tarball-packages.lock` |
+| `binary:` | the same, for a program downloaded as itself | `binary-packages.lock` |
 
 Re-resolution follows a `…/releases/latest/…` redirect, and re-queries the release list or
 the apt index for the `github:` / `apt:` locator forms (`nix store prefetch-file`). An
@@ -82,7 +83,7 @@ profile sets `network = "none"` is skipped.
 
 ### The `resolve` forms
 
-`deb:`, `appimage:` and `tarball:` each accept a `resolve` form, for a vendor that offers a
+`deb:`, `appimage:`, `tarball:` and `binary:` each accept a `resolve` form, for a vendor that offers a
 download API but no `latest`/apt/`github:` locator. On upgrade, `sbx` re-runs the package's
 `[deb.<name>]` / `[appimage.<name>]` / `[tarball.<name>]` `resolve` command **in a hermetic
 sandbox** to discover the current download URL, so those packages still roll forward. The

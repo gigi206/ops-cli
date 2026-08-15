@@ -795,6 +795,7 @@ impl Resolved {
             tarball: _,
             deb: _,
             appimage: _,
+            binary: _,
             // Reported per blob when the override was collected, which is the only place it can
             // be: the merge that builds this overlay carries the fields it understands and drops
             // the bag with them, so by here there is nothing left to name.
@@ -1475,6 +1476,7 @@ fn resolve(
         global.tarball,
         global.deb,
         global.appimage,
+        global.binary,
         TrustState::Trusted,
         false,
     );
@@ -1798,6 +1800,7 @@ fn resolve(
             proj.tarball,
             proj.deb,
             proj.appimage,
+            proj.binary,
             state,
             false,
         );
@@ -2897,6 +2900,7 @@ fn resolve_app(
             app.tarball,
             app.deb,
             app.appimage,
+            app.binary,
             TrustState::Trusted,
             false,
         );
@@ -3074,6 +3078,7 @@ fn resolve_app(
             app.tarball,
             app.deb,
             app.appimage,
+            app.binary,
             state,
             !trusted,
         );
@@ -3755,6 +3760,7 @@ fn apply_tools(
     tarball: BTreeMap<String, RawResolve>,
     deb: BTreeMap<String, RawResolve>,
     appimage: BTreeMap<String, RawResolve>,
+    binary: BTreeMap<String, RawResolve>,
     state: TrustState,
     protect_trusted: bool,
 ) {
@@ -3773,10 +3779,12 @@ fn apply_tools(
     let tarball_names = collect_sentinel(&packages, TARBALL_RESOLVE_SENTINEL);
     let deb_names = collect_sentinel(&packages, DEB_RESOLVE_SENTINEL);
     let appimage_names = collect_sentinel(&packages, APPIMAGE_RESOLVE_SENTINEL);
+    let binary_names = collect_sentinel(&packages, BINARY_RESOLVE_SENTINEL);
     packages.retain(|_, v| {
         v.as_str() != TARBALL_RESOLVE_SENTINEL
             && v.as_str() != DEB_RESOLVE_SENTINEL
             && v.as_str() != APPIMAGE_RESOLVE_SENTINEL
+            && v.as_str() != BINARY_RESOLVE_SENTINEL
     });
 
     for name in packages.keys() {
@@ -3825,6 +3833,18 @@ fn apply_tools(
         "appimage",
         |command| Backend::AppImageResolve { command },
     );
+    apply_resolvers(
+        out,
+        warnings,
+        source,
+        binary.clone(),
+        &binary_names,
+        state,
+        protect_trusted,
+        BINARY_RESOLVE_SENTINEL,
+        "binary",
+        |command| Backend::BinaryResolve { command },
+    );
     // After the packages exist, since `libs` decorates a package rather than declaring one: the
     // table it comes from may pair with either declaration form, so both must already be in `out`.
     apply_prebuilt_libs(out, warnings, source, &tarball, "tarball", protect_trusted);
@@ -3837,6 +3857,7 @@ fn apply_tools(
         "appimage",
         protect_trusted,
     );
+    apply_prebuilt_libs(out, warnings, source, &binary, "binary", protect_trusted);
 }
 
 /// Attach a `[<label>.<name>]` table's `libs` to the package it names — the extra nixpkgs attributes
@@ -4109,12 +4130,25 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
             ));
         }
         Ok(Backend::Tarball(rest.to_string()))
+    } else if value == BINARY_RESOLVE_SENTINEL {
+        Err(format!(
+            "`{BINARY_RESOLVE_SENTINEL}` needs a matching `[binary.<name>]` table declaring a \
+             `resolve` command"
+        ))
+    } else if let Some(rest) = value.strip_prefix("binary:") {
+        if !is_valid_binary_url(rest) {
+            return Err(format!(
+                "invalid binary reference `{rest}` — use an `https://` URL to the program itself, \
+                 or `binary:resolve` with a `[binary.<name>]` table"
+            ));
+        }
+        Ok(Backend::Binary(rest.to_string()))
     } else {
         Err(format!(
             "`{value}` needs a backend prefix — use `nix:<attribute>`, `mise:<token>`, \
              `flake:<ref>`, `deb:<url>` / `deb:github:<owner>/<repo>` / `deb:resolve`, \
              `appimage:<url>` / `appimage:github:<owner>/<repo>` / `appimage:resolve`, \
-             `tarball:<url>`, or `tarball:resolve`"
+             `tarball:<url>` / `tarball:resolve`, or `binary:<url>` / `binary:resolve`"
         ))
     }
 }
@@ -4135,6 +4169,13 @@ const DEB_RESOLVE_SENTINEL: &str = "deb:resolve";
 /// paired `[appimage.<name>]` table; [`apply_tools`] strips it before [`apply_packages`] and binds it
 /// by name.
 const APPIMAGE_RESOLVE_SENTINEL: &str = "appimage:resolve";
+
+/// The `[packages]` value that opts a package into the `binary:` auto-upgrade resolver form — the
+/// exact `binary:` analogue of [`TARBALL_RESOLVE_SENTINEL`]. Its `resolve` command lives in a paired
+/// `[binary.<name>]` table; [`apply_tools`] strips it before [`apply_packages`] and binds it by name.
+/// It carries more weight for this backend than for the others: a bare program's URL is
+/// version-stamped by construction, so the direct form cannot roll on its own.
+const BINARY_RESOLVE_SENTINEL: &str = "binary:resolve";
 
 /// A `deb:` URL: an `https://` URL to a prebuilt `.deb`. Required to be HTTPS (the fetch is not
 /// authenticated beyond TLS, and a `.deb` is executed after autoPatchelf, so a plaintext source is
@@ -4175,6 +4216,30 @@ pub(crate) fn is_valid_appimage_url(url: &str) -> bool {
 /// is the same injection-free URL set (including `%`, so a percent-encoded space like a vendor's
 /// `My%20App.tar.gz` is accepted), so the value carries no shell/nix metacharacter — it is
 /// interpolated into a generated nix expression and a `nix store prefetch-file` argument.
+/// A `binary:` URL: an `https://` URL to the program itself, with no archive around it.
+///
+/// The sibling of [`is_valid_tarball_url`], minus the extension requirement, and the difference is
+/// the point rather than an oversight: a bare executable has no extension to check. What the three
+/// archive backends get from their suffix is a typo catch, not a content guarantee — a `.tar.gz`
+/// ending proves nothing about the bytes behind it. What actually binds a pin to one artefact is the
+/// content hash, which this backend takes exactly like the others.
+///
+/// So the barrier here is what it always really was: HTTPS (the fetch is unauthenticated beyond TLS
+/// and the file is executed after autoPatchelf, so a plaintext source is refused) and the same
+/// injection-free character set (including `%`, for a percent-encoded path segment), because the
+/// value is interpolated into a generated nix expression and a `nix store prefetch-file` argument.
+/// A URL that is only a host is refused: the program is a path on it, never the root.
+pub(crate) fn is_valid_binary_url(url: &str) -> bool {
+    url.strip_prefix("https://").is_some_and(|rest| {
+        rest.split('/').next().is_some_and(|host| !host.is_empty())
+            && rest.contains('/')
+            && !rest.ends_with('/')
+            && url.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
+            })
+    })
+}
+
 pub(crate) fn is_valid_tarball_url(url: &str) -> bool {
     url.strip_prefix("https://").is_some_and(|rest| {
         let lower = url.to_ascii_lowercase();

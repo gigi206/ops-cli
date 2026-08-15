@@ -1,4 +1,4 @@
-//! `sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|provision] [--project <path>]`: roll the
+//! `sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision] [--project <path>]`: roll the
 //! managed channels and `[packages]` backends forward by re-resolving and rewriting their locks, so
 //! versions advance only on an explicit upgrade, never on an sbx binary update. `--project`
 //! retargets every roll at another project, exactly as running the command from that directory
@@ -27,6 +27,7 @@ pub(super) const TARGETS: &[&str] = &[
     "deb",
     "appimage",
     "tarball",
+    "binary",
     "provision",
 ];
 
@@ -283,6 +284,11 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         // The project's and apps' `appimage:` `[packages]` re-resolve their `.AppImage` URL to a new
         // content hash and the per-project appimage lock is rewritten — the exact `deb:` shape.
         ok &= upgrade_appimage_packages(&nix, &layout, &cwd, &cfg, &pal);
+    }
+    if matches!(what, "binary" | "all") {
+        // The project's and apps' `binary:` `[packages]` re-resolve to a new content hash and the
+        // per-project binary lock is rewritten — the same shape as the three archive backends.
+        ok &= upgrade_binary_packages(&nix, &layout, &cwd, &cfg, &pal);
     }
     if matches!(what, "tarball" | "all") {
         // The project's and apps' `tarball:` `[packages]` re-resolve their `.tar.gz` URL to a new
@@ -779,6 +785,36 @@ fn upgrade_appimage_packages(
     !outcomes
         .iter()
         .any(|o| matches!(o, sandbox::AppImageUpgrade::Failed { .. }))
+}
+
+/// Roll the project's and apps' `binary:` `[packages]` — the `tarball:` twin for a download that is
+/// the program itself, re-resolving each URL to its current content hash and rewriting the
+/// per-project binary lock. Returns whether every reference re-resolved.
+fn upgrade_binary_packages(
+    nix: &Path,
+    layout: &store::Layout,
+    cwd: &Path,
+    cfg: &config::Resolved,
+    pal: &style::Palette,
+) -> bool {
+    let outcomes = match sandbox::upgrade_binary(nix, layout, cwd, cfg) {
+        Ok(o) => o,
+        Err(e) => {
+            diag::error(&format!("sbx: cannot roll the binary packages: {e}"));
+            return false;
+        }
+    };
+    for line in prebuilt_upgrade_summary(
+        "binary",
+        &outcomes,
+        sandbox::withheld_binary_packages(cfg),
+        pal,
+    ) {
+        println!("{line}");
+    }
+    !outcomes
+        .iter()
+        .any(|o| matches!(o, sandbox::BinaryUpgrade::Failed { .. }))
 }
 
 /// Roll the project's and apps' `tarball:` `[packages]` — the `deb:` twin, re-resolving each archive

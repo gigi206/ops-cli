@@ -95,6 +95,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
         tarball: BTreeMap::new(),
         deb: BTreeMap::new(),
         appimage: BTreeMap::new(),
+        binary: BTreeMap::new(),
         nixpkgs: None,
         network: None,
         gui: None,
@@ -670,6 +671,7 @@ fn raw_app(
         tarball: BTreeMap::new(),
         deb: BTreeMap::new(),
         appimage: BTreeMap::new(),
+        binary: BTreeMap::new(),
         network,
         gui: None,
         gpu: None,
@@ -4452,6 +4454,41 @@ fn tarball_backend_parses_and_validates() {
     assert!(parse_backend("tarball:https://e/app.zip").is_err());
     assert!(parse_backend("tarball:not-a-url").is_err());
     assert!(parse_backend("tarball:resolve").is_err());
+}
+
+/// `binary:` accepts a URL to the program itself, and the sentinel is bound to its table elsewhere.
+///
+/// The interesting half is what this backend does NOT check. It has no extension to require, so the
+/// test says so explicitly: a URL ending in anything at all is accepted, and what is refused is the
+/// scheme, the injection charset, and a locator that is not a path to something.
+#[test]
+fn a_binary_backend_takes_a_url_to_the_program_itself() {
+    assert!(matches!(
+        parse_backend("binary:https://e/cli/demo-1.2.3-linux-x86_64"),
+        Ok(Backend::Binary(_))
+    ));
+
+    // No extension is required, and that is the point of this backend.
+    assert!(is_valid_binary_url("https://e/cli/demo-1.2.3-linux-x86_64"));
+    assert!(is_valid_binary_url("https://e/d/My%20Program")); // %-encoded space
+    assert!(is_valid_binary_url("https://e/cli/demo.tar.gz")); // an extension is not forbidden either
+
+    // What IS refused: a plaintext scheme (the file is executed after autoPatchelf), anything
+    // carrying a shell/nix metacharacter (the value is interpolated into a generated derivation and
+    // a prefetch argument), and a locator naming no path — a program is never the bare host.
+    assert!(!is_valid_binary_url("http://e/cli/demo")); // not https
+    assert!(!is_valid_binary_url("https://e/cli/de mo")); // raw whitespace
+    assert!(!is_valid_binary_url("https://e/cli/$(id)")); // command substitution
+    assert!(!is_valid_binary_url("https://e/cli/demo\";x")); // quote + separator
+    assert!(!is_valid_binary_url("https://e")); // no path at all
+    assert!(!is_valid_binary_url("https://e/")); // a directory, not a program
+    assert!(!is_valid_binary_url("https://")); // no host
+    assert!(!is_valid_binary_url("ftp://e/cli/demo")); // wrong scheme entirely
+
+    // A mistyped form is refused up front; the bare sentinel is refused here too, since it is bound
+    // to its `[binary.<name>]` table by `apply_tools` rather than parsed as a locator.
+    assert!(parse_backend("binary:not-a-url").is_err());
+    assert!(parse_backend("binary:resolve").is_err());
 }
 
 /// A `RawConfig` declaring one `tarball:resolve` package: the `[packages]` sentinel plus its

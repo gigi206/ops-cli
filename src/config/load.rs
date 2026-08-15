@@ -975,6 +975,7 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>
     acc.tarball.extend(higher.tarball);
     acc.deb.extend(higher.deb);
     acc.appimage.extend(higher.appimage);
+    acc.binary.extend(higher.binary);
     if let Some(secret) = higher.secret {
         match acc.secret.as_mut() {
             Some(base) => {
@@ -1027,6 +1028,9 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
     }
     for (k, v) in acc.appimage {
         app.appimage.entry(k).or_insert(v);
+    }
+    for (k, v) in acc.binary {
+        app.binary.entry(k).or_insert(v);
     }
     if let Some(secret) = acc.secret {
         match app.secret.as_mut() {

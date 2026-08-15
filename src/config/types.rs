@@ -98,6 +98,26 @@ pub(crate) enum Backend {
     /// forward. Arbitrary code, so it comes only from a trusted layer and never runs for an untrusted
     /// one.
     AppImageResolve { command: Vec<String> },
+    /// `binary:<url>` — a prebuilt program that is downloaded **as itself**, with no archive around
+    /// it, provisioned host-side into sbx's store exactly like the three above: sbx resolves the URL
+    /// to a content hash, then builds a generated derivation that installs the file at
+    /// `bin/<the [packages] key>`, makes it executable and `autoPatchelfHook`s it.
+    ///
+    /// The fourth prebuilt form exists because the other three all unpack something, and a vendor
+    /// that publishes a bare executable at a versioned URL fits none of them: `tarball:` would
+    /// `tar -xz` a file that is not an archive. Nothing else differs — same pin-on-first-use, same
+    /// per-project lock, same offline rebuild, same trust gate.
+    Binary(String),
+    /// `binary:resolve` — the auto-upgrade form of [`Backend::Binary`], the exact analogue of
+    /// [`Backend::TarballResolve`]. Declared as a `[packages]` sentinel `<name> = "binary:resolve"`
+    /// paired with a `[binary.<name>]` table (see [`RawResolve`]) carrying a `resolve` **command**
+    /// that prints the newest build's download URL. It is the form that matters most for this
+    /// backend: a bare executable's URL is version-stamped by construction, since there is no
+    /// archive name to hide the version in, so the direct form freezes and this one is how such a
+    /// package rolls forward. Arbitrary code, so it comes only from a trusted layer and never runs
+    /// for an untrusted one; its printed URL is re-validated by `is_valid_binary_url` before any
+    /// fetch.
+    BinaryResolve { command: Vec<String> },
 }
 
 impl Backend {
@@ -120,6 +140,9 @@ impl Backend {
             Backend::DebResolve { .. } => "resolve",
             // Same fixed short token as the other resolvers; the pin is keyed by the package name.
             Backend::AppImageResolve { .. } => "resolve",
+            Backend::Binary(url) => url,
+            // Same fixed short token as the other resolvers; the pin is keyed by the package name.
+            Backend::BinaryResolve { .. } => "resolve",
             // The output attribute — a short locator for display; the bulky flake source is not
             // itself a one-line locator (rendered as `flake (inline) #<attr>` by the config view).
             Backend::FlakeInline { attr, .. } => attr,
@@ -138,6 +161,8 @@ impl Backend {
             Backend::TarballResolve { .. } => "tarball",
             Backend::DebResolve { .. } => "deb",
             Backend::AppImageResolve { .. } => "appimage",
+            Backend::Binary(_) => "binary",
+            Backend::BinaryResolve { .. } => "binary",
             Backend::FlakeInline { .. } => "flake",
         }
     }

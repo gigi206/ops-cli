@@ -29,6 +29,7 @@ nix.
 | `deb:<url>` · `deb:github:…` · `deb:apt:…` · `deb:resolve` (+ `[deb.<name>]`) | host-side, from a prebuilt `.deb` | pin-on-first-use, rolled by `sbx upgrade deb` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 | `appimage:<url>` · `appimage:github:…` · `appimage:resolve` (+ `[appimage.<name>]`) | host-side, from a prebuilt `.AppImage` | pin-on-first-use, rolled by `sbx upgrade appimage` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 | `tarball:<url>` · `tarball:resolve` (+ `[tarball.<name>]`) | host-side, from a prebuilt `.tar.gz` | pin-on-first-use, rolled by `sbx upgrade tarball` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
+| `binary:<url>` · `binary:resolve` (+ `[binary.<name>]`) | host-side, from a program downloaded as itself | pin-on-first-use, rolled by `sbx upgrade binary` (the `resolve` form auto-discovers the newest version) | yes (seeded, durable) |
 
 ### `nix:`: a nixpkgs attribute
 
@@ -389,11 +390,54 @@ Two forms:
   the resolved URL then feeds; the allowlist governs the app's *runtime* egress, not this provisioning
   step.
 
+### `binary:`: a prebuilt program, with no archive around it
+
+```toml
+[packages]
+demo-app = "binary:https://host/path/demo-1.2.3-linux-x86_64"
+```
+
+The fourth prebuilt backend, for a vendor that publishes the **program itself** at an `https://` URL:
+no `.deb`, no `.AppImage`, no tarball, no nixpkgs attribute and no official flake. The other three
+all unpack something, so none of them fits, and `tarball:` would try to `tar -xz` a file that is not
+an archive. sbx resolves the URL to a content hash (pinned in a per-project `binary-packages.lock`)
+and builds a generated derivation that installs the download at `bin/<the [packages] key>`, makes it
+executable and `autoPatchelfHook`s it against the same curated library set, **host-side**, seeded and
+offline-reusable, exactly like its three siblings.
+
+The program is installed under the **`[packages]` key**, not the file name in the URL, so the `cmd` a
+profile writes is that key whatever the vendor called its download.
+
+**The direct form freezes, and more surely than elsewhere.** A bare program's URL is version-stamped
+by construction: there is no archive name for the version to hide in, and no `latest` alias unless
+the vendor publishes one. Use the direct form only when it does.
+
+```toml
+[packages]
+demo-app = "binary:resolve"
+
+[binary.demo-app]
+# A command (argv) that prints the current download URL to stdout, and nothing else.
+resolve = ["sh", "-c", "v=$(curl -fsSL https://host/path/stable); echo https://host/path/demo-$v-linux-x86_64"]
+```
+
+`binary:resolve` is therefore the form this backend is really for, and it behaves exactly like the
+other `*:resolve` forms: sbx runs the command in the same hermetic sandbox (base tools plus the app's
+own `nix:` packages, host network, sbx's CA bundle), re-validates the printed URL before any fetch,
+pins it, and `sbx upgrade binary` re-runs the command and rolls the pin forward. Honored **only from
+a trusted source** and **never run for an untrusted layer**.
+
+**What the URL check here can and cannot do.** The three archive backends require their extension,
+which reads like a content check but is not one: a `.tar.gz` ending proves nothing about the bytes
+behind it. A bare program has no extension to require, so the barrier is what it always really was,
+`https://` plus an injection-free character set, and the **content hash** is what actually binds a
+pin to one artefact. That hash is taken here exactly as it is for the others.
+
 ## Why the tool sources are trusted-only
 
 Loosening `packages` (or the inline `[flakes]`) to an untrusted project would let it override
 a trusted app's tool and run attacker code under that app's posture: the same class of hole as
-overriding a trusted app's command. So all six `[packages]` backends **and** inline `[flakes]`
+overriding a trusted app's command. So all seven `[packages]` backends **and** inline `[flakes]`
 are gated. A trusted app's tool **survives an untrusted project's override attempt** (the flagship
 "agent on untrusted code" property). The open self-equip path stays [`sbx mise`](../cli/mise)
 and a project's [`[tools]`](tools).

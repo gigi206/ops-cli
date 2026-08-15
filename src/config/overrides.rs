@@ -508,6 +508,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         tarball: _,
         deb: _,
         appimage: _,
+        binary: _,
         task: _,
         plugin: _,
         // Not carried, like `plugin`: a broker's `socket` names a host resource to stand in front

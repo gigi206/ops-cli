@@ -67,6 +67,15 @@ pub(crate) struct RawConfig {
     /// source.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) appimage: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers for `binary:resolve` packages, declared as `[binary.<name>]` tables —
+    /// the exact `binary:` analogue of [`tarball`](Self::tarball). Each pairs with a `[packages]`
+    /// entry `<name> = "binary:resolve"` and carries a `resolve` command that prints the newest
+    /// build's download URL. It matters more here than for the archive backends: a bare program's
+    /// URL is version-stamped by construction, so this table is how such a package rolls at all. A
+    /// security field (it runs an arbitrary sandboxed command host-side), honored only from a
+    /// trusted source.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) binary: BTreeMap<String, RawResolve>,
     /// Override the nixpkgs reference the tools resolve against: a branch/channel
     /// (`nixos-23.11`) or a 40-hex revision under `NixOS/nixpkgs`. A security field
     /// — honored from the global config or a trusted project, ignored from an
@@ -339,6 +348,9 @@ pub(crate) struct RawBundle {
     /// Auto-upgrade resolvers pairing with this bundle's `appimage:resolve` packages.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) appimage: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers pairing with this bundle's `binary:resolve` packages.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) binary: BTreeMap<String, RawResolve>,
 }
 
 /// The `[net]` table: config under the `net` namespace that is not a per-launch posture. For now
@@ -686,6 +698,12 @@ pub(crate) struct RawApp {
     /// an `<tool> = "appimage:resolve"` entry in the app's `packages`. Skipped when empty on serialize.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) appimage: BTreeMap<String, RawResolve>,
+    /// Auto-upgrade resolvers for this app's `binary:resolve` packages, declared as
+    /// `[app.<name>.binary.<tool>]` (or a top-level `[binary.<tool>]` in an imported profile). Same
+    /// shape and gating as the baseline `binary` (see [`RawConfig::binary`]); each pairs with a
+    /// `<tool> = "binary:resolve"` entry in the app's `packages`. Skipped when empty on serialize.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) binary: BTreeMap<String, RawResolve>,
     /// The app's network posture, overriding the baseline's when set. A security field.
     pub(crate) network: Option<NetworkField>,
     /// The app's process/exec posture, overriding the baseline's when set. A security field.
