@@ -234,7 +234,7 @@ A bundle may itself reference shared egress groups with `@name` (its header then
 `examples/net-groups/`,
 with `sbx net groups import`.
 
-The 62 shipped bundles, and what each carries:
+The 63 shipped bundles, and what each carries:
 
 | Bundle | Packages | Also carries | Requires groups |
 |---|---|---|---|
@@ -285,6 +285,7 @@ The 62 shipped bundles, and what each carries:
 | `opencode` | 1 (`mise:`) | 3 egress entries | `models-catalog`, `npm-registry` |
 | `opencode-desktop` | 1 (`deb:`) | 4 egress entries | `models-catalog`, `npm-runtime` |
 | `openfox` | 2 (`mise:`, `nix:`) | an install step | none |
+| `openwork` | 1 (`appimage:`) | 9 egress entries, an `appimage:` resolver | `models-catalog`, `npm-runtime` |
 | `pi` | 1 (`mise:`) | 1 egress entry | none |
 | `pool` | 1 (`tarball:`) | 1 egress entry, a `tarball:` resolver | none |
 | `prime-agent` | 5 (`nix:`) | 4 egress entries, 1 env var | `npm-registry`, `pypi` |
@@ -305,7 +306,7 @@ None of them carries a `cmd` or a posture (`network` mode, `gui`, `gpu`, …): a
 what a tool *needs*, and the consuming app keeps its own command and its own posture. See
 [What a bundle may carry](#what-a-bundle-may-carry-and-what-it-may-not).
 
-Every shipped profile now names a bundle with `use`: 62 of the 69 name their own, and the
+Every shipped profile now names a bundle with `use`: 63 of the 70 name their own, and the
 other 7 consume **another** agent's, because nothing would ever compose them in turn —
 `t3code` names `claude-code`; `aionui`, `opencode-web`, `open-design` and `orca-desktop`
 name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profile is a

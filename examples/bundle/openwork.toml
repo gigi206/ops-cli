@@ -1,0 +1,113 @@
+# `openwork` — the OpenWork desktop app: what it needs to be installed and to reach its own services.
+#
+#   sbx bundle import examples/bundle/openwork.toml
+#   # then in an app profile:   use = ["openwork"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-runtime.toml
+#
+# Derived from `examples/app/openwork.toml`, whose namesake profile names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
+# while the profile keeps its own command, posture and credential choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# THE ENGINE IS INSIDE THE ARTIFACT, so this bundle does not name the `opencode` one. OpenWork ships
+# the OpenCode binary as a sidecar inside its own AppImage (`resources/sidecars/opencode`, pinned by
+# the release's `versions.json`) and spawns it from there, rather than looking one up on `PATH`. The
+# app is therefore complete on its own: adding `use = ["opencode"]` would provision a SECOND,
+# independently versioned engine the app never runs. What the sidecar does need is the engine's own
+# reach, which is why the OpenCode hosts are in the allow list below.
+#
+# THE `appimage:resolve` BACKEND (auto-upgrade — why NOT `appimage:github:different-ai/openwork`).
+# The GitHub locator would pick the WRONG build. Upstream publishes three linux x86_64 AppImages in
+# one release — `openwork-…`, `openwork-cloud-…` and `openwork-enterprise-…` — and sbx's asset
+# selection sorts the candidates by name and takes the first one naming this architecture, which is
+# `openwork-cloud-…`. That is not a cosmetic difference: the desktop's own distribution table marks
+# the cloud and enterprise flavors `requireSignin: true`, while the public build runs without any
+# account. So this bundle uses the resolver form, and its command selects the PUBLIC asset by an
+# anchored name pattern. sbx runs that command in a HERMETIC sandbox (sbx's own base tools — curl,
+# jq; a shared network to reach the API; sbx's own CA bundle for TLS), re-validates the URL it
+# prints, resolves it to a content hash, and pins BOTH in the per-project appimage lock.
+# `sbx upgrade appimage` re-runs it and rolls the pin forward when upstream publishes; a warm launch
+# reuses the pin WITHOUT re-running it (offline). No manual version bump, no third party.
+#
+# The pattern is anchored at both ends (`^openwork-linux-x86_64-<version>.AppImage$`), so a future
+# flavor cannot match it, and the command prints nothing rather than a guess when the release carries
+# no such asset or more than one — a resolver that emits no URL fails the launch instead of pinning
+# the wrong artifact. It selects an x86_64 asset explicitly, like the other resolver bundles
+# (`kiro-desktop`, `pool`, `reasonix-desktop`): on aarch64 it resolves nothing, and upstream does
+# publish an arm64 AppImage if you edit the pattern.
+#
+# The AppImage is EXTRACTED at BUILD time, never self-mounted at runtime: `appimage-run`/`wrapType2`/
+# the raw AppImage all need a runtime FUSE/namespace mount the cage's seccomp denylist blocks, so sbx
+# unpacks the squashfs at build time (`appimageTools.extractType2`) and `autoPatchelfHook`s the
+# Electron binaries — and the OpenCode sidecar, an ordinary glibc ELF, with them. The build is
+# HOST-SIDE (an AppImage runs no maintainer script, so evaluating it host-side is safe), seeded into
+# the store, and offline-reusable after the first launch.
+#
+# THE ALLOW LIST IS A STARTING POINT. What a first launch put on the wire is marked OBSERVED below;
+# the rest is read out of the shipped app and its sources, opened ahead of need rather than measured
+# — a signed-in session driving an agent is what would confirm it. The definitive list is always what
+# the app actually calls: watch `sbx net logs -a openwork` and add what it names.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.openwork]
+allow = [
+    # OpenWork Den — the account, org and capability control plane. Sign-in, the Den API and the
+    # Den-hosted MCP all live under this host, and the app POSTs to them, so all verbs. The public
+    # build works signed OUT, so this is what an OPTIONAL Den login needs, not a launch requirement.
+    "{*} https://app.openworklabs.com",
+    # The OpenWork MCP endpoint (`/mcp/agent`) — what an external agent connects to, and what the
+    # desktop uses to reach assigned skills and connected services.
+    "{*} https://api.openworklabs.com",
+    # The model catalogue OpenWork serves to its OpenCode engine: the server resolves
+    # `OPENCODE_MODELS_URL` to this host in a packaged build, and the engine fetches the catalogue
+    # from it. A read-only fetch.
+    "{GET} https://models.openworklabs.com",
+    # The vendor site: the download page, the docs the Help menu links to, and the feedback form.
+    "{GET} https://openworklabs.com",
+    # The embedded OpenCode engine's own services — the gateway ("Zen"), its auth endpoints and the
+    # config/theme schemas. Same host the `opencode` bundle opens, for the same engine.
+    "{*} https://opencode.ai",
+    # The upstream model catalogue (`models.dev`), which the engine reads when it is not pointed at
+    # OpenWork's mirror above.
+    "@models-catalog",
+    # Runtime npm fetches: the engine's plugin loader pulls `@opencode-ai/plugin` (observed live in
+    # the `opencode-desktop` egress log, the same engine). OpenWork's own plugins ship inside the
+    # AppImage and need nothing here.
+    "@npm-runtime",
+    # The spellcheck dictionary Chromium fetches for the app's text fields and its embedded browser
+    # panel, served from rotating `*.gvt1.com` redirectors. OBSERVED refused on a first launch.
+    # GET-only and path-scoped to the dictionary path.
+    '{GET} re:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+]
+# Denied noise, kept out of the default log (still denied, still counted by `sbx net stats`). The
+# product analytics POST was OBSERVED on a first launch and is refused; the public build ships no
+# Sentry configuration, so no crash-reporting host is listed here.
+mute = [
+    "*.posthog.com",
+]
+
+[bundle.openwork.packages]
+# The OpenWork desktop app, auto-upgraded through the resolver below. The package name is
+# `openwork`, so it binds to the `[…appimage.openwork]` table and is wrapped as `bin/openwork` —
+# the executable name upstream's own electron-builder config gives the public build.
+openwork = "appimage:resolve"
+
+# The `appimage:resolve` command for the `openwork` package above (see "THE `appimage:resolve`
+# BACKEND" in the header for why the `github:` locator is not usable here). `-fsSL` fails closed on
+# an HTTP error; the jq filter keeps only the PUBLIC linux x86_64 asset and prints a URL only when
+# exactly one matches, so an ambiguous release resolves to nothing rather than to a guess. The
+# printed URL is re-validated as an `.AppImage` URL before sbx fetches it.
+[bundle.openwork.appimage.openwork]
+resolve = ["sh", "-c", '''
+curl -fsSL "https://api.github.com/repos/different-ai/openwork/releases/latest" \
+  | jq -r '[.assets[] | select(.name | test("^openwork-linux-x86_64-[0-9][0-9.]*\\.AppImage$")) | .browser_download_url] | if length == 1 then .[0] else empty end'
+''']

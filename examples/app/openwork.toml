@@ -1,0 +1,171 @@
+# OpenWork — the open-source agent workspace (different-ai/openwork), sandboxed by sbx.
+#
+#   sbx app import examples/app/openwork.toml
+#   sbx app run openwork
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.AppImage`, its auto-upgrade resolver and the
+# hosts the app reaches come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/openwork.toml
+#     sbx app import    examples/app/openwork.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
+#   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/models-catalog.toml
+#     sbx net groups import examples/net-groups/npm-runtime.toml
+#
+# OpenWork is a free, open-source Electron desktop app: a workspace where agents run against your
+# files, with skills, MCP connections and connected services you can share with teammates or keep to
+# yourself. It drives the OpenCode engine, which it SHIPS INSIDE ITS OWN ARTIFACT as a sidecar
+# binary rather than looking one up on `PATH` — so unlike the orchestrator profiles it needs no
+# second agent installed, and this profile does not name the `opencode` bundle (see the bundle's
+# header). Confined by sbx it sees only the cage filesystem (the project you launch it from, its own
+# persistent isolated home, and any `binds` below), reaches only the hosts you allow, and its powers
+# stop at the sandbox boundary (bubblewrap + seccomp + an empty netns + the egress allowlist).
+#
+# THE PUBLIC BUILD, DELIBERATELY. Upstream publishes three linux AppImages per release: the public
+# one, plus `cloud` and `enterprise` flavors whose own distribution table marks them
+# `requireSignin: true`. The bundle's resolver selects the PUBLIC asset by an anchored name pattern,
+# so this profile runs with NO account: an OpenWork Den login is an option you take, not a gate you
+# pass. The naive locator would have picked the cloud build — the bundle header explains why.
+#
+# FIRST LAUNCH resolves the current release, fetches the AppImage and builds it host-side — a large
+# Electron artifact, a couple of minutes, over your HOST network (the build does NOT use the cage
+# allowlist). Later launches reuse the pinned build offline. `sbx upgrade appimage` rolls the pin
+# forward; the app's own electron-updater cannot: sbx serves it from a read-only store, which is the
+# point — the artifact you audited is the artifact that runs. That updater still CHECKS on startup:
+# a launch fetches the release manifest from GitHub, which sbx's built-in allow-set already covers,
+# and it downloads nothing on its own (upstream sets `autoDownload = false`). Nothing in this profile
+# has to open a host for it.
+#
+# EGRESS IS FILTERED, and no environment variable is load-bearing for it. OpenWork's server routes
+# its outbound calls through `electron.net.fetch` — Chromium's network stack, which honours the
+# proxy variables sbx sets natively — rather than through Node's undici global (the dispatcher that
+# ignores `http_proxy` and made `NODE_USE_ENV_PROXY` mandatory in `examples/app/t3code.toml`). The
+# OpenCode sidecar is a separate process, and the app spawns it on top of its OWN environment
+# (`{ ...process.env, ...engineEnv }`), so the proxy and CA variables sbx sets reach the engine the
+# same way they reach it in `examples/app/opencode.toml`. If a launch misbehaves, read
+# `sbx net logs -a openwork` first: a
+# named deny is a host to add to `allow`, not a reason to drop the allowlist.
+# `sbx app run openwork --net shared` remains the one-launch escape hatch, and it leaves the profile
+# filtered.
+#
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
+# database (`~/.pki/nssdb`), so it would otherwise fail every HTTPS with `ERR_CERT_AUTHORITY_INVALID`.
+# For a `gui = "wayland"` cage under a filtering posture, sbx seeds its MITM CA into the cage's NSS
+# db automatically (part of the GUI hole, like fonts); `--use-system-ca` tells Chromium to consult
+# that store. The sidecar is a command-line client and takes the CA from the variables sbx sets.
+#
+# DISPLAY + GPU + DBUS. `gui = "wayland"` binds the host Wayland compositor socket (read-only) and
+# provisions fonts, so the Electron window maps. X11 is never offered. Isolation is
+# compositor-dependent — Mutter (GNOME) is safe; wlroots compositors (sway, hyprland) expose
+# screen-capture/input-injection to ordinary clients (see docs-site/docs/guide/configuration/gui.md).
+# `gpu = true` opens hardware-accelerated rendering (mesa provisioned into sbx's own store, the
+# render node under `/dev/dri`, the minimal `/sys` DRM subtree the driver needs) — without it a
+# Chromium/Electron app on Wayland often produces no buffer and no window maps, so it is on. mesa
+# covers Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (renders, slower).
+# `dbus = true` gives the cage its OWN private desktop portal, so the file picker that authorizes a
+# workspace directory opens IN-CAGE and lists the cage filesystem, and notifications are relayed.
+# The Electron flags: `--no-sandbox` is mandatory and acceptable because bubblewrap + seccomp + the
+# empty netns IS the boundary (it replaces Chromium's own redundant sandbox);
+# `--ozone-platform=wayland` selects the Wayland backend; `--disable-dev-shm-usage` avoids the small
+# cage `/dev/shm`.
+#
+# SIGNING IN TO DEN — use the app's OWN browser panel, and no in-cage Chromium is needed. This is
+# the one desktop profile that needs no `nix:chromium`: OpenWork embeds a browser panel, and its
+# main process INTERCEPTS the `openwork://` deep link the Den sign-in hands back ("so in-app browser
+# auth works without the system protocol handler", in upstream's words), so the whole flow closes
+# inside the app. Open the browser panel, go to the Den sign-in page, authenticate, and the grant
+# comes back to the app itself.
+#
+# The "Sign in" BUTTON is a different path and it is inert here: it calls Electron's
+# `shell.openExternal`, which hands the URL to a system browser the hermetic cage does not have, so
+# the click reports that it could not open a browser. That is a missing host browser, not a broken
+# login — the browser panel above is the way in. If you would rather wire the button, the pattern is
+# the in-cage Chromium the other desktop profiles use (`examples/app/freebuff-desktop.toml`): add
+# `chromium = "nix:chromium"` to a `[packages]` table here and replace `cmd` with the bash wrapper
+# that installs an `xdg-open` shim plus a `.desktop` handler — registering `openwork` itself as the
+# `x-scheme-handler/openwork` handler, so the callback reaches the running instance through
+# Electron's single-instance relay. It costs a large closure to replace something the app already
+# does.
+#
+# WHAT DOES NOT WORK IN THE CAGE, and why. OpenWork-MANAGED OAuth — the flow that connects a
+# third-party service (Google Workspace, Microsoft 365) through OpenWork rather than through your own
+# key — refuses to start: it derives its vault key from Electron's `safeStorage` and rejects the
+# `basic_text` backend outright ("A secure Linux password store is required"), which is the only
+# backend available with no keyring in the cage. Nothing else depends on it — the vault key is loaded
+# lazily, the first time you opt into that flow. Your own provider keys, the Den login and the
+# workspace itself are unaffected.
+cmd = [
+    "openwork",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+    "--password-store=basic",
+]
+# One workspace, one login, shared across the projects you launch from: the app's state (its
+# workspace list, the Den session, the engine's credentials) lives in a dedicated persistent isolated
+# home rather than one per project.
+home_scope = "global"
+
+gui = "wayland"
+gpu = true
+dbus = true
+
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `openwork` BUNDLE — the `.AppImage` and its auto-upgrade resolver, the hosts the
+# app and its embedded engine reach, and the noise mutes — from one declaration shared with the
+# bundle file itself, so this profile cannot fall behind when the app's requirements change. What
+# the bundle may never carry is posture: the `gui`/`gpu`/`dbus` grants and the command above stay
+# here.
+#
+# IMPORT THE BUNDLE FIRST — it is not in this file:
+#     sbx bundle import examples/bundle/openwork.toml
+# Without it the launch warns that the bundle is undeclared and the app is simply absent.
+use = ["openwork"]
+
+# No `[packages]` table here, and no `[appimage.openwork]` resolver: both come from the bundle.
+
+# OpenWork works on your files: the workspace you authorize in the app has to exist in the cage.
+# Launching from a project directory gives it that project; `binds` is what adds another. It is a
+# security field, honored only because this profile lives in your trusted config dir. Uncomment and
+# point at the directory holding the work you want the agent to touch (read/write at its real
+# absolute path).
+#binds = [
+#    { path = "~/work", mode = "rw" },
+#]
+
+[network]
+mode = "deny"
+# The app's own hosts, its embedded engine's hosts and the shared lanes all arrive with the
+# `openwork` bundle (`use` above) and are unioned into this list at resolution — inspect them with
+# `sbx bundle openwork`, and see the launch's own view with `sbx config show --app openwork`.
+# What belongs HERE is the provider you point the engine at, because that is a choice this profile
+# cannot make for you. Uncomment the one you use, and discover exact hosts with
+# `sbx net logs -a openwork` (or check ahead with `sbx test net <url>`).
+allow = [
+    #"{*} https://api.anthropic.com",
+    #"{*} https://api.openai.com",
+    #"{*} https://openrouter.ai",
+    #"{*} https://generativelanguage.googleapis.com",
+]
+
+# CREDENTIAL POSTURE — the engine's own credentials, held in the app's isolated home.
+# OpenWork drives its embedded OpenCode engine, and that engine authenticates the way it does
+# everywhere else: a provider key you enter in the app, or a provider login it performs itself. Both
+# land in the app's dedicated, persistent, isolated home (`home_scope = "global"` → one setup,
+# shared across projects), never in the project you launch from. There is no [secret] block because
+# no HTTP header key is injected host-side.
+#
+# If you would rather keep the key OUT of the cage entirely, the injected path works here as it does
+# in `examples/app/opencode.toml`: put a placeholder in [env], name the provider host in a [secret]
+# block, and the egress proxy substitutes the real value on the wire — the cage never holds it.
+#[env]
+#OPENROUTER_API_KEY = "sk-or-sbx-placeholder-replaced-by-the-egress-proxy"
+#
+#[secret."openrouter.ai"]
+#from = "env://OPENROUTER_API_KEY"
+#header = "Authorization"
+#type = "bearer"

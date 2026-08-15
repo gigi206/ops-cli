@@ -1,6 +1,6 @@
 # Profile catalog
 
-The repository's `examples/app/` directory ships **69 importable
+The repository's `examples/app/` directory ships **70 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -71,13 +71,15 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `warp` | `tarball:resolve` (the vendor's artifact redirect) | `app.warp.dev` + `sessions`/`rtc.app.warp.dev` WS (Warp account, device-code login; `WARP_API_KEY`) |
 | `vtcode` | `mise:github:vinhnx/VTCode` (+ `nix:ripgrep`, `nix:ast-grep`) | provider-dependent (BYOK, default OpenRouter) |
 
-## Desktop applications (14)
+## Desktop applications (15)
 
 GUI agents: Electron for most, a Wails/WebKit2GTK shell for `reasonix-desktop`. Each needs a [Wayland display](../configuration/gui)
 (`gui = "wayland"`), and most also enable [`gpu`](../configuration/gpu) and the in-cage
 [desktop portal](../configuration/dbus) (`dbus = true`). Where the tool's sign-in opens
 an external browser, the profile wires an in-cage Chromium as the `xdg-open` handler so the
-whole login closes inside the cage.
+whole login closes inside the cage. `openwork` is the exception: it embeds its own browser
+panel, which intercepts the deep link its sign-in hands back, so that profile needs no in-cage
+Chromium.
 
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
@@ -91,6 +93,7 @@ whole login closes inside the cage.
 | `kiro` | `nix:kiro-cli` (+ `nix:chromium`) | `*.kiro.dev` (AWS/Kiro account) |
 | `kiro-desktop` | `tarball:resolve` (+ `nix:chromium`) | `app.kiro.dev` (AWS/Kiro account) |
 | `opencode-desktop` | `deb:github:anomalyco/opencode` | provider-dependent (BYOK) |
+| `openwork` | `appimage:resolve` (the public build, whose OpenCode engine ships inside the artifact as a sidecar) | provider-dependent (BYOK); an OpenWork Den account (`app.openworklabs.com`) is optional |
 | `orca-desktop` | `deb:github:stablyai/orca` (+ `nix:chromium`; interior pilot agent `opencode` via `mise:opencode`) | provider-dependent (BYOK); Orca hosts (`login.onorca.dev`, `relay.onorca.dev`) denied by default |
 | `reasonix-desktop` | `deb:resolve` + `[deb.…] libs` (a Wails/WebKit2GTK shell, not Electron) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
 | `t3code` | `appimage:github:pingdotgg/t3code` (+ `nix:chromium`) | provider-dependent (BYOK) |
@@ -116,7 +119,7 @@ default (`home_scope = "global"`).
 ## Bundles: the shared pieces
 
 Beyond the app profiles, `examples/bundle/`
-ships **62 reusable tool bundles**: a named set of packages and egress rules that
+ships **63 reusable tool bundles**: a named set of packages and egress rules that
 profiles pull in with `use = [...]` instead of restating it: the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as

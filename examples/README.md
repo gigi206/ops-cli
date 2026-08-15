@@ -90,7 +90,7 @@ no such table gets a warning rather than an invented one, because inventing one 
 posture.
 
 **A bundle publishes what another profile can consume**, and that is the rule. Every shipped tool
-now has one — 62 bundles for 69 profiles — with a single exception: a profile that consumes another
+now has one — 63 bundles for 70 profiles — with a single exception: a profile that consumes another
 agent's engine publishes nothing of its own. `t3code` names `claude-code`; `aionui`,
 `opencode-web`, `open-design` and `orca-desktop` name `opencode`; `hermes-web` and `hermes-webui`
 name `hermes`. Nothing would ever compose one of *those*, so a bundle for them would be an artifact
