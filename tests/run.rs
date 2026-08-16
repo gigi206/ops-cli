@@ -2924,6 +2924,94 @@ fn a_trailing_argument_reaches_a_shell_profile_without_being_eaten_as_argv0() {
 }
 
 #[test]
+fn a_cage_carries_the_zone_database_and_the_config_moves_its_clock() {
+    // The zone end to end, through the real binary and two real cages.
+    //
+    // What makes this discriminating: `date` printing UTC is exactly what the old, database-less
+    // cage did, so the default-path assertions are the *link* and the *database contents* — neither
+    // of which existed before — and the configured-path assertion is a zone name nothing else in
+    // the system produces.
+    let project = TmpDir::new("tz-proj");
+    let data = TmpDir::new("tz-data");
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping timezone e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // Nothing configured. The cage still resolves a zone: the link exists, names UTC, and the
+    // database behind it is the whole IANA set rather than the one file the link needs.
+    let plain = run_in(
+        project.path(),
+        data.path(),
+        &[
+            "sh",
+            "-c",
+            "printf 'LINK=%s ZONE=%s PARIS=%s TZDIR=%s\\n' \
+             \"$(readlink /etc/localtime)\" \"$(date +%Z)\" \
+             \"$(test -f /usr/share/zoneinfo/Europe/Paris && echo yes || echo no)\" \"$TZDIR\"",
+        ],
+    );
+    let out = String::from_utf8_lossy(&plain.stdout);
+    let log = format!("{}{out}", String::from_utf8_lossy(&plain.stderr));
+    assert!(plain.status.success(), "default launch failed: {log}");
+    assert!(
+        out.contains("LINK=/usr/share/zoneinfo/UTC ZONE=UTC PARIS=yes TZDIR=/usr/share/zoneinfo\n"),
+        "an unconfigured cage must resolve UTC through a real database: {log}"
+    );
+
+    // A project names a zone — and is left UNTRUSTED on purpose. `timezone` is a free field, so
+    // this is the property the security postures beside it do not have; a launch that answered UTC
+    // here would mean the field had been gated.
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "timezone = \"Europe/Paris\"\n",
+    )
+    .unwrap();
+    let zoned = run_in(
+        project.path(),
+        data.path(),
+        &[
+            "sh",
+            "-c",
+            "printf 'LINK=%s ZONE=%s\\n' \"$(readlink /etc/localtime)\" \"$(date +%Z)\"",
+        ],
+    );
+    let out = String::from_utf8_lossy(&zoned.stdout);
+    let log = format!("{}{out}", String::from_utf8_lossy(&zoned.stderr));
+    assert!(zoned.status.success(), "configured launch failed: {log}");
+    assert!(
+        out.contains("LINK=/usr/share/zoneinfo/Europe/Paris ZONE=CET\n")
+            || out.contains("LINK=/usr/share/zoneinfo/Europe/Paris ZONE=CEST\n"),
+        "the link and the clock must both move, and agree: {log}"
+    );
+
+    // A zone the database does not carry: the launch stands, on the default zone, and says why.
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "timezone = \"Europe/Nowhere\"\n",
+    )
+    .unwrap();
+    let bogus = run_in(
+        project.path(),
+        data.path(),
+        &["sh", "-c", "printf 'ZONE=%s\\n' \"$(date +%Z)\""],
+    );
+    let out = String::from_utf8_lossy(&bogus.stdout);
+    let err = String::from_utf8_lossy(&bogus.stderr);
+    assert!(bogus.status.success(), "the launch must stand: {err}{out}");
+    assert!(out.contains("ZONE=UTC\n"), "{err}{out}");
+    assert!(
+        err.contains("Europe/Nowhere"),
+        "the fallback must name the zone it could not find: {err}"
+    );
+}
+
+#[test]
 fn a_network_allowlist_filters_egress_through_the_proxy() {
     // The Model-B egress path end to end through the real binary: a trusted
     // `network = "deny"` stands up the host filtering proxy on a bound socket, the

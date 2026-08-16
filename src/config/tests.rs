@@ -77,6 +77,7 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
+        timezone: None,
         plugin: Default::default(),
         broker: Default::default(),
         fs: None,
@@ -6465,6 +6466,90 @@ fn vhs(
 /// [`resolve`] with no installed plugins — the default for the layering tests.
 fn resolve_no_plugins(global: RawConfig, project: Option<(RawConfig, TrustState)>) -> Resolved {
     super::resolve(global, project, &PluginRegistry::default())
+}
+
+/// A config carrying nothing but a zone, for the layering test below.
+fn zoned(zone: &str) -> RawConfig {
+    RawConfig {
+        timezone: Some(zone.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_timezone_layers_from_any_source_and_a_bad_name_leaves_the_zone_in_effect() {
+    // `timezone` is a **free** field, so this asserts the property the security postures beside it
+    // do NOT have: an *untrusted* project's zone applies. The reason is in the schema — the value
+    // reads nothing from the host, and `[env] TZ` is already free — so a future gate on this field
+    // has to break this test deliberately.
+    let r = resolve_no_plugins(zoned("Europe/Paris"), None);
+    assert_eq!(r.timezone.as_deref(), Some("Europe/Paris"));
+    assert_eq!(r.timezone_origin, Provenance::Global);
+
+    let r = resolve_no_plugins(
+        zoned("Europe/Paris"),
+        Some((zoned("Asia/Tokyo"), TrustState::Untrusted)),
+    );
+    assert_eq!(r.timezone.as_deref(), Some("Asia/Tokyo"));
+    assert_eq!(r.timezone_origin, Provenance::Project);
+
+    // No layer named one: the field stays unset, and it is the *launcher* that turns that into UTC
+    // — so a test reading `Some("UTC")` here would be asserting the wrong layer's job.
+    let r = resolve_no_plugins(RawConfig::default(), None);
+    assert_eq!(r.timezone, None);
+    assert_eq!(r.timezone_origin, Provenance::Default);
+
+    // A value that is not a zone name is dropped with a warning and the layer below stands. Each of
+    // these would otherwise become a link target under the zone database: the traversal and the
+    // absolute path are the two that matter, the rest pin the charset.
+    for bad in [
+        "../../etc/shadow",
+        "/etc/shadow",
+        "Europe/../etc",
+        "Europe/Paris/",
+        "",
+        "Europe/Paris\n",
+        "Europe Paris",
+        "Europe/Paris;rm -rf /",
+    ] {
+        let r = resolve_no_plugins(
+            zoned("Europe/Paris"),
+            Some((zoned(bad), TrustState::Trusted)),
+        );
+        assert_eq!(
+            r.timezone.as_deref(),
+            Some("Europe/Paris"),
+            "{bad:?} must not take effect"
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("not an IANA zone name")),
+            "{bad:?} must say why it was dropped: {:?}",
+            r.warnings
+        );
+    }
+
+    // And the names that ARE zones, including the awkward ones the charset has to admit: three
+    // segments, a `+`, and a hyphen.
+    for good in [
+        "UTC",
+        "Europe/Paris",
+        "America/Argentina/Salta",
+        "Etc/GMT+3",
+        "America/Port-au-Prince",
+    ] {
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((zoned(good), TrustState::Trusted)),
+        );
+        assert_eq!(r.timezone.as_deref(), Some(good), "{good} is a zone name");
+        assert!(
+            r.warnings.is_empty(),
+            "{good} must not warn: {:?}",
+            r.warnings
+        );
+    }
 }
 
 // --- one-shot override application (`apply_override` / `apply_override_channel`) ---

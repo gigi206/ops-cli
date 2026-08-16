@@ -166,6 +166,8 @@ pub(crate) fn resolved(
     apps: Vec<(&str, crate::config::ResolvedApp)>,
 ) -> crate::config::Resolved {
     crate::config::Resolved {
+        timezone: None,
+        timezone_origin: crate::config::Provenance::Default,
         open: Default::default(),
         service: Default::default(),
         provisions: Default::default(),

@@ -37,15 +37,16 @@
 # curated `curl`; the curated tools are in src/sandbox/fhs.rs). No tarball is
 # extracted either, so no `nix:gnutar`/`nix:gzip`: the binary arrives
 # unarchived and is `chmod +x`'d into place by `update_binary` (verified in the
-# launcher source, downloaded fresh for this profile). The single `[packages]` entry
-# below serves the cage, not the launcher: it is the zone database (see TIMEZONE).
+# launcher source, downloaded fresh for this profile). So this profile declares no
+# `[packages]` at all.
 #
 # TIMEZONE — the CLI's cron store resolves the local zone the FHS way, by reading
-# `/etc/localtime`, which a hermetic cage does not carry. The wrapper links it (and
-# `/usr/share/zoneinfo`, the directory the resolver reads zone names under) to the
-# `tzdata` provisioned below. The zone defaults to UTC; select yours with
-#     sbx app run muse --env TZ=Europe/Paris
-# which then governs the cage's own `date` too.
+# `/etc/localtime`. Every cage carries that link and the zone database behind it, so
+# there is nothing for this profile to arrange; the zone reads UTC unless the config
+# names one:
+#     timezone = "Europe/Paris"     # in ~/.config/sbx/sbx.toml
+# which governs the cage's own `date` too. A bare `--env TZ=...` does not: it moves
+# the clock without moving the link the resolver reads.
 #
 # VERSION / UPGRADE — the launcher normally re-checks the channel hourly and rolls
 # the binary in the background; that would silently move the version, breaking the
@@ -61,9 +62,8 @@
 # `sbx upgrade` does NOT reach this binary, and cannot: it rolls managed channels
 # (`nix`/`mise`/`flake`/`deb`/`appimage`/`tarball`), and a bootstrap exposes no
 # download URL for a `<backend>:resolve` to re-resolve — Meta's launcher resolves
-# the channel itself, which is exactly what the override above re-runs. The one
-# thing here `sbx upgrade` does move is the `tzdata` below, with the nixpkgs
-# channel (`sbx upgrade nix`).
+# the channel itself, which is exactly what the override above re-runs. Nothing
+# else in this profile rolls: it declares no package for `sbx upgrade` to move.
 #
 # CREDENTIAL POSTURE — two ways in, headless-first:
 #
@@ -109,36 +109,9 @@ cmd = [
     '''
 set -eo pipefail
 bin="$HOME/.local/bin/muse"
-# A hermetic cage carries no `/etc/localtime`, and the CLI's cron store fails to
-# start without one:
-#   tbh-cron: cron timezone reconcile failed: cron store backend error:
-#   local timezone could not be determined
-# So point both FHS names at the provisioned zone database. Both are needed: the
-# resolver reads the zone NAME from the `/etc/localtime` link, and re-resolves a
-# `$TZ` it is given under `/usr/share/zoneinfo` — a `TZ` alone, without these
-# links, leaves the cage worse off than unset (the CLI still fails, and the cage's
-# `date` reads the name as a bare POSIX abbreviation at UTC). Guarded end to end: a
-# zone name the database does not carry leaves the cron warning in place rather
-# than failing the launch, and an `/etc/localtime` that already exists is left
-# alone, so the profile defers to whatever provided it. The glob spans tzdata's
-# other outputs (`-bin`, `-man`) as well, which is why the loop tests for the zone
-# file itself and moves on: it is that test, not the glob, that picks the output
-# carrying the database.
-zone="${TZ:-UTC}"
-if [ ! -e /etc/localtime ]; then
-  for zi in /nix/store/*-tzdata-*/share/zoneinfo; do
-    [ -f "$zi/$zone" ] || continue
-    { mkdir -p /usr/share \
-      && { [ -e /usr/share/zoneinfo ] || ln -s "$zi" /usr/share/zoneinfo; } \
-      && ln -sfn "/usr/share/zoneinfo/$zone" /etc/localtime; } || true
-    break
-  done
-fi
 # The install is the `muse` bundle's `provision`, and sbx has already run it by the
-# time this starts; what stays here is the launch. The timezone links above are it:
-# the cage's /etc is synthesized per launch, so they cannot be laid down by a step
-# that exited. A `provision` is a separate process, so its PATH export does not
-# reach this shell either.
+# time this starts; what stays here is the launch. A `provision` is a separate
+# process, so its own PATH export does not reach this shell.
 export PATH="$HOME/.local/bin:$PATH"
 exec "$bin" "$@"
     ''',
@@ -157,15 +130,8 @@ exec "$bin" "$@"
 #    { path = "~/.config/muse", mode = "rw" },
 #]
 
-# The zone database the wrapper links `/etc/localtime` to. Only its `share/zoneinfo`
-# is what this profile wants, but nix's tzdata also ships a `bin` output, and sbx
-# puts that on the cage PATH: the agent therefore also gains `zic` and `zdump` (the
-# zone compiler and its dumper — both local, neither reaching the host or the
-# network). Declared rather than assumed — tzdata reaches a store only as a
-# transitive dependency of whatever else was built there, so without this entry the
-# wrapper's lookup is a lottery on which packages the project happens to carry.
 # --- The agent's requirements come from its bundle ------------------------------------------------
-# `use` pulls in the `muse` BUNDLE — the zone database the CLI reads, the hosts it reaches and its auto-update opt-out —
+# `use` pulls in the `muse` BUNDLE — the install step, the hosts it reaches and its auto-update opt-out —
 # from one declaration shared with the bundle file itself, so this profile cannot fall behind when
 # the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
 # the `cmd` above, and a consuming app has to reproduce it to get the agent at all.

@@ -63,7 +63,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `kilocode` | `mise:github:Kilo-Org/kilocode` | provider-dependent (BYOK) |
 | `kimi` | `nix:nodejs` (+ `mise:npm:@moonshot-ai/kimi-code`) | `api.kimi.com` (`KIMI_API_KEY` / Moonshot account) |
 | `mimo` | `nix:nodejs` (+ `mise:npm:@mimo-ai/cli`) | `api.xiaomimimo.com` (MiMo Auto / Xiaomi account) |
-| `muse` | bootstrap installer (`cmd` wrapper) + `nix:tzdata` (zone database, no toolchain package) | `api.meta.ai` (Meta Model API / Muse Spark BYOK) or a Meta account (device login) |
+| `muse` | bootstrap installer (`cmd` wrapper), no toolchain package | `api.meta.ai` (Meta Model API / Muse Spark BYOK) or a Meta account (device login) |
 | `nanobot` | `mise:pipx:nanobot-ai` (+ `nix:uv`, `nix:python312`) | provider-dependent (BYOK: OpenRouter / OpenAI / Anthropic / Gemini / DeepSeek / any OpenAI-compatible / local) |
 | `nova` | `nix:nodejs` (+ `mise:npm:@compass-ai/nova`) | `api.compassap.ai` (`COMPASS_API_KEY`) or BYOK |
 | `omp` | `mise:github:can1357/oh-my-pi` (a high-capability fork of Pi, this repo's `pi`) | provider-dependent (BYOK) |

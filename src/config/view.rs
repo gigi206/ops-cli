@@ -86,6 +86,11 @@ pub(crate) struct ConfigView {
     pub(crate) gui: GuiView,
     /// Which layer supplied the GUI posture (`Default` when neither config set it).
     pub(crate) gui_origin: ProvenanceView,
+    /// The IANA zone the cage's clock reads in. Always a zone, never absent: the built-in
+    /// [`crate::sandbox::binds::DEFAULT_ZONE`] when no layer named one.
+    pub(crate) timezone: String,
+    /// Which layer named the zone (`Default` when none did).
+    pub(crate) timezone_origin: ProvenanceView,
     /// Whether hardware-accelerated GPU rendering is open (`gpu = true`).
     pub(crate) gpu: bool,
     /// Which layer supplied the GPU posture (`Default` when neither config set it).
@@ -1081,6 +1086,13 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         notify_origin: resolved.notify_origin.into(),
         gui,
         gui_origin: resolved.gui_origin.into(),
+        // The view reports the zone the cage will actually run in, so an unset field reads as the
+        // built-in default rather than as a blank — the cage always has one.
+        timezone: resolved
+            .timezone
+            .clone()
+            .unwrap_or_else(|| crate::sandbox::DEFAULT_ZONE.to_string()),
+        timezone_origin: resolved.timezone_origin.into(),
         gpu: resolved.gpu,
         gpu_origin: resolved.gpu_origin.into(),
         audio: resolved.audio,
@@ -1900,6 +1912,8 @@ mod tests {
     #[test]
     fn the_view_model_serializes_to_a_json_object() {
         let view = ConfigView {
+            timezone: "UTC".to_string(),
+            timezone_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -2259,6 +2273,8 @@ mod tests {
         // A baseline credential the app inherits — and that the app's narrowed network drops, the
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
+            timezone: None,
+            timezone_origin: Provenance::Default,
             plugin: Default::default(),
             net_groups: Default::default(),
             brokers: Vec::new(),

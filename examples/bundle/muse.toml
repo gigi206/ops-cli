@@ -1,4 +1,4 @@
-# `muse` — Meta's Muse CLI: the zone database it needs, plus the hosts it reaches.
+# `muse` — Meta's Muse CLI: the install step it needs, plus the hosts it reaches.
 #
 #   sbx bundle import examples/bundle/muse.toml
 #   # then in an app profile:   use = ["muse"]
@@ -12,13 +12,13 @@
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
 #
 # THE AGENT IS A VENDOR BOOTSTRAP, and the bundle carries it. Meta publishes no package sbx could
-# ride, only an installer script, which is why `[packages]` names no CLI: the download is the
-# `provision` below, the one-time step sbx runs before the consuming app's `cmd`. What `[packages]`
-# does name is the zone database, because the tool reads local time and a cage ships none.
+# ride, only an installer script, which is why this bundle declares no `[packages]` at all: the
+# download is the `provision` below, the one-time step sbx runs before the consuming app's `cmd`.
 #
-# What the app still owes is its own `cmd`, and here it is more than a PATH export: the cage's /etc
-# is synthesized per launch, so the `/etc/localtime` links the CLI's cron store needs cannot be laid
-# down by a step that exited. They live in `examples/app/muse.toml`, beside the launch they shape.
+# What the app still owes is its own `cmd`, which here is the PATH export the launch needs. The
+# CLI also resolves the local zone the FHS way; every cage carries the zone database and an
+# `/etc/localtime` for that, so neither this bundle nor the profile has anything to arrange.
+# Which zone is the user's `timezone` field, not an app's to choose.
 #
 # UPGRADE. A bootstrap install rides no `[packages]` backend, so there is no lock to roll: what
 # advances the CLI is running its installer again, which always resolves the current channel.
@@ -27,8 +27,8 @@
 # one launch only: `sbx app run muse --env MUSE_SBX_UPDATE=1`.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
-# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
-# silently become `packages.allow` — an unknown key, dropped without a word.
+# `[table]` header as belonging to that table, so an `allow` written below `[…env]` would
+# silently become `env.allow` — an unknown key, dropped without a word.
 
 [bundle.muse]
 # Meta's official installer, run once inside the cage, so the per-project build that `mise:`
@@ -60,10 +60,6 @@ allow = [
     "{GET}  https://lookaside.facebook.com",
     "{*}   https://auth.meta.com",
 ]
-
-[bundle.muse.packages]
-# The zone database the CLI reads; the tool itself arrives through the profile's `cmd`.
-tzdata = "nix:tzdata"
 
 [bundle.muse.env]
 # sbx owns upgrades, so tell the CLI not to replace itself behind the pin.

@@ -50,8 +50,9 @@ location**, so its `[packages]` apply regardless of any project's trust state.
 
 The schema is split by the [trust gate](../concepts/trust), not by two schemas:
 
-- **Free field**, [`env`](env), applies from any project (minus a reserved-key
-  denylist).
+- **Free fields**, [`env`](env) (minus a reserved-key denylist) and
+  [`timezone`](timezone), apply from any project. Neither reads anything from the host:
+  they say what the cage's own environment and clock look like.
 - **Security fields**, almost everything else, apply only from a **trusted** source (the
   global config, an app profile, or a project you have run [`sbx trust`](../cli/trust)
   on).
@@ -68,6 +69,7 @@ The global config and imported app profiles are **trusted by location**; a proje
 | Field | Kind | Page |
 |---|---|---|
 | `env` | free | [env](env) |
+| `timezone` | free | [timezone](timezone) |
 | `binds` | security | [binds](binds) |
 | `packages` | security | [packages](packages) |
 | `[flakes.<name>]` | security | [packages](packages#flakes-an-inline-nix-flake) |

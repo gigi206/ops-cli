@@ -284,6 +284,22 @@ pub(crate) fn resolve_userland(
             )
         })?;
 
+    // The IANA zone database, so the cage can answer what time it is at all. A hermetic cage
+    // carries no `/usr/share/zoneinfo` and no `/etc/localtime`, and a tool that resolves the local
+    // zone the FHS way (Rust's `iana-time-zone`, and every scheduler built on it) then fails
+    // outright rather than falling back to UTC — while a bare `TZ` leaves it worse off still, since
+    // glibc reads a zone name it cannot resolve as a POSIX abbreviation at UTC. Like `cacert` and
+    // the locale archive, tzdata's default output ships only data (no binary), so it is off PATH;
+    // the assembler binds it at the standard path, names it in `TZDIR`, and points
+    // `/etc/localtime` into it. Provisioned unconditionally rather than left to `[packages]`: the
+    // database reaches a store only as a transitive dependency of whatever else was built there, so
+    // without this its presence is a lottery on the project's other tools. The marker is the zone
+    // file the default cage links to, which also pins the data output.
+    // `.out` explicitly: tzdata's derivation also builds a `-bin` output (the `zic` compiler and
+    // `zdump`) and a `-man`, and naming the attribute bare would fetch both for a cage that binds
+    // neither. The marker is the zone file the default cage links to, which pins the data output.
+    let tzdata = realise("tzdata.out", "share/zoneinfo/UTC", "tzdata")?;
+
     // Curated base CLI tools: a small, broadly-useful set every project gets without
     // per-project provisioning — an HTTP client, version control, a pager, the text-processing
     // trio, file search (POSIX and fast), structured-data queries for JSON and YAML, and
@@ -318,6 +334,7 @@ pub(crate) fn resolve_userland(
         socat.clone(),
         cacert.clone(),
         locales.clone(),
+        tzdata.clone(),
     ];
     base_roots.extend(tools.iter().cloned());
 
@@ -365,6 +382,10 @@ pub(crate) fn resolve_userland(
         // The UTF-8 locale archive, named in `LOCALE_ARCHIVE` so the cage's glibc loads a
         // UTF-8 `LANG`. An in-sandbox logical path (it resolves through the store at `/nix`).
         locale_archive: locales.join("lib/locale/locale-archive"),
+        // The zone database directory, a host-side bind source (it backs the `/usr/share/zoneinfo`
+        // mount), so physical — like the CA bundle above and unlike the locale archive, which is
+        // named by store path rather than bound.
+        zoneinfo_src: crate::store::physical_path(layout, &tzdata.join("share/zoneinfo")),
     })
 }
 
@@ -473,11 +494,14 @@ mod resolve_tests {
         // the base roots are logical store paths, each backed by sbx's store and each a
         // top-level store path (no `bin`/`lib` sub-path), since they are the closure
         // roots the per-project store is seeded from. The expected base set is present:
-        // the eleven core provisions plus one root per curated CLI tool.
+        // the twelve core provisions plus one root per curated CLI tool. Three of the twelve
+        // carry data rather than a program (cacert, the locale archive, the zone database) and
+        // are deliberately absent from the loop below: they are off PATH, so a marker on the
+        // base PATH is exactly what they must NOT have.
         assert_eq!(
             u.base_roots.len(),
-            11 + BASE_TOOLS.len(),
-            "glibc, stdcpp, zlib, bash, coreutils, nix-ld, nix, mise, socat, cacert, locales + the curated tools"
+            12 + BASE_TOOLS.len(),
+            "glibc, stdcpp, zlib, bash, coreutils, nix-ld, nix, mise, socat, cacert, locales, tzdata + the curated tools"
         );
         // every curated tool is reachable by name: its marker binary physically exists in
         // one of the base PATH directories (so it is both realised and on PATH).

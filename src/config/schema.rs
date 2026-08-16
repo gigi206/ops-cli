@@ -158,6 +158,21 @@ pub(crate) struct RawConfig {
     /// X11 is deliberately never offered — an X client can snoop and drive every other window,
     /// which Wayland's per-client isolation prevents on a well-behaved compositor.
     pub(crate) gui: Option<String>,
+    /// The IANA zone the cage's clock reads in, e.g. `timezone = "Europe/Paris"`. A cage always
+    /// carries the zone database and an `/etc/localtime`; unset, that link names `UTC`, which is a
+    /// real answer disclosing nothing about where the host is. This names a different one.
+    ///
+    /// **Not a security field**, and the reason is worth stating rather than assuming: the value
+    /// travels one way. It tells the cage what to display; it reads nothing from the host, so no
+    /// layer can learn the host's zone by setting it. And a project can already reach the same
+    /// effect through `[env] TZ`, which is free (`TZ`/`TZDIR` steer data, not code, so neither is a
+    /// reserved key) — gating this one while leaving that open would buy nothing and lie about it.
+    ///
+    /// A zone is a **baseline** choice, like `[network] stats`: it belongs to the machine and the
+    /// person, not to an app, so there is no per-app override and a shipped app profile cannot
+    /// declare one (it does not know where its user is). A name the provisioned database does not
+    /// carry falls back to `UTC` with a warning rather than failing the launch.
+    pub(crate) timezone: Option<String>,
     /// Whether to open hardware-accelerated GPU rendering for the cage (`gpu = true`). sbx
     /// provisions mesa's DRI drivers into its own store and points the cage's libgbm/libEGL at
     /// them, grants the render node(s) under `/dev/dri`, and read-only-binds the minimal `/sys`

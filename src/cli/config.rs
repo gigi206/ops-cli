@@ -695,6 +695,23 @@ fn notify_section(view: &config::view::ConfigView, pal: &style::Palette) -> Stri
 
 /// The desktop holes, each shown only when opened so a config that opened none stays uncluttered:
 /// GUI (with the compositor caveat on `wayland`, and what `offscreen` supplies since it exposes
+/// The cage's clock, rendered only when a layer actually named a zone. Every cage has one, so
+/// printing it unconditionally would put a line reading `timezone: UTC` on every `sbx config show`
+/// that says nothing — the same reason `gui: none` is not printed. What is worth reading is that
+/// *this* configuration moved the clock somewhere, and from which layer.
+fn timezone_section(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
+    use config::view::ProvenanceView;
+    if view.timezone_origin == ProvenanceView::Default {
+        return None;
+    }
+    let (h, r) = (pal.head, pal.reset);
+    Some(format!(
+        "  {h}timezone:{r} {}{}\n",
+        view.timezone,
+        provenance_tag(view.timezone_origin, pal)
+    ))
+}
+
 /// nothing), GPU, audio, and the in-cage D-Bus portal.
 fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
     use config::view::GuiView;
@@ -1557,6 +1574,7 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
     for section in [
         proc_section(view, pal, details),
         Some(notify_section(view, pal)),
+        timezone_section(view, pal),
         desktop_sections(view, pal),
         forward_section(view, pal),
         limits_section(view, pal),
@@ -3071,6 +3089,8 @@ mod tests {
     fn sample_config_view() -> config::view::ConfigView {
         use config::view::*;
         ConfigView {
+            timezone: "UTC".to_string(),
+            timezone_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -3173,6 +3193,26 @@ mod tests {
     /// when every field is a built-in default (a config that tuned nothing must not grow a line
     /// saying so), and one line naming each field's own layer when any was overridden. A `contains`
     /// check on the whole render can see the second; only calling the section can see the first.
+    #[test]
+    fn the_timezone_line_is_silent_until_a_layer_names_a_zone() {
+        use config::view::ProvenanceView;
+        let plain = style::Palette::plain();
+        let mut view = sample_config_view();
+
+        // The default cage runs on UTC, and saying so on every `sbx config show` would be a line
+        // that never varies. What the view reports is that a layer *moved* the clock.
+        view.timezone = "UTC".into();
+        view.timezone_origin = ProvenanceView::Default;
+        assert_eq!(timezone_section(&view, &plain), None);
+
+        view.timezone = "Europe/Paris".into();
+        view.timezone_origin = ProvenanceView::Global;
+        assert_eq!(
+            timezone_section(&view, &plain).expect("a named zone is shown"),
+            "  timezone: Europe/Paris  (global)\n"
+        );
+    }
+
     #[test]
     fn the_limits_section_is_silent_until_a_layer_overrides_one() {
         use config::view::{LimitView, LimitsView, ProvenanceView};
@@ -3908,6 +3948,8 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            timezone: "UTC".to_string(),
+            timezone_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -4043,6 +4085,8 @@ mod tests {
         // a profile's app-overlay allowlist surfaces what `sbx app <name>` can actually reach.
         use config::view::*;
         let view = ConfigView {
+            timezone: "UTC".to_string(),
+            timezone_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -4199,6 +4243,8 @@ mod tests {
             notes: vec![],
         };
         let view = ConfigView {
+            timezone: "UTC".to_string(),
+            timezone_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -4284,6 +4330,8 @@ mod tests {
         // profile's credential surfaces in `sbx config` (the baseline `secrets` section is empty).
         use config::view::*;
         let view = ConfigView {
+            timezone: "UTC".to_string(),
+            timezone_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -4411,6 +4459,8 @@ mod tests {
         // profile's overlay env/binds surface, mirroring the baseline `env`/`binds` sections.
         use config::view::*;
         let view = ConfigView {
+            timezone: "UTC".to_string(),
+            timezone_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],
@@ -4538,6 +4588,8 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            timezone: "UTC".to_string(),
+            timezone_origin: Default::default(),
             open: vec![],
             service: vec![],
             plugins: vec![],

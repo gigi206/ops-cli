@@ -93,6 +93,22 @@ const OPEN_ROUTER_DIR: &str = "/opt/sbx/open";
 /// one is what `PATH` resolves.
 const OPEN_ROUTER_INCAGE: &str = "/opt/sbx/open/xdg-open";
 
+/// Where sbx's IANA zone database appears in the cage: the FHS path glibc, `iana-time-zone` and
+/// every language runtime look under, so `TZDIR` names it and [`CAGE_LOCALTIME`] points into it.
+pub(super) const CAGE_ZONEINFO: &str = "/usr/share/zoneinfo";
+
+/// The cage's local-zone pointer. A **symlink** into [`CAGE_ZONEINFO`], never a copy of the zone
+/// file: an FHS resolver reads the zone *name* by resolving this link and stripping the database
+/// prefix, so a regular file here answers "what offset" but not "which zone" — the very question
+/// the resolvers that failed without it are asking.
+pub(super) const CAGE_LOCALTIME: &str = "/etc/localtime";
+
+/// The zone a cage runs in when no config named one. UTC, not "absent": a cage with no
+/// `/etc/localtime` fails an FHS zone resolver outright, and this is the one zone that is a real,
+/// resolvable answer while disclosing nothing about where the host is. Naming a different zone is
+/// the user's call ([`crate::config::Config::timezone`]), because *which* zone is a location signal.
+pub(crate) const DEFAULT_ZONE: &str = "UTC";
+
 /// Where the synthetic ssh client config is bound read-only. This is OpenSSH's compiled-in
 /// **system-wide** path (verified against the binary the cage actually runs), which is the last file
 /// an ssh client reads: since the first value obtained for a keyword wins, a `~/.ssh/config` block
@@ -159,6 +175,11 @@ pub(crate) struct Userland {
     /// `LOCALE_ARCHIVE` so the cage's glibc can load a UTF-8 `LANG` without a host
     /// `/usr/lib/locale`; ships no binary, so it is off `PATH`.
     pub(crate) locale_archive: PathBuf,
+    /// sbx's own IANA zone database (tzdata's `share/zoneinfo`), bound read-only at
+    /// [`CAGE_ZONEINFO`] so a cage can resolve a zone name at all. A physical bind source (it
+    /// backs a mount), like `ca_bundle_src` and unlike the locale archive, which is named by
+    /// store path rather than bound. Ships only data, so it is off `PATH`.
+    pub(crate) zoneinfo_src: PathBuf,
 }
 
 /// One explicit bind injected by the launcher after the structural mounts (so it is
@@ -211,6 +232,11 @@ pub(crate) struct Overlay<'a> {
     pub(crate) binds: &'a [crate::config::Bind],
     /// Tool `bin` directories, prepended to `PATH` ahead of the base userland.
     pub(crate) bin_paths: &'a [PathBuf],
+    /// The IANA zone the cage runs in — [`DEFAULT_ZONE`] unless a config named one, already
+    /// validated against the provisioned database by the launcher (assembly stays pure, so a name
+    /// reaching here is one the database carries). It is interpolated into the [`CAGE_LOCALTIME`]
+    /// link target and into `TZ`.
+    pub(crate) timezone: &'a str,
 }
 
 /// Host-side paths backing one project's sandbox. The writable home and the
@@ -442,6 +468,25 @@ fn assemble(
             src: paths.machine_id_src.to_path_buf(),
             dest: PathBuf::from("/var/lib/dbus/machine-id"),
         },
+        // Zone 1 — the IANA zone database from sbx's own store, at the FHS path every resolver
+        // looks under, and the `/etc/localtime` link into it. A hermetic cage carries neither, and
+        // a tool that resolves the local zone the FHS way then does not fall back to UTC: it fails
+        // (a Rust agent's scheduler reports "local timezone could not be determined" and gives up).
+        // The link is what carries the answer — a resolver reads the zone *name* from its target,
+        // which is why it points at the in-cage database path rather than at the store — and it
+        // exists in every cage, naming [`DEFAULT_ZONE`] unless a config chose otherwise. Both are
+        // read-only from outside every writable mount, like the identity files: the database is
+        // sbx's, and the link is the answer to a question the cage should not be able to rewrite
+        // under a tool that already read it. The database discloses nothing about the host (it is
+        // the same file everywhere); *which* zone the link names is the config's decision.
+        Mount::RoBind {
+            src: userland.zoneinfo_src.clone(),
+            dest: PathBuf::from(CAGE_ZONEINFO),
+        },
+        Mount::Symlink {
+            target: PathBuf::from(format!("{CAGE_ZONEINFO}/{}", overlay.timezone)),
+            dest: PathBuf::from(CAGE_LOCALTIME),
+        },
         // Zone 1 — TLS: sbx's own CA bundle from its store rather than the host, so HTTPS
         // trust is hermetic. Bound at the two standard certificate paths a Linux toolchain
         // looks for by default — the NixOS `ca-bundle.crt` (nix's own libcurl) and the
@@ -648,6 +693,17 @@ fn assemble(
             userland.locale_archive.to_string_lossy().into_owned(),
         ),
         ("LANG".to_string(), "C.UTF-8".to_string()),
+        // Timezone. `TZDIR` names the bound database so a runtime that resolves a zone by name
+        // (glibc, and every language runtime that defers to it) finds one, and `TZ` states the
+        // cage's zone outright so a tool that reads the variable agrees with the `/etc/localtime`
+        // link rather than falling back to UTC beside it. The two are set *together*, never `TZ`
+        // alone: with no database to resolve it against, glibc reads a zone name as a POSIX
+        // abbreviation at offset zero, so a lone `TZ=Europe/Paris` leaves the cage printing
+        // "Europe" as its zone at UTC — worse than unset. Structural (lowest precedence), like the
+        // locale pair above: a trusted `[env]` may override them, which only mis-sets the
+        // project's own cage clock.
+        ("TZDIR".to_string(), CAGE_ZONEINFO.to_string()),
+        ("TZ".to_string(), overlay.timezone.to_string()),
     ];
     env.extend(mise_env(paths.mise_project_src.is_some(), nix.on_btrfs));
     for (key, val) in overlay.env {
@@ -676,6 +732,8 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     "/etc/hosts",
     "/etc/machine-id",
     "/var/lib/dbus/machine-id",
+    CAGE_ZONEINFO,
+    CAGE_LOCALTIME,
     "/etc/resolv.conf",
     "/etc/ssl/certs/ca-certificates.crt",
     LOADER_DEST,
@@ -1471,6 +1529,7 @@ mod tests {
             mise_bin: PathBuf::from("/store/mise/bin/mise"),
             nix_bin: PathBuf::from("/store/nix/bin/nix"),
             locale_archive: PathBuf::from("/nix/store/locales/lib/locale/locale-archive"),
+            zoneinfo_src: PathBuf::from("/nix/store/tzdata/share/zoneinfo"),
         }
     }
 
@@ -1511,6 +1570,7 @@ mod tests {
             env: &env,
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         assemble(
             &paths,
@@ -1822,6 +1882,7 @@ mod tests {
             env: &[],
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let devices = [PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")];
         let spec = assemble(
@@ -2008,6 +2069,7 @@ mod tests {
             env: &[],
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let extra = [
             ExtraBind {
@@ -2066,6 +2128,17 @@ mod tests {
         extra_binds: &[crate::config::Bind],
         extra_bin_paths: &[PathBuf],
     ) -> SandboxSpec {
+        assemble_with_zone(DEFAULT_ZONE, extra_env, extra_binds, extra_bin_paths)
+    }
+
+    /// [`assemble_with`], with the cage's zone named — the one input the launcher resolves per
+    /// launch rather than deriving from the userland.
+    fn assemble_with_zone(
+        zone: &str,
+        extra_env: &[(String, String)],
+        extra_binds: &[crate::config::Bind],
+        extra_bin_paths: &[PathBuf],
+    ) -> SandboxSpec {
         let paths = SandboxPaths {
             project: Path::new("/home/u/proj"),
             home_src: Path::new("/data/sbx/projects/abc/home"),
@@ -2086,6 +2159,7 @@ mod tests {
             env: extra_env,
             binds: extra_binds,
             bin_paths: extra_bin_paths,
+            timezone: zone,
         };
         assemble(
             &paths,
@@ -2115,6 +2189,43 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn the_cage_carries_the_zone_database_and_a_localtime_link_naming_its_zone() {
+        // Both halves, and the *shape* of each: the database is a read-only bind at the FHS path,
+        // and `/etc/localtime` is a SYMLINK whose target names the zone — a resolver reads the zone
+        // name off that target, so a bind of the zone file here would answer the offset and lose
+        // the name. Asserted against literal argv, not against the constants, so renaming a
+        // destination has to be a deliberate edit here too.
+        for zone in ["UTC", "Europe/Paris"] {
+            let argv = argv_strings(&assemble_with_zone(zone, &[], &[], &[]));
+            let db = argv
+                .iter()
+                .position(|s| s == "/nix/store/tzdata/share/zoneinfo")
+                .unwrap_or_else(|| panic!("the zone database must be bound ({zone}):\n{argv:?}"));
+            assert_eq!(argv[db - 1], "--ro-bind", "the database is read-only");
+            assert_eq!(argv[db + 1], "/usr/share/zoneinfo");
+            let link = argv
+                .iter()
+                .position(|s| s == "/etc/localtime")
+                .unwrap_or_else(|| panic!("/etc/localtime must exist ({zone}):\n{argv:?}"));
+            assert_eq!(argv[link - 2], "--symlink", "/etc/localtime is a symlink");
+            assert_eq!(
+                argv[link - 1],
+                format!("/usr/share/zoneinfo/{zone}"),
+                "the link target names the zone, through the in-cage database path"
+            );
+            // And the variable half, which has to agree with the link: `TZ` alone would move the
+            // clock without moving the name, `TZDIR` alone would leave `TZ` unresolvable.
+            let env = env_strings(&assemble_with_zone(zone, &[], &[], &[]));
+            let at = |key: &str| {
+                let i = env.iter().position(|s| s == key).expect(key);
+                env[i + 1].clone()
+            };
+            assert_eq!(at("TZ"), zone);
+            assert_eq!(at("TZDIR"), "/usr/share/zoneinfo");
+        }
     }
 
     #[test]
@@ -2419,6 +2530,8 @@ mod tests {
                 "SBX_EGRESS_CONTRACT",
                 "LOCALE_ARCHIVE",
                 "LANG",
+                "TZDIR",
+                "TZ",
                 "MISE_DATA_DIR",
                 "MISE_EXPERIMENTAL",
                 "MISE_YES",
@@ -2457,6 +2570,7 @@ mod tests {
             env: &[],
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let spec = assemble(
             &paths,
@@ -2735,6 +2849,7 @@ mod tests {
             env: &env,
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let spec = assemble(
             &paths,
@@ -2832,6 +2947,7 @@ mod tests {
             env: &[],
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let spec = build_spec(
             data.path(),
@@ -2951,6 +3067,7 @@ mod smoke {
             env: &env,
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         // this smoke exercises the userland against the shared store, read-only — the
         // writable per-project store is the launcher's concern.
@@ -3116,6 +3233,7 @@ mod smoke {
             env: &[],
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let foreign_spec = build_spec(
             data.path(),
@@ -3162,6 +3280,7 @@ mod smoke {
             env: &[],
             binds: &[],
             bin_paths: &bin_paths,
+            timezone: DEFAULT_ZONE,
         };
         let cross_spec = build_spec(
             data.path(),
@@ -3297,6 +3416,7 @@ mod smoke {
             env: &[],
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         // the cage reads the base userland AND writes into `/nix` — proving the rw bind
         // through the wired path. The write succeeding is itself proof `/nix` is
@@ -3470,6 +3590,7 @@ mod smoke {
             env: &[],
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let cmd = vec![
             userland.shell_bin.clone().into_os_string(),
@@ -3638,6 +3759,7 @@ mod smoke {
             env: &[],
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let cmd = vec![
             userland.shell_bin.clone().into_os_string(),
@@ -3766,6 +3888,7 @@ mod smoke {
                 env: &[],
                 binds: &[],
                 bin_paths: &[],
+                timezone: DEFAULT_ZONE,
             };
             let cmd = vec![
                 userland.shell_bin.clone().into_os_string(),
@@ -3898,6 +4021,7 @@ mod smoke {
             env: &env,
             binds: &[],
             bin_paths: &[],
+            timezone: DEFAULT_ZONE,
         };
         let nix_mount = NixMount {
             src: crate::store::physical_path(&layout, Path::new("/nix")),

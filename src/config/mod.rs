@@ -323,6 +323,17 @@ pub(crate) struct Resolved {
     pub(crate) gui: GuiPolicy,
     /// Which layer supplied the winning `gui` posture (`Default` when neither config set it).
     pub(crate) gui_origin: Provenance,
+    /// The IANA zone the cage's clock reads in, when a layer named one. `None` leaves the cage on
+    /// the built-in default ([`crate::sandbox::binds::DEFAULT_ZONE`]), which is a real zone and not
+    /// an absence — the cage always carries the database and the `/etc/localtime` link. **Not a
+    /// security field** (see [`schema::RawConfig::timezone`]): the value only tells the cage what
+    /// to display, and `[env] TZ` is already free, so gating it would buy nothing. Syntactically
+    /// validated here; the launcher checks the name against the provisioned database, since only it
+    /// has one to check against. Baseline-only, like `egress_stats`: a zone belongs to the machine
+    /// and the person, not to an app, so `[app.<name>]` carries no override.
+    pub(crate) timezone: Option<String>,
+    /// Which layer supplied the winning `timezone` (`Default` when no config named one).
+    pub(crate) timezone_origin: Provenance,
     /// Whether hardware-accelerated GPU rendering is open (the default `false` unless the global
     /// config or a trusted project set `gpu = true`). A security field, gated like `gui` — an
     /// untrusted project may not open a render node and the `/sys` device tree.
@@ -793,6 +804,7 @@ impl Resolved {
             packages,
             network,
             gui,
+            timezone,
             gpu,
             audio,
             dbus,
@@ -954,6 +966,18 @@ impl Resolved {
         if let Some(policy) = new_gui {
             self.gui = policy;
             self.gui_origin = Provenance::Override;
+        }
+        // `timezone` — not a security posture, so a bad value is not fatal: it warns and leaves the
+        // zone in effect, the fail-closed direction here (the cage keeps a zone it can resolve).
+        // Applied for the same reason it exists as a field rather than as an `[env] TZ` line: the
+        // clock and the `/etc/localtime` link have to move together, and only sbx can move both.
+        // The validator's warning goes straight to `self.warnings`: the `notes` vector was already
+        // drained into them above, and only a *fatal* verdict needed to reach the caller.
+        if let Some(value) = timezone
+            && let Some(zone) = validate_timezone(&mut self.warnings, OVERRIDE_SOURCE, value)
+        {
+            self.timezone = Some(zone);
+            self.timezone_origin = Provenance::Override;
         }
         // `proc` — the exec posture, validated above (a bad mode is fatal, like `gui`/`network`). The
         // override is the final word, so it may raise, lower, or disable enforcement for this launch
@@ -1637,6 +1661,14 @@ fn resolve(
         }
         None => GuiPolicy::default(),
     };
+    // The zone. Not a security field, so the layering is the plain scalar one — but the global
+    // layer is where it usually belongs: a machine sits in one place, and every project on it
+    // inherits that.
+    let mut timezone_origin = Provenance::Default;
+    let mut timezone = global
+        .timezone
+        .and_then(|v| validate_timezone(&mut warnings, GLOBAL_CONFIG, v))
+        .inspect(|_| timezone_origin = Provenance::Global);
     // The GPU posture is trusted by location at the global layer; the origin records `Global`
     // whenever the layer set the flag at all (so `gpu = true` reads distinctly from the default).
     let mut gpu_origin = Provenance::Default;
@@ -1981,6 +2013,17 @@ fn resolve(
                 |w, _| validate_gui(w, PROJECT_CONFIG, value),
             );
         }
+        // `timezone` is **not** a security field, so it applies whatever the project's verdict —
+        // the same treatment `[env]` gets, and for the same reason: the value travels one way (it
+        // tells the cage what to display, and reads nothing from the host), and a project can
+        // already set `TZ` through `[env]`, which is free. Gating this one would only leave the
+        // clock and the `/etc/localtime` link disagreeing.
+        if let Some(value) = proj.timezone
+            && let Some(zone) = validate_timezone(&mut warnings, PROJECT_CONFIG, value)
+        {
+            timezone = Some(zone);
+            timezone_origin = Provenance::Project;
+        }
         // `gpu` is a security field — a trusted project may open GPU rendering; an untrusted or
         // changed one may not (a render node and the `/sys` device tree widen the kernel attack
         // surface, a choice an untrusted project must not make).
@@ -2261,6 +2304,8 @@ fn resolve(
         notify_origin,
         gui,
         gui_origin,
+        timezone,
+        timezone_origin,
         gpu,
         gpu_origin,
         audio,
@@ -2422,6 +2467,46 @@ fn validate_redact_min_len(warnings: &mut Vec<String>, source: &str, value: u64)
         ));
     }
     floor
+}
+
+/// Validate a `timezone` value into the zone name the cage will link `/etc/localtime` to, dropping
+/// a malformed one with a warning (the cage keeps [`crate::sandbox::binds::DEFAULT_ZONE`]).
+///
+/// This is the **syntactic** half only: the name is interpolated into a path under the cage's zone
+/// database, so it is held to what an IANA zone name can be — one or more `/`-separated segments of
+/// letters, digits, `_`, `+` and `-`, each non-empty and none of them `.` or `..`, no leading or
+/// trailing slash. That rejects both the traversal (`../../etc/shadow`) and the absolute path
+/// (`/etc/shadow`) before either becomes a link target. Whether the database actually carries the
+/// zone is the launcher's check, because only the launcher has a database to look in.
+fn validate_timezone(warnings: &mut Vec<String>, source: &str, value: String) -> Option<String> {
+    if !is_zone_name(&value) {
+        warnings.push(format!(
+            "{source}: ignoring `timezone = \"{value}\"` — not an IANA zone name (expected a form \
+             like `Europe/Paris` or `UTC`); the cage keeps the zone in effect"
+        ));
+        return None;
+    }
+    Some(value)
+}
+
+/// Whether `value` is shaped like an IANA zone name — the rule itself, written once because two
+/// callers need it and must not drift: [`validate_timezone`] applies it to a config value (and
+/// warns), and the launcher applies it again to whatever it is about to join onto the zone
+/// database's path (and fails closed). One or more `/`-separated segments of letters, digits, `_`,
+/// `+` and `-`, each non-empty and none of them `.` or `..`, with no leading or trailing slash: that
+/// admits every real zone name (`Europe/Paris`, `America/Argentina/Salta`, `Etc/GMT+3`, `UTC`) while
+/// refusing the traversal (`../../etc/shadow`) and the absolute path (`/etc/shadow`) before either
+/// can become a link target.
+pub(crate) fn is_zone_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('/').all(|seg| {
+            !seg.is_empty()
+                && seg != "."
+                && seg != ".."
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-'))
+        })
 }
 
 /// Resolve a `[seccomp] allow` table into a [`SeccompPolicy`](crate::sandbox::seccomp::SeccompPolicy): split each string on commas, trim,

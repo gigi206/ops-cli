@@ -506,6 +506,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         proc,
         notify,
         gui,
+        timezone,
         gpu,
         audio,
         dbus,
@@ -556,6 +557,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     }
     if gui.is_some() {
         base.gui = gui;
+    }
+    if timezone.is_some() {
+        base.timezone = timezone;
     }
     if proc.is_some() {
         base.proc = proc;

@@ -118,6 +118,17 @@ conventional certificate paths: `ca-bundle.crt` (nix's libcurl default) and
 two TLS clients in the cage disagree on where the bundle lives. In-cage TLS
 therefore never depends on the host having a CA bundle.
 
+## Data the cage cannot ask the host for
+
+Three of the base provisions carry no program at all, only files a hermetic cage would
+otherwise have nowhere to read: the CA bundle above, a compiled UTF-8 **locale archive**
+(so accented text and filenames render instead of being byte-escaped), and the IANA
+**zone database** with an `/etc/localtime` pointing into it (so a program that resolves
+the local zone gets an answer rather than an error). None of them puts anything on the
+cage's `PATH`, and none discloses anything about the host: which zone the link names is
+the [`timezone`](../configuration/timezone) field's answer, and it reads `UTC` until you
+set it.
+
 ## A curated base toolset
 
 The base userland ships a small everyday CLI set: `curl`, `git`, `less`, `grep`,

@@ -109,7 +109,7 @@ pub(crate) use binary::{
     BinaryUpgrade, pinned_hashes as binary_pinned_hashes, upgrade_project as upgrade_binary,
     withheld as withheld_binary_packages,
 };
-pub(crate) use binds::{project_id, project_identity, structural_nesting_warning};
+pub(crate) use binds::{DEFAULT_ZONE, project_id, project_identity, structural_nesting_warning};
 pub(crate) use cgroup::{LimitReport, probe as resource_limits};
 pub(crate) use deb::{
     DebUpgrade, pinned_hashes as deb_pinned_hashes, upgrade_project as upgrade_deb,

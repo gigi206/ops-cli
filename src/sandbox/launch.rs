@@ -3896,6 +3896,35 @@ impl Drop for LaunchGuard {
     }
 }
 
+/// The IANA zone this cage runs in: the one a config named, when the provisioned database carries
+/// it, and [`binds::DEFAULT_ZONE`] otherwise.
+///
+/// The existence check is here, not in the config layer, for the reason the config layer says: only
+/// the launcher has a database to hold a name against. A name it does not carry is a **warning, not
+/// a refusal** — a cage that will not start because a zone was misspelled trades a wrong clock for
+/// no session at all, and the fallback is a zone that resolves.
+///
+/// The shape check is [`crate::config::is_zone_name`], the same rule the config validator applies,
+/// called again rather than assumed: the name is about to be joined onto the database path and
+/// written as a link target, and this is the join site.
+fn cage_timezone(declared: Option<&str>, zoneinfo_src: &Path) -> String {
+    let fallback = || binds::DEFAULT_ZONE.to_string();
+    let Some(zone) = declared else {
+        return fallback();
+    };
+    if !crate::config::is_zone_name(zone) {
+        return fallback();
+    }
+    if zoneinfo_src.join(zone).is_file() {
+        return zone.to_string();
+    }
+    crate::diag::warn(&format!(
+        "the zone database carries no `{zone}` — the cage's clock reads {} instead",
+        binds::DEFAULT_ZONE
+    ));
+    fallback()
+}
+
 fn build(
     prep: &Prepared,
     runtime: binds::Runtime,
@@ -5363,10 +5392,14 @@ fn build(
         (EnvLayer::Config, prep.cfg.env.clone()),
     ]);
 
+    // The cage's zone, checked against the database that will actually be bound — assembly is pure,
+    // so this is the last place a name can be held against something real.
+    let timezone = cage_timezone(prep.cfg.timezone.as_deref(), &prep.userland.zoneinfo_src);
     let overlay = binds::Overlay {
         env: &extra_env,
         binds: &prep.cfg.binds,
         bin_paths: &bin_paths,
+        timezone: &timezone,
     };
     // Generate the in-cage contract from the resolved (post-`merge_app`) config, so a process
     // inside the cage can see which hosts it can reach, why a direct connection or `ping` fails,
@@ -6518,6 +6551,42 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::path::PathBuf;
 
+    /// The zone a cage ends up in, held against a database that really is on disk.
+    ///
+    /// The config layer already refused the shapes that are not zone names; what only this side can
+    /// decide is whether the database *carries* the zone, so the cases here are the ones that turn
+    /// on a file existing.
+    #[test]
+    fn a_zone_the_database_does_not_carry_falls_back_to_the_default() {
+        let db = TmpDir::new();
+        std::fs::create_dir_all(db.path().join("Europe")).unwrap();
+        std::fs::write(db.path().join("Europe/Paris"), b"TZif").unwrap();
+        std::fs::write(db.path().join("UTC"), b"TZif").unwrap();
+
+        // Nothing declared: the built-in zone, which is a zone and not an absence.
+        assert_eq!(cage_timezone(None, db.path()), "UTC");
+        // Declared and present: taken.
+        assert_eq!(
+            cage_timezone(Some("Europe/Paris"), db.path()),
+            "Europe/Paris"
+        );
+        // Declared and absent: the default, not a refused launch — a misspelled zone costs a wrong
+        // clock, never the session.
+        assert_eq!(cage_timezone(Some("Europe/Pariss"), db.path()), "UTC");
+        // A directory inside the database is not a zone: `Europe` resolves to something that
+        // exists, so only the is-a-file test tells the two apart.
+        assert_eq!(cage_timezone(Some("Europe"), db.path()), "UTC");
+        // The shape rule is applied here too, at the join site: a traversal that would otherwise
+        // resolve to a real file outside the database never becomes a link target.
+        std::fs::write(db.path().join("../escaped"), b"x").unwrap();
+        assert_eq!(cage_timezone(Some("../escaped"), db.path()), "UTC");
+        // And a database that is not there at all still yields a launchable cage.
+        assert_eq!(
+            cage_timezone(Some("Europe/Paris"), Path::new("/nonexistent-zoneinfo")),
+            "UTC"
+        );
+    }
+
     /// Which argv shapes take an `$0` filler before the caller's `-- <args>` are appended, and
     /// which must be left exactly as the profile wrote them.
     ///
@@ -7351,6 +7420,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             mise_bin: PathBuf::from("/nix/store/mise/bin/mise"),
             nix_bin: PathBuf::from("/nix/store/nix/bin/nix"),
             locale_archive: PathBuf::from("/nix/store/locales/lib/locale/locale-archive"),
+            zoneinfo_src: PathBuf::from("/nix/store/tzdata/share/zoneinfo"),
         };
         let (bash, socat, head) = task_client_programs(&userland);
         assert_eq!(bash, PathBuf::from("/nix/store/bash/bin/bash"));
@@ -7383,6 +7453,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             mise_bin: PathBuf::from("/nix/store/mise/bin/mise"),
             nix_bin: PathBuf::from("/nix/store/nix/bin/nix"),
             locale_archive: PathBuf::from("/nix/store/locales/lib/locale/locale-archive"),
+            zoneinfo_src: PathBuf::from("/nix/store/tzdata/share/zoneinfo"),
         };
         let pkg_roots = [PathBuf::from("/nix/store/jq")];
         let tool_roots = [PathBuf::from("/nix/store/nodejs")];

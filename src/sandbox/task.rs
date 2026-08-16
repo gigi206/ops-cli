@@ -152,6 +152,11 @@ const KEPT_DESTS: &[&str] = &[
     "/etc/hosts",
     "/etc/machine-id",
     "/etc/resolv.conf",
+    // The zone database and the link into it, so a task resolves the local zone exactly as the
+    // session does. Both, never one: the link is what carries the zone *name*, and it is a dangling
+    // pointer without the database it points into.
+    super::binds::CAGE_ZONEINFO,
+    super::binds::CAGE_LOCALTIME,
     // Both CA bundle names, so a task making an HTTPS call trusts the same roots the session does —
     // `SSL_CERT_FILE` in the inherited environment points at the first of these.
     super::binds::CAGE_CA_BUNDLE,
@@ -168,6 +173,7 @@ const KEPT_ENV: &[&str] = &[
     "LC_ALL",
     "LOCALE_ARCHIVE",
     "TZDIR",
+    "TZ",
     "NIX_SSL_CERT_FILE",
     "SSL_CERT_FILE",
     "TERM",
@@ -2305,6 +2311,7 @@ mod smoke {
             env: &[("TERM".to_string(), "dumb".to_string())],
             binds: &[],
             bin_paths: &[],
+            timezone: super::super::binds::DEFAULT_ZONE,
         };
         let nix_mount = super::super::binds::NixMount {
             src: crate::store::physical_path(&layout, Path::new("/nix")),
@@ -3093,6 +3100,51 @@ mod tests {
             ),
         ]);
         assert_eq!(env.len(), 2, "the nix-ld shim's environment must survive");
+    }
+
+    /// A task resolves the local zone exactly as the session does. The question this asks is the
+    /// cross-plane one: everything a task cage gets is an allowlist entry, so a facility added to
+    /// the agent cage is absent here until it is named twice — and the halves are useless apart
+    /// (the link is a dangling pointer without the database, and `TZ` names a zone nothing can
+    /// resolve without `TZDIR`).
+    #[test]
+    fn the_zone_the_session_resolves_is_the_zone_a_task_resolves() {
+        let agent = vec![
+            Mount::RoBind {
+                src: PathBuf::from("/nix/store/abc-tzdata/share/zoneinfo"),
+                dest: PathBuf::from(super::super::binds::CAGE_ZONEINFO),
+            },
+            Mount::Symlink {
+                target: PathBuf::from("/usr/share/zoneinfo/Europe/Paris"),
+                dest: PathBuf::from(super::super::binds::CAGE_LOCALTIME),
+            },
+        ];
+        let kept: Vec<PathBuf> = task_mounts(&agent, Path::new("/shared/nix"))
+            .iter()
+            .map(|m| mount_dest(m).to_path_buf())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                PathBuf::from("/usr/share/zoneinfo"),
+                PathBuf::from("/etc/localtime"),
+            ],
+            "both halves of the zone must reach a task cage"
+        );
+
+        let env = task_env(&[
+            ("TZ".to_string(), "Europe/Paris".to_string()),
+            ("TZDIR".to_string(), "/usr/share/zoneinfo".to_string()),
+            ("SBX_EGRESS_CONTRACT".to_string(), "/opt/x".to_string()),
+        ]);
+        assert_eq!(
+            env,
+            vec![
+                ("TZ".to_string(), "Europe/Paris".to_string()),
+                ("TZDIR".to_string(), "/usr/share/zoneinfo".to_string()),
+            ],
+            "the zone variables survive the filter, and nothing else rides in with them"
+        );
     }
 
     // A writable structural bind is demoted rather than dropped, so the userland stays complete

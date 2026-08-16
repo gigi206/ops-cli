@@ -52,6 +52,7 @@ const sidebars: SidebarsConfig = {
           label: "The cage's contents",
           items: [
             'configuration/env',
+            'configuration/timezone',
             'configuration/binds',
             'configuration/packages',
             'configuration/service',
