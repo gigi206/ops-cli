@@ -2,121 +2,37 @@
 //! `sbx <command> [subcommand] --help`.
 //!
 //! These exercise the usage surface only — no sandbox, no nix, no network — so they run
-//! everywhere and fast. The load-bearing one is `every_command_and_verb_has_a_page`: it
-//! enumerates every command and subcommand the dispatchers accept and asserts each resolves
-//! to a help page, defending the single table against a verb added to the dispatch but
-//! forgotten in the help (the failure mode the architecture is exposed to).
+//! everywhere and fast. The load-bearing one is `every_command_and_verb_has_a_page`: it walks the
+//! command tree the binary declares and asserts each path renders through both help routes.
+//!
+//! **What that does and does not defend.** The walk comes from the binary's own page table, so it
+//! covers every page the moment one lands — no list here to forget. It cannot see the opposite
+//! drift: a verb wired into a dispatcher that the table never heard of is absent from the walk, so
+//! it is absent from this sweep too. That direction is a property of the dispatch and is answered
+//! there, not by a list kept beside it. An earlier version of this file did keep such a list, and
+//! it had gone stale by a third of the surface while this header claimed it enumerated all of it.
 
-use std::process::{Command, Output};
+use std::process::Command;
 
-fn sbx(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sbx"))
-        .args(args)
-        .output()
-        .expect("spawn sbx")
-}
-
-/// Every top-level command `main` dispatches.
-const TOP_LEVEL: &[&str] = &[
-    "doctor",
-    "run",
-    "mise",
-    "app",
-    "search",
-    "test",
-    "net",
-    "proc",
-    "fs",
-    "plugins",
-    "session",
-    "trust",
-    "untrust",
-    "config",
-    "upgrade",
-    "gc",
-    "projects",
-    "storage",
-    "store",
-    "bundle",
-    "completion",
-];
-
-/// Every command path the dispatchers accept (top-level commands and their subcommands). Keep
-/// in lockstep with the dispatch in `main.rs` — that lockstep is the point of the guard test.
-const PATHS: &[&[&str]] = &[
-    &["doctor"],
-    &["run"],
-    &["completion"],
-    &["mise"],
-    &["app"],
-    &["search"],
-    &["test"],
-    &["net"],
-    &["bundle"],
-    &["bundle", "export"],
-    &["bundle", "import"],
-    &["plugins"],
-    &["session"],
-    &["session", "ls"],
-    &["session", "logs"],
-    &["session", "attach"],
-    &["session", "stop"],
-    &["trust"],
-    &["untrust"],
-    &["config"],
-    &["config", "show"],
-    &["config", "get"],
-    &["config", "set"],
-    &["config", "unset"],
-    &["config", "path"],
-    &["config", "edit"],
-    &["upgrade"],
-    &["gc"],
-    &["projects"],
-    &["projects", "show"],
-    &["storage"],
-    &["store"],
-    &["app", "run"],
-    &["app", "upgrade"],
-    &["app", "import"],
-    &["app", "export"],
-    &["app", "rm"],
-    &["app", "list"],
-    &["app", "show"],
-    &["app", "prune"],
-    &["test", "net"],
-    &["net", "rules"],
-    &["net", "allow"],
-    &["net", "deny"],
-    &["net", "pending"],
-    &["net", "pending", "allow"],
-    &["net", "pending", "deny"],
-    &["proc"],
-    &["proc", "ls"],
-    &["proc", "live"],
-    &["proc", "logs"],
-    &["proc", "pending"],
-    &["proc", "allow"],
-    &["proc", "deny"],
-    &["proc", "rules"],
-    &["fs"],
-    &["fs", "logs"],
-    &["plugins", "list"],
-    &["plugins", "info"],
-    &["plugins", "install"],
-    &["plugins", "rm"],
-    &["plugins", "store"],
-    &["plugins", "store", "list"],
-    &["plugins", "store", "add"],
-    &["plugins", "store", "publish"],
-    &["plugins", "store", "update"],
-    &["plugins", "store", "install"],
-    &["plugins", "store", "info"],
-    &["plugins", "store", "rm"],
-];
+mod common;
+use common::{page_paths, sbx};
 
 #[test]
 fn top_level_help_lists_every_command() {
+    let paths = page_paths();
+    let top: Vec<&str> = paths
+        .iter()
+        .filter(|p| p.len() == 1)
+        .map(|p| p[0].as_str())
+        .collect();
+    // The precondition, before the property: a walk that found nothing would satisfy every
+    // assertion below by having nothing to check. The floor is well under the real count, so it
+    // catches a broken walk without needing an edit each time a command lands.
+    assert!(
+        top.len() >= 20,
+        "the walk found only {} top-level commands, so it is not walking",
+        top.len()
+    );
     for invocation in [&["--help"][..], &["-h"][..], &["help"][..]] {
         let out = sbx(invocation);
         assert!(out.status.success(), "`sbx {invocation:?}` should exit 0");
@@ -125,7 +41,7 @@ fn top_level_help_lists_every_command() {
             stdout.contains("Commands:"),
             "missing the command list for {invocation:?}"
         );
-        for cmd in TOP_LEVEL {
+        for cmd in &top {
             assert!(
                 stdout.contains(cmd),
                 "`sbx {invocation:?}` did not list '{cmd}'"
@@ -136,9 +52,19 @@ fn top_level_help_lists_every_command() {
 
 #[test]
 fn every_command_and_verb_has_a_page() {
-    // The guard: a path in the dispatch but missing from the help table fails both `sbx help
-    // <path>` (no page) and `sbx <path> --help` (falls through to "unknown" / runs the command).
-    for path in PATHS {
+    // Both routes to a page, over the whole declared tree: `sbx help <path>` and `sbx <path>
+    // --help`. A page reachable through one and not the other is the drift this catches — a verb
+    // whose help flag is swallowed by its own argument parsing reads as a working command until
+    // someone asks it for help.
+    let paths = page_paths();
+    assert!(
+        paths.len() >= 90,
+        "the walk found only {} command paths, so it is not walking",
+        paths.len()
+    );
+    for path in &paths {
+        let path: Vec<&str> = path.iter().map(String::as_str).collect();
+        let path = path.as_slice();
         let header = format!("sbx {} —", path.join(" "));
 
         let mut via_help = vec!["help"];
