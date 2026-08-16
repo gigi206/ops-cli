@@ -318,7 +318,7 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     }
     match closing_note(what, moved_store_paths) {
         ClosingNote::ProvisionSkipped => provision_channel_hint(&cfg, &pal),
-        ClosingNote::StoreMoved => store_moved_hint(&cfg, &pal),
+        ClosingNote::StoreMoved => store_moved_hint(&cfg, only, &pal),
         ClosingNote::None => {}
     }
     // A roll is what eventually supersedes a build. Point the user at `sbx gc --prune` when the
@@ -763,6 +763,11 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// leave out?". Here the roll already happened and the question is what it invalidated — so the two
 /// never share a sentence, even though they name the same apps.
 ///
+/// `only` is the roll's `--app` selector, and it narrows this the same way it narrowed the roll: a
+/// roll that moved one app's store paths must not name the apps it left alone. Without it the note
+/// would be right about the event and wrong about the subject — the same defect as the reserve
+/// below, by inclusion instead of omission.
+///
 /// **Reserve, structural**: an app that installs from its own `cmd` rather than from a bundle's
 /// install step cannot be named here, because it declares no step to select on. The shipped
 /// catalogue has **two**: `open-design`, which clones and installs on every launch, and `aionui`,
@@ -773,8 +778,11 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// long as the tree existed. Widening this note to cover them would mean detecting staging inside a
 /// shell string, which the config cannot do; what closes the gap is a declarative signal, not a
 /// better guess.
-fn store_moved_note(cfg: &config::Resolved) -> Option<String> {
-    let apps = apps_with_install_steps(cfg);
+fn store_moved_note(cfg: &config::Resolved, only: Option<&str>) -> Option<String> {
+    let apps: Vec<&str> = apps_with_install_steps(cfg)
+        .into_iter()
+        .filter(|name| only.is_none_or(|want| want == *name))
+        .collect();
     if apps.is_empty() {
         return None;
     }
@@ -786,9 +794,9 @@ fn store_moved_note(cfg: &config::Resolved) -> Option<String> {
     ))
 }
 
-/// Print [`store_moved_note`], when this project has an app it applies to.
-fn store_moved_hint(cfg: &config::Resolved, pal: &style::Palette) {
-    let Some(note) = store_moved_note(cfg) else {
+/// Print [`store_moved_note`], when this roll has an app it applies to.
+fn store_moved_hint(cfg: &config::Resolved, only: Option<&str>, pal: &style::Palette) {
+    let Some(note) = store_moved_note(cfg, only) else {
         return;
     };
     let (dim, r) = (pal.dim, pal.reset);
@@ -1442,7 +1450,7 @@ mod tests {
     fn a_roll_that_moved_store_paths_names_the_homes_built_against_them() {
         let mut cfg = crate::testutil::resolved(vec![], vec![]);
         assert!(
-            store_moved_note(&cfg).is_none(),
+            store_moved_note(&cfg, None).is_none(),
             "a project with no app says nothing"
         );
 
@@ -1455,7 +1463,7 @@ mod tests {
         cfg.apps
             .insert("plain".into(), crate::testutil::app_with(vec![]));
 
-        let note = store_moved_note(&cfg).expect("an app with a step must be named");
+        let note = store_moved_note(&cfg, None).expect("an app with a step must be named");
         assert!(note.contains("odysseus"), "{note}");
         assert!(
             !note.contains("plain"),
@@ -1477,6 +1485,25 @@ mod tests {
             !note.contains("not rolled by `all`"),
             "the store note must not claim the user ran `all`: {note}"
         );
+
+        // A roll narrowed to one app moved only that app's store paths, so the note is narrowed the
+        // same way: naming an app the roll never touched would be right about the event and wrong
+        // about the subject.
+        let mut other = crate::testutil::app_with(vec![]);
+        other.provisions = vec![config::BundleProvision {
+            bundle: "other-bundle".into(),
+            argv: vec!["true".into()],
+        }];
+        cfg.apps.insert("untouched".into(), other);
+        let narrowed =
+            store_moved_note(&cfg, Some("odysseus")).expect("the rolled app is still named");
+        assert!(narrowed.contains("odysseus"), "{narrowed}");
+        assert!(
+            !narrowed.contains("untouched"),
+            "an app this roll did not touch must not be named: {narrowed}"
+        );
+        // And an app that rides no install step selects nothing, so the roll closes silently.
+        assert!(store_moved_note(&cfg, Some("plain")).is_none());
     }
 
     /// The scope of the store note, asserted where it is decided. Removing the guard that keeps it

@@ -600,10 +600,15 @@ pub(crate) fn reap_one(
     ReapOneOutcome::Tree { dir, bytes }
 }
 
-/// One home directory a purge removed, and the bytes it freed.
+/// One app state directory a purge removed, and the bytes it freed.
 pub(crate) struct PurgedHome {
     pub(crate) path: PathBuf,
     pub(crate) bytes: u64,
+    /// Whether this tree actually carried a `home/`. A per-app tree holds more than a home — the
+    /// synthetic `/etc`, the app's channel lock — so an app that has only ever been pinned has a
+    /// tree to remove and no home in it. Reported apart, or the purge would name mise tools and
+    /// login state that were never there.
+    pub(crate) carried_home: bool,
 }
 
 /// The outcome of purging an app's isolated home directories: what was removed, and what could not
@@ -665,8 +670,13 @@ pub(crate) fn purge_app_homes(data_dir: &Path, name: &str) -> AppPurgeReport {
             continue;
         }
         let bytes = tree_size(&dir);
+        let carried_home = dir.join("home").is_dir();
         match force_remove_dir_all(&dir) {
-            Ok(()) => removed.push(PurgedHome { path: dir, bytes }),
+            Ok(()) => removed.push(PurgedHome {
+                path: dir,
+                bytes,
+                carried_home,
+            }),
             Err(e) => failed.push((dir, e)),
         }
     }
@@ -2172,6 +2182,31 @@ mod tests {
         let report = purge_app_homes(data.path(), "ghost");
         assert!(report.found_nothing());
         assert!(data.path().join("apps/demo-app").is_dir()); // the real app is untouched
+    }
+
+    #[test]
+    fn purge_app_homes_says_which_removed_trees_actually_held_a_home() {
+        // An app can have a per-app tree and no home in it: the tree also holds the synthetic
+        // `/etc` and the app's channel lock. The purge removes it either way — that lock is the
+        // app's state — but reports which is which, so the caller does not announce mise tools and
+        // login state that were never on disk.
+        let data = TmpDir::new();
+        let d = data.path();
+        std::fs::create_dir_all(d.join("apps/pinned-only")).unwrap();
+        std::fs::write(
+            d.join("apps/pinned-only/nixpkgs.lock"),
+            "nixos-unstable\nx\n",
+        )
+        .unwrap();
+        mk_home(&d.join("projects/p1/apps/pinned-only/home"));
+
+        let report = purge_app_homes(d, "pinned-only");
+        assert!(!report.found_nothing());
+        assert!(!d.join("apps/pinned-only").exists(), "the lock goes too");
+        let (with_home, without): (Vec<_>, Vec<_>) =
+            report.removed.iter().partition(|h| h.carried_home);
+        assert_eq!(with_home.len(), 1, "the per-project tree carried a home");
+        assert_eq!(without.len(), 1, "the global tree held only the lock");
     }
 
     #[test]

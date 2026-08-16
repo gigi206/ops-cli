@@ -1172,11 +1172,14 @@ fn app_rm_purge_one(
         None => false,
     };
 
-    // 2. The isolated home(s): mise tools + config + login state, freed immediately.
+    // 2. The isolated home(s): mise tools + config + login state, freed immediately. A per-app
+    //    tree that carried no home is removed too (it holds the app's channel lock), and named for
+    //    what it is rather than as a home the app never had.
     let report = sandbox::purge_app_homes(layout.data_dir(), name);
     for home in &report.removed {
         println!(
-            "{ok}removed{r} home {n}{}{r} {dim}({}){r}",
+            "{ok}removed{r} {} {n}{}{r} {dim}({}){r}",
+            if home.carried_home { "home" } else { "state" },
             home.path.display(),
             sandbox::human_bytes(home.bytes)
         );
@@ -1199,11 +1202,15 @@ fn app_rm_purge_one(
         };
     }
 
-    // Name only what was actually removed: a purge with no profile present must not claim one.
-    let removed_what = if profile_removed {
-        "profile + mise tools + login state"
-    } else {
-        "mise tools + login state"
+    // Name only what was actually removed: a purge with no profile present must not claim one, and
+    // one that found no home must not claim tools and login state that were never there — an app
+    // may have nothing on disk but its channel lock.
+    let any_home = report.removed.iter().any(|h| h.carried_home);
+    let removed_what = match (profile_removed, any_home) {
+        (true, true) => "profile + mise tools + login state",
+        (true, false) => "profile + channel pin",
+        (false, true) => "mise tools + login state",
+        (false, false) => "channel pin",
     };
     // A partial failure (a home that would not delete) is not a clean purge — say so, so the green
     // summary never contradicts the non-zero exit the batch will carry.

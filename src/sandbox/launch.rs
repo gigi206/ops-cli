@@ -2801,27 +2801,28 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // Read off the reference this launch actually resolved, not a second derivation of it: `prep`
     // already holds it, and re-deciding the channel here would have to know which app this is — a
     // fact the sweep has no reason to carry, and would get wrong the day it went stale.
-    let base_rev = Some(crate::store::revision_of(&prep.nixpkgs).to_string());
+    let base_rev = crate::store::revision_of(&prep.nixpkgs);
     let mise_revs = crate::store::live_mise_revisions(&prep.layout);
-    let superseded = match &base_rev {
-        // Prune only when the base *and* mise out-links for the current revisions are present: those
-        // two families root the irreducible userland (mise on its own revision, not the base one), so
-        // without them the keep-set could omit a current core build and the sweep would delete it. A
-        // missing family means we cannot safely tell superseded from sole-current, so skip — a
-        // re-provision on the next launch is cheap, a wrongful wipe is not.
-        Some(rev)
-            if data_gcroots.join("base").join(rev).is_dir()
-                && mise_revs
-                    .iter()
-                    .any(|m| data_gcroots.join("mise").join(m).is_dir()) =>
-        {
-            // `id` is `project_identity(cwd).0` — the very value `project_runtime_id` returns and the
-            // provisioning path keys `<data>/gcroots/projects/<id>/` on — so the projects family of the
-            // keep-set cannot drift from where a project's app builds are actually rooted.
-            let keep = super::gc::project_keep_roots(&data_gcroots, &id, rev, &mise_revs);
-            super::gc::prune_superseded_roots(&store_dir, &keep, prune).len()
-        }
-        _ => 0,
+    // Prune only when the base *and* mise out-links for the current revisions are present: those two
+    // families root the irreducible userland (mise on its own revision, not the base one), so without
+    // them the keep-set could omit a current core build and the sweep would delete it. A missing
+    // family means we cannot safely tell superseded from sole-current, so skip — a re-provision on
+    // the next launch is cheap, a wrongful wipe is not. This out-link check is the whole guard: the
+    // revision itself is always known here (the launch resolved it above), so there is no
+    // "unknown revision" case to fall through, and pretending there is would hide which condition
+    // actually protects the sweep.
+    let superseded = if data_gcroots.join("base").join(base_rev).is_dir()
+        && mise_revs
+            .iter()
+            .any(|m| data_gcroots.join("mise").join(m).is_dir())
+    {
+        // `id` is `project_identity(cwd).0` — the very value `project_runtime_id` returns and the
+        // provisioning path keys `<data>/gcroots/projects/<id>/` on — so the projects family of the
+        // keep-set cannot drift from where a project's app builds are actually rooted.
+        let keep = super::gc::project_keep_roots(&data_gcroots, &id, base_rev, &mise_revs);
+        super::gc::prune_superseded_roots(&store_dir, &keep, prune).len()
+    } else {
+        0
     };
 
     println!("{h}sbx gc{r} — {n}{}{r}", project.display());
