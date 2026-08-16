@@ -14,6 +14,7 @@ A project's base userland and tools are pinned by **locks** in the data director
 - `<data>/nixpkgs.lock`: the global base channel revision.
 - `<data>/mise-engine.lock`: the mise engine revision (independent of the base).
 - `<data>/projects/<id>/nixpkgs.lock`: a project's own channel pin.
+- `<data>/apps/<name>/nixpkgs.lock`: one app's own base channel revision.
 - `<data>/projects/<id>/tools.lock`: resolved `nix:` mise tools.
 - `<data>/projects/<id>/flake-packages.lock`: pinned `flake:` packages.
 - `<data>/projects/<id>/deb-packages.lock`, pinned `deb:` packages (declared source → content hash, plus the resolved download URL for a `deb:resolve` package).
@@ -51,7 +52,8 @@ lock:
 - In a project with a trusted [`nixpkgs`](../configuration/nixpkgs) pin, it rewrites
   the per-project lock, the only way a *channel* pin (`nixos-23.11`) advances within
   itself.
-- Otherwise it rolls the global channel.
+- With `--app <name>` and no such pin, it rewrites that app's lock and nothing else.
+- Otherwise it rolls the global channel, which no app follows.
 
 A *revision* pin refreshes to itself (a reported no-op). An untrusted/changed pin is
 dropped, so `upgrade` rolls the global channel and prints the config warning.

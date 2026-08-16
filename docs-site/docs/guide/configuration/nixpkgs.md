@@ -51,6 +51,12 @@ update, only on an explicit [`sbx upgrade`](../concepts/upgrade):
 - A **global** override records to the shared `<data>/nixpkgs.lock`.
 - A trusted **project** pin records to a per-project
   `<data>/projects/<id>/nixpkgs.lock`.
+- An **app** records to `<data>/apps/<name>/nixpkgs.lock`, so one app advances on its own
+  and a global roll leaves it where it is. It applies when no project pin does: under a
+  pin the app resolves against the project's lock like everything else in that launch,
+  because an app launch also builds the project's declared packages. The lock is seeded
+  from the global channel's the first time, so an app starts where the base already is.
+  See [Rolling one app](../cli/upgrade#an-apps-base-channel).
 
 Changing the *source* (e.g. `nixos-23.11` → `nixos-24.05`) re-resolves; an unchanged
 source stays fixed. A first launch of a pinned project downloads its own base closure
@@ -60,7 +66,9 @@ source stays fixed. A first launch of a pinned project downloads its own base cl
 
 A **channel** pin (`nixos-23.11`) advances *within itself* only via `sbx upgrade` run
 in that project, a global upgrade would not touch a project's own pin. A **revision**
-pin refreshes to itself (a no-op). See [Upgrading](../concepts/upgrade).
+pin refreshes to itself (a no-op). An app is the same shape one level down:
+`sbx upgrade nix` does not move it, `sbx upgrade nix --app <name>` does. See
+[Upgrading](../concepts/upgrade).
 
 ## Viewing the effective channel
 

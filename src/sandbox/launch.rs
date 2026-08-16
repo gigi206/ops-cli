@@ -104,7 +104,7 @@ pub(crate) fn run(
         );
         return ExitCode::from(2);
     }
-    let mut prep = match prepare_with(&ov) {
+    let mut prep = match prepare_with(&ov, None) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -772,7 +772,10 @@ pub(crate) fn app(
     ov: crate::config::Override,
     net_learn: Option<super::Granularity>,
 ) -> AppOutcome {
-    let mut prep = match prepare_with(&ov) {
+    // The app's name reaches `prepare_with` because the channel is chosen there, and an app
+    // resolves against its own lock. Nothing of the app's *configuration* is read that early — the
+    // overlay is merged below — so this is the launch's identity, not its content.
+    let mut prep = match prepare_with(&ov, Some(name)) {
         Ok(p) => p,
         Err(code) => return AppOutcome::plain(code),
     };
@@ -1235,7 +1238,7 @@ pub(crate) fn upgrade_mise_packages(
     // project being upgraded, so `--project` builds the roll cage in that project's store and home
     // rather
     // than wherever the command was invoked.
-    let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none()) {
+    let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none(), only) {
         Ok(p) => p,
         Err(_) => {
             // prepare_in already printed the pointed reason (missing bwrap/userns/nix).
@@ -1498,7 +1501,7 @@ pub(crate) fn upgrade_provision_steps(
 
     // Only now, with work to do, take on the sandbox prerequisites — against `cwd`, so `--project`
     // retargets these cages the way it retargets every other roll.
-    let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none()) {
+    let mut prep = match prepare_in(cwd.to_path_buf(), &crate::config::Override::none(), only) {
         Ok(p) => p,
         Err(_) => {
             // prepare_in already printed the pointed reason (missing bwrap/userns/nix).
@@ -2795,9 +2798,10 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // provisioned. Drop the seed roots whose build no current out-link references so the sweep
     // reclaims them. The keep-set is the union of every out-link family, which only gc (never a
     // single launch's seed) sees.
-    let base_rev = effective_lock_target(&prep.cwd, &prep.layout, &prep.cfg)
-        .ok()
-        .and_then(|t| t.locked_revision());
+    // Read off the reference this launch actually resolved, not a second derivation of it: `prep`
+    // already holds it, and re-deciding the channel here would have to know which app this is — a
+    // fact the sweep has no reason to carry, and would get wrong the day it went stale.
+    let base_rev = Some(crate::store::revision_of(&prep.nixpkgs).to_string());
     let mise_revs = crate::store::live_mise_revisions(&prep.layout);
     let superseded = match &base_rev {
         // Prune only when the base *and* mise out-links for the current revisions are present: those
@@ -2884,10 +2888,15 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
 /// superseded — the same guard [`sweep_current`] prunes under, so the count never over-reports (a
 /// just-rolled revision whose build is still deferred to the next launch fails the guard, so the
 /// hint waits until the superseded state is real).
+///
+/// `app` is the roll's `--app` selector, so the revision this measures is the one that roll
+/// actually moved: an app with its own lock is on its own revision, and reading the project's here
+/// would count against a base the app is not on.
 pub(crate) fn superseded_reclaimable_hint(
     layout: &Layout,
     cwd: &Path,
     cfg: &crate::config::Resolved,
+    app: Option<&str>,
     pal: &crate::style::Palette,
 ) {
     let Ok(id) = binds::project_runtime_id(cwd) else {
@@ -2896,7 +2905,7 @@ pub(crate) fn superseded_reclaimable_hint(
     if !super::projectstore::store_exists(layout, &id) {
         return;
     }
-    let Some(rev) = effective_lock_target(cwd, layout, cfg)
+    let Some(rev) = effective_lock_target(cwd, layout, cfg, app)
         .ok()
         .and_then(|t| t.locked_revision())
     else {
@@ -3614,7 +3623,7 @@ fn stop_session(
 /// chooses the channel the **whole** launch resolves against — base userland and
 /// tools alike (see [`Prepared`] for why they must be one).
 fn prepare() -> Result<Prepared, ExitCode> {
-    prepare_with(&crate::config::Override::none())
+    prepare_with(&crate::config::Override::none(), None)
 }
 
 /// [`prepare`] with a one-shot override applied. The override's **nixpkgs channel** is applied to
@@ -3622,7 +3631,12 @@ fn prepare() -> Result<Prepared, ExitCode> {
 /// launch resolves against), so a `-o nixpkgs=…` / `SBX_CONFIG` channel takes effect. The rest of
 /// the override (env, binds, network, gui, limits, secret) is applied by the caller with
 /// [`crate::config::Resolved::apply_override`] — after any app overlay merges, so it beats that too.
-fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
+///
+/// `app` names the app this launch is for, when it is one. It arrives here — before the app's
+/// overlay is even looked up — because the channel is resolved here, and an app resolves against
+/// its own lock ([`effective_lock_target`]). It is only ever the *identity* of the launch: nothing
+/// of the app's configuration is read at this point, and nothing here can be influenced by it.
+fn prepare_with(ov: &crate::config::Override, app: Option<&str>) -> Result<Prepared, ExitCode> {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -3630,14 +3644,18 @@ fn prepare_with(ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
             return Err(ExitCode::FAILURE);
         }
     };
-    prepare_in(cwd, ov)
+    prepare_in(cwd, ov, app)
 }
 
 /// [`prepare_with`] against an explicit project directory instead of the process's current
 /// directory. The whole cage — its per-project store, home, and resolved config — is built from
 /// `cwd`, so a caller that retargets another project (`sbx upgrade --project <path>`) drives the
 /// in-cage roll against *that* project, not wherever the command happened to be invoked.
-fn prepare_in(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared, ExitCode> {
+fn prepare_in(
+    cwd: PathBuf,
+    ov: &crate::config::Override,
+    app: Option<&str>,
+) -> Result<Prepared, ExitCode> {
     // The data directory is resolved first: it is where sbx looks for (and, under the
     // bundled features, materializes) the engines it owns, so `resolve_bwrap` below needs it.
     let Some(layout) = Layout::from_env() else {
@@ -3681,14 +3699,15 @@ fn prepare_in(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared, Ex
         return Err(ExitCode::from(2));
     }
 
-    let nixpkgs =
-        match effective_lock_target(&cwd, &layout, &cfg).and_then(|t| t.resolve(&nix, &layout)) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("sbx: cannot resolve the nixpkgs channel: {e}");
-                return Err(ExitCode::FAILURE);
-            }
-        };
+    let nixpkgs = match effective_lock_target(&cwd, &layout, &cfg, app)
+        .and_then(|t| t.resolve(&nix, &layout))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("sbx: cannot resolve the nixpkgs channel: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
     // The mise engine resolves against its own dedicated lock (the global channel source,
     // rolled independently by `sbx upgrade mise`), never this launch's possibly-pinned
     // base reference. Resolved *after* the base so its lock can be seeded from the base's
@@ -3724,25 +3743,40 @@ fn prepare_in(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared, Ex
     })
 }
 
-/// The single channel decision for the current directory — the one place that picks
-/// "which source, which lock", so the launch (resolve), `sbx upgrade` (refresh), and
-/// `sbx config` (display) all act on the same lock and can never drift.
+/// The single channel decision for a launch — the one place that picks "which source, which lock",
+/// so the launch (resolve), `sbx upgrade` (refresh), and `sbx config` (display) all act on the same
+/// lock and can never drift.
 ///
-/// A trusted per-project `nixpkgs` pin takes precedence (its own lock); otherwise the
-/// global channel — a global-config override, else the default. Only the pinned case
-/// canonicalises the project to derive its lock path, so the common no-pin path does
-/// no extra work and a per-project lock is never even named without a current pin.
+/// Three branches, in this order:
+///
+/// - **A trusted per-project `nixpkgs` pin wins, app or no app.** An app launch inherits the
+///   baseline's packages (`Resolved::merge_app` overrides by name, it does not replace the list),
+///   so the project's declared tools build in that launch too — and they must build from the
+///   pinned revision or the pin promises nothing. This is also the one-channel rule: one launch,
+///   one revision, base userland and tools alike.
+/// - **Otherwise an app resolves against its own lock** ([`crate::store::LockTarget::app`]), so
+///   `sbx upgrade nix --app <name>` moves one app and a global roll leaves it where it is. The
+///   *source* is still not the app's to choose — `nixpkgs` under an app is a refused key — only the
+///   resolution is frozen per app.
+/// - **Otherwise the global channel**: a global-config override, else the default.
+///
+/// Only the pinned case canonicalises the project to derive its lock path, so the common no-pin
+/// path does no extra work and a per-project lock is never even named without a current pin.
 pub(crate) fn effective_lock_target(
     cwd: &Path,
     layout: &Layout,
     cfg: &crate::config::Resolved,
+    app: Option<&str>,
 ) -> io::Result<crate::store::LockTarget> {
-    match cfg.nixpkgs_project.as_deref() {
-        Some(source) => {
+    match (cfg.nixpkgs_project.as_deref(), app) {
+        (Some(source), _) => {
             let id = binds::project_runtime_id(cwd)?;
             Ok(crate::store::LockTarget::project(layout, &id, source))
         }
-        None => Ok(crate::store::LockTarget::global(
+        (None, Some(name)) => {
+            crate::store::LockTarget::app(layout, name, cfg.nixpkgs_global.as_deref())
+        }
+        (None, None) => Ok(crate::store::LockTarget::global(
             layout,
             cfg.nixpkgs_global.as_deref(),
         )),
@@ -7397,9 +7431,13 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         )
         .unwrap();
 
-        let target =
-            effective_lock_target(Path::new("/nonexistent"), &layout, &resolved(None, None))
-                .expect("global target needs no canonicalisation");
+        let target = effective_lock_target(
+            Path::new("/nonexistent"),
+            &layout,
+            &resolved(None, None),
+            None,
+        )
+        .expect("global target needs no canonicalisation");
         assert_eq!(target.origin(), Origin::Default);
         assert_eq!(target.source(), "nixos-unstable");
         // it reads the global lock, never a per-project one
@@ -7414,6 +7452,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             Path::new("/nonexistent"),
             &layout,
             &resolved(Some("nixos-23.11"), None),
+            None,
         )
         .expect("global override needs no canonicalisation");
         assert_eq!(target.origin(), Origin::Global);
@@ -7428,7 +7467,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         let proj = TmpDir::new();
         let layout = crate::store::Layout::under(data.path());
 
-        let target = effective_lock_target(proj.path(), &layout, &resolved(None, Some(REV)))
+        let target = effective_lock_target(proj.path(), &layout, &resolved(None, Some(REV)), None)
             .expect("canonicalise the project");
         assert_eq!(target.origin(), Origin::ProjectPin);
         assert_eq!(target.source(), REV);
@@ -7443,6 +7482,75 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             .map(|e| e.flatten().any(|d| d.path().join("nixpkgs.lock").is_file()))
             .unwrap_or(false);
         assert!(has_lock, "a trusted pin must record a per-project lock");
+    }
+
+    #[test]
+    fn an_app_without_a_pin_targets_its_own_lock() {
+        // The app branch: no project pin, so the app resolves against a lock keyed by its name and
+        // sitting beside its state. The source is still the global one — an app cannot choose a
+        // channel — so what is per-app here is the revision, nothing else.
+        let data = TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+
+        let target = effective_lock_target(
+            Path::new("/nonexistent"),
+            &layout,
+            &resolved(None, None),
+            Some("demo-app"),
+        )
+        .expect("the app branch needs no canonicalisation either");
+        assert_eq!(target.origin(), Origin::Default);
+        assert_eq!(target.source(), "nixos-unstable");
+
+        // Resolving a fixed pin needs no nix, and records the revision in the app's own lock —
+        // never the global one, which is what makes `sbx upgrade nix` leave this app alone.
+        let pinned = effective_lock_target(
+            Path::new("/nonexistent"),
+            &layout,
+            &resolved(Some(REV), None),
+            Some("demo-app"),
+        )
+        .unwrap();
+        pinned
+            .resolve(Path::new("/nonexistent-nix"), &layout)
+            .expect("a revision source resolves without nix");
+        assert!(
+            layout
+                .data_dir()
+                .join("apps/demo-app/nixpkgs.lock")
+                .is_file(),
+            "the revision lands in the app's own lock"
+        );
+        assert!(!layout.data_dir().join("nixpkgs.lock").exists());
+    }
+
+    #[test]
+    fn a_project_pin_wins_over_an_app_lock() {
+        // The precedence that keeps the one-channel rule true: an app launch also builds the
+        // project's declared packages (`merge_app` overrides by name, it does not replace the
+        // list), so under a trusted pin those tools must come from the pinned revision. The app's
+        // own lock is therefore not even named here.
+        let data = TmpDir::new();
+        let proj = TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+
+        let target = effective_lock_target(
+            proj.path(),
+            &layout,
+            &resolved(None, Some(REV)),
+            Some("demo-app"),
+        )
+        .expect("canonicalise the project");
+        assert_eq!(target.origin(), Origin::ProjectPin);
+        assert_eq!(target.source(), REV);
+
+        target
+            .resolve(Path::new("/nonexistent-nix"), &layout)
+            .expect("a revision pin resolves without nix");
+        assert!(
+            !layout.data_dir().join("apps/demo-app").exists(),
+            "under a pin, no app lock is written"
+        );
     }
 
     #[test]

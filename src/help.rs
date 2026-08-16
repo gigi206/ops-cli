@@ -1602,7 +1602,7 @@ const PAGES: &[Page] = &[
             ),
             (
                 "-a, --app <name>",
-                "narrow `mise` or `provision` to one app's cage (leaves the engine, the project's nix: tools and the baseline alone)",
+                "narrow `nix`, `mise` or `provision` to one app (leaves the engine, the project's nix: tools and the baseline alone)",
             ),
             (
                 "--project <path>",
@@ -1621,15 +1621,22 @@ const PAGES: &[Page] = &[
             `all`, because unlike a lock rewrite it launches a cage per app and re-downloads;\n\
             `all` names the apps it left instead.\n\
             \n\
-            `-a, --app <name>` narrows a roll to one app's cage. It applies to the two in-cage\n\
-            rolls only — `provision` and `mise` — because those are the ones whose unit of work\n\
-            is already one app's own cage; every other target rewrites a project-wide lock\n\
-            host-side, where there is no per-app unit to select, and naming one there is a usage\n\
-            error rather than a flag that quietly rolls the project. Under `--app`, `mise` rolls\n\
-            that app's `mise:` packages and NOTHING else: not the engine, not the project's\n\
-            `nix:` tools, not the project baseline, all of which are project-wide. An app name\n\
-            that selects no work is refused with the reason — unknown, unlaunchable, or riding a\n\
-            backend instead — rather than reported as a clean roll of nothing.\n\
+            `-a, --app <name>` narrows a roll to one app. It applies to the two in-cage rolls,\n\
+            `provision` and `mise`, whose unit of work is already one app's own cage — and to\n\
+            `nix`, because an app resolves the base channel against a lock of its own: its\n\
+            revision moves when you roll that app, and a plain `sbx upgrade nix` leaves it where\n\
+            it is. The remaining targets rewrite a project-wide lock host-side, where there is no\n\
+            per-app unit to select, and naming one there is a usage error rather than a flag that\n\
+            quietly rolls the project. Under `--app`, `mise` rolls that app's `mise:` packages and\n\
+            NOTHING else: not the engine, not the project's `nix:` tools, not the project\n\
+            baseline, all of which are project-wide. An app name that selects no work is refused\n\
+            with the reason — unknown, unlaunchable, or riding a backend instead — rather than\n\
+            reported as a clean roll of nothing.\n\
+            \n\
+            `nix --app <name>` is refused in a project that pins `nixpkgs`. A pin outranks an\n\
+            app's own lock, because an app launch builds the project's declared packages too and\n\
+            those must come from the pinned revision — so there is no app-only revision to roll\n\
+            there, and rolling the pin under a per-app flag would be project-wide work.\n\
             \n\
             `--project <path>` retargets every roll at another project — exactly as running the\n\
             command from that directory would, with the same trust gate, pin, and locks. The path\n\
@@ -1892,13 +1899,19 @@ const PAGES: &[Page] = &[
         options: &[("<name>", "the app to advance")],
         details: "Advances a named app without asking which channel it rides: sbx reads what the app\n\
             declares and rolls the parts whose unit of work is the app's own cage — its `mise:`\n\
-            packages and its bundle's install step, the same two `sbx upgrade --app` narrows.\n\n\
-            What it does not do is hide the rest. A `nix:`, `flake:`, `deb:`, `appimage:`,\n\
-            `tarball:` or `binary:` package is pinned in a lock that belongs to the **project**, not\n\
-            to one app, so rolling it here would advance every app under a command that reads as\n\
-            \"only this one\". Those are named instead, with the channel command that rolls them —\n\
-            `sbx upgrade nix` and friends. An inline `[flakes.<name>]` pins its inputs in its own\n\
-            source and has no channel at all; it rebuilds when that source changes.\n\n\
+            packages and its bundle's install step.\n\n\
+            What it does not do is hide the rest. A `flake:`, `deb:`, `appimage:`, `tarball:` or\n\
+            `binary:` package is pinned in a lock that belongs to the **project**, not to one app,\n\
+            so rolling it here would advance every app under a command that reads as \"only this\n\
+            one\". Those are named instead, with the channel command that rolls them. An inline\n\
+            `[flakes.<name>]` pins its inputs in its own source and has no channel at all; it\n\
+            rebuilds when that source changes.\n\n\
+            The app's **base channel** is the one exception to that reasoning, and it is left out\n\
+            for a different reason: an app does have its own nixpkgs lock, so there is a per-app\n\
+            revision to roll — but rolling it re-resolves the channel and rebuilds the base\n\
+            userland, which is a download this verb does not take on unasked. It is\n\
+            `sbx upgrade nix --app <name>`, and until it is run the app stays on the revision it\n\
+            has: a global `sbx upgrade nix` does not move it.\n\n\
             The bundle install step runs here without a further flag, unlike under `sbx upgrade\n\
             all`: `all` is unscoped, so its steps would launch a cage per app across the project,\n\
             while naming one app bounds the cost to the cage you asked about. Nothing gates it, so\n\

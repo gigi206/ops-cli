@@ -68,7 +68,10 @@ impl UpgradeCage {
         cfg: &crate::config::Resolved,
     ) -> Option<Self> {
         let bwrap = crate::store::resolve_bwrap(Some(layout))?.path;
-        let nixpkgs = super::launch::effective_lock_target(project, layout, cfg)
+        // The project's channel, never an app's: the prebuilt backends this cage serves are not
+        // app-scoped (`sbx upgrade --app` narrows the in-cage rolls only), so there is no app whose
+        // lock could apply. A resolver command runs against the same base its project does.
+        let nixpkgs = super::launch::effective_lock_target(project, layout, cfg, None)
             .ok()?
             .resolve(nix, layout)
             .ok()?;

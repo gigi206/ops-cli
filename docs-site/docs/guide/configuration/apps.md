@@ -84,6 +84,27 @@ One mistake it cannot catch, and it is the more likely of the two: a scalar writ
 all. Appending `timezone = "Europe/Paris"` to the end of a profile is exactly that. Keep scalars
 above the first table.
 
+:::note Where an app's `nixpkgs` value comes from
+
+"Not a key an app has" says where you may *write* it. It does not say the app inherits the
+value from the config it was declared in. The launch reads the channel **source** from the
+directory it is launched in: a trusted `nixpkgs` pin in that project wins, otherwise the
+global config's channel, otherwise the default. For an app declared in a project's own
+`.sbx.toml` those are the same config. For a **global** app they are not, so the same profile
+launched from two projects can read two different sources.
+
+The **revision** is separate, and it is the app's own: each app has its own nixpkgs lock, so
+`sbx upgrade nix` rolls the project and leaves the app where it is, and
+[`sbx upgrade nix --app <name>`](../cli/upgrade#an-apps-base-channel) is what moves it. A
+trusted project pin still outranks that lock, because an app launch also builds the project's
+declared packages and they have to come from the pinned revision.
+
+What remains is that one shared home can be built under two different projects' pins. If that
+matters for an app, give it [`home_scope = "project"`](../apps/home): one home per project means
+one config decides for that home, and the two can never cross.
+
+:::
+
 ### The `cmd` field and trailing arguments
 
 `cmd` is either a bare string (a one-element argv, never whitespace-split) or an argv

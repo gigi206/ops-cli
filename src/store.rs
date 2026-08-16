@@ -956,6 +956,17 @@ pub(crate) struct LockTarget {
     source: String,
     lock_path: PathBuf,
     origin: Origin,
+    /// Another lock to take this one's first revision from, when this lock does not exist yet and
+    /// that one already records **this** source. Set on the targets that were carved out of the
+    /// global channel after the fact (the mise engine, an app): every install that predates the
+    /// carve-out has `nixpkgs.lock` and nothing else, so resolving fresh would hit the network and
+    /// re-pin them to the day's revision — advancing an engine, or an app, on a mere binary update.
+    /// That is what the seeded-not-baked model forbids, and it would also make the first launch
+    /// need a network the base does not.
+    ///
+    /// So the seed is not a cache: it is what makes the carve-out invisible until something is
+    /// rolled on purpose. `None` for the two targets that were always their own source of truth.
+    seed_from: Option<PathBuf>,
 }
 
 impl LockTarget {
@@ -967,6 +978,7 @@ impl LockTarget {
             source,
             lock_path: global_lock_path(layout),
             origin,
+            seed_from: None,
         }
     }
 
@@ -981,6 +993,7 @@ impl LockTarget {
             source,
             lock_path: engine_lock_path(layout),
             origin,
+            seed_from: Some(global_lock_path(layout)),
         }
     }
 
@@ -991,7 +1004,35 @@ impl LockTarget {
             source: source.to_string(),
             lock_path: project_lock_path(layout, project_id),
             origin: Origin::ProjectPin,
+            seed_from: None,
         }
+    }
+
+    /// One app's own target: the **global** channel source, pinned in a lock beside that app's
+    /// state, so `sbx upgrade nix --app <name>` advances one app and a global roll leaves it where
+    /// it is. Same shape as [`Self::engine`] — the source is not the app's to choose (writing
+    /// `nixpkgs` under an app is a refused key), only the resolution is frozen per app.
+    ///
+    /// Reachable **only** when no trusted project pin applies: an app launch inherits the
+    /// baseline's packages, so under a pin those tools must build from the pinned revision or the
+    /// pin's whole promise is void. [`crate::sandbox::effective_lock_target`] is where that
+    /// precedence lives.
+    ///
+    /// Errors when the name is not a single safe path component — defence at the sink, since this
+    /// joins onto sbx's data directory. Every name that reaches here has already passed
+    /// [`crate::config::is_valid_app_name`].
+    pub(crate) fn app(
+        layout: &Layout,
+        name: &str,
+        override_source: Option<&str>,
+    ) -> io::Result<Self> {
+        let (source, origin) = global_source(override_source);
+        Ok(Self {
+            source,
+            lock_path: app_lock_path(layout, name)?,
+            origin,
+            seed_from: Some(global_lock_path(layout)),
+        })
     }
 
     /// The configured source (a branch/channel or a 40-hex revision).
@@ -1025,7 +1066,13 @@ impl LockTarget {
     /// Resolve to a pinned `github:NixOS/nixpkgs/<rev>`, reusing the lock when its
     /// source matches and resolving (and recording) otherwise.
     pub(crate) fn resolve(&self, nix: &Path, layout: &Layout) -> io::Result<String> {
-        resolve_ref(nix, layout, &self.source, &self.lock_path)
+        resolve_ref(
+            nix,
+            layout,
+            &self.source,
+            &self.lock_path,
+            self.seed_from.as_deref(),
+        )
     }
 
     /// Force a fresh resolution of this source and rewrite the lock — the explicit
@@ -1057,6 +1104,22 @@ fn engine_lock_path(layout: &Layout) -> PathBuf {
     layout.data_dir().join(MISE_ENGINE_LOCK)
 }
 
+/// One app's own lock, beside that app's state under `<data>/apps/<name>/`. That directory is what
+/// `sbx app rm --purge` removes, so an app's pin goes when the app does rather than outliving it as
+/// an orphan nothing names.
+///
+/// Refuses a name that is not a single path component: this is the sink, and a name that traversed
+/// would write a lock outside sbx's data directory.
+fn app_lock_path(layout: &Layout, name: &str) -> io::Result<PathBuf> {
+    if !crate::config::is_valid_app_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`{name}` is not a usable app name, so it cannot key a channel lock"),
+        ));
+    }
+    Ok(layout.data_dir().join("apps").join(name).join(NIXPKGS_LOCK))
+}
+
 /// A project's own lock, under its runtime tree, pinning a trusted pin's revision.
 fn project_lock_path(layout: &Layout, project_id: &str) -> PathBuf {
     layout
@@ -1073,22 +1136,29 @@ pub(crate) fn read_global_lock(layout: &Layout) -> Option<(String, String)> {
     read_lock(&global_lock_path(layout))
 }
 
-/// The base-channel revisions a shared-store gc must keep: the global channel's, plus the pin of
-/// every project whose lock is still on disk. The GUI font set is keyed by the same channel
-/// revision as the base userland, so this set covers both `gcroots/base/<rev>/` and
-/// `gcroots/gui/<rev>/` — any revision outside it is stale. Reads the locks straight from disk,
-/// so a dead project reaped before the gc no longer contributes its pin (and on a dry run, where
-/// dead projects still exist, their pins keep their revisions, making the dry run a lower bound on
-/// what `--prune` frees). Pure file reads, no nix.
+/// The base-channel revisions a shared-store gc must keep: the global channel's, the pin of
+/// every project whose lock is still on disk, and the pin of every app that has one. The GUI font
+/// set is keyed by the same channel revision as the base userland, so this set covers both
+/// `gcroots/base/<rev>/` and `gcroots/gui/<rev>/` — any revision outside it is stale. Reads the
+/// locks straight from disk, so a dead project reaped before the gc no longer contributes its pin
+/// (and on a dry run, where dead projects still exist, their pins keep their revisions, making the
+/// dry run a lower bound on what `--prune` frees). Pure file reads, no nix.
+///
+/// An app lock has to be read here for the same reason a project's is: an app that has been rolled
+/// on its own sits on a revision no other lock records, and collecting it would leave that app's
+/// home holding store paths that are gone — the failure a per-app lock exists to make *less*
+/// frequent, recreated by the mechanism itself.
 pub(crate) fn live_base_revisions(layout: &Layout) -> BTreeSet<String> {
     let mut revs = BTreeSet::new();
     if let Some((_, rev)) = read_global_lock(layout) {
         revs.insert(rev);
     }
-    if let Ok(entries) = std::fs::read_dir(layout.data_dir().join("projects")) {
-        for entry in entries.flatten() {
-            if let Some((_, rev)) = read_lock(&entry.path().join(NIXPKGS_LOCK)) {
-                revs.insert(rev);
+    for dir in ["projects", "apps"] {
+        if let Ok(entries) = std::fs::read_dir(layout.data_dir().join(dir)) {
+            for entry in entries.flatten() {
+                if let Some((_, rev)) = read_lock(&entry.path().join(NIXPKGS_LOCK)) {
+                    revs.insert(rev);
+                }
             }
         }
     }
@@ -1114,9 +1184,9 @@ pub(crate) fn live_mise_revisions(layout: &Layout) -> BTreeSet<String> {
     revs
 }
 
-/// Resolve the mise engine reference, seeding its dedicated lock from the global channel
-/// lock on first use. Used in place of [`LockTarget::engine`]'s plain `resolve` so two
-/// properties hold across this feature's introduction:
+/// Resolve the mise engine reference. The engine's lock is seeded from the global channel lock on
+/// first use ([`LockTarget::seed_from`]), which is what makes two properties hold across this
+/// feature's introduction:
 ///
 /// - **A binary update never moves the engine.** Every install that predates the engine
 ///   lock has `nixpkgs.lock` but no `mise-engine.lock`; a plain resolve would hit the
@@ -1125,34 +1195,16 @@ pub(crate) fn live_mise_revisions(layout: &Layout) -> BTreeSet<String> {
 /// - **The first launch still works offline.** That fresh resolution would otherwise fail
 ///   with no network, where the base (resolved from its own lock) does not.
 ///
-/// So when the engine lock is absent, the engine is seeded from the global channel lock
-/// when that records the same source — no nix, the engine starting on exactly the
-/// revision the base is already on. The launcher resolves the base before the engine, so
-/// even a fresh install has `nixpkgs.lock` written by then and base == engine from the
-/// start; they diverge only on an explicit `sbx upgrade mise`. Only when neither lock has
-/// the source (a pinned-only user who has never resolved the global channel) does it
-/// resolve fresh, which then needs nix.
+/// The launcher resolves the base before the engine, so even a fresh install has `nixpkgs.lock`
+/// written by then and base == engine from the start; they diverge only on an explicit
+/// `sbx upgrade mise`. Only when neither lock has the source (a pinned-only user who has never
+/// resolved the global channel) does it resolve fresh, which then needs nix.
 pub(crate) fn resolve_engine_ref(
     nix: &Path,
     layout: &Layout,
     global_override: Option<&str>,
 ) -> io::Result<String> {
-    let engine = LockTarget::engine(layout, global_override);
-    // The engine's own lock already pins this source: reuse it (no nix), like any launch.
-    if let Some(rev) = engine.locked_revision() {
-        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{rev}"));
-    }
-    // First use of the engine lock: seed it from the global channel lock when that records
-    // the same source, so the engine starts where the base already is — no network, and a
-    // binary update never bumps it.
-    if let Some(rev) = LockTarget::global(layout, global_override).locked_revision() {
-        ensure(layout)?;
-        write_lock(&engine.lock_path, &engine.source, &rev)?;
-        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{rev}"));
-    }
-    // Neither lock pins this source yet: a genuine first resolution (needs nix), recorded
-    // in the engine's own lock so later launches reuse it.
-    engine.resolve(nix, layout)
+    LockTarget::engine(layout, global_override).resolve(nix, layout)
 }
 
 /// Whether a source is itself a fixed 40-hex revision (a frozen pin that an upgrade
@@ -1190,12 +1242,30 @@ pub(crate) fn revision_of(flake_ref: &str) -> &str {
 /// update never moves it; an explicit upgrade rewrites the lock). Pinning a concrete
 /// revision is also the security floor — names resolve against one fixed,
 /// signed-cache-built catalogue.
-fn resolve_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> io::Result<String> {
+///
+/// `seed_from` is the lock this one takes its **first** revision from ([`LockTarget::seed_from`]):
+/// consulted only when this lock does not already pin this source, and only when the seed pins the
+/// same source. Seeding writes the revision here, so the seed is read once and everything after
+/// reads this lock alone — a later roll of either lock moves only its own target.
+fn resolve_ref(
+    nix: &Path,
+    layout: &Layout,
+    source: &str,
+    lock_path: &Path,
+    seed_from: Option<&Path>,
+) -> io::Result<String> {
     ensure(layout)?;
     if let Some((locked_source, locked_rev)) = read_lock(lock_path)
         && locked_source == source
     {
         return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{locked_rev}"));
+    }
+    if let Some(seed) = seed_from
+        && let Some((seed_source, seed_rev)) = read_lock(seed)
+        && seed_source == source
+    {
+        write_lock(lock_path, source, &seed_rev)?;
+        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{seed_rev}"));
     }
     let rev = resolve_source_rev(nix, source)?;
     write_lock(lock_path, source, &rev)?;
@@ -2577,6 +2647,108 @@ mod tests {
         let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
         assert!(resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None).is_err());
+    }
+
+    #[test]
+    fn an_app_seeds_from_the_global_lock_and_then_stops_following_it() {
+        // The whole point of a per-app lock, in one run. An app that has never been resolved takes
+        // its first revision from the global lock (no nix — proven by the bogus one), records it in
+        // its own lock, and from then on a global roll leaves it where it is. Without the seed,
+        // shipping this feature would re-pin every existing app to the day's revision on its next
+        // launch; without the lock, the app would keep following the global channel and the verb
+        // that rolls one app would have nothing to roll.
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        std::fs::write(
+            layout.data_dir().join(NIXPKGS_LOCK),
+            format!("nixos-unstable\n{REV}\n"),
+        )
+        .unwrap();
+
+        let app = LockTarget::app(&layout, "demo-app", None).expect("a valid app name");
+        assert_eq!(
+            app.resolve(Path::new(BOGUS_NIX), &layout)
+                .expect("the app seeds from the global lock with no nix"),
+            format!("{NIXPKGS_FLAKE_PREFIX}{REV}")
+        );
+        // Recorded beside that app's state, which is what `sbx app rm --purge` removes.
+        assert_eq!(
+            read_lock(&layout.data_dir().join("apps/demo-app").join(NIXPKGS_LOCK)),
+            Some(("nixos-unstable".to_string(), REV.to_string()))
+        );
+
+        // The global channel moves on (as `sbx upgrade nix` would move it). The app does not: its
+        // own lock answers, and the seed is never consulted again.
+        let rolled = "1111111111111111111111111111111111111111";
+        std::fs::write(
+            layout.data_dir().join(NIXPKGS_LOCK),
+            format!("nixos-unstable\n{rolled}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            app.resolve(Path::new(BOGUS_NIX), &layout).unwrap(),
+            format!("{NIXPKGS_FLAKE_PREFIX}{REV}"),
+            "a global roll must not move an app that has its own lock"
+        );
+        assert_eq!(app.locked_revision().as_deref(), Some(REV));
+    }
+
+    #[test]
+    fn an_app_with_no_lock_anywhere_resolves_fresh_and_so_needs_nix() {
+        // Same floor as the engine's: nothing to seed from means a genuine first resolution, which
+        // needs nix. Proves the seed branch is not silently inventing a revision.
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let app = LockTarget::app(&layout, "demo-app", None).unwrap();
+        assert!(app.resolve(Path::new(BOGUS_NIX), &layout).is_err());
+    }
+
+    #[test]
+    fn an_app_lock_is_refused_for_a_name_that_is_not_one_path_component() {
+        // Defence at the sink: this joins onto sbx's data directory, so a name that traversed would
+        // write a lock outside it. The refusal names the offending value.
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        for bad in ["", ".", "..", "../etc", "a/b", "/abs"] {
+            let err = LockTarget::app(&layout, bad, None)
+                .expect_err("a name that is not a single component must be refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert!(LockTarget::app(&layout, "demo-app", None).is_ok());
+    }
+
+    #[test]
+    fn live_base_revisions_keeps_what_an_app_is_pinned_to() {
+        // A gc that does not read the app locks collects the base an app is frozen on, leaving that
+        // app's home pointing into a store path that is gone — the exact failure a per-app lock is
+        // meant to make rarer, recreated by the lock itself.
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        let d = layout.data_dir();
+        std::fs::create_dir_all(d).unwrap();
+        let app_rev = "2222222222222222222222222222222222222222";
+        let project_rev = "3333333333333333333333333333333333333333";
+        std::fs::write(d.join(NIXPKGS_LOCK), format!("nixos-unstable\n{REV}\n")).unwrap();
+        write_lock(
+            &d.join("apps/demo-app").join(NIXPKGS_LOCK),
+            "nixos-unstable",
+            app_rev,
+        )
+        .unwrap();
+        write_lock(
+            &d.join("projects/abcdef0123456789").join(NIXPKGS_LOCK),
+            "nixos-24.11",
+            project_rev,
+        )
+        .unwrap();
+
+        let live = live_base_revisions(&layout);
+        assert!(live.contains(REV), "the global channel's revision");
+        assert!(live.contains(project_rev), "a project's pin");
+        assert!(live.contains(app_rev), "an app's own pin");
+        assert_eq!(live.len(), 3);
     }
 
     #[test]

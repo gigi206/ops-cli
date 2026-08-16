@@ -40,7 +40,7 @@ fn known_target(s: &str) -> Option<&'static str> {
 /// already one app's own cage; every other target rewrites a project-wide lock host-side and has no
 /// per-app unit to select, so naming one there is a usage error rather than a flag that reads as
 /// "only this app" while rolling the project.
-const APP_SCOPED_TARGETS: &[&str] = &["provision", "mise"];
+const APP_SCOPED_TARGETS: &[&str] = &["provision", "mise", "nix"];
 
 /// The outcome of parsing `sbx upgrade`'s arguments: show help, run with a resolved target, an
 /// optional `--project` path and an optional `--app` selector, or a usage error (already-formatted
@@ -254,7 +254,7 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // the two channels that build through nix, and read once at the close (below).
     let mut moved_store_paths = false;
     if matches!(what, "nix" | "all") {
-        let roll = upgrade_nix_channel(&nix, &layout, &cwd, &cfg, &pal);
+        let roll = upgrade_nix_channel(&nix, &layout, &cwd, &cfg, only, &pal);
         ok &= roll.ok;
         moved_store_paths |= roll.moved;
     }
@@ -324,7 +324,7 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // A roll is what eventually supersedes a build. Point the user at `sbx gc --prune` when the
     // project's store is already holding superseded builds — cheap, filesystem-only, and silent
     // when there is nothing to reclaim (see the function).
-    sandbox::superseded_reclaimable_hint(&layout, &cwd, &cfg, &pal);
+    sandbox::superseded_reclaimable_hint(&layout, &cwd, &cfg, only, &pal);
 
     if ok {
         ExitCode::SUCCESS
@@ -709,7 +709,8 @@ pub(crate) fn app_upgrade_cmd(args: &[OsString]) -> ExitCode {
     if (plan.mise || plan.provision)
         && let Some(layout) = store::Layout::from_env()
     {
-        sandbox::superseded_reclaimable_hint(&layout, &cwd, &cfg, &pal);
+        // This verb is one app by construction, so the hint measures against that app's revision.
+        sandbox::superseded_reclaimable_hint(&layout, &cwd, &cfg, Some(name), &pal);
     }
 
     if ok {
@@ -830,15 +831,30 @@ fn upgrade_nix_channel(
     layout: &store::Layout,
     cwd: &Path,
     cfg: &config::Resolved,
+    only: Option<&str>,
     pal: &style::Palette,
 ) -> Roll {
-    let target = match sandbox::effective_lock_target(cwd, layout, cfg) {
+    let target = match sandbox::effective_lock_target(cwd, layout, cfg, only) {
         Ok(t) => t,
         Err(e) => {
             diag::error(&format!("sbx: cannot resolve the channel target: {e}"));
             return Roll::FAILED;
         }
     };
+    // `--app` asked for one app, and a trusted project pin outranks an app's own lock (the app
+    // builds this project's declared packages too, so it has to be on the pinned revision). The
+    // target that came back is therefore the *project's*, and refreshing it would roll the whole
+    // project under a flag that reads "only this app". Refuse instead, and say where the decision
+    // came from — read off the target, so this can never disagree with what was chosen.
+    if only.is_some() && target.origin() == store::Origin::ProjectPin {
+        diag::error(&format!(
+            "sbx: upgrade: this project pins nixpkgs ({}), and an app inherits that pin — so \
+             there is no app-only revision to roll here. Run `sbx upgrade nix` to roll the pin \
+             for the whole project, or launch the app from a directory that does not pin.",
+            target.source()
+        ));
+        return Roll::FAILED;
+    }
     // Read what was locked BEFORE the roll, and read it across sources. `Upgrade::previous` cannot
     // answer this: it is scoped to the current source, so it reports `None` both for a first-ever
     // pin (nothing to invalidate) and for a changed pin (which repoints the store exactly like a
@@ -1566,6 +1582,17 @@ mod tests {
                 app: Some("demo-app".to_string()),
             }
         );
+        // And the base channel, since an app has its own lock: spelled out rather than derived from
+        // `APP_SCOPED_TARGETS`, so removing `nix` from that list fails here instead of quietly
+        // moving `nix` into the refusing loop below and leaving the suite green.
+        assert_eq!(
+            parse_upgrade_args(&os(&["nix", "--app", "demo-app"])),
+            ParsedArgs::Run {
+                what: "nix",
+                project: None,
+                app: Some("demo-app".to_string()),
+            }
+        );
 
         // Every project-wide target refuses it, and the message says why rather than just "no".
         for t in TARGETS.iter().filter(|t| !APP_SCOPED_TARGETS.contains(t)) {
@@ -2089,6 +2116,60 @@ mod tests {
     }
 
     #[test]
+    fn rolling_one_app_is_refused_where_the_project_pin_would_be_rolled_instead() {
+        // `--app` narrows `nix` because an app has its own lock — but a trusted project pin
+        // outranks that lock, so under a pin the target that comes back is the project's. Rolling
+        // it would do project-wide work under a flag that reads "only this app", so it is refused,
+        // and nothing is written. The condition is read off the resolved target's origin, never
+        // re-derived from the config here, so the refusal cannot disagree with the choice.
+        let data = TmpDir::new();
+        let proj = TmpDir::new();
+        let layout = store::Layout::under(data.path());
+        let mut cfg = crate::testutil::resolved(vec![], vec![]);
+        cfg.nixpkgs_project = Some("f".repeat(40));
+
+        let roll = upgrade_nix_channel(
+            Path::new("/nonexistent-nix"),
+            &layout,
+            proj.path(),
+            &cfg,
+            Some("demo-app"),
+            &style::Palette::plain(),
+        );
+        assert!(!roll.ok, "the roll must refuse rather than run");
+        assert!(!roll.moved);
+        assert!(
+            !layout.data_dir().join("projects").exists(),
+            "a refused roll writes no project lock"
+        );
+        assert!(!layout.data_dir().join("apps").exists());
+
+        // Without a pin the same call is the app's own roll, and it succeeds: a 40-hex source
+        // resolves with no nix, and the revision lands in that app's lock.
+        let mut unpinned = crate::testutil::resolved(vec![], vec![]);
+        unpinned.nixpkgs_global = Some("e".repeat(40));
+        let roll = upgrade_nix_channel(
+            Path::new("/nonexistent-nix"),
+            &layout,
+            proj.path(),
+            &unpinned,
+            Some("demo-app"),
+            &style::Palette::plain(),
+        );
+        assert!(roll.ok);
+        assert!(
+            layout
+                .data_dir()
+                .join("apps/demo-app/nixpkgs.lock")
+                .is_file()
+        );
+        assert!(
+            !layout.data_dir().join("nixpkgs.lock").exists(),
+            "an app roll must not touch the global channel lock"
+        );
+    }
+
+    #[test]
     fn upgrade_mise_and_upgrade_nix_roll_separate_locks() {
         // The decoupling guarantee at the file level: rolling the engine must leave the
         // base channel lock byte-identical, and rolling the base must leave the engine
@@ -2168,7 +2249,7 @@ mod tests {
             &cfg(&rev_a),
             &plain
         ));
-        let seed = upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_a), &plain);
+        let seed = upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_a), None, &plain);
         assert!(seed.ok);
         assert!(
             !seed.moved,
@@ -2204,7 +2285,8 @@ mod tests {
             &plain
         ));
         let engine_reseed = std::fs::read(&engine_lock).unwrap();
-        let rolled = upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_b), &plain);
+        let rolled =
+            upgrade_nix_channel(bogus_nix, &layout, data.path(), &cfg(&rev_b), None, &plain);
         assert!(rolled.ok);
         assert!(
             rolled.moved,

@@ -21,7 +21,7 @@ advance **only here**, never on an `sbx` binary update.
 
 | Flag | Effect |
 |---|---|
-| `-a, --app <name>` | narrow `mise` or `provision` to one app's cage |
+| `-a, --app <name>` | narrow `nix`, `mise` or `provision` to one app |
 | `--project <path>` | roll another project instead of the current directory |
 
 This page is organised by **channel**, which is the right shape when you know which one
@@ -86,21 +86,45 @@ misconfiguration: mise's `aqua:` backend reads the GitHub API, whose anonymous c
 
 ### Rolling one app
 
-`-a, --app <name>` narrows a roll to a single app's cage:
+`-a, --app <name>` narrows a roll to a single app:
 
 ```
 sbx upgrade provision --app trae
 sbx upgrade mise --app openfox
+sbx upgrade nix --app openfox
 ```
 
-It applies to the two **in-cage** rolls only, `provision` and `mise`, because those are
-the ones whose unit of work is already one app's own cage. Every other target rewrites a
-project-wide lock host-side, where there is no per-app unit to select, so naming an app
-there is a usage error rather than a flag that quietly rolls the whole project.
+It applies to the two **in-cage** rolls, `provision` and `mise`, whose unit of work is
+already one app's own cage; and to `nix`, because an app resolves the base channel
+against a lock of its own. The remaining targets rewrite a project-wide lock host-side,
+where there is no per-app unit to select, so naming an app there is a usage error rather
+than a flag that quietly rolls the whole project.
 
 Under `--app`, `mise` rolls that app's `mise:` packages and nothing else: not the engine,
 not the project's `nix:` tools, not the project baseline. All three are project-wide, and
 rolling them would make a per-app flag do project-wide work.
+
+### An app's base channel
+
+An app does not follow the global nixpkgs channel. Its base userland and its `nix:`
+packages resolve against a lock of the app's own, so:
+
+- `sbx upgrade nix` rolls the channel for the project and leaves every app where it is.
+- `sbx upgrade nix --app <name>` rolls that one app, and nothing else.
+
+The first time an app runs, its lock is seeded from the global channel's, so an app that
+existed before this and an app created today both start where the base already is.
+Nothing moves it afterwards but a roll naming it.
+
+`sbx upgrade nix --app <name>` is refused in a project that **pins** `nixpkgs`. A pin
+outranks an app's own lock, because an app launch also builds the project's declared
+packages and those must come from the pinned revision. There is no app-only revision to
+roll there, and rolling the pin under a per-app flag would be project-wide work. Run
+`sbx upgrade nix` to roll the pin for the whole project, or launch the app from a
+directory that does not pin.
+
+`sbx config show --app <name>` prints the revision that app is on, which is how you see
+whether it has drifted from the project's.
 
 An app name that selects no work is refused, with which of the three ways it selected
 none: no app carries that name, the app declares no command so it never launches, or it

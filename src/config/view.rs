@@ -906,14 +906,16 @@ pub(crate) struct AppDetailView {
     /// The packages this app declares (its own), and the count it inherits from the baseline.
     pub(crate) packages: Vec<PackageView>,
     pub(crate) packages_inherited: usize,
-    /// The nixpkgs channel this app's launch resolves against — the same decision the baseline view
-    /// reports, carried here because it is what the app's `nix:` packages and its base userland are
-    /// built from, and nothing else in this view names it.
+    /// The nixpkgs channel this app's launch resolves against — the same decision the launch makes
+    /// (`sandbox::app` → `prepare_with` → `effective_lock_target`), carried here because it is what
+    /// the app's `nix:` packages and its base userland are built from, and nothing else in this
+    /// view names it.
     ///
-    /// It is a property of the **directory**, not of the app: the launch reads it from the current
-    /// directory (`sandbox::app` → `prepare_with` → `effective_lock_target`), so the same app run
-    /// from a project with a trusted `nixpkgs` pin resolves against that pin and run from anywhere
-    /// else against the global channel. Showing it is what makes that visible where someone asks
+    /// The **source** is still read from the current directory: a trusted `nixpkgs` pin in the
+    /// project the app is launched from wins, because an app launch also builds that project's
+    /// declared packages and they must come from the pinned revision. Absent a pin, the app has its
+    /// own lock, so what shows here is the revision *this app* is on rather than wherever the
+    /// global channel has since rolled. Showing it is what makes both visible where someone asks
     /// what the app will run with.
     pub(crate) nixpkgs: ChannelView,
     /// The credentials this app injects (its own), and the count it inherits from the baseline.
@@ -1023,7 +1025,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         .map(|m| tools_view(m, &resolved))
         .unwrap_or_default();
 
-    let nixpkgs = nixpkgs_channel(cwd, &resolved);
+    let nixpkgs = nixpkgs_channel(cwd, &resolved, None);
     let engine = engine_channel(&resolved);
     let network = network_view(&resolved.network);
     let gui = match resolved.gui {
@@ -1252,11 +1254,13 @@ fn tools_view(m: &super::MiseConfig, resolved: &Resolved) -> ToolsView {
 }
 
 /// The nixpkgs channel view, routed through the launch's own channel decision so it reports
-/// exactly the lock a launch would consult. Best-effort: if the data dir or project identity
-/// cannot be resolved, it falls back to the source and origin alone.
-fn nixpkgs_channel(cwd: &Path, resolved: &Resolved) -> ChannelView {
+/// exactly the lock a launch would consult. `app` is the app being viewed, when one is — an app
+/// resolves against its own lock, so a view that passed `None` here would report a revision that
+/// app is not on. Best-effort: if the data dir or project identity cannot be resolved, it falls
+/// back to the source and origin alone.
+fn nixpkgs_channel(cwd: &Path, resolved: &Resolved, app: Option<&str>) -> ChannelView {
     if let Some(layout) = store::Layout::from_env()
-        && let Ok(target) = sandbox::effective_lock_target(cwd, &layout, resolved)
+        && let Ok(target) = sandbox::effective_lock_target(cwd, &layout, resolved, app)
     {
         return ChannelView {
             source: target.source().to_string(),
@@ -1757,8 +1761,9 @@ fn app_detail_view(
             .collect(),
         packages_inherited,
         // The same call the baseline view makes, on the same directory and the same resolved
-        // config, so the two views can never report different channels for one launch.
-        nixpkgs: nixpkgs_channel(cwd, baseline),
+        // config — plus this app's name, which is what routes it to the app's own lock. Passing
+        // `None` here would report the project's revision for an app that is on its own.
+        nixpkgs: nixpkgs_channel(cwd, baseline, Some(name)),
         secrets: if secrets_dropped {
             Vec::new()
         } else {

@@ -723,12 +723,18 @@ fn pool_holds_a_tool(pool: &Path) -> bool {
 
 /// Enumerate the apps with isolated state on disk, grouped and sized by name. Scans the global homes
 /// under `<data>/apps/` and the per-project trees under `<data>/projects/<id>/apps/`, sizing each
-/// with [`tree_size`] and classifying a per-project tree as a home when it carries a `home/` dir
-/// (the same test [`app_home_dirs`] applies), else as a mise pool — counted only when the pool holds
-/// an installed tool ([`pool_holds_a_tool`]). Sorted by name. Read-only; a missing tree is simply no
-/// state. Sizing is a recursive stat, so a very large mise data dir makes this proportionally slower
-/// — acceptable for an interactive management listing, where the size is the point (it drives the
-/// purge decision).
+/// with [`tree_size`] and classifying a tree as a home when it carries a `home/` dir (the same test
+/// [`app_home_dirs`] applies), else — under a project — as a mise pool, counted only when the pool
+/// holds an installed tool ([`pool_holds_a_tool`]). Sorted by name. Read-only; a missing tree is
+/// simply no state. Sizing is a recursive stat, so a very large mise data dir makes this
+/// proportionally slower — acceptable for an interactive management listing, where the size is the
+/// point (it drives the purge decision).
+///
+/// The `home/` test applies to the global tree for the same reason it applies to a per-project one:
+/// `<data>/apps/<name>/` holds more than a home (the synthetic `/etc`, the app's channel lock), so
+/// its mere existence does not mean the app has installed anything. An app that has only ever had
+/// its revision pinned would otherwise be listed as carrying isolated state, and its size offered
+/// as disk a purge would reclaim.
 ///
 /// [`app_home_dirs`]: super::inspect::app_home_dirs
 pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
@@ -736,10 +742,13 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
     // name -> (global_bytes, project_homes, project_pools, project_bytes)
     let mut apps: BTreeMap<String, (Option<u64>, usize, usize, u64)> = BTreeMap::new();
 
-    // Global homes: <data>/apps/<name>/
+    // Global homes: <data>/apps/<name>/, when it actually carries one.
     if let Ok(entries) = std::fs::read_dir(data_dir.join("apps")) {
         for entry in entries.flatten() {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if !entry.path().join("home").is_dir() {
                 continue;
             }
             if let Some(name) = entry.file_name().to_str() {
@@ -2232,6 +2241,30 @@ mod tests {
         assert_eq!(demo_app.project_pools, 1);
         // both per-project trees are sized: a purge reclaims the pool too
         assert!(demo_app.project_bytes > 0);
+    }
+
+    #[test]
+    fn installed_app_homes_does_not_list_an_app_that_only_has_a_channel_lock() {
+        // `<data>/apps/<name>/` holds more than a home: the synthetic `/etc`, and the app's own
+        // `nixpkgs.lock`. A per-project app that never had a global home still gets that lock the
+        // first time it launches, so counting any directory here would report isolated state the
+        // app does not have — and offer its size as disk a purge would free.
+        let data = TmpDir::new();
+        let d = data.path();
+        std::fs::create_dir_all(d.join("apps/pinned-only")).unwrap();
+        std::fs::write(
+            d.join("apps/pinned-only/nixpkgs.lock"),
+            "nixos-unstable\nx\n",
+        )
+        .unwrap();
+        // An app that does carry a home is listed, so this is not "the listing went blind".
+        mk_home(&d.join("apps/demo-app/home"));
+
+        let apps = installed_app_homes(d);
+        assert_eq!(
+            apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["demo-app"]
+        );
     }
 
     /// Every launch creates the per-project pool dir (the writable bind needs an existing source),
