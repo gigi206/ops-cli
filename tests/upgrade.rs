@@ -1,5 +1,8 @@
 //! Integration tests for `sbx upgrade`, exercising the built binary end to end.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -152,7 +155,7 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
         String::from_utf8_lossy(&first.stdout)
     );
     if !first.status.success() || log.contains("re-resolve failed") {
-        eprintln!("skipping flake upgrade resolution: {log}");
+        skip_incapable!("skipping flake upgrade resolution: {log}");
         return;
     }
     assert!(
@@ -224,7 +227,7 @@ fn upgrade_resolves_and_locks_the_default_channel() {
 
     let first = run();
     if !first.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping upgrade resolution: {}",
             String::from_utf8_lossy(&first.stderr)
         );

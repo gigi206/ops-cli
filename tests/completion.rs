@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[macro_use]
 mod common;
 use common::{sbx, stdout_of, walk};
 
@@ -180,7 +181,7 @@ fn an_unsupported_shell_is_refused_by_name() {
 #[test]
 fn the_bash_script_parses_and_completes() {
     if !shell_available("bash") {
-        eprintln!("skipping bash completion drive: bash is not installed");
+        skip_incapable!("skipping bash completion drive: bash is not installed");
         return;
     }
     let script = stdout_of(&sbx(&["completion", "bash"]));
@@ -237,7 +238,7 @@ fn the_bash_script_parses_and_completes() {
 #[test]
 fn a_path_position_completes_files_in_a_real_bash() {
     if !shell_available("bash") {
-        eprintln!("skipping the bash file-completion drive: bash is not installed");
+        skip_incapable!("skipping the bash file-completion drive: bash is not installed");
         return;
     }
     let dir = scratch("bash-files");
@@ -287,7 +288,7 @@ fn a_path_position_completes_files_in_a_real_bash() {
 #[test]
 fn a_path_position_reaches_zshs_own_file_completion() {
     if !shell_available("zsh") {
-        eprintln!("skipping the zsh file-completion drive: zsh is not installed");
+        skip_incapable!("skipping the zsh file-completion drive: zsh is not installed");
         return;
     }
     let dir = scratch("zsh-files");
@@ -340,7 +341,7 @@ fn a_path_position_reaches_zshs_own_file_completion() {
 #[test]
 fn the_zsh_script_parses_and_registers_itself() {
     if !shell_available("zsh") {
-        eprintln!("skipping zsh completion check: zsh is not installed");
+        skip_incapable!("skipping zsh completion check: zsh is not installed");
         return;
     }
     let script = stdout_of(&sbx(&["completion", "zsh"]));
@@ -431,7 +432,7 @@ fn the_completion_tree_and_the_help_tree_are_the_same_tree() {
 #[test]
 fn every_command_path_completes_in_a_real_bash() {
     if !shell_available("bash") {
-        eprintln!("skipping the bash sweep: bash is not installed");
+        skip_incapable!("skipping the bash sweep: bash is not installed");
         return;
     }
     let dir = scratch("bash-sweep");
@@ -490,7 +491,7 @@ fn every_command_path_completes_in_a_real_bash() {
 #[test]
 fn every_command_path_completes_in_a_real_zsh() {
     if !shell_available("zsh") {
-        eprintln!("skipping the zsh sweep: zsh is not installed");
+        skip_incapable!("skipping the zsh sweep: zsh is not installed");
         return;
     }
     let dir = scratch("zsh-sweep");

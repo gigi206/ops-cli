@@ -29,6 +29,7 @@
 ///
 /// Not called directly: [`skip_incapable!`] and [`skip_unreachable!`] are the two spellings, and
 /// which one a site uses is the whole point — it says whether a capable host could have run it.
+#[allow(unused_macros)]
 macro_rules! __skip_note {
     ($enforced:expr, $($arg:tt)*) => {{
         let reason = format!($($arg)*);
@@ -56,6 +57,7 @@ macro_rules! __skip_note {
 ///
 /// Formats like `eprintln!`. Does not return: the caller keeps its own `return`, so reading the
 /// site still shows where the test stops.
+#[allow(unused_macros)]
 macro_rules! skip_incapable {
     ($($arg:tt)*) => { __skip_note!(true, $($arg)*) };
 }
@@ -64,6 +66,7 @@ macro_rules! skip_incapable {
 /// never enforced — no setting on this machine makes a remote dependable.
 ///
 /// Formats like `eprintln!`. Does not return: the caller keeps its own `return`.
+#[allow(unused_macros)]
 macro_rules! skip_unreachable {
     ($($arg:tt)*) => { __skip_note!(false, $($arg)*) };
 }

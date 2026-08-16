@@ -9,6 +9,9 @@
 //! job control" warning therefore proves job control survives that whole chain —
 //! the load-bearing concern for putting the cage inside a transient scope.
 
+#[macro_use]
+mod common;
+
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -102,7 +105,7 @@ fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal()
     std::fs::write(project.path().join("MARKER"), b"x").unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!(
+        skip_incapable!(
             "skipping interactive sbx run smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -198,7 +201,7 @@ fn an_interactive_observed_run_records_events_for_proc_logs() {
     let project = TmpDir::new("obs-proj");
     let data = TmpDir::new("obs-data");
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!(
+        skip_incapable!(
             "skipping interactive-observe smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -320,7 +323,7 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx app resize smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;

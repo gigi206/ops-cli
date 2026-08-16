@@ -1,5 +1,8 @@
 //! Integration tests for `sbx doctor`, exercising the built binary end to end.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -138,7 +141,7 @@ fn doctor_proves_the_boundary_by_a_real_launch_where_supported() {
         .expect("spawn sbx run")
         .success();
     if !can_sandbox {
-        eprintln!(
+        skip_incapable!(
             "skipping doctor launch-proof: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -178,7 +181,7 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
         .expect("spawn sbx run")
         .success();
     if !can_sandbox {
-        eprintln!(
+        skip_incapable!(
             "skipping bubblewrap-fault attribution: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;

@@ -4,6 +4,11 @@
 # integration e2e that need userns + nix + network are skipped on a hosted
 # runner; here they are simply not selected unless their source file changed.
 #
+# And what *is* selected does not all run: a test whose prerequisites are absent
+# returns early, which `cargo test` counts as a pass. The last step reports how
+# many did that, so this workflow's green check states its own blind spot instead
+# of implying the sandbox was exercised.
+#
 # Test selection is change-driven:
 #   - a core change (Cargo.toml/Cargo.lock/build.rs/src/**)  -> full suite
 #   - only tests/*.rs changed                               -> those files
@@ -60,8 +65,16 @@ jobs:
 
       - name: Select and run tests for the changed files
         shell: bash
+        env:
+          # A hosted runner has no userns, no bwrap and no nix, so every test that needs a cage
+          # returns early -- and `cargo test` counts an early return as a pass. Without this the
+          # green check below says nothing about whether the sandbox was ever exercised. Each skip
+          # appends one line here, and the summary step reports the total.
+          SBX_SKIP_LOG: ${{ github.workspace }}/target/test-skips.log
         run: |
           set -euo pipefail
+          mkdir -p "$(dirname "$SBX_SKIP_LOG")"
+          : > "$SBX_SKIP_LOG"
 
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git fetch origin "${{ github.base_ref }}" --depth=1
@@ -111,4 +124,18 @@ jobs:
                 cargo test --test "$t"
               done
             fi
+          fi
+
+      - name: Report the tests that reported ok without running
+        if: always()
+        shell: bash
+        env:
+          SBX_SKIP_LOG: ${{ github.workspace }}/target/test-skips.log
+        run: |
+          set -uo pipefail
+          n=0
+          [ -f "$SBX_SKIP_LOG" ] && n=$(wc -l < "$SBX_SKIP_LOG" | tr -d ' ')
+          echo "::notice::$n test(s) reported ok without running: this runner has no userns, no bwrap and no nix, so anything needing a cage skips. A green check here does not mean the sandbox was exercised."
+          if [ "$n" -gt 0 ]; then
+            sort "$SBX_SKIP_LOG" | uniq -c | sort -rn | head -40
           fi

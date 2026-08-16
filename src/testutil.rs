@@ -319,3 +319,66 @@ mod skip_macro_tests {
         assert!(read().ends_with("skipping e: the registry is down\n"));
     }
 }
+
+/// No test may give up in silence: a skip has to go through the macros, never through a bare
+/// print.
+///
+/// A hand-written `eprintln!` plus `return` is what the harness counts as a pass and what it then
+/// swallows, so a suite can report green for work it never did. The macros make that skip a
+/// recorded event and, for a host capability, an enforceable one. This sweep is what keeps the
+/// next one from being written by hand again.
+///
+/// What it cannot catch, and the limit is real: a test that returns early with **no message at
+/// all** is invisible to any grep. This guards the shape that exists, not the shape nobody has
+/// written yet.
+#[test]
+fn no_test_gives_up_through_a_bare_print() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Built at runtime, so this file does not match its own needle.
+    let needles: Vec<String> = ["eprintln!", "println!"]
+        .iter()
+        .map(|m| format!("{m}(\"skipping"))
+        .collect();
+    let mut offenders = Vec::new();
+    let mut macro_uses = 0;
+    let mut files = 0;
+    let mut stack = vec![root.join("src"), root.join("tests")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("read a source directory")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read a source file");
+            files += 1;
+            macro_uses += text.matches("skip_incapable!(").count();
+            macro_uses += text.matches("skip_unreachable!(").count();
+            for (n, line) in text.lines().enumerate() {
+                if needles.iter().any(|needle| line.contains(needle.as_str())) {
+                    let rel = path.strip_prefix(root).unwrap_or(&path).display();
+                    offenders.push(format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these tests skip through a bare print, so the harness counts them passed and hides the \
+         message: {offenders:?} — use `skip_incapable!` (the host lacks something) or \
+         `skip_unreachable!` (a remote does), from `src/testskip.rs`"
+    );
+    // The preconditions, asserted rather than assumed: a sweep that read nothing, or a tree that
+    // stopped skipping altogether, would pass while guarding nothing.
+    assert!(files > 100, "the sweep read only {files} source files");
+    assert!(
+        macro_uses > 100,
+        "only {macro_uses} skip macro uses — has the sweep gone stale?"
+    );
+}

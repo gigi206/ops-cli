@@ -4,6 +4,9 @@
 //! (`logs`). The pure error paths run against an isolated (empty) data directory (no sandbox); the
 //! cage-backed ones skip where the host cannot sandbox.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -290,7 +293,7 @@ fn detached_observe_records_exec_events_for_proc_logs() {
     // sandbox.
     let (project, data) = (TmpDir::new(), TmpDir::new());
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping detached --observe e2e: host cannot sandbox");
+        skip_incapable!("skipping detached --observe e2e: host cannot sandbox");
         return;
     }
 
@@ -352,7 +355,7 @@ fn proc_ls_shows_a_real_cage_process_tree() {
     // `sleep` is a real failure of the walk, not a skip.
     let (project, data) = (TmpDir::new(), TmpDir::new());
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!(
+        skip_incapable!(
             "skipping proc-ls cage e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -408,7 +411,7 @@ fn run_observe_streams_exec_events() {
     // path, not the pty one. Skipped, not failed, where the host cannot sandbox.
     let (project, data) = (TmpDir::new(), TmpDir::new());
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping run --observe e2e: host cannot sandbox");
+        skip_incapable!("skipping run --observe e2e: host cannot sandbox");
         return;
     }
 
@@ -460,7 +463,7 @@ fn enforce_blocks_a_denied_binary_in_a_real_cage() {
     )
     .unwrap();
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping proc enforce e2e: host cannot sandbox");
+        skip_incapable!("skipping proc enforce e2e: host cannot sandbox");
         return;
     }
 
@@ -529,7 +532,7 @@ fn an_override_config_proc_enforces_without_trusting_the_project() {
     // Skipped, not failed, where the host cannot sandbox.
     let (project, data) = (TmpDir::new(), TmpDir::new());
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping override-proc enforce e2e: host cannot sandbox");
+        skip_incapable!("skipping override-proc enforce e2e: host cannot sandbox");
         return;
     }
 
@@ -590,7 +593,7 @@ fn a_typed_proc_off_override_disables_a_trusted_projects_enforcement() {
     )
     .unwrap();
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping typed-proc-off e2e: host cannot sandbox");
+        skip_incapable!("skipping typed-proc-off e2e: host cannot sandbox");
         return;
     }
     let trusted = sbx_isolated()
@@ -650,7 +653,7 @@ fn app_run_observe_streams_exec_events() {
     )
     .unwrap();
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping app run --observe e2e: host cannot sandbox");
+        skip_incapable!("skipping app run --observe e2e: host cannot sandbox");
         return;
     }
 
@@ -972,7 +975,7 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
     )
     .unwrap();
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping proc --session e2e: host cannot sandbox");
+        skip_incapable!("skipping proc --session e2e: host cannot sandbox");
         return;
     }
     let trusted = sbx_isolated()

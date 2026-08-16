@@ -6,6 +6,9 @@
 //! in the same env". The shared-env test is skipped, not failed, where the host
 //! cannot sandbox.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -131,7 +134,7 @@ fn a_second_sandbox_shares_the_projects_persistent_home() {
 
     // Skip where the host cannot sandbox (this first run also warms the userland).
     if !run(&["run", "--", "true"], project.path(), data.path()).0 {
-        eprintln!(
+        skip_incapable!(
             "skipping shared-home smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;

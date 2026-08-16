@@ -9,6 +9,9 @@
 //! (the default posture, where the daemon becomes bubblewrap). Skipped, not failed, where the host
 //! cannot sandbox.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -218,7 +221,7 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx detach e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;

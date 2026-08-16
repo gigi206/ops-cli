@@ -2,6 +2,9 @@
 //! global+project layering and the trust gate, against redirected config/state
 //! dirs and a temp project as the working directory.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1294,7 +1297,7 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
         .unwrap_or(false);
     let target = Path::new("/etc/hostname");
     if !can_sandbox || !target.exists() {
-        eprintln!("skipping launch gate test: host cannot sandbox or /etc/hostname absent");
+        skip_incapable!("skipping launch gate test: host cannot sandbox or /etc/hostname absent");
         return;
     }
 
@@ -1373,7 +1376,7 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!(
+        skip_incapable!(
             "skipping package PATH test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -1420,7 +1423,7 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!(
+        skip_incapable!(
             "skipping unrealisable-package test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -1521,7 +1524,7 @@ fn upgrade_in_a_trusted_pinned_project_rolls_the_per_project_lock() {
 
     let out = fx.run(&["upgrade", "nix"]);
     if !out.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping pinned upgrade: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -1556,7 +1559,7 @@ fn upgrade_with_an_untrusted_pin_falls_back_to_the_global_lock() {
 
     let out = fx.run(&["upgrade", "nix"]);
     if !out.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping untrusted-pin upgrade: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -1616,7 +1619,7 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !can_sandbox {
-        eprintln!(
+        skip_incapable!(
             "skipping cross-channel pin test: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -2048,7 +2051,7 @@ fn git_in(dir: &Path, args: &[&str]) {
 #[test]
 fn publish_then_add_and_install_through_a_real_clone() {
     if !git_available() {
-        eprintln!("skipping publish e2e: git is not available");
+        skip_incapable!("skipping publish e2e: git is not available");
         return;
     }
     let fx = Fixture::new();

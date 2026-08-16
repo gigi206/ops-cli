@@ -6,6 +6,9 @@
 //! tests cannot: they check only the byte layout of the messages, never that the kernel accepts
 //! them and produces the expected namespace state.
 
+#[macro_use]
+mod common;
+
 use std::process::Command;
 
 /// Run the holder with a shell checker that dumps the two per-netns proc files, returning
@@ -25,7 +28,7 @@ fn holder_dump() -> Option<(String, String)> {
         .expect("spawn sbx __netns-holder");
 
     if !out.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping netns holder e2e: the holder did not run ({})",
             String::from_utf8_lossy(&out.stderr).trim()
         );
@@ -53,7 +56,9 @@ fn the_holder_configures_a_black_hole_dummy_via_rtnetlink() {
         .lines()
         .any(|l| l.split(':').next().is_some_and(|n| n.trim() == "dummy0"));
     if !dummy0_present {
-        eprintln!("skipping netns holder e2e: dummy0 absent (dummy kernel module unavailable?)");
+        skip_incapable!(
+            "skipping netns holder e2e: dummy0 absent (dummy kernel module unavailable?)"
+        );
         return;
     }
 

@@ -11,6 +11,12 @@
 //! about the crate itself.
 #![allow(dead_code)]
 
+// The skip macros, included rather than linked: an integration test is its own crate and cannot see
+// into the binary's `testskip` module, so both halves of the suite compile the same text. One
+// definition -- a second copy would drift, and a skip counted by one half and not the other is
+// worse than no count at all. Reach them with `#[macro_use] mod common;`.
+include!("../../src/testskip.rs");
+
 use std::process::{Command, Output};
 
 /// Run the binary under test with `args`.

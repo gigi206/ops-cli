@@ -110,6 +110,14 @@ mise run test    # cargo test (the heavy sandbox e2e skip without userns/nix/net
 mise run ci      # all of the above
 ```
 
+A test whose prerequisites are absent returns early, and `cargo test` counts that as a
+pass — so `mise run test` ends by naming how many of its green tests did nothing, and
+why. On a host that is supposed to have userns, bwrap and nix, make it prove it:
+
+```sh
+SBX_REQUIRE_CAPABLE=1 mise run test   # a missing host capability fails instead of skipping
+```
+
 ## License
 
 See [LICENSE](LICENSE).

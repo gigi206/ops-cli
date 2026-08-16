@@ -3,6 +3,9 @@
 //! control socket. The pure error paths run against an isolated (empty) data directory (no sandbox);
 //! the cage-backed one skips where the host cannot sandbox.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -223,7 +226,7 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
     // where the host cannot sandbox.
     let (project, data) = (TmpDir::new(), TmpDir::new());
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!("skipping detached fs --observe e2e: host cannot sandbox");
+        skip_incapable!("skipping detached fs --observe e2e: host cannot sandbox");
         return;
     }
 

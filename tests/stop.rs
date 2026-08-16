@@ -7,6 +7,9 @@
 //! (default posture, registered pid == bubblewrap) is trivially correct and covered by the unit
 //! tests of the stop primitive. Skipped, not failed, where the host cannot sandbox.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -330,7 +333,7 @@ fn stop_tears_down_a_supervised_app_session() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx stop supervised e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -368,7 +371,7 @@ fn stop_tears_down_a_supervised_app_session() {
     let pid = agent.0.id();
 
     if wait_for_session(data.path(), pid, Instant::now() + Duration::from_secs(60)).is_none() {
-        eprintln!("skipping sbx stop supervised e2e: the app session never registered");
+        skip_incapable!("skipping sbx stop supervised e2e: the app session never registered");
         return;
     }
 
@@ -383,7 +386,7 @@ fn stop_tears_down_a_supervised_app_session() {
     if !wait_until(Instant::now() + Duration::from_secs(30), || {
         process_with_arg("31337")
     }) {
-        eprintln!("skipping sbx stop supervised e2e: the cage's sleep never started");
+        skip_incapable!("skipping sbx stop supervised e2e: the cage's sleep never started");
         return;
     }
 
@@ -444,7 +447,7 @@ fn stop_all_stops_every_session() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx stop --all e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;

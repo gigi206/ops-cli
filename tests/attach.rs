@@ -5,6 +5,9 @@
 //! agent" really means the same environment it works in. Driven through a pty (attach, like
 //! `shell`, needs a controlling terminal). Skipped, not failed, where the host cannot sandbox.
 
+#[macro_use]
+mod common;
+
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -224,7 +227,7 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     .unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx attach app e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
         );
         return;
@@ -249,7 +252,7 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     if record.is_none() {
         let _ = agent.kill();
         let _ = agent.wait();
-        eprintln!(
+        skip_incapable!(
             "skipping sbx attach app e2e: the app session never registered (cannot sandbox?)"
         );
         return;

@@ -3,6 +3,9 @@
 //! (which spawn rather than exec) cannot cover. The sandbox cases skip, rather
 //! than fail, where the host cannot create a sandbox.
 
+#[macro_use]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -192,7 +195,7 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
     // capability probe: a capable host runs `true` to success; otherwise skip.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx run smoke: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -269,14 +272,14 @@ fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
     // sandbox, or if the cache is unreachable for the seed.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping localhost-resolve e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping localhost-resolve e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping localhost-resolve e2e: the binary cache is unreachable");
         return;
     }
 
@@ -392,7 +395,7 @@ fn a_one_shot_override_beats_an_app_overlay_through_the_real_dispatch() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping override-vs-app e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -435,7 +438,7 @@ fn a_one_shot_env_override_reaches_the_cage_and_the_cli_beats_the_environment() 
     // capability probe
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping override e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -508,7 +511,7 @@ fn a_cage_environment_value_is_never_substituted_from_the_host() {
     // capability probe
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping substitution e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -576,7 +579,7 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping rw-bind e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -728,7 +731,7 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // capability probe (also seeds the base store and exercises the pin path); skip if incapable.
     let probe = run("true");
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping control-plane pin e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -807,7 +810,7 @@ fn sbx_app_launches_the_apps_command_with_its_overlay() {
     // capability probe via `sbx run -- true`; skip (not fail) if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx app e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -911,7 +914,7 @@ fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell()
     // capability probe via `sbx run -- true`; skip (not fail) if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping app-home e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -971,7 +974,7 @@ fn an_imported_profile_launches_trusted_by_location() {
     // capability probe via `sbx run -- true`; skip (not fail) if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping imported-profile e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -1031,7 +1034,7 @@ fn a_trusted_mise_env_reaches_the_sandbox_only_once_trusted() {
         &["run", "--", "true"],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping mise env e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -1216,18 +1219,18 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
     write_config("demo-signs");
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping signer e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping signer e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping signer e2e: the binary cache is unreachable");
         return;
     }
     if !postman_echo_reachable() {
-        eprintln!("skipping signer e2e: postman-echo.com is unreachable");
+        skip_incapable!("skipping signer e2e: postman-echo.com is unreachable");
         return;
     }
 
@@ -1581,14 +1584,14 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping h2 signer refusal e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping h2 signer refusal e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping h2 signer refusal e2e: the binary cache is unreachable");
         return;
     }
 
@@ -1726,18 +1729,18 @@ fn a_signer_that_asked_for_a_body_digest_is_told_it_and_the_body_still_arrives()
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping body digest e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping body digest e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping body digest e2e: the binary cache is unreachable");
         return;
     }
     if !postman_echo_reachable() {
-        eprintln!("skipping body digest e2e: postman-echo.com is unreachable");
+        skip_incapable!("skipping body digest e2e: postman-echo.com is unreachable");
         return;
     }
 
@@ -1877,7 +1880,7 @@ fn a_launch_execs_into_the_cage_unless_something_host_side_must_outlive_it() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping supervision e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -1994,18 +1997,18 @@ fn a_gui_wayland_launch_connects_to_the_host_compositor() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping gui e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if wayland_socket().is_none() {
-        eprintln!("skipping gui e2e: no Wayland compositor on the host");
+        skip_incapable!("skipping gui e2e: no Wayland compositor on the host");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping gui e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping gui e2e: the binary cache is unreachable");
         return;
     }
 
@@ -2066,7 +2069,7 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
     .unwrap();
     let probe = run_in(gui.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!("skipping netns-dummy e2e: host cannot sandbox");
+        skip_incapable!("skipping netns-dummy e2e: host cannot sandbox");
         return;
     }
     let t = sbx_in(
@@ -2088,7 +2091,9 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
     );
     let ifaces = String::from_utf8_lossy(&out.stdout).into_owned();
     if !ifaces.contains("dummy0") {
-        eprintln!("skipping netns-dummy e2e: dummy interface unavailable on this host:\n{ifaces}");
+        skip_incapable!(
+            "skipping netns-dummy e2e: dummy interface unavailable on this host:\n{ifaces}"
+        );
         return;
     }
 
@@ -2138,11 +2143,11 @@ fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!("skipping dummy-egress e2e: host cannot sandbox");
+        skip_incapable!("skipping dummy-egress e2e: host cannot sandbox");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping dummy-egress e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping dummy-egress e2e: the binary cache is unreachable");
         return;
     }
     let trusted = sbx_in(
@@ -2165,7 +2170,7 @@ fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
         &["run", "--", "sh", "-c", "cat /proc/net/dev"],
     );
     if !String::from_utf8_lossy(&ifaces.stdout).contains("dummy0") {
-        eprintln!("skipping dummy-egress e2e: dummy interface unavailable on this host");
+        skip_incapable!("skipping dummy-egress e2e: dummy interface unavailable on this host");
         return;
     }
 
@@ -2242,7 +2247,7 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping gui-fonts e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -2251,7 +2256,7 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
     // The fonts and fontconfig are fetched host-side on the first launch, so the cache must be
     // reachable. No compositor is needed: this exercises the font layer, not the display socket.
     if !cache_reachable() {
-        eprintln!("skipping gui-fonts e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping gui-fonts e2e: the binary cache is unreachable");
         return;
     }
 
@@ -2352,14 +2357,14 @@ fn an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping gui-offscreen e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping gui-offscreen e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping gui-offscreen e2e: the binary cache is unreachable");
         return;
     }
 
@@ -2466,18 +2471,18 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping in-cage dbus e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if wayland_socket().is_none() {
-        eprintln!("skipping in-cage dbus e2e: no Wayland compositor on the host");
+        skip_incapable!("skipping in-cage dbus e2e: no Wayland compositor on the host");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping in-cage dbus e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping in-cage dbus e2e: the binary cache is unreachable");
         return;
     }
 
@@ -2556,23 +2561,23 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping in-cage relay e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if wayland_socket().is_none() {
-        eprintln!("skipping in-cage relay e2e: no Wayland compositor on the host");
+        skip_incapable!("skipping in-cage relay e2e: no Wayland compositor on the host");
         return;
     }
     // The relay bridges to the host session bus; without one it cannot attach.
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        eprintln!("skipping in-cage relay e2e: no host D-Bus session bus");
+        skip_incapable!("skipping in-cage relay e2e: no host D-Bus session bus");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping in-cage relay e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping in-cage relay e2e: the binary cache is unreachable");
         return;
     }
 
@@ -2673,18 +2678,18 @@ fn a_keyfile_rewrite_makes_the_in_cage_portal_re_emit_setting_changed() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping in-cage theme e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if wayland_socket().is_none() {
-        eprintln!("skipping in-cage theme e2e: no Wayland compositor on the host");
+        skip_incapable!("skipping in-cage theme e2e: no Wayland compositor on the host");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping in-cage theme e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping in-cage theme e2e: the binary cache is unreachable");
         return;
     }
 
@@ -2781,14 +2786,14 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping catrust e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping catrust e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping catrust e2e: the binary cache is unreachable");
         return;
     }
 
@@ -2868,7 +2873,7 @@ fn a_trailing_argument_reaches_a_shell_profile_without_being_eaten_as_argv0() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping argv0 e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -2936,7 +2941,7 @@ fn a_cage_carries_the_zone_database_and_the_config_moves_its_clock() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping timezone e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -3065,14 +3070,14 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     // a real fault rather than a cold cage.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping egress e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping egress e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping egress e2e: the binary cache is unreachable");
         return;
     }
 
@@ -3220,14 +3225,14 @@ fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
     // capability probe (untrusted → shared net): seeds the project store and skips a cage-less host.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping http2 e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping http2 e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping http2 e2e: the binary cache is unreachable");
         return;
     }
 
@@ -3328,14 +3333,14 @@ fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping http2 secret e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping http2 secret e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping http2 secret e2e: the binary cache is unreachable");
         return;
     }
 
@@ -3441,18 +3446,18 @@ fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping h2 grpc secret e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping h2 grpc secret e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping h2 grpc secret e2e: the binary cache is unreachable");
         return;
     }
     if !grpcb_in_reachable() {
-        eprintln!("skipping h2 grpc secret e2e: grpcb.in is unreachable");
+        skip_incapable!("skipping h2 grpc secret e2e: grpcb.in is unreachable");
         return;
     }
 
@@ -3530,14 +3535,14 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
     // rather than a cold cage).
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping net-learn e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping net-learn e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping net-learn e2e: the binary cache is unreachable");
         return;
     }
 
@@ -3716,21 +3721,23 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
     .unwrap();
     let probe = run_in(proj_a.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping forward e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping forward e2e: the binary cache is unreachable (socat closure unseeded)");
+        skip_unreachable!(
+            "skipping forward e2e: the binary cache is unreachable (socat closure unseeded)"
+        );
         return;
     }
 
     // With `forward`: the host must reach the cage server through the forwarder.
     let with = run_server_and_probe(proj_a.path(), data.path(), state.path(), true);
     let Some(body) = with else {
-        eprintln!(
+        skip_incapable!(
             "skipping forward e2e: the cage server did not come up in time (slow first seed?)"
         );
         return;
@@ -3777,14 +3784,14 @@ fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
     // seeds the project store so a later egress failure is a real fault, not a cold cage.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping cleartext egress e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping cleartext egress e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping cleartext egress e2e: the binary cache is unreachable");
         return;
     }
 
@@ -3887,14 +3894,14 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
     // capability probe (also seeds the project store, so the background run starts warm).
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping net logs e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping net logs e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping net logs e2e: the binary cache is unreachable");
         return;
     }
     let trusted = sbx_in(
@@ -4043,14 +4050,14 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping net logs --follow e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping net logs --follow e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping net logs --follow e2e: the binary cache is unreachable");
         return;
     }
     let trusted = sbx_in(
@@ -4227,7 +4234,7 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
     // later splice failure is a real fault rather than a cold cage.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping tcp splice e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -4290,14 +4297,14 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
     // later egress failure is a real fault rather than a cold cage.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping allow-mode egress e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping allow-mode egress e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping allow-mode egress e2e: the binary cache is unreachable");
         return;
     }
 
@@ -4417,18 +4424,18 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping gui+net e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if wayland_socket().is_none() {
-        eprintln!("skipping gui+net e2e: no Wayland compositor on the host");
+        skip_incapable!("skipping gui+net e2e: no Wayland compositor on the host");
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping gui+net e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping gui+net e2e: the binary cache is unreachable");
         return;
     }
 
@@ -4505,14 +4512,14 @@ fn a_shared_network_launch_trusts_sbx_own_cacert() {
     // capability probe; also seeds the project store so a later TLS failure is a real fault.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping cacert e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping cacert e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping cacert e2e: the binary cache is unreachable");
         return;
     }
 
@@ -4571,7 +4578,7 @@ fn the_curated_base_tools_run_in_the_cage() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping curated-tools e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -4641,14 +4648,14 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping usr-bin-env e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping usr-bin-env e2e: the network is unreachable");
+        skip_incapable!("skipping usr-bin-env e2e: the network is unreachable");
         return;
     }
 
@@ -4707,14 +4714,14 @@ fn a_tarball_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping tarball-resolve e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping tarball-resolve e2e: the network is unreachable");
+        skip_incapable!("skipping tarball-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -4781,14 +4788,14 @@ fn a_deb_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping deb-resolve e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping deb-resolve e2e: the network is unreachable");
+        skip_incapable!("skipping deb-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -4856,14 +4863,14 @@ fn sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage() {
     // capability probe (also seeds the base store the upgrade cage needs); skip if unsandboxable.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping deb-upgrade-resolve e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping deb-upgrade-resolve e2e: the network is unreachable");
+        skip_incapable!("skipping deb-upgrade-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -4931,14 +4938,14 @@ fn an_appimage_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validat
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping appimage-resolve e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping appimage-resolve e2e: the network is unreachable");
+        skip_incapable!("skipping appimage-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -5000,14 +5007,14 @@ fn sbx_upgrade_appimage_runs_an_appimage_resolve_command_through_the_upgrade_cag
     // capability probe (also seeds the base store the upgrade cage needs); skip if unsandboxable.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping appimage-upgrade-resolve e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping appimage-upgrade-resolve e2e: the network is unreachable");
+        skip_incapable!("skipping appimage-upgrade-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -5061,7 +5068,7 @@ fn a_synthetic_xdg_open_surfaces_the_url_and_exits_zero() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping xdg-open e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -5107,14 +5114,14 @@ fn a_bin_bash_shebang_resolves_in_the_cage() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping bin-bash e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping bin-bash e2e: the network is unreachable");
+        skip_incapable!("skipping bin-bash e2e: the network is unreachable");
         return;
     }
 
@@ -5162,14 +5169,14 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
     // capability probe (untrusted → shared net); also seeds the project store.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping mise-allowlist e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping mise-allowlist e2e: the binary cache is unreachable");
+        skip_unreachable!("skipping mise-allowlist e2e: the binary cache is unreachable");
         return;
     }
 
@@ -5246,14 +5253,14 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping auto-equip e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping auto-equip e2e: the network is unreachable");
+        skip_incapable!("skipping auto-equip e2e: the network is unreachable");
         return;
     }
 
@@ -5298,14 +5305,14 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
     // capability probe (untrusted → shared net); also seeds the project store.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping auto-equip allowlist e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping auto-equip allowlist e2e: the network is unreachable");
+        skip_incapable!("skipping auto-equip allowlist e2e: the network is unreachable");
         return;
     }
 
@@ -5370,14 +5377,14 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
     // capability probe (untrusted → shared net); also seeds the project store once.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping fresh `mise:` package app e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping fresh `mise:` package app e2e: the network is unreachable");
+        skip_incapable!("skipping fresh `mise:` package app e2e: the network is unreachable");
         return;
     }
 
@@ -5513,14 +5520,14 @@ fn a_global_app_splits_mise_pools_across_two_projects() {
     let probe_a = run_in(project_a.path(), data.path(), &["true"]);
     let probe_b = run_in(project_b.path(), data.path(), &["true"]);
     if !probe_a.status.success() || !probe_b.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping mise-split two-project e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe_a.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping mise-split two-project e2e: the network is unreachable");
+        skip_incapable!("skipping mise-split two-project e2e: the network is unreachable");
         return;
     }
 
@@ -5619,14 +5626,14 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping Lane-2 pool e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping Lane-2 pool e2e: the network is unreachable");
+        skip_incapable!("skipping Lane-2 pool e2e: the network is unreachable");
         return;
     }
 
@@ -5712,14 +5719,14 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
     // Capability probe against an *empty* project (nothing equipped); also seeds the store once.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping mise: package upgrade e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping mise: package upgrade e2e: the network is unreachable");
+        skip_incapable!("skipping mise: package upgrade e2e: the network is unreachable");
         return;
     }
 
@@ -5802,14 +5809,14 @@ fn sbx_upgrade_mise_rolls_a_global_apps_app_global_tool() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping global-app mise upgrade e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping global-app mise upgrade e2e: the network is unreachable");
+        skip_incapable!("skipping global-app mise upgrade e2e: the network is unreachable");
         return;
     }
 
@@ -5900,14 +5907,14 @@ fn a_flake_package_builds_host_side_into_the_shared_store_and_a_fresh_project_re
     // capability probe (also seeds project A's base store once).
     let probe = run_in(proj_a.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping host-side `flake:` e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping host-side `flake:` e2e: the network is unreachable");
+        skip_incapable!("skipping host-side `flake:` e2e: the network is unreachable");
         return;
     }
 
@@ -5930,7 +5937,7 @@ fn a_flake_package_builds_host_side_into_the_shared_store_and_a_fresh_project_re
         String::from_utf8_lossy(&a.stdout)
     );
     if !a.status.success() && transient_fetch_failure(&a_log) {
-        eprintln!("skipping host-side `flake:` e2e: transient nix download fault: {a_log}");
+        skip_incapable!("skipping host-side `flake:` e2e: transient nix download fault: {a_log}");
         return;
     }
     assert!(
@@ -6024,14 +6031,14 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     // capability probe (untrusted → shared net); also seeds the project store once.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping inline-flake e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping inline-flake e2e: the network is unreachable");
+        skip_incapable!("skipping inline-flake e2e: the network is unreachable");
         return;
     }
 
@@ -6063,7 +6070,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
         String::from_utf8_lossy(&cold.stdout)
     );
     if !cold.status.success() && transient_fetch_failure(&cold_log) {
-        eprintln!("skipping inline-flake e2e: transient nix download fault: {cold_log}");
+        skip_incapable!("skipping inline-flake e2e: transient nix download fault: {cold_log}");
         return;
     }
     assert!(
@@ -6079,7 +6086,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     let edited_out = String::from_utf8_lossy(&edited.stdout).into_owned();
     let edited_log = format!("{}{edited_out}", String::from_utf8_lossy(&edited.stderr));
     if !edited.status.success() && transient_fetch_failure(&edited_log) {
-        eprintln!(
+        skip_incapable!(
             "skipping inline-flake e2e: transient nix download fault on rebuild: {edited_log}"
         );
         return;
@@ -6133,14 +6140,14 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
     // capability probe (untrusted → the flake package is withheld, shared net); seeds the store.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping locked `flake:` e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping locked `flake:` e2e: the network is unreachable");
+        skip_incapable!("skipping locked `flake:` e2e: the network is unreachable");
         return;
     }
 
@@ -6170,7 +6177,9 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
         String::from_utf8_lossy(&pinned.stdout)
     );
     if !pinned.status.success() || pin_log.contains("re-resolve failed") {
-        eprintln!("skipping locked `flake:` e2e: cannot resolve the flake upstream: {pin_log}");
+        skip_incapable!(
+            "skipping locked `flake:` e2e: cannot resolve the flake upstream: {pin_log}"
+        );
         return;
     }
     assert!(
@@ -6191,7 +6200,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
         String::from_utf8_lossy(&out.stdout)
     );
     if !out.status.success() && transient_fetch_failure(&log) {
-        eprintln!("skipping locked `flake:` e2e: transient nix download fault: {log}");
+        skip_incapable!("skipping locked `flake:` e2e: transient nix download fault: {log}");
         return;
     }
     assert!(
@@ -6355,14 +6364,14 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx gc e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping sbx gc e2e: the network is unreachable");
+        skip_incapable!("skipping sbx gc e2e: the network is unreachable");
         return;
     }
 
@@ -6389,12 +6398,14 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
         String::from_utf8_lossy(&built.stdout)
     );
     if !built.status.success() && transient_fetch_failure(&built_log) {
-        eprintln!("skipping sbx gc e2e: transient nix download fault: {built_log}");
+        skip_incapable!("skipping sbx gc e2e: transient nix download fault: {built_log}");
         return;
     }
     if !built.status.success() || !String::from_utf8_lossy(&built.stdout).contains("Hello, world!")
     {
-        eprintln!("skipping sbx gc e2e: the flake build did not complete host-side: {built_log}");
+        skip_incapable!(
+            "skipping sbx gc e2e: the flake build did not complete host-side: {built_log}"
+        );
         return;
     }
 
@@ -6462,7 +6473,9 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
         String::from_utf8_lossy(&relaunch.stdout)
     );
     if !relaunch.status.success() && transient_fetch_failure(&relaunch_log) {
-        eprintln!("skipping sbx gc e2e: transient nix download fault on the roll: {relaunch_log}");
+        skip_incapable!(
+            "skipping sbx gc e2e: transient nix download fault on the roll: {relaunch_log}"
+        );
         return;
     }
     assert!(
@@ -6532,14 +6545,14 @@ fn sbx_projects_rm_dead_reaps_a_deleted_projects_tree() {
     // does that seeding.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping sbx projects rm --dead e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
         return;
     }
     if !cache_reachable() {
-        eprintln!("skipping sbx projects rm --dead e2e: the network is unreachable");
+        skip_incapable!("skipping sbx projects rm --dead e2e: the network is unreachable");
         return;
     }
 
@@ -6654,7 +6667,7 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     // confirms the host can sandbox; otherwise skip.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping secret no-leak e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -6756,7 +6769,7 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
     // capability probe (untrusted → shared net, secret dropped): seeds the store, confirms sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping resolver-plugin e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -6840,7 +6853,7 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
     // capability probe (also seeds the store, so a later failure is a real fault, not a cold cage)
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping outbound-secret e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -6893,7 +6906,9 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
     // CONTROL: a clean request to the same allowed host still works, so the tripwire is not a
     // blanket block. Gated on the cache being reachable (this one genuinely fetches).
     if !cache_reachable() {
-        eprintln!("skipping the outbound-secret positive control: the binary cache is unreachable");
+        skip_unreachable!(
+            "skipping the outbound-secret positive control: the binary cache is unreachable"
+        );
         return;
     }
     let clean = sbx()
@@ -6940,7 +6955,7 @@ fn the_cage_runs_under_a_resource_limit_scope() {
     // capability probe (also primes the base userland so the sleep launches fast)
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping resource-limit e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -6978,7 +6993,7 @@ fn the_cage_runs_under_a_resource_limit_scope() {
     // A match means a real `sbx run` placed the cage in a scope with the
     // configured cap; otherwise skip (no systemd user session delegating pids).
     if pids_max != TASK_CAP {
-        eprintln!(
+        skip_incapable!(
             "skipping resource-limit e2e: the cage is not under a task-capped scope \
              (pids.max={pids_max:?}); likely no systemd user session delegating pids"
         );
@@ -7015,7 +7030,7 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
         &["run", "--", "true"],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping limits-override e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7072,7 +7087,7 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
             "the cage ran under the default task cap, not the trusted override {OVERRIDE_CAP} — \
              the `[limits]` override did not thread through to the scope"
         );
-        eprintln!(
+        skip_incapable!(
             "skipping limits-override e2e: the cage is not under a task-capped scope \
              (pids.max={pids_max:?}); likely no systemd user session delegating pids"
         );
@@ -7108,7 +7123,7 @@ fn a_trusted_seccomp_relaxation_launches_a_working_cage() {
         &["run", "--", "true"],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping seccomp-relaxation e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7161,7 +7176,7 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
         .into_iter()
         .find(|d| std::path::Path::new(d).exists())
     else {
-        eprintln!("skipping devices e2e: no candidate host device present");
+        skip_incapable!("skipping devices e2e: no candidate host device present");
         return;
     };
 
@@ -7185,7 +7200,7 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
         &["run", "--", "sh", "-c", check.as_str()],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping devices e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7239,7 +7254,7 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
 #[test]
 fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
     if !std::path::Path::new("/dev/dri").exists() {
-        eprintln!("skipping gpu e2e: no /dev/dri render node on this host");
+        skip_incapable!("skipping gpu e2e: no /dev/dri render node on this host");
         return;
     }
 
@@ -7261,7 +7276,7 @@ fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
         &["run", "--", "sh", "-c", check],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping gpu e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7340,7 +7355,9 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
     match &host_socket {
         Some(p) if p.exists() => {}
         _ => {
-            eprintln!("skipping audio e2e: no PulseAudio socket at $XDG_RUNTIME_DIR/pulse/native");
+            skip_incapable!(
+                "skipping audio e2e: no PulseAudio socket at $XDG_RUNTIME_DIR/pulse/native"
+            );
             return;
         }
     }
@@ -7372,7 +7389,7 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
         &["run", "--", "sh", "-c", check],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping audio e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7459,7 +7476,7 @@ fn a_trusted_audio_posture_equips_a_python_portaudio_tool() {
     match &host_socket {
         Some(p) if p.exists() => {}
         _ => {
-            eprintln!(
+            skip_incapable!(
                 "skipping PortAudio e2e: no PulseAudio socket at $XDG_RUNTIME_DIR/pulse/native"
             );
             return;
@@ -7499,7 +7516,7 @@ fi"#;
         &["run", "--", "bash", "-c", check],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping PortAudio e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7605,7 +7622,7 @@ fn a_typed_one_shot_security_override_reaches_the_cage() {
         .into_iter()
         .find(|d| std::path::Path::new(d).exists())
     else {
-        eprintln!("skipping one-shot override e2e: no candidate host device present");
+        skip_incapable!("skipping one-shot override e2e: no candidate host device present");
         return;
     };
 
@@ -7623,7 +7640,7 @@ fn a_typed_one_shot_security_override_reaches_the_cage() {
         &["run", "--", "sh", "-c", check.as_str()],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping one-shot override e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7698,7 +7715,7 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
         &["run", "--", "true"],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping app-limits e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7751,7 +7768,7 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
             "the app cage ran under the default task cap, not the trusted app override \
              {OVERRIDE_CAP} — the app `[limits]` overlay did not thread through merge_app to the scope"
         );
-        eprintln!(
+        skip_incapable!(
             "skipping app-limits e2e: the cage is not under a task-capped scope \
              (pids.max={pids_max:?}); likely no systemd user session delegating pids"
         );
@@ -7780,7 +7797,7 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
         &["run", "--", "true"],
     );
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping typed-limit e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7823,7 +7840,7 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
             "the cage ran under the default task cap, not the typed `--limit tasks_max=8192` — the \
              typed one-shot flag did not thread through to the scope"
         );
-        eprintln!(
+        skip_incapable!(
             "skipping typed-limit e2e: the cage is not under a task-capped scope \
              (pids.max={pids_max:?}); likely no systemd user session delegating pids"
         );
@@ -7915,7 +7932,7 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     // fast). No config, no trust — a real attach provisions nothing and re-resolves no config.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping attach e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -7947,7 +7964,9 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     if !cage_userns_ready(session_pid) {
         let _ = agent.kill();
         let _ = agent.wait();
-        eprintln!("skipping attach e2e: the background cage never came up (userns not created)");
+        skip_incapable!(
+            "skipping attach e2e: the background cage never came up (userns not created)"
+        );
         return;
     }
 
@@ -8055,7 +8074,7 @@ fn sbx_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping attach-cmd e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -8086,7 +8105,7 @@ fn sbx_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
     if !cage_userns_ready(session_pid) {
         let _ = agent.kill();
         let _ = agent.wait();
-        eprintln!(
+        skip_incapable!(
             "skipping attach-cmd e2e: the background cage never came up (userns not created)"
         );
         return;
@@ -8191,7 +8210,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping attach-kill e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -8216,7 +8235,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     if !cage_userns_ready(session_pid) {
         let _ = agent.kill();
         let _ = agent.wait();
-        eprintln!("skipping attach-kill e2e: the background cage never came up");
+        skip_incapable!("skipping attach-kill e2e: the background cage never came up");
         return;
     }
 
@@ -8605,10 +8624,10 @@ fn gc_prune_drops_a_superseded_seed_root_and_keeps_the_current_base() {
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         if !cache_reachable() {
-            eprintln!("skipping gc-superseded e2e: the binary cache is unreachable");
+            skip_unreachable!("skipping gc-superseded e2e: the binary cache is unreachable");
             return;
         }
-        eprintln!(
+        skip_incapable!(
             "skipping gc-superseded e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr)
                 .lines()
@@ -8689,10 +8708,10 @@ fn upgrade_hints_at_reclaimable_superseded_builds() {
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
         if !cache_reachable() {
-            eprintln!("skipping upgrade-hint e2e: the binary cache is unreachable");
+            skip_unreachable!("skipping upgrade-hint e2e: the binary cache is unreachable");
             return;
         }
-        eprintln!(
+        skip_incapable!(
             "skipping upgrade-hint e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr)
                 .lines()
@@ -8768,7 +8787,7 @@ fn fs_masks_close_a_project_path_while_its_name_stays_visible() {
 
     let probe = run_in(p, data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping fs-mask e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -8884,7 +8903,7 @@ fn a_task_reads_the_key_its_own_unmask_names_and_nothing_else() {
 
     let probe = run_in(p, data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping unmask e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -8962,7 +8981,7 @@ fn a_one_shot_config_mask_closes_the_path_and_unions_with_the_project() {
 
     let probe = run_in(p, data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping one-shot fs-mask e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -9041,7 +9060,7 @@ fn a_broker_that_cannot_be_provided_warns_and_the_launch_still_succeeds() {
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
-        eprintln!(
+        skip_incapable!(
             "skipping broker launch e2e: host cannot sandbox ({})",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
