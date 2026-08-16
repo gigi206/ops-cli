@@ -2782,15 +2782,41 @@ mod smoke {
             return;
         };
 
+        // Each invocation draws its id the way production does, rather than naming one. The id is
+        // part of the cage name and therefore of the systemd scope (`sbx-<slug>-task<n>-<pid>.scope`),
+        // and this is the only test here that runs *two* commands: with a literal id on both, they
+        // asked for one scope name twice, and systemd refused the second outright ("was already
+        // loaded or has a fragment file") because the first had just been killed by the timeout and
+        // its unit was still loaded. Production cannot reach that — [`next_invocation`] is a
+        // monotonic counter — so the collision was the test's alone. Drawing from the same counter
+        // keeps it that way for whatever runs next.
         let killed = engine
-            .run("hang", &BTreeMap::new(), &BTreeMap::new(), 1)
+            .run(
+                "hang",
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                next_invocation(),
+            )
             .expect("the hanging task returns");
         assert!(killed.timed_out, "the timeout must fire");
         assert_ne!(killed.exit, 0, "a killed command does not report success");
 
         let cut = engine
-            .run("loud", &BTreeMap::new(), &BTreeMap::new(), 1)
+            .run(
+                "loud",
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                next_invocation(),
+            )
             .expect("the loud task returns");
+        // The command has to have *run* for the cap to mean anything: a cage that failed to start
+        // also produces no output, which is how the scope collision above read as an untruncated
+        // stream for as long as it did.
+        assert_eq!(
+            cut.exit, 0,
+            "the loud command must actually run: {:?}",
+            cut.stderr
+        );
         assert!(cut.truncated, "the output cap must report the truncation");
         assert!(
             cut.stdout.as_deref().map(str::len).unwrap_or(0) <= 256,
