@@ -1544,6 +1544,43 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_key_in_a_profile_file_reaches_the_report() {
+        // The route the guide documents, and the one the report is FOR: a profile file under
+        // `apps/<name>.toml` is where every global app actually lives (an inline `[app.*]` in the
+        // global config is refused outright, see `merge_profile_apps`). The inline route is tested
+        // beside `resolve`; this one has three hops between the parse and the warning — the
+        // directory read, the merge into the global layer, and the fold of bundles — and any of
+        // them rebuilding the struct would drop the bag before anything reported it.
+        let dir = TmpDir::new();
+        std::fs::write(
+            dir.path().join("demo.toml"),
+            b"cmd = \"demo\"\ntimezone = \"Europe/Paris\"\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let profiles = read_profile_apps_from(dir.path(), &mut warnings);
+        assert!(
+            !profiles["demo"].rest.is_empty(),
+            "the parse must keep what it did not know"
+        );
+
+        let mut global = RawConfig::default();
+        merge_profile_apps(&mut global, profiles, &mut warnings);
+        let resolved = super::resolve(global, None, &crate::plugins::PluginRegistry::default());
+        assert!(
+            resolved.apps["demo"]
+                .warnings
+                .iter()
+                .any(|w| w.contains("timezone")),
+            "a baseline-only key in a profile file must be named: {:?}",
+            resolved.apps["demo"].warnings
+        );
+        // And the field it names is genuinely inert: nothing about the baseline moved.
+        assert_eq!(resolved.timezone, None);
+    }
+
+    #[test]
     fn reading_profiles_keys_each_app_by_its_file_stem() {
         // A profile file is a top-level app; its filename (stem) is the app name.
         let dir = TmpDir::new();

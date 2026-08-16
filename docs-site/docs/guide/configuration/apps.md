@@ -71,18 +71,14 @@ tasks_max = 4096
 
 An app profile is a **subset** of this schema, not all of it: baseline fields like
 [`timezone`](timezone), `nixpkgs` and `[network] groups` belong to the config that holds the app,
-not to the app. Writing one under `[app.<name>]` (or at the top level of a profile file) parses and
-does nothing, so sbx names it at launch rather than dropping it in silence:
+not to the app. Writing one under `[app.<name>]`, or at the top level of a profile file, parses and does nothing.
+sbx names the key at launch instead of dropping it in silence, and says that a baseline-only field
+is declared outside the app. The same report catches a plain misspelling.
 
-```
-sbx: app `demo` (~/.config/sbx/sbx.toml): ignoring unknown key `timezone` - sbx does not know
-this field on an app (check the spelling; a field that exists only on the baseline, like
-`timezone`, is declared outside `[app.<name>]`)
-```
-
-The same report catches a plain misspelling. Note the one case it cannot: a scalar written *below*
-a `[table]` header is folded into that table by TOML itself, so it never reaches sbx as an app key
-at all. Keep scalars above the first table.
+One mistake it cannot catch, and it is the more likely of the two: a scalar written *below* a
+`[table]` header is folded into that table by TOML itself, so it never reaches sbx as an app key at
+all. Appending `timezone = "Europe/Paris"` to the end of a profile is exactly that. Keep scalars
+above the first table.
 
 ### The `cmd` field and trailing arguments
 
