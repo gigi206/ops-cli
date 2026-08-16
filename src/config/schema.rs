@@ -409,6 +409,12 @@ pub(crate) struct RawBundle {
     /// Auto-upgrade resolvers pairing with this bundle's `binary:resolve` packages.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) binary: BTreeMap<String, RawResolve>,
+    /// Every key of this bundle sbx does not know, kept for the reason [`RawApp::rest`] gives and
+    /// sharpened by this table's own doc: a bundle deliberately carries no `cmd` and no posture. A
+    /// `cmd` or a `gui` written here is exactly the mistake the design invites, and it used to be
+    /// indistinguishable from not writing one.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// One `binds` entry: a bare path string (bound **read-only**, the default) or a table
@@ -825,6 +831,16 @@ pub(crate) struct RawApp {
     /// untrusted project may set the scope of its own app but may not move a trusted app from
     /// `"project"` to `"global"` (which would let it write into the shared home).
     pub(crate) home_scope: Option<String>,
+    /// Every key of this app sbx does not know, kept for the same reason as
+    /// [`RawConfig::rest`]: unknown keys stay ignored, which is what makes the schema additive, but
+    /// a misspelling and a field from next year's release are indistinguishable in silence.
+    ///
+    /// It matters more here than at the baseline, and the reason is worth naming: an app profile is
+    /// a *subset* of the baseline schema. A reader who knows `timezone` or `nixpkgs` from the guide
+    /// has no way to see that those are baseline-only except by the value not taking effect — which
+    /// is exactly the observation this turns into a sentence.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The command form of an app's `cmd`: a full argv (`["demo-app", "--flag"]`) or a bare

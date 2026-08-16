@@ -61,7 +61,8 @@ cost you a wrong clock, not a session.
 A zone belongs to the machine and the person using it, not to an application, so it is a
 **baseline** field: declare it in the global config and every project and every app inherits it.
 There is no per-app override, and a shipped [app profile](apps) cannot carry one (it has no way
-to know where its user is).
+to know where its user is). A `timezone` written under an `[app.<name>]` is reported at launch
+rather than silently ignored.
 
 ```toml
 # ~/.config/sbx/sbx.toml: every cage on this machine

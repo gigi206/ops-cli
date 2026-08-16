@@ -2707,6 +2707,29 @@ pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &
     // named alongside the mode and the rules that did take effect.
 }
 
+/// Report the keys an app declared that sbx does not know, the app-scoped half of
+/// [`warn_unknown_keys`].
+///
+/// An app profile is a **subset** of the baseline schema, which is what makes this worth saying out
+/// loud rather than leaving to the additive-schema rule. A baseline-only field written under an
+/// `[app.<name>]` — `timezone`, `nixpkgs`, `[network] groups` — parses, is dropped, and changes
+/// nothing, and the only way its author could notice was the value not taking effect. The message
+/// names the key and says where such a field belongs, since "unknown" is misleading for a key that
+/// is a real field one layer up.
+fn warn_unknown_app_keys(
+    warnings: &mut Vec<String>,
+    source: &str,
+    rest: &BTreeMap<String, schema::RawIgnored>,
+) {
+    for key in rest.keys() {
+        warnings.push(format!(
+            "{source}: ignoring unknown key `{key}` — sbx does not know this field on an app \
+             (check the spelling; a field that exists only on the baseline, like `timezone`, is \
+             declared outside `[app.<name>]`)"
+        ));
+    }
+}
+
 /// Validate a `[ssh_agent] allow` list into the entries the broker will match on, dropping a
 /// malformed one with a warning and keeping the rest (the drop-bad-entry shape of `[devices]`).
 ///
@@ -3084,6 +3107,7 @@ fn resolve_app(
     // The global layer — trusted by location, honored in full.
     if let Some(app) = global {
         let source = app_source(GLOBAL_CONFIG, name);
+        warn_unknown_app_keys(&mut warnings, &source, &app.rest);
         absorb_provisions(app.provisions, &mut provisions);
         apply_env(&mut env, None, &mut warnings, &source, app.env, false);
         apply_binds(&mut binds, None, &mut warnings, &source, app.binds);
@@ -3234,6 +3258,9 @@ fn resolve_app(
     if let Some((app, state)) = project {
         let trusted = state == TrustState::Trusted;
         let source = app_source(PROJECT_CONFIG, name);
+        // Reported whatever the verdict, like the baseline's: an unknown key is a spelling
+        // question, not a capability, so an untrusted project hears about its own typo too.
+        warn_unknown_app_keys(&mut warnings, &source, &app.rest);
         let gate = Gate {
             trusted,
             state,

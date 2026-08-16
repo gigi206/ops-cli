@@ -728,6 +728,7 @@ fn raw_app(
     network: Option<NetworkField>,
 ) -> RawApp {
     RawApp {
+        rest: Default::default(),
         open: Default::default(),
         service: Default::default(),
         fs: None,
@@ -6568,6 +6569,40 @@ fn the_timezone_layers_from_any_source_and_a_bad_name_leaves_the_zone_in_effect(
     assert_eq!(r.timezone_origin, Provenance::Global);
 }
 
+#[test]
+fn a_baseline_only_field_written_under_an_app_says_so_instead_of_vanishing() {
+    // The motivating case is `timezone`, and it is the shape of the problem rather than one field:
+    // an app profile is a subset of the baseline schema, so a key a reader met in the guide can be
+    // real *and* have no effect here. Before this, serde dropped it and the only symptom was the
+    // value not applying.
+    let global: RawConfig = toml::from_str(
+        "[app.demo]\ncmd = \"demo\"\ntimezone = \"Europe/Paris\"\nmemory_maxx = \"8G\"\n",
+    )
+    .unwrap();
+    let r = resolve_no_plugins(global, None);
+    let app = &r.apps["demo"];
+    for key in ["timezone", "memory_maxx"] {
+        assert!(
+            app.warnings.iter().any(|w| w.contains(key)),
+            "`{key}` must be named, not dropped in silence: {:?}",
+            app.warnings
+        );
+    }
+    // And the baseline is untouched by it: a zone written in the wrong place sets no zone.
+    assert_eq!(r.timezone, None);
+
+    // The keys an app *does* know stay silent, or the message would be noise on every profile.
+    let global: RawConfig =
+        toml::from_str("[app.demo]\ncmd = \"demo\"\ngui = \"wayland\"\nhome_scope = \"project\"\n")
+            .unwrap();
+    let r = resolve_no_plugins(global, None);
+    assert!(
+        r.apps["demo"].warnings.is_empty(),
+        "a well-spelled profile must not warn: {:?}",
+        r.apps["demo"].warnings
+    );
+}
+
 // --- one-shot override application (`apply_override` / `apply_override_channel`) ---
 
 /// Apply a one-shot override built from `raw` onto a resolved config, returning the result.
@@ -9001,6 +9036,55 @@ fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
 /// The shape is re-derived here rather than borrowed from `sandbox::launch`: a net that shares its
 /// rule with the code it guards agrees with that code when the rule itself is what drifted. A plain
 /// argv needs nothing — sbx appends to it and the program reads its own arguments.
+#[test]
+fn no_shipped_profile_carries_a_key_sbx_does_not_know() {
+    // The catalogue is the population the new app-scoped unknown-key report is loudest on: 71
+    // profiles, each parsed on import, each warning surfacing at launch. A key that is real on the
+    // baseline and inert here would have been invisible before; now it would be a line on every
+    // launch of that app, so the catalogue has to be clean for the message to mean anything.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/app");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("examples/app/ dir exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let raw = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
+        assert!(
+            raw.rest.is_empty(),
+            "{}: unknown key(s) {:?}",
+            path.display(),
+            raw.rest.keys().collect::<Vec<_>>()
+        );
+        checked += 1;
+    }
+    // The bundles beside them, on the same rule: a bundle carries no `cmd` and no posture, so one
+    // written there would be dropped in silence, and the shipped set is where that would be
+    // loudest.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/bundle");
+    let mut bundles = 0;
+    for entry in std::fs::read_dir(&dir).expect("examples/bundle/ dir exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle"))
+            .expect("the bundle parses");
+        for (name, bundle) in &raw.bundle {
+            assert!(
+                bundle.rest.is_empty(),
+                "{} (`{name}`): unknown key(s) {:?}",
+                path.display(),
+                bundle.rest.keys().collect::<Vec<_>>()
+            );
+            bundles += 1;
+        }
+    }
+    // The guard asserts its own precondition: a `read_dir` that found nothing would pass in silence.
+    assert!(checked >= 60, "only {checked} profiles were read");
+    assert!(bundles >= 60, "only {bundles} bundles were read");
+}
+
 #[test]
 fn every_shipped_shell_profile_forwards_its_trailing_arguments() {
     const SHELLS: [&str; 4] = ["bash", "sh", "zsh", "dash"];

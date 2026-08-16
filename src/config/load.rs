@@ -958,6 +958,17 @@ fn expand_bundles(
                 continue;
             };
             let mut bundle = bundle.clone();
+            // A key this bundle carries that sbx does not know. Named here, against the *app* that
+            // pulled the bundle in, because that is who sees the warning and who is short of what
+            // they thought they had. The sharp case is a `cmd` or a posture: a bundle carries
+            // neither by design, so writing one is a natural mistake that changed nothing and said
+            // nothing.
+            for key in bundle.rest.keys() {
+                notes.push(format!(
+                    "bundle `{name}`: ignoring unknown key `{key}` — sbx does not know this field \
+                     on a bundle (a bundle carries no `cmd` and no posture; those belong to the app)"
+                ));
+            }
             // Stamp each declared operation with the bundle it came from, here — the fold below
             // makes a bundle's entry indistinguishable from one the app wrote itself, which is the
             // point everywhere except when a reader asks where an operation is declared.
@@ -1281,6 +1292,30 @@ mod tests {
         expand_bundles(&mut apps, &map, &mut notes);
         let warnings = notes.remove("demo").unwrap_or_default();
         (apps.remove("demo").unwrap(), warnings)
+    }
+
+    #[test]
+    fn a_key_a_bundle_cannot_carry_is_named_against_the_app_that_used_it() {
+        // A bundle deliberately holds no `cmd` and no posture, so writing one there is the mistake
+        // its own design invites — and it used to change nothing and say nothing. The warning lands
+        // on the app, because the app's author is who reads it and who is short of what they
+        // believed the bundle gave them.
+        let mut b = bundle("a");
+        b.rest = [
+            ("cmd".to_string(), schema::RawIgnored),
+            ("gui".to_string(), schema::RawIgnored),
+        ]
+        .into_iter()
+        .collect();
+        let (_, warnings) = expand_one(app_using(&["a"]), &[("a", b)]);
+        for key in ["cmd", "gui"] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(key) && w.contains("bundle `a`")),
+                "`{key}` must be named against the bundle it came from: {warnings:?}"
+            );
+        }
     }
 
     #[test]

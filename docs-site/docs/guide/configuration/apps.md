@@ -67,6 +67,23 @@ tasks_max = 4096
 | `fs` | ungated | project paths this app closes, **unioned** onto the baseline's: an app closes more for its own cage and can never reopen what the project closed (see [fs](fs)) |
 | `home_scope` | integrity-gated | `"global"` (default) or `"project"`: see [Per-app home](../apps/home) |
 
+### A key an app does not have
+
+An app profile is a **subset** of this schema, not all of it: baseline fields like
+[`timezone`](timezone), `nixpkgs` and `[network] groups` belong to the config that holds the app,
+not to the app. Writing one under `[app.<name>]` (or at the top level of a profile file) parses and
+does nothing, so sbx names it at launch rather than dropping it in silence:
+
+```
+sbx: app `demo` (~/.config/sbx/sbx.toml): ignoring unknown key `timezone` - sbx does not know
+this field on an app (check the spelling; a field that exists only on the baseline, like
+`timezone`, is declared outside `[app.<name>]`)
+```
+
+The same report catches a plain misspelling. Note the one case it cannot: a scalar written *below*
+a `[table]` header is folded into that table by TOML itself, so it never reaches sbx as an app key
+at all. Keep scalars above the first table.
+
 ### The `cmd` field and trailing arguments
 
 `cmd` is either a bare string (a one-element argv, never whitespace-split) or an argv

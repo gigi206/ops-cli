@@ -61,6 +61,10 @@ of your host, and it can never silently switch on a microphone or a display beca
 the tool it packages can use one. There is no `cmd` because an app's command is its
 identity: inheriting one would be an integrity hijack.
 
+Writing one of those fields here anyway is the mistake this design invites, so it is
+reported rather than dropped: an unknown key in a bundle is named at launch, against the
+app that used it, with a reminder that a command and a posture belong to the app.
+
 ### The install step
 
 `provision` is the one thing a bundle carries that is a **command**, and it is not an
