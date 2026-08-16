@@ -763,9 +763,15 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// never share a sentence, even though they name the same apps.
 ///
 /// **Reserve, structural**: an app that installs from its own `cmd` rather than from a bundle's
-/// install step cannot be named here, because it declares no step to select on. `open-design` is
-/// that case in the shipped catalogue. It is not left broken — its install runs inside its `cmd` on
-/// every launch, so it repairs itself exactly like a step does; it simply cannot be listed.
+/// install step cannot be named here, because it declares no step to select on. The shipped
+/// catalogue has **two**: `open-design`, which clones and installs on every launch, and `aionui`,
+/// which stages a runtime out of the store into its home. Neither is left broken — the work runs
+/// inside the `cmd`, so it repairs itself exactly as a step does; they simply cannot be listed.
+/// That self-repair is a property of the guard each one writes, not of the shape: `aionui`'s guard
+/// tested that the staged tree was *there* rather than that it *ran*, and skipped the repair for as
+/// long as the tree existed. Widening this note to cover them would mean detecting staging inside a
+/// shell string, which the config cannot do; what closes the gap is a declarative signal, not a
+/// better guess.
 fn store_moved_note(cfg: &config::Resolved) -> Option<String> {
     let apps = apps_with_install_steps(cfg);
     if apps.is_empty() {
