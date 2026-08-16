@@ -2355,6 +2355,18 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
         "a field no layer set is `Default`, not `Inherited` — the JSON carries the same three-way \
          answer the text view does"
     );
+    // The channel travels as a nested object, not a flat scalar like the provenance tags above, so
+    // its shape is pinned field by field: a consumer reads `nixpkgs.source`, and a flattening that
+    // kept the value but lost the origin would still answer `contains("nixos")`. The origin is the
+    // half that says whether the directory or the global config decided this.
+    assert_eq!(
+        doc["nixpkgs"]["source"], "nixos-unstable",
+        "the JSON must carry the channel the app resolves against:\n{doc}"
+    );
+    assert_eq!(
+        doc["nixpkgs"]["origin"], "default",
+        "and its origin, which is what distinguishes a pin from the global channel:\n{doc}"
+    );
 }
 
 #[test]
@@ -2396,6 +2408,28 @@ fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
         !outside.contains("nixos-24.11"),
         "the project's pin must not follow the app out of the project:\n{outside}"
     );
+
+    // The machine view carries the same answer, asserted here rather than beside the other `--json`
+    // checks: those run without a pin, where the directory's channel and any directory-independent
+    // one coincide, so they can only pin the document's *shape*. Only a fixture that carries a pin
+    // can tell a channel read from the working directory from one read anywhere else.
+    let doc: serde_json::Value = serde_json::from_slice(
+        &fx.run(&["config", "show", "--app", "demo", "--json"])
+            .stdout,
+    )
+    .expect("--app --json must emit valid JSON");
+    assert_eq!(doc["nixpkgs"]["source"], "nixos-24.11");
+    assert_eq!(doc["nixpkgs"]["origin"], "project pin");
+    let doc = serde_json::from_slice::<serde_json::Value>(
+        &fx.run_in(
+            elsewhere.path(),
+            &["config", "show", "--app", "demo", "--json"],
+        )
+        .stdout,
+    )
+    .expect("--app --json must emit valid JSON");
+    assert_eq!(doc["nixpkgs"]["origin"], "default");
+    assert_ne!(doc["nixpkgs"]["source"], "nixos-24.11");
 }
 
 #[test]
