@@ -775,9 +775,11 @@ fn answer_parked(p: &Parked, allow: bool) {
     }
 }
 
-/// Read a NUL-terminated path from a parked target's memory at `addr`. The target is blocked in the
-/// `execve` notification, so the pointer is valid and its memory is stable. Returns `None` on any read
-/// failure.
+/// Read a NUL-terminated path from a parked target's memory at `addr`. The notified *thread* is
+/// blocked in the `execve`, so the pointer is valid to read — but only that thread is stopped: a
+/// sibling in the cage can rewrite the buffer between this read and the `CONTINUE`, which is why
+/// allowing a named path is TOCTOU-racy while refusing one is not (module header). Nothing here
+/// closes that window. Returns `None` on any read failure.
 fn read_exec_path(pid: u32, addr: u64) -> Option<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
