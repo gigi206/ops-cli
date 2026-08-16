@@ -238,7 +238,7 @@ async fn stream(
     // the verdict. Scanned on the client's head *before* sbx's own injection is added, so it can
     // never self-trip on an injected credential (parity with the HTTP/1.1 `carries_secret`).
     let creds = ctx.credentials.snapshot();
-    if !creds.needles.is_empty() && head_carries_secret(&req, &creds.needles) {
+    if !creds.needles.is_empty() && head_carries_secret(&req, &creds.needles, connect_host) {
         ctx.outcome(
             Proto::Https,
             connect_host,
@@ -407,7 +407,7 @@ async fn relay(
     // hole in all three.
     let injected_names = super::injected_names(&creds, &injected_ids);
     ctx.credentials
-        .observe_head(&H2Headers(req.headers()), &injected_names);
+        .observe_head(&H2Headers(req.headers()), &injected_names, host);
 
     // The upstream this stream will ride: one this tunnel already opened for the same credential
     // set, or a new one. HTTP/2 multiplexes, so a connection here is **shared** rather than taken
@@ -768,7 +768,11 @@ async fn send_masked(dst: &mut h2::SendStream<Bytes>, data: Vec<u8>) -> Result<b
 /// outbound leak tripwire, HTTP/2 form. Reconstructs a byte blob of the `:path` plus each
 /// `name: value` header line and reuses the HTTP/1.1 [`carries_secret`] scan. Scanned before sbx's
 /// own injection is added, so an injected credential can never self-trip it.
-fn head_carries_secret(req: &Request<h2::RecvStream>, needles: &[SecretNeedle]) -> bool {
+fn head_carries_secret(
+    req: &Request<h2::RecvStream>,
+    needles: &[SecretNeedle],
+    dest: &str,
+) -> bool {
     let mut blob = Vec::new();
     if let Some(pq) = req.uri().path_and_query() {
         blob.extend_from_slice(pq.as_str().as_bytes());
@@ -780,7 +784,7 @@ fn head_carries_secret(req: &Request<h2::RecvStream>, needles: &[SecretNeedle]) 
         blob.extend_from_slice(value.as_bytes());
         blob.push(b'\n');
     }
-    carries_secret(&blob, needles)
+    carries_secret(&blob, needles, dest)
 }
 
 /// Mask every configured secret value out of each header value in `headers` (an equal-length run

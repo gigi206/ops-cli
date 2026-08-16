@@ -204,7 +204,7 @@ pub(super) fn serve_tunneled_request(
     //     can never trip it, and reached before the verdict so an exfil attempt never resolves a
     //     name or opens an upstream. A backstop against naive re-exfil only: it sees the head, not
     //     the streamed body, and matches the value byte-for-byte (any encoding evades it).
-    if carries_secret(&inner_bytes, &creds.needles) {
+    if carries_secret(&inner_bytes, &creds.needles, connect_host) {
         ctx.outcome(
             crate::sandbox::control::Proto::Https,
             connect_host,
@@ -456,7 +456,7 @@ pub(super) fn serve_tunneled_request(
     //     refusing every later request that carries it.
     let injected_names = injected_names(&creds, &injected_ids);
     ctx.credentials
-        .observe_head(&inner.headers, &injected_names);
+        .observe_head(&inner.headers, &injected_names, connect_host);
 
     // 7a. Whether this request may share its upstream leg with others. It takes a launch that asked
     //     for reuse, an HTTP/1.1 request (the version whose connections persist by default), and no

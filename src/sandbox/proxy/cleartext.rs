@@ -13,7 +13,9 @@ use super::*;
 /// **no TLS**: no CONNECT tunnel, no leaf minted, no upstream certificate to validate, and — because
 /// a bearer must never travel in the clear — **no credential injection** (a secret host can only be
 /// an inspected-over-TLS `to`, so [`matching_injections`] is skipped entirely, not merely trusted to
-/// return empty). The request is forwarded to the origin server in **origin-form** with the client's
+/// return empty). Injection and *observation* part company here: this plane injects nothing and
+/// still calls [`Credentials::observe_head`], because what it learns is what scopes that value on
+/// every other plane. The request is forwarded to the origin server in **origin-form** with the client's
 /// own `Host`, and the one response is streamed back. Every failure path is fail-closed with the same
 /// [`write_refusal`] reason categories the MITM path uses, so the agent tells a policy refusal from an
 /// unreachable host. `head_bytes` is the raw head (for the byte-exact secret tripwire); `head` is its
@@ -104,7 +106,7 @@ pub(super) fn handle_cleartext(
     // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
     //    configured secret verbatim. It matters more here than on the TLS path: a leaked secret sent
     //    in the clear is exposed on the wire, not just to the destination.
-    if carries_secret(head_bytes, &creds.needles) {
+    if carries_secret(head_bytes, &creds.needles, &host) {
         ctx.outcome(
             crate::sandbox::control::Proto::Http,
             &host,
@@ -213,6 +215,20 @@ pub(super) fn handle_cleartext(
         }
     };
 
+    // 6b. Remember any credential the cage sent for itself, in the same place the other inspected
+    //     planes put it: after the verdict (a refused request must not seed the scan set), after the
+    //     outbound scan (a request is never refused by the value it just taught sbx), and after the
+    //     SSRF guard, which is the last refusal before the wire. The names to exclude are empty here,
+    //     and that is a property of this plane rather than a shortcut: it skips `matching_injections`
+    //     entirely because a bearer must not travel in the clear, so no header is being replaced and
+    //     none has to be held back from observation.
+    //
+    //     This plane has to observe for the same reason it has to tripwire: what it learns protects
+    //     the *other* planes. A token the cage sends here is already exposed on this hop, but until it
+    //     is a needle, re-sending it over TLS to a different host is not refused. Learning it is what
+    //     scopes it to the destination it was acquired on.
+    ctx.credentials.observe_head(&head.headers, &[], &host);
+
     // 7. Open the plaintext upstream to the checked address (no TLS, no certificate — an `http://`
     //    connection is cleartext by definition; the empty netns + the allowlist are the boundary).
     let mut upstream = match TcpStream::connect((ip, port)) {
@@ -309,10 +325,14 @@ pub(super) fn handle_cleartext(
     // lift the upstream read timeout for the relay below (same rationale as the tunneled path).
     begin_response_stream(&upstream);
 
-    // 9. Relay the response head, then stream its framed body to the client and close. A cleartext
-    //    host is never a credential-injection target, so it can carry no *reflected* secret to mask —
-    //    the response is relayed unredacted (there is nothing this path could reflect that the
-    //    tripwire above did not already refuse outbound).
+    // 9. Relay the response head, then stream its framed body to the client and close. Inbound
+    //    masking is scoped to the responses of an injection-target host, and a cleartext host is
+    //    never one, so this response is relayed unredacted by the *same* rule the other planes apply
+    //    rather than a weaker one (`masks_reflection`, on the inspected-TLS path, asks exactly this
+    //    question). What that leaves open is narrow and deliberate: a value observed at step 6b can
+    //    name a cleartext host, so that host reflecting it back is not masked. Masking every host's
+    //    response instead would scan every body of every allowed request, which is the cost the
+    //    scoping decision exists to avoid.
     let mut up_br = BufReader::new(upstream);
     let RelayedHead {
         head: resp_head,

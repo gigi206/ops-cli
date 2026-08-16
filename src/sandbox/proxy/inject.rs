@@ -304,6 +304,15 @@ pub(crate) fn pairs_for(
     Ok(out)
 }
 
+/// The form a learned needle's destination is recorded and compared under. It is the allowlist's
+/// own [`canonical_host`](crate::allowlist::canonical_host) — the same normalization the verdict
+/// applies to the host it just authorized — so the two sides cannot drift into disagreeing about
+/// what one host is. Every caller passes a host that is already free of its port (the planes carry
+/// host and port separately), and canonicalization settles case, a trailing dot, and an IP literal.
+fn host_key(host: &str) -> String {
+    crate::allowlist::canonical_host(host)
+}
+
 /// A configured secret's value the proxy refuses to let leave the cage verbatim in an outbound
 /// request head — the egress leak tripwire. Held as raw bytes so the byte-substring scan matches
 /// whatever spelling reaches the wire (the plaintext, or its base64 form for Basic). Its `Debug`
@@ -332,6 +341,17 @@ pub(crate) struct SecretNeedle {
     /// value of the same declaration; an observed one has no declaration behind it, so nothing
     /// replaces it and dropping it is simply losing it — see [`Credentials::replace`].
     observed: bool,
+    /// For a **learned** needle, the host the cage was sending it to when sbx saw it — its rightful
+    /// destination, lowercased and without a port. `None` for a declared one.
+    ///
+    /// The outbound tripwire skips a learned needle on a request bound for this host, and only
+    /// there. What the tripwire exists to stop is the cage taking a credential it acquired for one
+    /// service and re-sending it to ANOTHER; scanning it on the way back to its own service refuses
+    /// the app's own authenticated traffic instead, so an app that signs itself in cuts its own
+    /// session off at the second request. A declared needle keeps `None` and is therefore scanned
+    /// everywhere, which stays correct: the cage never holds a declared value in the first place,
+    /// so its appearance anywhere — destination included — is a leak.
+    dest: Option<String>,
 }
 
 impl SecretNeedle {
@@ -343,14 +363,17 @@ impl SecretNeedle {
             bytes,
             finder,
             observed: false,
+            dest: None,
         }
     }
 
     /// A needle for a credential sbx **saw** rather than issued: an app's own sign-in, remembered by
-    /// [`Credentials::observe`] so the tripwires cover it too.
-    fn learned(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+    /// [`Credentials::observe`] so the tripwires cover it too. `dest` is the host it was travelling
+    /// to, which [`Self::scanned_for`] then exempts — see the field's own note.
+    fn learned(name: impl Into<String>, bytes: Vec<u8>, dest: &str) -> Self {
         Self {
             observed: true,
+            dest: Some(host_key(dest)),
             ..Self::named(name, bytes)
         }
     }
@@ -358,6 +381,16 @@ impl SecretNeedle {
     /// Whether this needle was learned from traffic rather than declared.
     fn is_observed(&self) -> bool {
         self.observed
+    }
+
+    /// Whether the outbound tripwire scans for this needle on a request bound for `host`.
+    ///
+    /// True for every declared needle, and for a learned one everywhere except the host it was
+    /// learned on. The comparison is on the same normalized form both sides record ([`host_key`]),
+    /// because an exemption that fails to match is invisible: the request is refused and the reason
+    /// looks like the credential really did go somewhere it should not.
+    pub(crate) fn scanned_for(&self, host: &str) -> bool {
+        self.dest.as_deref() != Some(host_key(host).as_str())
     }
 
     /// The needle bytes — used by the scan, and by the egress tests to confirm a needle was
@@ -514,7 +547,7 @@ impl Credentials {
     ///
     /// Only the injections are authoritative for what gets *sent*: this never adds an injection, so
     /// observing can change what is scanned but never what the cage authenticates as.
-    pub(crate) fn observe(&self, header: &str, value: &str) -> bool {
+    pub(crate) fn observe(&self, header: &str, value: &str, dest: &str) -> bool {
         let credential = credential_in(value);
         // The higher of the two floors. `OBSERVE_MIN_LEN` is not itself configurable: it states a
         // *relation* — an inferred credential is held to a stricter floor than a declared one — and
@@ -546,6 +579,7 @@ impl Credentials {
         needles.push(SecretNeedle::learned(
             format!("observed:{header}"),
             bytes.to_vec(),
+            dest,
         ));
         *current = std::sync::Arc::new(CredentialSet {
             injections: current.injections.clone(),
@@ -571,12 +605,17 @@ impl Credentials {
     /// HTTP/1.1 planes' parsed pairs, and the HTTP/2 plane's decoded header map. The alternative was
     /// a signature only one plane could satisfy, which is how this ended up running on one plane out
     /// of three in the first place.
-    pub(crate) fn observe_head(&self, headers: &dyn HeaderLookup, injected: &[&str]) -> usize {
+    pub(crate) fn observe_head(
+        &self,
+        headers: &dyn HeaderLookup,
+        injected: &[&str],
+        dest: &str,
+    ) -> usize {
         OBSERVED_AUTH_HEADERS
             .iter()
             .filter(|name| !injected.iter().any(|inj| name.eq_ignore_ascii_case(inj)))
             .filter_map(|name| headers.get(name).map(|value| (*name, value)))
-            .filter(|(name, value)| self.observe(name, value))
+            .filter(|(name, value)| self.observe(name, value, dest))
             .count()
     }
 }
@@ -781,7 +820,11 @@ mod tests {
             )],
         );
         assert!(
-            creds.observe("authorization", "Bearer app-own-token-abcdefgh"),
+            creds.observe(
+                "authorization",
+                "Bearer app-own-token-abcdefgh",
+                "host.test"
+            ),
             "the app's own credential is remembered"
         );
 
@@ -1045,7 +1088,7 @@ mod tests {
     #[test]
     fn an_observed_credential_is_kept_without_its_scheme_prefix() {
         let creds = default_creds(Vec::new(), Vec::new());
-        assert!(creds.observe("authorization", "Bearer tok-0123456789abcdef"));
+        assert!(creds.observe("authorization", "Bearer tok-0123456789abcdef", "host.test"));
         let set = creds.snapshot();
         assert_eq!(set.needles.len(), 1);
         assert_eq!(set.needles[0].as_bytes(), b"tok-0123456789abcdef");
@@ -1060,7 +1103,7 @@ mod tests {
     #[test]
     fn a_short_observed_value_is_not_kept() {
         let creds = default_creds(Vec::new(), Vec::new());
-        assert!(!creds.observe("authorization", "Bearer short"));
+        assert!(!creds.observe("authorization", "Bearer short", "host.test"));
         assert!(creds.snapshot().needles.is_empty());
     }
 
@@ -1070,7 +1113,7 @@ mod tests {
     fn a_lowered_declared_floor_does_not_lower_the_observed_one() {
         let creds = Credentials::new(Vec::new(), Vec::new(), 4);
         // 12 bytes: over the launch's floor, under the inferred one.
-        assert!(!creds.observe("authorization", "Bearer tok-01234567"));
+        assert!(!creds.observe("authorization", "Bearer tok-01234567", "host.test"));
         assert!(creds.snapshot().needles.is_empty());
     }
 
@@ -1080,10 +1123,14 @@ mod tests {
     fn a_raised_declared_floor_raises_the_observed_one() {
         let creds = Credentials::new(Vec::new(), Vec::new(), 24);
         // 20 bytes: over the inferred floor, under the launch's.
-        assert!(!creds.observe("authorization", "Bearer tok-0123456789abcdef"));
+        assert!(!creds.observe("authorization", "Bearer tok-0123456789abcdef", "host.test"));
         assert!(creds.snapshot().needles.is_empty());
         // 26 bytes clears both.
-        assert!(creds.observe("authorization", "Bearer tok-0123456789abcdefghijkl"));
+        assert!(creds.observe(
+            "authorization",
+            "Bearer tok-0123456789abcdefghijkl",
+            "host.test"
+        ));
         assert_eq!(creds.snapshot().needles.len(), 1);
     }
 
@@ -1092,12 +1139,16 @@ mod tests {
     #[test]
     fn the_same_credential_is_kept_once_and_the_set_is_capped() {
         let creds = default_creds(Vec::new(), Vec::new());
-        assert!(creds.observe("authorization", "Bearer tok-0123456789abcdef"));
-        assert!(!creds.observe("authorization", "Bearer tok-0123456789abcdef"));
+        assert!(creds.observe("authorization", "Bearer tok-0123456789abcdef", "host.test"));
+        assert!(!creds.observe("authorization", "Bearer tok-0123456789abcdef", "host.test"));
         assert_eq!(creds.snapshot().needles.len(), 1);
 
         for i in 0..20 {
-            creds.observe("authorization", &format!("Bearer tok-{i:0>20}"));
+            creds.observe(
+                "authorization",
+                &format!("Bearer tok-{i:0>20}"),
+                "host.test",
+            );
         }
         assert_eq!(
             creds.snapshot().needles.len(),
@@ -1121,6 +1172,7 @@ mod tests {
                 ("Authorization".into(), "Bearer tok-0123456789abcdef".into()),
             ],
             &[],
+            "host.test",
         );
         assert_eq!(kept, 1, "only the auth header counts");
         let set = creds.snapshot();
@@ -1142,6 +1194,7 @@ mod tests {
                 "Bearer sbx-placeholder-not-a-real-credential".into(),
             )],
             &["authorization"],
+            "host.test",
         );
         assert_eq!(
             kept, 0,

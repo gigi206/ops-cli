@@ -124,7 +124,7 @@ pub(super) fn handle_https_forward(
 
     // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
     //    configured secret verbatim, scanned before sbx's own injection so it cannot self-trip.
-    if carries_secret(head_bytes, &creds.needles) {
+    if carries_secret(head_bytes, &creds.needles, &host) {
         ctx.outcome(
             crate::sandbox::control::Proto::Https,
             &host,
@@ -333,7 +333,8 @@ pub(super) fn handle_https_forward(
     //     exchange. A credential acquired that way and never observed is one the tripwires do not
     //     cover afterwards, on any plane.
     let injected_names = injected_names(&creds, &injected_ids);
-    ctx.credentials.observe_head(&head.headers, &injected_names);
+    ctx.credentials
+        .observe_head(&head.headers, &injected_names, &host);
 
     // 7a. Whether this request may share its upstream leg with others, on the same terms as the
     //     tunneled path: the launch has to have asked for reuse, and the request has to be HTTP/1.1.

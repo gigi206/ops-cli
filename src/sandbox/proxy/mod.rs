@@ -1190,14 +1190,21 @@ fn signer_refusal_message(refusal: &SignRefusal, needles: &[SecretNeedle]) -> St
     String::from_utf8_lossy(&body).into_owned()
 }
 
-/// Whether the decrypted client request head carries any configured secret value verbatim — the
-/// outbound leak tripwire. Scans the raw head bytes (request line + every client header, before
-/// sbx's own injection is added), so it can never self-trip on an injected credential. A backstop,
-/// not a boundary: it catches a *verbatim* secret in the *head* only — an encoded value, or one in
-/// the streamed body, is out of scope (see the module doc).
-fn carries_secret(head_bytes: &[u8], redactions: &[SecretNeedle]) -> bool {
+/// Whether the decrypted client request head carries any secret value verbatim on its way to
+/// `dest` — the outbound leak tripwire. Scans the raw head bytes (request line + every client
+/// header, before sbx's own injection is added), so it can never self-trip on an injected
+/// credential. A backstop, not a boundary: it catches a *verbatim* secret in the *head* only — an
+/// encoded value, or one in the streamed body, is out of scope (see the module doc).
+///
+/// `dest` is the host the request is bound for, and it decides which needles apply
+/// ([`SecretNeedle::scanned_for`]): a declared secret is scanned for everywhere, while one the cage
+/// obtained for itself is scanned for everywhere EXCEPT the host it was acquired on. Sending such a
+/// credential back to its own service is the app using it, not leaking it; refusing that refuses
+/// every request after the first one an app makes with its own session.
+fn carries_secret(head_bytes: &[u8], redactions: &[SecretNeedle], dest: &str) -> bool {
     redactions
         .iter()
+        .filter(|n| n.scanned_for(dest))
         .any(|n| n.find_in(head_bytes, 0).is_some())
 }
 

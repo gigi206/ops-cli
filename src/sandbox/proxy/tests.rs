@@ -7030,12 +7030,15 @@ fn every_inspected_plane_refuses_the_same_framing_with_the_same_reason() {
     }
 }
 
-/// The same, asked of the **absolute-form `https://`** plane, which is the one where it matters/// The same, asked of the **absolute-form `https://`** plane, which is the one where it matters
+/// The same, asked of the **absolute-form `https://`** plane, which is the one where it matters
 /// most: that plane exists for a client whose only egress transport is this form, and the traffic
 /// that put it there was an OAuth token exchange. A credential acquired that way and never observed
 /// is one the tripwires do not cover afterwards, on any plane, because the scan set is shared.
 ///
-/// It ran on one plane out of three until this test asked the other two.
+/// It ran on one plane out of three until this test asked the other two, and on three out of four
+/// until [`the_cleartext_plane_observes_a_credential_the_cage_sent_itself`] asked the last one. The
+/// count is the lesson: each time, the plane that was missed was found by enumerating them, never by
+/// reading the one in front of me.
 #[test]
 fn the_absolute_form_plane_observes_a_credential_the_cage_sent_itself() {
     let (addr, upstream_ca, _up) = spawn_upstream(
@@ -7075,20 +7078,137 @@ fn the_absolute_form_plane_observes_a_credential_the_cage_sent_itself() {
     );
 }
 
-/// What observing buys, end to end. A token the cage obtained by its own sign-in belongs to no
-/// declaration, so nothing used to refuse it on the way out. Once the proxy has seen the cage send
-/// it to an allowed host, re-sending it anywhere is refused like a declared secret's — the same
-/// tripwire, now covering a credential nobody configured.
+/// The same, asked of the **inspected-cleartext (`http://`)** plane, which is the fourth one and the
+/// one that observed nothing: its only use of the credential state was the outbound scan, so a token
+/// the cage sent here joined no scan set.
 ///
-/// The request that *taught* sbx the value is not itself refused: observing happens after the
-/// outbound scan, so a credential can never trip on its own first use.
+/// The plane injects nothing, deliberately, because a bearer must not travel in the clear. Observing
+/// is the other half and does not follow from that: what is learned here is what refuses the same
+/// value on a *TLS* plane, toward a host it was never acquired on. Until it is a needle, that
+/// re-send is not refused anywhere, so the plane where a credential is most exposed was the one
+/// contributing least to covering it.
 #[test]
-fn a_credential_the_cage_sent_itself_becomes_a_tripwire_for_the_next_request() {
+fn the_cleartext_plane_observes_a_credential_the_cage_sent_itself() {
+    let (addr, _up_head) = spawn_plain_upstream(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    );
+    let port = addr.port();
+    let rule = format!("http://upstream.test:{port}");
+    let ctx = Arc::new(
+        ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let credentials = ctx.credentials.clone();
+    let request = format!(
+        "POST http://upstream.test:{port}/oauth/token HTTP/1.1\r\nHost: upstream.test:{port}\r\n\
+         Authorization: Bearer acquired-over-cleartext\r\nContent-Length: 0\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+    assert!(
+        resp.contains("200"),
+        "the request that teaches the value is not itself refused: {resp:?}"
+    );
+    let set = credentials.snapshot();
+    assert!(
+        set.needles
+            .iter()
+            .any(|n| n.as_bytes() == b"acquired-over-cleartext"),
+        "a credential the cage sent in the clear must join the scan set: {:?}",
+        set.needles.iter().map(|n| n.name()).collect::<Vec<_>>()
+    );
+}
+
+/// A **refused** cleartext request teaches nothing, which is the bound the guide states as "only an
+/// allowed request is observed". It exists so an agent cannot seed the scan set with a value it
+/// chose by aiming a header it controls at a host it knows is refused: such a needle would refuse
+/// the cage's own later traffic and mutate the responses it reads.
+///
+/// Two refusals stand between the verdict and the wire on this plane, and they test different
+/// things. A **verdict** refusal returns long before the observation point, so it would pass
+/// wherever the call sat. An **SSRF** refusal happens *after* the policy said yes, so it passes only
+/// if the call is placed after the guard: that case pins the insertion point, not just the rule.
+///
+/// The assertion is on the needle set itself rather than on a later request being blocked, so a pass
+/// cannot be explained by anything downstream of the observation.
+#[test]
+fn a_refused_cleartext_request_teaches_no_credential() {
+    for (case, rules, target, expected) in [
+        (
+            "verdict",
+            "http://allowed.test",
+            "http://refused.test/p",
+            "denied-default",
+        ),
+        (
+            "ssrf",
+            "http://*.corp.test",
+            "http://internal.corp.test/p",
+            "ssrf-blocked",
+        ),
+    ] {
+        let ctx = Arc::new(
+            ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rules]))
+                .unwrap()
+                // Every name resolves to loopback, which is what makes the `ssrf` case private.
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let credentials = ctx.credentials.clone();
+        let host = target
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap();
+        let request = format!(
+            "POST {target} HTTP/1.1\r\nHost: {host}\r\n\
+             Authorization: Bearer chosen-by-the-agent\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+        assert!(
+            resp.contains(expected),
+            "the `{case}` case must refuse with `{expected}`: {resp:?}"
+        );
+        assert!(
+            credentials
+                .snapshot()
+                .needles
+                .iter()
+                .all(|n| n.as_bytes() != b"chosen-by-the-agent"),
+            "the `{case}` refusal must teach nothing"
+        );
+    }
+}
+
+/// What observing buys, end to end, and where it stops. A token the cage obtained by its own
+/// sign-in belongs to no declaration, so nothing used to refuse it on the way out. Once the proxy
+/// has seen the cage send it to an allowed host, carrying it to a DIFFERENT host is refused like a
+/// declared secret's would be — the same tripwire, now covering a credential nobody configured.
+///
+/// Sending it back to the host it was acquired on is allowed, and that half is as load-bearing as
+/// the other. A session token exists to be re-sent to its own service on every subsequent request;
+/// a tripwire that fired there would turn a successful sign-in into a dead application, refusing
+/// the app's second authenticated request and every one after it. The exemption is by destination,
+/// so what the tripwire still stops is the case it exists for: the cage taking a credential it
+/// holds for one service and handing it to another.
+///
+/// The request that *taught* sbx the value is not itself refused either: observing happens after
+/// the outbound scan, so a credential can never trip on its own first use.
+#[test]
+fn an_observed_credential_is_refused_toward_another_host_and_allowed_back_to_its_own() {
+    // Two upstreams for the same name: each test upstream serves a single connection, and this
+    // test needs two requests to reach one host — the one that teaches the value, and the one that
+    // re-sends it there.
     let (addr, upstream_ca, _rx) = spawn_upstream_capturing(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let (again, again_ca, _rx2) = spawn_upstream_capturing(
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
     let mut roots = RootCertStore::empty();
     roots.add(upstream_ca).unwrap();
+    roots.add(again_ca).unwrap();
     let upstream_cfg = Arc::new(
         ClientConfig::builder()
             .with_root_certificates(roots)
@@ -7096,8 +7216,10 @@ fn a_credential_the_cage_sent_itself_becomes_a_tripwire_for_the_next_request() {
     );
     let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
     let proxy_ca_der = proxy_ca.ca_cert_der();
+    // Both hosts are allowed, so a refusal below can only come from the tripwire, never from the
+    // verdict.
     let ctx = Arc::new(
-        ProxyCtx::new(proxy_ca, policy(&["host.test:*"]))
+        ProxyCtx::new(proxy_ca, policy(&["host.test:*", "other.test:*"]))
             .unwrap()
             .with_upstream(upstream_cfg)
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
@@ -7119,20 +7241,35 @@ fn a_credential_the_cage_sent_itself_becomes_a_tripwire_for_the_next_request() {
         "the request that teaches the value must not be refused: {first:?}"
     );
 
-    // Re-sending that same value, now in a query string, is exfiltration of a credential the cage
-    // holds — and is refused exactly as a declared secret's would be.
-    let second = through_proxy(
-        ctx,
-        proxy_ca_der,
+    // The app's next authenticated request, to the service that issued the token. Allowed.
+    let again = through_proxy(
+        ctx.clone(),
+        proxy_ca_der.clone(),
         "host.test",
         "host.test",
-        addr.port(),
-        b"GET /?leak=acquired-token-0123456789 HTTP/1.1\r\nHost: host.test\r\n\r\n",
+        again.port(),
+        b"GET /me HTTP/1.1\r\nHost: host.test\r\nAuthorization: Bearer acquired-token-0123456789\r\n\r\n",
     )
     .unwrap();
     assert!(
-        second.contains("403") && second.contains("outbound-secret"),
-        "an observed credential must be refused on the way out: {second:?}"
+        again.contains("200"),
+        "an app must be able to re-send its own session token to its own service: {again:?}"
+    );
+
+    // The same value toward another host, here in a query string, is exfiltration of a credential
+    // the cage holds — and is refused exactly as a declared secret's would be.
+    let elsewhere = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "other.test",
+        "other.test",
+        addr.port(),
+        b"GET /?leak=acquired-token-0123456789 HTTP/1.1\r\nHost: other.test\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        elsewhere.contains("403") && elsewhere.contains("outbound-secret"),
+        "an observed credential must be refused toward a host it was not acquired on: {elsewhere:?}"
     );
 }
 

@@ -458,7 +458,7 @@ impl RuleKind {
             }
             RuleKind::Host(h, ports) => ports.admits(req.port) && &req.host == h,
             RuleKind::Subdomain(d, ports) => {
-                ports.admits(req.port) && (&req.host == d || req.host.ends_with(&format!(".{d}")))
+                ports.admits(req.port) && apex_or_subdomain(d, &req.host)
             }
             RuleKind::Url {
                 host: h,
@@ -483,7 +483,7 @@ impl RuleKind {
                 .map(|h| &h == ip)
                 .unwrap_or(false),
             RuleKind::Host(h, _) => &req.host == h,
-            RuleKind::Subdomain(d, _) => &req.host == d || req.host.ends_with(&format!(".{d}")),
+            RuleKind::Subdomain(d, _) => apex_or_subdomain(d, &req.host),
             RuleKind::Url {
                 host: h,
                 path: pa,
@@ -566,6 +566,22 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Whether `host` is `domain` itself or a subdomain of it: the question a `*.domain` rule asks.
+///
+/// The separating dot is required, so `domain.evil.com` never matches `*.domain` and
+/// `xexample.com` never matches `example.com`. Written without building `".{domain}"`: the verdict
+/// sweeps its rule lists several times per request, and a `format!` there allocates once per rule
+/// per sweep, only to compare against bytes both sides already hold.
+///
+/// One definition for the three places that ask it (the verdict, the port-agnostic `mute` match,
+/// and the HTTP/2 host list), so the separator rule cannot be right in one and wrong in another.
+fn apex_or_subdomain(domain: &str, host: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
 
 /// Canonicalize a host for matching: lowercase it, drop a trailing DNS root dot, and if it is an
@@ -790,7 +806,7 @@ impl Http2Host {
     /// a leading `.` is required, so `domain.evil.com` never matches `*.domain`).
     fn matches(&self, host: &str, port: u16) -> bool {
         let host_ok = if self.subdomain {
-            host == self.host || host.ends_with(&format!(".{}", self.host))
+            apex_or_subdomain(&self.host, host)
         } else {
             host == self.host
         };
@@ -1474,6 +1490,38 @@ mod tests {
 
     fn rule(s: &str) -> Rule {
         classify(s).unwrap_or_else(|e| panic!("classify({s:?}) failed: {e}"))
+    }
+
+    /// The separator rule of `*.domain`, on the shape that decides it rather than on a policy.
+    ///
+    /// Every expectation is a **literal**, never re-derived from a `".{domain}"` the code could
+    /// build the same wrong way: a table that computes its own answer agrees with any
+    /// implementation, including a broken one. The entries are the ones where a suffix test can go
+    /// wrong: the apex itself, a real subdomain, a name that merely *ends* with the domain, a
+    /// domain that appears in the middle, an empty side, and a leading dot.
+    #[test]
+    fn a_wildcard_domain_matches_its_apex_and_below_but_never_a_bare_suffix() {
+        for (domain, host, expected) in [
+            ("example.com", "example.com", true),
+            ("example.com", "a.example.com", true),
+            ("example.com", "a.b.example.com", true),
+            ("example.com", "xexample.com", false),
+            ("example.com", "example.com.evil.net", false),
+            ("example.com", "a.example.com.evil.net", false),
+            ("example.com", ".example.com", true),
+            ("example.com", "", false),
+            ("example.com", "com", false),
+            ("", "example.com", false),
+            ("", "", true),
+            (".example.com", "a.example.com", false),
+            (".example.com", "a..example.com", true),
+        ] {
+            assert_eq!(
+                apex_or_subdomain(domain, host),
+                expected,
+                "`*.{domain}` against `{host}`"
+            );
+        }
     }
 
     #[test]
