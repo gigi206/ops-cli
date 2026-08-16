@@ -833,4 +833,252 @@ mod tests {
             "sbx: projects show: name a tree id — usage: sbx projects show <id> [--json]"
         );
     }
+
+    // ---- the dispatch is answerable to the help table ---------------------------------------
+
+    /// One dispatcher: the command path it routes under, and the tokens its arms accept.
+    struct Head {
+        file: String,
+        path: Vec<String>,
+        verbs: Vec<String>,
+    }
+
+    /// The words of a `&["a", "b"]` slice literal starting at `from`, or `None` if it is not one.
+    fn slice_words(line: &str, from: usize) -> Option<Vec<String>> {
+        let rest = line[from..].strip_prefix("&[")?;
+        let end = rest.find(']')?;
+        let inner = &rest[..end];
+        // A quoted list alternates outside/inside: take the odd positions, and reject anything
+        // with an unquoted token between them (a path built from a variable is not a literal).
+        let mut words = Vec::new();
+        let mut parts = 0;
+        for (idx, part) in inner.split('"').enumerate() {
+            parts = idx + 1;
+            if idx % 2 == 1 {
+                words.push(part.to_string());
+            } else if !part.trim_matches([' ', ',']).is_empty() {
+                return None;
+            }
+        }
+        (!words.is_empty() && parts % 2 == 1).then_some(words)
+    }
+
+    /// The command path a dispatcher runs under, read from what it already writes down: the
+    /// `sbx …` synopsis opening its doc comment, and the page paths its body names. Every
+    /// candidate is checked against the help table and the shortest wins, since a body may also
+    /// name a child's page (`config` names `config show`, `plugins store` names its `add`).
+    fn declared_path(doc: &str, body: &str) -> Option<Vec<String>> {
+        let mut candidates: Vec<Vec<String>> = Vec::new();
+        // From the doc synopsis: take words after "`sbx " while the path stays a known one.
+        if let Some(at) = doc.find("`sbx ") {
+            let mut path: Vec<String> = Vec::new();
+            for word in doc[at + 5..].split_whitespace() {
+                let word = word.trim_end_matches('`');
+                if !word
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                {
+                    break;
+                }
+                let mut deeper = path.clone();
+                deeper.push(word.to_string());
+                let refs: Vec<&str> = deeper.iter().map(String::as_str).collect();
+                if !crate::help::is_command_path(&refs) {
+                    break;
+                }
+                path = deeper;
+            }
+            if !path.is_empty() {
+                candidates.push(path);
+            }
+        }
+        // From the body: every `&["…"]` slice literal that names a page.
+        for (i, _) in body.match_indices("&[") {
+            if let Some(words) = slice_words(body, i) {
+                let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+                if crate::help::is_command_path(&refs) && !words.is_empty() {
+                    candidates.push(words);
+                }
+            }
+        }
+        candidates.sort_by_key(Vec::len);
+        candidates.into_iter().next()
+    }
+
+    /// Every dispatcher under `src/cli`, found by the idiom they all share — `match` on the first
+    /// argument read as a string — rather than by a list kept here. Finding them is the whole
+    /// point: a list would go stale exactly like the one this replaces.
+    fn dispatch_heads() -> Vec<Head> {
+        const IDIOM: &str = ".first().and_then(|a| a.to_str())";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
+        let mut heads = Vec::new();
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("src/cli must be readable")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        files.sort();
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("a cli source must be readable");
+            let lines: Vec<&str> = text.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let t = line.trim();
+                if !(t.starts_with("match ") && t.contains(IDIOM) && t.ends_with('{')) {
+                    continue;
+                }
+                // The enclosing function, and the doc comment above it.
+                let is_fn = |line: &str| {
+                    let t = line.trim_start();
+                    let t = t.strip_prefix("pub").map_or(t, |r| {
+                        r.split_once(' ').map_or(r, |(vis, rest)| {
+                            if vis.is_empty() || vis.starts_with('(') {
+                                rest
+                            } else {
+                                t
+                            }
+                        })
+                    });
+                    t.starts_with("fn ")
+                };
+                let mut start = n;
+                while start > 0 && !is_fn(lines[start]) {
+                    start -= 1;
+                }
+                let mut doc_from = start;
+                while doc_from > 0 && lines[doc_from - 1].trim_start().starts_with("///") {
+                    doc_from -= 1;
+                }
+                let doc = lines[doc_from..start].join("\n");
+                // The arms of *this* match, and not of one nested inside it: depth is counted
+                // from the match's own brace, and only depth 1 is its own arm list. A nested
+                // match holds a different vocabulary (`config` reads flags in its fallback), and
+                // reading those as routed subcommands is how a hand-rolled scan lies.
+                let mut verbs: Vec<String> = Vec::new();
+                let mut depth = 0i32;
+                let mut body = String::new();
+                for line in &lines[n..] {
+                    let before = depth;
+                    if before == 1
+                        && let Some(arrow) = line.find("=>")
+                        && line.trim_start().starts_with("Some(")
+                    {
+                        let pattern = &line[..arrow];
+                        let mut quoted = pattern.split('"');
+                        quoted.next();
+                        while let Some(word) = quoted.next() {
+                            verbs.push(word.to_string());
+                            if quoted.next().is_none() {
+                                break;
+                            }
+                        }
+                    }
+                    body.push_str(line);
+                    body.push('\n');
+                    depth += line.matches('{').count() as i32;
+                    depth -= line.matches('}').count() as i32;
+                    if depth <= 0 {
+                        break;
+                    }
+                }
+                let Some(path) = declared_path(&doc, &body) else {
+                    panic!(
+                        "{}:{}: this dispatcher names no command path, so nothing can check what \
+                         it routes — open its doc comment with the `sbx <path> …` synopsis it \
+                         dispatches under",
+                        file.display(),
+                        n + 1
+                    )
+                };
+                heads.push(Head {
+                    file: format!("{}:{}", file.display(), n + 1),
+                    path,
+                    verbs,
+                });
+            }
+        }
+        heads
+    }
+
+    /// Whether `path`'s page names `verb`, as a subcommand of its own or in an option row.
+    ///
+    /// Both count, because both are how this CLI documents a subcommand: most get a page, and a
+    /// family whose verbs are one line each is described on its parent instead (`storage init`,
+    /// `proc pending deny`). An option row's key is human grammar, so it is matched word by word —
+    /// `allow <id> | deny <id>` names two verbs on one row.
+    fn page_names_verb(path: &[String], verb: &str) -> bool {
+        let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        let verb = crate::help::canonical(&refs, verb);
+        crate::help::subcommands_of(&refs)
+            .iter()
+            .any(|(name, _)| *name == verb)
+            || crate::help::options_of(&refs).iter().any(|(key, _)| {
+                key.split([' ', '|'])
+                    .any(|word| word == verb && !word.starts_with('-'))
+            })
+    }
+
+    /// Every subcommand a dispatcher routes is named by the page of the command it sits under.
+    ///
+    /// This is the direction `tests/help.rs` cannot see. That sweep walks the help table, so a verb
+    /// wired into a `match` and absent from the table is absent from the sweep too: it runs, it is
+    /// missing from `--help`, and shell completion never offers it. Measured by mutation before it
+    /// was written — an arm added to `app_cmd` with no page left 32 tests green.
+    ///
+    /// The dispatchers are **found**, not listed, and each one's path is read from what it already
+    /// writes down. A list here would be the same mirror kept by hand that this repository has
+    /// already been bitten by, one file away.
+    ///
+    /// What it does not check: that the prose is right, or that a verb the table declares is
+    /// actually routed. The first is not machine-checkable; the second is what `tests/help.rs`
+    /// covers, from the other side.
+    #[test]
+    fn every_routed_subcommand_is_named_by_its_parents_page() {
+        let heads = dispatch_heads();
+        // The precondition before the property: a scan that matched nothing would satisfy every
+        // assertion below by having nothing to assert. The floor sits well under the real count.
+        assert!(
+            heads.len() >= 15,
+            "the scan found only {} dispatchers, so it is not scanning",
+            heads.len()
+        );
+        // And the sharper half of the precondition: the scan's completeness is answerable to the
+        // table rather than to a floor. Every command the table gives children to is dispatched by
+        // something, so a family the scan walked past — a dispatcher written to a new idiom — is a
+        // family with subcommand pages and no head, and says so here instead of being skipped.
+        // (Two dispatchers are *not* covered by this, `storage` and `proc pending`, whose verbs
+        // live in their parent's option rows rather than in pages of their own.)
+        let mut parents: Vec<Vec<String>> = crate::help::all_paths()
+            .iter()
+            .filter(|p| p.len() > 1)
+            .map(|p| p[..p.len() - 1].iter().map(|w| (*w).to_string()).collect())
+            .collect();
+        parents.sort();
+        parents.dedup();
+        for parent in &parents {
+            assert!(
+                heads.iter().any(|h| &h.path == parent),
+                "`sbx {}` has subcommand pages but the scan found no dispatcher for it — it is \
+                 written to an idiom this test does not recognize, so nothing checks what it routes",
+                parent.join(" ")
+            );
+        }
+        for head in &heads {
+            assert!(
+                !head.verbs.is_empty(),
+                "{}: a dispatcher with no arms means the arm scan broke",
+                head.file
+            );
+            for verb in &head.verbs {
+                assert!(
+                    page_names_verb(&head.path, verb),
+                    "{}: `sbx {} {verb}` is routed, but the `{}` page names it neither as a \
+                     subcommand nor in an option row — add its page, or its row",
+                    head.file,
+                    head.path.join(" "),
+                    head.path.join(" ")
+                );
+            }
+        }
+    }
 }
