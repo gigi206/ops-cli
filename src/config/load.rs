@@ -334,9 +334,19 @@ fn control_plane_mode(
 /// Returns those mounts as host binds (source == destination), deduplicated and ordered
 /// shallow-to-deep so a parent mountpoint is always established before its child — a child bound
 /// first would be shadowed when the parent is later mounted over it, silently defeating the
-/// protection. The caller binds them last (the final word on those paths) and creates each before
-/// binding (a root the agent could otherwise create fresh). Iterates the same root set as
-/// [`control_plane_mode`], so a root added there is pinned here automatically.
+/// protection. The caller creates each before binding (a root the agent could otherwise create
+/// fresh) and emits them after every structural mount, so the read-write bind that contains a root
+/// is already in place when the pin lands on it — that ordering is the mechanism, not tidiness.
+///
+/// What it must keep true afterwards is the *destination*: a later mount on a pinned path replaces
+/// what the cage finds there, which is the substitution these pins exist to prevent. The launcher
+/// does append binds after them (the task control socket and its generated client), and those are
+/// safe not because they come first — they do not — but because their destinations are sbx's own
+/// constants: nothing a project configures chooses them. **A bind appended after the pins whose
+/// destination is derived from the configuration would break the protection.**
+///
+/// Iterates the same root set as [`control_plane_mode`], so a root added there is pinned here
+/// automatically.
 pub(crate) fn control_plane_pins(binds: &[Bind]) -> Vec<Bind> {
     control_plane_pins_for(binds, &sbx_control_plane_roots())
 }

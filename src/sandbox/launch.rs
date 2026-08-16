@@ -5316,8 +5316,10 @@ fn build(
     // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
     // code cannot rename a writable parent to move a control-plane root aside and recreate a forged
     // one at the same path — which sbx would otherwise read or `execve` on its next run. The bind
-    // stays read-write; only these specific host paths are protected. Appended last, so the pins
-    // are the final word on those paths (nothing structural touches them).
+    // stays read-write; only these specific host paths are protected. Emitted after the structural
+    // mounts — the containing read-write bind has to be in place before the pin lands on it. Binds
+    // are appended after this block (the task control plane below); the rule they have to respect
+    // is stated on `control_plane_pins`, and it is about their destination, not their position.
     //
     // Interdependency: the protection assumes in-cage code cannot `umount` a pin. That holds because
     // bwrap drops all capabilities (no `CAP_SYS_ADMIN` in the cage's user namespace) and the seccomp
