@@ -92,6 +92,11 @@
 # succeed, so it skips its own copy and uses the staged tree. Copies ~140 MB into the app home on the
 # first launch (a reflink where the filesystem supports it) and is a no-op afterwards; AionCore then
 # installs into that tree itself, which measured ~210 MB once settled.
+# The stage repeats on one other event: when the staged runtime stops RUNNING, which is what
+# reclaiming the nixpkgs revision it was copied from does to it (see the guard in `cmd`). The copy is
+# replaced, and AionCore's own install inside it goes with it, to be redone against the new runtime —
+# which is the point, an install linked against reclaimed store paths is not worth keeping — but it
+# is not free, so it is tied to that event and to nothing else.
 # RESIDUAL: the bundled CLIs beside it (`managed-resources/cli/`, ~590 MB — claude, codex) are
 # installed ON DEMAND, only when you pick one as the agent, and may hit the same read-only-rewrite
 # failure. That path was not exercised, so it is not staged here; the co-worked CLIs below come from
@@ -110,12 +115,24 @@ NODEDEST="$HOME/.config/AionUi/aionui/runtime/node"
 for v in "$NODESRC"/*/; do
     [ -d "$v" ] || continue
     n=$(basename "$v")
-    # Keyed by the runtime directory name (which carries the Node version), so an upgrade that brings
-    # a new Node stages the new one instead of trusting a marker. `-x` catches a tree staged without
-    # its exec bits (AionCore starts the runtime to validate it); `-w` catches one staged read-only.
-    [ -x "$NODEDEST/$n/bin/node" ] && [ -w "$NODEDEST/$n/bin/node" ] && continue
-    echo "sbx: staging the bundled Node runtime ($n) into the app home — first launch only" >&2
+    # The staged tree is a COPY out of the store, so it carries the store paths of the revision that
+    # built the `.deb`: `bin/node`'s ELF interpreter (glibc's `ld-linux`) and the shebangs of the npm
+    # and corepack shims beside it. A new nixpkgs revision rebuilds the app against new ones and
+    # `sbx gc --prune` reclaims the old revision, at which point the copy points at paths that are
+    # gone while remaining a directory that is present, executable and writable. So the guard RUNS
+    # the staged binary instead of testing that it is there: exec is what fails when the loader is
+    # reclaimed, and neither the runtime's name nor its modes move on that event. The one binary
+    # answers for the shims too — its loader and their `bash` are held alive by the same revision
+    # gcroot, so they are reclaimed together. `-w` stays a test of its own, since exec never sees it:
+    # AionCore rewrites `blank_user_npmrc`/`blank_global_npmrc` inside the copy, which is what fails
+    # on a tree staged read-only.
+    [ -w "$NODEDEST/$n/bin/node" ] && "$NODEDEST/$n/bin/node" --version >/dev/null 2>&1 && continue
+    echo "sbx: staging the bundled Node runtime ($n) into the app home (first launch, or after the runtime's store paths were reclaimed)" >&2
     mkdir -p "$NODEDEST"
+    # A tree copied out of the store and never chmod-ed carries the store's own modes, and `rm -rf`
+    # cannot unlink inside a directory it may not write: the restage would fail on exactly the state
+    # it exists to repair. Make it writable first, ignoring the case where there is nothing there.
+    chmod -R u+w "$NODEDEST/$n" 2>/dev/null || true
     rm -rf "$NODEDEST/$n"
     cp -r --reflink=auto "$NODESRC/$n" "$NODEDEST/" && chmod -R u+w "$NODEDEST/$n"
 done

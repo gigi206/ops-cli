@@ -9135,6 +9135,116 @@ fn every_shipped_shell_profile_forwards_its_trailing_arguments() {
 }
 
 #[test]
+fn a_runtime_staged_out_of_the_store_is_restaged_once_it_stops_running() {
+    // `aionui` is the one shipped profile whose wrapper copies a tree OUT of the nix store into the
+    // app's persistent home, because the app rewrites files inside it and the store is read-only.
+    // The copy keeps the store paths of the revision it came from — `bin/node`'s ELF interpreter,
+    // the shebangs of the npm and corepack shims beside it — so a launch that resolves against a
+    // newer revision, plus a `gc --prune` of the old one, leaves a tree that is still present, still
+    // executable and still writable, and that cannot run. A guard keyed on the tree's presence skips
+    // it forever, and the app reports only that its installation is incomplete.
+    //
+    // This runs the SHIPPED script, unmodified, against a stand-in app root: the profile's own
+    // `command -v aionui` lookup and its own `$HOME` are what place the two trees.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let profile = root.join("examples/app/aionui.toml");
+    let raw = schema::parse_app(&std::fs::read(&profile).expect("read the profile")).unwrap();
+    let argv = raw.cmd.expect("aionui ships a command").into_argv();
+    let script = argv.last().expect("the wrapper script").clone();
+    assert!(
+        script.contains("managed-resources/node"),
+        "`examples/app/aionui.toml` no longer stages the bundled Node runtime; this guard now \
+         asserts nothing and must be retargeted or removed"
+    );
+
+    let tmp = TmpDir::new();
+    let (app, home) = (tmp.path().join("approot"), tmp.path().join("home"));
+    let src =
+        app.join("opt/AionUi/resources/bundled-aioncore/linux-x64/managed-resources/node/v24/bin");
+    let dest = home.join(".config/AionUi/aionui/runtime/node/v24");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    // The launcher the script derives the app root from, and the runtime it stages. Both are given
+    // the store's own modes: read-only, executable, which is the state the staging exists to escape.
+    let write_exec = |path: &std::path::Path, body: &str, mode: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    write_exec(&app.join("bin/aionui"), "#!/bin/sh\nexit 0\n", 0o555);
+    write_exec(&src.join("node"), "#!/bin/sh\necho v24.0.0\n", 0o555);
+
+    let launch = || {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", app.join("bin").display()),
+            )
+            .output()
+            .expect("run the shipped wrapper");
+        assert!(out.status.success(), "the wrapper failed: {out:?}");
+    };
+    let node = dest.join("bin/node");
+    let runs = || {
+        std::process::Command::new(&node)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+
+    // 1. Nothing staged yet: the runtime lands, writable, and runs.
+    launch();
+    assert!(runs(), "the first launch did not stage a runnable runtime");
+    assert!(
+        !node.metadata().unwrap().permissions().readonly(),
+        "staged read-only"
+    );
+
+    // 2. A relaunch leaves it alone — the marker survives, so nothing was re-copied. Restaging is not
+    //    free: it discards whatever the app installed into the tree.
+    let marker = dest.join(".installed-by-the-app");
+    std::fs::write(&marker, "x").unwrap();
+    launch();
+    assert!(
+        marker.exists(),
+        "a healthy runtime was restaged, discarding the app's own install"
+    );
+
+    // 3. The revision it was copied from is reclaimed: the file is there, executable and writable,
+    //    and its interpreter is not. Presence says fine; running says otherwise.
+    write_exec(
+        &node,
+        "#!/nix/store/0000000000000000-reclaimed/bin/sh\n",
+        0o755,
+    );
+    assert!(!runs(), "the broken-runtime state was not reproduced");
+    launch();
+    assert!(
+        runs(),
+        "a runtime whose interpreter was reclaimed was left in place"
+    );
+    assert!(!marker.exists(), "the tree was not replaced");
+
+    // 4. A stage that never got its write bits: the repair must be able to remove what it replaces,
+    //    which `rm -rf` cannot do inside directories it may not write.
+    for p in [dest.join("bin"), dest.clone()] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    write_exec(&node, "#!/bin/sh\necho v24.0.0\n", 0o555);
+    launch();
+    assert!(runs(), "a read-only stage was not repaired");
+    assert!(
+        !node.metadata().unwrap().permissions().readonly(),
+        "still read-only"
+    );
+}
+
+#[test]
 fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
     // The shipped bundles under `examples/bundle/` are the single source of truth for what each
     // agent needs: the namesake profile under `examples/app/` no longer restates any of it — it
