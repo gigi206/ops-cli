@@ -156,6 +156,18 @@ When such a rebuild empties what a later step installed, the stamp that records 
 with it. A stamp left behind would skip the install and leave the app importing what is no longer
 there.
 
+A tree **copied** out of the store fails the same way for a different reason, and the copy is what
+hides it. Nothing in it is a symlink, so nothing looks stale: the files are real, present and
+executable. What they carry are the store paths of the revision they were copied from, in a binary's
+ELF interpreter and in the shebangs of the scripts beside it. Roll the channel, reclaim the old
+revision, and the tree is intact and cannot run. Key the guard on running the program the copy exists
+to provide, never on the copy's name or its modes, since neither of those moves on that event. This
+holds wherever the staging runs, in a `provision` step or in an app's own `cmd`.
+
+Repairing a copy also means removing it, and a copy that kept the store's own modes cannot be
+removed: `rm -rf` does not unlink inside a directory it may not write, so the repair fails on exactly
+the state it exists to fix. Make the tree writable before replacing it.
+
 The roll that moves the store [says so as it closes](../cli/upgrade#after-a-roll-that-moved-the-store),
 naming the apps whose steps build against those paths. That announcement is what tells you a
 repair is pending; whether the repair actually happens is decided here, by the guard you wrote.
