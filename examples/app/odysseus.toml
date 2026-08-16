@@ -1,7 +1,8 @@
 # Odysseus — a self-hosted AI workspace (chat, agents, research, docs, email,
 # notes, calendar, local-model workflows), served as a web UI by sbx.
 #
-#   sbx app import examples/app/odysseus.toml
+#   sbx bundle import examples/bundle/odysseus.toml
+#   sbx app import    examples/app/odysseus.toml
 #   sbx app run odysseus
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The substrate its source build needs and the hosts it reaches come from a
@@ -31,7 +32,7 @@
 # first launch. The clone and the install are the `odysseus` bundle's install step,
 # which sbx runs before this command; what stays here is what shapes the running
 # process. Roll it with
-#     sbx upgrade provision
+#     sbx app upgrade odysseus
 # which re-runs that step in this app's cage, or refresh it for ONE launch with
 #     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
 # which fetches `main`, hard-resets the checkout, and re-installs the dependencies
@@ -58,10 +59,11 @@
 #
 # DEGRADED SERVICES (vs the full Docker stack). The compose bundles ChromaDB
 # (vector memory), SearXNG (web search), and ntfy (notifications) as separate
-# containers. This native profile runs ONLY the app server, so:
-#   - Vector memory falls back to an in-process MemoryVectorStore (the server logs
-#     "DEGRADED" / "MemoryVectorStore" — functional, not persisted across recreates
-#     the way a ChromaDB volume is).
+# containers. Of those, only the vector store runs here, so:
+#   - Vector memory is real and persistent: ChromaDB is declared as a service in the
+#     bundle and runs in this same cage, on the cage loopback, writing to
+#     ~/chroma-data in the app's home. Without it the server would fall back to an
+#     in-process MemoryVectorStore and log "DEGRADED" / "MemoryVectorStore".
 #   - Web search needs a provider: configure a Google/Brave/Tavily API key in
 #     Settings, or point SEARXNG_INSTANCE at your own SearXNG. Without one, the
 #     Deep Research / web-search tools cannot reach the internet through the allowlist.
@@ -107,26 +109,12 @@ WRAP
   export ODYSSEUS_BROWSER_EXECUTABLE="$HOME/chromium-wrap.sh"
   break
 done
-# Vector memory (ChromaDB) — Odysseus expects it beside the app on :8100 and degrades if it is
-# absent. It persists to $HOME/chroma-data so the store survives restarts. The server binds
-# 0.0.0.0 (all cage interfaces) while `[env]` sets CHROMADB_HOST=127.0.0.1, so Odysseus reaches the
-# literal IPv4 loopback: a `localhost` that resolved to ::1 in the cage would refuse silently while
-# the server is up. `nohup` + `&` keeps it alive after `exec uvicorn` replaces this shell.
-# NOTE: modern chromadb installs its server as `chroma`, NOT `chromadb` — `chromadb run` is a
-# command-not-found that silently kills the background server.
-mkdir -p "$HOME/chroma-data"
-nohup chroma run --host 0.0.0.0 --port 8100 --path "$HOME/chroma-data" > "$HOME/chroma.log" 2>&1 &
-# Give ChromaDB a moment to bind :8100 (Odysseus retries anyway; this avoids the startup warning).
-# The probe runs inside `if` so a closed port does not trip `set -e` before `exec uvicorn`.
-for _ in $(seq 1 30); do
-  if python - <<'PY' >/dev/null 2>&1
-import socket; socket.create_connection(("127.0.0.1", 8100), timeout=1)
-PY
-  then break; fi
-  sleep 0.5
-done
+# The vector store (ChromaDB) it talks to is already up: the bundle declares it as a service, and
+# sbx started it and waited for its port before this command ran. See
+# `[bundle.odysseus.service.chroma]` and `~/.sbx-service-chroma.log`.
+#
 # Serve on the cage loopback; `forward` below bridges host 127.0.0.1:7000 -> cage.
-exec uvicorn app:app --host 127.0.0.1 --port 7000
+exec uvicorn app:app --host 127.0.0.1 --port 7000 "$@"
 ''',
 ]
 
@@ -154,7 +142,7 @@ forward = [7000]
 # the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
 # the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/odysseus.toml
 # Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
 use = ["odysseus"]

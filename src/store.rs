@@ -69,9 +69,12 @@ impl Layout {
         );
         if data_dir.is_none() {
             // The decision came from `data_dir_from`; the wording comes from the same
-            // check it consulted, so the two cannot describe different refusals.
+            // check it consulted, so the two cannot describe different refusals. The gate
+            // comes last on purpose: it latches, so it must be reached only once the
+            // refusal is about to be spoken.
             if let Some(over) = over.as_deref().filter(|o| !o.is_empty())
                 && let Err(why) = check_data_dir_override(over)
+                && refusal_unspoken()
             {
                 crate::diag::error(&format!("sbx: {why}"));
             }
@@ -89,12 +92,16 @@ impl Layout {
                     // Fail closed. The mount point exists only while mounted, and it lives
                     // under `/run` — a tmpfs. Carrying on with the unmounted path would
                     // provision gigabytes into RAM and present an empty store as the truth.
-                    crate::diag::error(&format!(
-                        "sbx: sbx's data is in a volume that could not be mounted: {why}"
-                    ));
-                    crate::diag::error(
-                        "sbx: refusing to continue rather than use an empty data directory",
-                    );
+                    // Both lines are inside the gate: they are one diagnostic, and speaking
+                    // the refusal without the consequence would stop mid-sentence.
+                    if refusal_unspoken() {
+                        crate::diag::error(&format!(
+                            "sbx: sbx's data is in a volume that could not be mounted: {why}"
+                        ));
+                        crate::diag::error(
+                            "sbx: refusing to continue rather than use an empty data directory",
+                        );
+                    }
                     return None;
                 }
             }
@@ -107,7 +114,9 @@ impl Layout {
         // `sbx storage` anchors to `default_data_dir`, not this path, so a volume can still be
         // adopted to fix it.
         if let Err(why) = check_resolved_data_dir(&data_dir) {
-            crate::diag::error(&format!("sbx: {why}"));
+            if refusal_unspoken() {
+                crate::diag::error(&format!("sbx: {why}"));
+            }
             return None;
         }
         Some(Self { data_dir })
@@ -207,6 +216,31 @@ fn follow_volume(default_dir: &Path) -> Option<Result<PathBuf, String>> {
             Some(crate::storage::ensure_mounted(&image))
         })
         .clone()
+}
+
+/// True the first time it is called in a process, false ever after — the gate the data-directory
+/// refusals speak through.
+///
+/// [`Layout::from_env`] is consulted by every layer that needs the store, dozens of times in a
+/// single command, and each consultation re-derives the same refusal from the same environment.
+/// Printed per consultation, one fact about the environment becomes a wall of identical lines —
+/// nine of them for `sbx config show` — and a reader counts failures instead of reading one.
+///
+/// A gate around the *block* rather than a wrapper around each print, because the volume refusal
+/// is two lines: a per-line gate would speak the first and swallow the second, leaving a
+/// diagnostic that stops mid-sentence.
+///
+/// One gate for the whole family rather than one per message, because at most one refusal can be
+/// true in a process. The environment decides, it is read afresh on every call, and the only code
+/// that rewrites it mid-process (`cli::storage`, after adopting a volume) points it at a mount
+/// point under `/run` — short by construction, and the very remedy the refusal names, so the
+/// second reading cannot refuse. **Trigger:** a second path that changes `$SBX_DATA_DIR`,
+/// `$XDG_DATA_HOME` or `$HOME` mid-process to something that can *also* be refused would go
+/// unspoken here; key the gate by message text then.
+fn refusal_unspoken() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SPOKEN: AtomicBool = AtomicBool::new(false);
+    !SPOKEN.swap(true, Ordering::Relaxed)
 }
 
 /// Whether `$SBX_DATA_DIR` is what selected the data directory. Surfaced by `doctor` so a
@@ -975,6 +1009,17 @@ impl LockTarget {
     /// lock never displays as current. Pure file read: no nix, no network.
     pub(crate) fn locked_revision(&self) -> Option<String> {
         read_lock(&self.lock_path).and_then(|(s, r)| (s == self.source).then_some(r))
+    }
+
+    /// The revision recorded here before a roll, **whatever source recorded it**.
+    ///
+    /// Deliberately not [`Self::locked_revision`], which is scoped to the current source so that a
+    /// stale lock never *displays* as current. This answers a different question: "was there a
+    /// build here that this roll supersedes?" — and a lock recording another source answers yes.
+    /// Switching a pin repoints the store exactly as rolling one forward does, so a caller asking
+    /// what a roll invalidated must see both. Pure file read: no nix, no network.
+    pub(crate) fn previously_locked(&self) -> Option<String> {
+        read_lock(&self.lock_path).map(|(_, rev)| rev)
     }
 
     /// Resolve to a pinned `github:NixOS/nixpkgs/<rev>`, reusing the lock when its

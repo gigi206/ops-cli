@@ -1,7 +1,8 @@
 # trae — ByteDance's research CLI agent for general-purpose software engineering
 # tasks (bytedance/trae-agent), sandboxed by sbx.
 #
-#   sbx app import examples/app/trae.toml
+#   sbx bundle import examples/bundle/trae.toml
+#   sbx app import    examples/app/trae.toml
 #   sbx app run trae
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The interpreter its source install needs and the hosts it reaches come from a
@@ -36,7 +37,7 @@
 #
 # Installed once on the first launch; persistent across projects (the same
 # isolated home). Trae rides no `[packages]` backend, so what advances it is running its install
-# again: `sbx upgrade provision`, the channel for exactly this shape. For one launch only, `sbx
+# again: `sbx app upgrade trae`, which re-runs that step in this app's cage. For one launch only, `sbx
 # app run trae --env TRAE_SBX_UPDATE=1` does the same (the `--env` override is read on the HOST
 # and authoritative for that launch). Either way the version moves only when you ask, matching
 # the "versions move only on an explicit upgrade" contract.
@@ -123,7 +124,7 @@ exec trae-cli "$@"
 # the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
 # the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/trae.toml
 # Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
 use = ["trae"]

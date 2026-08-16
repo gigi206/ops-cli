@@ -1,6 +1,7 @@
 # AionUi — the multi-agent "Cowork" desktop app (iOfficeAI/AionUi), sandboxed by sbx on Wayland.
 #
-#   sbx app import examples/app/aionui.toml
+#   sbx bundle import examples/bundle/opencode.toml
+#   sbx app import    examples/app/aionui.toml
 #   sbx app run aionui
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
@@ -69,15 +70,14 @@
 # socket). Requires `gui = "wayland"`. The login keyring is never exposed.
 # IN-CAGE BROWSER (for OAuth / "login without an API key"). AionUi opens external URLs via Electron's
 # `shell.openExternal` -> `xdg-open`, and (per its own docs) delegates OAuth account login to a CLI
-# whose callback is a loopback server. The hermetic cage has no host browser, so the command is a bash
-# wrapper (not a bare argv) that installs an `xdg-open` launching an IN-CAGE Chromium for http(s) — so
-# the whole flow (the provider consent page + the `localhost:<port>` callback) closes inside the
-# sandbox, no host browser, no `forward`. Same pattern as claude-desktop / hermes-desktop. HEAVY: it
-# pulls the Chromium closure into the store on first launch (see [packages]). The provider's OWN login
+# whose callback is a loopback server. The hermetic cage has no host browser, so the `[open]` table
+# below sends http(s) to an IN-CAGE Chromium — the provider consent page and the `localhost:<port>`
+# callback both resolve inside the sandbox, no host browser, no `forward`. Same pattern as
+# claude-desktop / hermes-desktop. HEAVY: it pulls the Chromium closure into the store on first
+# launch (see [packages]). The provider's OWN login
 # hosts must be in [network] below — add them from `sbx net logs -a aionui` on your first login attempt.
 # `--password-store=basic` forces the file cookie store (no keyring in the cage) so the OAuth session
-# survives a relaunch. If you only ever use API keys, drop this wrapper + the chromium package for a
-# bare `aionui` argv.
+# survives a relaunch. If you only ever use API keys, drop the `[open]` table + the chromium package.
 #
 # MANAGED NODE RUNTIME (why the wrapper stages it). AionUi's backend, AionCore, ships a bundled Node
 # runtime under `resources/bundled-aioncore/…/managed-resources/node/` and, at first start, copies it
@@ -100,39 +100,6 @@ cmd = [
     "bash",
     "-c",
     '''
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-case "$1" in
-  http://*|https://*)
-    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
-      --no-first-run --no-default-browser-check "$@" ;;
-  *)
-    exec aionui --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage "$@" ;;
-esac
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
-
-# Under `dbus = true` Electron opens external URLs via `org.freedesktop.portal.OpenURI`, not `xdg-open`
-# directly; the portal shows "no apps available" unless a default http/https handler is registered, which
-# silently breaks the login links. Register the wrapper as that handler. The Exec path is ABSOLUTE
-# ($HOME expanded here) because the portal-launched handler does not inherit this shell's PATH.
-mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=sbx URL handler
-Exec=$HOME/.local/bin/xdg-open %U
-MimeType=x-scheme-handler/http;x-scheme-handler/https;
-NoDisplay=true
-Terminal=false
-EOF
-cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
-[Default Applications]
-x-scheme-handler/http=sbx-open-uri.desktop
-x-scheme-handler/https=sbx-open-uri.desktop
-MIMEAPPS
 
 # AionCore's bundled Node runtime, staged WRITABLE out of the read-only store (see the note above).
 # The app root is derived from the launcher on PATH, never hard-coded: the `.deb` is rebuilt at a new
@@ -154,7 +121,7 @@ for v in "$NODESRC"/*/; do
 done
 
 exec aionui --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic
+    --use-system-ca --password-store=basic "$@"
 ''',
 ]
 
@@ -173,7 +140,7 @@ dbus = true
 # `platform.claude.com`, which the CLI contacts at EVERY startup — the co-worked agent was unusable
 # and nothing said why.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/opencode.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 #
@@ -192,13 +159,27 @@ use = ["opencode"]
 #    { path = "~/work/aionui", mode = "rw" },
 #]
 
+# Where a web link opens: the in-cage Chromium. One declaration covers both ways a link is opened —
+# a tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` — and sbx
+# freezes the routing, so nothing running in the cage can answer a sign-in link in its place.
+#
+# The hand-written wrapper this replaces also had a catch-all branch handing every OTHER scheme to
+# `aionui`. It was speculative: the registered handler only ever claimed http/https, so the portal
+# never used it. If AionUi answers a scheme of its own, declare it here as one more key; an
+# undeclared scheme is printed rather than opened.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+
 [packages]
 # Track the latest GitHub release's linux-amd64 `.deb` automatically (see "THE `deb:github:` BACKEND"
 # above). `sbx upgrade deb` rolls it forward; no manual version to bump.
 aionui = "deb:github:iOfficeAI/AionUi"
 
-# In-cage Chromium for the OAuth/login flow (see the `cmd` wrapper above). HEAVY — pulls a large
-# nixpkgs closure into the project store on first launch. Drop this (and the wrapper) if you only use
+# In-cage Chromium for the OAuth/login flow (see the `[open]` table above). HEAVY — pulls a large
+# nixpkgs closure into the project store on first launch. Drop this (and the table) if you only use
 # API keys.
 chromium = "nix:chromium"
 

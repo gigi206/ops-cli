@@ -32,9 +32,10 @@
 # here is a clone, a venv, its dependencies and the project's own setup — which is why this bundle
 # names a toolchain rather than an agent, and why it is complete all the same.
 #
-# What stays with the consuming app is everything that is not installation: the library path its
-# native wheels need, the browser wrapper its MCP reads, and the vector store it talks to. Those
-# shape a running process and cannot be done by a step that exits.
+# What stays with the consuming app is everything that is not installation and cannot be declared:
+# the library path its native wheels need and the browser wrapper its MCP reads, both discovered from
+# store paths whose hashes are not knowable when authoring a profile. The vector store it talks to is
+# neither — it is `[bundle.odysseus.service.chroma]` below.
 #
 # The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
 # remember that one succeeded. It is keyed on the CHECKED-OUT COMMIT rather than on a bare marker,
@@ -55,9 +56,9 @@ cd odysseus
 
 # Odysseus publishes no release artifact and is not a pip-installable package, so it rides no sbx
 # backend and no lock rewrite can roll it: the checkout would stay at whatever `main` was on the
-# first launch. What advances it is running this install again, which is what the `provision`
-# channel does (it raises SBX_UPGRADE for every app's install step):
-#     sbx upgrade provision
+# first launch. What advances it is running this install again, which is what raises SBX_UPGRADE
+# for this app's install step:
+#     sbx app upgrade odysseus
 # For one launch only, the app-specific ask does the same:
 #     sbx app run odysseus --env ODYSSEUS_SBX_UPDATE=1
 # `reset --hard` discards the local patch below (re-applied right after) and any other in-tree edit;
@@ -102,6 +103,10 @@ if [ "$(cat "$stamp" 2>/dev/null)" != "$rev" ]; then
   uv pip install chromadb
   printf '%s\n' "$rev" > "$stamp"
 fi
+# The vector store's data directory, created here rather than by the service that writes to it: a
+# service starts before the app's command and has no step of its own to prepare anything.
+mkdir -p "$HOME/chroma-data"
+
 # Odysseus' own setup step (creates the db / directories it expects). Unguarded on purpose: it is
 # idempotent and needs no network, and guarding it would skip the re-create if you wipe the data.
 python setup.py
@@ -139,3 +144,32 @@ ODYSSEUS_BROWSER_NO_SANDBOX = "1"
 # The vector store the workspace talks to, on the cage loopback.
 CHROMADB_HOST = "127.0.0.1"
 CHROMADB_PORT = "8100"
+
+[bundle.odysseus.service.chroma]
+# The vector store the workspace talks to. Odysseus expects it beside the app on :8100 and degrades
+# without it, logging "DEGRADED"/"MemoryVectorStore" and losing the persistence a real store gives.
+# It lives with the tool rather than with the app for the reason the whole bundle does: it is
+# installed by the step above (a venv dependency) and configured by the `[env]` above it, so a
+# hand-copy in a profile would fall behind the tool.
+#
+# Named by its absolute path in the venv, not by `chroma` on PATH: a service runs in the cage's
+# environment, and the venv this was installed into is activated by the app's own command, later.
+# The interpreter comes from the entry point's shebang, so activation is not needed.
+#
+# It binds 0.0.0.0 (all cage interfaces) while `[env]` sets CHROMADB_HOST=127.0.0.1, so the workspace
+# reaches the literal IPv4 loopback: a `localhost` resolving to ::1 in the cage would refuse silently
+# while the server is up. NOTE: modern chromadb installs its server as `chroma`, NOT `chromadb`.
+#
+# `ready` is what the app's command used to do by hand. The gate is not fatal: on expiry the
+# workspace starts anyway and degrades, which is what it does without a store at all.
+cmd = [
+    "~/odysseus/.venv/bin/chroma",
+    "run",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8100",
+    "--path",
+    "~/chroma-data",
+]
+ready = { tcp = 8100 }

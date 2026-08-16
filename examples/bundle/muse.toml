@@ -22,7 +22,7 @@
 #
 # UPGRADE. A bootstrap install rides no `[packages]` backend, so there is no lock to roll: what
 # advances the CLI is running its installer again, which always resolves the current channel.
-#     sbx upgrade provision
+#     sbx app upgrade muse
 # re-runs this step in the app's cage with SBX_UPGRADE set, and the guard below yields to it. For
 # one launch only: `sbx app run muse --env MUSE_SBX_UPDATE=1`.
 #

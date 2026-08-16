@@ -1,6 +1,7 @@
 # Junie — JetBrains' LLM-agnostic coding agent (the CLI), sandboxed by sbx.
 #
-#   sbx app import examples/app/junie.toml
+#   sbx bundle import examples/bundle/junie.toml
+#   sbx app import    examples/app/junie.toml
 #   sbx app run junie
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -73,7 +74,7 @@ cmd = "junie"
 # agent's requirements change — including the install step that turns the shim into a working
 # agent, which sbx runs before `cmd`. The bundle is COMPLETE: an app that names it gets the agent.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/junie.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["junie"]

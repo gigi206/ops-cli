@@ -49,9 +49,12 @@ indexes). It is shown in `sbx config`, so it is never a silent allowance, and a
 
 A filtering cage runs in an **empty network namespace**: no interfaces but
 loopback, no route, no DNS. Nothing leaves it by construction; a misconfiguration
-fails *closed*. The one and only path out is a **Unix-domain socket** bound into
-the cage, onto which an in-cage `socat` forwarder relays `127.0.0.1:18043` (the
-proxy the tools point at) as a TCP→UDS bridge. On the host side of that socket sits
+fails *closed*. Everything that leaves does so through a **Unix-domain socket** bound into
+the cage, and the one this page is about carries the agent's own traffic: an in-cage `socat`
+forwarder relays `127.0.0.1:18043` (the proxy the tools point at) onto it as a TCP→UDS
+bridge. (A [`tcp://` broker](../configuration/broker#the-honest-limits) binds a second such
+socket when one is declared. The same allowlist admits it, and the proxy does not inspect
+it.) On the host side of that socket sits
 an **`sbx`-owned MITM CONNECT proxy** that terminates TLS with a per-session,
 cage-only CA, checks each request against your resolved policy (host, port, path,
 method, regex), resolves DNS **host-side** (so the cage never sees a name to

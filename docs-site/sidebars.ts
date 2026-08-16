@@ -54,6 +54,7 @@ const sidebars: SidebarsConfig = {
             'configuration/env',
             'configuration/binds',
             'configuration/packages',
+            'configuration/service',
             'configuration/tools',
             'configuration/recommended-tools',
             'configuration/nixpkgs',
@@ -79,6 +80,7 @@ const sidebars: SidebarsConfig = {
             'configuration/gpu',
             'configuration/audio',
             'configuration/dbus',
+            'configuration/open',
           ],
         },
         {

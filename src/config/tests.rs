@@ -90,6 +90,8 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
             .collect::<BTreeMap<_, _>>(),
         binds: binds.iter().map(|s| RawBind::Path(s.to_string())).collect(),
         packages: BTreeMap::new(),
+        open: Default::default(),
+        service: Default::default(),
         bundle: BTreeMap::new(),
         flakes: BTreeMap::new(),
         tarball: BTreeMap::new(),
@@ -725,6 +727,8 @@ fn raw_app(
     network: Option<NetworkField>,
 ) -> RawApp {
     RawApp {
+        open: Default::default(),
+        service: Default::default(),
         fs: None,
         notify: None,
         ssh_agent: None,
@@ -2611,8 +2615,8 @@ fn an_untrusted_projects_app_limits_are_dropped_and_a_global_apps_survive() {
 #[test]
 fn an_apps_scalar_origins_record_which_app_layer_set_each_field() {
     // The data behind `config show --app`: each scalar the app overlay sets is attributed to
-    // its app layer; an untouched scalar keeps the default origin, so the detail view shows it
-    // inherited from the baseline.
+    // its app layer; an untouched scalar keeps the default origin, which is what lets the detail
+    // view tell "the baseline set this" from "nobody did".
     let global = raw_with_app(
         "demo",
         RawApp {
@@ -3098,6 +3102,31 @@ fn validating_a_profile_requires_a_command_and_summarizes_its_posture() {
     // A profile with no command is refused — and so is a file wrapped in `[app.<name>]` (it
     // parses as an empty app, so it trips the same gate with a helpful hint).
     assert!(validate_profile(b"[env]\nA = \"1\"\n").is_err());
+    // The two kinds of second file an app can be short of, side by side in one profile. Both are
+    // surfaced so the importer can name what is undeclared; neither is resolved here.
+    let referencing = validate_profile(
+        br#"
+            cmd = "demo-app"
+            use = ["demo-tool"]
+            [network]
+            mode = "deny"
+            allow = ["@demo-lane", "api.example.com/@handle"]
+            deny  = ["re:^https://x@y/"]
+            mute  = ["@demo-lane", "@demo-noise"]
+            "#,
+    )
+    .unwrap();
+    assert_eq!(referencing.uses, vec!["demo-tool".to_string()]);
+    // Sorted and deduplicated across all three lists — and a `@` that is not the FIRST character
+    // is part of the entry (a URL path, a `re:` pattern), never a reference. Assert the exact set:
+    // a `contains` would pass while a bogus extra reference is reported to the user as missing.
+    assert_eq!(
+        referencing.groups,
+        vec!["demo-lane".to_string(), "demo-noise".to_string()],
+    );
+    // The bare-string posture form has no lists at all, so it can reference nothing.
+    let posture = validate_profile(b"cmd = \"demo-app\"\nnetwork = \"deny\"\n").unwrap();
+    assert!(posture.groups.is_empty() && posture.uses.is_empty());
     let wrapped = validate_profile(b"[app.demo-app]\ncmd = \"demo-app\"\n").unwrap_err();
     assert!(wrapped.contains("cmd"), "{wrapped}");
 
@@ -3155,6 +3184,8 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
         env: vec![("A".into(), "app".into()), ("C".into(), "app".into())],
         binds: vec![],
         packages: vec![],
+        open: Default::default(),
+        service: Default::default(),
         network: Some(NetworkPolicy::Isolated),
         gui: None,
         gpu: Some(true),
@@ -3237,6 +3268,8 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
         env: vec![],
         binds: vec![],
         packages: vec![],
+        open: Default::default(),
+        service: Default::default(),
         network: None, // inherits the baseline's shared posture
         gui: None,
         gpu: None,
@@ -3290,6 +3323,8 @@ fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
         env: vec![],
         binds: vec![],
         packages: vec![],
+        open: Default::default(),
+        service: Default::default(),
         network: Some(NetworkPolicy::Allowlist(
             crate::allowlist::EgressPolicy::new(vec![], vec![]),
         )),
@@ -3341,6 +3376,8 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
         env: vec![],
         binds: vec![],
         packages: vec![],
+        open: Default::default(),
+        service: Default::default(),
         network,
         gui: None,
         gpu: None,
@@ -3494,6 +3531,8 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
         env: vec![],
         binds: vec![],
         packages: vec![],
+        open: Default::default(),
+        service: Default::default(),
         network: None,
         gui: None,
         gpu: None,
@@ -3553,6 +3592,8 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         env: vec![],
         binds: vec![],
         packages: vec![],
+        open: Default::default(),
+        service: Default::default(),
         network: Some(NetworkPolicy::Allowlist(
             crate::allowlist::EgressPolicy::new(vec![], vec![]),
         )),
@@ -3653,6 +3694,365 @@ fn a_changed_project_drops_binds_with_a_reapproval_hint() {
     assert!(r.binds.is_empty());
     assert!(r.warnings[0].contains("changed since it was trusted"));
     assert!(r.warnings[0].contains("re-run `sbx trust`"));
+}
+
+/// A `RawConfig` whose only field is an `[open]` table with one entry.
+fn raw_with_open(scheme: &str, entry: schema::RawOpen) -> RawConfig {
+    RawConfig {
+        open: BTreeMap::from([(scheme.to_string(), entry)]),
+        ..RawConfig::default()
+    }
+}
+
+/// A bare-argv `[open]` entry.
+fn open_argv(argv: &[&str]) -> schema::RawOpen {
+    schema::RawOpen::Argv(schema::RawCmd::Argv(
+        argv.iter().map(|s| s.to_string()).collect(),
+    ))
+}
+
+#[test]
+fn an_untrusted_project_cannot_declare_a_uri_handler() {
+    // The property the whole feature rests on. sbx puts the router first on PATH and freezes the
+    // portal's route so nothing in the cage can answer a link in its place; honoring `[open]` from
+    // an untrusted project would hand that answer straight back, through the config instead of
+    // through the filesystem.
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((
+            raw_with_open("https", open_argv(&["attacker-browser"])),
+            TrustState::Untrusted,
+        )),
+    );
+    assert!(r.open.is_empty(), "no handler survives: {:?}", r.open);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("`[open]`")),
+        "the drop is reported: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_trusted_layer_resolves_a_handler_and_its_mode() {
+    let r = resolve_no_plugins(
+        RawConfig {
+            open: BTreeMap::from([
+                ("https".to_string(), open_argv(&["chromium", "--flag"])),
+                (
+                    "cursor".to_string(),
+                    schema::RawOpen::Detailed(schema::RawOpenTable {
+                        cmd: schema::RawCmd::Argv(vec!["cursor".into(), "--open-url".into()]),
+                        mode: Some("detach".into()),
+                    }),
+                ),
+            ]),
+            ..RawConfig::default()
+        },
+        None,
+    );
+    assert_eq!(
+        r.open.get("https").map(|h| (h.argv.clone(), h.mode)),
+        Some((
+            vec!["chromium".to_string(), "--flag".to_string()],
+            crate::config::OpenMode::Exec
+        )),
+        "a bare argv defaults to exec"
+    );
+    assert_eq!(
+        r.open.get("cursor").map(|h| h.mode),
+        Some(crate::config::OpenMode::Detach)
+    );
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+}
+
+#[test]
+fn a_handler_sbx_cannot_honor_is_dropped_rather_than_guessed() {
+    // Three ways an entry can be unusable, each dropped with its scheme named. Dropping is the
+    // safe direction: an unhandled link is printed and the launch goes on, while a handler kept
+    // despite a value sbx did not understand would route a real sign-in click.
+    let r = resolve_no_plugins(
+        RawConfig {
+            open: BTreeMap::from([
+                // not a scheme: a reader may reach for a MIME type or a whole URL
+                ("text/html".to_string(), open_argv(&["viewer"])),
+                // a mode that does not exist: silently treating it as `exec` would hang the very
+                // caller `detach` was misspelled for
+                (
+                    "https".to_string(),
+                    schema::RawOpen::Detailed(schema::RawOpenTable {
+                        cmd: schema::RawCmd::Argv(vec!["chromium".into()]),
+                        mode: Some("background".into()),
+                    }),
+                ),
+                // no program at all
+                ("cursor".to_string(), open_argv(&[])),
+            ]),
+            ..RawConfig::default()
+        },
+        None,
+    );
+    assert!(r.open.is_empty(), "none is honored: {:?}", r.open);
+    assert_eq!(r.warnings.len(), 3, "each is reported: {:?}", r.warnings);
+    for scheme in ["text/html", "https", "cursor"] {
+        assert!(
+            r.warnings.iter().any(|w| w.contains(scheme)),
+            "`{scheme}` is named: {:?}",
+            r.warnings
+        );
+    }
+}
+
+/// A bare-argv `[service]` entry.
+fn service_argv(argv: &[&str]) -> schema::RawService {
+    schema::RawService::Argv(schema::RawCmd::Argv(
+        argv.iter().map(|s| s.to_string()).collect(),
+    ))
+}
+
+#[test]
+fn an_untrusted_project_cannot_declare_a_service() {
+    // A service runs a program of its own choosing at every launch, before anything else. That is
+    // the grant an untrusted project is already refused for `cmd`, and declaring it under another
+    // field's name would not make it a different grant.
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((
+            RawConfig {
+                service: BTreeMap::from([(
+                    "miner".to_string(),
+                    service_argv(&["attacker-daemon"]),
+                )]),
+                ..RawConfig::default()
+            },
+            TrustState::Untrusted,
+        )),
+    );
+    assert!(r.service.is_empty(), "none survives: {:?}", r.service);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("`[service]`")),
+        "the drop is reported: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_trusted_layer_resolves_a_service_with_its_condition_and_gate() {
+    let r = resolve_no_plugins(
+        RawConfig {
+            service: BTreeMap::from([
+                ("gateway".to_string(), service_argv(&["hermes", "gateway"])),
+                (
+                    "chroma".to_string(),
+                    schema::RawService::Detailed(schema::RawServiceTable {
+                        cmd: schema::RawCmd::Argv(vec!["chroma".into(), "run".into()]),
+                        enable: Some(schema::RawEnable::One(schema::RawEnableCond {
+                            env: "NO_CHROMA".into(),
+                            is: None,
+                            not: Some(schema::RawValues::One("1".into())),
+                        })),
+                        ready: Some(schema::RawServiceReady {
+                            tcp: 8100,
+                            timeout: Some("30s".into()),
+                        }),
+                    }),
+                ),
+            ]),
+            ..RawConfig::default()
+        },
+        None,
+    );
+    let gateway = r.service.get("gateway").expect("the bare argv resolves");
+    assert_eq!(
+        gateway.argv,
+        vec!["hermes".to_string(), "gateway".to_string()]
+    );
+    assert!(
+        gateway.enable.is_empty() && gateway.ready.is_none(),
+        "a bare argv starts unconditionally and is waited on for nothing"
+    );
+    let chroma = r.service.get("chroma").expect("the table form resolves");
+    assert_eq!(
+        chroma
+            .enable
+            .iter()
+            .map(crate::config::EnvCondition::display)
+            .collect::<Vec<_>>(),
+        vec!["NO_CHROMA != 1".to_string()]
+    );
+    assert_eq!(
+        chroma.ready.map(|g| (g.tcp, g.timeout.as_secs())),
+        Some((8100, 30))
+    );
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+}
+
+#[test]
+fn a_service_sbx_cannot_honor_is_dropped_and_a_bad_qualifier_only_costs_its_qualifier() {
+    // The two directions are different on purpose. An entry with no program cannot start anything,
+    // so it goes; a gate sbx cannot read is a *qualifier* on a service that is otherwise fine, so
+    // the service stays and only the qualifier is dropped. Losing the whole service over its
+    // timeout would take away the process the profile is for.
+    let r = resolve_no_plugins(
+        RawConfig {
+            service: BTreeMap::from([
+                ("empty".to_string(), service_argv(&[])),
+                ("bad name".to_string(), service_argv(&["daemon"])),
+                (
+                    "gated".to_string(),
+                    schema::RawService::Detailed(schema::RawServiceTable {
+                        cmd: schema::RawCmd::Argv(vec!["daemon".into()]),
+                        enable: None,
+                        // A wait that never gives up would hang the launch on a service that never
+                        // binds, which is the one outcome the gate exists to avoid.
+                        ready: Some(schema::RawServiceReady {
+                            tcp: 8100,
+                            timeout: Some("0".into()),
+                        }),
+                    }),
+                ),
+            ]),
+            ..RawConfig::default()
+        },
+        None,
+    );
+    assert!(!r.service.contains_key("empty"), "no program, no service");
+    assert!(
+        !r.service.contains_key("bad name"),
+        "a name that reaches a log file and every diagnostic is held to a shape"
+    );
+    let gated = r.service.get("gated").expect("the service itself survives");
+    assert!(gated.ready.is_none(), "only the unusable gate is dropped");
+    for named in ["empty", "bad name", "gated"] {
+        assert!(
+            r.warnings.iter().any(|w| w.contains(named)),
+            "`{named}` is named in a warning: {:?}",
+            r.warnings
+        );
+    }
+}
+
+#[test]
+fn a_condition_disjoins_over_the_values_of_one_variable() {
+    // The "or" that a start condition actually needs: "off" is written `0`, `false` or `no`
+    // depending on who typed it, and asking which one is not a question a profile should have to
+    // answer. It costs no boolean structure — the comparison already had a value, and now it may
+    // have a set of them — and it stops there: across DIFFERENT variables a list stays an `and`.
+    let r = resolve_no_plugins(
+        RawConfig {
+            service: BTreeMap::from([(
+                "daemon".to_string(),
+                schema::RawService::Detailed(schema::RawServiceTable {
+                    cmd: schema::RawCmd::Argv(vec!["daemon".into()]),
+                    enable: Some(schema::RawEnable::One(schema::RawEnableCond {
+                        env: "SWITCH".into(),
+                        is: None,
+                        not: Some(schema::RawValues::Any(vec![
+                            "0".into(),
+                            "false".into(),
+                            "no".into(),
+                        ])),
+                    })),
+                    ready: None,
+                }),
+            )]),
+            ..RawConfig::default()
+        },
+        None,
+    );
+    let cond = &r.service["daemon"].enable;
+    assert_eq!(cond.len(), 1, "one condition, not three");
+    assert_eq!(cond[0].values, vec!["0", "false", "no"]);
+    assert!(!cond[0].equals);
+    assert_eq!(cond[0].display(), "SWITCH != 0|false|no");
+
+    // Each of the three, and only those three, turns it off; anything else leaves it on.
+    let env = |v: &str| [("SWITCH".to_string(), v.to_string())];
+    for off in ["0", "false", "no"] {
+        assert!(!cond[0].holds(&env(off)), "`{off}` turns it off");
+    }
+    for on in ["1", "yes", "", "NO"] {
+        assert!(cond[0].holds(&env(on)), "`{on}` leaves it on");
+    }
+    assert!(
+        cond[0].holds(&[]),
+        "unset compares as empty, so it stays on"
+    );
+}
+
+#[test]
+fn an_enable_condition_that_compares_nothing_is_dropped_alone() {
+    // The two ways a condition can be unusable are the two ways its pair of comparisons can be
+    // wrong, and both are refused rather than guessed: with `is` and `not` both set there is no
+    // saying which was meant, and with neither there is nothing to compare. The service survives
+    // either way — a qualifier sbx cannot read must not cost the process the profile is for, and
+    // starting is what the profile asks for when nothing says otherwise.
+    let entry = |enable: schema::RawEnableCond| {
+        schema::RawService::Detailed(schema::RawServiceTable {
+            cmd: schema::RawCmd::Argv(vec!["daemon".into()]),
+            enable: Some(schema::RawEnable::One(enable)),
+            ready: None,
+        })
+    };
+    let r = resolve_no_plugins(
+        RawConfig {
+            service: BTreeMap::from([
+                (
+                    "both".to_string(),
+                    entry(schema::RawEnableCond {
+                        env: "A".into(),
+                        is: Some(schema::RawValues::One("1".into())),
+                        not: Some(schema::RawValues::One("0".into())),
+                    }),
+                ),
+                (
+                    "neither".to_string(),
+                    entry(schema::RawEnableCond {
+                        env: "B".into(),
+                        is: None,
+                        not: None,
+                    }),
+                ),
+                (
+                    "nameless".to_string(),
+                    entry(schema::RawEnableCond {
+                        env: String::new(),
+                        is: Some(schema::RawValues::One("1".into())),
+                        not: None,
+                    }),
+                ),
+                (
+                    "good".to_string(),
+                    entry(schema::RawEnableCond {
+                        env: "C".into(),
+                        is: None,
+                        not: Some(schema::RawValues::One("0".into())),
+                    }),
+                ),
+            ]),
+            ..RawConfig::default()
+        },
+        None,
+    );
+    for name in ["both", "neither", "nameless"] {
+        let svc = r.service.get(name).expect("the service itself survives");
+        assert!(svc.enable.is_empty(), "`{name}` loses only its condition");
+        assert!(
+            r.warnings.iter().any(|w| w.contains(name)),
+            "`{name}` is named in a warning: {:?}",
+            r.warnings
+        );
+    }
+    assert_eq!(
+        r.service
+            .get("good")
+            .map(|s| s
+                .enable
+                .iter()
+                .map(crate::config::EnvCondition::display)
+                .collect::<Vec<_>>())
+            .unwrap_or_default(),
+        vec!["C != 0".to_string()]
+    );
 }
 
 /// A `RawConfig` whose only field is the given `binds` list (raw, un-canonicalized).
@@ -8486,6 +8886,66 @@ fn an_inline_global_app_is_dropped_in_favour_of_the_profile() {
     assert!(
         !w.contains("sbx app export"),
         "when a profile already exists, do not suggest export: {w}"
+    );
+}
+
+/// Every shipped profile whose `cmd` is a shell script forwards `"$@"`.
+///
+/// `sbx app run <name> -- <args>` is in the verb's own synopsis, and sbx honours it by appending
+/// the trailing arguments to the declared `cmd`. A profile that wraps its command in `<shell> -c`
+/// and never expands `"$@"` therefore accepts those arguments and drops them, exit code 0 — the
+/// promise is kept by the launcher and broken by the profile, which is the half no launcher-side
+/// fix can reach.
+///
+/// The shape is re-derived here rather than borrowed from `sandbox::launch`: a net that shares its
+/// rule with the code it guards agrees with that code when the rule itself is what drifted. A plain
+/// argv needs nothing — sbx appends to it and the program reads its own arguments.
+#[test]
+fn every_shipped_shell_profile_forwards_its_trailing_arguments() {
+    const SHELLS: [&str; 4] = ["bash", "sh", "zsh", "dash"];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("examples/app");
+    let (mut shell_profiles, mut plain) = (0, 0);
+    for entry in std::fs::read_dir(&dir).expect("examples/app/ dir exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let raw = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
+        let argv = match raw.cmd {
+            Some(cmd) => cmd.into_argv(),
+            None => continue,
+        };
+        // The script is whatever follows a `-…c` flag that follows a shell. Anything else is a
+        // program, and its arguments are its own.
+        let script = argv.windows(2).position(|w| {
+            let is_shell = std::path::Path::new(&w[0])
+                .file_name()
+                .is_some_and(|s| SHELLS.iter().any(|k| s == *k));
+            let is_c_flag = w[1].strip_prefix('-').is_some_and(|rest| {
+                rest.ends_with('c') && rest.bytes().all(|b| b.is_ascii_lowercase())
+            });
+            is_shell && is_c_flag
+        });
+        let Some(i) = script.and_then(|i| argv.get(i + 2)) else {
+            plain += 1;
+            continue;
+        };
+        shell_profiles += 1;
+        assert!(
+            i.contains("\"$@\""),
+            "`examples/app/{name}.toml` wraps its command in a shell but never expands `\"$@\"`, so \
+             `sbx app run {name} -- <args>` accepts arguments and silently drops them. Add `\"$@\"` \
+             to the final `exec`, or drop the shell if the command is a plain argv."
+        );
+    }
+    // The precondition, asserted rather than assumed: a catalogue that stopped using shell commands
+    // would pass this test vacuously, and it would then be guarding nothing.
+    assert!(
+        shell_profiles >= 15,
+        "expected the shipped catalogue to still carry shell-wrapped profiles to guard, found \
+         {shell_profiles} (plain argv: {plain})"
     );
 }
 

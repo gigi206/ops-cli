@@ -1,6 +1,7 @@
 # Antigravity IDE — Google's agentic IDE (desktop, Electron / VS Code fork), sandboxed by sbx.
 #
-#   sbx app import examples/app/antigravity.toml
+#   sbx bundle import examples/bundle/antigravity.toml
+#   sbx app import    examples/app/antigravity.toml
 #   sbx app run antigravity
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The IDE tarball, its auto-upgrade resolver, the
@@ -65,7 +66,7 @@
 # LOGIN FLOW — VERIFIED on a real Google login. The IDE (a VS Code fork) opens the Google consent in
 # an external browser and receives the result back as the deep-link `antigravity-ide://oauth-success`,
 # handed to the running single-instance editor via `--open-url` (a standard VS Code CLI flag). The
-# hermetic cage has no browser and no `xdg-open`, so the `cmd` preamble below wires an in-cage Chromium
+# hermetic cage has no browser and no desktop, so the `[open]` table below routes to an in-cage Chromium
 # for the http(s) consent and routes the deep-link back to `antigravity-ide --open-url`.
 #
 #   THE `dbus = true` DETAIL (handled by sbx-core). Under `dbus = true` the in-cage Chromium opens the
@@ -109,13 +110,12 @@ cmd = [
     "bash",
     "-c",
     '''
-# IN-CAGE BROWSER LOGIN (adapted from cursor.toml / claude-desktop.toml). Antigravity's Google
-# Sign-In opens an external browser for the consent, then hands the result back as a deep-link to the
-# running editor. The hermetic cage has no browser and no `xdg-open`, so this preamble wires an
-# in-cage Chromium for the http(s) consent and routes the deep-link back to `antigravity-ide
-# --open-url`, so the whole flow closes inside the cage. See the header's LIVE-GATE note: the deep-link
-# scheme (`antigravity` below) is the VS Code-fork convention and UNVERIFIED — correct it if the
-# editor does not complete the login after the Google consent.
+# IN-CAGE BROWSER LOGIN. Antigravity's Google Sign-In opens an external browser for the consent,
+# then hands the result back as a deep-link to the running editor. What each of those opens with is
+# declared in `[open]` below; all that is left here is the one thing a declaration cannot express,
+# Chromium's managed policy. See the header's LIVE-GATE note: the deep-link scheme is the VS
+# Code-fork convention and UNVERIFIED — correct the `[open]` key if the editor does not complete
+# the login after the Google consent.
 
 # Chromium managed policy: auto-launch the deep-link with no confirmation dialog, else the callback
 # never reaches the editor and login silently fails. /etc is a writable cage tmpfs; Chromium reads
@@ -124,55 +124,8 @@ mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/polic
 {"AutoLaunchProtocolsFromOrigins":[{"allowed_origins":["*"],"protocol":"antigravity-ide"}]}
 POLICY
 
-# xdg-open routing by scheme: http(s) -> the in-cage Chromium (the Google consent); else (the deep-link
-# callback, whatever its scheme) -> `antigravity-ide --open-url` so it reaches the running editor
-# (the VS Code-fork single-instance handler). `--no-sandbox` on the editor branch too: it only hands the
-# deep-link to the single-instance app and quits, but still boots far enough to hit Chromium's SUID
-# sandbox (sbx's build strips the setuid bit off chrome-sandbox), which aborts FATAL without it.
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-case "$1" in
-  http://*|https://*)
-    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
-      --no-first-run --no-default-browser-check "$@" ;;
-  *)
-    exec antigravity-ide --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --open-url "$@" ;;
-esac
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
-
-# Under `dbus = true` the cage has a real portal, so Electron opens external URLs via
-# `org.freedesktop.portal.OpenURI` instead of calling `xdg-open` — and the portal shows "no apps
-# available" unless a default handler is registered, silently breaking the auth links. Register the
-# wrapper as the default handler for the web + `antigravity` schemes. The Exec path is ABSOLUTE ($HOME
-# expanded here) because the portal-launched handler does not inherit this shell's PATH. (If the scheme
-# is not `antigravity-ide`, fix the two `x-scheme-handler/antigravity-ide` lines.)
-mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=sbx URL handler
-Exec=$HOME/.local/bin/xdg-open %U
-MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/antigravity-ide;
-NoDisplay=true
-Terminal=false
-EOF
-cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
-[Default Applications]
-x-scheme-handler/http=sbx-open-uri.desktop
-x-scheme-handler/https=sbx-open-uri.desktop
-x-scheme-handler/antigravity-ide=sbx-open-uri.desktop
-MIMEAPPS
-
-# (The desktop-database INDEX the in-cage portal needs to resolve this deep-link handler — else it
-# shows "No apps available" for the OAuth callback under `dbus = true` — is built by sbx-core's portal
-# hole automatically: it provisions `desktop-file-utils` and runs `update-desktop-database` in the
-# background. No per-profile step is needed; this wrapper only WRITES the handler above.)
-
 exec antigravity-ide --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic
+    --use-system-ca --password-store=basic "$@"
 ''',
 ]
 
@@ -195,7 +148,7 @@ dbus = true
 # What the bundle may never carry is posture: the `gui`/`gpu`/`dbus` grants and the sign-in
 # preamble in `cmd` stay here.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/antigravity.toml
 # Without it the launch warns that the bundle is undeclared and the IDE is simply absent.
 use = ["antigravity"]
@@ -205,6 +158,19 @@ use = ["antigravity"]
 # An app is read-by-default ({GET,HEAD}); a host the editor/agent WRITES to (POSTing completions,
 # tokens) is opened to all verbs with `{*}`. Grounded on the `agy` CLI profile's Google chain +
 # claude-desktop's Google Sign-In set. See the header's LIVE-GATE note — refine from `sbx net logs`.
+# Where a link opens, declared rather than scripted. `http`/`https` go to the in-cage Chromium for
+# the web auth; `antigravity-ide` is the callback the provider redirects to, which must reach the
+# running editor (`--open-url` is how it accepts one). One declaration covers both ways a link is
+# opened — a tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` —
+# and sbx freezes the routing, so nothing in the cage can answer a sign-in link instead. If the
+# scheme turns out not to be `antigravity-ide`, change the key.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+antigravity-ide = ["antigravity-ide", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--open-url"]
+
 [network]
 mode = "deny"
 # NOTE on HTTP/2: `cloudcode-pa` serves BOTH HTTP/1.1 (the REST account-setup + agent calls) and

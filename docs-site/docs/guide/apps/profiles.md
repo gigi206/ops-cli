@@ -55,6 +55,14 @@ sbx app import <file> [--as <name>] [--force]
   machine can be read back and re-applied. That copy is not a profile (only `*.toml` is
   read as one) and is removed with the app.
 - The bytes are copied verbatim (comments preserved).
+- **What the profile is short of is named.** A profile that references a
+  [bundle](../configuration/bundles) in `use`, or an
+  [egress group](../networking/) as `@<name>`, resolves both against the global config; an
+  undeclared one is reported here, with the sibling file to import when one can be found.
+  All 71 shipped profiles name a bundle, so a starter profile takes two imports. Either
+  order works: nothing resolves until `sbx app run <name>`. With `--with-deps` the import
+  follows those references instead of naming them, which merges into your global config and
+  is therefore opt-in.
 
 ## Export
 

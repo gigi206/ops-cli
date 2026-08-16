@@ -246,6 +246,88 @@ pub(crate) fn dedupe_names(names: &mut Vec<&str>) {
     names.retain(|name| seen.insert(*name));
 }
 
+/// The portable file a `use` or `@<name>` reference most likely came from, when the imported file
+/// was taken from a catalogue laid out as siblings — `…/app/<x>.toml` beside `…/bundle/<x>.toml`
+/// and `…/net-groups/<x>.toml`, the layout this repository ships its examples in.
+///
+/// The path is returned **only** when the file parses as that kind of fragment *and* declares the
+/// missing name. The filename alone proves nothing: sbx owns no such layout (both exports write to
+/// stdout or `--out`), and an app profile is a sibling with the *same stem* as its bundle, so a
+/// name-only guess would happily point at the profile that was just imported. Naming a file that
+/// would not work is the defect this message exists to remove, reintroduced one line later.
+///
+/// A source with no grandparent — a bare filename, `./x.toml` — yields `None` and the caller keeps
+/// the generic wording. The candidate is built by walking up and is never canonicalized, so what is
+/// printed is a path the user can retype as-is.
+pub(crate) fn fragment_beside<T>(
+    src: &std::path::Path,
+    dir: &str,
+    name: &str,
+    read: impl Fn(&std::path::Path) -> Result<std::collections::BTreeMap<String, T>, String>,
+) -> Option<PathBuf> {
+    let candidate = src
+        .parent()?
+        .parent()?
+        .join(dir)
+        .join(format!("{name}.toml"));
+    read(&candidate)
+        .ok()?
+        .contains_key(name)
+        .then_some(candidate)
+}
+
+/// A reference an imported file names that nothing on this machine declares, paired with the
+/// sibling file that would declare it when [`fragment_beside`] found one.
+///
+/// One type for both kinds of reference (a bundle named in `use`, a group named in an egress list)
+/// because both have two consumers: the warnings render it, and `sbx app import --with-deps` acts
+/// on it. Kept apart, the filter that decides what "missing" means would exist twice inside one
+/// command, and a change to the message side would not be felt by the side that writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingRef {
+    pub(crate) name: String,
+    pub(crate) file: Option<PathBuf>,
+}
+
+/// The entries of `referenced` that `declared` does not carry, each paired with the sibling file
+/// that declares it. Caller order is preserved: a profile's `use` is authored order, and group
+/// references arrive sorted and deduplicated from `config::group_refs`.
+pub(crate) fn missing_refs<D, T>(
+    referenced: &[String],
+    declared: &std::collections::BTreeMap<String, D>,
+    src: &std::path::Path,
+    dir: &str,
+    read: impl Fn(&std::path::Path) -> Result<std::collections::BTreeMap<String, T>, String>,
+) -> Vec<MissingRef> {
+    referenced
+        .iter()
+        .filter(|name| !declared.contains_key(*name))
+        .map(|name| MissingRef {
+            name: name.clone(),
+            file: fragment_beside(src, dir, name, &read),
+        })
+        .collect()
+}
+
+/// The remedy clause for a set of undeclared references: one backticked `sbx <verb> <file>` per
+/// name when **every** file resolved, and the generic `<file>` placeholder otherwise.
+///
+/// All-or-nothing on purpose. A partial list reads as the whole remedy — the user runs the two
+/// commands they were given and is left with a third reference still undeclared, having been told
+/// nothing about it. One unresolved name therefore returns the whole clause to the generic form,
+/// which states the shape of what is missing without implying it is exhaustive.
+pub(crate) fn import_remedy(verb: &str, missing: &[MissingRef]) -> String {
+    if missing.iter().any(|m| m.file.is_none()) {
+        return format!("`sbx {verb} <file>`");
+    }
+    missing
+        .iter()
+        .filter_map(|m| m.file.as_ref())
+        .map(|p| format!("`sbx {verb} {}`", p.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Route a resolved command name to its handler. `main` has already peeled off the help paths
 /// (`sbx --help`, `sbx <cmd> --help`) and the no-command usage error, so every name that reaches
 /// here is a concrete command plus its remaining arguments; each family owns its parsing from this
@@ -365,6 +447,118 @@ mod tests {
         let mut names = vec!["demo-tool", "demo-app", "demo-tool", "demo-app", "demo-svc"];
         dedupe_names(&mut names);
         assert_eq!(names, vec!["demo-tool", "demo-app", "demo-svc"]);
+    }
+
+    /// A `read` stand-in for [`super::fragment_beside`]: a file that always parses, declaring
+    /// exactly `names`.
+    ///
+    /// It must **succeed regardless of the path**, or the two things the gate distinguishes — the
+    /// file is not that kind of fragment, versus it is but declares something else — collapse into
+    /// one, and the `contains_key` half of the gate becomes untestable here. (An earlier version of
+    /// this fake keyed off the path's stem and did exactly that: deleting the `contains_key` check
+    /// left this test green.)
+    fn declaring(
+        names: &'static [&'static str],
+    ) -> impl Fn(&std::path::Path) -> Result<std::collections::BTreeMap<String, ()>, String> {
+        move |_: &std::path::Path| Ok(names.iter().map(|n| ((*n).to_string(), ())).collect())
+    }
+
+    #[test]
+    fn a_sibling_is_named_only_when_the_file_backs_the_reference() {
+        let src = std::path::Path::new("examples/app/demo-app.toml");
+        // The catalogue layout: the reference resolves to the sibling directory, printed as a path
+        // the reader can retype — not a `..` walk, and not canonicalized against this machine.
+        assert_eq!(
+            super::fragment_beside(src, "bundle", "demo-app", declaring(&["demo-app"])),
+            Some(PathBuf::from("examples/bundle/demo-app.toml")),
+        );
+        // The counter-case that decides the gate: a file IS there at the guessed path, but it does
+        // not declare the name. Naming it would send the reader to a command that changes nothing.
+        assert_eq!(
+            super::fragment_beside(src, "bundle", "demo-app", declaring(&["other-thing"])),
+            None,
+        );
+        // Not that kind of fragment at all — an app profile sitting where a bundle was guessed.
+        assert_eq!(
+            super::fragment_beside(src, "bundle", "demo-app", |_: &std::path::Path| Err::<
+                std::collections::BTreeMap<String, ()>,
+                _,
+            >(
+                "no [bundle] table".to_string()
+            )),
+            None,
+        );
+        // A relative source keeps its own root, so the suggestion stays retypable from where the
+        // user stands: `app/x.toml` implies `bundle/x.toml` beside it, not an absolute path.
+        assert_eq!(
+            super::fragment_beside(
+                std::path::Path::new("app/demo-app.toml"),
+                "bundle",
+                "demo-app",
+                declaring(&["demo-app"])
+            ),
+            Some(PathBuf::from("bundle/demo-app.toml")),
+        );
+        // A bare filename has no directory structure to imply a catalogue at all — there is nothing
+        // to walk up to. Fail closed to the generic wording rather than guess a sibling of the cwd.
+        assert_eq!(
+            super::fragment_beside(
+                std::path::Path::new("demo-app.toml"),
+                "bundle",
+                "demo-app",
+                declaring(&["demo-app"])
+            ),
+            None,
+        );
+    }
+
+    fn missing(name: &str, file: Option<&str>) -> super::MissingRef {
+        super::MissingRef {
+            name: name.to_string(),
+            file: file.map(PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn a_partial_set_of_files_falls_back_rather_than_naming_some() {
+        let a = missing("a", Some("examples/bundle/a.toml"));
+        let b = missing("b", Some("examples/bundle/b.toml"));
+        assert_eq!(
+            super::import_remedy("bundle import", std::slice::from_ref(&a)),
+            "`sbx bundle import examples/bundle/a.toml`",
+        );
+        assert_eq!(
+            super::import_remedy(
+                "bundle import",
+                &[missing("a", Some("examples/bundle/a.toml")), b]
+            ),
+            "`sbx bundle import examples/bundle/a.toml`, `sbx bundle import examples/bundle/b.toml`",
+        );
+        // One unresolved name returns the WHOLE clause to the placeholder. Naming the subset would
+        // read as the complete remedy and leave the unnamed reference undeclared and unmentioned.
+        assert_eq!(
+            super::import_remedy("bundle import", &[a, missing("c", None)]),
+            "`sbx bundle import <file>`",
+        );
+    }
+
+    #[test]
+    fn a_reference_already_declared_is_not_reported_missing() {
+        let declared: std::collections::BTreeMap<String, ()> =
+            [("demo-tool".to_string(), ())].into_iter().collect();
+        let found = super::missing_refs(
+            &["demo-tool".to_string(), "demo-svc".to_string()],
+            &declared,
+            std::path::Path::new("examples/app/demo-app.toml"),
+            "bundle",
+            declaring(&["demo-svc"]),
+        );
+        let names: Vec<&str> = found.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["demo-svc"]);
+        assert_eq!(
+            found[0].file,
+            Some(PathBuf::from("examples/bundle/demo-svc.toml")),
+        );
     }
 
     fn os(words: &[&str]) -> Vec<OsString> {

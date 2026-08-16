@@ -528,6 +528,122 @@ pub(crate) struct Bind {
     pub(crate) writable: bool,
 }
 
+/// How a URI handler is launched, once the router has matched a scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OpenMode {
+    /// Replace the router with the handler, so the caller's wait ends when the handler does.
+    #[default]
+    Exec,
+    /// Start the handler detached and return 0 at once, leaving it running.
+    ///
+    /// For the caller that shells out to the router and *waits* for it: if the router becomes a
+    /// browser that outlives the sign-in, the wait never returns and the step after it — the code
+    /// for token exchange — never runs. The login appears to work in the browser and no token is
+    /// ever persisted, which is why this is a declared mode rather than a detail of the handler.
+    Detach,
+}
+
+/// One resolved URI handler: what the cage opens a URI of this scheme with, and how.
+///
+/// The scheme is the map key wherever this is held, so it is not repeated here. The URI itself is
+/// appended to [`argv`](Self::argv) as the final argument at call time — never substituted into the
+/// middle of a command and never passed through a shell, because the URI is chosen by whatever is
+/// running in the cage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenHandler {
+    /// The program and its fixed arguments. Resolved on the cage's `PATH` at call time, like any
+    /// other command the cage runs: the handler is a tool the cage already has.
+    pub(crate) argv: Vec<String>,
+    /// Whether the router execs the handler or detaches it.
+    pub(crate) mode: OpenMode,
+}
+
+/// How long a readiness gate waits before starting the app anyway, when the entry names no timeout.
+///
+/// Sized on what the hand-written probes it replaces already waited: thirty half-second attempts,
+/// i.e. fifteen seconds, for a service the app retries against on its own afterwards.
+pub(crate) const READY_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One resolved auxiliary service: a process started in the app's cage before its command.
+///
+/// The service's name is the map key wherever this is held, so it is not repeated here. What it is
+/// not is as load-bearing as what it is: sbx starts it, and nothing more. It is not restarted if it
+/// exits, it is not ordered against another service, and it is not stopped on its own — it ends when
+/// the cage does, because it is one more process in the cage's pid namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceSpec {
+    /// The program and its fixed arguments, resolved on the cage's `PATH`. An argument beginning
+    /// with `~/` is held verbatim here and expanded against the cage's home when the launch composes
+    /// the start-up script, which is the first place that home is known.
+    pub(crate) argv: Vec<String>,
+    /// The environment conditions that must **all** hold for the service to start. Empty starts it
+    /// unconditionally, which is both the default and where an unreadable condition lands.
+    pub(crate) enable: Vec<EnvCondition>,
+    /// The readiness gate, or `None` to start the app without waiting.
+    pub(crate) ready: Option<ServiceReady>,
+}
+
+/// A condition on one environment variable, as `[service]`'s `enable` expresses it.
+///
+/// One variable, one comparison, and the values it is compared against. An unset variable compares
+/// as empty rather than making the condition unanswerable, which is what lets `not = "0"` be on by
+/// default: nobody has to set a variable to get the behaviour the profile already promised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnvCondition {
+    /// The variable's name.
+    pub(crate) var: String,
+    /// Whether the condition holds when the variable matches one of the values, or when it matches
+    /// none of them.
+    pub(crate) equals: bool,
+    /// The values compared against, verbatim. Several are an "any of these", which is the one place
+    /// a condition disjoins.
+    pub(crate) values: Vec<String>,
+}
+
+impl EnvCondition {
+    /// Whether the condition holds against the environment the cage is being given.
+    ///
+    /// Answered here rather than by the cage's shell, because sbx composes that environment itself
+    /// (the cage starts from `--clearenv` and receives exactly what the launch assembled), so the
+    /// answer is knowable at the same moment the condition is read. A variable that is not in the
+    /// environment compares as empty rather than making the condition unanswerable.
+    ///
+    /// The last entry wins on a repeated key, matching how the launch upserts its environment
+    /// layers: the value the cage would actually see is the one the condition is asked about.
+    pub(crate) fn holds(&self, env: &[(String, String)]) -> bool {
+        let current = env
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == self.var)
+            .map_or("", |(_, v)| v.as_str());
+        self.values.iter().any(|v| v == current) == self.equals
+    }
+
+    /// Render the condition for display: the variable, the comparison, the value.
+    ///
+    /// Not the TOML a profile writes, deliberately — the config is a table, and printing a table
+    /// back would cost the line more width than the answer is worth. This reads as the question it
+    /// settles.
+    pub(crate) fn display(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.var,
+            if self.equals { "==" } else { "!=" },
+            self.values.join("|")
+        )
+    }
+}
+
+/// A service's readiness gate: the loopback port to wait for, and how long to wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServiceReady {
+    /// The port to connect to at `127.0.0.1` inside the cage.
+    pub(crate) tcp: u16,
+    /// How long to keep trying. On expiry the launch continues and names the service: a gate that
+    /// failed the launch would make a slow auxiliary process into a broken app.
+    pub(crate) timeout: std::time::Duration,
+}
+
 /// A validated declared operation: a fixed command sbx runs in an ephemeral sibling cage on a
 /// caller's behalf, with a credential the caller never holds.
 ///

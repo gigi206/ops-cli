@@ -108,7 +108,8 @@ tasks_max = 4096
 
 ```sh
 sbx config show            # a `limits:` line only when a field is overridden
-sbx config show --app cap  # an app's effective limits, tagged inherited or set
+sbx config show --app cap            # tagged default, inherited or set by the app
+sbx config show --app cap --details  # plus the limits no layer set (folded by default)
 sbx doctor                 # the host's resource-limiting capability
 ```
 

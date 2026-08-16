@@ -1,7 +1,7 @@
 # `sbx upgrade`
 
 ```
-sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|provision] [-a <name>] [--project <path>]
+sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision] [-a <name>] [--project <path>]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
@@ -16,12 +16,19 @@ advance **only here**, never on an `sbx` binary update.
 | `deb` | the project's and apps' `deb:` packages |
 | `appimage` | the project's and apps' `appimage:` packages |
 | `tarball` | the project's and apps' `tarball:` packages |
-| `provision` | re-run the apps' [bundle install steps](../configuration/bundles#provision) in-cage |
+| `binary` | the project's and apps' `binary:` packages |
+| `provision` | re-run the apps' [bundle install steps](../configuration/bundles#the-install-step) in-cage |
 
 | Flag | Effect |
 |---|---|
 | `-a, --app <name>` | narrow `mise` or `provision` to one app's cage |
 | `--project <path>` | roll another project instead of the current directory |
+
+This page is organised by **channel**, which is the right shape when you know which one
+you want. To advance a single app without working that out first, use
+[`sbx app upgrade <name>`](app#advancing-an-app): it reads what the app declares, rolls
+the two channels whose unit of work is that app's own cage, and names the project-wide
+ones rather than rolling them.
 
 See also: [Upgrading toolchains](../concepts/upgrade) · [Provisioning](../concepts/provisioning) · [`nixpkgs`](../configuration/nixpkgs) · [`packages`](../configuration/packages).
 
@@ -38,6 +45,39 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
   (host-side, under a `task pool` line), leaving `nixpkgs.lock` intact.
 - `sbx upgrade flake` re-pins the project's and apps' `flake:` packages.
 - `sbx upgrade provision` re-runs the bundle install steps, one cage per app.
+
+### After a roll that moved the store
+
+Three targets resolve to nix store paths, so rolling one **repoints them**: `nix` rolls
+the channel, `flake` builds through `nix build`, and `mise` re-resolves the project's
+`nix:` tools. An app home built against the old paths can be left holding a reference to
+one that is gone: a virtualenv is the clear case, since its `bin/python` is a symlink
+into the store. When such a roll replaces a revision that was locked before, the run
+closes by naming the apps whose [install
+steps](../configuration/bundles#the-install-step) build against those paths:
+
+```
+sbx upgrade — nix channel
+  channel: nixos-unstable  (default)
+  rolled forward 1111111 → 0e251e2 — the new base and tools download on the next launch.
+  the store paths moved: the install steps of odysseus build against them, so an app home
+  may now hold a reference to a path that is gone. Each repairs itself at its next launch
+  — or now, with `sbx upgrade provision`.
+```
+
+It is a pointer, not a failure: each home repairs itself the next time the app launches,
+provided the step's guard [tests what has to work rather than what has to
+exist](../configuration/bundles#rolling-an-install-step-forward). Running `sbx upgrade
+provision` only brings that repair forward, which is worth doing when you would rather
+find a broken build now than at the next launch.
+
+The other targets stay silent here, and on their mechanism rather than by omission:
+`deb`, `appimage`, `tarball` and `binary` place their own content-hashed artifacts, so
+none of them moves a path a home points into. Under `mise` it is the project's `nix:`
+tools that qualify the target, and only those: the engine runs host-side out of its own
+private home, and `mise:` packages are downloads inside each app's home, so neither can
+leave a home pointing into the store. `all` says the same thing in its own words, naming
+the channel it does not roll.
 
 A roll that fails with `403 rate limit exceeded` and `github auth: no` is not a
 misconfiguration: mise's `aqua:` backend reads the GitHub API, whose anonymous ceiling is

@@ -1,7 +1,8 @@
 # crush — Charm's "glamourous agentic coding" terminal (charmbracelet/crush),
 # sandboxed by sbx.
 #
-#   sbx app import examples/app/crush.toml
+#   sbx bundle import examples/bundle/crush.toml
+#   sbx app import    examples/app/crush.toml
 #   sbx app run crush
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -128,7 +129,7 @@ cmd = "crush"
 # reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
 # profile cannot fall behind when the agent's requirements change.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/crush.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["crush"]

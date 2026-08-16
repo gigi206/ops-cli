@@ -87,6 +87,13 @@ allow = [
     # panel, served from rotating `*.gvt1.com` redirectors. OBSERVED refused on a first launch.
     # GET-only and path-scoped to the dictionary path.
     '{GET} re:^https://[a-z0-9.-]+\.gvt1\.com/edgedl/chrome/dict/',
+    # The provider logos the model picker draws beside each entry: Google's favicon service, and the
+    # brand-icon CDN for the ones it does not cover. OBSERVED refused when the provider list is
+    # opened. Cosmetic — denying them costs icons, not function — but they are read-only and
+    # path-scoped, so they are opened rather than muted.
+    '{GET} re:^https://www\.google\.com/s2/favicons',
+    '{GET} re:^https://t[0-9]\.gstatic\.com/faviconV2',
+    "{GET} https://cdn.simpleicons.org",
 ]
 # Denied noise, kept out of the default log (still denied, still counted by `sbx net stats`). The
 # product analytics POST was OBSERVED on a first launch and is refused; the public build ships no

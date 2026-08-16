@@ -82,7 +82,8 @@ allow = ["/dev/dri"]
 
 ```sh
 sbx config show               # a `devices:` line only when a device is granted
-sbx config show --app render  # an app's effective grant, tagged inherited or set
+sbx config show --app render            # tagged default, inherited or set by the app
+sbx config show --app render --details  # plus the grants no layer set (folded by default)
 ```
 
 The paths render sorted, the same set the cage binds.

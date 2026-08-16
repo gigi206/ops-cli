@@ -1,6 +1,7 @@
 # Cursor — the Cursor AI code editor (desktop, Electron / VS Code fork), sandboxed by sbx.
 #
-#   sbx app import examples/app/cursor.toml
+#   sbx bundle import examples/bundle/cursor.toml
+#   sbx app import    examples/app/cursor.toml
 #   sbx app run cursor
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The editor's package, its auto-upgrade resolver,
@@ -71,10 +72,11 @@
 # signs in to your Cursor account through a WEB flow that ends in a `cursor://` deep-link handed back
 # to the app (confirmed from the `.deb`: `cursor-url-handler.desktop` runs `cursor --open-url %U` for
 # `x-scheme-handler/cursor`). The hermetic cage has no host browser and no `xdg-open`, so clicking
-# "login" out of the box does NOTHING. The `cmd` wrapper below closes the loop IN-CAGE (the
-# `claude-desktop` recipe): it opens http(s) in an in-cage Chromium for the web auth and routes the
-# `cursor://` callback to `cursor --open-url`, and registers a scheme handler so the portal (under
-# `dbus = true`) routes those links too. It needs `nix:chromium` (a large closure — see `[packages]`).
+# "login" out of the box does NOTHING. The `[open]` table below closes the loop IN-CAGE: http(s) go
+# to an in-cage Chromium for the web auth and the `cursor://` callback goes to `cursor --open-url`.
+# One declaration covers both ways a link is opened — a tool calling `xdg-open` and an Electron app
+# calling the portal under `dbus = true` — and sbx freezes the routing so nothing in the cage can
+# answer a sign-in link in its place. It needs `nix:chromium` (a large closure — see `[packages]`).
 #
 # FIRST LOGIN — run it once under `--net allow` (allow-by-default, so no allowlist whack-a-mole while
 # you discover which SSO hosts the flow touches), let the session persist in the isolated home, then
@@ -136,11 +138,10 @@ cmd = [
     "-c",
     '''
 # IN-CAGE BROWSER LOGIN (adapted from claude-desktop). Cursor's account sign-in opens an external
-# browser for the web auth, then hands the result back as a `cursor://` deep-link. The hermetic cage
-# has no browser and no `xdg-open`, so out of the box clicking "login" does nothing. This preamble
-# wires an in-cage Chromium for the http(s) auth and routes the `cursor://` callback to the editor,
-# so the whole flow closes inside the cage. (A plain EMAIL sign-in stays in the app webview and needs
-# none of this.)
+# browser for the web auth, then hands the result back as a `cursor://` deep-link. What each of
+# those opens with is declared in `[open]` below; all that is left here is the one thing a
+# declaration cannot express, Chromium's managed policy. (A plain EMAIL sign-in stays in the app
+# webview and needs neither.)
 
 # Chromium managed policy: auto-launch the `cursor://` deep-link with no confirmation dialog, else the
 # callback never reaches the editor and login silently fails. /etc is a writable cage tmpfs; Chromium
@@ -149,50 +150,8 @@ mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/polic
 {"AutoLaunchProtocolsFromOrigins":[{"allowed_origins":["*"],"protocol":"cursor"}]}
 POLICY
 
-# xdg-open routing by scheme: http(s) -> the in-cage Chromium (the web auth); else (the `cursor://`
-# deep-link) -> `cursor --open-url` so the callback reaches the running editor (the `.deb`'s own
-# handler is `cursor --open-url %U`). `--no-sandbox` on the cursor branch too: it only hands the
-# deep-link to the single-instance app and quits, but still boots far enough to hit Chromium's SUID
-# sandbox (sbx's build strips the setuid bit off chrome-sandbox), which aborts FATAL without it — the
-# callback would never arrive.
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-case "$1" in
-  http://*|https://*)
-    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
-      --no-first-run --no-default-browser-check "$@" ;;
-  *)
-    exec cursor --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --open-url "$@" ;;
-esac
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
-
-# Under `dbus = true` the cage has a real portal, so Electron opens external URLs via
-# `org.freedesktop.portal.OpenURI` instead of calling `xdg-open` — and the portal shows "no apps
-# available" unless a default handler is registered, silently breaking the auth links. Register the
-# wrapper as the default handler for the web + `cursor` schemes. The Exec path is ABSOLUTE ($HOME
-# expanded here) because the portal-launched handler does not inherit this shell's PATH.
-mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=sbx URL handler
-Exec=$HOME/.local/bin/xdg-open %U
-MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/cursor;
-NoDisplay=true
-Terminal=false
-EOF
-cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
-[Default Applications]
-x-scheme-handler/http=sbx-open-uri.desktop
-x-scheme-handler/https=sbx-open-uri.desktop
-x-scheme-handler/cursor=sbx-open-uri.desktop
-MIMEAPPS
-
 exec cursor --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic
+    --use-system-ca --password-store=basic "$@"
 ''',
 ]
 
@@ -218,12 +177,29 @@ dbus = true
 # `audio`/`dbus` grants above, the `http2` designation below, and the sign-in preamble in `cmd`
 # stay here.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/cursor.toml
 # Without it the launch warns that the bundle is undeclared and the editor is simply absent.
 use = ["cursor"]
 
 # No `[packages]` table here, and no `[deb.cursor]` resolver: both come from the bundle.
+
+# URL routing for the sign-in, declared rather than scripted. sbx generates the `xdg-open` the cage
+# reaches and the desktop entry the in-cage portal resolves, and freezes both, so a link opens the
+# same way whichever of the two a caller uses and nothing running in the cage can answer it instead.
+#
+# `http`/`https` go to the in-cage Chromium for the web auth. `cursor` is the callback: the provider
+# redirects to `cursor://…` and the editor must receive it, which is what the `.deb`'s own handler
+# (`cursor --open-url %U`) does. `--no-sandbox` on that branch too: it only hands the deep-link to
+# the single-instance app and quits, but still boots far enough to hit Chromium's SUID sandbox
+# (sbx's build strips the setuid bit off chrome-sandbox), which aborts FATAL without it, and the
+# callback would never arrive.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+cursor = ["cursor", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--open-url"]
 
 # An app is read-by-default ({GET,HEAD}); a host the editor WRITES to (POSTing prompts/context) is
 # opened to all verbs with `{*}`. See the EGRESS note in the header for the HTTP/2 caveat.

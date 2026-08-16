@@ -68,6 +68,11 @@ commit, so `readonly = [".git/"]` leaves `git log`, `git status` and `git diff` 
 every `git add` and `git commit` fail. Naming the files you actually mean (`.git/config`,
 `.git/hooks`) does what you want and leaves committing alone.
 
+Those two are worth setting even when nothing in the project is secret, and for a different
+reason than the rest of this page: they are what stops an agent from leaving a hook that your
+next `commit` runs on the host, outside any cage. See [where the protection
+stops](../concepts/security-model#where-the-protection-stops).
+
 ## The grammar
 
 Each entry is a path **relative to the project root**:

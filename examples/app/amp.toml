@@ -1,6 +1,7 @@
 # Amp — the coding agent from the Amp team (formerly Sourcegraph Amp), sandboxed by sbx.
 #
-#   sbx app import examples/app/amp.toml
+#   sbx bundle import examples/bundle/amp.toml
+#   sbx app import    examples/app/amp.toml
 #   sbx app run amp
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package, environment and hosts come
@@ -92,7 +93,7 @@ exec node "$amp/cli-wrapper.cjs" "$@"
 # the install repair: that is the wrapper in `cmd` above, and it stays here with the rest of this
 # app's posture.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/amp.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["amp"]

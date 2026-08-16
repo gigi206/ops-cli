@@ -519,6 +519,8 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         fs,
         redact,
         bundle,
+        open,
+        service,
         // Carried no further on purpose: `apply_override` refuses each of these outright, so folding
         // them would only move the drop to a later line. An inline `flake.nix`, an auto-upgrade
         // resolver command, and a declared operation are all vetted where they are read and listed,
@@ -539,6 +541,11 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
 
     base.env.extend(env);
     base.packages.extend(packages);
+    // A collection keyed by scheme, so a later blob replaces an earlier blob's handler for the same
+    // scheme and adds the rest — the behaviour `env` and `packages` already have on their key.
+    base.open.extend(open);
+    // Keyed by service name, on the same rule for the same reason.
+    base.service.extend(service);
     base.binds = union_binds(base.binds, binds);
     base.limits = union_limits(base.limits, limits);
     if nixpkgs.is_some() {

@@ -14,6 +14,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::cli::import_remedy;
 use crate::{config, diag, help, style};
 
 /// `sbx bundle` — dispatch. `export`/`import` are reserved subcommand verbs, so a bundle named
@@ -459,32 +460,16 @@ fn bundle_import(args: &[OsString]) -> ExitCode {
                 bundles.len(),
                 path.display()
             );
-            // Import is the one moment someone consciously brings in another author's data, so name
-            // what using it would grant, rather than letting a credential or an egress rule surface
-            // only at the next launch.
-            let granting: Vec<String> = bundles
-                .iter()
-                .filter_map(|(name, b)| {
-                    let rules = b.allow.len() + b.deny.len() + b.mute.len();
-                    let creds = b.secret.as_ref().map(|s| s.hosts.len()).unwrap_or(0);
-                    // An install step is named apart from the counts: it is a command that will run
-                    // in the consuming app's cage, which is a different kind of grant from a host
-                    // or a key, and the one a reader is least likely to expect.
-                    let step = b.provision.is_some().then_some(", an install step");
-                    (rules > 0 || creds > 0 || step.is_some()).then(|| {
-                        format!(
-                            "{name} ({rules} egress rule(s), {creds} credential(s){})",
-                            step.unwrap_or("")
-                        )
-                    })
-                })
-                .collect();
-            if !granting.is_empty() {
-                diag::warn(&format!(
-                    "an app that names these gains their egress, credentials and install steps: \
-                     {} — inspect with `sbx bundle <name>`",
-                    granting.join(", ")
-                ));
+            if let Some(note) = granting_note(&bundles) {
+                diag::warn(&note);
+            }
+            // A bundle's egress list may reference a group, and a group is global-only: undefined,
+            // its entries are dropped at the fold and the consuming app reaches LESS than the
+            // bundle names. This is where the majority of them surface — an app profile resolves
+            // nothing from disk, so `sbx app import` cannot see into the bundle its `use` names,
+            // and without this the reference is silent until a launch that quietly falls short.
+            if let Some(note) = undefined_groups_note(&bundles, &file) {
+                diag::warn(&note);
             }
             ExitCode::SUCCESS
         }
@@ -493,6 +478,101 @@ fn bundle_import(args: &[OsString]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// What naming these bundles from an app would grant, or `None` when they carry nothing to warn
+/// about. Import is the one moment someone consciously brings in another author's data, so the
+/// grant is named here rather than surfacing as a credential or an egress rule at the next launch.
+///
+/// Shared with `sbx app import --with-deps`, which writes bundles the user never named on the
+/// command line: the announcement has to follow the bytes, not the verb that happened to write
+/// them, or the one import where the grant is least expected would be the one that stays silent.
+pub(crate) fn granting_note(
+    bundles: &std::collections::BTreeMap<String, config::RawBundle>,
+) -> Option<String> {
+    let granting: Vec<String> = bundles
+        .iter()
+        .filter_map(|(name, b)| {
+            let rules = b.allow.len() + b.deny.len() + b.mute.len();
+            let creds = b.secret.as_ref().map(|s| s.hosts.len()).unwrap_or(0);
+            // An install step is named apart from the counts: it is a command that will run in the
+            // consuming app's cage, which is a different kind of grant from a host or a key, and the
+            // one a reader is least likely to expect.
+            let step = b.provision.is_some().then_some(", an install step");
+            (rules > 0 || creds > 0 || step.is_some()).then(|| {
+                format!(
+                    "{name} ({rules} egress rule(s), {creds} credential(s){})",
+                    step.unwrap_or("")
+                )
+            })
+        })
+        .collect();
+    (!granting.is_empty()).then(|| {
+        format!(
+            "an app that names these gains their egress, credentials and install steps: {} — \
+             inspect with `sbx bundle <name>`",
+            granting.join(", ")
+        )
+    })
+}
+
+/// The groups a set of bundles reference that `declared` does not define, each paired with the
+/// sibling file that declares it. `src` is the file being imported, so a remedy built from this can
+/// name where each group most likely came from.
+///
+/// Read from the *incoming* bundles rather than from the folded config: the fold drops an
+/// unresolved reference and only records it against the consuming app, so a bundle imported before
+/// any app names it would carry the gap with nothing to attribute it to. `declared` is passed in
+/// rather than read here, so a caller that already holds the group table decides against one set of
+/// bytes throughout instead of re-reading a file that may have changed under it.
+pub(crate) fn undefined_groups(
+    bundles: &std::collections::BTreeMap<String, config::RawBundle>,
+    src: &Path,
+    declared: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<crate::cli::MissingRef> {
+    let referenced = config::group_refs(
+        bundles
+            .values()
+            .flat_map(|b| b.allow.iter().chain(b.deny.iter()).chain(b.mute.iter())),
+    );
+    if referenced.is_empty() {
+        return Vec::new();
+    }
+    crate::cli::missing_refs(
+        &referenced,
+        declared,
+        src,
+        "net-groups",
+        config::read_net_groups_fragment,
+    )
+}
+
+/// The warning for [`undefined_groups`], or `None` when every reference resolves.
+fn undefined_groups_note(
+    bundles: &std::collections::BTreeMap<String, config::RawBundle>,
+    src: &Path,
+) -> Option<String> {
+    let (declared, _) = config::net_groups();
+    let missing = undefined_groups(bundles, src, &declared);
+    if missing.is_empty() {
+        return None;
+    }
+    let remedy = import_remedy("net groups import", &missing);
+    Some(format!(
+        "{} no `[network.groups]` here defines: {} — import {} too ({remedy}), or those entries \
+         are ignored and an app using this bundle reaches less than it names",
+        if missing.len() == 1 {
+            "this bundle references an egress group"
+        } else {
+            "this bundle references egress groups"
+        },
+        missing
+            .iter()
+            .map(|m| format!("@{}", m.name))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if missing.len() == 1 { "it" } else { "them" },
+    ))
 }
 
 #[cfg(test)]

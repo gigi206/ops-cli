@@ -256,6 +256,21 @@ pub(crate) struct Resolved {
     /// a program the manifest declares when `PATH` does not have it, and values for the variables
     /// it reads. Layered global-under-project and gated by trust, like `[packages]`.
     pub(crate) plugin: BTreeMap<String, crate::config::schema::RawPluginConfig>,
+    /// What the cage opens a URI with, keyed by URI scheme. Layered global-under-project and gated
+    /// by trust, like `[packages]` — a project that could declare one would decide what runs when a
+    /// person clicks a sign-in link.
+    pub(crate) open: BTreeMap<String, OpenHandler>,
+    /// Auxiliary processes to start in the cage before its command, keyed by service name. Layered
+    /// global-under-project and gated by trust, like `[packages]` — an entry runs a program of its
+    /// choosing at every launch, which is the grant an untrusted project is refused for `cmd`.
+    pub(crate) service: BTreeMap<String, ServiceSpec>,
+    /// The install steps the launched app's bundles carry, in `use` order — empty for a project run.
+    ///
+    /// Held here, rather than read off the app and composed on the spot, so that the one function
+    /// which stands up a cage composes the whole start-up in one place and in one order: install
+    /// first, then services, then the command. Composed apart, the two wrappers nest, and which one
+    /// ends up inside depends on the order the call sites happen to run in.
+    pub(crate) provisions: Vec<BundleProvision>,
     /// The global config's `nixpkgs` override (trusted by location), or `None` for
     /// the default channel. Drives the base userland and is the default source for a
     /// project's tools.
@@ -478,6 +493,12 @@ pub(crate) struct ResolvedApp {
     pub(crate) binds: Vec<Bind>,
     /// Extra tools, each tagged with its source's trust; override a baseline tool by name.
     pub(crate) packages: Vec<Package>,
+    /// This app's URI handlers, its bundles' folded in beneath its own; override a baseline
+    /// handler by scheme. A security field, gated like the app's `binds`.
+    pub(crate) open: BTreeMap<String, OpenHandler>,
+    /// This app's auxiliary services, its bundles' folded in beneath its own; override a baseline
+    /// service by name. A security field, gated like the app's `binds`.
+    pub(crate) service: BTreeMap<String, ServiceSpec>,
     /// The app's own network posture, set only when a trusted source declared one. `Some`
     /// overrides the baseline; `None` leaves the baseline posture in place.
     pub(crate) network: Option<NetworkPolicy>,
@@ -606,6 +627,16 @@ impl Resolved {
         // every other overlay field resolves — `env`/`packages`/`network`/`gui` all let the app
         // win. Both layers are trusted, so this is a precedence choice, not a security one: an app
         // may thus flip a baseline bind's mode (ro↔rw) or add a new path.
+        // URI handlers fold by scheme, the app's replacing the baseline's — the same rule as `env`
+        // and `packages`, so an app that opens its own deep links keeps whatever browser the
+        // baseline set for the web schemes it does not mention.
+        self.open.extend(app.open);
+        // Services fold by name on the same rule, so an app can retune one its bundle declares (a
+        // different port, a readiness gate the bundle left off) without forking the bundle.
+        self.service.extend(app.service);
+        // The app's install steps are taken whole rather than merged: a launch runs one app, and
+        // the baseline has none of its own to fold under it.
+        self.provisions = app.provisions;
         for bind in app.binds {
             if let Some(existing) = self.binds.iter_mut().find(|b| b.path == bind.path) {
                 *existing = bind;
@@ -775,6 +806,8 @@ impl Resolved {
             proc,
             notify,
             redact,
+            open,
+            service,
             // The channel is applied earlier (before the lock is chosen); groups/apps/bundles are
             // not launch-shaping and were noticed and dropped at collection time (a bundle is only
             // ever reached through an app's `use`, and an override declares no app). An override's
@@ -850,6 +883,28 @@ impl Resolved {
             env,
             false,
         );
+
+        // `[open]` — merged by scheme, the override's handler winning. Carried rather than refused
+        // like `[flakes]`/`[plugin]`: an override is authoritative by invocation, the same tier
+        // that already carries `binds`, and trying a handler for one launch before writing it into
+        // a profile is how one is arrived at. It reaches nothing `binds` does not already reach.
+        if !open.is_empty() {
+            self.open
+                .extend(validate_open(&mut self.warnings, OVERRIDE_SOURCE, open));
+        }
+
+        // `[service]` — merged by name, the override's entry winning, and carried for the same
+        // reason as `[open]`: trying an auxiliary process for one launch, before writing it into a
+        // profile, is how one is arrived at, and it runs in the cage like every other declared
+        // command. It can only *add* or retune, never remove — turning a declared service off for
+        // one launch is what its own `disable_env` and the existing `--env` are for.
+        if !service.is_empty() {
+            self.service.extend(validate_service(
+                &mut self.warnings,
+                OVERRIDE_SOURCE,
+                service,
+            ));
+        }
 
         // `binds` — validate to absolute, canonicalize (as `load` does for the layered binds), then
         // merge by canonical path so the override's mode wins on a collision. The provenance is
@@ -1473,6 +1528,18 @@ fn resolve(
     // Per-plugin settings, global layer: trusted by location, so taken in full.
     let mut plugin_cfg: BTreeMap<String, crate::config::schema::RawPluginConfig> =
         std::mem::take(&mut global.plugin);
+    // URI handlers, global layer: trusted by location, so validated and taken.
+    let mut open = validate_open(
+        &mut warnings,
+        GLOBAL_CONFIG,
+        std::mem::take(&mut global.open),
+    );
+    // Auxiliary services, global layer: trusted by location, so validated and taken.
+    let mut service = validate_service(
+        &mut warnings,
+        GLOBAL_CONFIG,
+        std::mem::take(&mut global.service),
+    );
     // Broker bindings, global layer: the only layer that may name a host resource.
     let mut broker_cfg: BTreeMap<String, crate::config::schema::RawBrokerConfig> =
         std::mem::take(&mut global.broker);
@@ -1790,6 +1857,32 @@ fn resolve(
                      (`sbx trust`)",
                     names.join(", ")
                 ));
+            }
+        }
+        // `[open]` is a security field — a trusted project may say what its links open with; an
+        // untrusted one may not, or it would decide where a sign-in click lands.
+        if !proj.open.is_empty() {
+            if trusted {
+                open.extend(validate_open(
+                    &mut warnings,
+                    PROJECT_CONFIG,
+                    proj.open.clone(),
+                ));
+            } else {
+                gate.refuse("`[open]` URI handlers", &mut warnings);
+            }
+        }
+        // `[service]` is a security field for the plainest reason of all: an entry runs a program
+        // at every launch. That is the grant an untrusted project is already refused for `cmd`.
+        if !proj.service.is_empty() {
+            if trusted {
+                service.extend(validate_service(
+                    &mut warnings,
+                    PROJECT_CONFIG,
+                    proj.service.clone(),
+                ));
+            } else {
+                gate.refuse("`[service]` auxiliary processes", &mut warnings);
             }
         }
         if !proj.plugin.is_empty() {
@@ -2148,6 +2241,10 @@ fn resolve(
         bind_layer,
         packages,
         plugin: plugin_cfg,
+        open,
+        service,
+        // Filled by `merge_app` when a launch is an app's; a project run carries none.
+        provisions: Vec::new(),
         nixpkgs_global,
         nixpkgs_project,
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.
@@ -2828,6 +2925,8 @@ fn resolve_app(
     let mut packages: Vec<Package> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
     let mut tasks: Vec<TaskSpec> = Vec::new();
+    let mut open: BTreeMap<String, OpenHandler> = BTreeMap::new();
+    let mut service: BTreeMap<String, ServiceSpec> = BTreeMap::new();
     let mut network: Option<NetworkPolicy> = None;
     // Every Mode-B app reads by default ({GET,HEAD}); a trusted layer's `default_methods` overrides it.
     let mut default_methods = builtin_app_default_methods();
@@ -2903,6 +3002,10 @@ fn resolve_app(
         absorb_provisions(app.provisions, &mut provisions);
         apply_env(&mut env, None, &mut warnings, &source, app.env, false);
         apply_binds(&mut binds, None, &mut warnings, &source, app.binds);
+        // The bundles this app names were folded under it at load, so this table already holds
+        // theirs beneath the app's own.
+        open.extend(validate_open(&mut warnings, &source, app.open));
+        service.extend(validate_service(&mut warnings, &source, app.service));
         apply_tools(
             &mut packages,
             &mut warnings,
@@ -3077,6 +3180,25 @@ fn resolve_app(
                 apply_binds(&mut binds, None, &mut warnings, &source, app.binds);
             } else {
                 warnings.push(dropped_binds_warning(state, app.binds.len()));
+            }
+        }
+        // `[open]` is gated like the app's binds. An untrusted project defining its *own* app is
+        // not the exception it is for `cmd`: a handler is not the app's identity but a program run
+        // on someone else's click, so an untrusted layer never supplies one.
+        if !app.open.is_empty() {
+            if trusted {
+                open.extend(validate_open(&mut warnings, &source, app.open));
+            } else {
+                gate.refuse("`[open]` URI handlers", &mut warnings);
+            }
+        }
+        // `[service]` is gated on the same footing, and the exception `cmd` gets does not extend to
+        // it either: a service is not the app's identity, it is a second program the launch runs.
+        if !app.service.is_empty() {
+            if trusted {
+                service.extend(validate_service(&mut warnings, &source, app.service));
+            } else {
+                gate.refuse("`[service]` auxiliary processes", &mut warnings);
             }
         }
         // An untrusted project may add its own app's packages but may not override a package a
@@ -3344,6 +3466,8 @@ fn resolve_app(
         env,
         binds,
         packages,
+        open,
+        service,
         network,
         proc,
         notify,
@@ -4996,6 +5120,30 @@ type NetGroups = BTreeMap<String, Vec<crate::allowlist::Rule>>;
 /// open in intent, so an unresolved reference must never pass unnoticed. Only a leading `@` is a
 /// reference: a `@` anywhere else (a URL path like `host/@user`, a `re:` pattern) is a legitimate
 /// part of the entry and is classified as written.
+/// The group an egress entry references, or `None` when the entry is a rule of its own. **Only a
+/// leading `@` is a reference**: a `@` anywhere else (a URL path like `host/@user`, a `re:` pattern)
+/// is a legitimate part of the entry and must classify as written.
+///
+/// One definition, three readers — the classifier that resolves the reference, and the two importers
+/// that report an undeclared one before it is ever folded. Split, they would drift on exactly the
+/// entries where the difference shows: an importer that missed a form would stay silent about a
+/// reference the fold then drops.
+pub(crate) fn group_ref(entry: &str) -> Option<&str> {
+    entry.trim().strip_prefix('@')
+}
+
+/// Every group referenced across a set of egress entries, sorted and deduplicated — the importers'
+/// view of what a fragment will need from `[network.groups]` before anything is resolved.
+pub(crate) fn group_refs<'a>(entries: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut names: Vec<String> = entries
+        .filter_map(|e| group_ref(e))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn classify_entries(
     warnings: &mut Vec<String>,
     source_label: &str,
@@ -5006,13 +5154,18 @@ fn classify_entries(
     let list = slot.label();
     let mut rules = Vec::new();
     for entry in entries {
-        if let Some(name) = entry.trim().strip_prefix('@') {
+        if let Some(name) = group_ref(&entry) {
             match groups.get(name) {
                 Some(group_rules) => rules.extend(group_rules.iter().cloned()),
+                // Both ways in are named: a group most often arrives as a portable fragment
+                // (`sbx net groups import`), and pointing only at hand-editing sends the reader to
+                // write by hand what a verb already imports — the same defect as a message that
+                // names a remedy the product does not offer, inverted.
                 None => warnings.push(format!(
-                    "{source_label}: {list} references undefined group `@{name}` — define it under \
-                     `[network.groups]` in the global config, or remove the reference (the entry is \
-                     ignored, so nothing is {} for it)",
+                    "{source_label}: {list} references undefined group `@{name}` — import it \
+                     (`sbx net groups import <file>`) or define it under `[network.groups]` in the \
+                     global config, or remove the reference (the entry is ignored, so nothing is \
+                     {} for it)",
                     match slot {
                         Slot::Deny => "denied",
                         Slot::Mute => "muted",
@@ -5101,6 +5254,249 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
 /// a reference `@<name>` is unambiguous and the name renders cleanly in warnings and `sbx net`.
 /// Shared with the `sbx net allow/deny` write path so a persisted `@<name>` reference is validated
 /// by the same rule the resolver uses to name a group.
+/// A URI scheme usable as an `[open]` key: RFC 3986's `scheme` production — an ASCII letter
+/// followed by letters, digits, `+`, `-` or `.`.
+///
+/// Kept to exactly that set rather than a looser "no separators" rule because the scheme is written
+/// into three generated artifacts at once — a `case` pattern in the router script, a `MimeType=`
+/// entry, and a `mimeapps.list` key. Every character outside this production is significant in at
+/// least one of them (`*` and `?` glob in the first, `;` terminates the second, `=` splits the
+/// third), so restricting to the production is what keeps one validator sufficient for all three.
+fn is_valid_uri_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && s.len() <= 64
+}
+
+/// Validate an `[open]` table into resolved handlers, dropping and warning on each entry it cannot
+/// honor. Dropping is the right failure here: a URI with no handler prints and continues (the
+/// router's undeclared behaviour), while a handler kept despite a value sbx did not understand would
+/// route a real sign-in click somewhere unintended.
+fn validate_open(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: BTreeMap<String, schema::RawOpen>,
+) -> BTreeMap<String, OpenHandler> {
+    let mut out = BTreeMap::new();
+    for (scheme, entry) in raw {
+        // Schemes are case-insensitive per RFC 3986, and the comparison the router makes is
+        // literal, so the key is folded once here rather than at every match.
+        let scheme = scheme.to_ascii_lowercase();
+        if !is_valid_uri_scheme(&scheme) {
+            warnings.push(format!(
+                "{source}: ignoring `[open]` entry `{scheme}` — a key is a URI scheme (a letter, \
+                 then letters, digits, `+`, `-` or `.`), not a MIME type or a URL"
+            ));
+            continue;
+        }
+        let (cmd, mode) = match entry {
+            schema::RawOpen::Argv(cmd) => (cmd, None),
+            schema::RawOpen::Detailed(table) => (table.cmd, table.mode),
+        };
+        let mode = match mode.as_deref() {
+            None | Some("exec") => OpenMode::Exec,
+            Some("detach") => OpenMode::Detach,
+            Some(other) => {
+                warnings.push(format!(
+                    "{source}: ignoring `[open]` entry `{scheme}` — unknown mode `{other}` \
+                     (expected `exec` or `detach`)"
+                ));
+                continue;
+            }
+        };
+        let argv = cmd.into_argv();
+        if argv.is_empty() || argv[0].is_empty() {
+            warnings.push(format!(
+                "{source}: ignoring `[open]` entry `{scheme}` — it names no program to open with"
+            ));
+            continue;
+        }
+        if argv.iter().any(|a| a.chars().any(char::is_control)) {
+            warnings.push(format!(
+                "{source}: ignoring `[open]` entry `{scheme}` — an argument carries a control \
+                 character"
+            ));
+            continue;
+        }
+        out.insert(scheme, OpenHandler { argv, mode });
+    }
+    out
+}
+
+/// Validate a `[service]` table into resolved specs, dropping what cannot be honored with a warning
+/// that names the service.
+///
+/// Dropping rather than failing keeps a malformed entry from taking the app down with it: an app
+/// whose auxiliary process is missing usually still runs (degraded, and the warning says which one),
+/// where a failed launch leaves nothing at all. That is the same trade `[open]` makes, for the same
+/// reason.
+fn validate_service(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: BTreeMap<String, schema::RawService>,
+) -> BTreeMap<String, ServiceSpec> {
+    let mut out = BTreeMap::new();
+    for (name, entry) in raw {
+        // The name reaches a log file name and every diagnostic, so hold it to the same shape as a
+        // bundle or group name rather than discovering a path separator in it later.
+        if !is_valid_group_name(&name) {
+            warnings.push(format!(
+                "{source}: ignoring `[service]` entry `{name}` — a name is letters, digits, `.`, \
+                 `_` or `-` (64 max)"
+            ));
+            continue;
+        }
+        let (cmd, enable, ready) = match entry {
+            schema::RawService::Argv(cmd) => (cmd, None, None),
+            schema::RawService::Detailed(table) => (table.cmd, table.enable, table.ready),
+        };
+        let argv = cmd.into_argv();
+        if argv.is_empty() || argv[0].is_empty() {
+            warnings.push(format!(
+                "{source}: ignoring `[service]` entry `{name}` — it names no program to run"
+            ));
+            continue;
+        }
+        if argv.iter().any(|a| a.chars().any(char::is_control)) {
+            warnings.push(format!(
+                "{source}: ignoring `[service]` entry `{name}` — an argument carries a control \
+                 character"
+            ));
+            continue;
+        }
+        // The condition is dropped alone when it cannot be read, rather than taking the service with
+        // it, on the same rule as the readiness gate: a qualifier sbx cannot understand must not
+        // cost the process the profile is for. The direction of the drop is the safe one — the
+        // service starts, which is what the profile asks for when nothing says otherwise.
+        //
+        // The two ways a condition can be unreadable are the two ways `is`/`not` can be wrong: both
+        // given (which of them was meant is not guessable) or neither (nothing is being compared).
+        // A list is an `and`, so a member that cannot be read takes the WHOLE condition with it
+        // rather than only itself: dropping one conjunct would silently *loosen* what the profile
+        // asked for, and a service running under half a condition is worse than one running under
+        // none, which at least matches what an absent `enable` means.
+        let enable = match enable {
+            None => Vec::new(),
+            Some(spec) => {
+                let raw = match spec {
+                    schema::RawEnable::One(cond) => vec![cond],
+                    schema::RawEnable::All(conds) => conds,
+                };
+                let reason = if raw.is_empty() {
+                    Some("it lists no condition".to_string())
+                } else {
+                    raw.iter().find_map(|c| {
+                        if c.env.is_empty() {
+                            Some("a condition names no variable".to_string())
+                        } else {
+                            match (&c.is, &c.not) {
+                                (Some(_), Some(_)) => Some(format!(
+                                    "the condition on `{}` sets both `is` and `not`, which cannot \
+                                     both be it",
+                                    c.env
+                                )),
+                                (None, None) => Some(format!(
+                                    "the condition on `{}` sets neither `is` nor `not`, so it \
+                                     compares nothing",
+                                    c.env
+                                )),
+                                (Some(schema::RawValues::Any(v)), None)
+                                | (None, Some(schema::RawValues::Any(v)))
+                                    if v.is_empty() =>
+                                {
+                                    Some(format!(
+                                        "the condition on `{}` lists no value, so it compares \
+                                         nothing",
+                                        c.env
+                                    ))
+                                }
+                                _ => None,
+                            }
+                        }
+                    })
+                };
+                match reason {
+                    Some(reason) => {
+                        warnings.push(format!(
+                            "{source}: ignoring `enable` of `[service]` entry `{name}` — {reason}; \
+                             the service starts unconditionally"
+                        ));
+                        Vec::new()
+                    }
+                    None => raw
+                        .into_iter()
+                        .map(|c| {
+                            let (equals, values) = match (c.is, c.not) {
+                                (Some(values), _) => (true, values.into_vec()),
+                                (_, Some(values)) => (false, values.into_vec()),
+                                // Refused above.
+                                (None, None) => unreachable!(),
+                            };
+                            EnvCondition {
+                                var: c.env,
+                                equals,
+                                values,
+                            }
+                        })
+                        .collect(),
+                }
+            }
+        };
+        let ready = match ready {
+            None => None,
+            Some(gate) => {
+                if gate.tcp == 0 {
+                    warnings.push(format!(
+                        "{source}: ignoring `ready` of `[service]` entry `{name}` — port 0 is not \
+                         a port a service can listen on"
+                    ));
+                    None
+                } else {
+                    let timeout = match gate.timeout.as_deref() {
+                        None => Some(READY_TIMEOUT_DEFAULT),
+                        Some(raw) => match parse_duration(raw) {
+                            Ok(d) => d,
+                            Err(reason) => {
+                                warnings.push(format!(
+                                    "{source}: `ready.timeout` of `[service]` entry `{name}` is \
+                                     invalid — {reason}; using the default"
+                                ));
+                                Some(READY_TIMEOUT_DEFAULT)
+                            }
+                        },
+                    };
+                    // `parse_duration` reads `0` as "no bound"; a readiness gate that never gives up
+                    // would hang the launch on a service that never binds, which is the one outcome
+                    // the gate exists to avoid.
+                    match timeout {
+                        Some(timeout) => Some(ServiceReady {
+                            tcp: gate.tcp,
+                            timeout,
+                        }),
+                        None => {
+                            warnings.push(format!(
+                                "{source}: ignoring `ready` of `[service]` entry `{name}` — a \
+                                 timeout of 0 would wait forever on a service that never binds"
+                            ));
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        out.insert(
+            name,
+            ServiceSpec {
+                argv,
+                enable,
+                ready,
+            },
+        );
+    }
+    out
+}
+
 pub(crate) fn is_valid_group_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64

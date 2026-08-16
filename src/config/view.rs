@@ -49,6 +49,10 @@ pub(crate) struct ConfigView {
     /// Extra host paths bound read-only, already canonicalized to what the launch would mount,
     /// each tagged with the layer that declared it.
     pub(crate) binds: Vec<BindView>,
+    /// The URI handlers in effect, one per scheme.
+    pub(crate) open: Vec<OpenView>,
+    /// The auxiliary services in effect, one per name.
+    pub(crate) service: Vec<ServiceView>,
     /// Declared `[packages]` tools, each with its backend and trust verdict.
     pub(crate) packages: Vec<PackageView>,
     /// The project's mise file and whether it would be honored, when one is present.
@@ -162,6 +166,84 @@ pub(crate) struct BindView {
     pub(crate) writable: bool,
     /// Which config layer declared the bind, when known.
     pub(crate) layer: Option<ProvenanceView>,
+}
+
+/// Project a resolved handler table for display, in scheme order.
+fn open_views(open: &std::collections::BTreeMap<String, super::OpenHandler>) -> Vec<OpenView> {
+    open.iter()
+        .map(|(scheme, h)| OpenView {
+            scheme: scheme.clone(),
+            cmd: h.argv.join(" "),
+            mode: match h.mode {
+                super::OpenMode::Exec => "exec".to_string(),
+                super::OpenMode::Detach => "detach".to_string(),
+            },
+        })
+        .collect()
+}
+
+/// One resolved URI handler, as displayed: the scheme it answers and the command it runs.
+///
+/// Surfaced rather than counted. A handler is what a sign-in link reaches, so "2 handlers" would
+/// tell a reader the one thing that does not matter about them.
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct OpenView {
+    /// The URI scheme, lowercased as it resolves.
+    pub(crate) scheme: String,
+    /// The command, as a display string.
+    pub(crate) cmd: String,
+    /// `exec` or `detach`.
+    pub(crate) mode: String,
+}
+
+/// Project a resolved service table for display, in name order.
+fn service_views(
+    service: &std::collections::BTreeMap<String, super::ServiceSpec>,
+) -> Vec<ServiceView> {
+    service
+        .iter()
+        .map(|(name, s)| ServiceView {
+            name: name.clone(),
+            cmd: s.argv.join(" "),
+            enable: (!s.enable.is_empty()).then(|| {
+                s.enable
+                    .iter()
+                    .map(super::EnvCondition::display)
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            }),
+            ready: s.ready.map(|r| ServiceReadyView {
+                tcp: r.tcp,
+                timeout_secs: r.timeout.as_secs(),
+            }),
+        })
+        .collect()
+}
+
+/// One resolved auxiliary service, as displayed.
+///
+/// This view is the field's whole reason for existing: the same process started by a `nohup` inside
+/// a `cmd` is invisible to every inspection verb, and a reader has to find it by reading a shell
+/// script. Named here, it is listed beside the packages and the handlers.
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct ServiceView {
+    /// The service's name, as declared — also the stem of its log file in the cage's home.
+    pub(crate) name: String,
+    /// The command, as a display string.
+    pub(crate) cmd: String,
+    /// The environment conditions it starts under, joined by `and`, when it has any.
+    pub(crate) enable: Option<String>,
+    /// The readiness gate, when it has one.
+    pub(crate) ready: Option<ServiceReadyView>,
+}
+
+/// A service's readiness gate, as displayed.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ServiceReadyView {
+    /// The cage-loopback port waited for.
+    pub(crate) tcp: u16,
+    /// The wait budget in seconds, after which the app starts regardless.
+    pub(crate) timeout_secs: u64,
 }
 
 /// Where a resolved value came from — the presentation-agnostic mirror of [`super::Provenance`].
@@ -677,6 +759,12 @@ pub(crate) struct AppView {
     /// baseline binds, each read-only or read-write. The overlay's own paths, canonicalized to what
     /// a launch would mount. A count by default, each path (with its mode) under `--details`.
     pub(crate) binds: Vec<BindView>,
+    /// The URI handlers this overlay adds over the baseline, its bundles' folded in beneath its
+    /// own. The overlay's own set, like its binds and packages.
+    pub(crate) open: Vec<OpenView>,
+    /// The auxiliary services this overlay adds over the baseline, its bundles' folded in beneath
+    /// its own. The overlay's own set, on the same rule as its handlers.
+    pub(crate) service: Vec<ServiceView>,
     /// The packages this overlay declares — the same projection the baseline `packages` section
     /// carries (backend, locator, realisation, trust verdict, and a `flake:` pin), so an untrusted
     /// app package reads as withheld here exactly as it would be withheld at launch, and the
@@ -818,6 +906,12 @@ pub(crate) struct AppDetailView {
     /// credential then, so the view does not report one either (mirroring the launch's posture).
     pub(crate) secrets: Vec<SecretView>,
     pub(crate) secrets_inherited: usize,
+    /// The URI handlers in effect for this app: its own folded over the baseline's, since that is
+    /// what the launch freezes and a reader chasing a sign-in wants the answer, not the delta.
+    pub(crate) open: Vec<OpenView>,
+    /// The auxiliary services in effect for this app, its own folded over the baseline's — what the
+    /// launch would actually start, which is what someone asking "what else is running?" wants.
+    pub(crate) service: Vec<ServiceView>,
     /// Notes about what this app's resolution dropped or ignored.
     pub(crate) notes: Vec<String>,
 }
@@ -968,6 +1062,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         cwd: cwd.display().to_string(),
         env,
         binds,
+        open: open_views(&resolved.open),
+        service: service_views(&resolved.service),
         packages,
         plugins,
         mise,
@@ -1287,6 +1383,8 @@ fn app_view(
     });
     AppView {
         name: name.to_string(),
+        open: open_views(&app.open),
+        service: service_views(&app.service),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
         provisions: app
             .provisions
@@ -1417,79 +1515,120 @@ fn app_detail_view(
         policy.apply_default_methods(&app.default_methods);
     }
     let network = network_view(&eff_network);
-    let network_origin = origin_or_inherited(app.network.is_some(), app.network_origin);
+    let network_origin = origin_or_inherited(
+        app.network.is_some(),
+        app.network_origin,
+        baseline.network_origin,
+    );
+    // The handlers the launch would freeze: the baseline's, with the app's folded over by scheme —
+    // the same rule `merge_app` applies, so the view and the cage agree on what answers a link.
+    let mut eff_open = baseline.open.clone();
+    eff_open.extend(app.open.clone());
+    // The services the launch would start, folded on the same rule and for the same reason: a
+    // reader asking what else runs beside this app wants the answer, not this layer's delta.
+    let mut eff_service = baseline.service.clone();
+    eff_service.extend(app.service.clone());
     let eff_proc = app.proc.clone().unwrap_or_else(|| baseline.proc.clone());
     let proc = proc_view(&eff_proc);
-    let proc_origin = origin_or_inherited(app.proc.is_some(), app.proc_origin);
+    let proc_origin =
+        origin_or_inherited(app.proc.is_some(), app.proc_origin, baseline.proc_origin);
     let eff_notify = app.notify.unwrap_or(baseline.notify);
     let notify = notify_view(&eff_notify);
-    let notify_origin = origin_or_inherited(app.notify.is_some(), app.notify_origin);
+    let notify_origin = origin_or_inherited(
+        app.notify.is_some(),
+        app.notify_origin,
+        baseline.notify_origin,
+    );
     let eff_gui = app.gui.unwrap_or(baseline.gui);
     let gui = match eff_gui {
         super::GuiPolicy::Wayland => GuiView::Wayland,
         super::GuiPolicy::Offscreen => GuiView::Offscreen,
         super::GuiPolicy::None => GuiView::None,
     };
-    let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin);
+    let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin, baseline.gui_origin);
     let eff_gpu = app.gpu.unwrap_or(baseline.gpu);
-    let gpu_origin = origin_or_inherited(app.gpu.is_some(), app.gpu_origin);
+    let gpu_origin = origin_or_inherited(app.gpu.is_some(), app.gpu_origin, baseline.gpu_origin);
     let eff_audio = app.audio.unwrap_or(baseline.audio);
-    let audio_origin = origin_or_inherited(app.audio.is_some(), app.audio_origin);
+    let audio_origin =
+        origin_or_inherited(app.audio.is_some(), app.audio_origin, baseline.audio_origin);
     let eff_dbus = app.dbus.unwrap_or(baseline.dbus);
-    let dbus_origin = origin_or_inherited(app.dbus.is_some(), app.dbus_origin);
+    let dbus_origin =
+        origin_or_inherited(app.dbus.is_some(), app.dbus_origin, baseline.dbus_origin);
 
     // Effective forward: the app's own ports ∪ the baseline's — the same union `merge_app`
     // performs — with the origin `Inherited` when the app added none of its own.
     let mut eff_forward = baseline.forward.clone();
     super::union_forward(&mut eff_forward, app.forward.clone());
-    let forward_origin = origin_or_inherited(!app.forward.is_empty(), app.forward_origin);
+    let forward_origin = origin_or_inherited(
+        !app.forward.is_empty(),
+        app.forward_origin,
+        baseline.forward_origin,
+    );
 
     // Effective seccomp: the app's own relaxation ∪ the baseline's — the same union `merge_app`
     // performs — with the origin `Inherited` when the app added none of its own.
     let mut eff_seccomp = baseline.seccomp.clone();
     eff_seccomp.union(&app.seccomp);
-    let seccomp_origin = origin_or_inherited(!app.seccomp.is_empty(), app.seccomp_origin);
+    let seccomp_origin = origin_or_inherited(
+        !app.seccomp.is_empty(),
+        app.seccomp_origin,
+        baseline.seccomp_origin,
+    );
 
     // Effective devices: the app's own grant ∪ the baseline's — the same union `merge_app` performs
     // — with the origin `Inherited` when the app added none of its own.
     let mut eff_devices = baseline.devices.clone();
     super::union_devices(&mut eff_devices, app.devices.clone());
-    let devices_origin = origin_or_inherited(!app.devices.is_empty(), app.devices_origin);
+    let devices_origin = origin_or_inherited(
+        !app.devices.is_empty(),
+        app.devices_origin,
+        baseline.devices_origin,
+    );
     // Effective masks: the app's own ∪ the baseline's — the same union `merge_app` performs, and
     // the same direction (an app closes more, never less).
     let mut eff_fs = baseline.fs.clone();
     eff_fs.union(app.fs.clone());
-    let fs_origin = origin_or_inherited(!app.fs.is_empty(), app.fs_origin);
+    let fs_origin = origin_or_inherited(!app.fs.is_empty(), app.fs_origin, baseline.fs_origin);
 
     // Effective ssh-agent grant: the app's own ∪ the baseline's — the same union `merge_app`
     // performs — with the origin `Inherited` when the app named no key of its own.
     let mut eff_ssh_agent = baseline.ssh_agent.clone();
     super::union_ssh_agent(&mut eff_ssh_agent, app.ssh_agent.clone());
-    let ssh_agent_origin = origin_or_inherited(!app.ssh_agent.is_empty(), app.ssh_agent_origin);
+    let ssh_agent_origin = origin_or_inherited(
+        !app.ssh_agent.is_empty(),
+        app.ssh_agent_origin,
+        baseline.ssh_agent_origin,
+    );
 
     // Effective limits: the app's overrides folded onto the baseline; each field's origin is the
     // app's when it set the field, else inherited from the baseline.
     let mut eff_limits = baseline.limits.clone();
     super::overlay_limits(&mut eff_limits, app.limits.clone());
-    let limit = |(value, _ov): (String, bool), set: bool, origin: super::Provenance| LimitView {
+    let limit = |(value, _ov): (String, bool),
+                 set: bool,
+                 origin: super::Provenance,
+                 baseline_origin: super::Provenance| LimitView {
         value,
-        origin: origin_or_inherited(set, origin),
+        origin: origin_or_inherited(set, origin, baseline_origin),
     };
     let limits = LimitsView {
         memory_high: limit(
             eff_limits.memory_high(),
             app.limits.memory_high.is_some(),
             app.limits_origin.memory_high,
+            baseline.limits_origin.memory_high,
         ),
         memory_max: limit(
             eff_limits.memory_max(),
             app.limits.memory_max.is_some(),
             app.limits_origin.memory_max,
+            baseline.limits_origin.memory_max,
         ),
         tasks_max: limit(
             eff_limits.tasks_max(),
             app.limits.tasks_max.is_some(),
             app.limits_origin.tasks_max,
+            baseline.limits_origin.tasks_max,
         ),
     };
 
@@ -1525,6 +1664,8 @@ fn app_detail_view(
     AppDetailView {
         name: name.to_string(),
         cwd: cwd.display().to_string(),
+        open: open_views(&eff_open),
+        service: service_views(&eff_service),
         cmd: (!app.cmd.is_empty()).then(|| app.cmd.join(" ")),
         cmd_origin: app.cmd_origin.into(),
         provisions: app
@@ -1624,11 +1765,23 @@ fn app_detail_view(
     }
 }
 
-/// A scalar app field's provenance for the detail view: the app layer that set it when it did,
-/// else `Inherited` (the field took the baseline's value).
-fn origin_or_inherited(app_set: bool, origin: super::Provenance) -> ProvenanceView {
+/// A scalar app field's provenance for the detail view, as a three-way answer: the app layer that
+/// set it when the app did, else `Inherited` when a *baseline* layer set it, else `Default`.
+///
+/// The last distinction is the one this view exists to make. Answering `Inherited` for everything
+/// the app left alone says "this value comes from your config" about ten fields nobody ever
+/// configured, and it flattens the only thing a reader is looking for: which of these postures
+/// somebody actually chose. `baseline_origin` is the same per-field provenance `sbx config show`
+/// renders, so the two views cannot disagree about who set what.
+fn origin_or_inherited(
+    app_set: bool,
+    app_origin: super::Provenance,
+    baseline_origin: super::Provenance,
+) -> ProvenanceView {
     if app_set {
-        origin.into()
+        app_origin.into()
+    } else if matches!(baseline_origin, super::Provenance::Default) {
+        ProvenanceView::Default
     } else {
         ProvenanceView::Inherited
     }
@@ -1747,6 +1900,8 @@ mod tests {
     #[test]
     fn the_view_model_serializes_to_a_json_object() {
         let view = ConfigView {
+            open: vec![],
+            service: vec![],
             plugins: vec![],
             tasks: Vec::new(),
             fs_deny: Vec::new(),
@@ -1835,6 +1990,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                open: vec![],
+                service: vec![],
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
@@ -2025,6 +2182,8 @@ mod tests {
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
             provisions: Vec::new(),
+            open: Default::default(),
+            service: Default::default(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: None,
@@ -2124,6 +2283,9 @@ mod tests {
             ],
             bind_layer: Default::default(),
             packages: vec![],
+            open: Default::default(),
+            service: Default::default(),
+            provisions: Default::default(),
             nixpkgs_global: None,
             nixpkgs_project: None,
             mise: None,
@@ -2164,6 +2326,8 @@ mod tests {
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
             provisions: Vec::new(),
+            open: Default::default(),
+            service: Default::default(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: None,

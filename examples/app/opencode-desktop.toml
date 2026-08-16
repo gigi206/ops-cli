@@ -1,6 +1,7 @@
 # opencode desktop — the Electron GUI of opencode, sandboxed by sbx (with a Wayland display).
 #
-#   sbx app import examples/app/opencode-desktop.toml
+#   sbx bundle import examples/bundle/opencode-desktop.toml
+#   sbx app import    examples/app/opencode-desktop.toml
 #   sbx app run opencode-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's package and the hosts it reaches come
@@ -98,7 +99,7 @@ dbus = true
 # app's requirements change. The posture above (`gui`/`gpu`/`dbus`) stays here: a bundle may never
 # widen what the cage exposes of the host.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/opencode-desktop.toml
 # Without it the launch warns that the bundle is undeclared and the app is simply absent.
 use = ["opencode-desktop"]

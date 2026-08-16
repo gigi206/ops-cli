@@ -1,6 +1,7 @@
 # T3 Code — the open-source control plane for coding agents (pingdotgg/t3code), sandboxed by sbx.
 #
-#   sbx app import examples/app/t3code.toml
+#   sbx bundle import examples/bundle/claude-code.toml
+#   sbx app import    examples/app/t3code.toml
 #   sbx app run t3code
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
@@ -63,60 +64,29 @@
 # (`claude auth login`, `codex login`, `opencode auth`) — an OAuth flow that opens a URL and waits on a
 # `localhost:<port>` callback. That callback server runs INSIDE the cage (empty netns), so the whole
 # flow must close in-cage: the URL cannot be completed in your host browser (its redirect to the
-# in-cage loopback is unreachable from the host). So the command is a bash wrapper (not a bare argv)
-# that installs an `xdg-open` launching an IN-CAGE Chromium for http(s) — the provider consent page +
-# the loopback callback both resolve inside the sandbox, no host browser, no `forward`. Same pattern as
-# aionui / claude-desktop. HEAVY: it pulls the Chromium closure into the store on first launch (see
-# [packages]). Each provider's OWN login hosts must be in [network] — add them from
+# in-cage loopback is unreachable from the host). So the `[open]` table below sends http(s) to an
+# IN-CAGE Chromium — the provider consent page and the loopback callback both resolve inside the
+# sandbox, no host browser, no `forward`. Same pattern as aionui / claude-desktop. HEAVY: it pulls
+# the Chromium closure into the store on first launch (see [packages]). Each provider's OWN login hosts must be in [network] — add them from
 # `sbx net logs -a t3code` on your first login attempt. `--password-store=basic` forces the file cookie
 # store (no keyring in the cage) so a login survives a relaunch. If every agent you use is configured
-# with an API KEY instead of OAuth (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY in its own config), you can
-# drop this wrapper + the chromium package for a bare `t3code` argv.
-cmd = [
-    "bash",
-    "-c",
-    '''
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-case "$1" in
-  http://*|https://*)
-    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
-      --no-first-run --no-default-browser-check "$@" ;;
-  *)
-    exec t3code --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage "$@" ;;
-esac
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
-
-# Under `dbus = true` Electron opens external URLs via `org.freedesktop.portal.OpenURI`, not `xdg-open`
-# directly; the portal shows "no apps available" unless a default http/https handler is registered.
-# Register the wrapper as that handler. The Exec path is ABSOLUTE ($HOME expanded here) because the
-# portal-launched handler does not inherit this shell's PATH.
-mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=sbx URL handler
-Exec=$HOME/.local/bin/xdg-open %U
-MimeType=x-scheme-handler/http;x-scheme-handler/https;
-NoDisplay=true
-Terminal=false
-EOF
-cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
-[Default Applications]
-x-scheme-handler/http=sbx-open-uri.desktop
-x-scheme-handler/https=sbx-open-uri.desktop
-MIMEAPPS
-
+# with an API KEY instead of OAuth (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY in its own config), you
+# can drop the `[open]` table + the chromium package.
+# A plain argv, not a `bash -c`: nothing here derives a value, tests a path or writes a file, so a
+# shell would only add a process and a quoting surface. It also means `sbx app run t3code -- <args>`
+# reaches the program directly, since sbx appends the trailing arguments to this list.
+#
 # GPU note: on an NVIDIA/Optimus machine Chromium may pick the discrete card, which has no in-cage
 # driver (`pci id 10de:… driver (null)` -> "GPU process isn't usable. Goodbye."), an intermittent
 # crash. If the window crashes on GPU, add `--disable-gpu` below for software rendering (maps via
 # wl_shm; a UI control plane needs no acceleration).
-exec t3code --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic
-''',
+cmd = [
+    "t3code",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+    "--password-store=basic",
 ]
 
 gui = "wayland"
@@ -186,6 +156,20 @@ use = ["claude-code"]
 #binds = [
 #    { path = "~/work", mode = "rw" },
 #]
+
+# Where a web link opens: the in-cage Chromium. One declaration covers both ways a link is opened —
+# a tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` — and sbx
+# freezes the routing, so nothing running in the cage can answer a sign-in link in its place.
+#
+# The hand-written wrapper this replaces also had a catch-all branch handing every OTHER scheme to
+# `t3code`. It was speculative (the registered handler only ever claimed http/https, so the portal
+# never used it). If T3 Code turns out to answer a scheme of its own, declare it here as one more
+# key; an undeclared scheme is printed rather than opened.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
 
 [packages]
 # The T3 Code desktop app, tracked from the latest GitHub release's linux `.AppImage` automatically

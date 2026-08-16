@@ -1,6 +1,7 @@
 # OpenWork — the open-source agent workspace (different-ai/openwork), sandboxed by sbx.
 #
-#   sbx app import examples/app/openwork.toml
+#   sbx bundle import examples/bundle/openwork.toml
+#   sbx app import    examples/app/openwork.toml
 #   sbx app run openwork
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.AppImage`, its auto-upgrade resolver and the
@@ -13,6 +14,7 @@
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-runtime.toml
+#     sbx net groups import examples/net-groups/chromium-background.toml
 #
 # OpenWork is a free, open-source Electron desktop app: a workspace where agents run against your
 # files, with skills, MCP connections and connected services you can share with teammates or keep to
@@ -48,7 +50,19 @@
 # `sbx net logs -a openwork` first: a
 # named deny is a host to add to `allow`, not a reason to drop the allowlist.
 # `sbx app run openwork --net shared` remains the one-launch escape hatch, and it leaves the profile
-# filtered.
+# filtered. Reach for `--net allow=…` instead and read its help first: a one-shot override is
+# AUTHORITATIVE, so it REPLACES this list rather than extending it — passing a single provider host
+# closes every host below, and the app comes up with its own backend refused.
+#
+# THE APP OPENS A DEVTOOLS PORT, and the empty netns is what contains it. OpenWork exposes the
+# Chrome DevTools Protocol unconditionally — that is how its own plugin drives the embedded browser
+# panel — binding the first free port from 9223 to 9227 on loopback, packaged build included. Under
+# the filtering posture that loopback is the CAGE's: the netns is empty, nothing on your machine can
+# reach it, and the port is as confined as the app. The escape hatch is what changes that:
+# `network = "shared"` (and `--net shared`) keeps the HOST network namespace, so the same port lands
+# on your host loopback, where any local process can drive the app — read its window, navigate its
+# browser panel, act as the user. That is a reason to use the escape hatch to diagnose a refused
+# host and then leave it, rather than to sit in it.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
@@ -72,23 +86,35 @@
 # `--ozone-platform=wayland` selects the Wayland backend; `--disable-dev-shm-usage` avoids the small
 # cage `/dev/shm`.
 #
-# SIGNING IN TO DEN — use the app's OWN browser panel, and no in-cage Chromium is needed. This is
-# the one desktop profile that needs no `nix:chromium`: OpenWork embeds a browser panel, and its
-# main process INTERCEPTS the `openwork://` deep link the Den sign-in hands back ("so in-app browser
-# auth works without the system protocol handler", in upstream's words), so the whole flow closes
-# inside the app. Open the browser panel, go to the Den sign-in page, authenticate, and the grant
-# comes back to the app itself.
+# SIGNING IN — why `[open]` declares TWO schemes. Anything OpenWork treats as an external link goes
+# through Electron's `shell.openExternal`: the "Sign in" button, the Help menu, a link opened from
+# the embedded browser panel. A hermetic cage has no system browser and no registered URL handler, so
+# `openExternal` does nothing and the click is silently dropped. This profile provisions an IN-CAGE
+# Chromium and names it in `[open]`, which covers both ways that click can travel: a direct
+# `xdg-open` call, and — the load-bearing one under `dbus = true`, where `openExternal` routes
+# through the portal's `org.freedesktop.portal.OpenURI` and consults the desktop database instead —
+# the desktop entry sbx generates from the same declaration. Same pattern as
+# `examples/app/freebuff-desktop.toml` and `examples/app/t3code.toml`.
 #
-# The "Sign in" BUTTON is a different path and it is inert here: it calls Electron's
-# `shell.openExternal`, which hands the URL to a system browser the hermetic cage does not have, so
-# the click reports that it could not open a browser. That is a missing host browser, not a broken
-# login — the browser panel above is the way in. If you would rather wire the button, the pattern is
-# the in-cage Chromium the other desktop profiles use (`examples/app/freebuff-desktop.toml`): add
-# `chromium = "nix:chromium"` to a `[packages]` table here and replace `cmd` with the bash wrapper
-# that installs an `xdg-open` shim plus a `.desktop` handler — registering `openwork` itself as the
-# `x-scheme-handler/openwork` handler, so the callback reaches the running instance through
-# Electron's single-instance relay. It costs a large closure to replace something the app already
-# does.
+# The SECOND scheme is what closes the loop, and it is specific to this app. OpenWork's Den sign-in
+# ends by handing back an `openwork://` deep link, and the browser that receives it is the in-cage
+# Chromium, not the app. So the wrapper registers `x-scheme-handler/openwork` as well, pointing at
+# `openwork` itself: launching the app a second time with the link as its argument hands it to the
+# instance already running, through Electron's single-instance relay, which is the path the app's own
+# `second-instance` handler expects. Without that registration the browser has nowhere to send the
+# grant and the login ends one step short.
+#
+# That relay instance MUST carry `--no-sandbox` like the first one. Measured: a bare
+# `openwork "openwork://…"` aborts on Chromium's SUID sandbox helper (`chrome-sandbox` is not
+# setuid root in the store, and it refuses to run unsandboxed on its own) — it dies before relaying,
+# the app shows nothing, and the sign-in page keeps polling a grant that never arrives. That is why
+# the shim's default branch passes the same flags, rather than exec'ing the bare command.
+#
+# The app ALSO embeds a browser panel that intercepts `openwork://` on its own ("so in-app browser
+# auth works without the system protocol handler", in upstream's words), so a sign-in driven entirely
+# from inside that panel closes without any of the above. It is a second route, not a replacement:
+# every link the app hands to `openExternal` still needs the wrapper. `--password-store=basic` forces
+# the file cookie store (no keyring in the cage) so a login survives a relaunch.
 #
 # WHAT DOES NOT WORK IN THE CAGE, and why. OpenWork-MANAGED OAuth — the flow that connects a
 # third-party service (Google Workspace, Microsoft 365) through OpenWork rather than through your own
@@ -121,12 +147,13 @@ dbus = true
 # the bundle may never carry is posture: the `gui`/`gpu`/`dbus` grants and the command above stay
 # here.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/openwork.toml
 # Without it the launch warns that the bundle is undeclared and the app is simply absent.
 use = ["openwork"]
 
-# No `[packages]` table here, and no `[appimage.openwork]` resolver: both come from the bundle.
+# The app itself and its `[appimage.openwork]` resolver come from the bundle; the only package
+# declared here is the browser, below.
 
 # OpenWork works on your files: the workspace you authorize in the app has to exist in the cage.
 # Launching from a project directory gives it that project; `binds` is what adds another. It is a
@@ -136,6 +163,30 @@ use = ["openwork"]
 #binds = [
 #    { path = "~/work", mode = "rw" },
 #]
+
+# Where a link opens, declared rather than scripted. `http`/`https` go to the in-cage Chromium for
+# the Den sign-in; `openwork` is the grant the browser receives at the end of it, which must reach
+# the running app — a second instance hands the link to the first and exits. The Electron flags are
+# NOT optional on that path: an `openwork` started without `--no-sandbox` dies on Chromium's SUID
+# sandbox helper before it relays anything, and the grant is lost with no message in the app.
+#
+# One declaration covers both ways a link is opened — a tool calling `xdg-open` and an Electron app
+# calling the portal under `dbus = true` — and sbx freezes the routing, so nothing running in the
+# cage can answer a sign-in link in its place.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+openwork = ["openwork", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage"]
+
+[packages]
+# In-cage Chromium for the sign-in flow and for any external link the app opens (see "SIGNING IN"
+# above). HEAVY — a large nixpkgs closure on the first launch, shared with every other Chromium
+# profile in your store. It is declared HERE rather than in the bundle because it is only useful
+# under the `gui` posture this profile sets, and a bundle may not set one: something that named the
+# bundle for the app alone should not inherit a browser closure it cannot display.
+chromium = "nix:chromium"
 
 [network]
 mode = "deny"
@@ -151,6 +202,25 @@ allow = [
     #"{*} https://openrouter.ai",
     #"{*} https://generativelanguage.googleapis.com",
 ]
+# The in-cage browser's OWN background traffic (update, safe-browsing, time, checkin, on-device
+# model), none of it required for the sign-in it is here to carry. Denied by construction; muted so
+# it does not drown the actionable refusals in `sbx net logs -a openwork`. It sits here rather than
+# in the bundle because the browser does: the group is only relevant where `chromium` is declared.
+# The group includes Google's leaked-password check, so denying it is a feature, not a loss.
+mute = [
+    "@chromium-background",
+    # Chrome's page-translation probe, in the same class as the group above but not part of it.
+    # OBSERVED refused when the sign-in page loads.
+    "translate.googleapis.com",
+]
+# SIGNING IN WITH A THIRD-PARTY ACCOUNT. The Den sign-in page offers identity providers, and each
+# one needs its own chain opened here — the profile opens none by default, so a launch that never
+# uses them stays narrow. `accounts.google.com` shows up refused on any Chromium start (its
+# `ListAccounts` probe) whether or not you intend to use Google; that refusal alone is not a reason
+# to open the lane. Uncomment the provider you actually sign in with:
+#     "@google-signin-incage",   # sbx net groups import examples/net-groups/google-signin-incage.toml
+#     "@github",                 # sbx net groups import examples/net-groups/github.toml
+# Add them to `allow` above, not here.
 
 # CREDENTIAL POSTURE — the engine's own credentials, held in the app's isolated home.
 # OpenWork drives its embedded OpenCode engine, and that engine authenticates the way it does

@@ -2,6 +2,7 @@
 
 ```
 sbx app run <name> [--detach] [--observe] [--net-learn[=level] [--global|--local] [--dry-run]] [override flags] [-- <args>...]
+sbx app upgrade <name>
 sbx app import <file> [--as <name>] [--force]
 sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
@@ -33,6 +34,12 @@ launched program without editing the profile: e.g. `sbx app run claude-code -- -
 the profile's `claude` with `-c`. They are ordinary launch-time arguments; the app's
 posture (network, binds, secrets, home) is fixed by the profile.
 
+When the profile's `cmd` is a shell script (`["bash", "-c", "..."]`), sbx inserts the
+app's name as the script's `$0` before appending, so your first argument arrives as `$1`
+instead of being absorbed as the shell's own name. The script still has to expand `"$@"`
+for the arguments to reach the program it runs: see
+[`cmd`](../configuration/apps#the-cmd-field-and-trailing-arguments).
+
 A one-shot override is applied after the app's overlay, so it is the final word: e.g.
 `sbx app run claude-code --net none` cuts the app's network for one run. Note: overriding
 an app's network drops its read-by-default verb filter (an override posture is
@@ -63,6 +70,69 @@ profile with `-g`, which, for an app defined only inline in a project `sbx.toml`
 a partial `apps/<name>.toml` the inline table then shadows on load; prefer `-g` for an
 app that is already an imported profile. It is foreground-only (not with `--detach`).
 
+## Advancing an app
+
+`sbx app upgrade <name>` moves one app forward without making you work out which
+channel it rides first. sbx reads what the app declares and dispatches on that.
+
+Two kinds of work exist, and the verb treats them differently because they differ in
+scope, not in importance.
+
+| What the app declares | What `sbx app upgrade` does |
+|---|---|
+| `mise:` packages | rolls them, in the app's own cage |
+| a bundle [install step](../configuration/bundles#the-install-step) | re-runs it, in the app's own cage |
+| `nix:` / `flake:` / `deb:` / `appimage:` / `tarball:` / `binary:` packages | names the channel that rolls them, and rolls none |
+| an inline [`[flakes.<name>]`](../configuration/packages#flakes-an-inline-nix-flake) | names it as floating: no channel advances it |
+
+The first two are rolled here because their unit of work is already one app's cage. The
+rest are pinned in a lock that belongs to the **project**, so rolling one from a per-app
+verb would advance every app that rides it, under a command that reads as though it
+touched only this one. Those are named with the channel command instead:
+
+```
+sbx app upgrade — reader
+  `deb:`, `nix:` packages advance with the project, not with one app: `sbx upgrade deb`, `sbx upgrade nix`.
+```
+
+That is the honest limit of the verb: what it removes is the question "which channel?",
+not the project-wide scope of the locks. See [`sbx upgrade`](upgrade) for the channels
+themselves.
+
+An inline flake is named apart because it has no channel at all. It pins its inputs
+inside its own `flake.nix` source and rebuilds when that source changes, and
+`sbx upgrade flake` deliberately skips it.
+
+A package a layer you have not trusted declared is counted rather than dropped, so an
+untrusted project never reads as "nothing advances this app":
+
+```
+  2 package(s) withheld (untrusted) — not equipped, so not rolled; run `sbx trust`.
+```
+
+### The install step runs here
+
+`sbx upgrade all` leaves the bundle install steps alone and says so, because it is
+unscoped: its steps would launch one cage per app across the whole project and re-run a
+clone, a build or a vendor script in each. Naming one app removes that reason. The cost
+is one cage, for the app you asked about, so `sbx app upgrade <name>` runs the step
+without a further flag.
+
+That matters for the apps a bundle **installs** rather than pins: they ride no
+`[packages]` backend, so re-running the install is the only thing that advances them.
+Gating it would make the verb fail exactly the apps it exists for.
+
+Because nothing gates it, the cost is named **before** the cage is built rather than
+reported after it:
+
+```
+  the install step below re-runs in junie's own cage, which downloads again — `sbx upgrade mise --app junie` rolls only the packages.
+```
+
+That second clause appears only for an app that has packages to roll. `sbx upgrade mise
+--app <name>` refuses an app that declares none, so an app the install step is the whole
+of is not sent to it.
+
 ## Managing profiles
 
 | Subcommand | Purpose |
@@ -74,11 +144,72 @@ app that is already an imported profile. It is foreground-only (not with `--deta
 | `rm <name> --purge --gc` | after the purge, sweep the **current project's** nix store too (one command; requires `--purge`) |
 | `list` | list the imported profiles **and** the apps with an installed home (with disk size) |
 
-`run`/`import`/`export`/`rm`/`list`/`show`/`prune` are subcommands. Launching always goes
-through `run`, so an app is never confused with a subcommand and **may be named like one**
-(reached as `sbx app run <name>`). `import` is a deliberate consent act: an agent in the
+`export`/`import`/`list`/`prune`/`rm`/`run`/`show`/`upgrade` are the subcommands. Launching
+always goes through `run`, so an app is never confused with a subcommand and **may be named
+like one** (reached as `sbx app run <name>`). `import` is a deliberate consent act: an agent in the
 cage cannot run it, and the profile stays inert until `sbx app run <name>`. See
 [Portable profiles](../apps/profiles).
+
+### What the import says you are still missing
+
+A profile is not always self-contained, and what it can be short of is not only a tool. Both
+kinds of reference resolve against the global config, and both are reported at import, when
+you are holding the file and can act on it:
+
+- a **bundle** it names in `use`, which carries the packages, environment, egress and
+  credential of the tool it wraps. See [Bundles](../configuration/bundles).
+- an **egress group** it references as `@<name>`, a reusable lane of allowlist entries.
+  Undefined, its entries are dropped and the app reaches less than it names.
+
+```
+sbx: warning: 'claude-code' names a bundle not declared here: claude-code — import it too
+  (`sbx bundle import examples/bundle/claude-code.toml`, or re-run with --with-deps), or the
+  app launches without the tool and egress it names
+```
+
+The remedy **names the file** when one can be found: the shipped catalogue lays `app/`,
+`bundle/` and `net-groups/` out as siblings, so the reference resolves to a path you can
+retype. It is named only when that file really declares what is missing, so following the
+suggestion always changes something; otherwise the message falls back to `<file>`. Order
+does not matter, and a profile never fires until `sbx app run <name>`.
+
+A group referenced by a **bundle** rather than by the profile is reported by
+`sbx bundle import` instead: a profile resolves nothing from disk, so it cannot see into the
+bundle its `use` names.
+
+### Importing what it references, in one gesture
+
+`--with-deps` follows those references instead of naming them, taking each from the file
+beside the profile in the same catalogue:
+
+```
+$ sbx app import examples/app/aider.toml --with-deps
+imported app profile 'aider' -> ~/.config/sbx/apps/aider.toml
+  ...
+imported 1 bundle(s) into ~/.config/sbx/sbx.toml — added aider
+imported 1 egress group(s) into ~/.config/sbx/sbx.toml — added pypi
+```
+
+It is a flag rather than the default because of **where it writes**. Importing a profile
+places a file at a path sbx owns; a bundle and a group are merged into `sbx.toml`, the config
+you maintain by hand. Following a reference therefore gives one command a second write target
+inside your own file, chosen by the contents of a profile. That is an admission, so it is
+asked for explicitly.
+
+What it will and will not do:
+
+- **Only the referenced names** are merged, never the rest of a fragment that happens to
+  declare more.
+- **Nothing already declared is replaced.** Only references nothing defines are written.
+- **A group a bundle reaches** is followed too, which is where most of them live. A group
+  reached through a bundle that is *already* declared is out of scope: that bundle arrived
+  through `sbx bundle import`, which named the gap at the time.
+- **All or nothing.** If any reference has no file behind it, the command refuses and writes
+  nothing at all, profile included. Outside a catalogue layout there is nothing to follow, so
+  drop the flag and the plain import will name what to fetch.
+- The **grant** a bundle carries is announced exactly as `sbx bundle import` announces it.
+  This is the one import where you did not name the bundle yourself, so it is the one where
+  an unexpected credential or egress rule matters most.
 
 Importing over a profile that already exists needs `--force`; without it the existing file
 is refused, not replaced. A forced import is the one import that can lose work, since the
@@ -174,6 +305,7 @@ whole home instead, use [`sbx app rm --purge`](#removing-an-app).
 ## Examples
 
 ```sh
+sbx bundle import examples/bundle/claude-code.toml   # what the agent requires
 sbx app import examples/app/claude-code.toml
 sbx app run claude-code                # launch with its own isolated home
 sbx app run claude-code -- -c          # resume the previous session

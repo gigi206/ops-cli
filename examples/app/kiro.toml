@@ -1,6 +1,7 @@
 # Kiro CLI — AWS's agentic coding CLI (the rebranded Amazon Q Developer CLI), sandboxed by sbx.
 #
-#   sbx app import examples/app/kiro.toml
+#   sbx bundle import examples/bundle/kiro.toml
+#   sbx app import    examples/app/kiro.toml
 #   sbx app run kiro -- login --license free   # authenticate once (in-cage browser, see below)
 #   sbx app run kiro -- chat                    # agentic chat/coding mode (strict egress)
 #   sbx app run kiro                            # the CLI (kiro-cli)
@@ -30,8 +31,7 @@
 # `kiro-cli login` (without `--use-device-flow`) opens its sign-in page in a browser and then
 # waits on a `http://localhost:3128` OAuth callback. In a hermetic cage the host browser cannot
 # reach the CAGE's loopback, so the login happens IN the cage: kiro-cli opens the page by calling
-# `xdg-open <url>`, and the `cmd` preamble below wires an `xdg-open` that routes it to an **in-cage
-# Chromium**. You complete Google / GitHub / Builder ID sign-in in that Chromium; the redirect to
+# `xdg-open <url>`, and the `[open]` table below routes that to an **in-cage Chromium**. You complete Google / GitHub / Builder ID sign-in in that Chromium; the redirect to
 # `http://localhost:3128` is a normal http URL Chromium follows back to kiro-cli's own in-cage
 # listener, so the whole flow closes inside the cage. The token persists in the app's isolated
 # `$HOME` — login is a one-time step.
@@ -84,51 +84,6 @@ cmd = [
     "-c",
     '''
 set -e
-# kiro-cli's browser login opens its sign-in page via `xdg-open <url>`. The hermetic cage has no
-# xdg-open, so wire one that routes http(s) to an in-cage Chromium. `--no-sandbox`: sbx's build
-# strips the setuid bit off chrome-sandbox, so Chromium's own SUID sandbox would abort FATAL — the
-# cage (bubblewrap + seccomp + empty/host netns) IS the boundary. `--password-store=basic` avoids a
-# system-keyring dependency the hermetic cage does not provide.
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-# Chromium flags:
-#   --use-system-ca: under the strict allowlist sbx runs a TLS-terminating MITM proxy and seeds
-#     its per-session CA into the cage's NSS store — Chromium must consult it, else it rejects
-#     every HTTPS cert and the sign-in page never loads.
-#   --disable-dev-shm-usage: route Chromium's shared memory to /tmp — the standard cage flag.
-#   --host-resolver-rules="MAP localhost 127.0.0.1": kiro-cli's local OAuth callback server binds
-#     127.0.0.1 (IPv4 ONLY, verified in the cage netns) on a DYNAMICALLY chosen port — it picks the
-#     first free candidate (3128 under the empty netns, but e.g. 4649 has been seen), so never
-#     assume 3128. The cage's synthetic /etc/hosts maps `localhost` to BOTH 127.0.0.1 and `::1`
-#     while the empty netns brings up NO IPv6 loopback, so without this rule the browser's redirect
-#     to `http://localhost:<port>/oauth/callback?code=…` can try `::1` and stall. Forcing
-#     `localhost` -> 127.0.0.1 sends the callback straight to kiro-cli's IPv4 listener. (This is a
-#     needed companion to the background-Chromium launch below, not the whole fix on its own.)
-#   --disable-background-timer-throttling / --disable-backgrounding-occluded-windows /
-#     --disable-renderer-backgrounding: kiro's Chromium window is spawned by the CLI and never
-#     focused, so Chromium backgrounds the renderer; these keep its timers live so Google's
-#     meta-refresh redirect chain (SetSID -> consent) is not throttled.
-# CRITICAL — background Chromium, do NOT `exec` it. kiro-cli opens the sign-in URL through the
-# Rust `open` crate, which runs `xdg-open <url>` and WAITS for it to exit (`.output().await`). An
-# `exec chromium` makes xdg-open *become* Chromium, so that wait never returns until the browser
-# is closed — kiro-cli then stalls forever on the "Opening browser..." spinner and never reaches
-# the step that drives the OAuth code->token exchange (the login hangs even though the browser
-# reaches the callback, so no token is ever persisted). Launching Chromium detached with its stdio
-# fully redirected lets xdg-open exit immediately, so kiro-cli proceeds to await the callback and
-# complete the exchange. `nohup … &` (the cage has no `setsid`) detaches it; stdout+stderr go to a
-# log in the isolated home — read it host-side at the path from `sbx app show kiro`
-# (…/apps/kiro/home/chromium-login.log).
-nohup chromium --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-  --use-system-ca --password-store=basic \
-  --host-resolver-rules="MAP localhost 127.0.0.1" \
-  --disable-background-timer-throttling --disable-backgrounding-occluded-windows \
-  --disable-renderer-backgrounding \
-  --no-first-run --no-default-browser-check "$@" >>"$HOME/chromium-login.log" 2>&1 </dev/null &
-exit 0
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
 # Telemetry OFF by default. kiro-cli's anonymous metrics hit hosts the allowlist denies; one of them
 # (cognito-identity.us-east-1.amazonaws.com) arrives as `blocked (bad-request)` — a pre-verdict
 # security guard the egress `mute` cannot silence (see the [network] mute note). Disabling telemetry
@@ -178,10 +133,10 @@ dbus = true
 # `use` pulls in the `kiro` BUNDLE — the CLI package, the Chromium the in-cage sign-in needs, the
 # hosts both reach, and the telemetry mutes — from one declaration shared with the bundle file
 # itself, so this profile cannot fall behind when the agent's requirements change. What the bundle
-# may never carry is posture: the `gui`/`gpu`/`dbus` grants above and the `xdg-open` shim in `cmd`
+# may never carry is posture: the `gui`/`gpu`/`dbus` grants above and the `[open]` routing below
 # stay here, and without them the browser login cannot start.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/kiro.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["kiro"]
@@ -208,6 +163,31 @@ use = ["kiro"]
 # NOTE: this allowlist governs DAILY runs (`chat`/`kiro-cli`), which need no browser. The
 # in-cage browser LOGIN is done under `--net allow` (see the LOGIN note), which replaces this
 # list for that one run — do not try to enumerate the IdP's host sprawl here.
+# Where a web link opens, declared rather than scripted. sbx generates the `xdg-open` the cage
+# reaches and the desktop entry the in-cage portal resolves, and freezes both, so a link opens the
+# same way whichever of the two a caller uses.
+#
+# `mode = "detach"` is load-bearing, not a preference. kiro-cli opens the sign-in URL and WAITS for
+# the opener to exit before driving the code-for-token exchange; a handler that becomes the browser
+# never returns, so the login stalls on "Opening browser..." with the browser itself working fine and
+# no token ever persisted. Detached, the opener returns at once and the exchange runs.
+#
+# The Chromium flags carry the rest of what that login needs. `--host-resolver-rules` pins the
+# dynamic-port localhost callback to IPv4: kiro-cli's callback server binds 127.0.0.1 only, while the
+# cage's synthetic hosts file maps `localhost` to both families and the empty netns brings up no IPv6
+# loopback, so without it the redirect can try `::1` and stall. The three `--disable-*background*`
+# flags keep the renderer's timers live in a window that is never focused, so the provider's
+# meta-refresh redirect chain is not throttled. `--use-system-ca` makes Chromium trust sbx's
+# per-session MITM CA under the allowlist. `--no-sandbox` because sbx's build strips the setuid bit
+# off chrome-sandbox, so Chromium's own SUID sandbox would abort FATAL; the cage is the boundary.
+# Chromium's output lands in `.sbx-open.log` in the isolated home, which is where to look if the
+# window opens and the login goes nowhere.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+https = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+
 [network]
 mode = "deny"
 allow = [

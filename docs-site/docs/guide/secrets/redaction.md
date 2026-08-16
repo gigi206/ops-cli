@@ -176,9 +176,17 @@ would have nothing to match it against.
 
 So the proxy remembers it. When an allowed request carries an authentication header
 (`Authorization`, `x-api-key`, and a short list of siblings), the token it holds is
-kept as a needle, and from then on it is treated like a declared secret's value:
-refused if the cage re-sends it anywhere, masked if a response reflects it, hidden
-from the capture.
+kept as a needle, along with the host it was going to, and from then on it is treated
+like a declared secret's value: refused if the cage sends it to any **other** host,
+masked if a response reflects it, hidden from the capture.
+
+Its own host is the exception, and it has to be. A session token exists to be sent
+back to the service that issued it, on every request after the sign-in; refusing it
+there would turn a successful login into an application that stops working at its
+second authenticated request. What the tripwire stops is the case it exists for, which
+is the cage carrying a credential it holds for one service to a different one. A
+declared secret keeps no such exemption: the cage is never given its value, so that
+value appearing in a request is a leak wherever the request is going.
 
 This is worth being explicit about, because it means `sbx` retains a value you never
 gave it. It only ever holds it in memory, never writes it and never logs it, and the
@@ -186,15 +194,30 @@ proxy already *saw* it in any case, being the thing that terminates the cage's T
 The choice is only whether it remembers what it has seen, and remembering is what
 lets it protect the credential at all.
 
-Every inspected plane observes: a request through the cage's tunnel, one sent in the
-absolute form a client uses when it treats the proxy as a forward proxy, and a gRPC
-stream. The scan set is shared, so a token learned on any of them is covered on all of
-them; a plane that watched and never learned would be a gap in each.
+Every inspected plane observes, and they are named here by what selects one rather than
+by the shape of the request, because two of them share that shape:
 
-Four bounds keep this narrow:
+| Plane | Selected by |
+|---|---|
+| tunneled | a `CONNECT`, the ordinary `https_proxy` route |
+| inspected TLS | an absolute-form `https://` request, a client treating the proxy as a forward proxy |
+| inspected cleartext | an absolute-form `http://` request, permitted only by an explicit [`http://` rule](../networking/rules) |
+| HTTP/2 | a negotiated h2 connection, gRPC included |
 
-- only an **allowed** request is observed, so an agent cannot seed the scan set by
-  aiming at hosts it knows are refused;
+The scan set is shared, so a token learned on any of them is covered on all of them; a
+plane that watched and never learned would be a gap in each. The cleartext plane observes
+although it never *injects*, and the two do not follow from one another: it injects
+nothing because a bearer must not travel in the clear, while what it observes is what
+refuses that same value on a TLS plane, toward a host it was never acquired on.
+
+Five bounds keep this narrow:
+
+- only a request that reached the wire is observed, so an agent cannot seed the scan
+  set by aiming at hosts it knows are refused. The bound is the **last** refusal, not
+  the first: a request the policy allowed and the SSRF guard then blocked teaches
+  nothing either;
+- the tripwire is scoped to **other** destinations, so an app re-sending its own
+  session token to its own service is not refused for holding it;
 - observation happens **after** the outbound scan, so the request that teaches a
   value is never refused by that value;
 - a short value is ignored, on a stricter floor than for a declared secret, since

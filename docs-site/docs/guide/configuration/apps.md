@@ -67,6 +67,32 @@ tasks_max = 4096
 | `fs` | ungated | project paths this app closes, **unioned** onto the baseline's: an app closes more for its own cage and can never reopen what the project closed (see [fs](fs)) |
 | `home_scope` | integrity-gated | `"global"` (default) or `"project"`: see [Per-app home](../apps/home) |
 
+### The `cmd` field and trailing arguments
+
+`cmd` is either a bare string (a one-element argv, never whitespace-split) or an argv
+array. `sbx app run <name> -- <args>` appends those arguments to it, so a plain argv
+receives them directly and the program reads its own flags.
+
+A shell-wrapped command needs one more thing from you. `["bash", "-c", "<script>"]` binds
+the element right after the script to `$0`, not to `$1`, so sbx inserts the app's name
+there before appending: your first argument arrives as `$1`. What sbx cannot do is decide
+where the script sends them, so the script has to expand `"$@"` itself, on the command it
+finally runs:
+
+```toml
+[app.demo]
+# Receives `sbx app run demo -- --flag value`.
+cmd = ["bash", "-c", "export PATH=\"$HOME/.local/bin:$PATH\"\nexec demo \"$@\""]
+
+# Accepts those arguments and drops them: no `"$@"` anywhere in the script.
+# cmd = ["bash", "-c", "exec demo --headless"]
+```
+
+A profile that declares its own element after the script keeps it: sbx adds nothing, and
+that element stays the script's `$0`. Use a shell only when the command derives a value,
+tests a path or writes a file; when it does not, a plain argv is one process fewer and
+needs no `"$@"` at all.
+
 ## Layering and gating
 
 An app resolves `global → project → app`, each field overriding per layer, and each
@@ -108,7 +134,8 @@ names.
 ```sh
 sbx config show                 # a compact per-app roster
 sbx config show --details       # each app's env, binds, packages, rules, credentials
-sbx config show --app review    # one app's effective config, each field tagged inherited or set
+sbx config show --app review    # each field tagged default, inherited, or set by the app
+sbx config show --app review --details  # plus every posture no layer set (folded by default)
 ```
 
 ## Examples by posture

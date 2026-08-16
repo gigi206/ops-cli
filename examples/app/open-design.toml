@@ -1,6 +1,7 @@
 # Open Design — the local-first, open-source design studio, served in a host browser by sbx.
 #
-#   sbx app import examples/app/open-design.toml
+#   sbx bundle import examples/bundle/opencode.toml
+#   sbx app import    examples/app/open-design.toml
 #   sbx app run open-design
 #   # then open http://127.0.0.1:17573 in your host browser
 #
@@ -90,7 +91,7 @@ if [ ! -f "$OD_DATA_DIR/app-config.json" ]; then
     printf '{"agentId":"opencode"}\n' > "$OD_DATA_DIR/app-config.json"
 fi
 
-exec pnpm tools-dev run web --daemon-port 17456 --web-port 17573
+exec pnpm tools-dev run web --daemon-port 17456 --web-port 17573 "$@"
 ''',
 ]
 

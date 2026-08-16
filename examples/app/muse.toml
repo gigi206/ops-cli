@@ -1,6 +1,7 @@
 # muse — Muse Code, Meta's terminal coding agent (Muse Spark), sandboxed by sbx.
 #
-#   sbx app import examples/app/muse.toml
+#   sbx bundle import examples/bundle/muse.toml
+#   sbx app import    examples/app/muse.toml
 #   sbx app run muse
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The zone database it reads and the hosts it reaches come from a
@@ -169,7 +170,7 @@ exec "$bin" "$@"
 # the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
 # the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/muse.toml
 # Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
 use = ["muse"]

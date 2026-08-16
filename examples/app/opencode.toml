@@ -1,6 +1,7 @@
 # opencode — a terminal AI coding agent (multi-provider), sandboxed by sbx.
 #
-#   sbx app import examples/app/opencode.toml
+#   sbx bundle import examples/bundle/opencode.toml
+#   sbx app import    examples/app/opencode.toml
 #   sbx app run opencode
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -12,8 +13,8 @@
 #
 # The tool is equipped fresh from upstream (mise's registry resolves `opencode` to
 # its standalone release binary) — no nixpkgs lag. It is equipped at the latest
-# upstream version on the first launch in a project; advancing an already-installed
-# version is not yet automated by `sbx upgrade`.
+# upstream version on the first launch in a project and pinned there, so a later upstream
+# release cannot change what runs under you; `sbx app upgrade opencode` advances that pin.
 #
 # opencode is MULTI-PROVIDER, so its egress depends on the model you use. This
 # template is set up for Anthropic; for another provider, change the allowlist and
@@ -36,7 +37,7 @@ cmd = "opencode"
 # reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
 # profile cannot fall behind when the agent's requirements change.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/opencode.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["opencode"]

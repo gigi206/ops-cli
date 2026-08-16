@@ -121,7 +121,8 @@ allow = ["ptrace"]
 
 ```sh
 sbx config show            # a `seccomp allow:` line only when a syscall is re-permitted
-sbx config show --app dbg  # an app's effective relaxation, tagged inherited or set
+sbx config show --app dbg            # tagged default, inherited or set by the app
+sbx config show --app dbg --details  # plus the relaxation no layer set (folded by default)
 ```
 
 The tokens render **canonically** (sorted, `:selector` form where narrow), derived from

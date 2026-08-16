@@ -4,11 +4,24 @@ The repository's `examples/app/` directory ships **71 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
-sbx app import examples/app/claude-code.toml
+sbx bundle import examples/bundle/claude-code.toml
+sbx app import    examples/app/claude-code.toml
 sbx app run claude-code
 ```
 
-See also: [Portable profiles](profiles) · [The app framework](../apps/) · [Secrets](../secrets/) · the repository `examples/README.md`.
+**Every profile below takes two imports.** All 71 name a bundle in `use`: the bundle holds
+the agent's package, environment and egress and follows upstream, the profile holds what
+you configure, and each ships as `examples/bundle/<name>.toml` beside
+`examples/app/<name>.toml`. Either order works, and nothing runs until you launch. Some
+profiles need a third file, a shared [egress group](../networking/) from
+`examples/net-groups/`; their own header names it, and so does the import when the group is
+undefined. Each profile's `Provider / egress` cell below tells you what it will reach.
+
+Adding `--with-deps` to the `sbx app import` line takes all of them in one gesture: the
+bundle, and any group it or the profile references, from the files beside it in this
+catalogue. See [`sbx app import`](../cli/app#importing-what-it-references-in-one-gesture).
+
+See also: [Portable profiles](profiles) · [The app framework](../apps/) · [Bundles](../configuration/bundles) · [Secrets](../secrets/) · the repository `examples/README.md`.
 
 The tables below list every shipped profile, grouped by **how you interact with it**: a
 terminal agent, a desktop window, or a UI served in your host browser. Each profile's own
@@ -78,9 +91,9 @@ GUI agents: Electron for most, a Wails/WebKit2GTK shell for `reasonix-desktop`. 
 (`gui = "wayland"`), and most also enable [`gpu`](../configuration/gpu) and the in-cage
 [desktop portal](../configuration/dbus) (`dbus = true`). Where the tool's sign-in opens
 an external browser, the profile wires an in-cage Chromium as the `xdg-open` handler so the
-whole login closes inside the cage. `openwork` is the exception: it embeds its own browser
-panel, which intercepts the deep link its sign-in hands back, so that profile needs no in-cage
-Chromium.
+whole login closes inside the cage. `openwork` needs one step more: its sign-in ends on a
+custom-scheme deep link, so its wrapper registers the app itself as that scheme's handler and
+the grant reaches the running instance.
 
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
@@ -94,7 +107,7 @@ Chromium.
 | `kiro` | `nix:kiro-cli` (+ `nix:chromium`) | `*.kiro.dev` (AWS/Kiro account) |
 | `kiro-desktop` | `tarball:resolve` (+ `nix:chromium`) | `app.kiro.dev` (AWS/Kiro account) |
 | `opencode-desktop` | `deb:github:anomalyco/opencode` | provider-dependent (BYOK) |
-| `openwork` | `appimage:resolve` (the public build, whose OpenCode engine ships inside the artifact as a sidecar) | provider-dependent (BYOK); an OpenWork Den account (`app.openworklabs.com`) is optional |
+| `openwork` | `appimage:resolve` (the public build, whose OpenCode engine ships inside the artifact as a sidecar) (+ `nix:chromium`) | provider-dependent (BYOK); an OpenWork Den account (`app.openworklabs.com`) is optional |
 | `orca-desktop` | `deb:github:stablyai/orca` (+ `nix:chromium`; interior pilot agent `opencode` via `mise:opencode`) | provider-dependent (BYOK); Orca hosts (`login.onorca.dev`, `relay.onorca.dev`) denied by default |
 | `reasonix-desktop` | `deb:resolve` + `[deb.…] libs` (a Wails/WebKit2GTK shell, not Electron) | `api.deepseek.com` (`DEEPSEEK_API_KEY`) |
 | `t3code` | `appimage:github:pingdotgg/t3code` (+ `nix:chromium`) | provider-dependent (BYOK) |

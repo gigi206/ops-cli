@@ -83,6 +83,18 @@ impl Fixture {
         std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
     }
 
+    /// Where `sbx app import` places a profile.
+    fn profile_path(&self, name: &str) -> PathBuf {
+        self.config_home
+            .path()
+            .join(format!("sbx/apps/{name}.toml"))
+    }
+
+    /// The global config bundles and groups are merged into, or empty when nothing wrote it.
+    fn global_config(&self) -> String {
+        std::fs::read_to_string(self.config_home.path().join("sbx/sbx.toml")).unwrap_or_default()
+    }
+
     /// Fabricate a global app home with a mise tool installed at `<munged>/<version>/`.
     fn install_mise_tool(&self, app: &str, munged: &str, version: &str) {
         let ver = self.data_home.path().join(format!(
@@ -139,6 +151,17 @@ impl Fixture {
             .join(format!("sbx/apps/{app}/home/.local/state/sbx/flake"));
         std::fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink(format!("/nix/store/{store_leaf}"), dir.join(name)).unwrap();
+    }
+
+    /// Write one file of a portable catalogue laid out the way this repository ships its examples:
+    /// `app/`, `bundle/` and `net-groups/` as siblings under one root. The import suggestions are
+    /// derived from exactly that shape, so a fixture that flattened it would not exercise them.
+    fn catalogue(&self, kind: &str, name: &str, body: &str) -> PathBuf {
+        let dir = self.proj.path().join("catalogue").join(kind);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.toml"));
+        std::fs::write(&path, body).unwrap();
+        path
     }
 
     /// Fabricate a `nix:` package gcroot in a project tree — `gcroots/projects/<tree_id>/<name>`, the
@@ -526,6 +549,330 @@ fn prune_reports_nothing_when_all_installed_tools_are_declared() {
         String::from_utf8_lossy(&out.stdout).contains("no undeclared mise tools"),
         "should report nothing to prune: {}",
         text(&out)
+    );
+}
+
+/// A profile is not self-contained: it names a bundle, and it may reference an egress group. Both
+/// resolve against the global config, and an undeclared one is silent in the way that matters — an
+/// absent tool, or dropped egress rules. These four exercise what the import says about it.
+#[test]
+fn import_names_the_bundle_file_that_sits_beside_the_profile() {
+    let fx = Fixture::new();
+    let bundle = fx.catalogue(
+        "bundle",
+        "demo-tool",
+        "[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
+    );
+    let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
+
+    let out = fx.sbx(&["app", "import", profile.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let t = text(&out);
+    // The command as the reader must type it, with the file — not a `<file>` placeholder they then
+    // have to go find. Assert the whole command, so a path that lost its directory still fails.
+    assert!(
+        t.contains(&format!("sbx bundle import {}", bundle.display())),
+        "the remedy should name the sibling bundle file:\n{t}"
+    );
+}
+
+#[test]
+fn import_keeps_the_placeholder_when_no_file_backs_the_reference() {
+    let fx = Fixture::new();
+    // A file IS at the path the layout implies — it just declares a different bundle. This is the
+    // case the content gate exists for: the guess is plausible and running it would change nothing.
+    fx.catalogue(
+        "bundle",
+        "demo-tool",
+        "[bundle.other-tool.packages]\ntool = \"nix:hello\"\n",
+    );
+    let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
+
+    let out = fx.sbx(&["app", "import", profile.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let t = text(&out);
+    assert!(
+        t.contains("sbx bundle import <file>"),
+        "an unbacked guess must fall back to the placeholder:\n{t}"
+    );
+    assert!(
+        !t.contains("bundle/demo-tool.toml"),
+        "the file that does not declare it must not be named:\n{t}"
+    );
+}
+
+#[test]
+fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
+    let fx = Fixture::new();
+    let group = fx.catalogue(
+        "net-groups",
+        "demo-lane",
+        "[network.groups]\ndemo-lane = [\"api.example.com\"]\n",
+    );
+    let profile = fx.catalogue(
+        "app",
+        "demo-app",
+        "cmd = \"demo\"\n[network]\nmode = \"deny\"\nallow = [\"@demo-lane\"]\n",
+    );
+
+    let out = fx.sbx(&["app", "import", profile.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let t = text(&out);
+    assert!(
+        t.contains("@demo-lane")
+            && t.contains(&format!("sbx net groups import {}", group.display())),
+        "an undefined group must be named with the file that defines it:\n{t}"
+    );
+
+    // Control: once the group is defined, the same import says nothing about it. Without this the
+    // test above would pass on a warning printed unconditionally.
+    assert!(
+        fx.sbx(&["net", "groups", "import", group.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let again = fx.sbx(&["app", "import", "--force", profile.to_str().unwrap()]);
+    let t = text(&again);
+    // Discriminate on the remedy, not on the group's name: the granted posture legitimately prints
+    // `allow @demo-lane` on every import, so asserting the name is absent would assert nothing.
+    assert!(
+        !t.contains("sbx net groups import"),
+        "a defined group must not be reported as missing:\n{t}"
+    );
+}
+
+#[test]
+fn bundle_import_reports_the_groups_the_bundle_itself_references() {
+    let fx = Fixture::new();
+    // The majority case in the shipped catalogue: the group is referenced by the BUNDLE, which an
+    // app profile cannot see into — `validate_profile` resolves nothing from disk. If this import
+    // stays silent, the reference surfaces only as an app quietly reaching less than it names.
+    let group = fx.catalogue(
+        "net-groups",
+        "demo-lane",
+        "[network.groups]\ndemo-lane = [\"api.example.com\"]\n",
+    );
+    let bundle = fx.catalogue(
+        "bundle",
+        "demo-tool",
+        "[bundle.demo-tool]\nallow = [\"@demo-lane\"]\n[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
+    );
+
+    let out = fx.sbx(&["bundle", "import", bundle.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let t = text(&out);
+    assert!(
+        t.contains("@demo-lane")
+            && t.contains(&format!("sbx net groups import {}", group.display())),
+        "the bundle's own group reference must be reported at its import:\n{t}"
+    );
+}
+
+/// `--with-deps` is the opt-in half of the same finding: instead of naming what is missing, the
+/// import follows the reference and merges it. It writes into the file the user maintains by hand,
+/// which is why it is a flag and not the default.
+#[test]
+fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
+    let fx = Fixture::new();
+    fx.catalogue(
+        "net-groups",
+        "demo-lane",
+        "[network.groups]\ndemo-lane = [\"api.example.com\"]\n",
+    );
+    fx.catalogue(
+        "bundle",
+        "demo-tool",
+        "[bundle.demo-tool]\nallow = [\"@demo-lane\"]\n[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
+    );
+    let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
+
+    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let t = text(&out);
+    let cfg = fx.global_config();
+    assert!(
+        cfg.contains("[bundle.demo-tool]"),
+        "the bundle the profile names should be merged:\n{cfg}"
+    );
+    // The group is reached THROUGH the bundle — nothing in the profile's own bytes names it. A plan
+    // built from the profile alone would write the bundle and leave its reference dead, which is the
+    // majority case in the shipped catalogue.
+    //
+    // Assert the group's ENTRY, not its name: `demo-lane` also appears as the bundle's own `allow`
+    // reference, so a test that looked for the name would pass with the group table never written —
+    // it would assert that the bundle landed, twice.
+    assert!(
+        cfg.contains("api.example.com"),
+        "the group the bundle references should be defined too, not just referenced:\n{cfg}"
+    );
+    // The grant belongs to the bytes, not to the verb: this is the one import where the reader did
+    // not name the bundle themselves, so a silent credential or egress rule would be least expected.
+    assert!(
+        t.contains("egress rule(s)"),
+        "the grant must still be announced:\n{t}"
+    );
+
+    // Nothing is left to ask for afterwards — the warnings and the writes agree on what "missing"
+    // means, which they cannot if each side keeps its own filter.
+    let again = fx.sbx(&[
+        "app",
+        "import",
+        "--force",
+        "--with-deps",
+        profile.to_str().unwrap(),
+    ]);
+    let t = text(&again);
+    assert!(
+        !t.contains("sbx bundle import") && !t.contains("sbx net groups import"),
+        "a second import has nothing left to report:\n{t}"
+    );
+
+    // Renaming the app does not rename what it references: the plan follows `use` and the source
+    // path, never the name the profile is being filed under. Two names in play, only one of which
+    // the references answer to.
+    let fx = Fixture::new();
+    fx.catalogue(
+        "bundle",
+        "demo-tool",
+        "[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
+    );
+    let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
+    let out = fx.sbx(&[
+        "app",
+        "import",
+        profile.to_str().unwrap(),
+        "--as",
+        "renamed",
+        "--with-deps",
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(fx.profile_path("renamed").exists(), "{}", text(&out));
+    assert!(
+        fx.global_config().contains("[bundle.demo-tool]"),
+        "the bundle the profile names still lands under its own name:\n{}",
+        fx.global_config()
+    );
+}
+
+#[test]
+fn with_deps_writes_nothing_at_all_when_a_reference_has_no_file() {
+    let fx = Fixture::new();
+    // A file IS at the implied path; it declares a different bundle. The reference cannot be
+    // followed, and following the rest would leave the app short of exactly what it names.
+    fx.catalogue(
+        "bundle",
+        "demo-tool",
+        "[bundle.other-tool.packages]\ntool = \"nix:hello\"\n",
+    );
+    let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
+
+    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unfollowable reference must refuse:\n{}",
+        text(&out)
+    );
+    // The assertion that separates all-or-nothing from a half-implementation: the refusal lands
+    // before the profile does, so the user is left exactly where they were.
+    assert!(
+        !fx.profile_path("demo-app").exists(),
+        "the profile must not have been written:\n{}",
+        text(&out)
+    );
+    assert!(
+        fx.global_config().is_empty(),
+        "nor may anything have reached the global config"
+    );
+}
+
+#[test]
+fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
+    let fx = Fixture::new();
+    // Nothing upstream refuses this: a profile's `use` is not validated against the name charset,
+    // and the fragment declares what it declares. Merged as-is, the bundle would be dropped when the
+    // config is read and the app would launch short of the tool it names, with nothing said — the
+    // silent shortfall this whole path exists to remove.
+    fx.catalogue(
+        "bundle",
+        "bad name!",
+        "[bundle.\"bad name!\".packages]\ntool = \"nix:hello\"\n",
+    );
+    let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"bad name!\"]\n");
+
+    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unusable name must refuse:\n{}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("invalid bundle name"),
+        "and must name why:\n{}",
+        text(&out)
+    );
+    assert!(
+        !fx.profile_path("demo-app").exists(),
+        "the refusal lands before the profile does"
+    );
+
+    // The same rule on the other name source, which is a separate check over a separate loop: a
+    // group name comes from an `@<name>` entry, not from `use`. Deleting one guard leaves the other
+    // one's tests green, so both are pinned here.
+    let fx = Fixture::new();
+    fx.catalogue(
+        "net-groups",
+        "bad name!",
+        "[network.groups]\n\"bad name!\" = [\"api.example.com\"]\n",
+    );
+    let profile = fx.catalogue(
+        "app",
+        "demo-app",
+        "cmd = \"demo\"\n[network]\nmode = \"deny\"\nallow = [\"@bad name!\"]\n",
+    );
+    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unusable group name must refuse too:\n{}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("invalid group name"),
+        "and must name why:\n{}",
+        text(&out)
+    );
+    assert!(
+        !fx.profile_path("demo-app").exists(),
+        "the refusal lands before the profile does"
+    );
+}
+
+#[test]
+fn with_deps_merges_only_the_referenced_name_from_a_fragment() {
+    let fx = Fixture::new();
+    // One file, two bundles. Only the one the profile names may land: a catalogue fragment is not a
+    // manifest of what the reader asked for, and writing the rest widens the import past the
+    // reference — the very thing that made this opt-in.
+    fx.catalogue(
+        "bundle",
+        "demo-tool",
+        "[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n\
+         [bundle.demo-spare.packages]\nspare = \"nix:hello\"\n",
+    );
+    let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
+
+    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let cfg = fx.global_config();
+    assert!(
+        cfg.contains("demo-tool"),
+        "the referenced bundle should land:\n{cfg}"
+    );
+    assert!(
+        !cfg.contains("demo-spare"),
+        "the rest of the fragment must not:\n{cfg}"
     );
 }
 

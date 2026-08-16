@@ -25,7 +25,7 @@
 #
 # UPGRADE. A bootstrap install rides no `[packages]` backend, so there is no lock to roll: what
 # advances the agent is running its installer again, which always resolves the current release.
-#     sbx upgrade provision
+#     sbx app upgrade prime-agent
 # re-runs this step in the app's cage with SBX_UPGRADE set, and the guard below yields to it. For
 # one launch only: `sbx app run prime-agent --env PRIME_AGENT_SBX_UPDATE=1`. Auth, sessions and
 # harness state live elsewhere in the app home and are untouched either way.

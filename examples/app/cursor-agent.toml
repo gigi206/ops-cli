@@ -1,6 +1,7 @@
 # Cursor CLI — Cursor's headless terminal coding agent (`cursor-agent`), sandboxed by sbx.
 #
-#   sbx app import examples/app/cursor-agent.toml
+#   sbx bundle import examples/bundle/cursor-agent.toml
+#   sbx app import    examples/app/cursor-agent.toml
 #   sbx app run cursor-agent -- -p "your task here"        # headless: prompt in, result out
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The tooling its bootstrap install needs and the hosts it reaches come from a
@@ -106,7 +107,7 @@ exec cursor-agent "$@"
 # the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
 # the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/cursor-agent.toml
 # Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
 use = ["cursor-agent"]

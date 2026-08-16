@@ -166,3 +166,64 @@ resource use where the host supports them. Network egress defaults to a
 [deny-by-default allowlist](../networking/) enforced by a host-side proxy, so a cage
 nobody configured reaches only the self-equip set; opening it back up to the host
 network is the deliberate act.
+
+## Where the protection stops
+
+Everything above is about what the agent can reach **while it runs**. The likeliest way
+out of a cage is not an escape from bubblewrap: it is that the agent writes something
+into the project, which it holds read-write by construction, and that **you run it
+afterwards on the host, with no cage at all**.
+
+The carriers are ordinary files, and they are executed by ordinary commands:
+
+| What the agent can write | What runs it, outside the cage |
+|---|---|
+| a `package.json` script (`postinstall`, `prepare`) | your next `npm install` |
+| a `Makefile`, `justfile`, `Taskfile` recipe | the command you type next |
+| a hook in `.git/hooks/`, or `core.hooksPath` in `.git/config` | your next `commit`, `push`, `checkout` |
+| a CI workflow file | the runner, holding the repository's secrets |
+| an `.envrc`, an editor task or launch config | your shell entering the directory, your editor opening it |
+
+None of this is a hole in the cage. It is the cage doing its job, and the boundary being
+crossed later, by you. So the control that covers it is not an `sbx` setting: it is
+**reading the diff before running anything**, the review a patch from a stranger would
+get. `sbx` is what makes it safe to let an agent produce that diff. It is not what makes
+it safe to execute it.
+
+### What `sbx` contributes here
+
+Two things, and which does what matters.
+
+**[`sbx fs logs`](../cli/fs#logs) narrows what you have to read.** The file-write feed
+reports every file the agent created, wrote, deleted or moved in the project, so the
+review starts from a list rather than from the whole tree. Three limits decide how far to
+lean on it:
+
+- it needs the session to have been launched with `--observe`; without it there is no
+  feed, and the session is reported as unobserved rather than shown empty;
+- it does **not** report writes under `.git`, `node_modules`, `target` or `.venv`, which
+  are filtered as build and vendor churn. A git hook, the sharpest form of this vector, is
+  precisely what it does not show;
+- it lives in the supervisor's memory for the session's lifetime and nothing survives the
+  session. It is a live account, not an audit trail; redirect `--json` to a file to keep
+  one.
+
+**[`[fs] readonly`](../configuration/fs) closes the carrier the feed misses.** A git hook
+is the one entry in the table above that no legitimate agent task needs to write:
+
+```toml
+[fs]
+readonly = [".git/hooks/", ".git/config"]
+```
+
+Both entries are needed, and for different reasons: the first stops a hook from being
+written, the second stops `core.hooksPath` from being pointed at a directory the first
+does not cover. Naming the **directory** is what makes the first one hold: a mask is a
+mount, resolved once at launch, so a directory refuses a hook created halfway through the
+session as well as one that was already there. Committing still works, which
+`readonly = [".git/"]` would break, since git writes `.git/index.lock`. And because `[fs]` is honored from **any** source and no
+layer can undo one below it, this holds for a project you never trusted.
+
+The other carriers stay open deliberately: the `package.json`, the `Makefile` and the
+workflow files *are* the work. Closing them would close the job. They are reported by the
+feed, and reading the diff is the whole control.

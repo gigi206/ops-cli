@@ -61,6 +61,8 @@ of your host, and it can never silently switch on a microphone or a display beca
 the tool it packages can use one. There is no `cmd` because an app's command is its
 identity: inheriting one would be an integrity hijack.
 
+### The install step
+
 `provision` is the one thing a bundle carries that is a **command**, and it is not an
 exception to that rule: it is the step that finishes installing the tool, it runs
 before the app's own command, and it can never replace it. It exists because a bundle
@@ -116,9 +118,10 @@ for a step to state the path it produces. Until then, the step owns its guard.
 ### Rolling an install step forward
 
 A step's guard is what keeps a launch from re-installing, which also means the agent it
-installs never moves. That is what [`sbx upgrade provision`](../cli/upgrade) is for: it
-re-runs each app's install steps in the app's own cage, with `SBX_UPGRADE=1` set. So the
-guard is written to yield to it:
+installs never moves. Two commands run it again, in the app's own cage and with
+`SBX_UPGRADE=1` set: [`sbx app upgrade <name>`](../cli/app#advancing-an-app) for one app,
+and [`sbx upgrade provision`](../cli/upgrade) for every app in the project. So the guard is
+written to yield to it:
 
 ```toml
 provision = ["bash", "-c", "[ -e \"$HOME/.local/bin/tool\" ] && [ -z \"${SBX_UPGRADE:-}\" ] || install-tool"]
@@ -148,6 +151,10 @@ provision = ["bash", "-c", "if ! .venv/bin/python -c '' 2>/dev/null; then rm -rf
 When such a rebuild empties what a later step installed, the stamp that records the install goes
 with it. A stamp left behind would skip the install and leave the app importing what is no longer
 there.
+
+The roll that moves the store [says so as it closes](../cli/upgrade#after-a-roll-that-moved-the-store),
+naming the apps whose steps build against those paths. That announcement is what tells you a
+repair is pending; whether the repair actually happens is decided here, by the guard you wrote.
 
 One shape stays outside the channel: an app that installs itself from its own `cmd`. A
 `provision` is a bundle's field, and a profile that consumes **another** agent's bundle has
@@ -234,11 +241,12 @@ A bundle may itself reference shared egress groups with `@name` (its header then
 `examples/net-groups/`,
 with `sbx net groups import`.
 
-The 63 shipped bundles, and what each carries:
+The 64 shipped bundles, and what each carries:
 
 | Bundle | Packages | Also carries | Requires groups |
 |---|---|---|---|
 | `agy` | 1 (`mise:`) | 9 egress entries | none |
+| `atomic-agent` | 1 (`tarball:`) | 7 egress entries, 2 env vars, a `tarball:` resolver | none |
 | `aider` | 3 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
 | `amp` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `ante` | 1 (`mise:`) | 4 egress entries | none |
@@ -285,7 +293,7 @@ The 63 shipped bundles, and what each carries:
 | `opencode` | 1 (`mise:`) | 3 egress entries | `models-catalog`, `npm-registry` |
 | `opencode-desktop` | 1 (`deb:`) | 4 egress entries | `models-catalog`, `npm-runtime` |
 | `openfox` | 2 (`mise:`, `nix:`) | an install step | none |
-| `openwork` | 1 (`appimage:`) | 9 egress entries, an `appimage:` resolver | `models-catalog`, `npm-runtime` |
+| `openwork` | 1 (`appimage:`) | 12 egress entries, an `appimage:` resolver | `models-catalog`, `npm-runtime` |
 | `pi` | 1 (`mise:`) | 1 egress entry | none |
 | `pool` | 1 (`tarball:`) | 1 egress entry, a `tarball:` resolver | none |
 | `prime-agent` | 5 (`nix:`) | 4 egress entries, 1 env var | `npm-registry`, `pypi` |
@@ -306,7 +314,7 @@ None of them carries a `cmd` or a posture (`network` mode, `gui`, `gpu`, …): a
 what a tool *needs*, and the consuming app keeps its own command and its own posture. See
 [What a bundle may carry](#what-a-bundle-may-carry-and-what-it-may-not).
 
-Every shipped profile now names a bundle with `use`: 63 of the 70 name their own, and the
+Every shipped profile now names a bundle with `use`: 64 of the 71 name their own, and the
 other 7 consume **another** agent's, because nothing would ever compose them in turn —
 `t3code` names `claude-code`; `aionui`, `opencode-web`, `open-design` and `orca-desktop`
 name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profile is a

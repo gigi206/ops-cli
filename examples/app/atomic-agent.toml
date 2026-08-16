@@ -1,6 +1,7 @@
 # Atomic Agent — the local-first agent runtime (AtomicBot-ai/atomic-agent), sandboxed by sbx.
 #
-#   sbx app import examples/app/atomic-agent.toml
+#   sbx bundle import examples/bundle/atomic-agent.toml
+#   sbx app import    examples/app/atomic-agent.toml
 #   sbx app run atomic-agent
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package, its auto-upgrade resolver and
@@ -119,7 +120,7 @@ gui = "offscreen"
 # one declaration shared with the bundle file itself, so this profile cannot fall behind when the
 # agent's requirements change.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/atomic-agent.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["atomic-agent"]

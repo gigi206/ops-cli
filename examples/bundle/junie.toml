@@ -57,7 +57,7 @@ j="$root/node_modules/@jetbrains/junie"
 # the script writes the launcher shim first, then creates `versions/<v>/`, then downloads into it —
 # so a failed download leaves both the shim AND an empty version directory behind, and a guard
 # keyed on either skips the retry forever while the launch dies with "No version found".
-# `sbx upgrade provision` raises SBX_UPGRADE to ask for a re-install (the vendor script then
+# `sbx app upgrade junie` raises SBX_UPGRADE to ask for a re-install (the vendor script then
 # fetches the current release); without it the guard below keeps the download to once.
 if [ -z "$(find "$HOME/.local/share/junie/versions" -mindepth 2 -print -quit 2>/dev/null)" ] || [ -n "${SBX_UPGRADE:-}" ]; then
   echo "junie: running the vendor install step mise's --ignore-scripts skipped (downloads the release) …" >&2

@@ -223,7 +223,8 @@ $ sbx config show
 ```
 
 When the events differ, each is listed with its own mode. `sbx config show --app <name>` shows the
-app's effective policy and whether it is the app's own or inherited.
+app's effective policy and whether it is the app's own, inherited from a config layer, or
+sbx's default (which is folded out of that view unless `--details` asks for it).
 
 ## Related
 

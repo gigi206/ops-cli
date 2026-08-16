@@ -1,6 +1,7 @@
 # rovo — Rovo Dev CLI (Atlassian's coding agent), sandboxed by sbx.
 #
-#   sbx app import examples/app/rovo.toml
+#   sbx bundle import examples/bundle/rovo.toml
+#   sbx app import    examples/app/rovo.toml
 #   sbx app run rovo
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The Atlassian CLI this agent rides on, and the
@@ -93,7 +94,7 @@ cmd = ["acli", "rovodev"]
 # gets the CLI, with nothing to reproduce; what stays here is the command that reaches the agent,
 # `acli rovodev`.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/rovo.toml
 # Without it the launch warns that the bundle is undeclared and the CLI is simply absent.
 use = ["rovo"]

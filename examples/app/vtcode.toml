@@ -1,6 +1,7 @@
 # VT Code — a Rust terminal coding agent with multi-provider LLM support, sandboxed by sbx.
 #
-#   sbx app import examples/app/vtcode.toml
+#   sbx bundle import examples/bundle/vtcode.toml
+#   sbx app import    examples/app/vtcode.toml
 #   sbx app run vtcode
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -14,7 +15,7 @@
 # (`vtcode-<version>-x86_64-unknown-linux-gnu.tar.gz`) — no node, no runtime deps. sbx equips it
 # fresh from upstream via mise's `github` backend (the same clean path `kilocode` uses); the binary
 # lands in the app's persistent isolated home, pinned at the version installed on the first launch
-# in a project. Advance it with `sbx upgrade mise` — do NOT use the built-in `vtcode update`, which
+# in a project. Advance it with `sbx app upgrade vtcode` — do NOT use the built-in `vtcode update`, which
 # would replace the binary underneath the pinned install.
 #
 # The agent's own search tools are external programs: ripgrep for content search and ast-grep for
@@ -56,7 +57,7 @@ cmd = "vtcode"
 # reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
 # profile cannot fall behind when the agent's requirements change.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/vtcode.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["vtcode"]

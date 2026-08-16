@@ -1,6 +1,7 @@
 # Poolside Agent CLI — Poolside's coding agent CLI (`pool`), sandboxed by sbx.
 #
-#   sbx app import examples/app/pool.toml
+#   sbx bundle import examples/bundle/pool.toml
+#   sbx app import    examples/app/pool.toml
 #   sbx app run pool -- "<task>"            # run a task (the agent's entrypoint)
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent itself, the resolver that keeps it
@@ -76,7 +77,7 @@ cmd = "pool"
 # this profile cannot fall behind when the agent's requirements change. The bundle is COMPLETE: an
 # app that names it gets the agent, with nothing to reproduce.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/pool.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["pool"]

@@ -13,6 +13,7 @@ mod fhs;
 mod launch;
 mod memfd;
 mod naming;
+mod openuri;
 mod pty;
 mod smoke;
 mod spec;
@@ -80,7 +81,7 @@ pub(crate) mod seccomp;
 
 // Filesystem observability.
 pub(crate) mod fs_control;
-mod fs_watch;
+pub(crate) mod fs_watch;
 mod fsmask;
 
 // Desktop / GUI holes: Wayland, GPU, audio, the D-Bus portal, theme/notifications.
@@ -131,6 +132,12 @@ pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};
 pub(crate) use netns::run_holder;
 pub(crate) use nixhub::{ToolUpgrade, current_system, parse_nix_tools, upgrade_tools};
+/// The sibling selector, exported for one guard rather than for a caller: `sbx app upgrade` decides
+/// that an inline `[flakes.<name>]` gets no channel *because* this is what `sbx upgrade flake`
+/// rolls, and the test that pins the decision asserts it against this function rather than against
+/// a restatement of the rule.
+#[cfg(test)]
+pub(crate) use packages::flake_packages;
 /// The `mise:` tokens a set of packages equips, untrusted ones withheld. Re-exported so `sbx
 /// upgrade --app` can ask the same question the roll asks rather than a lookalike of its own.
 pub(crate) use packages::mise_packages;

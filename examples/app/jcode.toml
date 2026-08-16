@@ -1,6 +1,7 @@
 # jcode — a Rust terminal coding agent ("the most RAM efficient harness"), sandboxed by sbx.
 #
-#   sbx app import examples/app/jcode.toml
+#   sbx bundle import examples/bundle/jcode.toml
+#   sbx app import    examples/app/jcode.toml
 #   sbx app run jcode
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -14,7 +15,7 @@
 # (`jcode-linux-x86_64.tar.gz`). sbx equips it fresh from upstream via mise's `github`
 # backend (the same clean path `vtcode`/`cortex` use) — no nixpkgs lag, no node. The binary
 # lands in the app's persistent isolated home, pinned at the version installed on the first
-# launch in a project; advance it with `sbx upgrade mise`. Do NOT use a built-in updater —
+# launch in a project; advance it with `sbx app upgrade jcode`. Do NOT use a built-in updater —
 # sbx owns the version here, and the upstream install script downloads from its own CDN
 # (jcode.sh/releases + the GitHub release), which stays denied below.
 #
@@ -90,7 +91,7 @@ exit 127
 # reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
 # profile cannot fall behind when the agent's requirements change.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/jcode.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["jcode"]

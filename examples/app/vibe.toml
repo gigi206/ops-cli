@@ -1,6 +1,7 @@
 # Mistral Vibe — Mistral's minimal open-source coding agent (CLI), sandboxed by sbx.
 #
-#   sbx app import examples/app/vibe.toml
+#   sbx bundle import examples/bundle/vibe.toml
+#   sbx app import    examples/app/vibe.toml
 #   sbx app run vibe
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's packages, the sign-in browser and the
@@ -31,41 +32,26 @@
 # callback is server-side polling, no `forward` is needed — a browser INSIDE the cage is enough, and
 # everything (the sign-in page + the poll) closes in the sandbox.
 #
-# The browser is a real Chromium provisioned into the cage (see [packages] + `gui`/`gpu` below).
-# Two details make it work: (1) Vibe's `webbrowser.open` BLOCKS on an unknown browser command (it
-# `wait()`s for the process), so `BROWSER` points at the `sbx-open` wrapper written by `cmd`, which
-# launches Chromium in the background with `nohup … &` (the cage ships no `setsid`) and returns
-# immediately, so the TUI never freezes; (2) under a filtering posture on a `gui = "wayland"` cage,
-# sbx seeds its per-session MITM CA into the cage's NSS db automatically (Chromium ignores the
-# CA-file env vars other tools honour), so HTTPS to console.mistral.ai succeeds — `--use-system-ca`
-# tells Chromium to consult that store, and `--password-store=basic` keeps the SSO cookies in a file
-# store (no keyring in the cage) so the session survives a relaunch. Chromium's output is logged to
-# `~/sbx-browser.log` in the isolated home, in case a launch ever fails.
+# The browser is a real Chromium provisioned into the cage (see [packages] + `gui`/`gpu` below) and
+# reached through the `[open]` table below. Two details make it work: (1) the handler runs in
+# `detach` mode, because Vibe's `webbrowser.open` hands the URL to sbx's router and does not wait,
+# so an `exec`ed Chromium would pour its output over the TUI; (2) under a filtering posture on a
+# `gui = "wayland"` cage, sbx seeds its per-session MITM CA into the cage's NSS db automatically
+# (Chromium ignores the CA-file env vars other tools honour), so HTTPS to console.mistral.ai
+# succeeds — `--use-system-ca` tells Chromium to consult that store, and `--password-store=basic`
+# keeps the SSO cookies in a file store (no keyring in the cage) so the session survives a relaunch.
+# Chromium's output goes to `~/.sbx-open.log` in the isolated home, in case a launch ever fails.
+#
+# Why no `BROWSER` variable, and why `gui` is load-bearing beyond the window: with `BROWSER` unset,
+# Python's `webbrowser` registers the `xdg-open` sbx puts on PATH as a *background* browser, which it
+# starts without waiting — verified on the Python this cage receives (3.12). That registration
+# happens only when `DISPLAY` or `WAYLAND_DISPLAY` is set, which `gui = "wayland"` provides. Setting
+# `BROWSER` to an unknown command is what makes `webbrowser.open` block, and it is what this profile
+# used to have to do.
 #
 # API-KEY (BYOK) is available as an alternative to the browser sign-in — see the [env]/[secret]
 # blocks at the bottom of this file.
-cmd = [
-    "bash",
-    "-c",
-    '''
-set -e
-mkdir -p "$HOME/.local/bin"
-# vibe opens the sign-in URL via Python's webbrowser, which BLOCKS on an unknown command; this
-# wrapper backgrounds an in-cage Chromium (nohup, since the cage has no setsid) and exits 0
-# immediately, so the TUI never freezes. Chromium's output is captured for troubleshooting.
-cat > "$HOME/.local/bin/sbx-open" <<'WRAP'
-#!/bin/sh
-nohup chromium --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-  --use-system-ca --password-store=basic --no-first-run --no-default-browser-check \
-  "$@" >"$HOME/sbx-browser.log" 2>&1 &
-exit 0
-WRAP
-chmod +x "$HOME/.local/bin/sbx-open"
-export BROWSER="$HOME/.local/bin/sbx-open"
-exec vibe "$@"
-''',
-    "vibe",
-]
+cmd = ["vibe"]
 
 # DISPLAY + GPU — needed so the in-cage Chromium (the SSO sign-in window) actually maps. `gui =
 # "wayland"` binds the host Wayland compositor socket (read-only) and provisions fonts; X11 is never
@@ -94,7 +80,7 @@ gpu = true
 # with the bundle file itself, so this profile cannot fall behind when the agent's requirements
 # change. The posture (`gui`/`gpu`) stays here: a bundle may never widen it.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/vibe.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["vibe"]
@@ -104,6 +90,17 @@ use = ["vibe"]
 # Egress is denied by construction except the SSO host, the Mistral API, and the install-time PyPI
 # hosts. An app is read-by-default ({GET,HEAD}): the SSO + API hosts the agent POSTs to are opened
 # to all verbs with `{*}`; the pure-download PyPI hosts stay `{GET}` (least privilege).
+
+# Where a web link opens: the in-cage Chromium that renders the Mistral sign-in page. `detach` is
+# the mode this caller needs — Vibe hands the URL over and carries straight on to poll
+# console.mistral.ai, so the browser must not own the terminal it left behind; its output goes to
+# `~/.sbx-open.log` instead.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+https = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+
 [network]
 mode = "deny"
 allow = [

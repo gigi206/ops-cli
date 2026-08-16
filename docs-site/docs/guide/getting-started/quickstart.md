@@ -68,9 +68,22 @@ network allowlist, and host-side credential injection. The repository ships
 [importable starter profiles](../apps/catalog):
 
 ```sh
-sbx app import examples/app/claude-code.toml
+sbx bundle import examples/bundle/claude-code.toml
+sbx app import    examples/app/claude-code.toml
 sbx app run claude-code
 ```
+
+A shipped profile is **not self-contained**, on purpose: the agent's package, the
+environment it reads and the hosts it must reach live in a [bundle](../configuration/bundles),
+which follows upstream, while the profile holds what you configure. So a starter profile
+takes two imports. Either order works, and the app is inert until you launch it; what does
+not work is skipping one. If you do, `sbx app import` names the file you still need, and
+`sbx app run` starts an agent that is simply absent.
+
+To do both in one gesture, `sbx app import examples/app/claude-code.toml --with-deps` follows
+what the profile references and imports it from the files beside it. It writes into your
+global config, so it is asked for rather than assumed. See
+[the import reference](../cli/app#importing-what-it-references-in-one-gesture).
 
 The agent runs in the cage with a persistent identity that never bleeds into your
 project shell. See [the app framework](../apps/).

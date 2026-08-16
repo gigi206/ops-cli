@@ -88,7 +88,8 @@ is trusted by invocation. The command line beats the environment, and both beat 
 
 ```sh
 sbx config show               # a `gpu:` line only when it is enabled
-sbx config show --app desktop  # an app's effective posture, tagged inherited or set
+sbx config show --app desktop            # tagged default, inherited or set by the app
+sbx config show --app desktop --details  # plus the postures no layer set (folded by default)
 ```
 
 ## Access, not new privilege

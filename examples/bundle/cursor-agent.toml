@@ -21,7 +21,7 @@
 # UPGRADE. A bootstrap install rides no `[packages]` backend, so there is no lock to roll. The
 # installer carries no update logic of its own either — it always downloads and overwrites with the
 # version `cursor.com/install` currently serves — so re-running it IS the upgrade:
-#     sbx upgrade provision
+#     sbx app upgrade cursor-agent
 # re-runs this step in the app's cage with SBX_UPGRADE set, and the guard below yields to it. For
 # one launch only: `sbx app run cursor-agent --env CURSOR_AGENT_SBX_UPDATE=1`. The login lives
 # elsewhere in the app home and is untouched either way.

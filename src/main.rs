@@ -553,12 +553,20 @@ fn format_log_time(at_epoch_ms: u128) -> String {
 /// `scope_path`, same trust-store, same "existing config must be trusted" rule — so a save that would
 /// later refuse refuses here instead, with nothing answered. Absent or already-trusted is fine (sbx's
 /// append is then the sole delta).
-/// The write-side trust gate for a `--local` save: an existing-but-untrusted (or changed) project
-/// config must not be silently blessed by an appended rule — the user reviews and re-trusts it
-/// first. An absent config (bootstrap) or an already-trusted one is fine, so sbx's edit is the sole
-/// delta from the trusted bytes. Pure on the `(exists, state)` pair, so the refuse/allow matrix is
-/// unit-testable without a filesystem.
-fn local_save_permitted(exists: bool, state: trust::TrustState) -> bool {
+/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or
+/// changed) config must not be silently blessed, the user reviews and re-trusts it first. An absent
+/// config (bootstrap) or an already-trusted one is fine, so sbx's edit is the sole delta from the
+/// trusted bytes. Pure on the `(exists, state)` pair, so the refuse/allow matrix is unit-testable
+/// without a filesystem.
+///
+/// **The invariant it states, for every verb that writes and blesses in one step: sbx blesses the
+/// delta it authored, never content the user has not approved.** `sbx net allow --local` and
+/// `sbx proc allow --local` re-trust unconditionally after writing, so they must be admitted here
+/// first; `sbx config set|add|rm|unset --trust` blesses only when asked, so it is admitted only when
+/// the flag is passed (see `cli::config::admit_config_write`). The one deliberate exception is
+/// `sbx config edit --trust`, where the editor showed the user the file: what you have seen may be
+/// blessed.
+pub(crate) fn local_save_permitted(exists: bool, state: trust::TrustState) -> bool {
     !exists || state == trust::TrustState::Trusted
 }
 

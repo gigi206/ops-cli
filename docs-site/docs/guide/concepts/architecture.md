@@ -437,7 +437,7 @@ decision. A private in-cage desktop portal is different in kind: it stands up it
 | what syscalls are reachable | the mandatory denylist, relaxable only when trusted | the kernel, every launch |
 | what the agent may execute | the [`[proc]`](../configuration/proc) posture | a parked syscall, host-side verdict |
 | how much it may consume | the [`[limits]`](../configuration/limits) table, over built-in defaults | a cgroup scope, best-effort |
-| where the agent may connect | the egress policy | the host proxy, the only route out |
+| where the agent may connect | the egress policy | the host proxy for the cage's own traffic; the same policy admits a [`tcp://` broker](../configuration/broker#the-honest-limits), which it does not inspect |
 | which credential goes where | a host-scoped secret entry | the proxy, on the wire |
 | where a secret's value comes from | a scheme, built-in or plugin | a host-side resolver cage |
 | what a plugin may touch | its signed manifest, plus your own answer | the resolver's cage |

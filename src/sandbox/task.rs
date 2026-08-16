@@ -2324,6 +2324,7 @@ mod smoke {
             &Default::default(),
             super::super::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             vec![OsString::from("/bin/true")],
         )
         .ok()?;

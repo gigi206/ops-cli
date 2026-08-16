@@ -1,6 +1,7 @@
 # freebuff desktop — the Electron GUI of Freebuff (by CodebuffAI), sandboxed by sbx (Wayland display).
 #
-#   sbx app import examples/app/freebuff-desktop.toml
+#   sbx bundle import examples/bundle/freebuff-desktop.toml
+#   sbx app import    examples/app/freebuff-desktop.toml
 #   sbx app run freebuff-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.AppImage`, its auto-upgrade resolver, the
@@ -51,17 +52,16 @@
 # a large Electron + Chromium closure (hundreds of MiB), a couple of minutes, over your HOST network (the
 # build does NOT use the cage allowlist). Later launches reuse the pinned build offline.
 #
-# SIGN-IN — why the `cmd` is a bash wrapper (this is the fix for "clicking sign-in does nothing"). The
+# SIGN-IN — why this profile declares `[open]` (the fix for "clicking sign-in does nothing"). The
 # renderer runs on the cage loopback; the "sign-in to freebuff" button opens the login page at an OFF-ORIGIN
 # https URL, which Electron's main process hands to `shell.openExternal` (verified in the app's own
 # `main.cjs`). A hermetic cage has NO system browser and NO registered URL handler, so `openExternal` does
 # NOTHING — the click is silently dropped. Freebuff's login is a device-code flow (open a codebuff.com URL,
-# then the in-cage orchestrator polls for completion), so the WHOLE flow must close IN-CAGE. The wrapper
-# therefore provisions an IN-CAGE Chromium and makes it the URL handler two ways: an `xdg-open` shim on
-# PATH, AND — the load-bearing one under `dbus = true`, where `openExternal` routes through the portal's
-# `org.freedesktop.portal.OpenURI` and consults the desktop database, never `xdg-open` — a registered
-# `.desktop` handler + `mimeapps.list` default for http/https. Same pattern as `examples/app/t3code.toml` /
-# `examples/app/claude-desktop.toml`. `--password-store=basic` forces the file cookie store (no keyring in the
+# then the in-cage orchestrator polls for completion), so the WHOLE flow must close IN-CAGE. The profile
+# therefore provisions an IN-CAGE Chromium and names it in `[open]`, which covers both ways a link is
+# opened: a direct `xdg-open` call, and — the load-bearing one under `dbus = true`, where
+# `openExternal` routes through the portal's `org.freedesktop.portal.OpenURI` and consults the desktop
+# database instead — the desktop entry sbx generates from the same declaration. `--password-store=basic` forces the file cookie store (no keyring in the
 # cage) so a login survives a relaunch. If you would rather sign in with an API key (no browser), drop the
 # `chromium` package and the wrapper for a bare `freebuff` argv with the Electron flags.
 #
@@ -88,46 +88,12 @@
 # IS the boundary (it replaces Chromium's own redundant sandbox); `--ozone-platform=wayland` selects the
 # Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
 cmd = [
-    "bash",
-    "-c",
-    '''
-# --- In-cage browser as the http/https handler, so "sign-in to freebuff" opens (see SIGN-IN header) ---
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-case "$1" in
-  http://*|https://*)
-    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
-      --no-first-run --no-default-browser-check "$@" ;;
-  *)
-    exec freebuff --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage "$@" ;;
-esac
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
-
-# Under `dbus = true` Electron opens external URLs via `org.freedesktop.portal.OpenURI`, not `xdg-open`
-# directly; the portal shows "no apps available" unless a default http/https handler is registered. The
-# Exec path is ABSOLUTE ($HOME expanded here) because the portal-launched handler does not inherit PATH.
-mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=sbx URL handler
-Exec=$HOME/.local/bin/xdg-open %U
-MimeType=x-scheme-handler/http;x-scheme-handler/https;
-NoDisplay=true
-Terminal=false
-EOF
-cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
-[Default Applications]
-x-scheme-handler/http=sbx-open-uri.desktop
-x-scheme-handler/https=sbx-open-uri.desktop
-MIMEAPPS
-
-exec freebuff --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic
-''',
+    "freebuff",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+    "--password-store=basic",
 ]
 home_scope = "global"
 
@@ -142,12 +108,25 @@ dbus = true
 # the bundle may never carry is posture: the `gui`/`gpu`/`dbus` grants and the sign-in wrapper in
 # `cmd` stay here.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/freebuff-desktop.toml
 # Without it the launch warns that the bundle is undeclared and the app is simply absent.
 use = ["freebuff-desktop"]
 
 # No `[packages]` table here, and no `[appimage.freebuff]` resolver: both come from the bundle.
+
+# Where a web link opens: the in-cage Chromium. One declaration covers both ways a link is opened —
+# a tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` — and sbx
+# freezes the routing, so nothing running in the cage can answer a sign-in link in its place.
+#
+# The hand-written wrapper this replaces also had a catch-all branch handing every OTHER scheme to
+# `freebuff`. It was speculative: the registered handler only ever claimed http/https, so the portal
+# never used it. If FreeBuff answers a scheme of its own, declare it here as one more key.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
 
 [network]
 # EGRESS — the filtering allowlist WORKS for Freebuff (its Bun orchestrator honors the proxy sbx sets:
@@ -189,7 +168,7 @@ mute = [
 ]
 
 # CREDENTIAL POSTURE — account / OAuth, NOT a header-injectable API key.
-# You log in ONCE inside the cage (via the in-cage browser the `cmd` wrapper sets up — sign in to your
+# You log in ONCE inside the cage (via the in-cage browser `[open]` routes to — sign in to your
 # Codebuff account, or GitHub/Google). The token persists in the app's dedicated, persistent, isolated home
 # (`home_scope = "global"` → one login, shared across projects). There is no [secret] block because no HTTP
 # header key is injected host-side.

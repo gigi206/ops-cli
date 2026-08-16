@@ -60,7 +60,10 @@ use super::fs_control::{FsKind, FsRing};
 /// one of these trees is not observed. That is acceptable for a cheap observe lens (the cage, not this
 /// feed, is the boundary), and a surgical, configurable ignore set is the natural follow-on; this fixed
 /// set covers the common heavy cases.
-const IGNORED_COMPONENTS: &[&str] = &[".git", "node_modules", "target", ".venv"];
+///
+/// Reachable crate-wide so `docs_coverage` can assert the guide names every entry: a tree that stops
+/// being watched without its page saying so turns a written blind spot back into a silent one.
+pub(crate) const IGNORED_COMPONENTS: &[&str] = &[".git", "node_modules", "target", ".venv"];
 
 /// The inotify event mask installed on every watched directory. `IN_ONLYDIR` makes an accidental
 /// `add_watch` on a non-directory fail closed; `IN_EXCL_UNLINK` drops events for an already-unlinked

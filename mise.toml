@@ -32,6 +32,14 @@ zig                             = "latest"
 # materialises them into docs-site/node_modules via `npm install`. Keep the two in
 # sync when bumping a version. `pagefind` (the search indexer) is a dev dep too.
 node                            = "latest"
+# The TS/JS language server for the Docusaurus docs-site. `typescript` is capped at
+# the 5.x line because it is the last to ship tsserver (typescript 7/tsgo does not,
+# and typescript-language-server needs it); docs-site keeps its own
+# `typescript: ^7` devDependency for `npm run typecheck` — the two coexist.
+# Keep the `tsserver.path` in the omp LSP config (~/.omp/agent/lsp.json) in sync
+# with the resolved typescript version when it bumps.
+"npm:typescript"                = "5"
+"npm:typescript-language-server" = "latest"
 
 # ============================================================================
 # Tasks — invoked via `mise run <name>`. `mise run ci` is the full one-liner you
@@ -139,6 +147,6 @@ depends = ["docs-install"]
 run = "npm --prefix docs-site run build"
 
 [tasks.docs-serve]
-description = "Serve the built docs site from docs-site/build/ (http://localhost:3000) — search needs this, the index only exists after a build"
+description = "Serve the built docs site from docs-site/build/ (http://localhost:3000): search needs this, the index only exists after a build"
 depends = ["docs-build"]
 run = "npm --prefix docs-site run serve"

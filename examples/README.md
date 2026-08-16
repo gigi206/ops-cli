@@ -28,14 +28,23 @@ app profile  ──use──▶  bundle  ──@name──▶  egress group
  credentials)           env, hosts)         allow/mute/deny entries)
 ```
 
-Most profiles are therefore **not self-contained, on purpose**: `sbx app import` alone is not
-enough. Import the bundle, and any group its header lists under `REQUIRES`, first; every header
-says which. The reason is the failure this layout removes: a hand-copied set of an agent's
-requirements falls behind the agent silently, and the launch that breaks says nothing about why.
+Profiles are therefore **not self-contained, on purpose**: `sbx app import` alone is not enough.
+Import the bundle too, and any group the header lists under `REQUIRES`; every header says which.
+The reason is the failure this layout removes: a hand-copied set of an agent's requirements falls
+behind the agent silently, and the launch that breaks says nothing about why.
 
-Every shipped profile names a bundle, so this is the shape everywhere: import the bundle, then the
-profile. The seven that name **another** agent's bundle rather than their own are the orchestrators
-listed below.
+**Order does not matter.** Each import writes its own file and resolves nothing: a profile is inert
+until `sbx app run <name>`, so the references are looked up then, not at import. What order does
+change is only what you are told — import the profile first and it names the bundle file you still
+need; import the bundle first and it names any group *it* references. Skipping one is what breaks:
+the app launches without the tool and egress it named.
+
+`sbx app import <profile> --with-deps` does all of them at once, taking each from the file beside it
+here. It merges into your global config rather than only writing a profile sbx owns, which is why it
+is a flag: an unresolvable reference makes it refuse and write nothing at all.
+
+All 71 shipped profiles name a bundle, so this is the shape everywhere. The seven that name
+**another** agent's bundle rather than their own are the orchestrators listed below.
 
 ## App profiles (`app/`)
 

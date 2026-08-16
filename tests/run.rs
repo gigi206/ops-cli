@@ -2835,6 +2835,94 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
     );
 }
 
+/// `sbx app run <name> -- <args>` reaches a `bash -c` profile intact — including the *first*
+/// argument.
+///
+/// The defect this pins: sbx appends the trailing arguments to the declared `cmd` positionally, and
+/// `<shell> -c <script>` binds the element right after the script to `$0`. A profile that did not
+/// write its own `$0` filler therefore lost one argument silently, with a zero exit — the synopsis
+/// promises `[-- <args>...]` and the launch honoured it one short.
+///
+/// Both halves are launched, because the fix has to hold in two directions: a profile without a
+/// filler must gain one, and a profile that wrote its own must keep the name it chose. Asserting
+/// `$0` by name is what separates them — a test that only counted arguments would pass with sbx
+/// overwriting the profile's chosen name.
+#[test]
+fn a_trailing_argument_reaches_a_shell_profile_without_being_eaten_as_argv0() {
+    let project = TmpDir::new("argv0-proj");
+    let data = TmpDir::new("argv0-data");
+    let state = TmpDir::new("argv0-state");
+    // `nofill` declares no element after its script; `ownfill` declares `chosen-zero`. Both echo
+    // the two facts under test, so one launch each settles both directions.
+    // Written with TOML-escaped quotes: the script itself must be quoted inside a basic string, and
+    // an unescaped one silently truncates the table — the config then parses to no apps at all.
+    let script = r#"echo \"ZERO=$0 COUNT=$# ARGS=[$*]\""#;
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        format!(
+            "[app.nofill]\ncmd = [\"bash\", \"-c\", \"{script}\"]\n\
+             [app.ownfill]\ncmd = [\"bash\", \"-c\", \"{script}\", \"chosen-zero\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let probe = run_in(project.path(), data.path(), &["true"]);
+    if !probe.status.success() {
+        eprintln!(
+            "skipping argv0 e2e: host cannot sandbox ({})",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+        return;
+    }
+
+    // `[app.*]` is trusted-only, and an untrusted config drops the table outright ("No apps are
+    // configured"), so trust before launching or both launches fail before reaching the argv.
+    let trusted = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["trust", ".sbx.toml"],
+    );
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+
+    // No filler declared: sbx supplies one, so the caller's first argument lands on `$1`. The
+    // expectation is written out in full rather than assembled from the input — a net that derives
+    // its own answer agrees with a broken appender.
+    let nofill = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "nofill", "--", "--flag-a", "value-b"],
+    );
+    let out = String::from_utf8_lossy(&nofill.stdout);
+    let log = format!("{}{out}", String::from_utf8_lossy(&nofill.stderr));
+    assert!(nofill.status.success(), "nofill launch failed: {log}");
+    assert!(
+        out.contains("ZERO=nofill COUNT=2 ARGS=[--flag-a value-b]"),
+        "both arguments must reach the script, with the app name as `$0`: {log}"
+    );
+
+    // A profile that wrote its own `$0` keeps it: sbx must add nothing, or it would rename the
+    // script out from under a profile that already said what it should be called.
+    let ownfill = sbx_in(
+        project.path(),
+        data.path(),
+        state.path(),
+        &["app", "run", "ownfill", "--", "--flag-a", "value-b"],
+    );
+    let out = String::from_utf8_lossy(&ownfill.stdout);
+    let log = format!("{}{out}", String::from_utf8_lossy(&ownfill.stderr));
+    assert!(ownfill.status.success(), "ownfill launch failed: {log}");
+    assert!(
+        out.contains("ZERO=chosen-zero COUNT=2 ARGS=[--flag-a value-b]"),
+        "a profile's own `$0` must survive, with both arguments still intact: {log}"
+    );
+}
+
 #[test]
 fn a_network_allowlist_filters_egress_through_the_proxy() {
     // The Model-B egress path end to end through the real binary: a trusted

@@ -109,8 +109,12 @@ Honest limits:
   surfaced with a one-time warning rather than hidden.
 - The filtered trees are an **observation blind spot**, not just noise: because the cage runs an
   untrusted agent, anything it writes under `.git`, `node_modules`, `target`, or `.venv` is not shown.
-  They are filtered because they would flood the feed and slow the launch. It is not a security
-  hole, the cage is the boundary and this is only visibility, but it is a gap worth knowing.
+  They are filtered because they would flood the feed and slow the launch. The cage is still the
+  boundary while the session runs, so this is visibility rather than enforcement, but the gap has a
+  sharp edge: a hook the agent leaves in `.git/hooks/` is run by your next `commit`, outside the cage,
+  and this feed will not have shown it. See [where the protection
+  stops](../concepts/security-model#where-the-protection-stops), which names the `[fs]` entry that
+  closes that one.
 - A **directory renamed** while the session runs keeps its old path in the feed for later writes
   under it: the event still fires, only its reported path can be stale.
 - The feed watches the **project tree on disk**, so it reports every writer to it: if two sessions

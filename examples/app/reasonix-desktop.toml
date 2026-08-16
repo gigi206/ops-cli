@@ -1,6 +1,7 @@
 # reasonix-desktop — the Reasonix desktop shell (reasonix.io), sandboxed by sbx.
 #
-#   sbx app import examples/app/reasonix-desktop.toml
+#   sbx bundle import examples/bundle/reasonix-desktop.toml
+#   sbx app import    examples/app/reasonix-desktop.toml
 #   sbx app run reasonix-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.deb`, its resolver and library list, the
@@ -84,7 +85,7 @@ dbus = true
 # the bundle file itself. The posture (`gui`/`gpu`/`dbus`) stays here: a bundle may never widen it,
 # and `dbus = true` is what serves this shell its light/dark scheme.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/reasonix-desktop.toml
 # Without it the launch warns that the bundle is undeclared and the app is simply absent.
 use = ["reasonix-desktop"]

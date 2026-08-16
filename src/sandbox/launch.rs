@@ -737,6 +737,32 @@ impl AppOutcome {
     }
 }
 
+/// The shells whose `-c` binds the *next* argv element to `$0`. All four are POSIX-family and
+/// agree on it, so the rule is theirs, not a per-shell quirk.
+const ARGV0_SHELLS: [&str; 4] = ["bash", "sh", "zsh", "dash"];
+
+/// Whether `cmd` ends in `<shell> -<flags>c <script>` — the shape whose trailing element is a
+/// script, not a program, so anything appended after it starts at `$0`.
+///
+/// The script must be *last*: an argv that already carries an element after it has its `$0`, and a
+/// profile that wrote one is saying which name its script should report. The shell is matched on
+/// its file name so an absolute `/bin/bash` counts, and the flag must *end* in `c` because that is
+/// what makes the following element the script (`-c`, `-lc`, `-euc`); a flag with anything after
+/// the `c` consumes it differently and is left alone.
+fn ends_with_shell_payload(cmd: &[OsString]) -> bool {
+    let [shell, flag, _script] = &cmd[cmd.len().saturating_sub(3)..] else {
+        return false;
+    };
+    let is_shell = Path::new(shell)
+        .file_name()
+        .is_some_and(|s| ARGV0_SHELLS.iter().any(|k| s == *k));
+    let is_c_flag = flag.to_str().is_some_and(|f| {
+        f.strip_prefix('-')
+            .is_some_and(|rest| rest.ends_with('c') && rest.bytes().all(|b| b.is_ascii_lowercase()))
+    });
+    is_shell && is_c_flag
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn app(
     name: &str,
@@ -769,14 +795,22 @@ pub(crate) fn app(
     // `sbx app <name> -- <args>` are appended to the declared `cmd`, so the caller can pass a flag
     // to the launched program (e.g. `-c` to resume) without editing the profile.
     let mut cmd: Vec<OsString> = app.cmd.iter().map(OsString::from).collect();
-    cmd.extend(extra);
-    // A bundle's install step runs BEFORE the app's command, in this same cage — same posture, same
-    // allowlist, same environment — and never in its place: the app's command stays its identity.
-    // Composed here rather than launched as a second cage, so the step sees exactly what the launch
-    // sees, and `&&` is what makes it fail closed: a step that exits non-zero never reaches `exec`.
-    if !app.provisions.is_empty() {
-        cmd = compose_provisioned_cmd(&app.provisions, cmd);
+    if !extra.is_empty() && ends_with_shell_payload(&cmd) {
+        // The shell's own `$0`, so the caller's first argument lands on `$1`. `<shell> -c <script>`
+        // binds the element right after the script to `$0`, not to `$1`: without this filler the
+        // append above silently eats one argument, and the profile sees a short `"$@"`. The app's
+        // name is the filler because `$0` is what the shell prints in its own diagnostics.
+        //
+        // Only when there is something to append: with no trailing arguments nothing can be eaten,
+        // and leaving the argv untouched keeps `$0` at whatever the shell defaults to.
+        cmd.push(OsString::from(name));
     }
+    cmd.extend(extra);
+    // A bundle's install step and a declared service both run BEFORE the app's command, in this same
+    // cage — same posture, same allowlist, same environment — and never in its place: the app's
+    // command stays its identity. Both are composed in `build`, once the app overlay and any
+    // one-shot override have been folded in, so the whole start-up is written in one place and one
+    // order rather than by whichever wrapper happened to be applied first.
     let runtime = match app.home_scope {
         crate::config::AppHomeScope::Global => binds::Runtime::GlobalApp(name),
         crate::config::AppHomeScope::Project => binds::Runtime::ProjectApp(name),
@@ -5349,6 +5383,15 @@ fn build(
     if prep.cfg.gpu && !devices.contains(&dri) {
         devices.push(dri);
     }
+    // A command with nothing declared ahead of it is passed through untouched, so the ordinary
+    // launch keeps the process it would have had — the same pid, the same signals, the same exit
+    // status — and only a launch that actually declared something gains a shell above it.
+    let nothing_to_compose = prep.cfg.provisions.is_empty() && prep.cfg.service.is_empty();
+    let startup_cmd = if cmd.is_empty() || nothing_to_compose {
+        cmd
+    } else {
+        compose_startup_cmd(&prep.cfg.provisions, &prep.cfg.service, &extra_env, cmd)
+    };
     let spec = binds::build_spec(
         prep.layout.data_dir(),
         &prep.cwd,
@@ -5371,7 +5414,14 @@ fn build(
         // render node under `gpu = true`, so an app's `[devices]` union is in effect for `sbx app`,
         // exactly like its seccomp relaxation.
         &devices,
-        cmd,
+        // The URI handlers from the resolved (post-`merge_app`) config, so an app's `[open]` folds
+        // over the baseline's for `sbx app` the way its packages and environment do.
+        &prep.cfg.open,
+        // The command, with the launch's whole start-up composed ahead of it: the app's bundle
+        // install steps, then its services. Composed here — the one function that stands up a cage —
+        // so every path reaching a cage gets the same start-up in the same order, and so both read
+        // the config *after* the app overlay and any one-shot override have had their say.
+        startup_cmd,
     )
     .map_err(|e| {
         eprintln!("sbx: cannot prepare the sandbox: {e}");
@@ -6291,33 +6341,6 @@ enum EnvLayer {
     Config,
 }
 
-/// Chain a bundle's install steps ahead of the app's own command, in one cage.
-///
-/// The steps run in `use` order and the command runs last, as `exec` so the app keeps the process
-/// it would have had — the same pid, the same signals, the same exit status, which is what makes
-/// the composition invisible to everything downstream. `&&` between them is the fail-closed rule:
-/// a step that exits non-zero stops the chain, so a launch never reaches an agent whose install did
-/// not finish.
-///
-/// The app's argv is passed as positional parameters rather than pasted into the script: an argv
-/// element that contains a quote, a space or a `$` is data, and a shell that re-parses it would
-/// read it as syntax.
-fn compose_provisioned_cmd(
-    provisions: &[crate::config::BundleProvision],
-    cmd: Vec<OsString>,
-) -> Vec<OsString> {
-    let script = format!("{} && exec \"$@\"", provision_chain(provisions));
-    let mut out: Vec<OsString> = vec![
-        OsString::from("bash"),
-        OsString::from("-c"),
-        OsString::from(script),
-        // `$0` for the composed script; the app's argv follows as `$1 …`.
-        OsString::from("sbx"),
-    ];
-    out.extend(cmd);
-    out
-}
-
 /// The install steps as one `&&` chain, without the app's command.
 ///
 /// Each step is itself an argv, rendered through `shell_quote` so a step's own arguments survive
@@ -6336,6 +6359,117 @@ fn provision_chain(provisions: &[crate::config::BundleProvision]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" && ")
+}
+
+/// Where a service's output goes, inside the cage's own home: `~/.sbx-service-<name>.log`.
+///
+/// A service outlives the call that started it and shares the terminal with the app, so its output
+/// cannot stay there — a chatty daemon would bury the app's own. The file is never rotated; it is
+/// the first place to look when an app starts but the thing beside it never answers.
+fn service_log_path(name: &str) -> String {
+    format!("\"${{HOME:-/tmp}}\"/.sbx-service-{name}.log")
+}
+
+/// Render one argv element for the start-up script, expanding a leading `~/` against the cage's home.
+///
+/// The expansion is the one substitution a service's argv gets, and it exists because a service is
+/// declared where the home's path is not knowable — `~/chroma-data` is the only way to name a
+/// directory under a home whose location sbx chooses. Everything else is quoted verbatim: a `$VAR`
+/// stays four characters, because the argv is data and a shell that re-read it would find syntax.
+fn service_arg(arg: &str) -> String {
+    match arg.strip_prefix("~/") {
+        Some(rest) => format!("\"${{HOME}}\"/{}", shell_quote(rest)),
+        None => shell_quote(arg),
+    }
+}
+
+/// The start-up script's lines for one service: the launch, and the readiness wait.
+///
+/// The launch is a subshell redirected to the service's log and backgrounded — the same shape the
+/// hand-written `nohup … &` had, and for the same reason (the cage ships no `setsid`). It is not
+/// supervised: if it dies, it stays dead, and the app is not told. What the readiness gate buys is
+/// only that the app does not *race* it.
+///
+/// A service whose `enable` condition does not hold never reaches here: it is left out of the script
+/// entirely, decided against the environment the launch composed rather than by a shell test in the
+/// cage. See [`compose_startup_cmd`].
+fn service_lines(name: &str, svc: &crate::config::ServiceSpec) -> String {
+    let mut out = String::new();
+    let argv = svc
+        .argv
+        .iter()
+        .map(|a| service_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let log = service_log_path(name);
+    out.push_str(&format!("( {argv} ) >>{log} 2>&1 </dev/null &\n"));
+    if let Some(ready) = svc.ready {
+        // A tenth-of-the-budget poll on bash's own `/dev/tcp`, so the wait needs no tool the base
+        // userland might not carry. The connection is opened in a subshell and dropped immediately:
+        // the question is whether anything accepts, and a fd left open in the launch would outlive
+        // the answer. On expiry the launch goes on — a gate that failed here would turn a slow
+        // auxiliary process into a broken app, which is the outcome it exists to avoid.
+        let attempts = ready.timeout.as_millis().div_ceil(500).max(1);
+        let port = ready.tcp;
+        out.push_str(&format!(
+            "sbx_ready=0\n\
+             for _ in $(seq 1 {attempts}); do\n\
+             \x20 if ( exec 3<>/dev/tcp/127.0.0.1/{port} ) 2>/dev/null; then sbx_ready=1; break; fi\n\
+             \x20 sleep 0.5\n\
+             done\n\
+             if [ \"$sbx_ready\" != 1 ]; then\n\
+             \x20 echo \"sbx: service {name} did not answer on port {port} within {}s — starting anyway; see {log}\" >&2\n\
+             fi\n",
+            ready.timeout.as_secs().max(1)
+        ));
+    }
+    out
+}
+
+/// Compose the cage's whole start-up ahead of the command it was launched to run: the app's install
+/// steps, then its services, then the command itself.
+///
+/// One script rather than nested wrappers, because the order is the point and nesting decides it by
+/// accident: an install that puts a program on `PATH` must run before a service that starts it. The
+/// install chain keeps its fail-closed `&&` — a step that exits non-zero stops everything, so no
+/// service and no command runs after a broken install. The services do not: one that fails to start
+/// is a degraded app, not a failed launch, which is the trade every hand-written `nohup` here
+/// already made.
+///
+/// The command's argv is passed as positional parameters rather than pasted in: an element holding a
+/// quote, a space or a `$` is data, and a shell that re-parsed it would read it as syntax.
+///
+/// A service's `enable` condition is answered **here**, against `env` — the environment this launch
+/// composed for the cage — and a service that fails it is simply not written into the script. sbx
+/// builds that environment itself, from a cleared one, so the answer is knowable at the moment the
+/// script is written; emitting a shell `if` instead would push a decision sbx has already made into
+/// a language the field is not.
+fn compose_startup_cmd(
+    provisions: &[crate::config::BundleProvision],
+    services: &std::collections::BTreeMap<String, crate::config::ServiceSpec>,
+    env: &[(String, String)],
+    cmd: Vec<OsString>,
+) -> Vec<OsString> {
+    let mut script = String::new();
+    if !provisions.is_empty() {
+        script.push_str(&provision_chain(provisions));
+        script.push_str(" || exit $?\n");
+    }
+    for (name, svc) in services {
+        if svc.enable.iter().all(|cond| cond.holds(env)) {
+            script.push_str(&service_lines(name, svc));
+        }
+    }
+    script.push_str("exec \"$@\"\n");
+    let mut out: Vec<OsString> = vec![
+        OsString::from("bash"),
+        OsString::from("-c"),
+        OsString::from(script),
+        // `$0` for the composed script; the command's argv follows as `$1 …`.
+        OsString::from("sbx"),
+    ];
+    out.extend(cmd);
+    out
 }
 
 /// The install steps alone, as a cage command — what `sbx upgrade provision` runs.
@@ -6383,6 +6517,55 @@ mod tests {
     use crate::store::Origin;
     use crate::testutil::TmpDir;
     use std::path::PathBuf;
+
+    /// Which argv shapes take an `$0` filler before the caller's `-- <args>` are appended, and
+    /// which must be left exactly as the profile wrote them.
+    ///
+    /// Every case is a literal argv, never one assembled by the code under test: the whole point
+    /// is to pin the shape from the outside, so a detector that drifts has nothing to agree with.
+    #[test]
+    fn only_a_trailing_shell_script_takes_an_argv0_filler() {
+        let argv = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
+
+        // The shape that eats an argument: the script is the last element, so whatever follows
+        // becomes the shell's `$0`.
+        assert!(ends_with_shell_payload(&argv(&["bash", "-c", "exec foo"])));
+        // Combined short flags still end in `c`, so the script still follows.
+        assert!(ends_with_shell_payload(&argv(&["bash", "-lc", "exec foo"])));
+        assert!(ends_with_shell_payload(&argv(&["sh", "-euc", "exec foo"])));
+        // The shell is matched on its file name, so an absolute path counts.
+        assert!(ends_with_shell_payload(&argv(&[
+            "/bin/dash",
+            "-c",
+            "exec foo"
+        ])));
+        assert!(ends_with_shell_payload(&argv(&["zsh", "-c", "exec foo"])));
+        // A leading wrapper does not hide the shape — only the last three elements decide.
+        assert!(ends_with_shell_payload(&argv(&[
+            "env", "-i", "bash", "-c", "exec foo"
+        ])));
+
+        // Already carries its own `$0`: the profile said which name its script reports, and the
+        // append lands on `$1` unaided. Touching this would rename the script.
+        assert!(!ends_with_shell_payload(&argv(&[
+            "bash", "-c", "exec foo", "foo"
+        ])));
+        // A plain argv: the appended arguments are the program's own, with nothing to shift.
+        assert!(!ends_with_shell_payload(&argv(&["foo", "--flag", "value"])));
+        // Not a shell whose `-c` binds `$0` this way.
+        assert!(!ends_with_shell_payload(&argv(&[
+            "python3", "-c", "print(1)"
+        ])));
+        // A flag that does not end in `c` does not make the next element a script.
+        assert!(!ends_with_shell_payload(&argv(&["bash", "-i", "exec foo"])));
+        assert!(!ends_with_shell_payload(&argv(&[
+            "bash", "-ci", "exec foo"
+        ])));
+        // Too short to carry the shape at all — must not panic on the slice.
+        assert!(!ends_with_shell_payload(&argv(&["bash", "-c"])));
+        assert!(!ends_with_shell_payload(&argv(&["foo"])));
+        assert!(!ends_with_shell_payload(&argv(&[])));
+    }
 
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
 
@@ -6823,6 +7006,8 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     ) -> crate::config::ResolvedApp {
         crate::config::ResolvedApp {
             provisions: Vec::new(),
+            open: Default::default(),
+            service: Default::default(),
             fs: Default::default(),
             fs_origin: crate::config::Provenance::Default,
             notify: None,
@@ -8069,16 +8254,17 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         ];
         let cmd: Vec<OsString> = ["agent", "--flag"].iter().map(OsString::from).collect();
 
-        let out = compose_provisioned_cmd(&steps, cmd);
+        let out = compose_startup_cmd(&steps, &Default::default(), &[], cmd);
         let script = out[2].to_string_lossy().to_string();
         assert_eq!(out[0], OsString::from("bash"));
         assert_eq!(out[1], OsString::from("-c"));
         assert!(
-            script.starts_with("'bash' '-c' 'first-step' && 'second-step' && "),
-            "steps run in fold order, each still its own argv: {script}"
+            script.starts_with("'bash' '-c' 'first-step' && 'second-step' || exit $?\n"),
+            "steps run in fold order, each still its own argv, and a failure ends the launch: \
+             {script}"
         );
         assert!(
-            script.ends_with("exec \"$@\""),
+            script.ends_with("exec \"$@\"\n"),
             "the app's command runs last, and as exec: {script}"
         );
         // The app's argv is positional, never pasted into the script: `$0` then the command.
@@ -8107,11 +8293,271 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
                 "it's".into(),
             ],
         }];
-        let out = compose_provisioned_cmd(&steps, vec![OsString::from("agent")]);
+        let out = compose_startup_cmd(
+            &steps,
+            &Default::default(),
+            &[],
+            vec![OsString::from("agent")],
+        );
         let script = out[2].to_string_lossy().to_string();
         assert!(
-            script.starts_with("'installer' '--dir=/opt/a b' '$(whoami)' 'it'\\''s' && "),
+            script.starts_with("'installer' '--dir=/opt/a b' '$(whoami)' 'it'\\''s' || exit $?"),
             "every element is one quoted word, an interior quote closed and reopened: {script}"
+        );
+    }
+
+    /// A `[service]` entry with just an argv, for the start-up composition tests.
+    fn service(argv: &[&str]) -> crate::config::ServiceSpec {
+        crate::config::ServiceSpec {
+            argv: argv.iter().map(|s| (*s).to_string()).collect(),
+            enable: Vec::new(),
+            ready: None,
+        }
+    }
+
+    #[test]
+    fn a_service_starts_after_the_install_and_before_the_command() {
+        // The order is the whole reason install steps and services are composed by one function: a
+        // service started before the install that puts its program on PATH would fail on a first
+        // launch, and nesting two wrappers would settle that order by accident.
+        let steps = vec![crate::config::BundleProvision {
+            bundle: "alpha".into(),
+            argv: vec!["install-it".into()],
+        }];
+        let mut services = std::collections::BTreeMap::new();
+        services.insert("chroma".to_string(), service(&["chroma", "run"]));
+
+        let out = compose_startup_cmd(&steps, &services, &[], vec![OsString::from("agent")]);
+        let script = out[2].to_string_lossy().to_string();
+        let install = script.find("install-it").expect("the install step runs");
+        let start = script.find("'chroma' 'run'").expect("the service starts");
+        let exec = script.find("exec \"$@\"").expect("the command runs");
+        assert!(
+            install < start && start < exec,
+            "install, then service, then command: {script}"
+        );
+        assert!(
+            script.contains(
+                "( 'chroma' 'run' ) >>\"${HOME:-/tmp}\"/.sbx-service-chroma.log 2>&1 </dev/null &"
+            ),
+            "a service is backgrounded with its output in its own log, off the app's terminal: \
+             {script}"
+        );
+    }
+
+    #[test]
+    fn a_failed_service_does_not_fail_the_launch_but_a_failed_install_does() {
+        // The two are joined differently on purpose. An install that did not finish must never
+        // reach the app (it would run against a half-equipped cage); a service that will not start
+        // leaves a degraded app, which is the trade the hand-written `nohup` already made — and the
+        // app is the thing the person asked for.
+        let steps = vec![crate::config::BundleProvision {
+            bundle: "alpha".into(),
+            argv: vec!["install-it".into()],
+        }];
+        let mut services = std::collections::BTreeMap::new();
+        services.insert("gateway".to_string(), service(&["gateway", "run"]));
+
+        let script = compose_startup_cmd(&steps, &services, &[], vec![OsString::from("agent")])[2]
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            script.contains("'install-it' || exit $?"),
+            "the install chain ends the launch on failure: {script}"
+        );
+        let after_install = &script[script.find("|| exit $?").unwrap()..];
+        assert!(
+            !after_install.contains("exit $?") || after_install.matches("exit $?").count() == 1,
+            "nothing after the install chain aborts the launch: {script}"
+        );
+    }
+
+    #[test]
+    fn a_service_argument_is_data_except_a_leading_home_tilde() {
+        // One expansion and one only. `~/` is expanded because a service is declared where the
+        // home's path cannot be known; everything else stays the characters it was written as, or a
+        // profile author writing an argv would be writing shell without meaning to.
+        let mut services = std::collections::BTreeMap::new();
+        services.insert(
+            "chroma".to_string(),
+            service(&["chroma", "--path", "~/chroma-data", "--tag", "$(whoami)"]),
+        );
+
+        let script = compose_startup_cmd(&[], &services, &[], vec![OsString::from("agent")])[2]
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            script.contains("'--path' \"${HOME}\"/'chroma-data'"),
+            "a leading `~/` becomes the cage's home, the rest still one quoted word: {script}"
+        );
+        assert!(
+            script.contains("'$(whoami)'"),
+            "a `$` is data, not a substitution: {script}"
+        );
+    }
+
+    /// A `[service]` entry gated on an environment condition.
+    fn gated(argv: &[&str], var: &str, equals: bool, value: &str) -> crate::config::ServiceSpec {
+        crate::config::ServiceSpec {
+            argv: argv.iter().map(|s| (*s).to_string()).collect(),
+            enable: vec![crate::config::EnvCondition {
+                var: var.to_string(),
+                equals,
+                values: vec![value.to_string()],
+            }],
+            ready: None,
+        }
+    }
+
+    #[test]
+    fn an_enable_condition_decides_before_the_script_is_written_not_inside_it() {
+        // The runtime switch the field exists for: `--env NAME=value` turns a declared service off
+        // for one launch, without editing the profile. It is answered against the environment this
+        // launch composed — sbx builds that from a cleared one, so the answer is already known — and
+        // a service that fails leaves no trace in the script at all, rather than a shell `if` around
+        // a decision that was made before the shell existed.
+        let mut services = std::collections::BTreeMap::new();
+        services.insert("on-by-default".to_string(), gated(&["a"], "GW", false, "0"));
+        services.insert("opt-in".to_string(), gated(&["b"], "EXTRA", true, "on"));
+
+        // Nothing set: an unset variable compares as empty, which is what makes `!= 0` the on-by-
+        // default form and `== on` the opt-in one, without anyone setting anything.
+        let script = compose_startup_cmd(&[], &services, &[], vec![OsString::from("agent")])[2]
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            script.contains("( 'a' )"),
+            "`!= 0` is on by default: {script}"
+        );
+        assert!(
+            !script.contains("( 'b' )"),
+            "`== on` is off by default: {script}"
+        );
+        assert!(
+            !script.contains("if ["),
+            "no condition survives into the script: {script}"
+        );
+
+        // Both variables set to flip both conditions, as a `--env` pair would.
+        let env = [
+            ("GW".to_string(), "0".to_string()),
+            ("EXTRA".to_string(), "on".to_string()),
+        ];
+        let script = compose_startup_cmd(&[], &services, &env, vec![OsString::from("agent")])[2]
+            .to_string_lossy()
+            .to_string();
+        assert!(!script.contains("( 'a' )"), "`!= 0` is off now: {script}");
+        assert!(script.contains("( 'b' )"), "`== on` is on now: {script}");
+        assert!(
+            script.ends_with("exec \"$@\"\n"),
+            "a gated-out service changes nothing else about the launch: {script}"
+        );
+    }
+
+    #[test]
+    fn a_list_of_conditions_is_an_and_and_one_failure_is_enough() {
+        // What a list promises: every condition holds, or the service does not start. The failing
+        // case is the one worth pinning, because a conjunction that started on a partial match
+        // would be indistinguishable from an `or` on the profiles that use one condition.
+        let mut services = std::collections::BTreeMap::new();
+        services.insert(
+            "svc".to_string(),
+            crate::config::ServiceSpec {
+                argv: vec!["daemon".into()],
+                enable: vec![
+                    crate::config::EnvCondition {
+                        var: "A".into(),
+                        equals: false,
+                        values: vec!["0".into()],
+                    },
+                    crate::config::EnvCondition {
+                        var: "B".into(),
+                        equals: true,
+                        values: vec!["1".into()],
+                    },
+                ],
+                ready: None,
+            },
+        );
+        let script = |env: &[(String, String)]| {
+            compose_startup_cmd(&[], &services, env, vec![OsString::from("agent")])[2]
+                .to_string_lossy()
+                .to_string()
+        };
+        let set = |k: &str, v: &str| (k.to_string(), v.to_string());
+
+        assert!(
+            script(&[set("B", "1")]).contains("'daemon'"),
+            "both hold (A unset compares as empty, which is not `0`)"
+        );
+        assert!(
+            !script(&[]).contains("'daemon'"),
+            "the second fails: B is unset, which is not `1`"
+        );
+        assert!(
+            !script(&[set("A", "0"), set("B", "1")]).contains("'daemon'"),
+            "the first fails, and one failure is enough"
+        );
+    }
+
+    #[test]
+    fn a_repeated_environment_key_is_answered_with_the_value_the_cage_will_see() {
+        // The launch upserts its environment layers in order, so a key set twice reaches the cage
+        // with the LAST value. A condition answered from the first would gate on a value that was
+        // overwritten before the cage ever started — the `--env` override being exactly the layer
+        // that comes last.
+        let mut services = std::collections::BTreeMap::new();
+        services.insert("svc".to_string(), gated(&["a"], "GW", false, "0"));
+        let env = [
+            ("GW".to_string(), "1".to_string()),
+            ("GW".to_string(), "0".to_string()),
+        ];
+
+        let script = compose_startup_cmd(&[], &services, &env, vec![OsString::from("agent")])[2]
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            !script.contains("( 'a' )"),
+            "the overriding value decides: {script}"
+        );
+    }
+
+    #[test]
+    fn a_readiness_gate_waits_for_the_port_then_starts_the_app_regardless() {
+        // The gate exists so the app does not race the service. It must not become a way for a slow
+        // auxiliary process to prevent the app from running at all, so expiry is a message on
+        // stderr and the launch goes on — which is what the hand-written probe it replaces did.
+        let mut services = std::collections::BTreeMap::new();
+        services.insert(
+            "chroma".to_string(),
+            crate::config::ServiceSpec {
+                argv: vec!["chroma".into()],
+                enable: Vec::new(),
+                ready: Some(crate::config::ServiceReady {
+                    tcp: 8100,
+                    timeout: std::time::Duration::from_secs(15),
+                }),
+            },
+        );
+
+        let script = compose_startup_cmd(&[], &services, &[], vec![OsString::from("agent")])[2]
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            script.contains("for _ in $(seq 1 30); do"),
+            "the wait polls twice a second for the declared budget: {script}"
+        );
+        assert!(
+            script.contains("if ( exec 3<>/dev/tcp/127.0.0.1/8100 ) 2>/dev/null; then"),
+            "readiness is a TCP connect on the cage loopback, needing no extra tool: {script}"
+        );
+        assert!(
+            script.contains("did not answer on port 8100 within 15s — starting anyway"),
+            "expiry names the service and continues: {script}"
+        );
+        assert!(
+            script.ends_with("exec \"$@\"\n"),
+            "the command still runs after an expired gate: {script}"
         );
     }
 

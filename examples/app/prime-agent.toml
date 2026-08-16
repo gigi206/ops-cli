@@ -1,7 +1,8 @@
 # prime-agent — Prime Agent, Prime Intellect's self-improving RLM coding and research agent
 # (PrimeIntellect-ai/prime-agent), sandboxed by sbx.
 #
-#   sbx app import examples/app/prime-agent.toml
+#   sbx bundle import examples/bundle/prime-agent.toml
+#   sbx app import    examples/app/prime-agent.toml
 #   sbx app run prime-agent                      # interactive TUI, working on the current project
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The runtime its installer needs and the hosts it reaches come from a
@@ -41,7 +42,7 @@
 # verifies it against the release `SHA256SUMS` and runs `npm install -g`. So the `prime-agent`
 # bundle's install step runs THAT installer inside the cage on the first launch — contained by
 # bubblewrap + seccomp + the empty netns + the egress allowlist — into the app's isolated home, and
-# `sbx upgrade provision` is what runs it again to advance the release. The tarball's internal dependencies
+# `sbx app upgrade prime-agent` is what runs it again to advance the release. The tarball's internal dependencies
 # are rewritten at packaging time into absolute tarball URLs on Prime Intellect's release bucket,
 # and its third-party dependencies resolve from npm: both hosts are in `allow` for that reason.
 #
@@ -132,7 +133,7 @@ exec prime-agent "$@"
 # runs before `cmd`. The bundle is COMPLETE: an app that names it gets the agent. What stays here is
 # the launch: the installer's prefix goes back on PATH, then the agent takes the process.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/prime-agent.toml
 # Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
 use = ["prime-agent"]

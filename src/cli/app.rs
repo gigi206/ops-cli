@@ -1,8 +1,9 @@
 //! `sbx app <subcommand>`: launch and manage named application profiles — `run <name>` (launch an
-//! app inside the project sandbox) and `import`/`export`/`rm`/`list`/`show`/`prune` (manage the
-//! profiles and their per-app isolated homes). The launch verb is mandatory, so the first token is
-//! always a subcommand and an app name can never collide with one. The shared confirmation
-//! renderers (`render_app_imported`/`render_app_exported`/`render_removed`) stay at the crate root.
+//! app inside the project sandbox), `upgrade <name>` (advance it, dispatching on what it declares)
+//! and `import`/`export`/`rm`/`list`/`show`/`prune` (manage the profiles and their per-app isolated
+//! homes). The launch verb is mandatory, so the first token is always a subcommand and an app name
+//! can never collide with one. The shared confirmation renderers
+//! (`render_app_imported`/`render_app_exported`/`render_removed`) stay at the crate root.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -10,6 +11,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::cli::confirm::{render_app_exported, render_app_imported, render_removed};
+use crate::cli::import_remedy;
 use crate::{
     build_override, config_cwd, egress_write_target, flag_name, net_mode_word, persist_egress_rule,
     take_override_flag,
@@ -18,13 +20,15 @@ use crate::{config, diag, help, sandbox, session, store, style, trust};
 
 /// `sbx app <subcommand>`: launch or manage named application profiles. `run <name>` launches an
 /// app (an `[app.<name>]` table from the global or project config, or an imported `<name>.toml`
-/// profile) inside the project sandbox; `import`/`export`/`rm`/`list`/`show`/`prune` manage them.
-/// Launching goes through the explicit `run` verb, so the first token is always a subcommand and an
-/// app name can never collide with one — an app may be named `run`, `show`, etc., and is reached as
-/// `sbx app run <name>`.
+/// profile) inside the project sandbox; `upgrade <name>` advances it;
+/// `import`/`export`/`rm`/`list`/`show`/`prune` manage them. Launching goes through the explicit
+/// `run` verb, so the first token is always a subcommand and an app name can never collide with one
+/// — an app may be named `run`, `upgrade`, `show`, etc., and is reached as `sbx app run <name>`.
+/// That invariant is what makes adding a subcommand here safe: it can never shadow an app.
 pub(crate) fn app_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("run") => app_run(&args[1..]),
+        Some("upgrade") => crate::cli::upgrade::app_upgrade_cmd(&args[1..]),
         Some("import") => app_import(&args[1..]),
         Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(&args[1..]),
@@ -317,6 +321,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let mut source: Option<&OsString> = None;
     let mut as_name: Option<String> = None;
     let mut force = false;
+    let mut with_deps = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
@@ -328,6 +333,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
                 }
             },
             Some("--force") => force = true,
+            Some("--with-deps") => with_deps = true,
             Some(flag) if flag.starts_with("--") => {
                 diag::error(&format!(
                     "sbx: unknown flag '{flag}' (usage: {})",
@@ -398,6 +404,48 @@ fn app_import(args: &[OsString]) -> ExitCode {
         }
     };
 
+    // What the profile references that this machine does not declare, resolved BEFORE anything is
+    // written. Computed even without `--with-deps`, from one filter per kind, so the warnings and
+    // the writes can never disagree about what "missing" means.
+    let (declared_bundles, _) = config::bundles();
+    let missing_bundles = super::missing_refs(
+        &preview.uses,
+        &declared_bundles,
+        src_path,
+        "bundle",
+        config::read_bundle_fragment,
+    );
+    // Only the profile's OWN group references are visible from these bytes — validation resolves
+    // nothing from disk. The groups its bundles reference come from the bundle files themselves,
+    // which only `--with-deps` reads; without it they are reported by `sbx bundle import`.
+    let (declared_groups, _) = config::net_groups();
+    let missing_groups = super::missing_refs(
+        &preview.groups,
+        &declared_groups,
+        src_path,
+        "net-groups",
+        config::read_net_groups_fragment,
+    );
+    // `--with-deps` promises all-or-nothing across two writers that are each all-or-nothing on
+    // their own, which two calls are not. Resolve and validate the whole plan here, so a refusal
+    // lands before the first byte does and only I/O can fail afterwards.
+    let plan = if with_deps {
+        match dep_plan(
+            &missing_bundles,
+            &missing_groups,
+            &declared_groups,
+            src_path,
+        ) {
+            Ok(plan) => Some(plan),
+            Err(e) => {
+                diag::error(&format!("sbx: app import --with-deps: {e}"));
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+
     let dest = dir.join(format!("{name}.toml"));
     if dest.exists() && !force {
         diag::error(&format!(
@@ -447,32 +495,228 @@ fn app_import(args: &[OsString]) -> ExitCode {
         );
         diag::warn(&render_replaced_profile(&dropped, &kept));
     }
-    // A profile that names a bundle is NOT self-contained, and a bundle that is not declared leaves
-    // the app short of a tool and its egress — which surfaces later only as an app that quietly does
-    // nothing. Import is the moment to say so: it is when the user is holding the file and can act.
-    if !preview.uses.is_empty() {
-        let (declared, _) = config::bundles();
-        let missing: Vec<&str> = preview
-            .uses
-            .iter()
-            .filter(|b| !declared.contains_key(*b))
-            .map(String::as_str)
-            .collect();
-        if !missing.is_empty() {
-            diag::warn(&format!(
-                "'{name}' names {} not declared here: {} — import {} too (`sbx bundle import \
-                 <file>`), or the app launches without the tool and egress it names",
-                if missing.len() == 1 {
-                    "a bundle"
-                } else {
-                    "bundles"
-                },
-                missing.join(", "),
-                if missing.len() == 1 { "it" } else { "them" },
-            ));
+    // A profile is NOT self-contained, and what it is short of is not only a bundle. Both kinds of
+    // reference resolve against the global config, both are silent at launch in the way that matters
+    // (an absent tool, a dropped egress rule), and import is the moment to act on it or say so — it
+    // is when the user is holding the file.
+    match plan {
+        Some(plan) => {
+            if let Err(code) = write_deps(&plan) {
+                return code;
+            }
         }
+        None => report_missing_refs(&name, &missing_bundles, &missing_groups),
     }
     ExitCode::SUCCESS
+}
+
+/// What `--with-deps` will merge into the global config alongside the profile: the bundles the
+/// profile names that nothing declares, and the groups those bundles and the profile reference that
+/// nothing defines. Both maps hold **only the referenced names** — a fragment may declare more, and
+/// writing the rest would widen the import past what the reference asked for, which is the whole
+/// reason this is opt-in.
+struct DepPlan {
+    bundles: std::collections::BTreeMap<String, config::RawBundle>,
+    groups: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Read and validate everything `--with-deps` would write, or say why it cannot. Called before the
+/// profile is written, so an unresolvable reference costs nothing: the user is left exactly where
+/// they were, with the name that could not be found.
+///
+/// A group a bundle references is only visible once that bundle's file has been read, so the group
+/// set is the profile's own references plus the ones the bundles bring in. A group referenced by a
+/// bundle that is **already declared** is deliberately out of scope: that bundle arrived through
+/// `sbx bundle import`, which named the gap at the moment it was created.
+fn dep_plan(
+    missing_bundles: &[super::MissingRef],
+    missing_groups: &[super::MissingRef],
+    declared_groups: &std::collections::BTreeMap<String, Vec<String>>,
+    src: &Path,
+) -> Result<DepPlan, String> {
+    let mut bundles = std::collections::BTreeMap::new();
+    for m in missing_bundles {
+        let Some(file) = m.file.as_ref() else {
+            return Err(unresolvable("bundle", &m.name, src));
+        };
+        // A name keys a referenceable identifier and, if invalid, is dropped at load — the silent
+        // shortfall this whole path exists to remove. Fail closed, naming the offender.
+        if !config::is_valid_bundle_name(&m.name) {
+            return Err(format!(
+                "invalid bundle name `{}` (1–64 of [A-Za-z0-9._-]); nothing was written",
+                m.name
+            ));
+        }
+        let mut fragment = config::read_bundle_fragment(file).map_err(nothing_written)?;
+        let Some(bundle) = fragment.remove(&m.name) else {
+            return Err(format!(
+                "{} no longer declares `{}`; nothing was written",
+                file.display(),
+                m.name
+            ));
+        };
+        bundles.insert(m.name.clone(), bundle);
+    }
+
+    let mut wanted: Vec<super::MissingRef> = missing_groups.to_vec();
+    for m in super::bundle::undefined_groups(&bundles, src, declared_groups) {
+        if !wanted.iter().any(|w| w.name == m.name) {
+            wanted.push(m);
+        }
+    }
+    let mut groups = std::collections::BTreeMap::new();
+    for m in &wanted {
+        let Some(file) = m.file.as_ref() else {
+            return Err(unresolvable("egress group", &m.name, src));
+        };
+        if !config::is_valid_group_name(&m.name) {
+            return Err(format!(
+                "invalid group name `{}` (1–64 of [A-Za-z0-9._-]); nothing was written",
+                m.name
+            ));
+        }
+        let mut fragment = config::read_net_groups_fragment(file).map_err(nothing_written)?;
+        let Some(entries) = fragment.remove(&m.name) else {
+            return Err(format!(
+                "{} no longer declares `{}`; nothing was written",
+                file.display(),
+                m.name
+            ));
+        };
+        groups.insert(m.name.clone(), entries);
+    }
+    Ok(DepPlan { bundles, groups })
+}
+
+fn nothing_written(e: String) -> String {
+    format!("{e}; nothing was written")
+}
+
+/// A reference `--with-deps` cannot follow. It names the sibling layout it looked in rather than
+/// only the reference, because the fix is to fetch that file or run the import by hand — and the
+/// command that would do so is the one the plain import prints.
+fn unresolvable(kind: &str, name: &str, src: &Path) -> String {
+    format!(
+        "no file beside {} declares the {kind} `{name}` this profile names — import it by hand \
+         first (`sbx {} <file>`), or drop --with-deps to import the profile alone; nothing was \
+         written",
+        src.display(),
+        if kind == "bundle" {
+            "bundle import"
+        } else {
+            "net groups import"
+        },
+    )
+}
+
+/// Merge a resolved [`DepPlan`] into the global config. Never overwrites: the plan holds only names
+/// nothing declared when it was built, so a collision here means the config gained one in between
+/// (or holds one that is dropped at load, and so invisible to the reader that built the plan).
+/// Refusing by name beats replacing a declaration the user did not offer up.
+fn write_deps(plan: &DepPlan) -> Result<(), ExitCode> {
+    if plan.bundles.is_empty() && plan.groups.is_empty() {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir().map_err(|e| {
+        diag::error(&format!("sbx: cannot read the current directory: {e}"));
+        ExitCode::FAILURE
+    })?;
+    let path = config::manage::scope_path(&config::manage::Scope::Global, &cwd).map_err(|e| {
+        diag::error(&format!("sbx: app import --with-deps: {e}"));
+        ExitCode::from(1)
+    })?;
+    if !plan.bundles.is_empty() {
+        merged(
+            config::manage::import_bundles(&path, &plan.bundles, false),
+            "bundle",
+            &path,
+        )?;
+    }
+    if !plan.groups.is_empty() {
+        merged(
+            config::manage::import_net_groups(&path, &plan.groups, false),
+            "egress group",
+            &path,
+        )?;
+    }
+    // The grant belongs to the bytes, not to the verb that wrote them: this is the one import where
+    // a reader did not name the bundle themselves, so it is the one where an unannounced credential
+    // or egress rule would be least expected.
+    if let Some(note) = super::bundle::granting_note(&plan.bundles) {
+        diag::warn(&note);
+    }
+    Ok(())
+}
+
+fn merged(
+    outcome: Result<config::manage::ImportOutcome, config::manage::ManageError>,
+    kind: &str,
+    path: &Path,
+) -> Result<(), ExitCode> {
+    match outcome {
+        Ok(outcome) => {
+            // Only `added` is reported, unlike `sbx bundle import`, which reports both halves: the
+            // plan holds nothing that was already declared and the merge is called without `force`,
+            // so `overwritten` cannot be non-empty here. A caller that ever passes `force` would
+            // have to say what it replaced.
+            println!(
+                "imported {} {kind}(s) into {} — added {}",
+                outcome.added.len(),
+                path.display(),
+                outcome.added.join(", ")
+            );
+            Ok(())
+        }
+        Err(e) => {
+            diag::error(&format!("sbx: app import --with-deps: {e}"));
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// Name what the profile still references and nothing declares — the plain import's half of the
+/// job, and what `--with-deps` would have written.
+fn report_missing_refs(name: &str, bundles: &[super::MissingRef], groups: &[super::MissingRef]) {
+    if !bundles.is_empty() {
+        let remedy = import_remedy("bundle import", bundles);
+        diag::warn(&format!(
+            "'{name}' names {} not declared here: {} — import {} too ({remedy}, or re-run with \
+             --with-deps), or the app launches without the tool and egress it names",
+            if bundles.len() == 1 {
+                "a bundle"
+            } else {
+                "bundles"
+            },
+            bundles
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if bundles.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    // A group is global-only, so an undefined one is dropped at the fold and the app is launched
+    // with LESS egress than it names — the failure mode a reader is least likely to attribute to a
+    // missing import.
+    if !groups.is_empty() {
+        let remedy = import_remedy("net groups import", groups);
+        diag::warn(&format!(
+            "'{name}' references {} no `[network.groups]` here defines: {} — import {} too \
+             ({remedy}, or re-run with --with-deps), or those entries are ignored and the app \
+             reaches less than it names",
+            if groups.len() == 1 {
+                "an egress group"
+            } else {
+                "egress groups"
+            },
+            groups
+                .iter()
+                .map(|m| format!("@{}", m.name))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if groups.len() == 1 { "it" } else { "them" },
+        ));
+    }
 }
 
 /// Remove the copy a `--force` import kept, if there is one. Called from every path that removes a

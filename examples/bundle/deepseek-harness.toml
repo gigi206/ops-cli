@@ -61,7 +61,7 @@ set -eu
 dsh_root="$(mise where 'npm:@deepseek-ai/dsh')"
 dsh_dir="$dsh_root/node_modules/@deepseek-ai/dsh"
 [ -d "$dsh_dir" ] || dsh_dir="$dsh_root/lib/node_modules/@deepseek-ai/dsh"
-# `sbx upgrade provision` raises SBX_UPGRADE to ask for a re-install; without it the guard
+# `sbx app upgrade deepseek-harness` raises SBX_UPGRADE to ask for a re-install; without it the guard
 # below keeps the build to once.
 if [ ! -e "$dsh_dir/node_modules/node-pty/build/Release/pty.node" ] || [ -n "${SBX_UPGRADE:-}" ]; then
   echo "deepseek-harness: building node-pty, the addon the script-free install leaves out …" >&2

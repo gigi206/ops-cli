@@ -322,3 +322,111 @@ fn every_shipped_app_profile_is_in_the_catalogue() {
         "these shipped profiles are absent from the catalogue page: {missing:?}"
     );
 }
+
+/// Every `sbx upgrade` target has a row in the reference page's table.
+///
+/// A channel the binary offers but the page never lists is invisible: the reader cannot ask for
+/// what they do not know exists. This is asserted against `TARGETS` itself rather than a literal
+/// kept by hand, so the two sources stay independent — the code declares the channels, the page
+/// documents them, and neither is written from the other.
+///
+/// A table row is required rather than a bare mention, and the distinction is what makes the check
+/// mean anything: every one of these words (`all`, `nix`, `mise`, `binary`) occurs in the page's
+/// prose already, so `contains(target)` would pass on a page that lists nothing.
+#[test]
+fn every_upgrade_target_has_a_row_in_its_reference_page() {
+    let page = std::fs::read_to_string(guide().join("cli/upgrade.md"))
+        .expect("docs-site/docs/guide/cli/upgrade.md must exist");
+    let missing: Vec<&str> = crate::cli::upgrade::TARGETS
+        .iter()
+        .copied()
+        .filter(|target| !page.contains(&format!("| `{target}` |")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these `sbx upgrade` targets have no row in docs-site/docs/guide/cli/upgrade.md: {missing:?}"
+    );
+
+    // The synopsis names the same set a second time, and it drifted the same way. Comparing it to
+    // the binary's own synopsis keeps the page's first line from becoming a stale copy.
+    let synopsis = crate::help::synopsis_of(&["upgrade"]);
+    assert!(
+        page.contains(synopsis),
+        "the page's synopsis is not the binary's; expected to find:\n{synopsis}"
+    );
+}
+
+/// The `sbx app` subcommand family is enumerated in prose twice, and both enumerations are the real
+/// set, in the real order.
+///
+/// This is the drift a new subcommand actually causes. The dispatcher and the help table are
+/// already tied together (`tests/help.rs` resolves every accepted path to a page), but the two
+/// *sentences* that name the family are hand-written and go stale in silence: a reader is told the
+/// verb has seven subcommands while the binary offers eight, and nothing fails. Asserted against
+/// [`crate::help::subcommands_of`] rather than a literal kept here, so the code declares the set and
+/// the prose is checked against it — neither is written from the other.
+///
+/// **Narrow on purpose.** The same check over every verb with subcommands was measured and refused:
+/// 13 verbs document a subcommand as a table row or a section heading instead of an enumeration
+/// (`sbx config get`, `sbx plugins install`, `sbx net deny` and 18 more), which is legitimate prose,
+/// not drift. `app` is the verb that carries an explicit ordered enumeration in both places, so it
+/// is the one that can be checked exactly rather than approximately.
+///
+/// **"Both places" means the two enumerations, not the whole page.** The reference page also opens
+/// with a synopsis block listing each subcommand's grammar, and this says nothing about it: deleting
+/// that block leaves this test green (checked). Guarding it too would mean matching a synopsis whose
+/// wording legitimately differs from `help.rs`'s — the drift 14.2 measured and left alone across 13
+/// pages. What is asserted here is the one sentence that names the family, in both artifacts.
+#[test]
+fn the_app_subcommand_enumeration_is_the_real_set_in_both_places() {
+    let subs: Vec<&str> = crate::help::subcommands_of(&["app"])
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let enumeration = format!("`{}`", subs.join("`/`"));
+
+    let page = std::fs::read_to_string(guide().join("cli/app.md"))
+        .expect("docs-site/docs/guide/cli/app.md must exist");
+    assert!(
+        page.contains(&enumeration),
+        "docs-site/docs/guide/cli/app.md does not enumerate the real subcommand set; \
+         expected to find:\n{enumeration}"
+    );
+
+    let help = crate::help::page_usage(&["app"]).expect("the `app` page must exist");
+    assert!(
+        help.contains(&enumeration),
+        "`sbx app --help` does not enumerate its own subcommands; expected to find:\n{enumeration}"
+    );
+}
+
+/// Every tree the file-write feed stops watching is named in the page's scope section.
+///
+/// This one guards a blind spot rather than a feature. `IGNORED_COMPONENTS` removes trees from
+/// observation, so a name added there and nowhere else makes the feed quieter about something a
+/// reader still believes it reports. That is the failure this catches: not an undocumented
+/// capability, but an undocumented *absence*, which no reader can discover by using the tool.
+///
+/// The search is confined to the `### Scope` section, where the limits are stated, so a mention
+/// elsewhere on the page cannot satisfy it. It checks presence, never wording, and it says nothing
+/// about the consequence of the gap: that a hook written under `.git` is executed outside the cage
+/// is prose in the security model, and no test can hold it there.
+#[test]
+fn every_unwatched_tree_is_named_in_the_file_feed_page() {
+    let page = std::fs::read_to_string(guide().join("cli/fs.md"))
+        .expect("docs-site/docs/guide/cli/fs.md must exist");
+    let scope = page
+        .split_once("\n### Scope\n")
+        .expect("the page must keep a `### Scope` section stating what is not watched")
+        .1;
+    let missing: Vec<&str> = crate::sandbox::fs_watch::IGNORED_COMPONENTS
+        .iter()
+        .copied()
+        .filter(|tree| !scope.contains(&format!("`{tree}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these trees are excluded from the file-write feed but unnamed in the scope section of \
+         docs-site/docs/guide/cli/fs.md: {missing:?}"
+    );
+}

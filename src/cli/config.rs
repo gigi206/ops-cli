@@ -424,27 +424,17 @@ fn write_net_transport(o: &mut String, t: NetTransport, details: bool, pal: &sty
     }
 }
 
-fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
-    use config::view::{AppNetworkView, GuiView, LimitView, NetDefaultView, NetworkView};
+/// The layered environment, after the trust gate. Shown even when empty: a reader looking for a
+/// variable they set needs to see that nothing carries it.
+fn env_section(env: &[config::view::EnvVar], pal: &style::Palette) -> String {
     use std::fmt::Write as _;
-    let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let mut o = String::new();
-
-    // The hue carries the layering story the model already holds: a section header is bold, an
-    // identifier (a key, a path, a rule, a channel) rides the name span, a value the trust gate
-    // *withheld* is yellow while an admitted one's detail is dimmed, and every value's provenance
-    // tag is hued by level — a built-in default gray, a global source cyan, a project source green
-    // — so where a value came from reads at a glance. None of this is new data; it is the gating
-    // outcome and the per-value origin made visible. Every span is empty under a non-terminal, so
-    // captured output stays byte-for-byte the plain text the integration tests pin.
-    let _ = writeln!(o, "{h}sbx config{r} — resolved for {n}{}{r}", view.cwd);
-
-    // The layered environment and host binds (read-only or read-write), after the trust gate.
-    if view.env.is_empty() {
+    if env.is_empty() {
         let _ = writeln!(o, "  {h}env:{r}   {dim}(none){r}");
     } else {
         let _ = writeln!(o, "  {h}env:{r}");
-        for e in &view.env {
+        for e in env {
             let _ = writeln!(
                 o,
                 "    {n}{}{r}={}{}",
@@ -454,11 +444,19 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             );
         }
     }
-    if view.binds.is_empty() {
+    o
+}
+
+/// The host paths bound into the cage, read-only or read-write, after the trust gate.
+fn binds_section(binds: &[config::view::BindView], pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let mut o = String::new();
+    if binds.is_empty() {
         let _ = writeln!(o, "  {h}binds:{r} {dim}(none){r}");
     } else {
         let _ = writeln!(o, "  {h}binds:{r}");
-        for b in &view.binds {
+        for b in binds {
             let _ = writeln!(
                 o,
                 "    {n}{}{r}{}{}",
@@ -468,23 +466,75 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             );
         }
     }
+    o
+}
 
-    // Declared tools, each with its backend and trust verdict — the launcher's decision, shown
-    // without realising anything (no nix, no network). A withheld package's reason is yellow (the
-    // trust gate dropped it); an admitted one's realisation detail is dimmed.
-    if view.packages.is_empty() {
+/// What a URI opens with, by scheme. Listed rather than counted, and shown even when empty: the
+/// empty state is the informative one here, since a cage with no handler opens nothing and a reader
+/// chasing a sign-in that goes nowhere is looking for exactly this line.
+fn open_section(open: &[config::view::OpenView], pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    let mut o = String::new();
+    if open.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}open:{r} {dim}(none — a URI is printed, not opened){r}"
+        );
+    } else {
+        let _ = writeln!(o, "  {h}open:{r}");
+        for e in open {
+            let _ = writeln!(
+                o,
+                "    {n}{}://{r} {} {dim}({}){r}",
+                e.scheme, e.cmd, e.mode
+            );
+        }
+    }
+    o
+}
+
+/// The auxiliary processes the cage starts before its command. Listed, never counted, and only when
+/// there are any: this section exists so a second process running beside the app is a line someone
+/// can read rather than a `nohup` buried in a shell script.
+fn service_section(service: &[config::view::ServiceView], pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    if service.is_empty() {
+        return None;
+    }
+    let (h, r) = (pal.head, pal.reset);
+    let mut o = String::new();
+    let _ = writeln!(o, "  {h}service:{r}");
+    for s in service {
+        let _ = writeln!(o, "{}", service_line(s, pal, "    "));
+    }
+    Some(o)
+}
+
+/// Declared tools, each with its backend and trust verdict — the launcher's decision, shown without
+/// realising anything (no nix, no network).
+fn packages_section(packages: &[config::view::PackageView], pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    let mut o = String::new();
+    if packages.is_empty() {
         let _ = writeln!(o, "  {h}packages:{r} {dim}(none){r}");
     } else {
         let _ = writeln!(o, "  {h}packages:{r}");
-        for p in &view.packages {
+        for p in packages {
             let _ = writeln!(o, "{}", package_line(p, pal, "    "));
         }
     }
+    o
+}
 
-    // The project's mise file and whether it would be honored — a tool source gated like
-    // `packages`, reported as presence + verdict (no mise run). Trusted is green (it applies);
-    // withheld is yellow.
-    match &view.mise {
+/// The project's mise file and whether it would be honored — a tool source gated like `packages`,
+/// reported as presence + verdict (no mise run). Trusted is green (it applies); withheld is yellow.
+fn mise_section(mise: Option<&config::view::MiseView>, pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+    let mut o = String::new();
+    match mise {
         None => {
             let _ = writeln!(o, "  {h}mise:{r}  {dim}(none){r}");
         }
@@ -500,65 +550,356 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
             );
         }
     }
+    o
+}
 
-    // The tools that file declares — parsed only. `nix:` tools carry the file's trust; a
-    // non-`nix:` tool is equipped in-cage (so honored regardless of trust) unless `network =
-    // "none"` prevents the fetch; a malformed `nix:` token is shown so it is not silently absent.
-    if !view.tools.is_empty() {
-        let _ = writeln!(o, "  {h}tools:{r}");
-        for t in &view.tools.nix {
-            match &t.withheld_reason {
-                Some(reason) => {
-                    let _ = writeln!(
-                        o,
-                        "    {n}nix:{}{r} = {}  {warn}(withheld: {reason}){r}",
-                        t.pkg, t.version
-                    );
-                }
-                None => {
-                    let _ = writeln!(o, "    {n}nix:{}{r} = {}", t.pkg, t.version);
-                }
-            }
-        }
-        for t in &view.tools.non_nix {
-            if t.equipped {
+/// The tools that mise file declares — parsed only. `nix:` tools carry the file's trust; a
+/// non-`nix:` tool is equipped in-cage (so honored regardless of trust) unless `network = "none"`
+/// prevents the fetch; a malformed `nix:` token is shown so it is not silently absent.
+fn tools_section(tools: &config::view::ToolsView, pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    if tools.is_empty() {
+        return None;
+    }
+    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    let mut o = String::new();
+    let _ = writeln!(o, "  {h}tools:{r}");
+    for t in &tools.nix {
+        match &t.withheld_reason {
+            Some(reason) => {
                 let _ = writeln!(
                     o,
-                    "    {n}{}{r} = {}  {dim}(equipped in-cage via mise){r}",
-                    t.token, t.version
-                );
-            } else {
-                let _ = writeln!(
-                    o,
-                    "    {n}{}{r} = {}  {}",
-                    t.token,
-                    t.version,
-                    style::paint_spans(
-                        &format!(
-                            "{warn}(needs network — not equipped under `network = \"none\"`){r}"
-                        ),
-                        pal.code,
-                        pal.warn,
-                        pal
-                    )
+                    "    {n}nix:{}{r} = {}  {warn}(withheld: {reason}){r}",
+                    t.pkg, t.version
                 );
             }
-        }
-        for token in &view.tools.malformed {
-            let _ = writeln!(o, "    {token}  {warn}(ignored: malformed nix: token){r}");
+            None => {
+                let _ = writeln!(o, "    {n}nix:{}{r} = {}", t.pkg, t.version);
+            }
         }
     }
+    for t in &tools.non_nix {
+        if t.equipped {
+            let _ = writeln!(
+                o,
+                "    {n}{}{r} = {}  {dim}(equipped in-cage via mise){r}",
+                t.token, t.version
+            );
+        } else {
+            let _ = writeln!(
+                o,
+                "    {n}{}{r} = {}  {}",
+                t.token,
+                t.version,
+                style::paint_spans(
+                    &format!("{warn}(needs network — not equipped under `network = \"none\"`){r}"),
+                    pal.code,
+                    pal.warn,
+                    pal
+                )
+            );
+        }
+    }
+    for token in &tools.malformed {
+        let _ = writeln!(o, "    {token}  {warn}(ignored: malformed nix: token){r}");
+    }
+    Some(o)
+}
 
-    // The nixpkgs source the tools resolve against and its locked revision, then the mise
-    // engine's own channel — shown so the engine's decoupling from the base channel is visible.
-    // Routed through the launch's own channel decision; an unlocked source omits the revision.
+/// The nixpkgs source the tools resolve against and its locked revision, then the mise engine's own
+/// channel — shown so the engine's decoupling from the base channel is visible. Routed through the
+/// launch's own channel decision; an unlocked source omits the revision.
+fn channels_section(view: &config::view::ConfigView, pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (h, r) = (pal.head, pal.reset);
+    let mut o = String::new();
     let _ = writeln!(o, "  {h}nixpkgs:{r} {}", channel_text(&view.nixpkgs, pal));
     let _ = writeln!(o, "  {h}engine:{r} {}", channel_text(&view.engine, pal));
+    o
+}
 
-    // The network posture — a security field. `shared` keeps the host network; `none` cuts it
-    // off; a filtering posture (`deny`/`allow`/`ask`) routes egress through the proxy — `deny`
-    // permits only what is listed (deny wins over allow), plus the always-allowed built-in set so
-    // the self-equip allowance is never silent.
+/// The process/exec posture — shown only when the lens is on, so an unenforced config stays
+/// uncluttered. `--details` lists the allow/deny exec-target rules.
+fn proc_section(
+    view: &config::view::ConfigView,
+    pal: &style::Palette,
+    details: bool,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    if view.proc.mode == "off" {
+        return None;
+    }
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    let mut o = String::new();
+    let p = &view.proc;
+    let _ = writeln!(
+        o,
+        "  {h}proc:{r} {} {dim}({} allow, {} deny){r}{}",
+        p.mode,
+        p.allow.len(),
+        p.deny.len(),
+        provenance_tag(view.proc_origin, pal)
+    );
+    if details {
+        for rule in &p.allow {
+            let _ = writeln!(o, "      {dim}allow{r} {rule}");
+        }
+        for rule in &p.deny {
+            let _ = writeln!(o, "      {dim}deny{r}  {rule}");
+        }
+    }
+    Some(o)
+}
+
+/// The refusal notifications. Summarised as one mode when every event shares it (the common case,
+/// including the default), and spelled out per event only when they differ — a row that reads
+/// `notify: once` says everything there is to say, while five identical lines would be noise. `off`
+/// for everything is shown too, unlike the postures below: silence is exactly the state a reader
+/// wondering "why was I not told" needs to see.
+fn notify_section(view: &config::view::ConfigView, pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    let mut o = String::new();
+    let n = &view.notify;
+    let uniform = n
+        .events
+        .first()
+        .filter(|(_, first)| n.events.iter().all(|(_, m)| m == first))
+        .map(|(_, m)| m.clone());
+    let every = if n.repeat_after.is_empty() {
+        String::new()
+    } else {
+        format!(" {dim}(a repeat waits {}){r}", n.repeat_after)
+    };
+    match uniform {
+        Some(mode) => {
+            let _ = writeln!(
+                o,
+                "  {h}notify:{r} {mode}{every}{}",
+                provenance_tag(view.notify_origin, pal)
+            );
+        }
+        None => {
+            let _ = writeln!(
+                o,
+                "  {h}notify:{r} {dim}per event{r}{every}{}",
+                provenance_tag(view.notify_origin, pal)
+            );
+            for (event, mode) in &n.events {
+                let _ = writeln!(o, "      {dim}{event}{r} {mode}");
+            }
+        }
+    }
+    o
+}
+
+/// The desktop holes, each shown only when opened so a config that opened none stays uncluttered:
+/// GUI (with the compositor caveat on `wayland`, and what `offscreen` supplies since it exposes
+/// nothing), GPU, audio, and the in-cage D-Bus portal.
+fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
+    use config::view::GuiView;
+    use std::fmt::Write as _;
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    let mut o = String::new();
+    match view.gui {
+        GuiView::Wayland => {
+            let _ = writeln!(
+                o,
+                "  {h}gui:{r} wayland {dim}(exposure depends on your compositor){r}{}",
+                provenance_tag(view.gui_origin, pal)
+            );
+        }
+        GuiView::Offscreen => {
+            let _ = writeln!(
+                o,
+                "  {h}gui:{r} offscreen {dim}(fonts + proxy CA, no display){r}{}",
+                provenance_tag(view.gui_origin, pal)
+            );
+        }
+        GuiView::None => {}
+    }
+    if view.gpu {
+        let _ = writeln!(
+            o,
+            "  {h}gpu:{r} enabled {dim}(mesa: Intel/AMD/nouveau){r}{}",
+            provenance_tag(view.gpu_origin, pal)
+        );
+    }
+    if view.audio {
+        let _ = writeln!(
+            o,
+            "  {h}audio:{r} enabled {dim}(microphone + playback via PulseAudio){r}{}",
+            provenance_tag(view.audio_origin, pal)
+        );
+    }
+    if view.dbus {
+        let _ = writeln!(
+            o,
+            "  {h}dbus:{r} in-cage portal {dim}(file chooser + theme + notifications){r}{}",
+            provenance_tag(view.dbus_origin, pal)
+        );
+    }
+    (!o.is_empty()).then_some(o)
+}
+
+/// Inbound loopback forward ports — shown only when a layer declared any. Each port is bound on the
+/// host's `127.0.0.1` and bridged into the cage at the same port (an OAuth `localhost:<port>`
+/// callback, or a cage-run dev server).
+fn forward_section(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    if view.forward.is_empty() {
+        return None;
+    }
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    let mut o = String::new();
+    let ports = view
+        .forward
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        o,
+        "  {h}forward:{r} {ports} {dim}(host loopback → cage loopback){r}{}",
+        provenance_tag(view.forward_origin, pal)
+    );
+    Some(o)
+}
+
+/// Resource limits — shown only when a config `[limits]` override customizes one, so a
+/// default-profile config stays uncluttered (the effective defaults are in `sbx doctor`). When
+/// shown, each of the three fields carries its own provenance: the overridden ones name their
+/// layer, the untouched ones read `(default)`, so the line tells exactly which limits were tuned.
+fn limits_section(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
+    use config::view::LimitView;
+    use std::fmt::Write as _;
+    let (h, r) = (pal.head, pal.reset);
+    let l = &view.limits;
+    let overridden = |v: &LimitView| v.origin != config::view::ProvenanceView::Default;
+    if !(overridden(&l.memory_high) || overridden(&l.memory_max) || overridden(&l.tasks_max)) {
+        return None;
+    }
+    let cell = |name: &str, v: &LimitView| {
+        let (label, span) = provenance_parts(v.origin, pal);
+        format!("{name}={} {span}({label}){r}", v.value)
+    };
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "  {h}limits:{r} {}, {}, {}",
+        cell("MemoryHigh", &l.memory_high),
+        cell("MemoryMax", &l.memory_max),
+        cell("TasksMax", &l.tasks_max),
+    );
+    Some(o)
+}
+
+/// The grants that widen the cage beyond its defaults, each shown only when a trusted layer made
+/// it: a seccomp denylist relaxation, a host device node, the `[fs]` masks, and the ssh-agent keys.
+/// The entries read as written, since that is what a reader edits; what each covers is settled at
+/// launch and reported there.
+fn grants_section(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    let mut o = String::new();
+    if !view.seccomp.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}seccomp allow:{r} {} {dim}(syscalls re-permitted in the cage){r}{}",
+            view.seccomp.join(", "),
+            provenance_tag(view.seccomp_origin, pal)
+        );
+    }
+    if !view.devices.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}devices:{r} {} {dim}(host device nodes exposed in the cage){r}{}",
+            view.devices.join(", "),
+            provenance_tag(view.devices_origin, pal)
+        );
+    }
+    if !view.fs_deny.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}fs deny:{r} {} {dim}(closed to the cage; the name stays visible){r}{}",
+            view.fs_deny.join(", "),
+            provenance_tag(view.fs_origin, pal)
+        );
+    }
+    if !view.fs_readonly.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}fs readonly:{r} {} {dim}(readable in the cage, not writable){r}{}",
+            view.fs_readonly.join(", "),
+            provenance_tag(view.fs_origin, pal)
+        );
+    }
+    if !view.ssh_agent.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}ssh-agent:{r} {} {dim}({}){r}{}",
+            view.ssh_agent.join(", "),
+            if view.ssh_agent_confirm {
+                "keys the cage may sign with, each signature confirmed on your desktop"
+            } else {
+                "keys the cage may sign with"
+            },
+            provenance_tag(view.ssh_agent_origin, pal)
+        );
+    }
+    (!o.is_empty()).then_some(o)
+}
+
+/// Broker plugins — shown only when one is bound. The **socket** leads each line: it is the whole of
+/// what is exposed, and a reader auditing a broker is auditing that path. The policy follows, and
+/// its provenance tag is the policy's — the socket is always the global config's, which is what
+/// makes the tag readable rather than ambiguous.
+fn brokers_section(brokers: &[config::view::BrokerView], pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    if brokers.is_empty() {
+        return None;
+    }
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    let mut o = String::new();
+    for b in brokers {
+        let _ = writeln!(
+            o,
+            "  {h}broker:{r} {} {dim}→{r} {} {dim}({}){r}{}",
+            b.socket,
+            b.name,
+            if b.allow.is_empty() {
+                "brokered by this plugin, no policy entries".to_string()
+            } else {
+                format!("brokered by this plugin: {}", b.allow.join(", "))
+            },
+            provenance_tag(b.origin, pal)
+        );
+        // The credential, by locator. On its own line rather than folded into the one above: a
+        // broker that authenticates on the cage's behalf is the thing an audit stops at.
+        if !b.secret.is_empty() {
+            let _ = writeln!(
+                o,
+                "    {dim}places the credential from:{r} {}",
+                b.secret.join(", ")
+            );
+        }
+    }
+    Some(o)
+}
+
+/// The network posture — a security field. `shared` keeps the host network; `none` cuts it off; a
+/// filtering posture (`deny`/`allow`/`ask`) routes egress through the proxy — `deny` permits only
+/// what is listed (deny wins over allow), plus the always-allowed built-in set so the self-equip
+/// allowance is never silent.
+///
+/// The largest section by far, and the one whose sub-lines carry the most: the tuning knobs under
+/// `--details`, the rule lists, the mute and http2 sets, and the egress-stats toggle, which is
+/// meaningful only here because the proxy runs only under a filtering posture.
+fn network_section(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
+    use config::view::{NetDefaultView, NetworkView};
+    use std::fmt::Write as _;
+    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    let mut o = String::new();
     let net_tag = provenance_tag(view.network_origin, pal);
     match &view.network {
         NetworkView::Shared => {
@@ -759,613 +1100,528 @@ fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details:
         }
     }
 
-    // The process/exec posture — shown only when the lens is on, so an unenforced config stays
-    // uncluttered. `--details` lists the allow/deny exec-target rules.
-    if view.proc.mode != "off" {
-        let p = &view.proc;
+    o
+}
+
+/// Credentials the egress proxy injects — by destination and source locator, never the value.
+fn secrets_section(secrets: &[config::view::SecretView], pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    if secrets.is_empty() {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "  {h}secrets (injected host-side by the egress proxy):{r}"
+    );
+    for s in secrets {
         let _ = writeln!(
             o,
-            "  {h}proc:{r} {} {dim}({} allow, {} deny){r}{}",
-            p.mode,
-            p.allow.len(),
-            p.deny.len(),
-            provenance_tag(view.proc_origin, pal)
+            "    {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
+            s.header, s.to, s.shape, s.sources
         );
-        if details {
-            for rule in &p.allow {
-                let _ = writeln!(o, "      {dim}allow{r} {rule}");
-            }
-            for rule in &p.deny {
-                let _ = writeln!(o, "      {dim}deny{r}  {rule}");
-            }
+    }
+    Some(o)
+}
+
+/// The redaction floor, shown only when a layer moved it. It governs credentials the secrets
+/// section may not list — a task's, and one the cage obtained for itself — so it gets its own line
+/// rather than a note under the secrets above; at the built-in floor there is nothing to report.
+fn redact_section(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    if view.redact_min_len_origin == config::view::ProvenanceView::Default {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "  {h}redact:{r} a secret under {n}{}{r} bytes is not scanned for{}",
+        view.redact_min_len,
+        provenance_tag(view.redact_min_len_origin, pal)
+    );
+    Some(o)
+}
+
+/// What the host answers to a resolver plugin. Values are shown: a `[plugin.<name>]` table carries
+/// configuration, never a credential — a secret is declared in `[secret]`, which
+/// [`secrets_section`] prints by locator and never by value.
+fn plugins_section(plugins: &[config::view::PluginView], pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    if plugins.is_empty() {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "  {h}plugins (what this host supplies to a resolver):{r}"
+    );
+    for p in plugins {
+        // Two different kinds of answer, kept on their own lines: `env` configures a tool the
+        // machine already has, `programs` says where to get one it has not. Running them
+        // together would read as one list whose entries mean different things.
+        if !p.env.is_empty() {
+            let _ = writeln!(o, "    {n}{}{r}  env: {}", p.name, p.env.join(", "));
+        }
+        if !p.programs.is_empty() {
+            let _ = writeln!(
+                o,
+                "    {n}{}{r}  programs: {} (a fallback; PATH wins)",
+                p.name,
+                p.programs.join(", ")
+            );
         }
     }
+    Some(o)
+}
 
-    // The refusal notifications. Summarised as one mode when every event shares it (the common case,
-    // including the default), and spelled out per event only when they differ — a row that reads
-    // `notify: once` says everything there is to say, while five identical lines would be noise.
-    // `off` for everything is shown too, unlike the postures above: silence is exactly the state a
-    // reader wondering "why was I not told" needs to see.
-    {
-        let n = &view.notify;
-        let uniform = n
-            .events
-            .first()
-            .filter(|(_, first)| n.events.iter().all(|(_, m)| m == first))
-            .map(|(_, m)| m.clone());
-        let every = if n.repeat_after.is_empty() {
-            String::new()
-        } else {
-            format!(" {dim}(a repeat waits {}){r}", n.repeat_after)
+/// Declared operations, the static counterpart to `sbx task ls` (which reads a running session).
+/// Name, what it says it does, and which layer declared it — not the command, which is the whole
+/// contract `sbx task show` prints. Without this there was no way to confirm a `[task]` block
+/// survived validation short of launching a session and asking it.
+fn tasks_section(tasks: &[config::view::TaskView], pal: &style::Palette) -> Option<String> {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
+    if tasks.is_empty() {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(o, "  {h}tasks (declared operations a cage may run):{r}");
+    let width = tasks.iter().map(|t| t.name.len()).max().unwrap_or(0);
+    for t in tasks {
+        let described = match &t.description {
+            Some(d) => format!("  {d}"),
+            None => String::new(),
         };
-        match uniform {
-            Some(mode) => {
-                let _ = writeln!(
-                    o,
-                    "  {h}notify:{r} {mode}{every}{}",
-                    provenance_tag(view.notify_origin, pal)
-                );
+        let _ = writeln!(
+            o,
+            "    {n}{:<width$}{r}{described}  {dim}({}){r}",
+            t.name,
+            t.origin,
+            width = width
+        );
+    }
+    Some(o)
+}
+
+/// Named application profiles, each a gated overlay over the baseline: the command it runs, what
+/// its overlay adds, and its own dropped-field notes (so `sbx app <name>` holds no surprises).
+/// Security fields appear only when their source was trusted, exactly as at launch.
+fn apps_section(
+    apps: &[config::view::AppView],
+    pal: &style::Palette,
+    details: bool,
+) -> Option<String> {
+    use config::view::{AppNetworkView, GuiView};
+    use std::fmt::Write as _;
+    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    if apps.is_empty() {
+        return None;
+    }
+    let mut o = String::new();
+    let _ = writeln!(o, "  {h}apps:{r}");
+    for app in apps {
+        match &app.cmd {
+            Some(cmd) => {
+                let _ = writeln!(o, "    {n}{}{r}: {cmd}", app.name);
             }
+            // No layer declared a command — the app cannot launch, so flag it.
             None => {
-                let _ = writeln!(
-                    o,
-                    "  {h}notify:{r} {dim}per event{r}{every}{}",
-                    provenance_tag(view.notify_origin, pal)
-                );
-                for (event, mode) in &n.events {
-                    let _ = writeln!(o, "      {dim}{event}{r} {mode}");
+                let _ = writeln!(o, "    {n}{}{r}: {warn}(no command){r}", app.name);
+            }
+        }
+        let _ = writeln!(o, "      {dim}home:{r} {}", app.home_scope);
+        // The environment this overlay adds over the baseline — a count by default, each
+        // `KEY=value` under `--details`, mirroring the baseline `env` section. A free field; the
+        // value shown is the one that enters the cage (a placeholder for a credential profile),
+        // never the injected secret, which sbx reads host-side and never prints.
+        if !app.env.is_empty() {
+            if details {
+                let _ = writeln!(o, "      {dim}env:{r}");
+                for e in &app.env {
+                    let _ = writeln!(o, "        {n}{}{r}={}", e.key, e.value);
                 }
+            } else {
+                let _ = writeln!(o, "      {dim}env:{r} {} set", app.env.len());
             }
         }
-    }
-
-    // The GUI posture — shown only when opened, so a non-GUI config stays uncluttered. `wayland`
-    // carries the compositor caveat; `offscreen` names what it supplies, since it exposes nothing.
-    match view.gui {
-        GuiView::Wayland => {
-            let _ = writeln!(
-                o,
-                "  {h}gui:{r} wayland {dim}(exposure depends on your compositor){r}{}",
-                provenance_tag(view.gui_origin, pal)
-            );
-        }
-        GuiView::Offscreen => {
-            let _ = writeln!(
-                o,
-                "  {h}gui:{r} offscreen {dim}(fonts + proxy CA, no display){r}{}",
-                provenance_tag(view.gui_origin, pal)
-            );
-        }
-        GuiView::None => {}
-    }
-
-    // The GPU posture — shown only when opened, so a non-GPU config stays uncluttered.
-    if view.gpu {
-        let _ = writeln!(
-            o,
-            "  {h}gpu:{r} enabled {dim}(mesa: Intel/AMD/nouveau){r}{}",
-            provenance_tag(view.gpu_origin, pal)
-        );
-    }
-    // The audio posture — shown only when opened, same as GPU.
-    if view.audio {
-        let _ = writeln!(
-            o,
-            "  {h}audio:{r} enabled {dim}(microphone + playback via PulseAudio){r}{}",
-            provenance_tag(view.audio_origin, pal)
-        );
-    }
-    // The D-Bus posture — the in-cage desktop portal; shown only when opened, same as GPU.
-    if view.dbus {
-        let _ = writeln!(
-            o,
-            "  {h}dbus:{r} in-cage portal {dim}(file chooser + theme + notifications){r}{}",
-            provenance_tag(view.dbus_origin, pal)
-        );
-    }
-
-    // Inbound loopback forward ports — shown only when a layer declared any, so a default-profile
-    // config stays uncluttered. Each port is bound on the host's `127.0.0.1` and bridged into the
-    // cage at the same port (an OAuth `localhost:<port>` callback, or a cage-run dev server).
-    if !view.forward.is_empty() {
-        let ports = view
-            .forward
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(
-            o,
-            "  {h}forward:{r} {ports} {dim}(host loopback → cage loopback){r}{}",
-            provenance_tag(view.forward_origin, pal)
-        );
-    }
-
-    // Resource limits — shown only when a config `[limits]` override customizes one, so a
-    // default-profile config stays uncluttered (the effective defaults are in `sbx doctor`). When
-    // shown, each of the three fields carries its own provenance: the overridden ones name their
-    // layer, the untouched ones read `(default)`, so the line tells exactly which limits were tuned.
-    let l = &view.limits;
-    let overridden = |v: &LimitView| v.origin != config::view::ProvenanceView::Default;
-    if overridden(&l.memory_high) || overridden(&l.memory_max) || overridden(&l.tasks_max) {
-        let cell = |name: &str, v: &LimitView| {
-            let (label, span) = provenance_parts(v.origin, pal);
-            format!("{name}={} {span}({label}){r}", v.value)
-        };
-        let _ = writeln!(
-            o,
-            "  {h}limits:{r} {}, {}, {}",
-            cell("MemoryHigh", &l.memory_high),
-            cell("MemoryMax", &l.memory_max),
-            cell("TasksMax", &l.tasks_max),
-        );
-    }
-
-    // Seccomp denylist relaxation — shown only when a trusted `[seccomp] allow` re-permits a
-    // syscall, so the default (full mandatory denylist) stays uncluttered. The tokens read as the
-    // canonical `allow` entries; the provenance names which layer relaxed the denylist.
-    if !view.seccomp.is_empty() {
-        let _ = writeln!(
-            o,
-            "  {h}seccomp allow:{r} {} {dim}(syscalls re-permitted in the cage){r}{}",
-            view.seccomp.join(", "),
-            provenance_tag(view.seccomp_origin, pal)
-        );
-    }
-
-    // Host device grant — shown only when a trusted `[devices] allow` exposes a device, so the
-    // default (minimal, hostless `/dev`) stays uncluttered. The paths read as the `allow` entries;
-    // the provenance names which layer granted them.
-    if !view.devices.is_empty() {
-        let _ = writeln!(
-            o,
-            "  {h}devices:{r} {} {dim}(host device nodes exposed in the cage){r}{}",
-            view.devices.join(", "),
-            provenance_tag(view.devices_origin, pal)
-        );
-    }
-
-    // The `[fs]` masks — shown only when a layer closed something, so a project that closed
-    // nothing stays uncluttered. The entries read as written, since that is what a reader edits;
-    // which paths each covers is settled at launch, and reported there.
-    if !view.fs_deny.is_empty() {
-        let _ = writeln!(
-            o,
-            "  {h}fs deny:{r} {} {dim}(closed to the cage; the name stays visible){r}{}",
-            view.fs_deny.join(", "),
-            provenance_tag(view.fs_origin, pal)
-        );
-    }
-    if !view.fs_readonly.is_empty() {
-        let _ = writeln!(
-            o,
-            "  {h}fs readonly:{r} {} {dim}(readable in the cage, not writable){r}{}",
-            view.fs_readonly.join(", "),
-            provenance_tag(view.fs_origin, pal)
-        );
-    }
-
-    // ssh-agent grant — shown only when a trusted `[ssh_agent] allow` names a key, so the default
-    // (no agent in the cage at all) stays uncluttered. The entries read as written; which of them
-    // the host agent actually holds is settled at launch, and reported there.
-    if !view.ssh_agent.is_empty() {
-        let _ = writeln!(
-            o,
-            "  {h}ssh-agent:{r} {} {dim}({}){r}{}",
-            view.ssh_agent.join(", "),
-            if view.ssh_agent_confirm {
-                "keys the cage may sign with, each signature confirmed on your desktop"
+        // The host binds this overlay adds — a security field, so what host paths
+        // `sbx app <name>` exposes (and whether read-write) is visible here, the same as the
+        // baseline `binds` section. A count by default, each canonical path under `--details`.
+        if !app.binds.is_empty() {
+            if details {
+                let _ = writeln!(o, "      {dim}binds:{r}");
+                for b in &app.binds {
+                    let _ = writeln!(
+                        o,
+                        "        {n}{}{r}{}",
+                        b.path,
+                        bind_mode_tag(b.writable, pal)
+                    );
+                }
             } else {
-                "keys the cage may sign with"
-            },
-            provenance_tag(view.ssh_agent_origin, pal)
-        );
-    }
-
-    // Broker plugins — shown only when one is bound. The **socket** leads each line: it is the
-    // whole of what is exposed, and a reader auditing a broker is auditing that path. The policy
-    // follows, and its provenance tag is the policy's — the socket is always the global config's,
-    // which is what makes the tag readable rather than ambiguous.
-    for b in &view.brokers {
-        let _ = writeln!(
-            o,
-            "  {h}broker:{r} {} {dim}→{r} {} {dim}({}){r}{}",
-            b.socket,
-            b.name,
-            if b.allow.is_empty() {
-                "brokered by this plugin, no policy entries".to_string()
-            } else {
-                format!("brokered by this plugin: {}", b.allow.join(", "))
-            },
-            provenance_tag(b.origin, pal)
-        );
-        // The credential, by locator. On its own line rather than folded into the one above: a
-        // broker that authenticates on the cage's behalf is the thing an audit stops at.
-        if !b.secret.is_empty() {
-            let _ = writeln!(
-                o,
-                "    {dim}places the credential from:{r} {}",
-                b.secret.join(", ")
-            );
-        }
-    }
-
-    // Credentials the egress proxy injects — by destination and source locator, never the value.
-    if !view.secrets.is_empty() {
-        let _ = writeln!(
-            o,
-            "  {h}secrets (injected host-side by the egress proxy):{r}"
-        );
-        for s in &view.secrets {
-            let _ = writeln!(
-                o,
-                "    {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
-                s.header, s.to, s.shape, s.sources
-            );
-        }
-    }
-
-    // The redaction floor, shown only when a layer moved it. It governs credentials this section
-    // may not list — a task's, and one the cage obtained for itself — so it gets its own line
-    // rather than a note under the secrets above; at the built-in floor there is nothing to report.
-    if view.redact_min_len_origin != config::view::ProvenanceView::Default {
-        let _ = writeln!(
-            o,
-            "  {h}redact:{r} a secret under {n}{}{r} bytes is not scanned for{}",
-            view.redact_min_len,
-            provenance_tag(view.redact_min_len_origin, pal)
-        );
-    }
-
-    // What the host answers to a resolver plugin. Values are shown: a `[plugin.<name>]` table
-    // carries configuration, never a credential — a secret is declared in `[secret]`, which the
-    // block above prints by locator and never by value.
-    if !view.plugins.is_empty() {
-        let _ = writeln!(
-            o,
-            "  {h}plugins (what this host supplies to a resolver):{r}"
-        );
-        for p in &view.plugins {
-            // Two different kinds of answer, kept on their own lines: `env` configures a tool the
-            // machine already has, `programs` says where to get one it has not. Running them
-            // together would read as one list whose entries mean different things.
-            if !p.env.is_empty() {
-                let _ = writeln!(o, "    {n}{}{r}  env: {}", p.name, p.env.join(", "));
+                let _ = writeln!(o, "      {dim}binds:{r} {}", app.binds.len());
             }
-            if !p.programs.is_empty() {
+        }
+        // The URI handlers this overlay adds, its bundles' folded in. Listed by default, not
+        // counted: a handler is what a sign-in link reaches, which is precisely what
+        // distinguishes this app from every other one.
+        if !app.open.is_empty() {
+            let _ = writeln!(o, "      {dim}open:{r}");
+            for e in &app.open {
                 let _ = writeln!(
                     o,
-                    "    {n}{}{r}  programs: {} (a fallback; PATH wins)",
-                    p.name,
-                    p.programs.join(", ")
+                    "        {n}{}://{r} {} {dim}({}){r}",
+                    e.scheme, e.cmd, e.mode
                 );
             }
         }
-    }
-
-    // Declared operations, the static counterpart to `sbx task ls` (which reads a running session).
-    // Name, what it says it does, and which layer declared it — not the command, which is the whole
-    // contract `sbx task show` prints. Without this there was no way to confirm a `[task]` block
-    // survived validation short of launching a session and asking it.
-    if !view.tasks.is_empty() {
-        let _ = writeln!(o, "  {h}tasks (declared operations a cage may run):{r}");
-        let width = view.tasks.iter().map(|t| t.name.len()).max().unwrap_or(0);
-        for t in &view.tasks {
-            let described = match &t.description {
-                Some(d) => format!("  {d}"),
-                None => String::new(),
-            };
-            let _ = writeln!(
-                o,
-                "    {n}{:<width$}{r}{described}  {dim}({}){r}",
-                t.name,
-                t.origin,
-                width = width
-            );
+        // The auxiliary processes this overlay adds, its bundles' folded in. Listed for the
+        // reason the field exists: what else this app starts is part of what it is.
+        if !app.service.is_empty() {
+            let _ = writeln!(o, "      {dim}service:{r}");
+            for s in &app.service {
+                let _ = writeln!(o, "{}", service_line(s, pal, "        "));
+            }
         }
-    }
-
-    // Named application profiles, each a gated overlay over the baseline: the command it runs,
-    // what its overlay adds, and its own dropped-field notes (so `sbx app <name>` holds no
-    // surprises). Security fields appear only when their source was trusted, exactly as at launch.
-    if !view.apps.is_empty() {
-        let _ = writeln!(o, "  {h}apps:{r}");
-        for app in &view.apps {
-            match &app.cmd {
-                Some(cmd) => {
-                    let _ = writeln!(o, "    {n}{}{r}: {cmd}", app.name);
+        // The packages this overlay declares. Compact by default — names with ` @ <rev>` for a
+        // pinned `flake:` one and ` (withheld)` for one the trust gate would withhold at launch,
+        // so an untrusted app package reads as withheld here without `--details`. `--details`
+        // expands to one full line per package (backend, locator, realisation), the same line
+        // the baseline `packages` section renders, so the two never drift.
+        if !app.packages.is_empty() {
+            if details {
+                let _ = writeln!(o, "      {dim}packages:{r}");
+                for p in &app.packages {
+                    let _ = writeln!(o, "{}", package_line(p, pal, "        "));
                 }
-                // No layer declared a command — the app cannot launch, so flag it.
-                None => {
-                    let _ = writeln!(o, "    {n}{}{r}: {warn}(no command){r}", app.name);
-                }
-            }
-            let _ = writeln!(o, "      {dim}home:{r} {}", app.home_scope);
-            // The environment this overlay adds over the baseline — a count by default, each
-            // `KEY=value` under `--details`, mirroring the baseline `env` section. A free field; the
-            // value shown is the one that enters the cage (a placeholder for a credential profile),
-            // never the injected secret, which sbx reads host-side and never prints.
-            if !app.env.is_empty() {
-                if details {
-                    let _ = writeln!(o, "      {dim}env:{r}");
-                    for e in &app.env {
-                        let _ = writeln!(o, "        {n}{}{r}={}", e.key, e.value);
-                    }
-                } else {
-                    let _ = writeln!(o, "      {dim}env:{r} {} set", app.env.len());
-                }
-            }
-            // The host binds this overlay adds — a security field, so what host paths
-            // `sbx app <name>` exposes (and whether read-write) is visible here, the same as the
-            // baseline `binds` section. A count by default, each canonical path under `--details`.
-            if !app.binds.is_empty() {
-                if details {
-                    let _ = writeln!(o, "      {dim}binds:{r}");
-                    for b in &app.binds {
-                        let _ = writeln!(
-                            o,
-                            "        {n}{}{r}{}",
-                            b.path,
-                            bind_mode_tag(b.writable, pal)
-                        );
-                    }
-                } else {
-                    let _ = writeln!(o, "      {dim}binds:{r} {}", app.binds.len());
-                }
-            }
-            // The packages this overlay declares. Compact by default — names with ` @ <rev>` for a
-            // pinned `flake:` one and ` (withheld)` for one the trust gate would withhold at launch,
-            // so an untrusted app package reads as withheld here without `--details`. `--details`
-            // expands to one full line per package (backend, locator, realisation), the same line
-            // the baseline `packages` section renders, so the two never drift.
-            if !app.packages.is_empty() {
-                if details {
-                    let _ = writeln!(o, "      {dim}packages:{r}");
-                    for p in &app.packages {
-                        let _ = writeln!(o, "{}", package_line(p, pal, "        "));
-                    }
-                } else {
-                    let pkgs = app
-                        .packages
-                        .iter()
-                        .map(|p| {
-                            // A withheld package stands as its name plus the marker — neither its
-                            // pin nor its realisation, since it is not built; the same short-circuit
-                            // the full `--details` line takes, so the two paths agree.
-                            if p.withheld_reason.is_some() {
-                                return format!("{} {warn}(withheld){r}", p.name);
-                            }
-                            match &p.pinned_rev {
-                                Some(rev) => format!("{} @ {}", p.name, short_rev(rev)),
-                                None => p.name.clone(),
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let _ = writeln!(o, "      {dim}packages:{r} {pkgs}");
-                }
-            }
-            // An overlay is a compact summary by default — one line per field; an allowlist shows
-            // just its rule counts. `--details` expands that to the individual allow/deny rules
-            // and the always-allowed built-in hosts, so what `sbx app <name>` can reach is visible
-            // here (the baseline `network` section shows the built-in set only when the *baseline*
-            // is an allowlist, which a profile's app-overlay allowlist is not).
-            if let Some(net) = &app.network {
-                match net {
-                    AppNetworkView::Shared => {
-                        let _ = writeln!(o, "      {dim}network:{r} shared {dim}(host network){r}");
-                    }
-                    AppNetworkView::Isolated => {
-                        let _ = writeln!(
-                            o,
-                            "      {dim}network:{r} none {dim}(isolated — no network){r}"
-                        );
-                    }
-                    AppNetworkView::Allowlist {
-                        default_action,
-                        ask_timeout,
-                        ask_notice,
-                        allow,
-                        deny,
-                        builtin,
-                    } if details => {
-                        let _ = writeln!(
-                            o,
-                            "      {dim}network:{r} {}",
-                            net_mode_word(*default_action)
-                        );
-                        if let Some(t) = ask_timeout {
-                            let _ = writeln!(o, "        {dim}ask timeout: {t}{r}");
-                        }
-                        if matches!(ask_notice, Some(false)) {
-                            let _ = writeln!(o, "        {dim}ask notice: off{r}");
-                        }
-                        for rule in allow {
-                            let _ = writeln!(o, "        allow {n}{rule}{r}");
-                        }
-                        for rule in deny {
-                            let _ = writeln!(o, "        {warn}deny{r}  {n}{rule}{r}");
-                        }
-                        let _ = writeln!(
-                            o,
-                            "        {dim}built-in (always allowed, so self-equip works):{r}"
-                        );
-                        for host in builtin {
-                            let _ = writeln!(o, "          allow {n}{host}{r}");
-                        }
-                        let _ = writeln!(o, "        {dim}(deny wins over allow){r}");
-                    }
-                    AppNetworkView::Allowlist {
-                        default_action,
-                        allow,
-                        deny,
-                        ..
-                    } => {
-                        let _ = writeln!(
-                            o,
-                            "      {dim}network:{r} {} {dim}({} allow, {} deny){r}",
-                            net_mode_word(*default_action),
-                            allow.len(),
-                            deny.len()
-                        );
-                    }
-                }
-            }
-            // The GUI posture the overlay sets, matched like the baseline `gui` line: `wayland`
-            // carries the same compositor-exposure caveat, so an app that opens a display explains
-            // it the same way; an explicit `none` (the app closing a display the baseline may open)
-            // stays a bare word — there is nothing to caveat.
-            match &app.gui {
-                Some(GuiView::Wayland) => {
-                    let _ = writeln!(
-                        o,
-                        "      {dim}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
-                    );
-                }
-                Some(GuiView::Offscreen) => {
-                    let _ = writeln!(
-                        o,
-                        "      {dim}gui:{r} offscreen {dim}(fonts + proxy CA, no display){r}"
-                    );
-                }
-                Some(GuiView::None) => {
-                    let _ = writeln!(o, "      {dim}gui:{r} none");
-                }
-                None => {}
-            }
-            // The GPU posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
-            match app.gpu {
-                Some(true) => {
-                    let _ = writeln!(o, "      {dim}gpu:{r} enabled {dim}(mesa){r}");
-                }
-                Some(false) => {
-                    let _ = writeln!(o, "      {dim}gpu:{r} disabled");
-                }
-                None => {}
-            }
-            // The audio posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
-            match app.audio {
-                Some(true) => {
-                    let _ = writeln!(
-                        o,
-                        "      {dim}audio:{r} enabled {dim}(microphone + playback){r}"
-                    );
-                }
-                Some(false) => {
-                    let _ = writeln!(o, "      {dim}audio:{r} disabled");
-                }
-                None => {}
-            }
-            // The D-Bus posture the overlay sets; `None` inherits.
-            match app.dbus {
-                Some(true) => {
-                    let _ = writeln!(
-                        o,
-                        "      {dim}dbus:{r} in-cage portal {dim}(file chooser + theme + notifications){r}"
-                    );
-                }
-                Some(false) => {
-                    let _ = writeln!(o, "      {dim}dbus:{r} disabled");
-                }
-                None => {}
-            }
-            // The cgroup limits this overlay overrides — only the fields it tunes, since an app
-            // does not carry the full effective set (an unset field inherits the baseline, shown in
-            // `sbx doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
-            if let Some(limits) = &app.limits {
-                let mut parts: Vec<String> = Vec::new();
-                if let Some(v) = &limits.memory_high {
-                    parts.push(format!("MemoryHigh={v}"));
-                }
-                if let Some(v) = &limits.memory_max {
-                    parts.push(format!("MemoryMax={v}"));
-                }
-                if let Some(v) = &limits.tasks_max {
-                    parts.push(format!("TasksMax={v}"));
-                }
-                let _ = writeln!(o, "      {dim}limits:{r} {}", parts.join(", "));
-            }
-            // The host loopback ports this overlay adds (its own, not the baseline-merged set). A
-            // compact list under the app's roster entry; the effective set is in `config show --app`.
-            if !app.forward.is_empty() {
-                let ports = app
-                    .forward
+            } else {
+                let pkgs = app
+                    .packages
                     .iter()
-                    .map(u16::to_string)
+                    .map(|p| {
+                        // A withheld package stands as its name plus the marker — neither its
+                        // pin nor its realisation, since it is not built; the same short-circuit
+                        // the full `--details` line takes, so the two paths agree.
+                        if p.withheld_reason.is_some() {
+                            return format!("{} {warn}(withheld){r}", p.name);
+                        }
+                        match &p.pinned_rev {
+                            Some(rev) => format!("{} @ {}", p.name, short_rev(rev)),
+                            None => p.name.clone(),
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let _ = writeln!(o, "      {dim}forward:{r} {ports} (host loopback → cage)");
+                let _ = writeln!(o, "      {dim}packages:{r} {pkgs}");
             }
-            // The seccomp relaxation this overlay adds (its own allow tokens, not the merged set).
-            if !app.seccomp.is_empty() {
-                let _ = writeln!(o, "      {dim}seccomp allow:{r} {}", app.seccomp.join(", "));
-            }
-            // The host device grant this overlay adds (its own `/dev/` paths, not the merged set).
-            if !app.devices.is_empty() {
-                let _ = writeln!(o, "      {dim}devices:{r} {}", app.devices.join(", "));
-            }
-            if !app.fs_deny.is_empty() {
-                let _ = writeln!(o, "      {dim}fs deny:{r} {}", app.fs_deny.join(", "));
-            }
-            if !app.fs_readonly.is_empty() {
-                let _ = writeln!(
-                    o,
-                    "      {dim}fs readonly:{r} {}",
-                    app.fs_readonly.join(", ")
-                );
-            }
-            // The ssh-agent keys this overlay grants (its own entries, not the merged set) — the
-            // whole point of the per-app field is that one app may sign where another may not, so a
-            // listing that folded it into the baseline would hide exactly what it is for.
-            if !app.ssh_agent.is_empty() {
-                let _ = writeln!(o, "      {dim}ssh-agent:{r} {}", app.ssh_agent.join(", "));
-            }
-            // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
-            // unions them with the baseline only for the launch) — a count by default, expanded
-            // under `--details` to each by destination and source, the same metadata the baseline
-            // section shows. Never the value; sbx reads that host-side.
-            if !app.secrets.is_empty() {
-                if details {
-                    let _ = writeln!(o, "      {dim}secrets (injected host-side):{r}");
-                    for s in &app.secrets {
-                        let _ = writeln!(
-                            o,
-                            "        {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
-                            s.header, s.to, s.shape, s.sources
-                        );
-                    }
-                } else {
+        }
+        // An overlay is a compact summary by default — one line per field; an allowlist shows
+        // just its rule counts. `--details` expands that to the individual allow/deny rules
+        // and the always-allowed built-in hosts, so what `sbx app <name>` can reach is visible
+        // here (the baseline `network` section shows the built-in set only when the *baseline*
+        // is an allowlist, which a profile's app-overlay allowlist is not).
+        if let Some(net) = &app.network {
+            match net {
+                AppNetworkView::Shared => {
+                    let _ = writeln!(o, "      {dim}network:{r} shared {dim}(host network){r}");
+                }
+                AppNetworkView::Isolated => {
                     let _ = writeln!(
                         o,
-                        "      {dim}secrets:{r} {} injected host-side",
-                        app.secrets.len()
+                        "      {dim}network:{r} none {dim}(isolated — no network){r}"
+                    );
+                }
+                AppNetworkView::Allowlist {
+                    default_action,
+                    ask_timeout,
+                    ask_notice,
+                    allow,
+                    deny,
+                    builtin,
+                } if details => {
+                    let _ = writeln!(
+                        o,
+                        "      {dim}network:{r} {}",
+                        net_mode_word(*default_action)
+                    );
+                    if let Some(t) = ask_timeout {
+                        let _ = writeln!(o, "        {dim}ask timeout: {t}{r}");
+                    }
+                    if matches!(ask_notice, Some(false)) {
+                        let _ = writeln!(o, "        {dim}ask notice: off{r}");
+                    }
+                    for rule in allow {
+                        let _ = writeln!(o, "        allow {n}{rule}{r}");
+                    }
+                    for rule in deny {
+                        let _ = writeln!(o, "        {warn}deny{r}  {n}{rule}{r}");
+                    }
+                    let _ = writeln!(
+                        o,
+                        "        {dim}built-in (always allowed, so self-equip works):{r}"
+                    );
+                    for host in builtin {
+                        let _ = writeln!(o, "          allow {n}{host}{r}");
+                    }
+                    let _ = writeln!(o, "        {dim}(deny wins over allow){r}");
+                }
+                AppNetworkView::Allowlist {
+                    default_action,
+                    allow,
+                    deny,
+                    ..
+                } => {
+                    let _ = writeln!(
+                        o,
+                        "      {dim}network:{r} {} {dim}({} allow, {} deny){r}",
+                        net_mode_word(*default_action),
+                        allow.len(),
+                        deny.len()
                     );
                 }
             }
-            for note in &app.notes {
-                let _ = writeln!(o, "      {warn}note: {note}{r}");
+        }
+        // The GUI posture the overlay sets, matched like the baseline `gui` line: `wayland`
+        // carries the same compositor-exposure caveat, so an app that opens a display explains
+        // it the same way; an explicit `none` (the app closing a display the baseline may open)
+        // stays a bare word — there is nothing to caveat.
+        match &app.gui {
+            Some(GuiView::Wayland) => {
+                let _ = writeln!(
+                    o,
+                    "      {dim}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
+                );
+            }
+            Some(GuiView::Offscreen) => {
+                let _ = writeln!(
+                    o,
+                    "      {dim}gui:{r} offscreen {dim}(fonts + proxy CA, no display){r}"
+                );
+            }
+            Some(GuiView::None) => {
+                let _ = writeln!(o, "      {dim}gui:{r} none");
+            }
+            None => {}
+        }
+        // The GPU posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
+        match app.gpu {
+            Some(true) => {
+                let _ = writeln!(o, "      {dim}gpu:{r} enabled {dim}(mesa){r}");
+            }
+            Some(false) => {
+                let _ = writeln!(o, "      {dim}gpu:{r} disabled");
+            }
+            None => {}
+        }
+        // The audio posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
+        match app.audio {
+            Some(true) => {
+                let _ = writeln!(
+                    o,
+                    "      {dim}audio:{r} enabled {dim}(microphone + playback){r}"
+                );
+            }
+            Some(false) => {
+                let _ = writeln!(o, "      {dim}audio:{r} disabled");
+            }
+            None => {}
+        }
+        // The D-Bus posture the overlay sets; `None` inherits.
+        match app.dbus {
+            Some(true) => {
+                let _ = writeln!(
+                    o,
+                    "      {dim}dbus:{r} in-cage portal {dim}(file chooser + theme + notifications){r}"
+                );
+            }
+            Some(false) => {
+                let _ = writeln!(o, "      {dim}dbus:{r} disabled");
+            }
+            None => {}
+        }
+        // The cgroup limits this overlay overrides — only the fields it tunes, since an app
+        // does not carry the full effective set (an unset field inherits the baseline, shown in
+        // `sbx doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
+        if let Some(limits) = &app.limits {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = &limits.memory_high {
+                parts.push(format!("MemoryHigh={v}"));
+            }
+            if let Some(v) = &limits.memory_max {
+                parts.push(format!("MemoryMax={v}"));
+            }
+            if let Some(v) = &limits.tasks_max {
+                parts.push(format!("TasksMax={v}"));
+            }
+            let _ = writeln!(o, "      {dim}limits:{r} {}", parts.join(", "));
+        }
+        // The host loopback ports this overlay adds (its own, not the baseline-merged set). A
+        // compact list under the app's roster entry; the effective set is in `config show --app`.
+        if !app.forward.is_empty() {
+            let ports = app
+                .forward
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(o, "      {dim}forward:{r} {ports} (host loopback → cage)");
+        }
+        // The seccomp relaxation this overlay adds (its own allow tokens, not the merged set).
+        if !app.seccomp.is_empty() {
+            let _ = writeln!(o, "      {dim}seccomp allow:{r} {}", app.seccomp.join(", "));
+        }
+        // The host device grant this overlay adds (its own `/dev/` paths, not the merged set).
+        if !app.devices.is_empty() {
+            let _ = writeln!(o, "      {dim}devices:{r} {}", app.devices.join(", "));
+        }
+        if !app.fs_deny.is_empty() {
+            let _ = writeln!(o, "      {dim}fs deny:{r} {}", app.fs_deny.join(", "));
+        }
+        if !app.fs_readonly.is_empty() {
+            let _ = writeln!(
+                o,
+                "      {dim}fs readonly:{r} {}",
+                app.fs_readonly.join(", ")
+            );
+        }
+        // The ssh-agent keys this overlay grants (its own entries, not the merged set) — the
+        // whole point of the per-app field is that one app may sign where another may not, so a
+        // listing that folded it into the baseline would hide exactly what it is for.
+        if !app.ssh_agent.is_empty() {
+            let _ = writeln!(o, "      {dim}ssh-agent:{r} {}", app.ssh_agent.join(", "));
+        }
+        // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
+        // unions them with the baseline only for the launch) — a count by default, expanded
+        // under `--details` to each by destination and source, the same metadata the baseline
+        // section shows. Never the value; sbx reads that host-side.
+        if !app.secrets.is_empty() {
+            if details {
+                let _ = writeln!(o, "      {dim}secrets (injected host-side):{r}");
+                for s in &app.secrets {
+                    let _ = writeln!(
+                        o,
+                        "        {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
+                        s.header, s.to, s.shape, s.sources
+                    );
+                }
+            } else {
+                let _ = writeln!(
+                    o,
+                    "      {dim}secrets:{r} {} injected host-side",
+                    app.secrets.len()
+                );
             }
         }
+        for note in &app.notes {
+            let _ = writeln!(o, "      {warn}note: {note}{r}");
+        }
+    }
+    Some(o)
+}
+
+fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
+    use std::fmt::Write as _;
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
+    let mut o = String::new();
+
+    // The hue carries the layering story the model already holds: a section header is bold, an
+    // identifier (a key, a path, a rule, a channel) rides the name span, a value the trust gate
+    // *withheld* is yellow while an admitted one's detail is dimmed, and every value's provenance
+    // tag is hued by level — a built-in default gray, a global source cyan, a project source green
+    // — so where a value came from reads at a glance. None of this is new data; it is the gating
+    // outcome and the per-value origin made visible. Every span is empty under a non-terminal, so
+    // captured output stays byte-for-byte the plain text the integration tests pin.
+    let _ = writeln!(o, "{h}sbx config{r} — resolved for {n}{}{r}", view.cwd);
+
+    // Each section renders on its own and is appended in order. The order is load-bearing (it is
+    // the reading order of a resolved config), so it lives here as a sequence of calls rather than
+    // inside the sections themselves.
+    o.push_str(&env_section(&view.env, pal));
+    o.push_str(&binds_section(&view.binds, pal));
+    o.push_str(&open_section(&view.open, pal));
+    if let Some(s) = service_section(&view.service, pal) {
+        o.push_str(&s);
+    }
+    o.push_str(&packages_section(&view.packages, pal));
+    o.push_str(&mise_section(view.mise.as_ref(), pal));
+    if let Some(s) = tools_section(&view.tools, pal) {
+        o.push_str(&s);
+    }
+    o.push_str(&channels_section(view, pal));
+
+    o.push_str(&network_section(view, pal, details));
+
+    for section in [
+        proc_section(view, pal, details),
+        Some(notify_section(view, pal)),
+        desktop_sections(view, pal),
+        forward_section(view, pal),
+        limits_section(view, pal),
+        grants_section(view, pal),
+        brokers_section(&view.brokers, pal),
+        secrets_section(&view.secrets, pal),
+        redact_section(view, pal),
+        plugins_section(&view.plugins, pal),
+        tasks_section(&view.tasks, pal),
+        apps_section(&view.apps, pal, details),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        o.push_str(&section);
     }
 
     o
 }
 
+/// Whether a posture line belongs in the default per-app view, recording the ones it does not.
+///
+/// A posture nobody configured — not the app, not the baseline — says only that sbx has a default,
+/// which is the same answer for every app on the machine. Ten of them crowded out the handful of
+/// fields that actually distinguish one app from another, so they are folded unless `--details`
+/// asks for the full picture. `folded` collects their names in the order they would have appeared,
+/// and the caller prints them on one line: what is hidden is still named, and the flag that shows
+/// it is named beside it.
+///
+/// The judgement is `at_default`, not the provenance itself, so `limits` — three cells with three
+/// origins — folds on the same rule as the scalars: only when no cell was set by anyone.
+fn posture_shown(
+    details: bool,
+    at_default: bool,
+    name: &'static str,
+    folded: &mut Vec<&'static str>,
+) -> bool {
+    if details || !at_default {
+        return true;
+    }
+    folded.push(name);
+    false
+}
+
 /// Render one app's *effective* configuration with per-field provenance — the `config show --app
 /// <name>` view. Every scalar shows the value the app would launch with, tagged `app:global`/
-/// `app:project` (the app set it) or `inherited` (it took the baseline's); collections show the
-/// overlay's own additions and a count of the baseline entries they inherit, with the entry lists
-/// and the allowlist rules expanded under `--details`. Color and layout only over
+/// `app:project` (the app set it), `inherited` (it took a value the baseline configured) or
+/// `default` (nobody configured it); collections show the overlay's own additions and a count of
+/// the baseline entries they inherit, with the entry lists and the allowlist rules expanded under
+/// `--details`. A posture left entirely at its default is folded out of the default view and named
+/// on the summary line instead ([`posture_shown`]). Color and layout only over
 /// [`config::view::AppDetailView`]; every span empties under a non-terminal.
 fn render_app_detail(
     view: &config::view::AppDetailView,
     pal: &style::Palette,
     details: bool,
 ) -> String {
-    use config::view::{GuiView, LimitView, NetworkView};
+    use config::view::{GuiView, LimitView, NetworkView, ProvenanceView};
     use std::fmt::Write as _;
     let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
     let mut o = String::new();
+    // The postures nobody configured, in the order they would have been printed. Filled as the
+    // fields below are skipped, and spelled out once after them.
+    let mut folded: Vec<&'static str> = Vec::new();
+    let untouched = |origin: ProvenanceView| origin == ProvenanceView::Default;
 
     let _ = writeln!(
         o,
@@ -1481,13 +1737,17 @@ fn render_app_detail(
                 details,
                 pal,
             );
+            // The policy itself is listed either way: which hosts this app may reach is the
+            // answer someone opens this view to find, and a count sends them to a second command
+            // to read it. A rule is a whole clause (verbs, scheme, host pattern), so one per line
+            // rather than joined — nineteen of them on one line would be unreadable.
+            for rule in allow {
+                let _ = writeln!(o, "    allow {n}{rule}{r}");
+            }
+            for rule in deny {
+                let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+            }
             if details {
-                for rule in allow {
-                    let _ = writeln!(o, "    allow {n}{rule}{r}");
-                }
-                for rule in deny {
-                    let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
-                }
                 for rule in mute {
                     let _ = writeln!(o, "    {dim}mute{r}  {n}{rule}{r}");
                 }
@@ -1503,100 +1763,120 @@ fn render_app_detail(
                 }
                 let _ = writeln!(o, "    {dim}(deny wins over allow){r}");
             } else {
-                // The mute / http2 counts ride the summary only when non-zero, so an app that uses
-                // neither reads exactly as before.
+                // What stays behind the flag decides nothing about reachability: `mute` only
+                // silences an already-permitted request in the log, `http2` picks a transport, and
+                // the built-in set is the same for every app. Counted, not listed — and only when
+                // non-zero, so an app that uses neither reads as if the line were not there.
                 let mut extra = String::new();
                 if !mute.is_empty() {
-                    extra.push_str(&format!(", {} mute", mute.len()));
+                    extra.push_str(&format!("{} mute", mute.len()));
                 }
                 if !http2.is_empty() {
-                    extra.push_str(&format!(", {} http2", http2.len()));
+                    if !extra.is_empty() {
+                        extra.push_str(", ");
+                    }
+                    extra.push_str(&format!("{} http2", http2.len()));
                 }
+                if !extra.is_empty() {
+                    let _ = writeln!(o, "    {dim}({extra} — see --details){r}");
+                }
+            }
+        }
+    }
+
+    // The effective process/exec posture — shown whenever somebody set it, `off` included, so the
+    // inherited story is visible.
+    if posture_shown(details, untouched(view.proc_origin), "proc", &mut folded) {
+        let proc_tag = app_provenance_tag(view.proc_origin, pal);
+        let _ = writeln!(
+            o,
+            "  {h}proc:{r}    {} {dim}({} allow, {} deny){r}{proc_tag}",
+            view.proc.mode,
+            view.proc.allow.len(),
+            view.proc.deny.len()
+        );
+    }
+
+    // The effective refusal notifications — shown whenever somebody set them, even when every event
+    // agrees, and spelled out per event only when they differ.
+    if posture_shown(
+        details,
+        untouched(view.notify_origin),
+        "notify",
+        &mut folded,
+    ) {
+        let notify_tag = app_provenance_tag(view.notify_origin, pal);
+        let uniform = view
+            .notify
+            .events
+            .first()
+            .filter(|(_, first)| view.notify.events.iter().all(|(_, m)| m == first))
+            .map(|(_, m)| m.clone());
+        match uniform {
+            Some(mode) => {
+                let _ = writeln!(o, "  {h}notify:{r}  {mode}{notify_tag}");
+            }
+            None => {
+                let _ = writeln!(o, "  {h}notify:{r}  {dim}per event{r}{notify_tag}");
+                for (event, mode) in &view.notify.events {
+                    let _ = writeln!(o, "      {dim}{event}{r} {mode}");
+                }
+            }
+        }
+    }
+
+    // The effective GUI posture — shown whenever somebody set it, `none` included.
+    if posture_shown(details, untouched(view.gui_origin), "gui", &mut folded) {
+        let gui_tag = app_provenance_tag(view.gui_origin, pal);
+        match view.gui {
+            GuiView::Wayland => {
                 let _ = writeln!(
                     o,
-                    "    {dim}({} allow, {} deny{extra} — see --details){r}",
-                    allow.len(),
-                    deny.len()
+                    "  {h}gui:{r}     wayland {dim}(exposure depends on your compositor){r}{gui_tag}"
                 );
             }
-        }
-    }
-
-    // The effective process/exec posture — shown even when `off`, so the inherited story is visible.
-    let proc_tag = app_provenance_tag(view.proc_origin, pal);
-    let _ = writeln!(
-        o,
-        "  {h}proc:{r}    {} {dim}({} allow, {} deny){r}{proc_tag}",
-        view.proc.mode,
-        view.proc.allow.len(),
-        view.proc.deny.len()
-    );
-
-    // The effective refusal notifications — shown even when every event agrees, so the inherited
-    // story is visible, and spelled out per event only when they differ.
-    let notify_tag = app_provenance_tag(view.notify_origin, pal);
-    let uniform = view
-        .notify
-        .events
-        .first()
-        .filter(|(_, first)| view.notify.events.iter().all(|(_, m)| m == first))
-        .map(|(_, m)| m.clone());
-    match uniform {
-        Some(mode) => {
-            let _ = writeln!(o, "  {h}notify:{r}  {mode}{notify_tag}");
-        }
-        None => {
-            let _ = writeln!(o, "  {h}notify:{r}  {dim}per event{r}{notify_tag}");
-            for (event, mode) in &view.notify.events {
-                let _ = writeln!(o, "      {dim}{event}{r} {mode}");
+            GuiView::Offscreen => {
+                let _ = writeln!(
+                    o,
+                    "  {h}gui:{r}     offscreen {dim}(fonts + proxy CA, no display){r}{gui_tag}"
+                );
+            }
+            GuiView::None => {
+                let _ = writeln!(o, "  {h}gui:{r}     none{gui_tag}");
             }
         }
     }
 
-    // The effective GUI posture — shown even when `none`, so the inherited story is visible.
-    let gui_tag = app_provenance_tag(view.gui_origin, pal);
-    match view.gui {
-        GuiView::Wayland => {
-            let _ = writeln!(
-                o,
-                "  {h}gui:{r}     wayland {dim}(exposure depends on your compositor){r}{gui_tag}"
-            );
-        }
-        GuiView::Offscreen => {
-            let _ = writeln!(
-                o,
-                "  {h}gui:{r}     offscreen {dim}(fonts + proxy CA, no display){r}{gui_tag}"
-            );
-        }
-        GuiView::None => {
-            let _ = writeln!(o, "  {h}gui:{r}     none{gui_tag}");
-        }
+    // The effective GPU posture — shown either way whenever somebody set it.
+    if posture_shown(details, untouched(view.gpu_origin), "gpu", &mut folded) {
+        let gpu_tag = app_provenance_tag(view.gpu_origin, pal);
+        let _ = writeln!(
+            o,
+            "  {h}gpu:{r}     {}{gpu_tag}",
+            if view.gpu { "enabled" } else { "disabled" }
+        );
     }
 
-    // The effective GPU posture — shown either way, so the inherited story is visible.
-    let gpu_tag = app_provenance_tag(view.gpu_origin, pal);
-    let _ = writeln!(
-        o,
-        "  {h}gpu:{r}     {}{gpu_tag}",
-        if view.gpu { "enabled" } else { "disabled" }
-    );
+    // The effective audio posture — shown either way whenever somebody set it.
+    if posture_shown(details, untouched(view.audio_origin), "audio", &mut folded) {
+        let audio_tag = app_provenance_tag(view.audio_origin, pal);
+        let _ = writeln!(
+            o,
+            "  {h}audio:{r}   {}{audio_tag}",
+            if view.audio { "enabled" } else { "disabled" }
+        );
+    }
 
-    // The effective audio posture — shown either way, so the inherited story is visible.
-    let audio_tag = app_provenance_tag(view.audio_origin, pal);
-    let _ = writeln!(
-        o,
-        "  {h}audio:{r}   {}{audio_tag}",
-        if view.audio { "enabled" } else { "disabled" }
-    );
-
-    // The effective D-Bus posture — shown either way, so the inherited story is visible.
-    let dbus_tag = app_provenance_tag(view.dbus_origin, pal);
-    let dbus_label = if view.dbus {
-        "in-cage portal"
-    } else {
-        "disabled"
-    };
-    let _ = writeln!(o, "  {h}dbus:{r}    {dbus_label}{dbus_tag}");
+    // The effective D-Bus posture — shown either way whenever somebody set it.
+    if posture_shown(details, untouched(view.dbus_origin), "dbus", &mut folded) {
+        let dbus_tag = app_provenance_tag(view.dbus_origin, pal);
+        let dbus_label = if view.dbus {
+            "in-cage portal"
+        } else {
+            "disabled"
+        };
+        let _ = writeln!(o, "  {h}dbus:{r}    {dbus_label}{dbus_tag}");
+    }
 
     // The effective cgroup limits — every field its provenance (inherited from the baseline, or the
     // app layer that tuned it).
@@ -1605,55 +1885,94 @@ fn render_app_detail(
         format!("{label_name}={} {span}({label}){r}", v.value)
     };
     let l = &view.limits;
-    let _ = writeln!(
-        o,
-        "  {h}limits:{r}  {}, {}, {}",
-        cell("MemoryHigh", &l.memory_high),
-        cell("MemoryMax", &l.memory_max),
-        cell("TasksMax", &l.tasks_max),
-    );
+    // One line, three origins: it folds only when no cell was set by anyone. A single tuned cell
+    // keeps the whole line, since the other two are the context that tuning is read against.
+    let limits_untouched = untouched(l.memory_high.origin)
+        && untouched(l.memory_max.origin)
+        && untouched(l.tasks_max.origin);
+    if posture_shown(details, limits_untouched, "limits", &mut folded) {
+        let _ = writeln!(
+            o,
+            "  {h}limits:{r}  {}, {}, {}",
+            cell("MemoryHigh", &l.memory_high),
+            cell("MemoryMax", &l.memory_max),
+            cell("TasksMax", &l.tasks_max),
+        );
+    }
 
     // Effective inbound loopback forward ports — the app's own ∪ the baseline's. Shown even when
     // empty so the inherited story is visible (a non-empty baseline set shows as `inherited`).
-    let forward_tag = app_provenance_tag(view.forward_origin, pal);
-    if view.forward.is_empty() {
-        let _ = writeln!(o, "  {h}forward:{r} (none){forward_tag}");
-    } else {
-        let ports = view
-            .forward
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(
-            o,
-            "  {h}forward:{r} {ports} {dim}(host loopback → cage loopback){r}{forward_tag}"
-        );
+    if posture_shown(
+        details,
+        untouched(view.forward_origin),
+        "forward",
+        &mut folded,
+    ) {
+        let forward_tag = app_provenance_tag(view.forward_origin, pal);
+        if view.forward.is_empty() {
+            let _ = writeln!(o, "  {h}forward:{r} (none){forward_tag}");
+        } else {
+            let ports = view
+                .forward
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                o,
+                "  {h}forward:{r} {ports} {dim}(host loopback → cage loopback){r}{forward_tag}"
+            );
+        }
     }
 
     // Effective seccomp relaxation — the app's own ∪ the baseline's. Shown even when empty so the
     // inherited story is visible (a relaxation the app takes from the baseline reads as `inherited`).
-    let seccomp_tag = app_provenance_tag(view.seccomp_origin, pal);
-    if view.seccomp.is_empty() {
-        let _ = writeln!(o, "  {h}seccomp:{r} (mandatory denylist){seccomp_tag}");
-    } else {
-        let _ = writeln!(
-            o,
-            "  {h}seccomp:{r} allow {} {dim}(syscalls re-permitted){r}{seccomp_tag}",
-            view.seccomp.join(", ")
-        );
+    if posture_shown(
+        details,
+        untouched(view.seccomp_origin),
+        "seccomp",
+        &mut folded,
+    ) {
+        let seccomp_tag = app_provenance_tag(view.seccomp_origin, pal);
+        if view.seccomp.is_empty() {
+            let _ = writeln!(o, "  {h}seccomp:{r} (mandatory denylist){seccomp_tag}");
+        } else {
+            let _ = writeln!(
+                o,
+                "  {h}seccomp:{r} allow {} {dim}(syscalls re-permitted){r}{seccomp_tag}",
+                view.seccomp.join(", ")
+            );
+        }
     }
 
     // Effective host device grant — the app's own ∪ the baseline's. Shown even when empty so the
     // inherited story is visible (a device the app takes from the baseline reads as `inherited`).
-    let devices_tag = app_provenance_tag(view.devices_origin, pal);
-    if view.devices.is_empty() {
-        let _ = writeln!(o, "  {h}devices:{r} (none — minimal /dev){devices_tag}");
-    } else {
+    if posture_shown(
+        details,
+        untouched(view.devices_origin),
+        "devices",
+        &mut folded,
+    ) {
+        let devices_tag = app_provenance_tag(view.devices_origin, pal);
+        if view.devices.is_empty() {
+            let _ = writeln!(o, "  {h}devices:{r} (none — minimal /dev){devices_tag}");
+        } else {
+            let _ = writeln!(
+                o,
+                "  {h}devices:{r} {} {dim}(host device nodes exposed){r}{devices_tag}",
+                view.devices.join(", ")
+            );
+        }
+    }
+
+    // What the fold cost, on one line: every hidden posture named, and the flag that brings them
+    // back. Nothing disappears without saying so — a reader must never have to guess whether a
+    // field is absent because it is unset or because the view chose not to show it.
+    if !folded.is_empty() {
         let _ = writeln!(
             o,
-            "  {h}devices:{r} {} {dim}(host device nodes exposed){r}{devices_tag}",
-            view.devices.join(", ")
+            "  {dim}at their default: {} — see --details{r}",
+            folded.join(", ")
         );
     }
 
@@ -1692,13 +2011,23 @@ fn render_app_detail(
         );
     }
 
-    // Collections: the overlay's own additions and how many baseline entries it inherits. The own
-    // entry lists expand under `--details`; the inherited baseline entries are not re-listed (they
-    // are one hop away in `sbx config show`).
+    // Collections: what the overlay adds, by name, then how many baseline entries it inherits.
+    // Names rather than counts, because the names are what distinguishes this app — `1 own` is
+    // true of half the catalogue. What each entry *is* (a value, a backend line, a credential's
+    // shape and sources) still expands under `--details`; the inherited baseline entries are not
+    // re-listed there either, being one hop away in `sbx config show`.
     let _ = writeln!(
         o,
         "  {h}env:{r}     {}",
-        collection_summary(view.env.len(), view.env_inherited, pal)
+        collection_list(
+            &view
+                .env
+                .iter()
+                .map(|e| format!("{n}{}{r}", e.key))
+                .collect::<Vec<_>>(),
+            view.env_inherited,
+            pal
+        )
     );
     if details {
         for e in &view.env {
@@ -1708,27 +2037,73 @@ fn render_app_detail(
     let _ = writeln!(
         o,
         "  {h}binds:{r}   {}",
-        collection_summary(view.binds.len(), view.binds_inherited, pal)
+        collection_list(
+            &view
+                .binds
+                .iter()
+                .map(|b| format!("{n}{}{r}{}", b.path, bind_mode_tag(b.writable, pal)))
+                .collect::<Vec<_>>(),
+            view.binds_inherited,
+            pal
+        )
     );
-    if details {
-        for b in &view.binds {
-            let _ = writeln!(o, "    {n}{}{r}{}", b.path, bind_mode_tag(b.writable, pal));
-        }
-    }
     let _ = writeln!(
         o,
         "  {h}packages:{r} {}",
-        collection_summary(view.packages.len(), view.packages_inherited, pal)
+        collection_list(
+            &view
+                .packages
+                .iter()
+                .map(|p| package_name_tag(p, pal))
+                .collect::<Vec<_>>(),
+            view.packages_inherited,
+            pal
+        )
     );
     if details {
         for p in &view.packages {
             let _ = writeln!(o, "{}", package_line(p, pal, "    "));
         }
     }
+    // What a link opens with, effective. Listed in full rather than summarised as a count: this is
+    // the answer someone opens this view to find when a sign-in goes nowhere, and it is short.
+    if view.open.is_empty() {
+        let _ = writeln!(
+            o,
+            "  {h}open:{r} {dim}(none — a URI is printed, not opened){r}"
+        );
+    } else {
+        let _ = writeln!(o, "  {h}open:{r}");
+        for e in &view.open {
+            let _ = writeln!(
+                o,
+                "    {n}{}://{r} {} {dim}({}){r}",
+                e.scheme, e.cmd, e.mode
+            );
+        }
+    }
+
+    // The auxiliary processes the cage starts before its command. Listed, never counted, and only
+    // when there are any: this section exists so a second process running beside the app is a line
+    // someone can read rather than a `nohup` buried in a shell script.
+    if !view.service.is_empty() {
+        let _ = writeln!(o, "  {h}service:{r}");
+        for s in &view.service {
+            let _ = writeln!(o, "{}", service_line(s, pal, "    "));
+        }
+    }
     let _ = writeln!(
         o,
         "  {h}secrets:{r} {}",
-        collection_summary(view.secrets.len(), view.secrets_inherited, pal)
+        collection_list(
+            &view
+                .secrets
+                .iter()
+                .map(|s| format!("{n}{}{r} -> {n}{}{r}", s.header, s.to))
+                .collect::<Vec<_>>(),
+            view.secrets_inherited,
+            pal
+        )
     );
     if details {
         for s in &view.secrets {
@@ -1746,12 +2121,63 @@ fn render_app_detail(
     o
 }
 
-/// The compact summary for a per-app collection: `<own> own · inherits <n> baseline`. The own count
-/// rides the name span (the app's own contribution), the inherited count is dim (it lives in the
-/// baseline `sbx config show`).
-fn collection_summary(own: usize, inherited: usize, pal: &style::Palette) -> String {
+/// One per-app collection line: the overlay's own entries, then what it inherits.
+///
+/// `own` arrives already rendered (each entry carries its own spans), because what identifies an
+/// entry differs per collection — a variable's name, a bind's path and mode, a package's name and
+/// backend. Measured before choosing to join them on one line: across every shipped bundle and
+/// profile the widest of these is six packages and four variables, so they fit. The allowlist,
+/// whose rules run to seventy characters each, is listed one per line instead.
+///
+/// The inherited tail is dim (those entries live in the baseline `sbx config show`) and is dropped
+/// when there are none: `· inherits 0 baseline` is a sentence about nothing.
+fn collection_list(own: &[String], inherited: usize, pal: &style::Palette) -> String {
+    let (dim, r) = (pal.dim, pal.reset);
+    let head = if own.is_empty() {
+        format!("{dim}(none){r}")
+    } else {
+        own.join(", ")
+    };
+    if inherited == 0 {
+        head
+    } else {
+        format!("{head}  {dim}· inherits {inherited} baseline{r}")
+    }
+}
+
+/// A package's compact identity for the collection line: its name, its backend, and — in the
+/// caution hue — whether it was withheld. The backend is there because it decides *how* the app
+/// gets the thing (host store, in-cage fetch, downloaded artifact); the withheld marker is there
+/// because a package that will not be installed must never read like one that will.
+fn package_name_tag(p: &config::view::PackageView, pal: &style::Palette) -> String {
+    let (n, warn, dim, r) = (pal.name, pal.warn, pal.dim, pal.reset);
+    match p.withheld_reason {
+        Some(_) => format!("{n}{}{r} {warn}({}, withheld){r}", p.name, p.backend),
+        None => format!("{n}{}{r} {dim}({}){r}", p.name, p.backend),
+    }
+}
+
+/// One `service:` line: the name, the command it runs, and the two qualifiers that change whether
+/// and when it runs. Shared by the baseline section (four spaces) and an app overlay's expansion
+/// (eight), so the two render identically and cannot drift.
+///
+/// The readiness gate is shown because its absence is the interesting half: a service with no gate
+/// means the app starts without waiting for it, which is what someone debugging a race needs to
+/// read. The enable condition is shown because it is the switch — the way to turn this off for one
+/// launch without editing anything.
+fn service_line(s: &config::view::ServiceView, pal: &style::Palette, indent: &str) -> String {
     let (n, dim, r) = (pal.name, pal.dim, pal.reset);
-    format!("{n}{own}{r} own  {dim}· inherits {inherited} baseline{r}")
+    let mut line = format!("{indent}{n}{}{r} {}", s.name, s.cmd);
+    if let Some(ready) = &s.ready {
+        line.push_str(&format!(
+            " {dim}(waits for :{} up to {}s){r}",
+            ready.tcp, ready.timeout_secs
+        ));
+    }
+    if let Some(cond) = &s.enable {
+        line.push_str(&format!(" {dim}[only when {cond}]{r}"));
+    }
+    line
 }
 
 /// One package's detail line, indented by `indent`: `<name> -> <backend>:<locator>  (<detail>)`,
@@ -1916,6 +2342,78 @@ fn reject_app(verb: &str, app: &Option<String>) -> Option<ExitCode> {
     }
 }
 
+/// Whether a write to this scope passes a trust gate at all.
+///
+/// The global config is trusted **by location**: the loader consults no marker for it, so one written
+/// there is never read back. Everything else a write can target (a project `.sbx.toml`, an explicit
+/// `-c` file) is hashed and gated.
+///
+/// One definition, shared by the key-writing verbs and by `edit`, because a second one is exactly how
+/// `edit` came to write a marker nothing reads and report a gate that does not exist.
+fn scope_is_gated(scope: &config::manage::Scope) -> bool {
+    !matches!(scope, config::manage::Scope::Global)
+}
+
+/// Read the trust verdict for a write, **before** the write happens, and refuse the one write that
+/// would bless bytes the user has never approved.
+///
+/// Two answers in one pass, because both come from the same read and both must precede the edit:
+///
+/// - The returned `was_trusted` is what [`report_write_trust`] needs to say whether this edit
+///   re-armed a gate. It has to be read first: the write changes the file, and so its verdict.
+/// - `--trust` on a file that exists and is not trusted is **refused** (exit 2), because the flag
+///   blesses the whole current file — every security field in it, including the ones the user has
+///   not read. It is the same admission [`crate::local_save_permitted`] applies to `sbx net allow
+///   --local`, and calling that function is the point: one definition of when sbx may bless.
+///
+/// The refusal lands before the edit deliberately. Writing and *then* declining to bless would leave
+/// a modified, untrusted file — worse than either outcome, since the user must now review bytes sbx
+/// changed under them.
+///
+/// Scope decides the gate, not the verb: a `-c <file>` target carries a trust marker like any
+/// project config, so it is admitted the same way. Only the global config and the app profiles are
+/// exempt, and they are exempt because they are trusted by *location* — there is no marker to bless.
+fn admit_config_write(
+    verb: &str,
+    path: &Path,
+    gated: bool,
+    trust_flag: bool,
+    store_dir: Option<&Path>,
+) -> Result<bool, ExitCode> {
+    if !gated {
+        return Ok(false);
+    }
+    // No store means no marker can be read and none can be written: `--trust` cannot bless anything,
+    // which `report_write_trust` says in its own words. Nothing to admit.
+    let Some(dir) = store_dir else {
+        return Ok(false);
+    };
+    let state = trust::state(dir, path);
+    if trust_flag && !crate::local_save_permitted(path.exists(), state) {
+        // The two refused states read very differently to whoever hit them. "Never trusted" is a
+        // file you have not vetted; "changed since" is one you *did* vet, whose current bytes are
+        // not the ones you approved — and being told it "is not trusted" there invites the honest
+        // objection that you trusted it yourself. Name the edit instead.
+        let why = if state == trust::TrustState::Changed {
+            "changed since you trusted it"
+        } else {
+            "is not trusted"
+        };
+        diag::error(&format!(
+            "sbx: config {verb}: {} {why} — `--trust` blesses the whole file, \
+             including what you have not read",
+            path.display()
+        ));
+        diag::hint(&format!(
+            "       review it and run `sbx trust {}`, then retry — or use `sbx config edit --trust`, \
+             which opens the file first",
+            path.display()
+        ));
+        return Err(ExitCode::from(2));
+    }
+    Ok(state == trust::TrustState::Trusted)
+}
+
 /// Resolve the file a key-taking verb (`get`/`set`/`unset`) targets and the dotted key within it,
 /// applying the `--app <name>` routing and reporting whether the target is trust-gated.
 ///
@@ -1937,7 +2435,7 @@ fn resolve_key_target(
     cwd: &Path,
 ) -> Result<(PathBuf, String, bool), ExitCode> {
     use config::manage::{self, Scope};
-    let gated = !matches!(scope, Scope::Global);
+    let gated = scope_is_gated(scope);
     let scope_path = |scope: &Scope| {
         manage::scope_path(scope, cwd).map_err(|e| {
             diag::error(&format!("sbx: config: {e}"));
@@ -2001,14 +2499,11 @@ fn config_set(args: &[OsString]) -> ExitCode {
             Ok(t) => t,
             Err(code) => return code,
         };
-    // Capture the trust state before the write — the write itself changes the file and so its
-    // verdict, so "was it trusted" must be read first. A non-gated target (the global config or an
-    // app profile, both trusted by location) carries no marker, so the read is skipped.
     let store_dir = trust::default_store_dir();
-    let was_trusted = gated
-        && store_dir
-            .as_deref()
-            .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+    let was_trusted = match admit_config_write("set", &path, gated, trust, store_dir.as_deref()) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
 
     match config::manage::set(&path, &key, val) {
         Ok(created) => {
@@ -2073,13 +2568,11 @@ fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
             Ok(t) => t,
             Err(code) => return code,
         };
-    // Read the trust verdict before the write, exactly as `set` does: the write changes the file and
-    // so its verdict, and a no-op must not report a re-arming that did not happen.
     let store_dir = trust::default_store_dir();
-    let was_trusted = gated
-        && store_dir
-            .as_deref()
-            .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+    let was_trusted = match admit_config_write(verb, &path, gated, trust, store_dir.as_deref()) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
 
     let outcome = match op {
         ListEdit::Add => config::manage::add(&path, &key, entry),
@@ -2145,10 +2638,10 @@ fn config_unset(args: &[OsString]) -> ExitCode {
             Err(code) => return code,
         };
     let store_dir = trust::default_store_dir();
-    let was_trusted = gated
-        && store_dir
-            .as_deref()
-            .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+    let was_trusted = match admit_config_write("unset", &path, gated, trust, store_dir.as_deref()) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
 
     match config::manage::unset(&path, &key) {
         Ok(true) => {
@@ -2258,6 +2751,10 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
 /// positional so it needs no quoting. Because the trust gate hashes the whole file, an edit that
 /// changes a trusted file re-arms it — detected after the editor exits (the verdict becomes
 /// Changed) and warned, or applied at once with `--trust`.
+///
+/// All of that is about a **gated** target. The global config is trusted by location, so it has no
+/// marker to re-arm and none to write: `--trust` there is answered with the note the key-writing
+/// verbs give, and nothing is stored. See [`scope_is_gated`].
 fn config_edit(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,
@@ -2301,10 +2798,20 @@ fn config_edit(args: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Whether this target passes a trust gate at all. A non-gated one (the global config) carries no
+    // marker: writing one would leave a file nothing ever reads, and reporting one would announce a
+    // gate that does not exist. Both are settled before the editor runs, so the answer cannot depend
+    // on what was saved.
+    //
+    // This verb deliberately skips [`admit_config_write`]: `--trust` here blesses a file the editor
+    // just showed, which is the one case where blessing bytes sbx did not author is what the user
+    // asked for. It is the escape hatch the other four verbs point at when they refuse.
+    let gated = scope_is_gated(&scope);
     let store_dir = trust::default_store_dir();
-    let was_trusted = store_dir
-        .as_deref()
-        .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
+    let was_trusted = gated
+        && store_dir
+            .as_deref()
+            .is_some_and(|d| trust::state(d, &path) == trust::TrustState::Trusted);
 
     let editor_os = std::env::var_os("VISUAL")
         .or_else(|| std::env::var_os("EDITOR"))
@@ -2327,7 +2834,17 @@ fn config_edit(args: &[OsString]) -> ExitCode {
         }
     }
 
-    if trust_flag {
+    if !gated {
+        // Say so only when `--trust` was asked for: the flag is what carries the mistaken belief,
+        // and an unasked-for note on every global edit would be noise. The same sentence the
+        // key-writing verbs use, since it is the same fact.
+        if trust_flag {
+            diag::note(&format!(
+                "{} is trusted by location; `--trust` is not needed",
+                path.display()
+            ));
+        }
+    } else if trust_flag {
         match store_dir.as_deref() {
             Some(dir) => match trust::trust(dir, &path) {
                 Ok(()) => {
@@ -2554,6 +3071,8 @@ mod tests {
     fn sample_config_view() -> config::view::ConfigView {
         use config::view::*;
         ConfigView {
+            open: vec![],
+            service: vec![],
             plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
@@ -2644,6 +3163,86 @@ mod tests {
             apps: vec![],
             warnings: vec![],
         }
+    }
+
+    /// A section renders on its own, which is the point of splitting the renderer up: before, the
+    /// only way to ask "what does `limits` print when nothing overrode it?" was to build a whole
+    /// view, render all fifty sections, and search the result.
+    ///
+    /// `limits` is the case worth pinning because **both** of its answers are meaningful: silence
+    /// when every field is a built-in default (a config that tuned nothing must not grow a line
+    /// saying so), and one line naming each field's own layer when any was overridden. A `contains`
+    /// check on the whole render can see the second; only calling the section can see the first.
+    #[test]
+    fn the_limits_section_is_silent_until_a_layer_overrides_one() {
+        use config::view::{LimitView, LimitsView, ProvenanceView};
+        let plain = style::Palette::plain();
+        let mut view = sample_config_view();
+
+        view.limits = LimitsView {
+            memory_high: LimitView {
+                value: "80%".into(),
+                origin: ProvenanceView::Default,
+            },
+            memory_max: LimitView {
+                value: "90%".into(),
+                origin: ProvenanceView::Default,
+            },
+            tasks_max: LimitView {
+                value: "16384".into(),
+                origin: ProvenanceView::Default,
+            },
+        };
+        assert_eq!(
+            limits_section(&view, &plain),
+            None,
+            "a config that tuned no limit must print no limits line"
+        );
+
+        view.limits.tasks_max = LimitView {
+            value: "4096".into(),
+            origin: ProvenanceView::Project,
+        };
+        let shown = limits_section(&view, &plain).expect("an overridden limit is shown");
+        assert_eq!(
+            shown,
+            "  limits: MemoryHigh=80% (default), MemoryMax=90% (default), TasksMax=4096 (project)\n",
+            "each field carries its own provenance, so the line says which one was tuned"
+        );
+    }
+
+    /// The collection sections state their emptiness the same way, and nothing else checks it: the
+    /// render assertions pin the absence of a `limits` and a `redact` line, but a `secrets`,
+    /// `plugins`, `tasks` or `apps` header that started appearing on a config declaring none would
+    /// pass every one of them. Calling the four with empty inputs is the only place that says a
+    /// config which declared nothing announces nothing.
+    ///
+    /// `secrets` then carries the second half, compared whole rather than by fragment, because what
+    /// it must print is exactly a locator: header, destination, shape and source name, and no value.
+    #[test]
+    fn a_collection_section_stays_silent_on_an_empty_collection() {
+        let plain = style::Palette::plain();
+        assert_eq!(secrets_section(&[], &plain), None, "no secret, no header");
+        assert_eq!(plugins_section(&[], &plain), None, "no plugin, no header");
+        assert_eq!(tasks_section(&[], &plain), None, "no task, no header");
+        assert_eq!(
+            apps_section(&[], &plain, true),
+            None,
+            "no app profile, no roster"
+        );
+
+        let secrets = vec![config::view::SecretView {
+            header: "Authorization".into(),
+            to: "https://api.example.com".into(),
+            shape: "bearer".into(),
+            sources: "env EXAMPLE_TOKEN".into(),
+        }];
+        assert_eq!(
+            secrets_section(&secrets, &plain).expect("a declared secret is listed"),
+            "  secrets (injected host-side by the egress proxy):\n    \
+             Authorization -> https://api.example.com  (bearer, from env EXAMPLE_TOKEN)\n",
+            "a credential is shown by destination and locator, never by value"
+        );
     }
 
     #[test]
@@ -3024,6 +3623,8 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let view = AppDetailView {
+            open: vec![],
+            service: vec![],
             provisions: Vec::new(),
             fs_deny: Vec::new(),
             fs_origin: Default::default(),
@@ -3108,16 +3709,21 @@ mod tests {
         assert!(out.contains("cmd:     demo-agent  (app:global)"), "{out}");
         assert!(out.contains("gui:     none  (inherited)"), "{out}");
         assert!(out.contains("network: deny  (app:global)"), "{out}");
-        assert!(out.contains("(1 allow, 0 deny — see --details)"), "{out}");
+        // The policy is listed in the compact view, not counted: which hosts the app may reach is
+        // what this view is opened for.
+        assert!(out.contains("    allow api.example.com"), "{out}");
         // Per-field limits: two inherited from the baseline, the task cap set by the app.
         assert!(out.contains("MemoryHigh=70% (inherited)"), "{out}");
         assert!(out.contains("TasksMax=2048 (app:project)"), "{out}");
-        // Collections summarize the overlay's own count and the inherited baseline count.
-        assert!(out.contains("1 own  · inherits 2 baseline"), "{out}");
+        // Collections name the overlay's own entries and count what they inherit.
+        assert!(out.contains("DEMO_TOKEN  · inherits 2 baseline"), "{out}");
+        assert!(!out.contains(" own  ·"), "{out}");
 
-        // Details expand the allowlist rules and the overlay's own env entries.
+        // Details add what the compact view keeps back: each variable's value, and the built-in
+        // set every app shares.
         let detailed = render_app_detail(&view, &p, true);
         assert!(detailed.contains("    allow api.example.com"), "{detailed}");
+        assert!(detailed.contains("built-in (always allowed"), "{detailed}");
         assert!(
             detailed.contains("    DEMO_TOKEN=placeholder"),
             "{detailed}"
@@ -3240,6 +3846,8 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let app = |name: &str, limits: Option<AppLimitsView>| AppView {
+            open: vec![],
+            service: vec![],
             provisions: Vec::new(),
             fs_deny: Vec::new(),
             fs_readonly: Vec::new(),
@@ -3300,6 +3908,8 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            open: vec![],
+            service: vec![],
             plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
@@ -3370,6 +3980,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                open: vec![],
+                service: vec![],
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
@@ -3431,6 +4043,8 @@ mod tests {
         // a profile's app-overlay allowlist surfaces what `sbx app <name>` can actually reach.
         use config::view::*;
         let view = ConfigView {
+            open: vec![],
+            service: vec![],
             plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
@@ -3482,6 +4096,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                open: vec![],
+                service: vec![],
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
@@ -3558,6 +4174,8 @@ mod tests {
         // with or without `--details` — the default render is enough to pin them.
         use config::view::*;
         let app = |name: &str, network: Option<AppNetworkView>, gui: Option<GuiView>| AppView {
+            open: vec![],
+            service: vec![],
             provisions: Vec::new(),
             fs_deny: Vec::new(),
             fs_readonly: Vec::new(),
@@ -3581,6 +4199,8 @@ mod tests {
             notes: vec![],
         };
         let view = ConfigView {
+            open: vec![],
+            service: vec![],
             plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
@@ -3664,6 +4284,8 @@ mod tests {
         // profile's credential surfaces in `sbx config` (the baseline `secrets` section is empty).
         use config::view::*;
         let view = ConfigView {
+            open: vec![],
+            service: vec![],
             plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
@@ -3715,6 +4337,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                open: vec![],
+                service: vec![],
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
@@ -3787,6 +4411,8 @@ mod tests {
         // profile's overlay env/binds surface, mirroring the baseline `env`/`binds` sections.
         use config::view::*;
         let view = ConfigView {
+            open: vec![],
+            service: vec![],
             plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
@@ -3838,6 +4464,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                open: vec![],
+                service: vec![],
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
@@ -3910,6 +4538,8 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
+            open: vec![],
+            service: vec![],
             plugins: vec![],
             fs_deny: Vec::new(),
             tasks: Vec::new(),
@@ -3961,6 +4591,8 @@ mod tests {
             limits: Default::default(),
             secrets: vec![],
             apps: vec![AppView {
+                open: vec![],
+                service: vec![],
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),

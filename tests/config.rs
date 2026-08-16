@@ -20,9 +20,16 @@ impl TmpDir {
         // other e2e suites. This one is fixed on purpose — the sibling suites honour a
         // `SBX_TEST_TMPDIR` override, but here the location is what the assertions rest on, and
         // pointing it at `/tmp` would reintroduce the very nesting the tests must not see.
+        //
+        // The name is kept short for a measured reason: one of these dirs becomes
+        // `$XDG_DATA_HOME`, and a data directory over 74 bytes is refused outright (it could not
+        // host the sockets sbx binds under it). With the previous `sbx-config-it-<pid>-<n>` and a
+        // 7-digit pid, this suite sat *at* that cap — a four-digit counter, an eight-digit pid or
+        // a longer checkout path would have taken the store away from every test in it, without
+        // any test saying so.
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         d.push("target/test-tmp");
-        d.push(format!("sbx-config-it-{}-{n}", std::process::id()));
+        d.push(format!("cfg-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)
     }
@@ -2250,8 +2257,10 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
     let fx = Fixture::new();
     // A baseline `[limits]` (global, trusted by location) the app inherits, plus a profile (also
     // trusted by location) that sets its own command, network, and one limit. `config show --app`
-    // then tells the inheritance story end-to-end: the fields the app set read `app:global`, the
-    // ones it left alone read `inherited` and show the baseline's effective value.
+    // then tells the inheritance story end-to-end, in three parts: a field the app set reads
+    // `app:global`, one it left to a baseline layer that set it reads `inherited` at the
+    // baseline's value, and one no layer set at all reads `default` — folded out of the default
+    // view rather than presented as something a config carries.
     fx.write_global("[limits]\nmemory_high = \"70%\"\n");
     fx.write_profile(
         "demo",
@@ -2275,19 +2284,36 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
         stdout.contains("TasksMax=2048 (app:global)"),
         "the task cap the app set must read app:global:\n{stdout}"
     );
-    // The app left these alone — inherited from the baseline (the throttle the baseline set; the
-    // GUI default). This is the headline the per-app view exists for.
-    assert!(
-        stdout.contains("gui:     none  (inherited)"),
-        "the untouched gui must read inherited:\n{stdout}"
-    );
+    // The app left this one alone and the baseline set it — `inherited`, at the baseline's value.
+    // This is the headline the per-app view exists for.
     assert!(
         stdout.contains("MemoryHigh=70% (inherited)"),
         "the throttle the app left to the baseline must read inherited at the baseline's value:\n{stdout}"
     );
+    // The GUI is a different case that used to render the same way: nobody set it, at either
+    // layer. It reads `default` (not `inherited` — no config carries it) and is folded out of the
+    // default view, named on the summary line instead.
     assert!(
-        stdout.contains("env:     1 own"),
-        "the overlay's own env count must show:\n{stdout}"
+        !stdout.contains("gui:"),
+        "a posture nobody configured must not crowd the default view:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("at their default: proc, notify, gui, gpu, audio, dbus, forward")
+            && stdout.contains("— see --details"),
+        "the fold must name what it hid and the flag that shows it:\n{stdout}"
+    );
+    let detailed = String::from_utf8_lossy(
+        &fx.run(&["config", "show", "--app", "demo", "--details"])
+            .stdout,
+    )
+    .to_string();
+    assert!(
+        detailed.contains("gui:     none  (default)"),
+        "--details must bring it back, tagged for what it is:\n{detailed}"
+    );
+    assert!(
+        stdout.contains("env:     DEMO_TOKEN"),
+        "the overlay's own env is named, not counted — `1 own` is true of half the catalogue:\n{stdout}"
     );
 
     // An unknown app fails and names the declared ones.
@@ -2312,7 +2338,11 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
         doc["cmd_origin"], "Global",
         "the JSON carries the command's provenance"
     );
-    assert_eq!(doc["gui_origin"], "Inherited", "and the inherited GUI's");
+    assert_eq!(
+        doc["gui_origin"], "Default",
+        "a field no layer set is `Default`, not `Inherited` — the JSON carries the same three-way \
+         answer the text view does"
+    );
 }
 
 #[test]
@@ -2339,16 +2369,18 @@ fn a_mode_less_app_network_inherits_the_baseline_mode() {
         "a mode-less app must inherit the baseline's `ask`, not fall back to `deny`:\n{stdout}"
     );
     assert!(
-        stdout.contains("1 allow"),
-        "the app keeps its own allow-list:\n{stdout}"
+        stdout.contains("allow {GET,HEAD} https://api.example.com"),
+        "the app keeps its own allow-list, and the rule itself is what the default view shows \
+         (a count would send the reader to a second command to learn what it reaches):\n{stdout}"
     );
 
-    // `--details` lists the app's own rule under the inherited `ask` posture.
+    // `--details` adds what the default view leaves out: the always-allowed built-in set, which is
+    // the same for every app and decides nothing about this one.
     let out = fx.run(&["config", "show", "--app", "demo", "--details"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("api.example.com"),
-        "the app's own rule must be listed:\n{stdout}"
+        stdout.contains("built-in (always allowed"),
+        "--details must surface the built-in set the default view keeps out:\n{stdout}"
     );
 }
 
@@ -2384,8 +2416,9 @@ fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("0 own  · inherits 0 baseline"),
-        "a narrowed network drops the inherited credential in the view:\n{stdout}"
+        stdout.contains("secrets: (none)") && !stdout.contains("secrets: (none)  ·"),
+        "a narrowed network drops the inherited credential in the view, and with nothing left to \
+         inherit the tail is dropped too:\n{stdout}"
     );
     assert!(
         stdout.contains("ignoring 1 HTTP-header secret(s)"),
@@ -4125,6 +4158,258 @@ fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
 }
 
 #[test]
+fn config_edit_global_trust_writes_no_marker_and_says_why() {
+    use std::os::unix::fs::PermissionsExt;
+    // The global config is trusted **by location**: the loader consults no marker for it. A
+    // `--trust` here used to write one anyway and print "the whole file is now trusted", which is a
+    // gate the reader does not have — the marker is never read back, so the sentence describes
+    // nothing. The four key-writing verbs already answered this case; `edit` never computed it.
+    let fx = Fixture::new();
+    let editor = fx.bind_dir.path().join("global-editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf '[env]\\nGLOBAL = \"yes\"\\n' >> \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = fx
+        .sbx(&["config", "edit", "--global", "--trust"])
+        .env("EDITOR", &editor)
+        .env_remove("VISUAL")
+        .output()
+        .expect("spawn sbx");
+    assert!(out.status.success(), "edit should exit 0");
+
+    // The editor ran, so this is not a pass by refusing the command.
+    let global = fx.config_home.path().join("sbx/sbx.toml");
+    assert!(
+        std::fs::read_to_string(&global)
+            .unwrap_or_default()
+            .contains("GLOBAL = \"yes\""),
+        "the editor must have run on the global file"
+    );
+
+    // The assertion that matters is on the store, not on the words: nothing was written there.
+    let store = fx.state_home.path().join("sbx/trusted");
+    let markers: Vec<_> = std::fs::read_dir(&store)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(
+        markers.is_empty(),
+        "a trust marker for the global config is never read back, so none must be written: \
+         {markers:?}"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stderr.contains("trusted by location"),
+        "`--trust` must be answered with why it is not needed:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("now trusted"),
+        "it must not claim a gate the global config does not have:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_key_write_refuses_to_bless_a_project_the_user_never_approved() {
+    // `--trust` blesses the **whole current file**, so on a config that was never trusted it would
+    // activate every security field in it — including ones the user has not read. `sbx net allow
+    // --local` and `sbx proc allow --local` already refuse that (they re-trust unconditionally, so
+    // they must be admitted first); the four key-writing verbs blessed unconditionally. The rule
+    // both sides now share: sbx blesses the delta it authored, never content the user has not
+    // approved.
+    //
+    // Each of the four verbs is exercised, because each calls the admission from its own body: a
+    // fifth that read the trust state inline is exactly how this hole would grow back.
+    let hostile = "[packages]\nevil = \"nix:hello\"\n\n[network]\nmode = \"shared\"\nallow = [\"a.example.com\"]\n";
+    let cases: [&[&str]; 4] = [
+        &["config", "set", "--local", "--trust", "env.FOO", "bar"],
+        &[
+            "config",
+            "add",
+            "--local",
+            "--trust",
+            "network.allow",
+            "b.example.com",
+        ],
+        &[
+            "config",
+            "rm",
+            "--local",
+            "--trust",
+            "network.allow",
+            "a.example.com",
+        ],
+        &["config", "unset", "--local", "--trust", "network.mode"],
+    ];
+
+    for args in cases {
+        let fx = Fixture::new();
+        fx.write_project(hostile);
+        let out = fx.run(args);
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{}` must refuse with exit 2:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The refusal lands *before* the write. Writing and then declining to bless would leave a
+        // modified untrusted file — the user would have to review bytes sbx changed under them.
+        let on_disk = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+        assert_eq!(
+            on_disk,
+            hostile,
+            "`{}` must not have touched the file",
+            args.join(" ")
+        );
+
+        // The assertion that matters is on the store, not on the words: nothing was blessed.
+        let store = fx.state_home.path().join("sbx/trusted");
+        let markers: Vec<_> = std::fs::read_dir(&store)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            markers.is_empty(),
+            "`{}` must have blessed nothing: {markers:?}",
+            args.join(" ")
+        );
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("config edit --trust"),
+            "the refusal must name the way through — the editor shows the file first:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_key_write_refuses_a_file_that_changed_since_it_was_approved() {
+    // The other refused state, and the one the help text and the guide both promise: "never
+    // trusted, **or changed since**". A file you vetted, then hand-edited, no longer holds the bytes
+    // you approved — the edit is precisely what `--trust` would bless unread. The message says so in
+    // its own words rather than claiming the file "is not trusted", which the user would rightly
+    // dispute: they trusted it themselves.
+    let fx = Fixture::new();
+    fx.write_project("[packages]\ngood = \"nix:hello\"\n");
+    assert!(
+        fx.run(&["trust", ".sbx.toml"]).status.success(),
+        "the fixture must start from an approved file"
+    );
+    let tampered = "[packages]\ngood = \"nix:hello\"\n\n[network]\nmode = \"shared\"\n";
+    fx.write_project(tampered);
+
+    let out = fx.run(&["config", "set", "--local", "--trust", "env.FOO", "bar"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an edit made outside sbx must not be blessed by a write:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap(),
+        tampered,
+        "the file must be left alone"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("changed since you trusted it"),
+        "the refusal must name the edit, not deny a trust the user did grant:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_one_shot_config_file_is_admitted_by_scope_like_any_other() {
+    // `-c <file>` is gated too, and that is a decision rather than an inheritance: `sbx net allow`
+    // and `sbx proc allow` refuse `-c` outright, so there was no precedent to copy. The rule chosen
+    // is that the *scope* decides, not the verb — a `-c` file carries a trust marker like any
+    // project config, so blessing it unread is the same act. The exempt targets are the ones with no
+    // marker at all (the global config, the app profiles), which are trusted by location.
+    //
+    // Both answers are pinned, because an over-broad guard would be just as wrong as none: an
+    // absent file still bootstraps, since sbx's write is then the whole content.
+    let fx = Fixture::new();
+    let existing = fx.proj.path().join("other.toml");
+    std::fs::write(&existing, "[packages]\nevil = \"nix:hello\"\n").unwrap();
+
+    let out = fx.run(&[
+        "config",
+        "set",
+        "-c",
+        "other.toml",
+        "--trust",
+        "env.FOO",
+        "bar",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an existing, never-approved `-c` file is not blessed either:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap(),
+        "[packages]\nevil = \"nix:hello\"\n",
+        "the file must be left alone"
+    );
+
+    let out = fx.run(&[
+        "config",
+        "set",
+        "-c",
+        "fresh.toml",
+        "--trust",
+        "env.FOO",
+        "bar",
+    ]);
+    assert!(
+        out.status.success(),
+        "an absent file bootstraps: sbx's own write is the whole content:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(fx.proj.path().join("fresh.toml"))
+            .unwrap()
+            .contains("FOO"),
+        "the bootstrap write must have landed"
+    );
+}
+
+#[test]
+fn a_key_write_still_re_trusts_a_project_the_user_had_approved() {
+    // The other half, and the reason the refusal is scoped to the never-approved case: `--trust`
+    // exists so a write to a file you already vetted does not need a second command. The trust gate
+    // hashes the whole file, so sbx's own edit re-arms it; blessing that delta is blessing sbx's
+    // work, not a stranger's.
+    let fx = Fixture::new();
+    fx.write_project("[packages]\ngood = \"nix:hello\"\n");
+    assert!(
+        fx.run(&["trust", ".sbx.toml"]).status.success(),
+        "the fixture must start from an approved file"
+    );
+
+    let out = fx.run(&["config", "set", "--local", "--trust", "env.FOO", "bar"]);
+    assert!(
+        out.status.success(),
+        "a write to an approved file keeps working:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Blessed for real: the security field the file declares still applies after the write.
+    let show = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        stdout.contains("good -> nix:hello  (host-side, durable)"),
+        "the re-trust must have taken, so the package is not withheld:\n{stdout}"
+    );
+}
+
+#[test]
 fn an_untrusted_seccomp_relaxation_is_dropped_but_trusting_applies_it() {
     // `[seccomp] allow` re-permits denied syscalls in the cage — a security field, so an untrusted
     // project's relaxation is dropped (loosening the kernel-attack-surface control), and applied
@@ -4592,5 +4877,194 @@ fn fs_masks_are_honored_untrusted_and_surfaced_in_config_show() {
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("fs deny:"),
         "the refused entry must not be presented as effective"
+    );
+}
+
+#[test]
+fn an_unusable_data_directory_is_explained_once_not_once_per_layer() {
+    // Every layer that needs the store resolves the layout for itself, so a data directory too
+    // long for the sockets sbx binds under it was refused — correctly — once per layer: nine
+    // identical lines for `sbx config show`, seven for `--app`. The refusal is one fact about the
+    // environment and must read as one.
+    let fx = Fixture::new();
+
+    // The overlong component is named here rather than inherited from the fixture root, so the
+    // refusal fires whatever the build tree measures. A test that relied on the root being long
+    // enough would quietly stop exercising anything on a shorter checkout.
+    let long = fx.bind_dir.path().join("d".repeat(120));
+    std::fs::create_dir_all(&long).unwrap();
+
+    let out = fx
+        .sbx(&["config", "show"])
+        .env("XDG_DATA_HOME", &long)
+        .output()
+        .expect("spawn sbx");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let spoken = stderr.matches("sbx's data directory is").count();
+
+    // Precondition before the count: zero occurrences would mean the scenario stopped reproducing
+    // (or that the gate swallowed the diagnostic outright), which must fail rather than pass as
+    // "no duplicates".
+    assert!(
+        spoken >= 1,
+        "the overlong data directory must still be refused:\n{stderr}"
+    );
+    assert_eq!(
+        spoken, 1,
+        "the refusal belongs to the environment, not to each layer that consults it:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_posture_nobody_configured_folds_and_one_a_layer_set_stays() {
+    // The 14.3 inversion: ten posture lines at their built-in default crowded out the handful of
+    // fields that tell one app from another. What decides is who set the value, so the pair here
+    // differs only in that: `notify` is set by the baseline (visible, `inherited`), `gui` by
+    // nobody (folded, named on the summary line). Both are untouched by the app itself.
+    let fx = Fixture::new();
+    fx.write_global("[notify]\nmode = \"off\"\n");
+    fx.write_profile("demo", "cmd = \"demo-agent\"\n");
+
+    let out = fx.run(&["config", "show", "--app", "demo"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("notify:  off  (inherited)"),
+        "a posture a config layer set must stay in the default view:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("gui:") && !stdout.contains("gpu:") && !stdout.contains("devices:"),
+        "postures nobody set must not be printed by default:\n{stdout}"
+    );
+    // Named, not silently dropped — and `notify` is absent from the list precisely because it was
+    // configured, which is what makes this line load-bearing rather than decorative.
+    assert!(
+        stdout.contains("at their default: proc, gui, gpu, audio, dbus, limits, forward, seccomp, devices — see --details"),
+        "the summary must name every folded posture, in order, and exclude the configured one:\n{stdout}"
+    );
+
+    // `--details` is the full picture: every posture back, none of them summarised away.
+    let out = fx.run(&["config", "show", "--app", "demo", "--details"]);
+    let detailed = String::from_utf8_lossy(&out.stdout);
+    for field in [
+        "proc:", "notify:", "gui:", "gpu:", "audio:", "dbus:", "limits:", "forward:", "seccomp:",
+        "devices:",
+    ] {
+        assert!(
+            detailed.contains(field),
+            "--details must show `{field}`:\n{detailed}"
+        );
+    }
+    assert!(
+        !detailed.contains("at their default:"),
+        "nothing is folded under --details, so the summary line must not appear:\n{detailed}"
+    );
+
+    // The whole set, on a profile that declares nothing but its command: all ten fold, in order.
+    // This is the guard for the wiring itself — a posture added to the view without its fold would
+    // print at its default forever, and only a test that pins the complete list would notice.
+    let fx = Fixture::new();
+    fx.write_profile("bare", "cmd = \"demo-agent\"\n");
+    let out = fx.run(&["config", "show", "--app", "bare"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "at their default: proc, notify, gui, gpu, audio, dbus, limits, forward, seccomp, \
+             devices — see --details"
+        ),
+        "with nothing configured, every posture folds and every one is named:\n{stdout}"
+    );
+}
+
+#[test]
+fn an_apps_own_entries_are_named_not_counted() {
+    // The other half of the 14.3 inversion: `env: 1 own · inherits 0 baseline` is true of half the
+    // catalogue and says nothing about *this* app. The names are the distinguishing part, and they
+    // fit on a line: measured across every shipped bundle and profile, the widest own collection is
+    // six packages and four variables.
+    let fx = Fixture::new();
+    fx.write_global("[env]\nBASE_ONLY = \"1\"\n");
+    let target = fx.bind_target("workspace");
+    fx.write_profile(
+        "demo",
+        &format!(
+            "cmd = \"demo-agent\"\n[env]\nOWN_TOKEN = \"placeholder\"\n\
+             [[binds]]\npath = \"{}\"\nmode = \"rw\"\n\
+             [packages]\nripgrep = \"nix:ripgrep\"\n",
+            target.display()
+        ),
+    );
+
+    let out = fx.run(&["config", "show", "--app", "demo"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("env:     OWN_TOKEN") && stdout.contains("· inherits 1 baseline"),
+        "the app's own variable is named, and what it inherits is still counted (those entries \
+         live one hop away, in the baseline view):\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(" own  ·"),
+        "no collection may present itself as a bare count any more:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("workspace") && stdout.contains("(rw)"),
+        "a bind is named by its path, with the mode that makes it more than read-only:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("packages: ripgrep (nix)"),
+        "a package is named with the backend that decides how the app gets it:\n{stdout}"
+    );
+    // Nothing inherited, nothing owned: the line states the absence rather than counting to zero,
+    // and drops the tail that would say `· inherits 0 baseline`.
+    assert!(
+        stdout.contains("secrets: (none)\n"),
+        "an empty collection states the absence, without a tail about nothing:\n{stdout}"
+    );
+}
+
+#[test]
+fn the_network_policy_is_listed_but_its_machinery_stays_behind_details() {
+    // What the app may reach is the answer someone opens this view to find, so the rules are listed.
+    // What rides `--details` is what decides nothing about reachability: `mute` only silences an
+    // already-permitted request in the log, `http2` picks a transport, and the built-in set is the
+    // same for every app on the machine.
+    let fx = Fixture::new();
+    fx.write_profile(
+        "demo",
+        "cmd = \"demo-agent\"\n[network]\nmode = \"deny\"\n\
+         allow = [\"api.example.com\"]\ndeny = [\"evil.example.com\"]\n\
+         mute = [\"noise.example.com\"]\nhttp2 = [\"api.example.com\"]\n",
+    );
+
+    let out = fx.run(&["config", "show", "--app", "demo"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("allow {GET,HEAD} https://api.example.com"),
+        "an allow rule must be readable without a second command:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("deny") && stdout.contains("evil.example.com"),
+        "a deny rule too — it is the half that overrides the other:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("noise.example.com") && !stdout.contains("built-in"),
+        "the machinery must not ride the default view:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(1 mute, 1 http2 — see --details)"),
+        "what was kept back is counted and named, with the flag that shows it:\n{stdout}"
+    );
+
+    let out = fx.run(&["config", "show", "--app", "demo", "--details"]);
+    let detailed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        detailed.contains("noise.example.com")
+            && detailed.contains("built-in")
+            && detailed.contains("deny wins over allow"),
+        "--details is where the machinery lives:\n{detailed}"
     );
 }

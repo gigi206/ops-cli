@@ -251,3 +251,151 @@ fn upgrade_resolves_and_locks_the_default_channel() {
         String::from_utf8_lossy(&again.stdout)
     );
 }
+
+/// Write an app profile at `<config>/sbx/apps/<name>.toml` — an imported profile, trusted by
+/// location, so its packages are admitted without a trust gate standing in the way.
+fn write_profile(config_home: &Path, name: &str, body: &str) {
+    let dir = config_home.join("sbx/apps");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
+}
+
+fn app_upgrade(config: &Path, data: &Path, proj: &Path, name: &str) -> std::process::Output {
+    sbx()
+        .args(["app", "upgrade", name])
+        .current_dir(proj)
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_DATA_HOME", data)
+        .env("LC_ALL", "C.UTF-8")
+        .output()
+        .expect("spawn sbx app upgrade")
+}
+
+/// The routing case, which is what sixteen of the shipped profiles are: every package the app rides
+/// is pinned in a project-wide lock, so the verb names the channel that advances it and rolls
+/// nothing itself.
+///
+/// The load-bearing half is the negative one. A per-app verb that quietly rewrote the project's
+/// `nix:` lock would look identical in a test that only checked the exit code, and would advance
+/// every other app in the project under a command that reads as "only this one". So this asserts
+/// that neither in-cage roll announced itself, and that the run needed no nix at all — it completes
+/// where `sbx upgrade nix` would have to be skipped for want of one.
+#[test]
+fn app_upgrade_names_the_project_wide_channels_and_rolls_nothing_itself() {
+    let (config, data, proj) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    write_profile(
+        config.path(),
+        "reader",
+        "cmd = [\"reader\"]\n\
+         [packages]\n\
+         reader = \"deb:https://example.invalid/reader.deb\"\n\
+         toolkit = \"nix:hello\"\n",
+    );
+
+    let out = app_upgrade(config.path(), data.path(), proj.path(), "reader");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}");
+    assert!(stdout.contains("sbx app upgrade — reader"), "{stdout}");
+    // Both channels named, each with the command that rolls it.
+    assert!(stdout.contains("`deb:`, `nix:`"), "{stdout}");
+    assert!(
+        stdout.contains("`sbx upgrade deb`, `sbx upgrade nix`"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("not with one app"), "{stdout}");
+    // And nothing was rolled: neither in-cage roll prints its header.
+    assert!(
+        !stdout.contains("mise packages") && !stdout.contains("install steps"),
+        "a project-wide-only app builds no cage:\n{stdout}"
+    );
+}
+
+/// The two refusals a name can earn, each with its own answer and its own exit code.
+#[test]
+fn app_upgrade_refuses_a_name_that_is_not_a_launchable_app() {
+    let (config, data, proj) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    write_profile(config.path(), "ghost", "[packages]\nx = \"nix:hello\"\n");
+
+    // A name no app carries — the typo, pointed at the listing.
+    let unknown = app_upgrade(config.path(), data.path(), proj.path(), "nope");
+    assert_eq!(unknown.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("no app named `nope`"), "{stderr}");
+    assert!(stderr.contains("sbx app ls"), "{stderr}");
+    // The verb names itself, not the channel command it shares the sentence with.
+    assert!(stderr.contains("sbx: app upgrade:"), "{stderr}");
+
+    // An app with no command never launches, so there is no cage to roll anything in.
+    let dead = app_upgrade(config.path(), data.path(), proj.path(), "ghost");
+    assert_eq!(dead.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&dead.stderr);
+    assert!(stderr.contains("declares no command"), "{stderr}");
+}
+
+/// An app that declares nothing at all says so, rather than printing a header and exiting 0 —
+/// which would read as a roll that happened.
+#[test]
+fn app_upgrade_says_when_an_app_declares_nothing_to_advance() {
+    let (config, data, proj) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    write_profile(config.path(), "bare", "cmd = [\"bare\"]\n");
+
+    let out = app_upgrade(config.path(), data.path(), proj.path(), "bare");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}");
+    assert!(stdout.contains("nothing to advance"), "{stdout}");
+}
+
+/// A routing answer is complete even when the data directory is unusable.
+///
+/// The property under test is that the answer does **not depend on the store**: sixteen of the
+/// shipped profiles roll nothing at all, and for them this verb is a question about where their
+/// packages advance, which the config alone answers. Pinned against a directory sbx refuses (too
+/// long to hold a Unix socket path), so a change that made the routing path reach for the store
+/// would turn a clean reply into a failure here.
+///
+/// It deliberately does **not** assert the refusal is silent. `config::load` resolves the data
+/// directory to discover resolver plugins, so every verb that loads config reports an unusable one
+/// once; that is the product's existing behaviour, not this verb's, and asserting otherwise would
+/// pin a claim the binary does not make.
+#[test]
+fn a_routing_answer_survives_an_unusable_data_directory() {
+    let (config, data, proj) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    write_profile(
+        config.path(),
+        "reader",
+        "cmd = [\"reader\"]\n[packages]\nreader = \"nix:hello\"\n",
+    );
+    // Past the 74-byte cap the socket paths impose.
+    let long = data.path().join("d".repeat(80));
+    std::fs::create_dir_all(&long).unwrap();
+
+    let run = |args: &[&str]| {
+        sbx()
+            .args(args)
+            .current_dir(proj.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("XDG_DATA_HOME", &long)
+            .env("LC_ALL", "C.UTF-8")
+            .output()
+            .expect("spawn sbx")
+    };
+
+    // The fixture really is over the cap: a verb that needs the store says so.
+    let control = run(&["app", "ls"]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("data directory"),
+        "the fixture must actually trip the length cap; stderr:\n{}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    let out = run(&["app", "upgrade", "reader"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("`sbx upgrade nix`"),
+        "the answer must be whole without a store:\n{stdout}"
+    );
+}

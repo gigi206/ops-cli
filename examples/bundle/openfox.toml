@@ -60,7 +60,7 @@ if [ -z "$bs" ]; then
   exit 1
 fi
 marker="$bs/build/Release/better_sqlite3.node"
-# `sbx upgrade provision` raises SBX_UPGRADE to ask for a re-install; without it the guard
+# `sbx app upgrade openfox` raises SBX_UPGRADE to ask for a re-install; without it the guard
 # below keeps the fetch to once.
 if [ ! -e "$marker" ] || [ -n "${SBX_UPGRADE:-}" ]; then
   echo "openfox: fetching the better-sqlite3 binding that mise's --ignore-scripts skips …" >&2

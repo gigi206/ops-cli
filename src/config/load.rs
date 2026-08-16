@@ -638,6 +638,13 @@ pub(crate) struct ProfilePreview {
     /// leaves the app short of a tool and its egress — a gap that would otherwise show up only as
     /// an app that mysteriously does nothing.
     pub(crate) uses: Vec<String>,
+    /// The egress groups the profile references with `@<name>` in its own `allow`/`deny`/`mute`.
+    /// A bundle is not the only second file an app can be short of: a group is global-only, so a
+    /// profile that references one and finds it undefined loses those rules silently — the import
+    /// is the moment to say so, exactly as for a bundle. Only the profile's *own* references are
+    /// here; the groups its bundles reference are invisible from these bytes by construction (this
+    /// resolves nothing from disk), and are reported by `sbx bundle import` instead.
+    pub(crate) groups: Vec<String>,
 }
 
 /// Validate bytes as an importable app profile: they must parse as a top-level [`schema::RawApp`]
@@ -659,7 +666,24 @@ pub(crate) fn validate_profile(bytes: &[u8]) -> Result<ProfilePreview, String> {
     Ok(ProfilePreview {
         summary: describe_app_posture(&app),
         uses: app.uses.clone(),
+        groups: referenced_groups(app.network.as_ref()),
     })
+}
+
+/// The egress groups a raw `network` field references, across all three lists. The bare-string
+/// posture form has no lists at all, so it references nothing. What counts as a reference is
+/// [`super::group_ref`]'s single definition, shared with the fold that resolves it.
+fn referenced_groups(network: Option<&NetworkField>) -> Vec<String> {
+    let Some(NetworkField::Table(table)) = network else {
+        return Vec::new();
+    };
+    super::group_refs(
+        table
+            .allow
+            .iter()
+            .chain(table.deny.iter())
+            .chain(table.mute.iter()),
+    )
 }
 
 /// Render one raw bind for the import posture summary: its path, with a ` (rw)` marker when the
@@ -984,6 +1008,8 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>
     acc.allow.extend(higher.allow);
     acc.deny.extend(higher.deny);
     acc.mute.extend(higher.mute);
+    acc.open.extend(higher.open);
+    acc.service.extend(higher.service);
     acc.flakes.extend(higher.flakes);
     acc.tarball.extend(higher.tarball);
     acc.deb.extend(higher.deb);
@@ -1029,6 +1055,12 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
     }
     for (k, v) in acc.env {
         app.env.entry(k).or_insert(v);
+    }
+    for (k, v) in acc.open {
+        app.open.entry(k).or_insert(v);
+    }
+    for (k, v) in acc.service {
+        app.service.entry(k).or_insert(v);
     }
     for (k, v) in acc.flakes {
         app.flakes.entry(k).or_insert(v);

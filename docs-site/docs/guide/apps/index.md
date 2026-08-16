@@ -5,11 +5,19 @@ bundles a command with a security and tooling overlay so you can run an autonomo
 agent *on* untrusted code, safely and repeatably.
 
 ```sh
-sbx app import examples/app/claude-code.toml   # a deliberate trust act
-sbx app run claude-code                    # launch it, sandboxed
+sbx bundle import examples/bundle/claude-code.toml  # what the agent requires
+sbx app import    examples/app/claude-code.toml     # a deliberate trust act
+sbx app run claude-code                             # launch it, sandboxed
 ```
 
-See also: [`[app.<name>]` config](../configuration/apps) · [Per-app home](home) · [Portable profiles](profiles) · [Profile catalog](catalog) · [`sbx app`](../cli/app).
+A shipped profile names a [bundle](../configuration/bundles) in `use`, so it takes two
+imports: the bundle carries what the agent **requires** and follows upstream, the profile
+carries what **you** configure. Either order works. Import only the profile and the app
+launches without the tool and egress it named, which is why `sbx app import` names the
+file you are still missing, and why `--with-deps` will fetch it for you from the file
+beside the profile.
+
+See also: [`[app.<name>]` config](../configuration/apps) · [Per-app home](home) · [Portable profiles](profiles) · [Profile catalog](catalog) · [Bundles](../configuration/bundles) · [`sbx app`](../cli/app).
 
 ## The two-layer model
 

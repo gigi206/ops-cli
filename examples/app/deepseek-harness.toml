@@ -1,7 +1,8 @@
 # DeepSeek Harness — DeepSeek's open-source agent harness (deepseek-ai/deepseek-harness), served
 # in your own browser, sandboxed by sbx.
 #
-#   sbx app import examples/app/deepseek-harness.toml
+#   sbx bundle import examples/bundle/deepseek-harness.toml
+#   sbx app import    examples/app/deepseek-harness.toml
 #   sbx app run deepseek-harness
 #   # then open http://127.0.0.1:3080 in your browser
 #
@@ -187,7 +188,7 @@ forward = [3080]
 # when the agent's requirements change. What the bundle cannot carry is the build step: that is the
 # guarded wrapper in `cmd` above, and it stays here with the rest of this app's posture.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/deepseek-harness.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["deepseek-harness"]

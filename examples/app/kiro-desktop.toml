@@ -1,6 +1,7 @@
 # Kiro — the Kiro agentic IDE (desktop, Electron / Code-OSS fork), sandboxed by sbx.
 #
-#   sbx app import examples/app/kiro-desktop.toml
+#   sbx bundle import examples/bundle/kiro-desktop.toml
+#   sbx app import    examples/app/kiro-desktop.toml
 #   sbx app run kiro-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The IDE tarball, its auto-upgrade resolver, the
@@ -69,8 +70,8 @@
 # browser. Kiro signs in exactly like `kiro-cli`: it opens the sign-in page in the EXTERNAL default
 # browser and runs its OWN local HTTP callback server, and the browser redirects to
 # `http://localhost:<port>/oauth/callback?...` (a plain http URL — NOT a `kiro://` deep-link, unlike
-# Cursor). The hermetic cage has no host browser and no `xdg-open`, so out of the box clicking "login"
-# does nothing. The `cmd` wrapper below closes the loop IN-CAGE: it routes http(s) to an in-cage
+# Cursor). The hermetic cage has no host browser and no desktop, so out of the box clicking "login"
+# does nothing. The `[open]` table below closes the loop IN-CAGE: it routes http(s) to an in-cage
 # Chromium, and because the callback is a normal `http://localhost` URL the browser follows it right
 # back to the IDE's own in-cage callback server (same cage, same empty-netns loopback) — no scheme
 # handler needed. Two load-bearing details carried over from `kiro.toml` (both proven there):
@@ -82,8 +83,8 @@
 #     3128 under the empty netns, but 4649 and others have been seen), so the rule maps the NAME, not a
 #     port.
 # Under `dbus = true` Electron opens external URLs via `org.freedesktop.portal.OpenURI` rather than
-# calling `xdg-open`, and the portal shows "no apps available" unless a default handler is registered —
-# so the wrapper also registers itself as the http/https scheme handler (`.desktop` + `mimeapps.list`).
+# calling `xdg-open` — one `[open]` declaration covers both, since sbx generates and freezes the
+# desktop entry the portal resolves as well as the opener `PATH` reaches.
 #
 # ⚠ HONEST GATE — the desktop OAuth login is BUGGY UPSTREAM, and it is IDE-SPECIFIC. Multiple OPEN
 # vendor issues (kirodotdev/Kiro #10138, #3782, #3158, #7727) report the IDE's localhost callback
@@ -128,61 +129,12 @@
 # end-to-end AI turn. If a request is blocked, the proxy names the host it refused — add it to `allow`
 # (or check ahead with `sbx test net <url>`).
 cmd = [
-    "bash",
-    "-c",
-    '''
-# IN-CAGE BROWSER LOGIN (see the CREDENTIAL POSTURE note in the header). Kiro's account sign-in opens
-# an external browser for the web auth and runs its own `http://localhost:<port>/oauth/callback`
-# server; the hermetic cage has no browser and no `xdg-open`, so wire one that routes http(s) to an
-# in-cage Chromium. Because the callback is a normal http URL, Chromium follows it straight back to
-# Kiro's in-cage callback server — no `kiro://` scheme handler needed.
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-# BACKGROUND Chromium (`nohup … &`), never `exec` — a blocking opener stalls the login before the
-# token exchange (proven in kiro.toml). `--host-resolver-rules="MAP localhost 127.0.0.1"` pins the
-# dynamic-port localhost callback to the cage's IPv4 loopback (the empty netns has no IPv6 loopback).
-# `--use-system-ca` makes Chromium trust sbx's MITM CA under the allowlist. Chromium's output goes to
-# a log in the isolated home — read it host-side at the path from `sbx app show kiro-desktop`.
-case "$1" in
-  http://*|https://*)
-    nohup chromium --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-      --use-system-ca --password-store=basic \
-      --host-resolver-rules="MAP localhost 127.0.0.1" \
-      --disable-background-timer-throttling --disable-backgrounding-occluded-windows \
-      --disable-renderer-backgrounding \
-      --no-first-run --no-default-browser-check "$@" >>"$HOME/chromium-login.log" 2>&1 </dev/null &
-    ;;
-esac
-exit 0
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
-
-# Under `dbus = true` the cage has a real portal, so Electron opens external URLs via
-# `org.freedesktop.portal.OpenURI` instead of calling `xdg-open` — and the portal shows "no apps
-# available" unless a default handler is registered, silently breaking the sign-in link. Register the
-# wrapper as the default handler for the web schemes. The Exec path is ABSOLUTE ($HOME expanded here)
-# because the portal-launched handler does not inherit this shell's PATH.
-mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=sbx URL handler
-Exec=$HOME/.local/bin/xdg-open %U
-MimeType=x-scheme-handler/http;x-scheme-handler/https;
-NoDisplay=true
-Terminal=false
-EOF
-cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
-[Default Applications]
-x-scheme-handler/http=sbx-open-uri.desktop
-x-scheme-handler/https=sbx-open-uri.desktop
-MIMEAPPS
-
-exec kiro --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic
-''',
+    "kiro",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+    "--password-store=basic",
 ]
 
 gui = "wayland"
@@ -205,7 +157,7 @@ dbus = true
 # behind when the app's requirements change. What the bundle may never carry is posture: the
 # `gui`/`gpu`/`dbus` grants, the `http2` designation below, and the sign-in preamble in `cmd`.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/kiro-desktop.toml
 # Without it the launch warns that the bundle is undeclared and the IDE is simply absent.
 use = ["kiro-desktop"]
@@ -217,6 +169,29 @@ use = ["kiro-desktop"]
 # (kiro.dev/docs/privacy-and-security/firewalls) PLUS the Google browser-login chain proven live for
 # `kiro.toml`. Kiro's firewall doc is known to mix IDE/CLI hosts and omit some (issue #6314), so treat
 # `sbx net logs -a kiro-desktop` as ground truth on the first `--net shared` run.
+# Where a web link opens, declared rather than scripted. sbx generates the `xdg-open` the cage
+# reaches and the desktop entry the in-cage portal resolves, and freezes both, so a link opens the
+# same way whichever of the two a caller uses.
+#
+# `mode = "detach"` is load-bearing, not a preference. kiro-cli opens the sign-in URL and WAITS for
+# the opener to exit before driving the code-for-token exchange; a handler that becomes the browser
+# never returns, so the login stalls on "Opening browser..." with the browser itself working fine and
+# no token ever persisted. Detached, the opener returns at once and the exchange runs.
+#
+# The Chromium flags carry the rest of what that login needs. `--host-resolver-rules` pins the
+# dynamic-port localhost callback to IPv4: kiro-cli's callback server binds 127.0.0.1 only, while the
+# cage's synthetic hosts file maps `localhost` to both families and the empty netns brings up no IPv6
+# loopback, so without it the redirect can try `::1` and stall. The three `--disable-*background*`
+# flags keep the renderer's timers live in a window that is never focused, so the provider's
+# meta-refresh redirect chain is not throttled. `--use-system-ca` makes Chromium trust sbx's
+# per-session MITM CA under the allowlist. Chromium's own output lands in `.sbx-open.log` in the
+# isolated home, which is where to look if the window opens and the login goes nowhere.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+https = { cmd = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage", "--use-system-ca", "--password-store=basic", "--host-resolver-rules=MAP localhost 127.0.0.1", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--no-first-run", "--no-default-browser-check"], mode = "detach" }
+
 [network]
 mode = "deny"
 allow = [

@@ -281,6 +281,17 @@ the **policy's** layer, since the socket is always the global config's.
   resolver.
 - **The bound is the hole it replaces**, not perfection. A plugin that decides badly can
   allow whatever the host resource would have allowed. It can never allow more.
+- **The allowlist governs a `tcp://` route; the filtering proxy does not inspect it.** Both
+  halves matter and they are often confused. The endpoint is admitted by the same rule set
+  as everything else, through the same function, so there is no second answer to where this
+  cage may go. But once admitted, the bytes travel on a connection `sbx` opens straight to
+  the endpoint, not through the proxy. What that costs, precisely: the rule is matched
+  **once**, at L4, when the broker starts, so there is no per-request verdict; no
+  [outbound-secret tripwire](../secrets/redaction) runs over the traffic; a secret the
+  endpoint reflects back is not masked; and none of it appears in the `net` feed, whose
+  subject is the proxy. The `broker` feed above is a different record on purpose: it holds
+  the **decisions**, not the bytes they covered. The plugin is what inspects on this route,
+  which is exactly the trade the first limit states.
 - **A [task](task)'s own cage does not get the socket.** A task cage keeps a named set of
   destinations and drops every channel (the ssh-agent socket and the display go the same
   way), so a task's *command* cannot speak to a brokered resource. What a task does get is

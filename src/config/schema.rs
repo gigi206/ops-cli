@@ -42,6 +42,38 @@ pub(crate) struct RawConfig {
     /// forbids adding scalar keys to a table after one of its subtables is opened.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
+    /// What a URI opens with inside the cage, keyed by URI scheme: `[open]` with
+    /// `https = ["chromium", …]` for web links, `<app> = { cmd = […], mode = "detach" }` for an
+    /// application's own callback scheme (see [`RawOpen`]).
+    ///
+    /// A hermetic cage has no browser and no desktop, so sbx synthesises a router the cage reaches
+    /// as `xdg-open`. Undeclared, that router prints the URI and exits 0, which is enough for a
+    /// device-auth flow to continue but opens nothing. This table is what it routes to — and it is
+    /// the same table the in-cage portal reads, so a link opened through `org.freedesktop.portal
+    /// .OpenURI` and one opened by calling `xdg-open` reach the same handler.
+    ///
+    /// **A security field**, honored only from a trusted source, and for a reason particular to
+    /// this one: the router exists to be the thing an agent cannot substitute. A URI handler runs a
+    /// program every time a link is opened, including the sign-in link a *person* clicked — so a
+    /// project able to declare one could route that click to a look-alike page and collect
+    /// credentials for a service the cage never sees. Honoring this from an untrusted layer would
+    /// hand back exactly the substitution the router is placed first on `PATH` to prevent.
+    ///
+    /// Scheme keys only, never MIME types: this routes links, not files. It carries no per-origin
+    /// rule either — which hosts are reachable is `[network]`'s answer, and duplicating it here
+    /// would create a second policy to keep in step with the first.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) open: BTreeMap<String, RawOpen>,
+    /// Auxiliary processes to start in the cage before the app's command, as `[service.<name>]`
+    /// tables (see [`RawService`]). A vector database beside the agent that queries it, a gateway
+    /// daemon beside the UI that lists its jobs: today those are a `nohup … &` buried in a `cmd`,
+    /// invisible to every inspection verb. Declared here they are named, listed, and switchable.
+    ///
+    /// **A security field**, honored only from a trusted source, for the plainest of reasons: an
+    /// entry runs a program of its choosing at every launch, before anything else. That is the same
+    /// grant as `cmd`, which an untrusted project is already refused.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) service: BTreeMap<String, RawService>,
     /// Auto-upgrade resolvers for `tarball:resolve` packages, declared as `[tarball.<name>]`
     /// tables. Each pairs with a `[packages]` entry `<name> = "tarball:resolve"` (the opt-in
     /// sentinel) and carries a `resolve` command that prints the newest release's download URL, so
@@ -331,6 +363,25 @@ pub(crate) struct RawBundle {
     /// Inline nix flakes this bundle's packages refer to, `[bundle.<name>.flakes.<tool>]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
+    /// URI handlers this bundle's tool needs, `[bundle.<name>.open]`, unioned into any app that
+    /// names the bundle (the app's own entry wins on a scheme). It belongs with the bundle for the
+    /// same reason its packages and hosts do: a tool's callback scheme — the `<tool>://` URI its
+    /// provider redirects to after a sign-in — is a property of the tool, tracked upstream, not a
+    /// preference of whoever runs it, and a hand-copy of it falls behind the tool exactly like a
+    /// hand-copied host list does.
+    ///
+    /// It stays inside the rule that governs everything else here: a bundle may add a tool, its
+    /// environment, its egress and its credential, and may never widen what the cage exposes of the
+    /// host. A handler widens nothing — the program it names runs in the cage, under the same
+    /// posture as the rest, and reaches only what `[network]` already allows.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) open: BTreeMap<String, RawOpen>,
+    /// Auxiliary processes this bundle's tool needs beside it, `[bundle.<name>.service.<svc>]`.
+    /// Same shape and gating as the baseline `service` (see [`RawConfig::service`]). A daemon a tool
+    /// cannot work without belongs here rather than in each app that uses the tool, for the reason
+    /// that governs the whole table: a hand-copy of a tool's requirements falls behind the tool.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) service: BTreeMap<String, RawService>,
     /// Auto-upgrade resolvers pairing with this bundle's `tarball:resolve` packages.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) tarball: BTreeMap<String, RawResolve>,
@@ -652,6 +703,18 @@ pub(crate) struct RawApp {
     /// when empty on serialize, so an app with no inline flake carries no `[flakes]` table.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) flakes: BTreeMap<String, RawInlineFlake>,
+    /// This app's URI handlers, `[app.<name>.open]` (or a top-level `[open]` in an imported
+    /// profile). Same shape and gating as the baseline `open` (see [`RawConfig::open`]); an app's
+    /// entry overrides the baseline's and any bundle's on the same scheme, so an app that opens its
+    /// own deep links decides them without disturbing the browser every other app shares.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) open: BTreeMap<String, RawOpen>,
+    /// This app's auxiliary processes, `[app.<name>.service.<svc>]` (or a top-level `[service]` in
+    /// an imported profile). Same shape and gating as the baseline `service` (see
+    /// [`RawConfig::service`]); an app's entry overrides a bundle's and the baseline's under the
+    /// same name, so an app can retune a service its bundle declares without forking the bundle.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) service: BTreeMap<String, RawService>,
     /// Auto-upgrade resolvers for this app's `tarball:resolve` packages, declared as
     /// `[app.<name>.tarball.<tool>]` (or a top-level `[tarball.<tool>]` in an imported profile).
     /// Same shape and gating as the baseline `tarball` (see [`RawConfig::tarball`]); each pairs with
@@ -770,6 +833,180 @@ impl RawCmd {
             RawCmd::Argv(argv) => argv,
         }
     }
+}
+
+/// One `[open]` entry: what a URI of a given scheme opens with. A bare argv
+/// (`https = ["chromium", "--no-sandbox"]`) or a table adding how it is launched
+/// (`{ cmd = [...], mode = "detach" }`) — the same string-or-table pairing as [`RawBind`] and
+/// [`RawCmd`], so the common case stays one line and the exception is explicit.
+///
+/// The URI is appended to the argv as its final argument. There is no shell in between and no
+/// substitution placeholder: an agent chooses the URI, so a form where it lands anywhere but the
+/// end of an argv would be a quoting surface.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawOpen {
+    /// The argv alone, launched in the default `exec` mode.
+    Argv(RawCmd),
+    /// An argv plus an explicit launch mode.
+    Detailed(RawOpenTable),
+}
+
+/// One `[service.<name>]` entry: an auxiliary process started in the app's own cage, before its
+/// command. A bare argv (`gateway = ["hermes", "gateway", "run"]`) or a table adding when to start
+/// it and when to consider it up — the same string-or-table pairing as [`RawOpen`] and [`RawBind`].
+///
+/// **It is a declaration, never a supervisor.** The service shares the app's cage — its home, its
+/// egress allowlist, its cgroup, its pid namespace — and dies with it, which is what the hand-written
+/// `nohup … &` in a `cmd` already achieved. What the field adds is that the process is *visible*:
+/// named in the profile, listed by `sbx config show`, instead of buried in a shell script. sbx does
+/// not restart a service that exits, and declares no ordering between two of them: the cage has no
+/// init beyond bubblewrap's reaper, and inventing one is not what this field is for.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawService {
+    /// The argv alone: started unconditionally, waited on for nothing.
+    Argv(RawCmd),
+    /// An argv plus its start condition and readiness gate.
+    Detailed(RawServiceTable),
+}
+
+/// The table form of a `[service.<name>]` entry.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawServiceTable {
+    /// The argv to run. Never a shell line: an element is one argument, whatever it contains.
+    ///
+    /// One expansion, and only one: an argument beginning with `~/` is rewritten against the cage's
+    /// home, so a service can name a path under a home whose location it cannot know. Nothing else
+    /// is substituted — a `$VAR` stays the four characters it is.
+    pub(crate) cmd: RawCmd,
+    /// Start the service only when an environment condition holds:
+    /// `{ env = "NAME", not = "0" }`.
+    ///
+    /// It exists for one reason: a service the profile starts by default must stay switchable
+    /// **without editing the profile**. The variable is the cage's, so the one-shot override already
+    /// reaches it — `sbx app run <app> --env NAME=0` turns off a service declared
+    /// `{ env = "NAME", not = "0" }` for that launch alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) enable: Option<RawEnable>,
+    /// When to consider the service up, so the app's command does not race it.
+    ///
+    /// Absent, the app starts immediately — the right answer for a service the app degrades
+    /// gracefully without. Present, the launch waits for the port, then starts the app **anyway**
+    /// on expiry, naming the service it did not see come up: a readiness gate that failed the
+    /// launch would turn a slow auxiliary process into a broken app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ready: Option<RawServiceReady>,
+}
+
+/// A `[service]`'s start condition: one environment comparison, or a list of them that must all
+/// hold.
+///
+/// ```toml
+/// enable = { env = "HERMES_WEBUI_SBX_GATEWAY", not = "0" }
+/// enable = [{ env = "A", not = "0" }, { env = "B", is = "1" }]
+/// ```
+///
+/// The single-or-list pairing is the same one [`RawCmd`] and [`RawBind`] use, so the common case
+/// stays one line and the exception costs a pair of brackets. A list is an **and**: every condition
+/// must hold. There is no **or**, and no negation of a whole list: those are the shapes that turn a
+/// config field into an expression language, and the escape hatch for them is better than a bad
+/// grammar (see below).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawEnable {
+    /// One condition.
+    One(RawEnableCond),
+    /// Several, all of which must hold.
+    All(Vec<RawEnableCond>),
+}
+
+/// One environment comparison inside a `[service]`'s [`enable`](RawServiceTable::enable).
+///
+/// Written as data rather than as an expression — `{ env = "NAME", not = "0" }`, not
+/// `"$NAME != 0"` — because that is what it is. sbx composes the cage's environment itself, so the
+/// condition is answered while the launch is assembled and never reaches a shell; a form that looked
+/// like a shell test would invite `$(…)` and `${NAME:-1}` only to refuse them, and would have to be
+/// parsed back into these three fields to be used. It also matches its neighbour: `ready` is a table
+/// on the same service, and one qualifier written as data beside another written as a sentence is
+/// the inconsistency, not the fix.
+///
+/// Exactly one of `is` / `not` is set. An unset variable compares as **empty**, which is what
+/// decides the default without anyone setting anything: `not = "0"` starts the service for someone
+/// who never touches the variable, `is = "1"` starts it only for someone who does.
+///
+/// Anything past equality — a file exists, a command succeeds, one condition *or* another — is a
+/// program, and belongs in the service's own `cmd`: `["bash", "-c", "test … && exec …"]` says it in
+/// a real language and in full view, which is a better answer than a grammar that almost says it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawEnableCond {
+    /// The environment variable to read, by name.
+    pub(crate) env: String,
+    /// Start the service when the variable holds this value, or any one of these values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) is: Option<RawValues>,
+    /// Start the service unless the variable holds this value, or any one of these values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) not: Option<RawValues>,
+}
+
+/// One value, or several of which any may match: `not = "0"` and `not = ["0", "false", "no"]`.
+///
+/// This is where a condition's "or" lives, and the only place it does. Several values of **one**
+/// variable is the disjunction that comes up — "off" is written `0`, `false` or `no` depending on
+/// who typed it — and it needs no boolean structure to express: the comparison already had a value,
+/// and now it may have a set of them. Across *different* variables a list of conditions remains an
+/// `and`; a service that would start under "A or B" has two independent switches, and that is a
+/// program, belonging in the service's own `cmd` where a real language can say it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawValues {
+    /// A single value.
+    One(String),
+    /// Several, any of which matches.
+    Any(Vec<String>),
+}
+
+impl RawValues {
+    /// The values as a list, whichever way they were written.
+    pub(crate) fn into_vec(self) -> Vec<String> {
+        match self {
+            RawValues::One(v) => vec![v],
+            RawValues::Any(v) => v,
+        }
+    }
+}
+
+/// A service's readiness gate: `ready = { tcp = 8100 }`, optionally `{ tcp = 8100, timeout = "30s" }`.
+///
+/// A TCP connect on the cage's loopback is the whole vocabulary. It is what the profiles that hand-
+/// rolled this check were already doing, and a richer probe (an HTTP status, a file appearing, a log
+/// line) would need a matching richer failure story for something sbx cannot fail on anyway.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawServiceReady {
+    /// The port the service listens on, reached at `127.0.0.1` inside the cage.
+    pub(crate) tcp: u16,
+    /// How long to wait before giving up and starting the app regardless — a duration like `"30s"`,
+    /// the same grammar as `ask_timeout`. Omitted, [`READY_TIMEOUT_DEFAULT`] applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout: Option<String>,
+}
+
+/// The table form of an `[open]` entry: `{ cmd = [...], mode = "exec" | "detach" }`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawOpenTable {
+    /// The argv to run, the URI appended last.
+    pub(crate) cmd: RawCmd,
+    /// How it is launched. `"exec"` (the default) replaces the router, so the caller's wait ends
+    /// when the handler does. `"detach"` starts it in the background and returns 0 at once.
+    ///
+    /// The distinction is load-bearing, not stylistic. A tool that shells out to the router and
+    /// waits for it — the Rust `open` crate does, and so a CLI built on it does — never reaches
+    /// the step after "opening browser" if the router *becomes* a browser that outlives the login.
+    /// Those tools need `"detach"`; a tool that hands a deep link to an already-running app and
+    /// expects it to have arrived wants `"exec"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
 }
 
 /// An inline nix flake declared as a `[flakes.<name>]` table: the full `flake.nix` source plus

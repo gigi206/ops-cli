@@ -1,6 +1,7 @@
 # Hermes WebUI — the community self-hosted web interface for Hermes Agent, sandboxed by sbx.
 #
-#   sbx app import examples/app/hermes-webui.toml
+#   sbx bundle import examples/bundle/hermes.toml
+#   sbx app import    examples/app/hermes-webui.toml
 #   sbx app run hermes-webui      # then open http://127.0.0.1:8787 in your host browser
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -16,7 +17,7 @@
 # the same agent, with its own feature set: persistent searchable sessions (projects/tags), a
 # workspace file browser with inline preview/edit, user profiles with optional password/passkey auth,
 # and a task/cron scheduling panel (which needs the agent's gateway daemon to actually fire — this
-# profile starts one, see the `cmd` wrapper). The upstream repo calls it "Community Web UI (unofficial)".
+# profile declares one, see `[service.gateway]`). The upstream repo calls it "Community Web UI (unofficial)".
 # The BINARY still comes from that project's own official upstream (its own nix flake), not from a
 # third-party repackager.
 #
@@ -139,38 +140,10 @@ except Exception:
     pass
 PYINIT
 
-# Cron scheduler. The WebUI's Tasks panel CREATES and lists cron jobs, but it does not fire them:
-# upstream is explicit that "scheduled cron ticks are not driven by the WebUI itself — the gateway
-# daemon ticks the scheduler every 60 seconds; without one running, scheduled jobs sit idle" (the
-# panel's "Run now" button still works, because that path runs in-process). Upstream's own answer for
-# a single-container deployment — which is exactly what a cage is — is to run `hermes gateway` inside
-# it as a long-lived background process, so that is what happens here.
-#
-# `gateway run` is the foreground mode upstream recommends for container/WSL use; the systemd-based
-# `gateway start` has no init to talk to in the cage. It starts fine with NO messaging platform
-# configured (it just logs "No messaging platforms enabled") and still ticks the cron scheduler,
-# which is the part that matters here. Backgrounded with `nohup … &` — the cage has no `setsid` —
-# and it dies with the cage, since it is just another process in the cage's PID namespace.
-#
-# Its output goes to a log file rather than the terminal: the daemon is chatty (SQLite advisories,
-# platform warnings) and would otherwise bury the WebUI's own request log. Read it with
-# `sbx session attach` + `tail -f ~/.hermes/gateway.log`, or from the host under the app's home.
-# Set HERMES_WEBUI_SBX_GATEWAY=0 (e.g. `--env HERMES_WEBUI_SBX_GATEWAY=0`) to skip it and run the UI
-# alone. Best-effort: if the daemon fails to start the server still comes up — you lose scheduled
-# ticks, not the app.
-#
-# Egress note: a firing cron job talks to your LLM provider, already in the allowlist. If you enable
-# a messaging platform (Telegram, Discord, …) its API host is NOT allowed here — add it with
-# `sbx net allow -a hermes-webui <url>`.
-if [ "${HERMES_WEBUI_SBX_GATEWAY:-1}" = "1" ]; then
-    gw_home="${HERMES_HOME:-$HOME/.hermes}"
-    mkdir -p "$gw_home"
-    nohup hermes gateway run >>"$gw_home/gateway.log" 2>&1 &
-fi
-
-exec hermes-webui
+exec hermes-webui "$@"
 ''',
 ]
+
 
 # The inbound hole: forward host 127.0.0.1:8787 into the cage at the same port, so your HOST browser
 # reaches the server the cage binds on its own loopback (the cage runs in an empty network namespace,
@@ -214,10 +187,42 @@ gui = "offscreen"
 # reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
 # profile cannot fall behind when the agent's requirements change.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/hermes.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["hermes"]
+
+# Cron scheduler. The WebUI's Tasks panel CREATES and lists cron jobs, but it does not fire them:
+# upstream is explicit that "scheduled cron ticks are not driven by the WebUI itself — the gateway
+# daemon ticks the scheduler every 60 seconds; without one running, scheduled jobs sit idle" (the
+# panel's "Run now" button still works, because that path runs in-process). Upstream's own answer for
+# a single-container deployment — which is exactly what a cage is — is to run `hermes gateway` inside
+# it, so that is what this declares.
+#
+# `gateway run` is the foreground mode upstream recommends for container/WSL use; the systemd-based
+# `gateway start` has no init to talk to in the cage. It starts fine with NO messaging platform
+# configured (it just logs "No messaging platforms enabled") and still ticks the cron scheduler,
+# which is the part that matters here.
+#
+# NO `ready` gate, deliberately: the UI must come up whether or not the daemon does. If the gateway
+# fails, the server still starts and you lose scheduled ticks, not the app. Its output goes to
+# `~/.sbx-service-gateway.log` in the app's isolated home rather than the terminal — the daemon is
+# chatty (SQLite advisories, platform warnings) and would otherwise bury the WebUI's own request log.
+# Read it with `sbx session attach` + `tail -f ~/.sbx-service-gateway.log`, or from the host under
+# the app's home.
+#
+# `enable` keeps the switch this had as a shell `if`, with the same variable and the same default
+# (an unset variable compares as empty, so the daemon runs unless you say otherwise): run the UI
+# alone with `sbx app run hermes-webui --env HERMES_WEBUI_SBX_GATEWAY=0`, without editing this file.
+#
+# Egress note: a firing cron job talks to your LLM provider, already in the allowlist. If you enable
+# a messaging platform (Telegram, Discord, …) its API host is NOT allowed here — add it with
+# `sbx net allow -a hermes-webui <url>`.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[service.gateway]
+cmd = ["hermes", "gateway", "run"]
+enable = { env = "HERMES_WEBUI_SBX_GATEWAY", not = "0" }
 
 [packages]
 # The WebUI itself, from its own upstream flake (`bin/hermes-webui` — a wrapper that runs bootstrap

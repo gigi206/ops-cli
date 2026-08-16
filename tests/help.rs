@@ -77,6 +77,7 @@ const PATHS: &[&[&str]] = &[
     &["storage"],
     &["store"],
     &["app", "run"],
+    &["app", "upgrade"],
     &["app", "import"],
     &["app", "export"],
     &["app", "rm"],

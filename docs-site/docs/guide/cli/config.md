@@ -52,14 +52,55 @@ whole contract is read. `[task]` is trust-gated, so an untrusted project shows n
 | Option | Meaning |
 |---|---|
 | `--json` | the resolved model as JSON (warnings included) |
-| `--details` | expand each app overlay (env, binds, packages, allowlist rules, credentials) |
-| `-a, --app <name>` | one app's **effective** config, each field tagged `inherited` or `app:global`/`app:project` |
+| `--details` | expand what each app overlay's entries *are* (env values, package backend lines, credential shapes), plus the postures left at their default and the allowlist machinery |
+| `-a, --app <name>` | one app's **effective** config, each field tagged `default`, `inherited`, or `app:global`/`app:project` |
 | `-g, --global` | only what the global config (and imported profiles) contributes |
 | `-l, --local` | only what the project `.sbx.toml` contributes |
 | `-d, --default` | the built-in defaults alone |
 
 The single-source flags are mutually exclusive and do not combine with `--app`. Note
 `-d` is `--default`, so `--details` has no short form.
+
+### What `--app` shows, and what it leaves out
+
+The per-app view answers one question: what would this app launch with, and who decided.
+So each field carries one of three tags. `app:global` / `app:project` means the app
+declaration set it. `inherited` means a config layer set it and the app takes that value.
+`default` means no layer set it at all: the value is sbx's own.
+
+A field tagged `default` is not printed. It would say the same thing for every app on the
+machine, and there are ten of them, which is enough to bury the few fields that tell this
+app from the next one. They are named together on a single line instead:
+
+```
+  at their default: proc, gui, gpu, audio, dbus, limits, forward, seccomp, devices — see --details
+```
+
+Nothing is dropped without being listed, and `--details` prints every one of them back in
+place. The line disappears when there is nothing to fold, so an app that configures its
+whole posture reads exactly as before.
+
+What the app *adds* is named rather than counted, for the same reason: `1 own` is true of
+half the catalogue and says nothing about this app.
+
+```
+  env:     ANTHROPIC_MODEL  · inherits 2 baseline
+  binds:   /srv/workspace (rw)
+  packages: chromium (nix), cursor (deb)
+  secrets: (none)
+```
+
+The tail counts what comes from the baseline, because those entries are one hop away in
+`sbx config show`; it disappears when there are none. `--details` expands each entry to
+what it *is*: an env value, a package's full backend line, a credential's shape and
+sources.
+
+The allow and deny rules are listed too, one per line, since a rule is a whole clause
+(verbs, scheme, host pattern) and nineteen of them joined on one line would be
+unreadable. What stays behind `--details` is the machinery that decides nothing about
+reachability: muted hosts (they only silence an already-permitted request in the log),
+HTTP/2 designations (a transport choice), and the always-allowed built-in set (identical
+for every app). The compact view counts those instead.
 
 ## get, set, add, rm, unset
 
@@ -200,6 +241,26 @@ Writing a trusted project file re-arms its [trust gate](../concepts/trust); pass
 `--trust` to re-trust in one step. The global config and app profiles are trusted by
 location, so a write there needs no trust; a free `env` value needs no trust.
 
+`--trust` blesses the **whole current file**, which is why these four verbs refuse it on
+a file that was never trusted, or that changed since you trusted it. Blessing it would
+activate every security field in the file, including ones you have not read: a
+`[network] mode = "shared"` you never saw takes the cage out of its own network
+namespace, and with it the allowlist, the filtering proxy, and the egress log. The rule
+the writing verbs share is that sbx blesses the delta it wrote, never bytes you have not
+approved. The refusal lands before the write, so the file is left alone, and it names the
+two ways through: review it and run `sbx trust`, or use `sbx config edit --trust`, where
+the editor shows you the file first.
+
+A file you trusted and then hand-edited is refused for the same reason, and says so in its
+own words rather than claiming it is untrusted: the edit is exactly what `--trust` would
+bless unread. The scope decides this, not the verb, so a `-c <file>` target is admitted the
+same way; the exempt ones are those with no marker at all, the global config and the app
+profiles. A file that does not exist yet is written and trusted, since sbx's own write is
+then the whole content.
+
+Without `--trust` nothing changes: the write goes through, and a security key is reported
+as applying only once the file is trusted.
+
 A write that would leave the layer unparseable is refused and the file is left
 byte-for-byte alone. This is fail-closed on purpose: a committed invalid layer is dropped
 **whole** at load, taking every security field with it.
@@ -238,7 +299,15 @@ and the rest of the tree is writable, but the agent still cannot alter what sbx 
 trusts.
 
 An edit that changes a trusted file re-arms its trust gate; `--trust` re-trusts as
-the editor closes.
+the editor closes. That is about a gated file. The global config is trusted by
+location, exactly as it is for the writing verbs above: it carries no marker, so
+there is none to re-arm and none to write, and `--trust` there answers that it is not
+needed rather than storing something nothing reads back.
+
+This is also the one verb whose `--trust` blesses a file that was never trusted, where
+`set`, `add`, `rm` and `unset` refuse. The difference is what you saw: the editor put the
+file in front of you, so what is blessed is what you read. It is the way through the
+other four verbs point at.
 
 ## Examples
 

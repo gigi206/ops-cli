@@ -166,6 +166,9 @@ pub(crate) fn resolved(
     apps: Vec<(&str, crate::config::ResolvedApp)>,
 ) -> crate::config::Resolved {
     crate::config::Resolved {
+        open: Default::default(),
+        service: Default::default(),
+        provisions: Default::default(),
         plugin: Default::default(),
         net_groups: Default::default(),
         fs: Default::default(),
@@ -220,6 +223,8 @@ pub(crate) fn resolved(
 pub(crate) fn app_with(packages: Vec<crate::config::Package>) -> crate::config::ResolvedApp {
     crate::config::ResolvedApp {
         provisions: Vec::new(),
+        open: Default::default(),
+        service: Default::default(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
         notify: None,

@@ -1,6 +1,7 @@
 # Cortex Code — a coding agent focused on performance-oriented code, sandboxed by sbx.
 #
-#   sbx app import examples/app/cortex.toml
+#   sbx bundle import examples/bundle/cortex.toml
+#   sbx app import    examples/app/cortex.toml
 #   sbx app run cortex
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's binary, the library it needs and its
@@ -13,7 +14,7 @@
 # Cortex ships as a Rust release binary on its own GitHub releases (`CortexLM/cortex-code`). sbx
 # equips it fresh from upstream via mise's `github` backend — which here does more than download:
 # it verifies the release's **GitHub artifact attestations and SLSA provenance** before installing,
-# the same supply-chain check `goose` gets. Advance it with `sbx upgrade mise`, not the binary's own
+# the same supply-chain check `goose` gets. Advance it with `sbx app upgrade cortex`, not the binary's own
 # updater. Note the version: **v0.0.7**, early and moving, and the repository carries **no license**
 # — neither is a blocker for a profile that only points at the vendor's official artifact, but you
 # should know both before wiring it into anything.
@@ -72,7 +73,7 @@ exec Cortex "$@"
 # this profile cannot fall behind when the agent's requirements change. What the bundle cannot
 # carry is the library wiring: that is the wrapper in `cmd` above.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/cortex.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["cortex"]

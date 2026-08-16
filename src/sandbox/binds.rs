@@ -64,20 +64,41 @@ pub(super) const SANDBOX_ENV: &str = "/usr/bin/env";
 /// it owns no data, opens nothing.
 const XDG_OPEN_INCAGE: &str = "/usr/bin/xdg-open";
 
+/// The directory holding sbx's URL router, placed **first** on `PATH` — and the one place the
+/// cage's `PATH` order is sbx's rather than the project's.
+///
+/// Everything else on `PATH` follows the rule stated where it is built: a declared tool wins over
+/// an agent-activated one, which wins over the base userland, and the synthetic `/usr/bin` comes
+/// last so it shadows nothing. That order leaves `xdg-open` resolvable from a directory the cage
+/// can write: the mise shims directory lives in the writable home and precedes `/usr/bin`, so a
+/// process inside the cage can drop its own `xdg-open` there and every later caller resolves it
+/// — the read-only bind at [`XDG_OPEN_INCAGE`] is simply never reached.
+///
+/// What that substitution buys is narrow but real, and it is worth naming precisely. The cage is
+/// one trust domain: a process inside it can already execute whatever it likes, so this is not an
+/// escape and not a privilege boundary. What it buys is the ability to **substitute the page the
+/// user asked for** — the user clicks "sign in", the application hands the URL to the router, and
+/// a look-alike opens in the in-cage browser instead of the provider. Credentials the user types
+/// there are for a third-party service the cage otherwise never sees. Displaying a page is
+/// something anything in the cage can do unaided; intercepting a URL the *user* initiated is not.
+///
+/// So this directory is first, and it holds exactly one name — the router. The inversion is
+/// bounded to that name deliberately: it is the name no project can usefully own (a hermetic cage
+/// has no desktop, so a real `xdg-utils` here would open nothing), and the one profiles already
+/// rewrite by hand for want of a way to declare it.
+const OPEN_ROUTER_DIR: &str = "/opt/sbx/open";
+
+/// Where the router is bound inside [`OPEN_ROUTER_DIR`]. The same file as [`XDG_OPEN_INCAGE`],
+/// exposed under a second name: the FHS path stays for anything that calls it absolutely, and this
+/// one is what `PATH` resolves.
+const OPEN_ROUTER_INCAGE: &str = "/opt/sbx/open/xdg-open";
+
 /// Where the synthetic ssh client config is bound read-only. This is OpenSSH's compiled-in
 /// **system-wide** path (verified against the binary the cage actually runs), which is the last file
 /// an ssh client reads: since the first value obtained for a keyword wins, a `~/.ssh/config` block
 /// of the cage's own overrides everything written here. A hermetic cage carries no `/etc/ssh`, so
 /// this shadows nothing.
 pub(crate) const SSH_CONFIG_INCAGE: &str = "/etc/ssh/ssh_config";
-
-/// The synthetic `xdg-open` body. POSIX `sh` (the cage's `/bin/sh`), prints every
-/// argument (the common call is a single file or URL) to stderr with an `sbx:`
-/// prefix, then exits 0. Robust to any argv a tool passes: it never inspects or
-/// forks — `xdg-open` may be asked to open anything, not only a URL.
-const XDG_OPEN_CONTENTS: &str = "#!/bin/sh\n\
-echo \"sbx: open on the host:\" \"$@\" >&2\n\
-exit 0\n";
 
 /// The resolved hermetic userland (provided by the nix resolver). A nix binary
 /// finds its own libraries by absolute RPATH, so a read-only `/nix` suffices for
@@ -247,6 +268,20 @@ struct SandboxPaths<'a> {
     /// Synthetic `/etc/machine-id`; bound read-only at `/etc/machine-id` and
     /// `/var/lib/dbus/machine-id`.
     machine_id_src: &'a Path,
+    /// The generated desktop-entry directory and mime defaults, present only when `[open]` declares
+    /// a handler. Bound read-only *inside the writable home*, at the locations the XDG lookup
+    /// prefers: `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` are unset in the cage, so their defaults
+    /// under `$HOME` are the highest-priority ones, and a copy anywhere else would be shadowed by
+    /// one written there. Freezing the mountpoint is enough for exactly that reason — the lookup
+    /// asks for these paths by name, and a read-only bind refuses both the write and the unlink
+    /// that would replace them.
+    ///
+    /// The entry is bound as its whole *directory* rather than as one file, which is what makes the
+    /// portal answer at all rather than only what makes it answer correctly — see
+    /// [`super::openuri::APPLICATIONS_REL`].
+    open_apps_src: Option<&'a Path>,
+    /// The generated mime defaults; see [`Self::open_apps_src`]. Always set together with it.
+    open_mimeapps_src: Option<&'a Path>,
 }
 
 /// Assemble a [`SandboxSpec`] from already-resolved host paths. Pure: no I/O, no
@@ -337,6 +372,14 @@ fn assemble(
         Mount::RoBind {
             src: paths.xdg_open_src.to_path_buf(),
             dest: PathBuf::from(XDG_OPEN_INCAGE),
+        },
+        // Zone 1 — the same file under [`OPEN_ROUTER_INCAGE`], the copy `PATH` actually resolves.
+        // Two names for one source rather than a move: the FHS path is what a tool calling
+        // `/usr/bin/xdg-open` absolutely expects to find, and this one sits in the directory the
+        // cage cannot shadow. See [`OPEN_ROUTER_DIR`] for why that directory leads `PATH`.
+        Mount::RoBind {
+            src: paths.xdg_open_src.to_path_buf(),
+            dest: PathBuf::from(OPEN_ROUTER_INCAGE),
         },
         // Zone 1 — the embedded mise "nix" backend plugin, read-only: an agent's
         // in-cage mise resolves it (via a symlink in the writable mise data dir) to
@@ -469,6 +512,25 @@ fn assemble(
         });
     }
 
+    // What the in-cage portal reads to reach the router. Emitted *after* the writable home above,
+    // so they layer over it rather than being shadowed by it — the whole point is that these paths
+    // inside a writable directory are the ones the cage cannot rewrite.
+    if let Some(src) = paths.open_apps_src {
+        mounts.push(Mount::RoBind {
+            src: src.to_path_buf(),
+            dest: PathBuf::from(format!(
+                "{SANDBOX_HOME}/{}",
+                super::openuri::APPLICATIONS_REL
+            )),
+        });
+    }
+    if let Some(src) = paths.open_mimeapps_src {
+        mounts.push(Mount::RoBind {
+            src: src.to_path_buf(),
+            dest: PathBuf::from(format!("{SANDBOX_HOME}/{}", super::openuri::MIMEAPPS_REL)),
+        });
+    }
+
     // Host device nodes from a trusted `[devices]` grant, bound at their own `/dev/*` paths with
     // device access. Emitted *after* the `Mount::Dev` above (part of the structural block), so each
     // real device layers over the minimal, hostless `/dev` rather than being shadowed by it. A `-try`
@@ -503,13 +565,19 @@ fn assemble(
         }
     }));
 
-    // The sandbox PATH: the project's declared tools first, then mise's shims, then
-    // the base userland, so a declared tool wins over an agent-activated one, which
-    // wins over the base. A tool the in-cage mise has activated (`mise use`) gets a
-    // shim in the shims dir, so a later `sbx run -- <tool>` resolves it. `/bin/sh` and
-    // the loader are wired by absolute path, not PATH, so prepending here never weakens
-    // them.
-    let mut path_dirs = overlay.bin_paths.to_vec();
+    // The sandbox PATH: sbx's URL router first, then the project's declared tools, then mise's
+    // shims, then the base userland, so a declared tool wins over an agent-activated one, which
+    // wins over the base. A tool the in-cage mise has activated (`mise use`) gets a shim in the
+    // shims dir, so a later `sbx run -- <tool>` resolves it. `/bin/sh` and the loader are wired by
+    // absolute path, not PATH, so prepending here never weakens them.
+    //
+    // The router leads, and it is the single exception to "a declared tool wins": the shims
+    // directory sits in the writable home, so any other order lets the cage substitute its own
+    // `xdg-open` for every later caller. The directory holds that one name and nothing else, which
+    // is what keeps the exception from being a general inversion — see [`OPEN_ROUTER_DIR`] for what
+    // the substitution would buy and why it is worth one name.
+    let mut path_dirs = vec![PathBuf::from(OPEN_ROUTER_DIR)];
+    path_dirs.extend(overlay.bin_paths.iter().cloned());
     // For a global app, the per-project primary's shims come first (project + `nix:` tools the agent
     // self-equips), then the app-global pool's shims (the agent's own `mise:` tools reached through
     // the shared-install fallback). A shim only re-resolves from the ambient `MISE_DATA_DIR` at exec,
@@ -521,9 +589,10 @@ fn assemble(
     path_dirs.push(PathBuf::from(format!("{SANDBOX_HOME}/{MISE_SHIMS_REL}")));
     path_dirs.extend(userland.bin_paths.iter().cloned());
     // The synthetic `/usr/bin` (only `env` and `xdg-open`, both sbx-owned — no host
-    // leak) is on PATH last, so a tool that calls `xdg-open` by name resolves the
-    // stub. Last so declared tools, mise shims, and the base userland all win on a
-    // name collision; `/usr/bin/env` is the same coreutils `env` already on PATH.
+    // leak) is on PATH last, so declared tools, mise shims, and the base userland all win on a
+    // name collision; `/usr/bin/env` is the same coreutils `env` already on PATH. It is no longer
+    // how a bare `xdg-open` resolves — the router directory at the head is — so this entry now
+    // serves only a caller that names `/usr/bin` explicitly.
     path_dirs.push(PathBuf::from("/usr/bin"));
 
     // Where the declared-operations client is bound, when the session offers any. On PATH because
@@ -615,6 +684,7 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     SANDBOX_BASH,
     SANDBOX_ENV,
     XDG_OPEN_INCAGE,
+    OPEN_ROUTER_INCAGE,
     CAGE_CA_BUNDLE,
     SHELL_RC_INCAGE,
     super::miseplugin::INCAGE_DIR,
@@ -1160,6 +1230,7 @@ pub(crate) fn build_spec(
     tcp: &super::egress::TcpPlan,
     seccomp: super::seccomp::SeccompPolicy,
     devices: &[PathBuf],
+    open: &std::collections::BTreeMap<String, crate::config::OpenHandler>,
     cmd: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
     use std::fs::DirBuilder;
@@ -1188,12 +1259,63 @@ pub(crate) fn build_spec(
     let contract = rt.etc_dir.join("egress-contract.md");
     write_atomic(&contract, egress_contract.as_bytes())?;
 
-    // Materialize the synthetic `xdg-open` stub beside the other synthetic files
-    // (outside every writable mount, so it has no writable alias the agent could
-    // rewrite), then make it executable so a tool calling `xdg-open` runs it.
+    // Materialize the URL router beside the other synthetic files (outside every writable mount, so
+    // it has no writable alias the agent could rewrite), then make it executable so a tool calling
+    // `xdg-open` runs it. Undeclared, it is the printing stub; with `[open]` it routes by scheme.
+    // Regenerated every launch, so a handler removed from the config is gone from the next run.
     let xdg_open = rt.etc_dir.join("xdg-open");
-    write_atomic(&xdg_open, XDG_OPEN_CONTENTS.as_bytes())?;
+    write_atomic(&xdg_open, super::openuri::router(open).as_bytes())?;
     std::fs::set_permissions(&xdg_open, std::fs::Permissions::from_mode(0o755))?;
+
+    // The portal's route to the same router: a desktop-entry directory and the mime defaults naming
+    // it, staged here (outside every writable mount, like the router) and bound read-only at the
+    // `$HOME` paths the XDG lookup prefers. Written only when a handler is declared — with none,
+    // there is nothing to route and no reason to freeze a directory the cage did not ask for.
+    // Regenerated every launch; a directory left by a previous launch of the same home is emptied
+    // first, so a scheme dropped from the config stops being claimed.
+    let (open_apps, open_mimeapps) = (
+        rt.etc_dir.join("applications"),
+        rt.etc_dir.join("mimeapps.list"),
+    );
+    let (open_apps_src, open_mimeapps_src) = if open.is_empty() {
+        let _ = std::fs::remove_dir_all(&open_apps);
+        let _ = std::fs::remove_file(&open_mimeapps);
+        (None, None)
+    } else {
+        let _ = std::fs::remove_dir_all(&open_apps);
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&open_apps)?;
+        write_atomic(
+            &open_apps.join(super::openuri::DESKTOP_FILE),
+            super::openuri::desktop_entry(open, OPEN_ROUTER_INCAGE).as_bytes(),
+        )?;
+        // The index the portal reads to find the claimants of a scheme. Generated because the
+        // directory carrying it is read-only in the cage, so `update-desktop-database` cannot
+        // produce it there.
+        write_atomic(
+            &open_apps.join("mimeinfo.cache"),
+            super::openuri::mimeinfo_cache(open).as_bytes(),
+        )?;
+        write_atomic(&open_mimeapps, super::openuri::mimeapps(open).as_bytes())?;
+        // bwrap creates a missing mountpoint, but it would create it in the *host* home this bind
+        // exposes — leaving a stray empty file or directory behind after the cage is gone. Creating
+        // the parents here (owner-only, like the mise pool) keeps that placement sbx's decision
+        // rather than a side effect.
+        for rel in [
+            super::openuri::APPLICATIONS_REL,
+            super::openuri::MIMEAPPS_REL,
+        ] {
+            if let Some(parent) = rt.home_src.join(rel).parent() {
+                DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+            }
+        }
+        (Some(open_apps.as_path()), Some(open_mimeapps.as_path()))
+    };
 
     // Materialize the embedded mise `nix:` backend plugin (read-only, content-keyed,
     // shared across projects) and register it for this cage's mise: a symlink in the
@@ -1277,6 +1399,8 @@ pub(crate) fn build_spec(
         hosts_src: &hosts,
         ssh_config_src,
         machine_id_src: &machine_id,
+        open_apps_src,
+        open_mimeapps_src,
     };
     assemble(
         &paths,
@@ -1379,6 +1503,8 @@ mod tests {
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
             ssh_config_src,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
+            open_apps_src: None,
+            open_mimeapps_src: None,
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
@@ -1689,6 +1815,8 @@ mod tests {
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
             ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
+            open_apps_src: None,
+            open_mimeapps_src: None,
         };
         let overlay = Overlay {
             env: &[],
@@ -1786,14 +1914,14 @@ mod tests {
         let joined = env_strings(&spec);
 
         let path_i = joined.iter().position(|s| s == "PATH").unwrap();
-        // mise's shims dir sits between the (here empty) declared tools and the base
-        // userland, so an agent-activated tool surfaces ahead of base on a name clash; the
-        // synthetic `/usr/bin` (env + xdg-open) trails so `xdg-open` resolves by name, and
-        // `/opt/sbx/bin` trails both so the declared-operations client resolves by the name
+        // the URL router leads, ahead of every writable directory; mise's shims dir sits between
+        // the (here empty) declared tools and the base userland, so an agent-activated tool
+        // surfaces ahead of base on a name clash; the synthetic `/usr/bin` (env + xdg-open) trails,
+        // and `/opt/sbx/bin` trails both so the declared-operations client resolves by the name
         // the cage's own contract tells an agent to type.
         assert_eq!(
             joined[path_i + 1],
-            "/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin:/opt/sbx/bin"
+            "/opt/sbx/open:/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin:/opt/sbx/bin"
         );
         // foreign binaries reach the base glibc through the nix-ld shim, never the
         // global LD_LIBRARY_PATH (which would skew a differently-pinned nix tool)
@@ -1873,6 +2001,8 @@ mod tests {
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
             ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
+            open_apps_src: None,
+            open_mimeapps_src: None,
         };
         let overlay = Overlay {
             env: &[],
@@ -1949,6 +2079,8 @@ mod tests {
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
             ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
+            open_apps_src: None,
+            open_mimeapps_src: None,
         };
         let overlay = Overlay {
             env: extra_env,
@@ -2015,11 +2147,63 @@ mod tests {
         );
         let argv = env_strings(&spec);
         let path_i = argv.iter().position(|s| s == "PATH").unwrap();
-        // declared tools first, then mise's shims, then the base userland, then the
-        // synthetic `/usr/bin` (env + xdg-open, sbx-owned) so `xdg-open` resolves by name.
+        // the URL router first (the one name the cage may not shadow), then declared tools, then
+        // mise's shims, then the base userland, then the synthetic `/usr/bin` (env + xdg-open).
         assert_eq!(
             argv[path_i + 1],
-            "/nix/store/node/bin:/nix/store/python/bin:/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin:/opt/sbx/bin"
+            "/opt/sbx/open:/nix/store/node/bin:/nix/store/python/bin:/home/sandbox/.local/share/mise/shims:/store/bash/bin:/store/coreutils/bin:/usr/bin:/opt/sbx/bin"
+        );
+    }
+
+    #[test]
+    fn the_url_router_leads_path_ahead_of_every_writable_directory() {
+        // The finding this ordering answers: the mise shims directory lives in the writable home
+        // and used to precede the synthetic `/usr/bin`, so a process in the cage could drop its own
+        // `xdg-open` there and every later caller resolved it — the read-only bind was never
+        // reached. Asserted on the emitted PATH rather than on the vector that builds it, and by
+        // *position*: the router must precede the shims directory, whatever else is declared.
+        let spec = assemble_with(&[], &[], &[PathBuf::from("/nix/store/node/bin")]);
+        let argv = env_strings(&spec);
+        let path_i = argv.iter().position(|s| s == "PATH").unwrap();
+        let dirs: Vec<&str> = argv[path_i + 1].split(':').collect();
+        assert_eq!(
+            dirs.first().copied(),
+            Some(OPEN_ROUTER_DIR),
+            "the router directory leads PATH"
+        );
+        let shims = dirs
+            .iter()
+            .position(|d| d.contains("mise/shims"))
+            .expect("the mise shims dir is on PATH");
+        assert!(
+            shims > 0,
+            "no writable directory may precede the router on PATH"
+        );
+        assert!(
+            !dirs[1..].contains(&OPEN_ROUTER_DIR),
+            "the router directory appears exactly once"
+        );
+    }
+
+    #[test]
+    fn the_router_binds_the_same_stub_read_only_under_both_names() {
+        // The router path is what PATH resolves; the FHS path stays for a caller that names
+        // `/usr/bin/xdg-open` absolutely. One staged source, two read-only binds — a second copy
+        // would be a second thing to keep in step.
+        let argv = argv_strings(&assembled());
+        let router = argv
+            .iter()
+            .position(|s| s == OPEN_ROUTER_INCAGE)
+            .expect("the router is synthesised");
+        assert_eq!(
+            argv[router - 1],
+            "/data/sbx/projects/abc/etc/xdg-open",
+            "the router binds the same staged stub as /usr/bin/xdg-open"
+        );
+        assert_eq!(
+            argv[router - 2],
+            "--ro-bind",
+            "the router is a read-only bind"
         );
     }
 
@@ -2066,21 +2250,23 @@ mod tests {
     }
 
     #[test]
-    fn xdg_open_contents_is_a_posix_sh_script_that_exits_zero() {
-        // The stub must be a valid `#!/bin/sh` script (the cage synthesises that
-        // path) that exits 0 — the whole point is a tool calling `xdg-open` does not
-        // see a failure — and surface its argument so the user can act on it.
+    fn the_staged_router_is_a_posix_sh_script_that_exits_zero() {
+        // The router must be a valid `#!/bin/sh` script (the cage synthesises that path) that
+        // exits 0 — the whole point is a tool calling `xdg-open` does not see a failure — and
+        // surface its argument so the user can act on it. Asserted on what the module *emits*,
+        // since that is the byte sequence the launch stages and binds.
+        let staged = super::super::openuri::router(&Default::default());
         assert!(
-            XDG_OPEN_CONTENTS.starts_with("#!/bin/sh\n"),
-            "the stub is a /bin/sh script"
+            staged.starts_with("#!/bin/sh\n"),
+            "the router is a /bin/sh script"
         );
         assert!(
-            XDG_OPEN_CONTENTS.contains("exit 0"),
-            "the stub exits 0 so the caller treats the open as non-fatal"
+            staged.contains("exit 0"),
+            "it exits 0 so the caller treats the open as non-fatal"
         );
         assert!(
-            XDG_OPEN_CONTENTS.contains("\"$@\""),
-            "the stub surfaces the argument the tool passed"
+            staged.contains("\"$@\""),
+            "it surfaces the argument the tool passed"
         );
     }
 
@@ -2259,6 +2445,8 @@ mod tests {
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
             ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
+            open_apps_src: None,
+            open_mimeapps_src: None,
         };
         let nix = NixMount {
             src: PathBuf::from("/data/sbx/projects/abc/store/nix"),
@@ -2539,6 +2727,8 @@ mod tests {
             hosts_src: Path::new("/data/sbx/apps/demo-app/etc/hosts"),
             ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/apps/demo-app/etc/machine-id"),
+            open_apps_src: None,
+            open_mimeapps_src: None,
         };
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
@@ -2656,6 +2846,7 @@ mod tests {
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             vec![OsString::from("/bin/sh")],
         )
         .expect("build spec");
@@ -2781,6 +2972,7 @@ mod smoke {
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             cmd,
         )
         .expect("build spec");
@@ -2938,6 +3130,7 @@ mod smoke {
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             vec![foreign.clone().into_os_string()],
         )
         .expect("build foreign spec");
@@ -2983,6 +3176,7 @@ mod smoke {
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             vec![OsString::from("hello")],
         )
         .expect("build cross spec");
@@ -3125,6 +3319,7 @@ mod smoke {
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             cmd,
         )
         .expect("build spec");
@@ -3294,6 +3489,7 @@ mod smoke {
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             cmd,
         )
         .expect("build spec");
@@ -3461,6 +3657,7 @@ mod smoke {
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             cmd,
         )
         .expect("build spec");
@@ -3588,6 +3785,7 @@ mod smoke {
                 &Default::default(),
                 crate::sandbox::seccomp::SeccompPolicy::default(),
                 &[],
+                &Default::default(),
                 cmd,
             )
             .expect("build spec");
@@ -3719,6 +3917,7 @@ mod smoke {
             &Default::default(),
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
+            &Default::default(),
             cmd,
         )
         .expect("build spec");

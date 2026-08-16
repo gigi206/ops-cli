@@ -242,8 +242,9 @@ const PAGES: &[Page] = &[
         details: "A named application profile (a project [app.<name>] overlay, or an imported\n\
             apps/<name>.toml profile — a global app lives as a profile file, not inline in\n\
             sbx.toml) runs inside the project sandbox, each with its own persistent isolated home.\n\n\
-            `sbx app run <name>` launches one; `import`/`export`/`rm`/`list`/`show`/`prune` manage\n\
-            them. Run one of the subcommands below. Launching always goes through `run`, so an app\n\
+            `export`/`import`/`list`/`prune`/`rm`/`run`/`show`/`upgrade` are the subcommands:\n\
+            `sbx app run <name>` launches one, `sbx app upgrade <name>` advances it, and the rest\n\
+            manage the profiles. Launching always goes through `run`, so an app\n\
             name is never a subcommand — an app may be named `run`, `show`, etc. and is still\n\
             launched as `sbx app run <name>`.",
     },
@@ -304,6 +305,11 @@ const PAGES: &[Page] = &[
             demo-app -- -c` runs the profile's `demo-app` command with `-c` (resume the previous\n\
             session). They are ordinary launch-time arguments; the app's posture (network, binds,\n\
             secrets, home) is fixed by the profile and unchanged.\n\n\
+            When the profile's command is a shell script (`[\"bash\", \"-c\", ...]`), sbx inserts the\n\
+            app's name as the script's `$0` before appending, so the first argument arrives as `$1`\n\
+            rather than being absorbed as the shell's own name. The script must still expand `\"$@\"`\n\
+            for the arguments to reach the program it runs; a profile that declares its own element\n\
+            after the script keeps it, and sbx adds nothing.\n\n\
             A one-shot override (`--config` or a typed flag, and their `SBX_*` environment\n\
             equivalents) is applied *after* the app's overlay, so it is the final word — e.g.\n\
             `sbx app run demo-app --net none` cuts the app's network for one run. Note that\n\
@@ -1317,7 +1323,10 @@ const PAGES: &[Page] = &[
             \n\
             The trust gate hashes the whole file, so any edit re-arms it: after writing a project\n\
             file you had trusted, its security fields stop applying until you run `sbx trust`. Pass\n\
-            --trust to re-trust in one step (this blesses the whole current file). The global config\n\
+            --trust to re-trust in one step (this blesses the whole current file). Which is why\n\
+            --trust is refused on a file that was never trusted, or was changed since: sbx blesses\n\
+            the delta it wrote, never bytes you have not read. Review it and run `sbx trust`, or use\n\
+            `sbx config edit --trust`, where the editor shows you the file first. The global config\n\
             and app profiles are trusted by location, so a write to either needs no trust. A free\n\
             env value needs no trust. Array and table fields (binds, an allowlist, secrets, apps)\n\
             are edited with `sbx config edit`.",
@@ -1362,7 +1371,9 @@ const PAGES: &[Page] = &[
             `sbx config rm` is in fact the only way to take an `allow`/`deny` rule back out.\n\
             \n\
             The trust gate hashes the whole file, so a write re-arms it; --trust re-blesses the file\n\
-            in one step (the global config and app profiles are trusted by location and need none).",
+            in one step (the global config and app profiles are trusted by location and need none).\n\
+            On a file that was never trusted, or was changed since, --trust is refused: it would\n\
+            bless bytes you have not read. Run `sbx trust`, or `sbx config edit --trust`.",
     },
     Page {
         path: &["config", "rm"],
@@ -1388,7 +1399,9 @@ const PAGES: &[Page] = &[
         ],
         details: "Removes one entry from the list at <key>, leaving the other entries and the file's\n\
             comments in place. An entry that is not there changes nothing (and so never re-arms\n\
-            trust), the same as `sbx config unset` on a key that was not set.\n\
+            trust), the same as `sbx config unset` on a key that was not set. --trust is refused on\n\
+            a file that was never trusted, or was changed since: it would bless bytes you have not\n\
+            read (run `sbx trust`, or `sbx config edit --trust`).\n\
             \n\
             Removing the last entry leaves an empty list rather than deleting the key: `deny = []`\n\
             states that nothing is closed here, which is a different claim from the key being\n\
@@ -1420,7 +1433,9 @@ const PAGES: &[Page] = &[
         details: "Removes a dotted key from one layer file. Removing a key that is not set changes\n\
             nothing (and so never re-arms trust). A removal that does change a trusted project\n\
             file re-arms its trust gate, the same as `set` (the global config and app profiles\n\
-            are trusted by location, so a removal there needs no re-trust).\n\
+            are trusted by location, so a removal there needs no re-trust). And as with `set`,\n\
+            --trust is refused on a file that was never trusted, or was changed since — it would\n\
+            bless bytes you have not read (run `sbx trust`, or `sbx config edit --trust`).\n\
             \n\
             --app <name> addresses an app's config: inline (a project .sbx.toml) it removes\n\
             app.<name>.<key>; with -g it removes the top-level key from the app's profile file\n\
@@ -1472,7 +1487,13 @@ const PAGES: &[Page] = &[
             read-only in place — so the rest of the tree is writable but the agent still cannot\n\
             alter what sbx runs or trusts.\n\
             An edit that changes a file you had trusted re-arms its trust gate, so it warns to\n\
-            re-run `sbx trust`; pass --trust to re-trust as the editor closes.",
+            re-run `sbx trust`; pass --trust to re-trust as the editor closes. That applies to a\n\
+            gated file: the global config is trusted by location and has no marker to re-arm, so\n\
+            --trust there says it is not needed and stores nothing.\n\
+            \n\
+            This is the one verb whose --trust also blesses a file that was never trusted — `set`,\n\
+            `add`, `rm` and `unset` refuse that. The difference is that the editor showed you the\n\
+            file: what you have seen may be blessed.",
     },
     Page {
         path: &["config", "show"],
@@ -1485,11 +1506,11 @@ const PAGES: &[Page] = &[
             ),
             (
                 "--details",
-                "expand each app overlay's compact summary (env, binds, packages, allowlist rules, and injected credentials)",
+                "expand what each app overlay's entries are (env values, package backend lines, credential shapes), plus the postures left at their default and the allowlist machinery (mute, http2, built-ins)",
             ),
             (
                 "-a, --app <name>",
-                "show one app's effective configuration, each field tagged inherited or set by the app",
+                "show one app's effective configuration, each field tagged default, inherited, or set by the app",
             ),
             (
                 "-g, --global",
@@ -1523,18 +1544,27 @@ const PAGES: &[Page] = &[
             for --app; note -d is --default, so --details has no short form.\n\
             \n\
             With --app <name>, the view is one app's effective configuration — the baseline\n\
-            folded with the app's overlay — each field tagged (inherited) when it takes the\n\
-            baseline's value, or (app:global)/(app:project) when the app set it. (It does not\n\
-            combine with a single-source flag.)\n\
+            folded with the app's overlay — each field tagged (app:global)/(app:project) when the\n\
+            app set it, (inherited) when a config layer set it and the app takes that value, or\n\
+            (default) when no layer set it at all. (It does not combine with a single-source\n\
+            flag.)\n\
             \n\
-            An app profile is otherwise shown as a compact summary (one line per field); with\n\
-            --details its env is expanded to each KEY=value, its binds to each path, its packages\n\
-            to each full backend line (a withheld one marked, the same line the baseline packages\n\
-            section renders), its allowlist to the individual allow/deny rules plus the\n\
-            always-allowed built-in hosts, and its injected credentials to each by destination and\n\
-            source — so what `sbx app <name>` adds, can reach, and injects is visible at a glance.\n\
-            An env value is the in-cage placeholder, a free field; the credential value is never\n\
-            shown — sbx reads it host-side at launch.\n\
+            A posture left entirely at its default is not printed: it says the same thing for\n\
+            every app on the machine, and ten such lines crowd out the few fields that tell this\n\
+            app from another. They are named together on one line — at their default: proc, gui,\n\
+            … — so nothing is hidden without being listed, and --details prints them all in\n\
+            place.\n\
+            \n\
+            What an app *adds* is named in the compact view, not counted: its own variables,\n\
+            binds, packages and credentials by name, followed by how many baseline entries it\n\
+            inherits. Its allow and deny rules are listed there too — which hosts an app may reach\n\
+            is the answer this view is opened for, and a count sends the reader to a second\n\
+            command. With --details each entry is expanded to what it *is*: an env value (the\n\
+            in-cage placeholder, a free field — an injected credential's value is never shown, sbx\n\
+            reads it host-side at launch), a package's full backend line, a credential's shape and\n\
+            sources. --details also carries the allowlist machinery the compact view counts\n\
+            instead: the muted hosts, the HTTP/2 designations and the always-allowed built-in set,\n\
+            none of which change what the app can reach.\n\
             \n\
             With --json, the same resolved model is printed as a JSON document (warnings\n\
             included as a field) — the machine-readable form the human output renders, already\n\
@@ -1849,8 +1879,29 @@ const PAGES: &[Page] = &[
     },
     // ---- app subcommands ----------------------------------------------------------
     Page {
+        path: &["app", "upgrade"],
+        synopsis: "sbx app upgrade <name>",
+        summary: "advance one app, dispatching on what it declares",
+        options: &[("<name>", "the app to advance")],
+        details: "Advances a named app without asking which channel it rides: sbx reads what the app\n\
+            declares and rolls the parts whose unit of work is the app's own cage — its `mise:`\n\
+            packages and its bundle's install step, the same two `sbx upgrade --app` narrows.\n\n\
+            What it does not do is hide the rest. A `nix:`, `flake:`, `deb:`, `appimage:`,\n\
+            `tarball:` or `binary:` package is pinned in a lock that belongs to the **project**, not\n\
+            to one app, so rolling it here would advance every app under a command that reads as\n\
+            \"only this one\". Those are named instead, with the channel command that rolls them —\n\
+            `sbx upgrade nix` and friends. An inline `[flakes.<name>]` pins its inputs in its own\n\
+            source and has no channel at all; it rebuilds when that source changes.\n\n\
+            The bundle install step runs here without a further flag, unlike under `sbx upgrade\n\
+            all`: `all` is unscoped, so its steps would launch a cage per app across the project,\n\
+            while naming one app bounds the cost to the cage you asked about. Nothing gates it, so\n\
+            it names its cost before the cage is built rather than after. To roll only the cheap\n\
+            half, use `sbx upgrade mise --app <name>` — which the notice points at only for an app\n\
+            that has packages to roll, since it refuses one that declares none.",
+    },
+    Page {
         path: &["app", "import"],
-        synopsis: "sbx app import <file> [--as <name>] [--force]",
+        synopsis: "sbx app import <file> [--as <name>] [--force] [--with-deps]",
         summary: "place a portable app profile (trusted by location)",
         options: &[
             (
@@ -1865,6 +1916,10 @@ const PAGES: &[Page] = &[
                 "--force",
                 "overwrite an existing profile of the same name (naming what it drops)",
             ),
+            (
+                "--with-deps",
+                "also import the bundles and egress groups it names, from files beside it",
+            ),
         ],
         details: "The deliberate command IS the consent — an agent in the cage cannot run it, and the\n\
             profile stays inert until `sbx app <name>` launches it. The granted posture is\n\
@@ -1874,7 +1929,16 @@ const PAGES: &[Page] = &[
             replaced. With it, the settings the incoming file no longer carries are named, and\n\
             the bytes it replaced are kept beside it as `<name>.toml.replaced` — a per-machine\n\
             rule or credential added by hand can be read back from there. That copy is not a\n\
-            profile (only `*.toml` is read) and is removed with `sbx app rm <name>`.",
+            profile (only `*.toml` is read) and is removed with `sbx app rm <name>`.\n\
+            \n\
+            A profile is not self-contained: it names bundles in `use` and egress groups as\n\
+            `@<name>`, both of which live in the global config. By default the import names\n\
+            what is missing and leaves the writing to you. With --with-deps it also imports\n\
+            them, taking each from the file sitting beside the profile in the same catalogue\n\
+            (`bundle/<name>.toml`, `net-groups/<name>.toml`) and only when that file really\n\
+            declares the name. Only the referenced names are merged, never the rest of a\n\
+            fragment, and nothing already declared is replaced. If any reference has no file\n\
+            behind it, nothing at all is written — including the profile.",
     },
     Page {
         path: &["app", "export"],

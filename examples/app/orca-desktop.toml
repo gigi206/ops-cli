@@ -1,7 +1,8 @@
 # orca-desktop — the Orca Agent Development Environment (ADE), sandboxed by sbx (with a Wayland
 # display).
 #
-#   sbx app import examples/app/orca-desktop.toml
+#   sbx bundle import examples/bundle/opencode.toml
+#   sbx app import    examples/app/orca-desktop.toml
 #   sbx app run orca-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -64,8 +65,8 @@
 # login keyring is never exposed.
 #
 # SIGN-IN. Where the tool's sign-in opens an external browser, the profile wires an in-cage
-# Chromium as the `xdg-open` handler so the whole login closes inside the cage (see the `cmd`
-# wrapper below). That matters for the Orca ACCOUNT flow (`login.onorca.dev`) and for any interior
+# Chromium as the handler for web links so the whole login closes inside the cage (see the `[open]`
+# table below). That matters for the Orca ACCOUNT flow (`login.onorca.dev`) and for any interior
 # agent that re-authenticates via a web page; the pilot `opencode` agent is BYOK (env var) and
 # needs no browser. The Orca account host stays DENIED by default — open `{*} https://login.onorca.dev`
 # the day you sign in to your Orca account (the in-cage Chromium renders the page). `relay.onorca.dev`
@@ -84,46 +85,11 @@
 # and hosts (read out of app.asar), and Orca's known agent ids (`--agent opencode`, per upstream's
 # CLI skill guide).
 cmd = [
-    "bash",
-    "-c",
-    '''
-# xdg-open routing: the Orca-account sign-in and any interior-agent web auth open their URL
-# through Electron's `shell.openExternal` -> `xdg-open`. Route every http(s) URL to the IN-CAGE
-# Chromium so the login closes inside the cage (MIMEAPPS registration below routes the desktop
-# portal's OpenURI through the same wrapper; the Exec path is ABSOLUTE because the portal-launched
-# handler does not inherit this shell's PATH). Orca has no app deep-link scheme to route.
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-case "$1" in
-  http://*|https://*)
-    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
-      --no-first-run --no-default-browser-check "$@" ;;
-  *)
-    echo "xdg-open: no handler for $1" >&2
-    exit 1 ;;
-esac
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
-mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=sbx URL handler
-Exec=$HOME/.local/bin/xdg-open %U
-MimeType=x-scheme-handler/http;x-scheme-handler/https;
-NoDisplay=true
-Terminal=false
-EOF
-cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
-[Default Applications]
-x-scheme-handler/http=sbx-open-uri.desktop
-x-scheme-handler/https=sbx-open-uri.desktop
-MIMEAPPS
-
-exec orca-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage --use-system-ca
-''',
+    "orca-desktop",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
 ]
 
 gui = "wayland"
@@ -135,15 +101,29 @@ dbus = true
 # reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
 # profile cannot fall behind when the agent's requirements change.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/opencode.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["opencode"]
 
+# Where a web link opens: the in-cage Chromium. One declaration covers both ways a link is opened —
+# a tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` — and sbx
+# freezes the routing, so nothing running in the cage can answer a sign-in link in its place.
+#
+# One deliberate change of behaviour: the hand-written wrapper this replaces answered any OTHER
+# scheme with an error and a failing exit status. A scheme no entry claims now takes sbx's own
+# default instead, which names the URI on stderr and succeeds, so a flow that treats a failed open
+# as a failed sign-in carries on and leaves the choice to the person.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+
 [packages]
 # The ADE itself, from upstream's GitHub release (see "THE `deb:github:` BACKEND" above).
 orca-desktop = "deb:github:stablyai/orca"
-# In-cage Chromium as the `xdg-open` handler for sign-in flows (see the cmd wrapper above).
+# In-cage Chromium, the browser the `[open]` table routes sign-in links to.
 chromium = "nix:chromium"
 # The PILOT interior agent — the same `opencode` the CLI profile equips (`mise:opencode`), so
 # `orca worktree create --agent opencode --prompt "…"` has something to launch. Add other agent

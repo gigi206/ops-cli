@@ -1,6 +1,7 @@
 # Claude Desktop — Anthropic's official desktop app (Chat + Cowork + Code), sandboxed by sbx.
 #
-#   sbx app import examples/app/claude-desktop.toml
+#   sbx bundle import examples/bundle/claude-desktop.toml
+#   sbx app import    examples/app/claude-desktop.toml
 #   sbx app run claude-desktop
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's `.deb`, the sign-in browser, the
@@ -81,14 +82,14 @@
 #   * LOGIN — both email and Google work. "Continue with email" (Claude emails a code you type into
 #     the window) is the simplest: it stays in the app's own webview and needs nothing extra.
 #     "Continue with Google" opens the consent in the IN-CAGE Chromium (via `shell.openExternal` ->
-#     the xdg-open wrapper below); Google then redirects to the deep-link
+#     the `[open]` routing below); Google then redirects to the deep-link
 #     `claude://login/google-auth?code=…&anon_id=…`, which Chromium hands to the running claude-desktop
 #     (Electron single-instance), and the app completes the login — the `anon_id` is the app's own
 #     cross-session bridge, so the browser's cookie jar is NOT the channel (a common misconception).
 #     The browser MUST be in-cage: a HOST browser's `claude://` would find no claude-desktop on the
-#     host. The `cmd` wrapper writes a Chromium managed policy so that deep-link opens with no
-#     confirmation dialog (see the wrapper). Google is the heavier path (it pulls Chromium); if you
-#     only ever use email, drop the `cmd` wrapper + the `chromium` package for a bare argv.
+#     host. The `cmd` writes a Chromium managed policy so that deep-link opens with no
+#     confirmation dialog. Google is the heavier path (it pulls Chromium); if you only ever use
+#     email, drop the `[open]` table + the `chromium` package, and the `cmd` with them.
 #   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT) and closing the
 #     window does NOT quit (Claude Desktop is a tray/background app and the cage exposes no tray). Press
 #     **Ctrl+C twice within 2s** to force-quit the session (sbx terminates the cage), or `sbx session stop <id>`
@@ -105,13 +106,13 @@
 #
 # If a request is refused, the proxy names the host — watch `sbx net logs -a claude-desktop` and add
 # it below (or check ahead with `sbx test net <url>`).
-# The command is a small bash wrapper (not a bare argv) so "Continue with Google" works IN the cage.
-# Why: the app opens the Google consent with Electron's `shell.openExternal` (which runs `xdg-open`),
-# and expects the OAuth result back as the deep-link `claude://login/google-auth?code=…&anon_id=…`,
-# which Electron's single-instance mechanism delivers to the already-running app. The wrapper installs
-# an `xdg-open` that (a) launches an IN-CAGE Chromium for the http(s) consent and (b) routes the
-# `claude://` deep-link back to claude-desktop — so the whole flow closes inside the sandbox. It also
-# writes a Chromium managed policy (see the wrapper's first block) so Chromium follows the `claude://`
+# The `[open]` table below is what makes "Continue with Google" work IN the cage. Why: the app opens
+# the Google consent with Electron's `shell.openExternal`, and expects the OAuth result back as the
+# deep-link `claude://login/google-auth?code=…&anon_id=…`, which Electron's single-instance mechanism
+# delivers to the already-running app. So http(s) is routed to an IN-CAGE Chromium for the consent and
+# `claude` back to claude-desktop, and the whole flow closes inside the sandbox. The command stays a
+# small bash wrapper for the one thing a declaration cannot express: a Chromium managed policy so
+# Chromium follows the `claude://`
 # redirect with no "open external app?" confirmation dialog (without it the code never reaches the app
 # and the login silently fails — the real bug behind "the browser signed in but the app didn't").
 # A HOST browser cannot do this: its `claude://` would find no claude-desktop installed on the host.
@@ -136,54 +137,9 @@ mkdir -p /etc/chromium/policies/managed 2>/dev/null && cat > /etc/chromium/polic
 {"AutoLaunchProtocolsFromOrigins":[{"allowed_origins":["*"],"protocol":"claude"}]}
 POLICY
 
-# xdg-open routing by scheme: http(s) -> the in-cage Chromium (Google consent); else (the `claude://`
-# deep-link) -> claude-desktop, so the callback reaches the running app. Prepended to PATH.
-# NOTE the `--no-sandbox` on the claude-desktop branch: this invocation only hands the deep-link to
-# the already-running instance (Electron single-instance) and quits, but it still boots far enough to
-# hit Chromium's SUID sandbox — which aborts FATAL because sbx's build strips the setuid bit off
-# chrome-sandbox (an unprivileged nix builder cannot set it). Without --no-sandbox here the forwarding
-# process dies rc=133 and the Google login code never reaches the app (the real, load-bearing bug).
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/xdg-open" <<'WRAP'
-#!/bin/sh
-case "$1" in
-  http://*|https://*)
-    exec chromium --no-sandbox --ozone-platform=wayland --password-store=basic \
-      --no-first-run --no-default-browser-check "$@" ;;
-  *)
-    exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage "$@" ;;
-esac
-WRAP
-chmod +x "$HOME/.local/bin/xdg-open"
-export PATH="$HOME/.local/bin:$PATH"
-
-# Route the desktop portal's OpenURI back to the xdg-open wrapper above. Under `dbus = true` the
-# cage has a real portal, so Electron opens external URLs via `org.freedesktop.portal.OpenURI` instead
-# of calling `xdg-open` — and the portal shows "Open With… no apps available" unless a default handler
-# is registered, which silently breaks the login/re-verification links (Google consent, the device
-# re-verification page, the `claude://` OAuth callback). Register the wrapper as the default handler
-# for the web + `claude` schemes so those links route through it exactly as they did without a portal.
-# The Exec path is ABSOLUTE (`$HOME` is expanded here) because the portal-launched handler does not
-# inherit this shell's PATH. Harmless under `dbus = false` (no portal to call OpenURI).
-mkdir -p "$HOME/.local/share/applications" "$HOME/.config"
-cat > "$HOME/.local/share/applications/sbx-open-uri.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=sbx URL handler
-Exec=$HOME/.local/bin/xdg-open %U
-MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/claude;
-NoDisplay=true
-Terminal=false
-EOF
-cat > "$HOME/.config/mimeapps.list" <<'MIMEAPPS'
-[Default Applications]
-x-scheme-handler/http=sbx-open-uri.desktop
-x-scheme-handler/https=sbx-open-uri.desktop
-x-scheme-handler/claude=sbx-open-uri.desktop
-MIMEAPPS
 
 exec claude-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic
+    --use-system-ca --password-store=basic "$@"
 ''',
 ]
 
@@ -208,7 +164,7 @@ dbus = true
 # bundle may never carry is posture: the `gui`/`gpu`/`audio`/`dbus` grants and the sign-in preamble
 # in `cmd` stay here.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/claude-desktop.toml
 # Without it the launch warns that the bundle is undeclared and the app is simply absent.
 use = ["claude-desktop"]
@@ -220,6 +176,18 @@ use = ["claude-desktop"]
 # Grounded on Anthropic's documented "Network access requirements" (code.claude.com/docs/en/network-
 # config). `raw.githubusercontent.com` (changelog / plugin marketplace) is already covered by sbx's
 # built-in nix-cache/github allow-set, so it is not repeated here.
+# Where a link opens, declared rather than scripted. `http`/`https` go to the in-cage Chromium for
+# the web auth (Google consent, the device re-verification page); `claude` is the OAuth callback the
+# provider redirects to, which must reach the desktop app. One declaration covers both ways a link
+# is opened — a tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` —
+# and sbx freezes the routing, so nothing running in the cage can answer a sign-in link instead.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+claude = ["claude-desktop", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage"]
+
 [network]
 mode = "deny"
 allow = [

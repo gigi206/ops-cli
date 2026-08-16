@@ -1,6 +1,7 @@
 # Pi — a minimal, provider-agnostic (BYOK) terminal coding agent, sandboxed by sbx.
 #
-#   sbx app import examples/app/pi.toml
+#   sbx bundle import examples/bundle/pi.toml
+#   sbx app import    examples/app/pi.toml
 #   sbx app run pi
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -12,8 +13,9 @@
 #
 # The tool is equipped fresh from upstream (mise's `aqua` backend pulls the standalone
 # `pi` release binary from GitHub) — no nixpkgs lag, no node runtime needed. It is
-# equipped at the latest upstream version on the first launch in a project; advancing
-# an already-installed version is not yet automated by `sbx upgrade`.
+# equipped at the latest upstream version on the first launch in a project and pinned there,
+# so a later upstream release cannot change what runs under you; `sbx app upgrade pi`
+# advances that pin.
 #
 # Pi is MULTI-PROVIDER (it speaks each provider's native API directly), so its egress
 # depends on the provider you key it to. This template is set up for Anthropic; for
@@ -38,7 +40,7 @@ cmd = "pi"
 # reach, and its telemetry mutes — from one declaration shared with the bundle file itself, so this
 # profile cannot fall behind when the agent's requirements change.
 #
-# IMPORT THE BUNDLE FIRST — it is not in this file:
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/pi.toml
 # Without it the launch warns that the bundle is undeclared and the agent is simply absent.
 use = ["pi"]
