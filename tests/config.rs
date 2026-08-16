@@ -156,9 +156,17 @@ impl Fixture {
 
     /// An `sbx` invocation in the project dir with the redirected dirs.
     fn sbx(&self, args: &[&str]) -> Command {
+        self.sbx_in(self.proj.path(), args)
+    }
+
+    /// [`sbx`](Self::sbx) from another directory, with the same redirected homes — so a test can ask
+    /// what changes when only the working directory does. The project config lives in `proj`, so
+    /// running from elsewhere is running with no project config at all, which is what a user does
+    /// whenever they launch a global app from outside a project.
+    fn sbx_in(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
         cmd.args(args)
-            .current_dir(self.proj.path())
+            .current_dir(dir)
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .env("XDG_STATE_HOME", self.state_home.path())
             .env("XDG_DATA_HOME", self.data_home.path())
@@ -172,6 +180,10 @@ impl Fixture {
 
     fn run(&self, args: &[&str]) -> Output {
         self.sbx(args).output().expect("spawn sbx")
+    }
+
+    fn run_in(&self, dir: &Path, args: &[&str]) -> Output {
+        self.sbx_in(dir, args).output().expect("spawn sbx")
     }
 }
 
@@ -2342,6 +2354,47 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
         doc["gui_origin"], "Default",
         "a field no layer set is `Default`, not `Inherited` — the JSON carries the same three-way \
          answer the text view does"
+    );
+}
+
+#[test]
+fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
+    // A global app's nixpkgs channel is not a property of the app: the launch reads it from the
+    // current directory (`sandbox::app` builds its cage through `effective_lock_target(&cwd, …)`),
+    // so the same app resolves against a project's trusted pin when run from that project and
+    // against the global channel when run from anywhere else. The app view is where someone asks
+    // what an app will run with, so it has to say which of the two it got.
+    let fx = Fixture::new();
+    fx.write_profile("demo", "cmd = \"demo-agent\"\n");
+    fx.write_project("nixpkgs = \"nixos-24.11\"\n");
+    assert!(
+        fx.run(&["trust", ".sbx.toml"]).status.success(),
+        "a pin is trust-gated, so the project must be vouched for first"
+    );
+
+    let inside =
+        String::from_utf8_lossy(&fx.run(&["config", "show", "--app", "demo"]).stdout).into_owned();
+    assert!(
+        inside.contains("nixpkgs: nixos-24.11") && inside.contains("(project pin)"),
+        "from the pinned project the app view must report the pin, origin included:\n{inside}"
+    );
+
+    // The same app, same profile, same homes — only the directory differs.
+    let elsewhere = TmpDir::new();
+    let outside = String::from_utf8_lossy(
+        &fx.run_in(elsewhere.path(), &["config", "show", "--app", "demo"])
+            .stdout,
+    )
+    .into_owned();
+    assert!(
+        outside.contains("(default)"),
+        "outside the project the same app must report the global channel:\n{outside}"
+    );
+    // The discriminating half: the pin must be *gone*, not merely joined by a second line. Asserting
+    // only the presence of `(default)` would pass on a view that printed both.
+    assert!(
+        !outside.contains("nixos-24.11"),
+        "the project's pin must not follow the app out of the project:\n{outside}"
     );
 }
 

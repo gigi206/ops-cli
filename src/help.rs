@@ -1566,6 +1566,13 @@ const PAGES: &[Page] = &[
             instead: the muted hosts, the HTTP/2 designations and the always-allowed built-in set,\n\
             none of which change what the app can reach.\n\
             \n\
+            The nixpkgs line beside the packages is the channel the app's nix: packages and its\n\
+            base userland are built from. It is the one field of this view the *directory*\n\
+            decides rather than the app: a launch resolves the channel from the working\n\
+            directory, so the same app run from a project with a trusted nixpkgs pin builds\n\
+            against that pin, and run from anywhere else against the global channel. Its origin\n\
+            tag — (project pin), (global) or (default) — is what says which of the two you got.\n\
+            \n\
             With --json, the same resolved model is printed as a JSON document (warnings\n\
             included as a field) — the machine-readable form the human output renders, already\n\
             carrying every app's env, binds, packages, rules, and injected credentials in full.",

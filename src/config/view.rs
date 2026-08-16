@@ -906,6 +906,16 @@ pub(crate) struct AppDetailView {
     /// The packages this app declares (its own), and the count it inherits from the baseline.
     pub(crate) packages: Vec<PackageView>,
     pub(crate) packages_inherited: usize,
+    /// The nixpkgs channel this app's launch resolves against — the same decision the baseline view
+    /// reports, carried here because it is what the app's `nix:` packages and its base userland are
+    /// built from, and nothing else in this view names it.
+    ///
+    /// It is a property of the **directory**, not of the app: the launch reads it from the current
+    /// directory (`sandbox::app` → `prepare_with` → `effective_lock_target`), so the same app run
+    /// from a project with a trusted `nixpkgs` pin resolves against that pin and run from anywhere
+    /// else against the global channel. Showing it is what makes that visible where someone asks
+    /// what the app will run with.
+    pub(crate) nixpkgs: ChannelView,
     /// The credentials this app injects (its own), and the count it inherits from the baseline.
     /// Both are zero when the app's effective network is not an allowlist: the launch injects no
     /// credential then, so the view does not report one either (mirroring the launch's posture).
@@ -1746,6 +1756,9 @@ fn app_detail_view(
             .map(|p| package_view(p, flake_pins))
             .collect(),
         packages_inherited,
+        // The same call the baseline view makes, on the same directory and the same resolved
+        // config, so the two views can never report different channels for one launch.
+        nixpkgs: nixpkgs_channel(cwd, baseline),
         secrets: if secrets_dropped {
             Vec::new()
         } else {

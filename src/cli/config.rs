@@ -2083,6 +2083,12 @@ fn render_app_detail(
             let _ = writeln!(o, "{}", package_line(p, pal, "    "));
         }
     }
+    // The channel those packages — and the cage's base userland — are built from. Beside them
+    // rather than among the postures, because it is what they resolve against, and it is the one
+    // field of this view that the *directory* decides rather than the app: the same app launched
+    // from a project with a trusted pin builds against that pin. Rendered by the baseline view's
+    // own `channel_text`, so a channel reads identically wherever it appears.
+    let _ = writeln!(o, "  {h}nixpkgs:{r} {}", channel_text(&view.nixpkgs, pal));
     // What a link opens with, effective. Listed in full rather than summarised as a count: this is
     // the answer someone opens this view to find when a sign-in goes nowhere, and it is short.
     if view.open.is_empty() {
@@ -3674,6 +3680,11 @@ mod tests {
             ssh_agent_confirm: false,
             name: "demo".into(),
             cwd: "/proj".into(),
+            nixpkgs: ChannelView {
+                source: "nixos-23.11".into(),
+                origin: "project pin".into(),
+                locked_rev: Some("9ae611a0f2b1c3d4".into()),
+            },
             cmd: Some("demo-agent".into()),
             cmd_origin: ProvenanceView::Global,
             home_scope: "global (shared across projects)".into(),
@@ -3758,6 +3769,15 @@ mod tests {
         // Collections name the overlay's own entries and count what they inherit.
         assert!(out.contains("DEMO_TOKEN  · inherits 2 baseline"), "{out}");
         assert!(!out.contains(" own  ·"), "{out}");
+        // The channel the packages and the base userland resolve against, in the default view (not
+        // behind `--details`): it is what they are built from, and no other line of this view names
+        // it. The whole line is pinned, origin included — the origin is the half that says the
+        // directory decided this, and a channel shown without it would read as a property of the
+        // app.
+        assert!(
+            out.contains("  nixpkgs: nixos-23.11 @ 9ae611a  (project pin)"),
+            "the app view must name the channel it resolves against:\n{out}"
+        );
 
         // Details add what the compact view keeps back: each variable's value, and the built-in
         // set every app shares.

@@ -87,6 +87,7 @@ half the catalogue and says nothing about this app.
   env:     ANTHROPIC_MODEL  · inherits 2 baseline
   binds:   /srv/workspace (rw)
   packages: chromium (nix), cursor (deb)
+  nixpkgs: nixos-unstable @ 0e251e2  (default)
   secrets: (none)
 ```
 
@@ -94,6 +95,24 @@ The tail counts what comes from the baseline, because those entries are one hop 
 `sbx config show`; it disappears when there are none. `--details` expands each entry to
 what it *is*: an env value, a package's full backend line, a credential's shape and
 sources.
+
+The `nixpkgs` line sits beside the packages because it is what they resolve against: the
+channel your `nix:` packages and the cage's base userland are built from. It is the one
+field of this view that the **directory** decides rather than the app. A launch reads the
+channel from the working directory, so the same app run from a project carrying a trusted
+`nixpkgs` pin builds against that pin, and run from anywhere else builds against the
+global channel. That is why the origin tag matters here as much as the value: `project
+pin`, `global` or `default` tells you which of the two you are looking at.
+
+```
+$ cd ~/work/pinned-project && sbx config show --app cursor | grep nixpkgs
+  nixpkgs: nixos-24.11  (project pin)
+
+$ cd ~ && sbx config show --app cursor | grep nixpkgs
+  nixpkgs: nixos-unstable @ 0e251e2  (default)
+```
+
+The app is the same in both, and so is its home. Only the directory changed.
 
 The allow and deny rules are listed too, one per line, since a rule is a whole clause
 (verbs, scheme, host pattern) and nineteen of them joined on one line would be
