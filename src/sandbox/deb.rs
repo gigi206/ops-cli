@@ -799,7 +799,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
     #[test]
     fn resolve_apt_deb_url_derives_a_current_deb_from_the_real_claude_index() {
         let Some(nix) = store::resolve_nix(None) else {
-            eprintln!("skipping deb:apt live resolve: no nix on PATH");
+            skip_incapable!("skipping deb:apt live resolve: no nix on PATH");
             return;
         };
         let data = TmpDir::new();
@@ -808,7 +808,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         let url = match resolve_apt_deb_url(&nix, &layout, INDEX, true) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("skipping deb:apt live resolve (network/nix): {e}");
+                skip_unreachable!("skipping deb:apt live resolve (network/nix): {e}");
                 return;
             }
         };

@@ -652,15 +652,15 @@ mod run_tests {
     #[test]
     fn runs_mise_from_sbx_store_hermetically_and_writes_only_into_sbx_data() {
         let Some(nix) = store::resolve_nix(None) else {
-            eprintln!("skipping mise run: no nix on PATH");
+            skip_incapable!("skipping mise run: no nix on PATH");
             return;
         };
         let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
-            eprintln!("skipping mise run: no bwrap on PATH");
+            skip_incapable!("skipping mise run: no bwrap on PATH");
             return;
         };
         if !matches!(crate::probe_userns(), crate::Userns::Ok) {
-            eprintln!("skipping mise run: no capability-bearing user namespace");
+            skip_incapable!("skipping mise run: no capability-bearing user namespace");
             return;
         }
 
@@ -739,15 +739,15 @@ mod run_tests {
     #[test]
     fn resolve_env_maps_authorized_env_and_ignores_unauthorized_siblings() {
         let Some(nix) = store::resolve_nix(None) else {
-            eprintln!("skipping mise resolve_env: no nix on PATH");
+            skip_incapable!("skipping mise resolve_env: no nix on PATH");
             return;
         };
         let Some(bwrap) = crate::pathfind::find_on_path("bwrap") else {
-            eprintln!("skipping mise resolve_env: no bwrap on PATH");
+            skip_incapable!("skipping mise resolve_env: no bwrap on PATH");
             return;
         };
         if !matches!(crate::probe_userns(), crate::Userns::Ok) {
-            eprintln!("skipping mise resolve_env: no capability-bearing user namespace");
+            skip_incapable!("skipping mise resolve_env: no capability-bearing user namespace");
             return;
         }
 

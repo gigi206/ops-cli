@@ -3032,7 +3032,7 @@ mod smoke {
     #[test]
     fn the_generated_argv_launches_a_working_hermetic_shell() {
         let Some((bwrap, nix)) = prerequisites() else {
-            eprintln!("skipping hermetic smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping hermetic smoke: need bwrap, userns, and nix");
             return;
         };
 
@@ -3045,7 +3045,9 @@ mod smoke {
             .expect("resolve nixpkgs");
         let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
         else {
-            eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
+            skip_unreachable!(
+                "skipping: base userland provisioning failed (cache or channel drift)"
+            );
             return;
         };
 
@@ -3140,7 +3142,7 @@ mod smoke {
     fn the_nix_ld_shim_serves_foreign_binaries_and_unskews_cross_channel_tools() {
         use std::os::unix::fs::PermissionsExt;
         let Some((bwrap, nix)) = prerequisites() else {
-            eprintln!("skipping nix-ld smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping nix-ld smoke: need bwrap, userns, and nix");
             return;
         };
 
@@ -3151,7 +3153,9 @@ mod smoke {
             .expect("resolve base channel");
         let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
         else {
-            eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
+            skip_unreachable!(
+                "skipping: base userland provisioning failed (cache or channel drift)"
+            );
             return;
         };
         // both halves consume the shared store read-only (the userland is what is under
@@ -3214,7 +3218,7 @@ mod smoke {
         {
             Ok(pe) => pe,
             Err(e) => {
-                eprintln!(
+                skip_incapable!(
                     "skipping nix-ld smoke: cannot run a relocated-store patchelf host-side \
                      (its loader is not in the host /nix store): {e}"
                 );
@@ -3222,7 +3226,7 @@ mod smoke {
             }
         };
         if !pe.status.success() {
-            eprintln!(
+            skip_incapable!(
                 "skipping nix-ld smoke: patchelf failed: {}",
                 String::from_utf8_lossy(&pe.stderr)
             );
@@ -3269,7 +3273,7 @@ mod smoke {
             .resolve(&nix, &layout)
             .expect("resolve cross channel");
         if cross_ref == base_ref {
-            eprintln!(
+            skip_incapable!(
                 "skipping the cross-channel half: both channels resolved to the same revision"
             );
             return;
@@ -3325,11 +3329,11 @@ mod smoke {
     #[test]
     fn the_cage_runs_from_a_writable_per_project_store_seeded_with_the_base_closure() {
         let Some((bwrap, nix)) = prerequisites() else {
-            eprintln!("skipping per-project store flip smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping per-project store flip smoke: need bwrap, userns, and nix");
             return;
         };
         let Some(nix_store) = crate::store::resolve_nix_store(None) else {
-            eprintln!("skipping per-project store flip smoke: need nix-store");
+            skip_incapable!("skipping per-project store flip smoke: need nix-store");
             return;
         };
 
@@ -3344,7 +3348,9 @@ mod smoke {
             .expect("resolve base channel");
         let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
         else {
-            eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
+            skip_unreachable!(
+                "skipping: base userland provisioning failed (cache or channel drift)"
+            );
             return;
         };
         let unseeded = crate::store::provision(
@@ -3496,11 +3502,11 @@ mod smoke {
     #[test]
     fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
         let Some((bwrap, nix)) = prerequisites() else {
-            eprintln!("skipping nix-in-cage smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping nix-in-cage smoke: need bwrap, userns, and nix");
             return;
         };
         let Some(nix_store) = crate::store::resolve_nix_store(None) else {
-            eprintln!("skipping nix-in-cage smoke: need nix-store");
+            skip_incapable!("skipping nix-in-cage smoke: need nix-store");
             return;
         };
 
@@ -3513,7 +3519,9 @@ mod smoke {
         // brings nix and its closure into the per-project store.
         let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
         else {
-            eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
+            skip_unreachable!(
+                "skipping: base userland provisioning failed (cache or channel drift)"
+            );
             return;
         };
         // hello: realised into the shared store but NOT a seeded root — the discriminant's
@@ -3704,15 +3712,15 @@ mod smoke {
     #[test]
     fn the_cage_self_equips_a_nix_tool_via_mise() {
         let Some((bwrap, nix)) = prerequisites() else {
-            eprintln!("skipping mise self-equip smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping mise self-equip smoke: need bwrap, userns, and nix");
             return;
         };
         let Some(nix_store) = crate::store::resolve_nix_store(None) else {
-            eprintln!("skipping mise self-equip smoke: need nix-store");
+            skip_incapable!("skipping mise self-equip smoke: need nix-store");
             return;
         };
         if !network_reachable() {
-            eprintln!("skipping mise self-equip smoke: the binary cache is unreachable");
+            skip_unreachable!("skipping mise self-equip smoke: the binary cache is unreachable");
             return;
         }
 
@@ -3725,7 +3733,9 @@ mod smoke {
         // its closure into the per-project store — the agent reaches it by name.
         let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
         else {
-            eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
+            skip_unreachable!(
+                "skipping: base userland provisioning failed (cache or channel drift)"
+            );
             return;
         };
 
@@ -3845,15 +3855,15 @@ mod smoke {
     #[test]
     fn a_mise_used_tool_is_activated_on_path_in_a_later_launch() {
         let Some((bwrap, nix)) = prerequisites() else {
-            eprintln!("skipping mise activation smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping mise activation smoke: need bwrap, userns, and nix");
             return;
         };
         let Some(nix_store) = crate::store::resolve_nix_store(None) else {
-            eprintln!("skipping mise activation smoke: need nix-store");
+            skip_incapable!("skipping mise activation smoke: need nix-store");
             return;
         };
         if !network_reachable() {
-            eprintln!("skipping mise activation smoke: the binary cache is unreachable");
+            skip_unreachable!("skipping mise activation smoke: the binary cache is unreachable");
             return;
         }
 
@@ -3864,7 +3874,9 @@ mod smoke {
             .expect("resolve base channel");
         let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &base_ref, &base_ref)
         else {
-            eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
+            skip_unreachable!(
+                "skipping: base userland provisioning failed (cache or channel drift)"
+            );
             return;
         };
 
@@ -3991,7 +4003,7 @@ mod smoke {
         // installs as the read-only fallback, and BOTH shims dirs on PATH. A unit test proves the
         // spec; only a real launch proves the generated argv carries it.
         let Some((bwrap, nix)) = prerequisites() else {
-            eprintln!("skipping mise-split smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping mise-split smoke: need bwrap, userns, and nix");
             return;
         };
         let data = TmpDir::new();
@@ -4001,7 +4013,9 @@ mod smoke {
             .expect("resolve nixpkgs");
         let Ok(userland) = super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
         else {
-            eprintln!("skipping: base userland provisioning failed (cache or channel drift)");
+            skip_unreachable!(
+                "skipping: base userland provisioning failed (cache or channel drift)"
+            );
             return;
         };
 

@@ -1323,7 +1323,7 @@ mod tests {
     #[test]
     fn run_binds_a_nix_programs_closure_so_a_wrapper_script_can_start() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         // Needs a real nix-installed program to be meaningful; skip where there is none.
@@ -1331,7 +1331,7 @@ mod tests {
             return;
         };
         if !pass.starts_with(NIX_STORE) {
-            eprintln!("skipping nix closure run: `pass` is not a store path here");
+            skip_incapable!("skipping nix closure run: `pass` is not a store path here");
             return;
         }
         // The case the closure exists for. A nix `pass` is a wrapper script whose shebang is a
@@ -1501,7 +1501,7 @@ mod tests {
     #[test]
     fn run_keeps_state_across_invocations_under_the_grant() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         let (_root, p) = installed_resolver(
@@ -1527,7 +1527,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_keeps_nothing_across_invocations_without_the_grant() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         let (_root, p) = installed_resolver(
@@ -1548,7 +1548,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_binds_a_declared_program_so_the_plugin_calls_it_by_name() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         // `env` exists on every host this runs on, so what the test pins is not its presence but
@@ -1568,7 +1568,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_binds_the_path_an_allow_env_paths_variable_names() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         // The case the field exists for: a user whose store is not where the manifest guessed.
@@ -1598,7 +1598,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_drops_a_relative_allow_env_paths_value_rather_than_binding_it() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         // A relative value cannot mean what it says inside a cage sharing no working directory, so
@@ -1622,7 +1622,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_fails_closed_when_a_declared_program_is_not_on_the_path() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         let (_dir, p) = fake_resolver_with(
@@ -1660,7 +1660,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_returns_the_plugins_stdout_for_the_passed_ref() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         let (_dir, p) = fake_resolver("printf 'resolved:%s' \"$1\"");
@@ -1671,7 +1671,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_fails_closed_on_a_nonzero_exit_folding_stderr_not_stdout() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         // prints a plaintext to stdout but exits non-zero — the error must fold stderr, never stdout
@@ -1690,7 +1690,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_returns_empty_for_a_clean_absent_so_the_caller_can_fall_through() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         // exit 0, nothing on stdout — the contract's "absent"; the caller's classify_value turns
@@ -1753,7 +1753,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_returns_the_value_of_a_chatty_plugin_untouched() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         // A plugin that logs while it resolves. The value comes back verbatim, and the run is not
@@ -1769,7 +1769,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_sanitizes_the_stderr_it_folds_into_an_error() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         let (_dir, p) = fake_resolver("printf 'boom\\033[2J\\nsbx: fake line' >&2 ; exit 3");
@@ -1785,7 +1785,7 @@ printf 'run-%s' "$n""#,
     #[test]
     fn run_refuses_a_group_writable_executable() {
         let Some(bwrap) = sandbox_prereqs() else {
-            eprintln!("skipping resolver run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
             return;
         };
         let (_dir, p) = fake_resolver("printf x");

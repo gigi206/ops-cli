@@ -811,7 +811,7 @@ mod tests {
             crate::pathfind::find_on_path("systemd-run"),
             crate::pathfind::find_on_path("printf"),
         ) else {
-            eprintln!("skipping dollar-escape test: no systemd-run or printf");
+            skip_incapable!("skipping dollar-escape test: no systemd-run or printf");
             return;
         };
         let run = |args: &[String]| {
@@ -823,7 +823,7 @@ mod tests {
         // A baseline scope must work here, or there is no usable session — then a failure would be
         // the host rather than a drift in the escape, so skip.
         if run(&["baseline".to_string()]).is_none() {
-            eprintln!("skipping dollar-escape test: cannot create a user scope here");
+            skip_incapable!("skipping dollar-escape test: cannot create a user scope here");
             return;
         }
 
@@ -869,11 +869,11 @@ mod tests {
         if crate::pathfind::find_on_path("systemd-run").is_none()
             || std::env::var_os("XDG_RUNTIME_DIR").is_none()
         {
-            eprintln!("skipping scope-unit test: no systemd user session");
+            skip_incapable!("skipping scope-unit test: no systemd user session");
             return;
         }
         let Some((_launcher, prefix)) = scope_wrapper(&Limits::default(), "demo-app") else {
-            eprintln!("skipping scope-unit test: no delegated controller");
+            skip_incapable!("skipping scope-unit test: no delegated controller");
             return;
         };
         let unit = prefix
@@ -950,17 +950,17 @@ mod tests {
     #[test]
     fn the_profile_properties_land_as_real_cgroup_limits() {
         let Some(systemd_run) = crate::pathfind::find_on_path("systemd-run") else {
-            eprintln!("skipping cgroup landing test: no systemd-run");
+            skip_incapable!("skipping cgroup landing test: no systemd-run");
             return;
         };
         if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-            eprintln!("skipping cgroup landing test: no systemd user session");
+            skip_incapable!("skipping cgroup landing test: no systemd user session");
             return;
         }
         let delegated = delegated_controllers();
         let props = enforceable_properties(&delegated, &Limits::default());
         if props.is_empty() {
-            eprintln!("skipping cgroup landing test: no controller delegated");
+            skip_incapable!("skipping cgroup landing test: no controller delegated");
             return;
         }
 
@@ -977,7 +977,7 @@ mod tests {
         cmd.args(["--", "bash", "-c", script]);
         let out = cmd.output().expect("run a transient scope");
         if !out.status.success() {
-            eprintln!("skipping cgroup landing test: scope did not launch");
+            skip_incapable!("skipping cgroup landing test: scope did not launch");
             return;
         }
         let s = String::from_utf8_lossy(&out.stdout);
@@ -1018,7 +1018,7 @@ mod tests {
     #[test]
     fn every_accepted_value_is_one_systemd_run_accepts() {
         let Some(systemd_run) = crate::pathfind::find_on_path("systemd-run") else {
-            eprintln!("skipping systemd grammar test: no systemd-run");
+            skip_incapable!("skipping systemd grammar test: no systemd-run");
             return;
         };
         let launches = |prop: Option<&str>| {
@@ -1033,7 +1033,7 @@ mod tests {
         // A baseline scope with no property must launch here, or there is no usable session — then
         // a per-form failure would be the host, not a validator drift, so skip rather than fail.
         if !launches(None) {
-            eprintln!("skipping systemd grammar test: cannot create a user scope here");
+            skip_incapable!("skipping systemd grammar test: cannot create a user scope here");
             return;
         }
 

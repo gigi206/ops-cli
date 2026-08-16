@@ -1118,7 +1118,7 @@ mod smoke {
     #[test]
     fn seed_is_closure_scoped_consistent_isolated_and_tops_up() {
         let Some((nix, nix_store)) = prerequisites() else {
-            eprintln!("skipping projectstore smoke: need nix and nix-store");
+            skip_incapable!("skipping projectstore smoke: need nix and nix-store");
             return;
         };
 
@@ -1250,7 +1250,7 @@ mod smoke {
     fn concurrent_same_project_seeds_converge_to_a_consistent_registered_store() {
         use std::collections::BTreeSet;
         let Some((nix, nix_store)) = prerequisites() else {
-            eprintln!("skipping concurrent-seed smoke: need nix and nix-store");
+            skip_incapable!("skipping concurrent-seed smoke: need nix and nix-store");
             return;
         };
 

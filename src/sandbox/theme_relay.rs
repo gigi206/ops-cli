@@ -246,7 +246,7 @@ mod tests {
         // a read that shells out to one fails on an ordinary host and every launch silently loses
         // the theme.
         if !host_portal_present() {
-            eprintln!("skipping host theme read: no desktop portal on the session bus");
+            skip_incapable!("skipping host theme read: no desktop portal on the session bus");
             return;
         }
         let scheme = read_host_color_scheme();

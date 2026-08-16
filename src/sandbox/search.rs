@@ -529,7 +529,7 @@ mod search_tests {
     #[test]
     fn searches_a_known_package_and_surfaces_its_versions() {
         let Some(nix) = store::resolve_nix(None) else {
-            eprintln!("skipping nixhub search: no nix on PATH");
+            skip_incapable!("skipping nixhub search: no nix on PATH");
             return;
         };
         let data = TmpDir::new();
@@ -544,7 +544,7 @@ mod search_tests {
         ) {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("skipping nixhub search: {e}");
+                skip_unreachable!("skipping nixhub search: {e}");
                 return;
             }
         };

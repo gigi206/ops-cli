@@ -1599,7 +1599,7 @@ mod tests {
     #[test]
     fn a_started_plane_records_which_incarnation_owns_its_directory() {
         let Some((data, _plane, _script)) = plane_and_client(vec![probe_task()]) else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let stamp = task_dir(data.path(), std::process::id()).join("incarnation");
@@ -1700,7 +1700,7 @@ mod tests {
     fn a_second_detached_writer_is_refused_before_it_is_given_an_id() {
         let Some((_data, _project, plane)) = plane_with_output("sleep 3\nprintf 'wrote\\n'\n")
         else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -1756,7 +1756,7 @@ mod tests {
     #[test]
     fn an_operation_that_takes_seconds_still_answers_the_cage() {
         let Some((_data, _plane, script)) = slow_plane_and_client("2") else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let out = run_client(
@@ -1802,7 +1802,7 @@ mod tests {
         let Some((_data, plane, _script)) =
             plane_with_launcher("sleep 2\nprintf 'the-answer\\n'\n")
         else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -1853,7 +1853,7 @@ mod tests {
     #[test]
     fn a_collected_result_stays_collectable() {
         let Some((_data, plane, _script)) = plane_with_launcher("printf 'twice\\n'\n") else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -1884,7 +1884,7 @@ mod tests {
     #[test]
     fn a_detached_invocation_is_refused_before_it_is_given_an_id() {
         let Some((_data, plane, _script)) = plane_and_client(vec![probe_task()]) else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -1912,7 +1912,7 @@ mod tests {
     #[test]
     fn the_crossing_socket_does_not_know_how_to_detach() {
         let Some((_data, plane, _script)) = plane_and_client(vec![probe_task()]) else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let refused = client::run_detached(
@@ -1938,7 +1938,7 @@ mod tests {
     #[test]
     fn detached_invocations_are_capped_while_they_are_live() {
         let Some((_data, plane, _script)) = plane_with_launcher("exec sleep 20\n") else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -1974,7 +1974,7 @@ mod tests {
     #[test]
     fn a_result_tells_running_from_foreground_from_unknown() {
         let Some((_data, plane, _script)) = plane_with_launcher("exec sleep 20\n") else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -2069,7 +2069,7 @@ mod tests {
     #[test]
     fn a_running_invocation_is_stopped_by_the_id_status_shows() {
         let Some((data, plane, _script)) = plane_with_launcher("exec sleep 20\n") else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -2140,7 +2140,7 @@ mod tests {
     #[test]
     fn info_shows_what_an_invocation_runs_and_never_what_it_carries() {
         let Some((_data, plane, _script)) = plane_with_launcher("exec sleep 20\n") else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -2223,7 +2223,7 @@ mod tests {
     #[test]
     fn a_stop_tells_a_finished_invocation_from_an_unknown_one() {
         let Some((_data, plane, _script)) = plane_and_client(vec![probe_task()]) else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let host = plane.log_socket.clone();
@@ -2287,7 +2287,7 @@ mod tests {
     #[test]
     fn the_client_lists_what_the_plane_serves() {
         let Some((_data, _plane, script)) = plane_and_client(vec![probe_task()]) else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let out = run_client(&script, &["task", "list"]);
@@ -2377,7 +2377,7 @@ mod tests {
         producing.name = "dump".into();
         producing.output = true;
         let Some((_data, _plane, script)) = plane_and_client(vec![producing, probe_task()]) else {
-            eprintln!("skipping: bash, socat or head is not on PATH");
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
             return;
         };
         let out = run_client(&script, &["task", "list"]);

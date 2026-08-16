@@ -2429,7 +2429,7 @@ mod smoke {
         }) {
             Some(shell) => shell,
             None => {
-                eprintln!("skipping task smoke: need nix and a provisioned userland");
+                skip_incapable!("skipping task smoke: need nix and a provisioned userland");
                 return;
             }
         };
@@ -2438,7 +2438,7 @@ mod smoke {
             project.path(),
             "smoke-declared",
         ) else {
-            eprintln!("skipping task smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping task smoke: need bwrap, userns, and nix");
             return;
         };
 
@@ -2508,7 +2508,7 @@ mod smoke {
         }) {
             Some(shell) => shell,
             None => {
-                eprintln!("skipping count smoke: need nix and a provisioned userland");
+                skip_incapable!("skipping count smoke: need nix and a provisioned userland");
                 return;
             }
         };
@@ -2533,7 +2533,7 @@ mod smoke {
         task.stderr = OutputDisposition::Show;
 
         let Some((engine, _data)) = engine_for(vec![task], project.path(), "smoke-withheld") else {
-            eprintln!("skipping count smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping count smoke: need bwrap, userns, and nix");
             return;
         };
 
@@ -2581,7 +2581,7 @@ mod smoke {
         }) {
             Some(shell) => shell,
             None => {
-                eprintln!("skipping refusal smoke: need nix and a provisioned userland");
+                skip_incapable!("skipping refusal smoke: need nix and a provisioned userland");
                 return;
             }
         };
@@ -2606,7 +2606,7 @@ mod smoke {
         task.spawn = Some(vec![]);
 
         let Some((engine, _data)) = engine_for(vec![task], project.path(), "smoke-refusal") else {
-            eprintln!("skipping refusal smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping refusal smoke: need bwrap, userns, and nix");
             return;
         };
 
@@ -2705,7 +2705,7 @@ mod smoke {
         let Some((engine, _data)) =
             engine_with(vec![spec], project.path(), Some(&pool), "smoke-pool")
         else {
-            eprintln!("skipping task pool smoke: need bwrap, userns, and nix");
+            skip_incapable!("skipping task pool smoke: need bwrap, userns, and nix");
             return;
         };
         let outcome = engine
@@ -2749,7 +2749,7 @@ mod smoke {
             }) {
             Some(shell) => shell,
             None => {
-                eprintln!("skipping task ceiling smoke: need bwrap, userns, and nix");
+                skip_incapable!("skipping task ceiling smoke: need bwrap, userns, and nix");
                 return;
             }
         };
@@ -2778,7 +2778,7 @@ mod smoke {
 
         let Some((engine, _data)) = engine_for(vec![hang, loud], project.path(), "smoke-timeout")
         else {
-            eprintln!("skipping task ceiling smoke: prerequisites absent");
+            skip_incapable!("skipping task ceiling smoke: prerequisites absent");
             return;
         };
 

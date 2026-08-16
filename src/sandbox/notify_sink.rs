@@ -1136,7 +1136,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
         else {
-            eprintln!("skipping: no dbus-daemon on PATH");
+            skip_incapable!("skipping: no dbus-daemon on PATH");
             return;
         };
         let mut bus = ChildGuard(bus);
@@ -1269,7 +1269,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
         else {
-            eprintln!("skipping: no dbus-daemon on PATH");
+            skip_incapable!("skipping: no dbus-daemon on PATH");
             return;
         };
         let mut bus = ChildGuard(bus);

@@ -473,7 +473,7 @@ mod resolve_tests {
     #[test]
     fn resolves_a_usable_hermetic_userland_from_sbx_store() {
         let Some(nix) = crate::store::resolve_nix(None) else {
-            eprintln!("skipping userland resolution: no nix on PATH");
+            skip_incapable!("skipping userland resolution: no nix on PATH");
             return;
         };
 
@@ -485,7 +485,7 @@ mod resolve_tests {
         // engine == base here (the decoupling is exercised by the launcher and its own
         // tests); this check is about the userland being usable from sbx's store.
         let Ok(u) = resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs) else {
-            eprintln!(
+            skip_unreachable!(
                 "skipping userland resolution: base provisioning failed (cache or channel drift)"
             );
             return;

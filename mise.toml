@@ -55,11 +55,37 @@ description = "Run clippy over all targets, denying warnings"
 run = "cargo clippy --all-targets -- -D warnings"
 
 [tasks.test]
-description = "Run the full test suite (the heavy sandbox e2e skip when userns/nix/network are absent)"
+description = "Run the full test suite and report the tests that skipped for want of a prerequisite"
 # Locally this runs the integration e2e too where the host can sandbox. CI runs
 # `cargo test --bins` (the unit tests) because the sandbox e2e need userns + nix +
 # network a hosted runner does not provide — there they skip, buying no coverage.
-run = "cargo test"
+#
+# And a skip is invisible without this: `cargo test` has no outcome for a precondition that fails
+# at runtime, so a test that returns early is counted *passed* and the harness swallows what it
+# printed. `SBX_SKIP_LOG` is where the skip macros (`src/testskip.rs`) record one line each, so the
+# run can end by saying how many of its green tests did nothing, and why.
+#
+# The log is truncated first — a killed run leaves its own behind — and read only after every test
+# binary has finished, since `cargo test` runs them one target at a time.
+run = '''
+set -uo pipefail
+LOG="${SBX_SKIP_LOG:-target/test-skips.log}"
+mkdir -p "$(dirname "$LOG")"
+: > "$LOG"
+export SBX_SKIP_LOG="$LOG"
+
+rc=0
+cargo test || rc=$?
+
+n=$(wc -l < "$LOG" | tr -d ' ')
+if [ "$n" -gt 0 ]; then
+  echo
+  echo "$n test(s) reported ok without running — their prerequisites were absent:"
+  sort "$LOG" | uniq -c | sort -rn | sed 's/^/  /'
+  echo "  (SBX_REQUIRE_CAPABLE=1 turns the host-capability ones into failures.)"
+fi
+exit $rc
+'''
 
 [tasks.coverage]
 description = "Report unit-test coverage with cargo-llvm-cov (fast, deterministic; pass --html for a browsable report)"

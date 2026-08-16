@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn a_real_launch_is_hardened_and_hermetic() {
         let Some(bwrap) = prerequisites() else {
-            eprintln!("skipping bwrap smoke: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping bwrap smoke: no bwrap or no capability-bearing userns");
             return;
         };
         let report = run(&bwrap).expect("the probe should run where the host can sandbox");

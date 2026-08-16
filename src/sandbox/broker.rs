@@ -1960,7 +1960,7 @@ mod tests {
         let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
             .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
         else {
-            eprintln!("skipping broker plugin run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping broker plugin run: no bwrap or no capability-bearing userns");
             return;
         };
         // Accept the handshake, then deny every frame with a reason. `read` per line is all a
@@ -1994,7 +1994,7 @@ done"#,
         let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
             .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
         else {
-            eprintln!("skipping broker plugin run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping broker plugin run: no bwrap or no capability-bearing userns");
             return;
         };
         // Answers with 8 bytes of `data`, under a manifest that declares a 4-byte protocol.
@@ -2025,7 +2025,7 @@ done"#,
         let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
             .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
         else {
-            eprintln!("skipping broker plugin run: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping broker plugin run: no bwrap or no capability-bearing userns");
             return;
         };
         let (_root, plugin) = staged_broker(

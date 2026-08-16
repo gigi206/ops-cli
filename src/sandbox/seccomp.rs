@@ -949,7 +949,7 @@ mod tests {
         );
         match libc::WEXITSTATUS(status) {
             0 => {} // enforced: the denied syscall was refused with EPERM, the allowed one ran
-            2 => eprintln!(
+            2 => skip_incapable!(
                 "skipping seccomp enforcement: filter not installable (no CONFIG_SECCOMP?)"
             ),
             code => panic!("the EPERM filter did not enforce the denylist (probe exit {code})"),
@@ -1043,7 +1043,7 @@ mod tests {
         use std::process::Command;
         let bwrap = sandbox_prereq()?;
         if !PathBuf::from("/usr/bin/python3").exists() {
-            eprintln!("skipping seccomp cage test: no /usr/bin/python3 for the probe");
+            skip_incapable!("skipping seccomp cage test: no /usr/bin/python3 for the probe");
             return None;
         }
         let spec = probe_spec(probe);

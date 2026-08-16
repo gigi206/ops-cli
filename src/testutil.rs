@@ -267,3 +267,55 @@ pub(crate) fn app_with(packages: Vec<crate::config::Package>) -> crate::config::
         warnings: vec![],
     }
 }
+
+#[cfg(test)]
+mod skip_macro_tests {
+    use super::{EnvVar, TmpDir, env_lock};
+
+    /// The three promises of the skip macros, asserted together because they are one contract: a
+    /// skip is **recorded** so a run can report it, a host skip **fails** where the host was
+    /// declared capable, and a remote skip never does — no setting on this machine makes a binary
+    /// cache reachable, so enforcing it would only teach people to unset the flag.
+    #[test]
+    fn a_skip_is_recorded_and_only_a_host_skip_is_enforced() {
+        let _lock = env_lock();
+        let tmp = TmpDir::new();
+        let log = tmp.join("skips");
+        let _log_var = EnvVar::set("SBX_SKIP_LOG", &log);
+        let read = || std::fs::read_to_string(&log).unwrap_or_default();
+
+        // Unset: both skip quietly, and both leave a line behind.
+        let _off = EnvVar::unset("SBX_REQUIRE_CAPABLE");
+        skip_incapable!("skipping a: need {}", "bwrap");
+        skip_unreachable!("skipping b: the cache is unreachable");
+        assert_eq!(
+            read(),
+            "skipping a: need bwrap\nskipping b: the cache is unreachable\n"
+        );
+
+        // `0` is how a caller says "no", and it must not read as "set".
+        let _zero = EnvVar::set("SBX_REQUIRE_CAPABLE", "0");
+        skip_incapable!("skipping c");
+        assert!(
+            read().ends_with("skipping c\n"),
+            "a skip under `=0` was not recorded"
+        );
+
+        // Set: the host was supposed to manage, so a host skip is a failure — and the panic names
+        // the reason, which is the whole point of failing rather than returning.
+        let _on = EnvVar::set("SBX_REQUIRE_CAPABLE", "1");
+        let err = std::panic::catch_unwind(|| skip_incapable!("skipping d: need nix")).unwrap_err();
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(
+            msg.contains("skipping d: need nix"),
+            "the panic did not name the reason: {msg}"
+        );
+
+        // A remote is not a host capability: still recorded, still not a failure.
+        skip_unreachable!("skipping e: the registry is down");
+        assert!(read().ends_with("skipping e: the registry is down\n"));
+    }
+}

@@ -1038,7 +1038,7 @@ mod resolve_tests {
     #[test]
     fn resolves_a_known_package_to_a_pinned_commit_and_attribute() {
         let Some(nix) = store::resolve_nix(None) else {
-            eprintln!("skipping nixhub resolution: no nix on PATH");
+            skip_incapable!("skipping nixhub resolution: no nix on PATH");
             return;
         };
         let data = TmpDir::new();
@@ -1052,7 +1052,7 @@ mod resolve_tests {
             Ok(p) => p,
             Err(e) => {
                 // the GET needs the network; treat an unreachable nixhub as a skip
-                eprintln!("skipping nixhub resolution: {e}");
+                skip_unreachable!("skipping nixhub resolution: {e}");
                 return;
             }
         };
@@ -1068,7 +1068,7 @@ mod resolve_tests {
     #[test]
     fn provisions_a_trusted_nix_tool_and_withholds_an_untrusted_one() {
         let Some(nix) = store::resolve_nix(None) else {
-            eprintln!("skipping nix-tool provisioning: no nix on PATH");
+            skip_incapable!("skipping nix-tool provisioning: no nix on PATH");
             return;
         };
         let data = TmpDir::new();
@@ -1111,7 +1111,7 @@ mod resolve_tests {
         let out = match provision(&nix, &layout, proj.path(), &files, true, &current_system()) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("skipping nix-tool provisioning: {e}");
+                skip_unreachable!("skipping nix-tool provisioning: {e}");
                 return;
             }
         };

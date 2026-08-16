@@ -1424,7 +1424,7 @@ mod tests {
     fn git_or_skip() -> Option<PathBuf> {
         let git = crate::store::resolve_git();
         if git.is_none() {
-            eprintln!("skipping remote-store test: git is not on PATH");
+            skip_incapable!("skipping remote-store test: git is not on PATH");
         }
         git
     }

@@ -2009,7 +2009,7 @@ mod tests {
             let (_, mnt, kind) = (f.next()?, f.next()?, f.next()?);
             (kind == "btrfs").then(|| PathBuf::from(mnt))
         }) else {
-            eprintln!("skipping: no btrfs mount on this host");
+            skip_incapable!("skipping: no btrfs mount on this host");
             return;
         };
         let layout = Layout::under(&btrfs_mount);
@@ -3137,7 +3137,7 @@ mod provision_tests {
     #[test]
     fn provision_realises_a_pinned_package_into_the_user_store_with_a_gcroot() {
         let Some(nix) = resolve_nix(None) else {
-            eprintln!("skipping provision: no nix on PATH");
+            skip_incapable!("skipping provision: no nix on PATH");
             return;
         };
         let base = TmpDir::new();
@@ -3177,13 +3177,13 @@ mod provision_tests {
     #[test]
     fn provision_expr_short_circuits_a_repeat_and_rebuilds_a_changed_expression() {
         let Some(nix) = resolve_nix(None) else {
-            eprintln!("skipping provision_expr: no nix on PATH");
+            skip_incapable!("skipping provision_expr: no nix on PATH");
             return;
         };
         let base = TmpDir::new();
         let layout = Layout::under(&base.join("sbx"));
         let Ok(nixpkgs) = LockTarget::global(&layout, None).resolve(&nix, &layout) else {
-            eprintln!("skipping provision_expr: cannot resolve nixpkgs (offline?)");
+            skip_incapable!("skipping provision_expr: cannot resolve nixpkgs (offline?)");
             return;
         };
         let system = format!("{}-linux", std::env::consts::ARCH);
@@ -3205,7 +3205,7 @@ mod provision_tests {
 
         // First build (real nix): produces the AAA output and writes the expr stamp.
         let Ok(out_a) = provision_expr(&nix, &layout, &gcroot, &expr("AAA"), "probe", "tag") else {
-            eprintln!("skipping provision_expr: cold build failed (cache unreachable?)");
+            skip_unreachable!("skipping provision_expr: cold build failed (cache unreachable?)");
             return;
         };
         assert_eq!(read_tag(&out_a), "AAA");

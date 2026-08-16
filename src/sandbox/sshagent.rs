@@ -1144,7 +1144,7 @@ mod tests {
     fn agent_with_two_keys(dir: &Path) -> Option<ThrowawayAgent> {
         for bin in ["ssh-agent", "ssh-add", "ssh-keygen"] {
             if crate::pathfind::find_on_path(bin).is_none() {
-                eprintln!("skipping ssh-agent broker smoke: no {bin} on PATH");
+                skip_incapable!("skipping ssh-agent broker smoke: no {bin} on PATH");
                 return None;
             }
         }

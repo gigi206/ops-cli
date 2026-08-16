@@ -2502,7 +2502,7 @@ mod tests {
         let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
             .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
         else {
-            eprintln!("skipping plugin resolve: no bwrap or no capability-bearing userns");
+            skip_incapable!("skipping plugin resolve: no bwrap or no capability-bearing userns");
             return;
         };
         // a fake resolver that returns the locator part of the ref as the plaintext
@@ -2551,7 +2551,9 @@ mod tests {
         let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
             .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
         else {
-            eprintln!("skipping plugin fall-through: no bwrap or no capability-bearing userns");
+            skip_incapable!(
+                "skipping plugin fall-through: no bwrap or no capability-bearing userns"
+            );
             return;
         };
         let dir = TmpDir::new();
