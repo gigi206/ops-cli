@@ -455,6 +455,30 @@ fn show_of_an_unknown_app_fails_and_lists_the_declared_ones() {
     );
 }
 
+/// A profile with no `cmd` is told where a command goes — in the file the profile is actually in.
+///
+/// `sbx app import` refuses a `cmd`-less profile, but a launch reads the profile *directory*, not
+/// the import record, so a file dropped there by hand reaches this refusal. Its remedy therefore has
+/// to fit a profile's own shape: the fields sit at the top level, and asking for an `[app.<name>]`
+/// table would ask for the very wrapper `validate_profile` tells the author to remove. The check is
+/// on the file being named, which is what a reader opens.
+#[test]
+fn a_profile_with_no_command_is_told_where_the_command_goes() {
+    let fx = Fixture::new();
+    fx.write_profile("ghost", "[network]\nmode = \"deny\"\n");
+
+    let out = fx.sbx(&["app", "run", "ghost"]);
+    let s = text(&out);
+    assert!(
+        s.contains("declares no command"),
+        "a profile with no cmd must be refused, not launched:\n{s}"
+    );
+    assert!(
+        s.contains("apps/ghost.toml"),
+        "the refusal must name the file that carries the profile:\n{s}"
+    );
+}
+
 /// A demo-app fixture with one declared mise tool installed and one undeclared leftover, plus a home
 /// mise config listing both — the shape `sbx app prune` acts on.
 fn fixture_with_a_leftover() -> Fixture {

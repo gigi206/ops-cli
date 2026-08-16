@@ -2711,11 +2711,16 @@ pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &
 /// [`warn_unknown_keys`].
 ///
 /// An app profile is a **subset** of the baseline schema, which is what makes this worth saying out
-/// loud rather than leaving to the additive-schema rule. A baseline-only field written under an
-/// `[app.<name>]` — `timezone`, `nixpkgs`, `[network] groups` — parses, is dropped, and changes
-/// nothing, and the only way its author could notice was the value not taking effect. The message
-/// names the key and says where such a field belongs, since "unknown" is misleading for a key that
-/// is a real field one layer up.
+/// loud rather than leaving to the additive-schema rule. A baseline-only field written on an app —
+/// `timezone`, `nixpkgs`, `[network] groups` — parses, is dropped, and changes nothing, and the only
+/// way its author could notice was the value not taking effect. The message names the key and says
+/// where such a field belongs, since "unknown" is misleading for a key that is a real field one
+/// layer up.
+///
+/// The remedy names the two config files rather than the `[app.<name>]` shape, because an app has
+/// two declaration shapes and only one of them is a table: a global app is a profile file whose
+/// fields are at its top level, so "outside `[app.<name>]`" would describe a wrapper that file does
+/// not have.
 fn warn_unknown_app_keys(
     warnings: &mut Vec<String>,
     source: &str,
@@ -2725,7 +2730,7 @@ fn warn_unknown_app_keys(
         warnings.push(format!(
             "{source}: ignoring unknown key `{key}` — sbx does not know this field on an app \
              (check the spelling; a field that exists only on the baseline, like `timezone`, is \
-             declared outside `[app.<name>]`)"
+             declared at the top level of `{GLOBAL_CONFIG}` or `{PROJECT_CONFIG}`, never on an app)"
         ));
     }
 }
@@ -3106,7 +3111,7 @@ fn resolve_app(
 
     // The global layer — trusted by location, honored in full.
     if let Some(app) = global {
-        let source = app_source(GLOBAL_CONFIG, name);
+        let source = global_app_source(name);
         warn_unknown_app_keys(&mut warnings, &source, &app.rest);
         absorb_provisions(app.provisions, &mut provisions);
         apply_env(&mut env, None, &mut warnings, &source, app.env, false);
@@ -3257,7 +3262,7 @@ fn resolve_app(
     // The project layer — gated by the project's verdict, overriding the global per field.
     if let Some((app, state)) = project {
         let trusted = state == TrustState::Trusted;
-        let source = app_source(PROJECT_CONFIG, name);
+        let source = project_app_source(name);
         // Reported whatever the verdict, like the baseline's: an unknown key is a spelling
         // question, not a capability, so an untrusted project hears about its own typo too.
         warn_unknown_app_keys(&mut warnings, &source, &app.rest);
@@ -3657,10 +3662,21 @@ fn apply_app_secret(
     apply_secret_section(out, warnings, source, section.hosts, &effective, plugins);
 }
 
-/// The warning source label for a field of `[app.<name>]` in a given config file — e.g.
-/// `".sbx.toml [app.demo-app]"` — so a dropped app field reads as clearly as a baseline one.
-fn app_source(config: &str, name: &str) -> String {
-    format!("{config} [app.{name}]")
+/// The warning source label for a field of a **global** app — e.g. `"apps/demo-app.toml"`.
+///
+/// A global app is a profile file, whose fields sit at its top level: [`load::merge_profile_apps`]
+/// clears any inline `[app.*]` in the global config before resolution, so every global app reaching
+/// here came from that directory. Naming `sbx.toml [app.<name>]` would send the reader to a file
+/// that does not carry the key, in a shape the loader refuses.
+fn global_app_source(name: &str) -> String {
+    format!("{PROFILES_DIR}/{name}.toml")
+}
+
+/// The warning source label for a field of a **project** app — e.g. `".sbx.toml [app.demo-app]"` —
+/// so a dropped app field reads as clearly as a baseline one. A project app is inline by
+/// construction: the profile directory is a sibling of the global config, never of a project's.
+fn project_app_source(name: &str) -> String {
+    format!("{PROJECT_CONFIG} [app.{name}]")
 }
 
 /// Fold a layer's environment into `out`: drop a malformed key, drop a reserved

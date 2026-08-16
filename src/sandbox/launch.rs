@@ -784,8 +784,13 @@ pub(crate) fn app(
         return AppOutcome::plain(ExitCode::from(2));
     };
     if app.cmd.is_empty() {
+        // Both declaration shapes are named, because only one of them is a table. A hand-written
+        // profile file reaches here (`sbx app import` refuses a `cmd`-less one, a file dropped into
+        // the directory is simply read), and telling its author to add an `[app.<name>]` table
+        // would ask for the very wrapper `validate_profile` tells them to remove.
         crate::diag::error(&format!(
-            "sbx: app `{name}` declares no command — add a `cmd` to its `[app.{name}]` table."
+            "sbx: app `{name}` declares no command — add a `cmd` to its declaration (at the top \
+             level of `apps/{name}.toml`, or in the `[app.{name}]` table of a project config)."
         ));
         return AppOutcome::plain(ExitCode::FAILURE);
     }

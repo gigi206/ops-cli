@@ -72,8 +72,12 @@ tasks_max = 4096
 An app profile is a **subset** of this schema, not all of it: baseline fields like
 [`timezone`](timezone), `nixpkgs` and `[network] groups` belong to the config that holds the app,
 not to the app. Writing one under `[app.<name>]`, or at the top level of a profile file, parses and does nothing.
-sbx names the key at launch instead of dropping it in silence, and says that a baseline-only field
-is declared outside the app. The same report catches a plain misspelling.
+sbx names the key at launch instead of dropping it in silence, and says that such a field is
+declared at the top level of `sbx.toml` or `.sbx.toml`. The same report catches a plain misspelling.
+
+The report names the **file** the key is in, which is the one to open: `apps/<name>.toml` for a
+global app, `.sbx.toml [app.<name>]` for a project one. The two differ because only a project app is
+a table; a profile file holds one app and puts its fields at the top level.
 
 One mistake it cannot catch, and it is the more likely of the two: a scalar written *below* a
 `[table]` header is folded into that table by TOML itself, so it never reaches sbx as an app key at

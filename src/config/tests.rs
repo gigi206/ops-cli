@@ -9709,7 +9709,9 @@ fn every_untrusted_override_of_a_trusted_app_names_itself_in_its_refusal() {
         let project: RawConfig = toml::from_str(OVERRIDING_PROJECT).unwrap();
         let r = resolve_no_plugins(global, Some((project, state)));
         let app = &r.apps["demo-app"];
-        let source = super::app_source(PROJECT_CONFIG, "demo-app");
+        // Written out rather than built from `project_app_source`: an expectation computed by the
+        // code under test survives that code changing its answer.
+        let source = ".sbx.toml [app.demo-app]";
         for what in TRUSTED_OVERRIDE_REFUSALS {
             let expected = format!("{source}: ignoring {what} ({reason})");
             assert!(

@@ -1568,12 +1568,19 @@ mod tests {
         let mut global = RawConfig::default();
         merge_profile_apps(&mut global, profiles, &mut warnings);
         let resolved = super::resolve(global, None, &crate::plugins::PluginRegistry::default());
+        // The whole line, written out: the key alone would be satisfied by any message that
+        // happened to quote it, and the half worth pinning is the *file* named on the left. A
+        // profile file is where the key actually is; `sbx.toml [app.demo]` — the shape this label
+        // used to take — is a file the reader would open and not find it in.
         assert!(
-            resolved.apps["demo"]
-                .warnings
-                .iter()
-                .any(|w| w.contains("timezone")),
-            "a baseline-only key in a profile file must be named: {:?}",
+            resolved.apps["demo"].warnings.contains(
+                &"apps/demo.toml: ignoring unknown key `timezone` — sbx does not know this field \
+                 on an app (check the spelling; a field that exists only on the baseline, like \
+                 `timezone`, is declared at the top level of `sbx.toml` or `.sbx.toml`, never on \
+                 an app)"
+                    .to_string()
+            ),
+            "a baseline-only key in a profile file must be named, with its file: {:?}",
             resolved.apps["demo"].warnings
         );
         // And the field it names is genuinely inert: nothing about the baseline moved.
