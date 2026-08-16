@@ -3896,6 +3896,26 @@ impl Drop for LaunchGuard {
     }
 }
 
+/// Which zone name this cage was asked for: whatever `TZ` will finally read, and the `timezone`
+/// field when nothing set `TZ`.
+///
+/// The variable comes first *because* it wins. The assembler sets a structural `TZ` from the zone
+/// and every overlay layer upserts over it, so a `[env] TZ` (or a one-shot `--env TZ=`) decides what
+/// the cage's clock reads whether or not its author thought of it as choosing a zone. Deriving the
+/// `/etc/localtime` link from the same value is what keeps the two halves from disagreeing —
+/// otherwise the clock moves and the link stays, and an FHS resolver answers the old zone with no
+/// error anywhere. `env` is layered lowest-first, so the winning entry is the last one.
+///
+/// This grants nothing: `timezone` is a free field, so a layer that can write `[env] TZ` could
+/// already have written the zone directly.
+fn declared_zone<'a>(env: &'a [(String, String)], field: Option<&'a str>) -> Option<&'a str> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == "TZ")
+        .map(|(_, v)| v.as_str())
+        .or(field)
+}
+
 /// The IANA zone this cage runs in: the one a config named, when the provisioned database carries
 /// it, and [`binds::DEFAULT_ZONE`] otherwise.
 ///
@@ -5393,8 +5413,12 @@ fn build(
     ]);
 
     // The cage's zone, checked against the database that will actually be bound — assembly is pure,
-    // so this is the last place a name can be held against something real.
-    let timezone = cage_timezone(prep.cfg.timezone.as_deref(), &prep.userland.zoneinfo_src);
+    // so this is the last place a name can be held against something real. Read off the assembled
+    // environment, not off the field alone: see `declared_zone`.
+    let timezone = cage_timezone(
+        declared_zone(&extra_env, prep.cfg.timezone.as_deref()),
+        &prep.userland.zoneinfo_src,
+    );
     let overlay = binds::Overlay {
         env: &extra_env,
         binds: &prep.cfg.binds,
@@ -6584,6 +6608,42 @@ mod tests {
         assert_eq!(
             cage_timezone(Some("Europe/Paris"), Path::new("/nonexistent-zoneinfo")),
             "UTC"
+        );
+    }
+
+    /// Which of the two ways to name a zone decides the link. The property under test is not a
+    /// precedence preference, it is that **one** value drives both halves: `TZ` is what the cage's
+    /// clock will read, so the link has to follow it or the two answer differently with no error.
+    #[test]
+    fn the_link_follows_whatever_tz_will_finally_read() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+
+        // Neither: nothing is declared, and the caller falls back to the built-in zone.
+        assert_eq!(declared_zone(&env(&[("LANG", "C.UTF-8")]), None), None);
+        // The field alone.
+        assert_eq!(
+            declared_zone(&env(&[]), Some("Europe/Paris")),
+            Some("Europe/Paris")
+        );
+        // `TZ` alone — the case that used to move the clock and leave the link behind.
+        assert_eq!(
+            declared_zone(&env(&[("TZ", "Asia/Tokyo")]), None),
+            Some("Asia/Tokyo")
+        );
+        // Both, disagreeing: `TZ` wins, because `TZ` is what the cage will actually read.
+        assert_eq!(
+            declared_zone(&env(&[("TZ", "Asia/Tokyo")]), Some("Europe/Paris")),
+            Some("Asia/Tokyo")
+        );
+        // Two layers both setting it: the later one wins, exactly as the assembler's upsert does.
+        assert_eq!(
+            declared_zone(&env(&[("TZ", "Asia/Tokyo"), ("TZ", "UTC")]), None),
+            Some("UTC")
         );
     }
 

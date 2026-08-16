@@ -8,9 +8,10 @@ RUST_LOG   = "info"
 MY_SETTING = "value"
 ```
 
-`env` is the one **free** field: it applies even from an **untrusted** project (minus
+`env` is a **free** field: it applies even from an **untrusted** project (minus
 a reserved-key denylist, below). An untrusted project setting a variable can only
-affect the process inside its own cage, so it is not gated.
+affect the process inside its own cage, so it is not gated. The other free field is
+[`timezone`](timezone).
 
 See also: [The trust gate](../concepts/trust) · [Configuration overview](../configuration/) · [One-shot overrides](overrides).
 
@@ -26,6 +27,15 @@ So a trusted config `env` value wins over `sbx`'s own structural defaults. (An
 untrusted config's `env` has already lost its reserved keys, see below, so it
 cannot override those.) An app's `[app.<name>.env]` overlays the baseline `env`, the
 app winning on a key collision.
+
+## `TZ` also moves the clock's other half
+
+Setting `TZ` here is not only a variable. A cage answers "what zone is this?" through `TZ` **and**
+through the `/etc/localtime` link an FHS resolver reads, and the two disagreeing is a wrong answer
+with no error, so sbx points the link at whatever `TZ` ends up naming. A `TZ` written here
+therefore outranks the [`timezone`](timezone) field, and a name the zone database does not carry
+warns and leaves the cage on `UTC`. The field is the clearer way to say it; this is what happens
+when a config says it through `env` instead.
 
 ## The reserved-key denylist (untrusted only)
 

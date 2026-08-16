@@ -26,20 +26,28 @@ appears on the cage's `PATH`.
 that discloses nothing about where the host is, so the failure above cannot happen in a cage
 nobody configured.
 
-## Why it is a field and not an `[env]` line
+## Two halves, one answer
 
-An `[env] TZ = "Europe/Paris"` moves only half of the answer. Two different mechanisms read the
-cage's zone:
+Two different mechanisms read a cage's zone, and they have to agree:
 
 - `TZ`, read by glibc and by the language runtimes that defer to it, which is what `date` prints.
 - `/etc/localtime`, whose **link target** carries the zone *name*, which is what an FHS resolver
   reads.
 
-Setting `TZ` alone leaves those two disagreeing: the clock moves, the resolver still answers
-`UTC`. Worse, in a cage with no database to resolve the name against, glibc reads `Europe/Paris`
-as a POSIX abbreviation at offset zero and prints `Europe` as the zone name at UTC, which is
-further from right than leaving it unset. `timezone` moves the link and the variable together,
-which only sbx can do, since only sbx assembles the cage.
+sbx moves both from a single value, which only it can do, since only it assembles the cage. That
+value is whatever `TZ` will finally read, and `timezone` when nothing set `TZ`. So an
+[`[env]`](env) `TZ` (or a one-shot `--env TZ=Asia/Tokyo`) moves the link too, and outranks this
+field when both are written: `TZ` is what the cage actually reads, so the link follows it rather
+than contradicting it.
+
+```sh
+sbx run --env TZ=Asia/Tokyo -- sh -c 'date +%Z; readlink /etc/localtime'
+# JST
+# /usr/share/zoneinfo/Asia/Tokyo
+```
+
+Prefer the field. `[env] TZ` reaches the same place, but it reads as an environment variable and
+sets a machine-wide property, and nothing in an `[env]` table says that.
 
 ## Which zone, and what happens to a wrong one
 

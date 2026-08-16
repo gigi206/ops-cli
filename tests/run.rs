@@ -3009,6 +3009,34 @@ fn a_cage_carries_the_zone_database_and_the_config_moves_its_clock() {
         err.contains("Europe/Nowhere"),
         "the fallback must name the zone it could not find: {err}"
     );
+
+    // The other way to name a zone, and the one that used to move only half of it: a `TZ` in the
+    // environment. The clock has always followed it; what this pins is that the link does too, so
+    // an FHS resolver and `date` cannot answer differently. It also outranks the field, because it
+    // is what `TZ` ends up reading.
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "timezone = \"Europe/Paris\"\n",
+    )
+    .unwrap();
+    let via_env = sbx()
+        .args(["run", "--env", "TZ=Asia/Tokyo", "--"])
+        .args([
+            "sh",
+            "-c",
+            "printf 'LINK=%s ZONE=%s\\n' \"$(readlink /etc/localtime)\" \"$(date +%Z)\"",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx run");
+    let out = String::from_utf8_lossy(&via_env.stdout);
+    let log = format!("{}{out}", String::from_utf8_lossy(&via_env.stderr));
+    assert!(via_env.status.success(), "the launch must stand: {log}");
+    assert!(
+        out.contains("LINK=/usr/share/zoneinfo/Asia/Tokyo ZONE=JST\n"),
+        "a `TZ` in the environment must move the link with the clock: {log}"
+    );
 }
 
 #[test]

@@ -42,11 +42,11 @@
 #
 # TIMEZONE — the CLI's cron store resolves the local zone the FHS way, by reading
 # `/etc/localtime`. Every cage carries that link and the zone database behind it, so
-# there is nothing for this profile to arrange; the zone reads UTC unless the config
-# names one:
+# there is nothing for this profile to arrange; the zone reads UTC unless something
+# names one, either standing:
 #     timezone = "Europe/Paris"     # in ~/.config/sbx/sbx.toml
-# which governs the cage's own `date` too. A bare `--env TZ=...` does not: it moves
-# the clock without moving the link the resolver reads.
+# or for one launch: `sbx app run muse --env TZ=Europe/Paris`. Both move the link and
+# the cage's `date` together, so the cron store and the clock agree.
 #
 # VERSION / UPGRADE — the launcher normally re-checks the channel hourly and rolls
 # the binary in the background; that would silently move the version, breaking the

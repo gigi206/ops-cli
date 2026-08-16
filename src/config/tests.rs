@@ -6550,6 +6550,22 @@ fn the_timezone_layers_from_any_source_and_a_bad_name_leaves_the_zone_in_effect(
             r.warnings
         );
     }
+
+    // The one-shot override, the last layer and the one the guide tells a reader to use. The
+    // overlay fold that carries it is a hand-written field list, and its own comment records having
+    // dropped a field in silence three times — the compiler catches an unnamed field there, nothing
+    // catches a named one that is never applied.
+    let base = resolve_no_plugins(zoned("Europe/Paris"), None);
+    let r = with_override(base, zoned("Asia/Tokyo"));
+    assert_eq!(r.timezone.as_deref(), Some("Asia/Tokyo"));
+    assert_eq!(r.timezone_origin, Provenance::Override);
+
+    // And a bad one is not fatal here, unlike a scalar *security* posture: it warns, and the layer
+    // below stands, because falling back to a resolvable zone is the fail-closed direction.
+    let base = resolve_no_plugins(zoned("Europe/Paris"), None);
+    let r = with_override(base, zoned("../../etc/shadow"));
+    assert_eq!(r.timezone.as_deref(), Some("Europe/Paris"));
+    assert_eq!(r.timezone_origin, Provenance::Global);
 }
 
 // --- one-shot override application (`apply_override` / `apply_override_channel`) ---
