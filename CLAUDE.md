@@ -16,7 +16,7 @@
 ## Tests
 
 - ALWAYS prefer targeted tests over the full suite, which is very long. Run only the test binary or filter relevant to the change (e.g. `cargo test --test <file> <filter>`, `cargo test --lib <module>::<test>`, or `cargo test --doc` for doctests). Only run the whole `cargo test` when the change has cross-cutting impact that demands it.
-- Before any push (and at the end of a task), ALWAYS run `mise run ci` — it chains `fmt` + `lint` + `test` and is the local reproduction of `.github/workflows/ci.yml`. If `mise run ci` passes locally, CI passes; if it fails here, push nothing and fix it first.
+- Before any push (and at the end of a task), ALWAYS run `mise run ci` — it chains `fmt` + `lint` + `rustdoc` + `test` and is the local reproduction of `.github/workflows/ci.yml`. If `mise run ci` passes locally, CI passes; if it fails here, push nothing and fix it first.
 
 ## Authorization
 
