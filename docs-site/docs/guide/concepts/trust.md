@@ -127,4 +127,6 @@ which files exist to be acted on: the layers a launch loads, the `@<file>` form 
 rewrite. `sbx config set` on a file a launch would drop refuses instead of reporting a
 success no launch would honour. The one verb that still opens such a file is
 [`sbx config edit`](../cli/config), which hands the path to your `$EDITOR` and never
-reads it itself, so a file that has not been vetted stays repairable.
+reads it itself, so a file that has not been vetted stays repairable. Recording trust
+afterwards is a separate step and still goes through the gate: `sbx config edit --trust`
+opens and saves normally, then warns that it could not trust a file the gate refuses.

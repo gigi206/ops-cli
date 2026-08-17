@@ -1160,8 +1160,11 @@ fn split_key(key: &str) -> Result<Vec<String>, ManageError> {
 /// *silent* edit of a file whose owner or mode says its content is not exclusively yours.
 fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
     match super::safety::read_safe_bytes(path) {
+        // The gate hands back bytes, so the text conversion is explicit here. TOML is UTF-8 by
+        // definition, so bytes that are not text are a malformed document rather than a read
+        // failure, and the message says which of the two it is.
         Ok(bytes) => String::from_utf8(bytes)
-            .map_err(|e| ManageError::Parse(path.to_path_buf(), e.to_string()))?
+            .map_err(|_| ManageError::Parse(path.to_path_buf(), "not UTF-8 text".into()))?
             .parse::<DocumentMut>()
             .map_err(|e| ManageError::Parse(path.to_path_buf(), e.to_string())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
@@ -1448,6 +1451,13 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
         let err = get(&fifo, "network").unwrap_err().to_string();
         assert!(err.contains("not a regular file"), "{err}");
+
+        // Bytes that are not text: a malformed document, not a read failure, since TOML is UTF-8
+        // by definition. The gate returns bytes, so this conversion is the verb's own.
+        let binary = tmp.join("binary.toml");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        let err = get(&binary, "network").unwrap_err().to_string();
+        assert!(err.contains("not valid TOML: not UTF-8 text"), "{err}");
     }
 
     #[test]
