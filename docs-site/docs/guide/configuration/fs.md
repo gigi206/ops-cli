@@ -190,9 +190,11 @@ it cannot write a file into a denied directory. They are ways the *host side* ca
 path open, which is why they are worth knowing rather than worth panicking about.
 
 The second one is structural rather than an omission. A mask is a mount, and a cage's mounts
-are fixed when it is built, so a pattern cannot cover a name that did not exist yet. There are
-only two ways around it, and both are already here: **name the directory**, which closes it
-whatever appears inside, or **relaunch** the session after adding a secret the pattern should
+are fixed when it is built, so a pattern cannot cover a name that did not exist yet. Three
+things answer it, and all three are already here: **name the directory**, which closes it
+whatever appears inside; **[`scan`](#scan-closing-a-file-by-what-it-holds)**, which asks at
+every open instead of at launch and so covers a file that appears or changes mid-session, for
+the content it recognises; or **relaunch** the session after adding a secret the pattern should
 have caught.
 
 ## git
