@@ -225,9 +225,11 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
     // hermetic: `/usr` is the minimal synthetic tree — two entries, each one sbx staged itself,
     // never the host's `/usr`, which would expose `lib`, `local`, `sbin`, … alongside. `bin` carries
     // the `/usr/bin/env` symlink and the `/usr/bin/xdg-open` stub; `share` carries the zone database
-    // and, as the next assertion pins, nothing else. Matched as the whole listing rather than a
-    // prefix of it, so an entry staged under `/usr` later has to come past this test. (That
-    // `/usr/bin/env` resolves an interpreted shebang is proven separately by
+    // and, as the next assertion pins, nothing else. Neither listing depends on the config: the
+    // database is bound **whole**, so a launch that names a zone other than the default still stages
+    // the same one entry, and only the `/etc/localtime` link differs. Matched as the whole listing
+    // rather than a prefix of it, so an entry staged under `/usr` later has to come past this test.
+    // (That `/usr/bin/env` resolves an interpreted shebang is proven separately by
     // `a_usr_bin_env_shebang_resolves_in_the_cage`.)
     let usr = run_in(project.path(), data.path(), &["ls", "/usr"]);
     let usr_out = String::from_utf8_lossy(&usr.stdout);
