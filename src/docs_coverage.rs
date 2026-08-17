@@ -6,9 +6,15 @@
 //! failed when a new verb, field or profile arrived without its prose, so the gap surfaced when a
 //! reader looked for it rather than when it was introduced. These tests move that to build time.
 //!
-//! They check *presence*, never wording: a page that exists but says the wrong thing still passes,
-//! and no test here can tell whether prose is accurate. What they buy is that nothing ships
-//! silently undocumented.
+//! They check *presence*, never accuracy: a page that exists but says the wrong thing still passes,
+//! and no test here can tell whether prose is true. What they buy is that nothing ships silently
+//! undocumented.
+//!
+//! One check is of a different kind and is kept here because it has the same failure mode. The guide
+//! writes no em dash of its own, a rule applied across it once by hand and reintroduced afterwards
+//! because nothing failed when a new one arrived. That is a claim about *how* a sentence is written
+//! rather than whether it exists, so it is the one place in this module that reads wording. It still
+//! answers presence in the end: what it refuses is a character, never an argument.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -19,13 +25,14 @@ fn guide() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs-site/docs/guide")
 }
 
-/// Every guide page's contents, one string per file.
+/// Every guide page, as its path and its contents.
 ///
 /// Kept per file rather than pre-joined because code-fence state must not cross a page boundary:
 /// one page whose fences do not balance would otherwise invert every page after it in the walk,
-/// and the resulting check would be wrong in a way that looks like a documentation gap.
-fn guide_pages() -> Vec<String> {
-    fn walk(dir: &Path, out: &mut Vec<String>) {
+/// and the resulting check would be wrong in a way that looks like a documentation gap. The path
+/// rides along so a check that finds a bad line can name where it is.
+fn guide_pages() -> Vec<(PathBuf, String)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -34,7 +41,8 @@ fn guide_pages() -> Vec<String> {
             if path.is_dir() {
                 walk(&path, out);
             } else if path.extension().is_some_and(|e| e == "md") {
-                out.push(std::fs::read_to_string(&path).unwrap_or_default());
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                out.push((path, text));
             }
         }
     }
@@ -98,9 +106,9 @@ fn every_cli_verb_has_a_reference_page() {
 /// the guide contains that word answers nothing: the whole schema could go undocumented and the
 /// test would still be green. Those two surfaces are where the guide actually shows a field, in
 /// the form a reader would type it, and neither is reachable by writing an English sentence.
-fn documented_surface(pages: &[String]) -> String {
+fn documented_surface(pages: &[(PathBuf, String)]) -> String {
     let mut out = String::new();
-    for page in pages {
+    for (_, page) in pages {
         // Fence state is per page, never carried into the next one.
         let mut in_fence = false;
         for line in page.lines() {
@@ -240,7 +248,11 @@ fn every_config_field_is_shown_in_the_guide() {
     );
 
     let pages = guide_pages();
-    let guide = pages.join("\n");
+    let guide = pages
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let surface = documented_surface(&pages);
     assert!(
         surface.len() > guide.len() / 20,
@@ -428,5 +440,149 @@ fn every_unwatched_tree_is_named_in_the_file_feed_page() {
         missing.is_empty(),
         "these trees are excluded from the file-write feed but unnamed in the scope section of \
          docs-site/docs/guide/cli/fs.md: {missing:?}"
+    );
+}
+
+/// How wide a slice around an em dash must be found under `src/` for the dash to count as a
+/// quotation rather than prose.
+///
+/// Twelve characters each side is enough to identify the message it belongs to, and short enough to
+/// survive assembly: the guide shows a withheld-package warning as one line, while the binary builds
+/// that line from a wrapper format and a separate trust-state clause, so no single literal in `src/`
+/// holds all of it.
+const QUOTED_WINDOW: usize = 12;
+
+/// Every `.rs` file under `src/`, concatenated: the corpus a quoted guide line is checked against.
+fn rust_sources() -> String {
+    fn walk(dir: &Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+                out.push('\n');
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    out
+}
+
+/// The character ranges of a line covered by inline code spans, so a dash inside one can be told
+/// from a dash in prose.
+///
+/// Indices are into `chars`, not bytes, because an em dash is three bytes and the windowing above
+/// counts characters. A closing run of at least the opener's length closes the span: the guide uses
+/// the doubled form when the quoted text itself contains a backtick (a warning that names a config
+/// key), and the single backticks inside it must not be read as the close.
+fn code_spans(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            i += 1;
+            continue;
+        }
+        let open = i;
+        while i < chars.len() && chars[i] == '`' {
+            i += 1;
+        }
+        let ticks = i - open;
+        let body = i;
+        let mut close = None;
+        while i < chars.len() {
+            if chars[i] != '`' {
+                i += 1;
+                continue;
+            }
+            let run = i;
+            while i < chars.len() && chars[i] == '`' {
+                i += 1;
+            }
+            if i - run >= ticks {
+                close = Some(run);
+                break;
+            }
+        }
+        match close {
+            Some(end) => out.push((body, end)),
+            // An unbalanced span: nothing after it is a span, so stop rather than guess.
+            None => break,
+        }
+    }
+    out
+}
+
+/// The guide writes no em dash of its own, and this is what fails when one arrives.
+///
+/// The joints an em dash makes are written `:`, `,`, `;` or with parentheses. The rule was applied
+/// across the whole guide once and came back anyway, eight prose occurrences at a time, because
+/// nothing failed when one was introduced: it surfaced only when someone counted. That is the shape
+/// this module exists to move to build time.
+///
+/// **The exception is real and cannot be dropped**: a line that quotes what the binary prints
+/// carries whatever punctuation the binary uses, and rewriting it would make the page lie about the
+/// screen. So a dash is accepted in exactly two positions, and both were measured before being
+/// allowed.
+///
+/// Inside a fenced block, unconditionally. The fence's tag does not separate a transcript from an
+/// authored snippet, so it cannot be the discriminator: the `sh` blocks of the `proc` and `fs` pages
+/// paste a feed header sbx prints, and a tag-based rule would flag real output as prose. The
+/// residual is named rather than closed: a hand-written comment inside a `toml` fence is authoring,
+/// and this check does not see it.
+///
+/// Outside a fence, only inside an inline code span whose surroundings are found under `src/`. Both
+/// halves are load bearing. The span alone would let any dash through on a backtick, and the source
+/// match alone would accept a sentence that happens to share twelve characters with a message.
+///
+/// One place the rule covers is deliberately out of scope: the landing page's transcript
+/// (`docs-site/src/pages/index.tsx`) is quoted output end to end, and its one dash sits beside a
+/// colour escape in `src/cli/doctor.rs`, so no window taken from the page can match the source. It
+/// is checked by reading, not here.
+#[test]
+fn the_guide_writes_no_em_dash_outside_the_output_it_quotes() {
+    let sources = rust_sources();
+    let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    for (path, page) in guide_pages() {
+        // Fence state is per page, never carried into the next one.
+        let mut in_fence = false;
+        for (n, line) in page.lines().enumerate() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence || !line.contains('—') {
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let spans = code_spans(&chars);
+            for (i, c) in chars.iter().enumerate() {
+                if *c != '—' {
+                    continue;
+                }
+                let window: String = chars
+                    [i.saturating_sub(QUOTED_WINDOW)..(i + QUOTED_WINDOW + 1).min(chars.len())]
+                    .iter()
+                    .collect();
+                if spans.iter().any(|(a, b)| (*a..*b).contains(&i)) && sources.contains(&window) {
+                    continue;
+                }
+                let at = path.display().to_string().replace(&root, "");
+                offenders.push(format!("{at}:{}  {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the guide does not write em dashes: use `:`, `,`, `;` or parentheses. If the line quotes \
+         what the binary prints, put it in a fenced block or an inline code span whose text matches \
+         the message in `src/`, and it is accepted.\n{}",
+        offenders.join("\n")
     );
 }
