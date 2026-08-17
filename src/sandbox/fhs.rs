@@ -142,22 +142,28 @@ fn provision_locale_archive(
     system: &str,
     locales: &[String],
 ) -> io::Result<PathBuf> {
+    crate::store::provision_expr(
+        nix,
+        layout,
+        &roots.join("locales"),
+        &locale_archive_expr(nixpkgs, system, locales),
+        "glibcLocales",
+        "lib/locale/locale-archive",
+    )
+}
+
+/// The expression [`provision_locale_archive`] builds. A function of its own so a test can hand it
+/// to nix rather than assert on its text: what the emitter owes nix is an *expression*, and a
+/// substring survives one nix refuses.
+fn locale_archive_expr(nixpkgs: &str, system: &str, locales: &[String]) -> String {
     let locale_list = locales
         .iter()
         .map(|l| format!("\"{l}/UTF-8\""))
         .collect::<Vec<_>>()
         .join(" ");
-    let expr = format!(
+    format!(
         "(builtins.getFlake \"{nixpkgs}\").legacyPackages.{system}.glibcLocales.override \
          {{ allLocales = false; locales = [ {locale_list} ]; }}"
-    );
-    crate::store::provision_expr(
-        nix,
-        layout,
-        &roots.join("locales"),
-        &expr,
-        "glibcLocales",
-        "lib/locale/locale-archive",
     )
 }
 
@@ -437,6 +443,22 @@ mod locale_tests {
         );
         assert_eq!(normalize_utf8_locale("a b.UTF-8"), None);
         assert_eq!(normalize_utf8_locale("$(touch pwned).UTF-8"), None);
+    }
+
+    /// The gate above keeps a hostile value out of the expression; this asks nix whether what the
+    /// gate lets through composes into one at all. See [`crate::testutil::assert_nix_parses`].
+    #[test]
+    fn the_locale_archive_expr_is_one_nix_accepts() {
+        let Some(instantiate) = crate::testutil::nix_instantiate() else {
+            skip_incapable!("skipping locale archive parse: no nix-instantiate on this host");
+            return;
+        };
+        // The set a launch really passes (built by `locale_set`, so the anchor is in it), and the
+        // empty list, which is its own syntax case: `locales = [ ]`.
+        for locales in [locale_set(["fr_FR.UTF-8".into()]), Vec::new()] {
+            let expr = locale_archive_expr("github:NixOS/nixpkgs/abc", "x86_64-linux", &locales);
+            crate::testutil::assert_nix_parses(&instantiate, "fhs::locale_archive_expr", &expr);
+        }
     }
 
     #[test]

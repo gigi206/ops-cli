@@ -320,6 +320,36 @@ mod skip_macro_tests {
     }
 }
 
+/// `nix-instantiate`, when this host can run it: the resolved `nix` has a sibling by that name.
+/// `None` is the caller's cue to `skip_incapable!`, so a run that skipped the check says so
+/// instead of reporting a guard that did nothing.
+pub(crate) fn nix_instantiate() -> Option<PathBuf> {
+    let instantiate = crate::store::resolve_nix(None)?.with_file_name("nix-instantiate");
+    instantiate.exists().then_some(instantiate)
+}
+
+/// Ask nix whether `expr` is an expression at all, and fail with nix's own error beside the text
+/// when it is not. `emitter` names what produced it.
+///
+/// Every expression sbx hands to nix is built by substituting into a template, and what the tests
+/// around those templates assert is `contains` on the pieces -- which a missing `;`, an unbalanced
+/// indented-string delimiter, or an interpolation opened and not closed all leave in place. This is
+/// the question none of them asks, and the emitters share it, so it is defined once here.
+///
+/// `--parse` is the right depth: it answers "is this an expression?" without fetching the pinned
+/// nixpkgs or building anything, so it needs no network and costs milliseconds.
+pub(crate) fn assert_nix_parses(instantiate: &Path, emitter: &str, expr: &str) {
+    let out = std::process::Command::new(instantiate)
+        .args(["--parse", "-E", expr])
+        .output()
+        .expect("nix-instantiate runs");
+    assert!(
+        out.status.success(),
+        "`{emitter}` emits an expression nix rejects:\n{}\n--- expression ---\n{expr}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 /// No test may give up in silence: a skip has to go through the macros, never through a bare
 /// print.
 ///

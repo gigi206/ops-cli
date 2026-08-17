@@ -2108,6 +2108,14 @@ mod tests {
         );
     }
 
+    /// The single argument following `--expr`, if any. Shared by the two tests that examine the
+    /// unfree path: one asserts what the expression says, the other hands it to nix.
+    fn expr_arg(cmd: &Command) -> Option<String> {
+        let args: Vec<_> = cmd.get_args().collect();
+        let i = args.iter().position(|a| *a == OsStr::new("--expr"))?;
+        args.get(i + 1).map(|a| a.to_string_lossy().into_owned())
+    }
+
     #[test]
     fn provision_command_permits_unfree_via_a_pure_expr_only_when_asked() {
         let layout = Layout::under(Path::new("/data/sbx"));
@@ -2116,12 +2124,6 @@ mod tests {
                 .any(|(k, _)| k == OsStr::new("NIXPKGS_ALLOW_UNFREE"))
         };
         let has_impure = |cmd: &Command| cmd.get_args().any(|a| a == OsStr::new("--impure"));
-        // The single argument following `--expr`, if any.
-        let expr_arg = |cmd: &Command| -> Option<String> {
-            let args: Vec<_> = cmd.get_args().collect();
-            let i = args.iter().position(|a| *a == OsStr::new("--expr"))?;
-            args.get(i + 1).map(|a| a.to_string_lossy().into_owned())
-        };
 
         // The unfree path evaluates a PURE `--expr` that re-imports the pinned nixpkgs with a scoped
         // `config.allowUnfree = true` — so a proprietary attribute evaluates instead of being
@@ -2181,6 +2183,29 @@ mod tests {
             free.get_args().any(|a| a == OsStr::new("nixpkgs#hello")),
             "free build must select the positional installable"
         );
+    }
+
+    /// The test above asserts what the unfree expression says; this asks nix whether it is an
+    /// expression. See [`crate::testutil::assert_nix_parses`]: the `contains` above survives a
+    /// brace left open, and the failure would then land on a user installing a proprietary package,
+    /// at the one moment sbx claims to have re-scoped `allowUnfree` for them.
+    #[test]
+    fn the_unfree_expr_is_one_nix_accepts() {
+        let Some(instantiate) = crate::testutil::nix_instantiate() else {
+            skip_incapable!("skipping unfree expr parse: no nix-instantiate on this host");
+            return;
+        };
+        let layout = Layout::under(Path::new("/data/sbx"));
+        let unfree = provision_command(
+            Path::new("/nix"),
+            &layout,
+            Path::new("/g"),
+            "nixpkgs",
+            "kiro-cli",
+            true,
+        );
+        let expr = expr_arg(&unfree).expect("unfree build must select via --expr");
+        crate::testutil::assert_nix_parses(&instantiate, "store: the unfree build --expr", &expr);
     }
 
     #[test]

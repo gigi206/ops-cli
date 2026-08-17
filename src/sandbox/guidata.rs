@@ -112,6 +112,18 @@ mod tests {
         assert!(!expr.contains("@NIXPKGS@") && !expr.contains("@SYSTEM@"));
     }
 
+    /// The test above asserts the pieces; this one asks nix whether what carries them is an
+    /// expression. See [`crate::testutil::assert_nix_parses`] for why a `contains` cannot.
+    #[test]
+    fn the_expr_is_one_nix_accepts() {
+        let Some(instantiate) = crate::testutil::nix_instantiate() else {
+            skip_incapable!("skipping gui-data derivation parse: no nix-instantiate on this host");
+            return;
+        };
+        let expr = derivation_expr("github:NixOS/nixpkgs/abc", "x86_64-linux");
+        crate::testutil::assert_nix_parses(&instantiate, "guidata::derivation_expr", &expr);
+    }
+
     #[test]
     fn the_env_points_xdg_data_dirs_at_the_output_share() {
         let env = data_env(Path::new("/nix/store/abc-sbx-gui-data"));

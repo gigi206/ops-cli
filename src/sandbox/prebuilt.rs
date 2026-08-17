@@ -1698,27 +1698,17 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
     }
 
     /// Every backend's derivation is text until nix reads it, and nothing here asked nix whether it
-    /// would. The assertions in the four modules are `contains` on the pieces, and a piece survives
-    /// an expression nix refuses: a missing `;`, an unbalanced indented-string delimiter, an
-    /// interpolation opened and
-    /// not closed removes none of them.
-    ///
-    /// `--parse` is exactly the right depth. It answers "is this an expression?" without fetching
-    /// the pinned nixpkgs or building anything, so the check needs no network and costs milliseconds.
+    /// would: see [`crate::testutil::assert_nix_parses`] for what a `contains` assertion leaves
+    /// standing and why `--parse` is the depth that answers it.
     ///
     /// Driven by [`DIRECT_ORDER`] rather than a list written here, so a fifth backend is covered by
     /// existing on the same terms as the other four.
     #[test]
     fn every_backend_emits_an_expression_nix_accepts() {
-        let Some(nix) = store::resolve_nix(None) else {
-            skip_incapable!("skipping derivation parse: no nix on PATH");
+        let Some(instantiate) = crate::testutil::nix_instantiate() else {
+            skip_incapable!("skipping derivation parse: no nix-instantiate on this host");
             return;
         };
-        let instantiate = nix.with_file_name("nix-instantiate");
-        if !instantiate.exists() {
-            skip_incapable!("skipping derivation parse: no nix-instantiate beside nix");
-            return;
-        }
         // A URL carrying the characters the validators admit beyond alphanumerics, so the quoting is
         // exercised on the shapes a real release index produces rather than on a tidy one.
         const URL: &str = "https://example.com/d/v1.2.3/demo~app_x86_64-linux%2Ebin";
@@ -1735,17 +1725,10 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
                     HASH,
                     &libs,
                 );
-                let out = std::process::Command::new(&instantiate)
-                    .args(["--parse", "-E", &expr])
-                    .output()
-                    .expect("nix-instantiate runs");
-
-                assert!(
-                    out.status.success(),
-                    "`{}` emits an expression nix rejects ({} libs):\n{}\n--- expression ---\n{expr}",
-                    kind.name(),
-                    libs.len(),
-                    String::from_utf8_lossy(&out.stderr),
+                crate::testutil::assert_nix_parses(
+                    &instantiate,
+                    &format!("{} ({} libs)", kind.name(), libs.len()),
+                    &expr,
                 );
             }
         }

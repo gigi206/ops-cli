@@ -634,9 +634,7 @@ pub(crate) fn fetch_url_text(
 /// validated package name, a percent-encoded query, or a charset-validated URL, so it carries no
 /// quote, `$`, or backslash to escape the expression.
 fn fetch_url_bytes(nix: &Path, layout: &Layout, url: &str, fresh: bool) -> io::Result<Vec<u8>> {
-    let expr = format!(
-        "builtins.readFile (builtins.fetchurl {{ url = \"{url}\"; name = \"sbx-nixhub\"; }})"
-    );
+    let expr = fetch_expr(url);
     let mut cmd = store::nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"]);
     // `builtins.fetchurl` caches by `tarball-ttl` (an hour by default), so a repeat within the
@@ -655,6 +653,14 @@ fn fetch_url_bytes(nix: &Path, layout: &Layout, url: &str, fresh: bool) -> io::R
         )));
     }
     Ok(out.stdout)
+}
+
+/// The expression [`fetch_url_bytes`] evaluates. A function of its own so a test can hand it to
+/// nix rather than assert on its text: a URL is interpolated into a nix string literal here, and
+/// the shapes that reach it (a query string, percent-encoding) are exactly the ones a `contains`
+/// would not notice going wrong.
+fn fetch_expr(url: &str) -> String {
+    format!("builtins.readFile (builtins.fetchurl {{ url = \"{url}\"; name = \"sbx-nixhub\"; }})")
 }
 
 /// Select the nixpkgs pin for `version_req` on `system` from a package's nixhub
@@ -966,6 +972,30 @@ mod tests {
         assert!(select_release(&metadata(), "9.9", "x86_64-linux").is_none());
         // a system nixhub has no build for
         assert!(select_release(&metadata(), "latest", "riscv64-linux").is_none());
+    }
+
+    /// The validators below keep a hostile URL out of the fetch expression; this asks nix whether
+    /// the URLs they *admit* still compose into an expression. See
+    /// [`crate::testutil::assert_nix_parses`].
+    #[test]
+    fn the_fetch_expr_is_one_nix_accepts() {
+        let Some(instantiate) = crate::testutil::nix_instantiate() else {
+            skip_incapable!("skipping fetch expr parse: no nix-instantiate on this host");
+            return;
+        };
+        // The three shapes callers really pass: a plain metadata URL, one carrying a query string
+        // with percent-encoding (the case the `{ url; name; }` form exists for), and an apt index.
+        for url in [
+            "https://www.nixhub.io/packages/nodejs?_data=routes%2F_nixhub.packages.%24pkg._index",
+            "https://search.example.org/q?name=gcc-unwrapped&v=1.7-bin",
+            "https://deb.example.org/debian/dists/stable/main/binary-amd64/Packages",
+        ] {
+            crate::testutil::assert_nix_parses(
+                &instantiate,
+                "nixhub::fetch_expr",
+                &fetch_expr(url),
+            );
+        }
     }
 
     #[test]
