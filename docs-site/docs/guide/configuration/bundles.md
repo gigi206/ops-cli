@@ -172,10 +172,20 @@ The roll that moves the store [says so as it closes](../cli/upgrade#after-a-roll
 naming the apps whose steps build against those paths. That announcement is what tells you a
 repair is pending; whether the repair actually happens is decided here, by the guard you wrote.
 
-One shape stays outside the channel: an app that installs itself from its own `cmd`. A
-`provision` is a bundle's field, and a profile that consumes **another** agent's bundle has
-none of its own to put one in. Among the shipped profiles that is `open-design` alone, which
-clones its own source, and it advances the way it always has, with
+One shape stays outside the channel, and outside that announcement: an app that installs
+itself from its own `cmd`. A `provision` is a bundle's field, so hosting one means owning a
+bundle, and here a bundle belongs to the agent it packages; a profile that consumes
+**another** agent's bundle has nowhere of its own to put a step. Two shipped profiles are in
+that position, and both consume `opencode`, which carries no step at all: `open-design`,
+which clones its own source, and `aionui`, which stages a read-only runtime out of the store
+into its home.
+
+For those two the consequence is not a narrower channel but a silent one. `sbx upgrade
+provision` has nothing to run, and a roll that moves the store closes without a word rather
+than closing with a list they are missing from. Each still repairs itself at its next launch,
+from the guard in its own `cmd`, and both say on stderr that they are doing it, so what is absent
+is the advance notice rather than the repair or any account of it. Read the announcement above as
+bounded by what a step declares. `open-design` also advances deliberately, with
 `sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1`.
 
 `task` folds like the rest: a tool that ships a brokered operation (a fixed command

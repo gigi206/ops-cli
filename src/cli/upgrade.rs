@@ -772,12 +772,21 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// install step cannot be named here, because it declares no step to select on. The shipped
 /// catalogue has **two**: `open-design`, which clones and installs on every launch, and `aionui`,
 /// which stages a runtime out of the store into its home. Neither is left broken — the work runs
-/// inside the `cmd`, so it repairs itself exactly as a step does; they simply cannot be listed.
+/// inside the `cmd`, so it repairs itself exactly as a step does; what they lose is the notice.
+/// And they lose all of it, not a name in a list: both consume the `opencode` bundle, which carries
+/// no step, so their `provisions` is empty and this function returns `None` for a project holding
+/// only them. The roll closes in silence rather than closing with an incomplete sentence, which is
+/// the sharper statement of the same gap and the one to weigh against the cost of closing it. What
+/// bounds that cost: each of the two prints its own restage on stderr as it runs, so what the roll
+/// withholds is the advance notice, not an account of the work.
 /// That self-repair is a property of the guard each one writes, not of the shape: `aionui`'s guard
 /// tested that the staged tree was *there* rather than that it *ran*, and skipped the repair for as
 /// long as the tree existed. Widening this note to cover them would mean detecting staging inside a
 /// shell string, which the config cannot do; what closes the gap is a declarative signal, not a
-/// better guess.
+/// better guess. Both signals that would work move something a caller cannot: a field an app sets
+/// to declare that its home holds store content, or a bundle of its own to host the step — which in
+/// this catalogue means the namesake shape (a bundle's profile is thin and names only it, pinned in
+/// `src/config/tests.rs`) that a consumer profile is precisely not.
 fn store_moved_note(cfg: &config::Resolved, only: Option<&str>) -> Option<String> {
     let apps: Vec<&str> = apps_with_install_steps(cfg)
         .into_iter()
