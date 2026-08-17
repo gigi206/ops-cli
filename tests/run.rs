@@ -702,14 +702,39 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // membership + enforcement tests); the base cage carries no `umount` binary, so this e2e
     // exercises the reachable filesystem attack (rename/remove), not a raw syscall. Skips (never
     // fails) where the host cannot sandbox.
-    let home = TmpDir::new("cp-home");
+    let home = TmpDir::new("cp");
     // A fabricated `$HOME` with sbx's XDG roots inside it, so the control plane lives under the
     // read-write bind. Canonical, because `load` canonicalizes the bind source and the roots.
+    //
+    // Single letters, not `.local/share` and friends, and the budget is why rather than taste: a
+    // launch binds `<data dir>/forward/fwd-<pid>/p-<port>.sock` and `sun_path` caps the whole path
+    // at 107 bytes, so sbx refuses a data directory over 74. This is the only e2e that nests sbx's
+    // roots inside its own fixture, and the conventional names spend eleven bytes it does not have
+    // on an ordinary checkout. They buy nothing here either: sbx reads the three variables, and the
+    // pins follow what those resolve to, never the XDG defaults.
+    const DATA_REL: &str = "d";
+    const STATE_REL: &str = "s";
+    const CONFIG_REL: &str = "c";
     let h = std::fs::canonicalize(home.path()).unwrap();
-    let data = h.join(".local/share");
-    let state = h.join(".local/state");
-    let config = h.join(".config");
+    let data = h.join(DATA_REL);
+    let state = h.join(STATE_REL);
+    let config = h.join(CONFIG_REL);
     let project = h.join("project");
+    // Fail, never skip, when the fixture itself is what does not fit. The launch would refuse the
+    // data directory, the capability probe below would read that refusal as "the host cannot
+    // sandbox" — a lie about a host that cages perfectly well — and `SBX_REQUIRE_CAPABLE=1` would
+    // turn the lie into a failure naming the wrong cause. The bound is written as a literal because
+    // an integration test cannot see the binary's own constant, and a net that recomputes its
+    // expectation measures nothing.
+    let data_dir = data.join("sbx");
+    assert!(
+        data_dir.as_os_str().len() <= 74,
+        "this fixture's data directory is {} bytes ({}) and a launch accepts at most 74, because it \
+         binds sockets under it and a Unix socket path cannot exceed 107. Point SBX_TEST_TMPDIR at a \
+         shorter fixture root (e.g. /tmp/sbx-t) and rerun.",
+        data_dir.as_os_str().len(),
+        data_dir.display()
+    );
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(config.join("sbx")).unwrap();
     // The global config (trusted by location) binds the whole fabricated home read-write.
@@ -754,13 +779,15 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     let script = format!(
         r#"H="{h}"
 echo "A:$(touch "$H/writeprobe" 2>/dev/null && echo OK || echo FAIL)"
-echo "B:$(echo x > "$H/.local/state/sbx/trusted/forged" 2>/dev/null && echo BAD || echo RO)"
-echo "C:$(mv "$H/.local/state" "$H/.local/state.bak" 2>/dev/null && echo BAD || echo EBUSY)"
-echo "D:$(mv "$H/.local/state/sbx/trusted" "$H/stolen" 2>/dev/null && echo BAD || echo EBUSY)"
-echo "E:$(rmdir "$H/.config/sbx" 2>/dev/null && echo BAD || echo BLOCKED)"
+echo "B:$(echo x > "$H/{s}/sbx/trusted/forged" 2>/dev/null && echo BAD || echo RO)"
+echo "C:$(mv "$H/{s}" "$H/{s}.bak" 2>/dev/null && echo BAD || echo EBUSY)"
+echo "D:$(mv "$H/{s}/sbx/trusted" "$H/stolen" 2>/dev/null && echo BAD || echo EBUSY)"
+echo "E:$(rmdir "$H/{c}/sbx" 2>/dev/null && echo BAD || echo BLOCKED)"
 echo "F:$(touch /nix/.sbx-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
 "#,
-        h = h.display()
+        h = h.display(),
+        s = STATE_REL,
+        c = CONFIG_REL
     );
     let out = run(&script);
     let stdout = String::from_utf8_lossy(&out.stdout);
