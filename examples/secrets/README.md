@@ -117,6 +117,7 @@ provider page says which one to read and what proves the header arrived.
 | [Perplexity](perplexity/) | `api.perplexity.ai/v1/*` | `env://PERPLEXITY_API_KEY` | `Authorization` / `bearer` |
 | [StepFun](stepfun-ai/) | `api.stepfun.ai/v1/*` | `env://STEPFUN_API_KEY` | `Authorization` / `bearer` |
 | [Tencent](tencent/) | `api.lkeap.cloud.tencent.com/coding/v3/*` | `env://TENCENT_CODING_PLAN_API_KEY` | `Authorization` / `bearer` |
+| [TokenRouter](tokenrouter/) | `api.tokenrouter.com/v1/*` | `env://TOKENROUTER_API_KEY` | `Authorization` / `bearer` |
 | [Together AI](togetherai/) | `api.together.xyz/v1/*` | `env://TOGETHER_API_KEY` | `Authorization` / `bearer` |
 | [Venice](venice/) | `api.venice.ai/api/v1/*` | `env://VENICE_API_KEY` | `Authorization` / `bearer` |
 | [xAI](xai/) | `api.x.ai/v1/*` | `env://XAI_API_KEY` | `Authorization` / `bearer` |
