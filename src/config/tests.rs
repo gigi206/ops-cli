@@ -1185,6 +1185,96 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
     assert_eq!(effective(&NetworkPolicy::Isolated), DefaultAction::Deny);
 }
 
+/// What declaring a table costs, said in the layer that declares it.
+///
+/// The mode is the one thing a table inherits, so a reader has every reason to think the rest of
+/// the layer below comes with it — every other layered table amends. This is the case that made it
+/// worth saying: `sbx net allow --local` writes a one-rule `[network]` into a project, and the
+/// settings the global config carried stop applying to that project.
+#[test]
+fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
+    use crate::allowlist::EgressPolicy;
+    use crate::sandbox::control::CaptureLevel;
+    // The table `sbx net allow --local` writes: a mode and one rule, no settings of its own.
+    let one_rule = || {
+        NetworkField::Table(NetworkTable {
+            mute: vec![],
+            http2: vec![],
+            capture: None,
+            capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
+            mode: Some("deny".to_string()),
+            allow: vec!["example.com".to_string()],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+            dns_cache_ttl: None,
+            pool: None,
+            idle_timeout: None,
+            max_connections: None,
+            body_max_mb: None,
+            ca_roots: None,
+        })
+    };
+    let warn = |parent: &NetworkPolicy| {
+        let mut w = Vec::new();
+        super::validate_network(
+            &mut w,
+            PROJECT_CONFIG,
+            one_rule(),
+            &NetGroups::new(),
+            parent,
+        )
+        .expect("a table with a mode always resolves");
+        w
+    };
+
+    // Two settings below: both named, in the order the config file declares them, plural.
+    let w = warn(&NetworkPolicy::Allowlist(
+        EgressPolicy::default()
+            .with_ca_roots(false)
+            .with_capture(CaptureLevel::Bodies, None),
+    ));
+    assert_eq!(w.len(), 1, "one line names them all: {w:?}");
+    assert!(
+        w[0].contains("replaces the layer below rather than adding to it"),
+        "{}",
+        w[0]
+    );
+    assert!(
+        w[0].contains("settings it carried do not apply here: `ca_roots`, `capture`"),
+        "{}",
+        w[0]
+    );
+    assert!(w[0].contains("re-declare them"), "{}", w[0]);
+
+    // One setting: the singular form, because a message that reads as generated invites being
+    // skimmed past.
+    let w = warn(&NetworkPolicy::Allowlist(
+        EgressPolicy::default().with_ca_roots(false),
+    ));
+    assert!(
+        w[0].contains("setting it carried does not apply here: `ca_roots`"),
+        "{}",
+        w[0]
+    );
+    assert!(w[0].contains("re-declare it"), "{}", w[0]);
+
+    // The two silent cases, which is what keeps this off every project that adds a rule: a parent
+    // carrying nothing, and a non-filtering parent that has no settings to carry.
+    assert!(
+        warn(&NetworkPolicy::Allowlist(EgressPolicy::default())).is_empty(),
+        "a neutral parent gives nothing up"
+    );
+    assert!(
+        warn(&NetworkPolicy::Shared).is_empty(),
+        "a shared parent runs no proxy, so it carries no proxy setting"
+    );
+}
+
 #[test]
 fn a_mode_less_project_network_table_inherits_the_global_mode() {
     use crate::allowlist::DefaultAction;
@@ -6717,6 +6807,55 @@ fn an_override_reference_to_an_undefined_group_is_dropped_with_a_warning() {
         policy.allow_rules().is_empty(),
         "and nothing opened: {:?}",
         policy.allow_rules()
+    );
+}
+
+/// The one-shot plane rebuilds the policy exactly as a config layer does, so it gives up the same
+/// settings — and says so under its own source label. It is the plane where a reader is least
+/// likely to expect it: `--config '[network] allow=[…]'` reads as adding one rule for one launch.
+#[test]
+fn a_one_shot_override_says_what_its_network_table_gives_up() {
+    let table = |capture: Option<&str>, allow: &[&str]| {
+        NetworkField::Table(NetworkTable {
+            mode: Some("deny".to_string()),
+            allow: allow.iter().map(|h| h.to_string()).collect(),
+            capture: capture.map(str::to_string),
+            mute: vec![],
+            http2: vec![],
+            capture_max_kb: None,
+            groups: Default::default(),
+            rest: Default::default(),
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+            dns_cache_ttl: None,
+            pool: None,
+            idle_timeout: None,
+            max_connections: None,
+            body_max_mb: None,
+            ca_roots: None,
+        })
+    };
+    let with_capture = RawConfig {
+        network: Some(table(Some("bodies"), &[])),
+        ..RawConfig::default()
+    };
+    let one_rule = RawConfig {
+        network: Some(table(None, &["example.com"])),
+        ..RawConfig::default()
+    };
+    let applied = with_override(resolve_no_plugins(with_capture, None), one_rule);
+    let said = applied
+        .warnings
+        .iter()
+        .find(|w| w.contains("replaces the layer below"))
+        .unwrap_or_else(|| panic!("the override plane says it too: {:?}", applied.warnings));
+    assert!(said.starts_with("override: "), "{said}");
+    assert!(
+        said.contains("setting it carried does not apply here: `capture`"),
+        "{said}"
     );
 }
 

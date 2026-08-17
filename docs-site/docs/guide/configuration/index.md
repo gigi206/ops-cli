@@ -40,6 +40,13 @@ sbx config show -g             # what the global layer contributes
 sbx config show -a review      # ast-grep tagged "inherited" in the app's effective config
 ```
 
+One table composes differently, and it is worth knowing before relying on a global
+setting: a [`[network]`](network#what-a-table-does-not-inherit) table declared in a lower
+layer **replaces** the one above it rather than adding to it. A global `capture` or
+`ca_roots` therefore stops applying to a project that declares its own table, which
+[`sbx net allow --local`](../cli/net) does for you. Only the mode is inherited, and sbx
+names on stderr whatever stopped applying.
+
 By contrast, a project's mise files ([`[tools]`](tools)) are **project-local by
 design**: declare a tool there and it equips that project only. The usual split
 is a global `[packages]` for tools you want everywhere, plus the project's mise

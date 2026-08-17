@@ -960,6 +960,113 @@ impl EgressPolicy {
         self
     }
 
+    /// The settings `parent` carries that `self` does not, by their `[network]` key — what a config
+    /// layer gives up by declaring a table of its own.
+    ///
+    /// A layer's table *rebuilds* the policy from its own keys (only an omitted `mode` is inherited),
+    /// so every setting starts from the neutral value again: a global `capture` or `ca_roots` stops
+    /// applying the moment a project adds one `allow` rule. That is the reversion
+    /// [`Self::with_rules`] exists to avoid for the two amenders, on the one path that cannot amend —
+    /// a layer genuinely declares its own rules. It stays a replacement; this is what lets the caller
+    /// say so instead of letting it pass in silence.
+    ///
+    /// Compared **by effect** against a neutral policy, not by which keys were written: a layer that
+    /// re-declares the same value gives up nothing, and one that declares a different value replaced
+    /// it in the open. The neutral instance comes from [`Self::new`] for the reason [`Default`]
+    /// delegates to it — `pool` and `ca_roots` are `true` unset, so a second hand-written notion of
+    /// "unset" would drift the day a field is added.
+    ///
+    /// The destructure is exhaustive on purpose: a new setting has to fail to compile here rather
+    /// than quietly join the set a layer drops without a word.
+    pub(crate) fn settings_dropped_from(&self, parent: &Self) -> Vec<&'static str> {
+        let neutral = Self::new(Vec::new(), Vec::new());
+        let Self {
+            // The rules are not settings: replacing them is what declaring a table is *for*, and the
+            // resolved view shows the result. `capture_body_kb` rides `capture` — it is refused
+            // where it is read without one — so naming `capture` names both. The posture is not a
+            // setting either, but it is read below: it bounds where two of them mean anything.
+            allow: _,
+            deny: _,
+            capture_body_kb: _,
+            default_action,
+            mute,
+            http2,
+            dns_cache_ttl,
+            pool,
+            idle_timeout,
+            max_connections,
+            body_max,
+            ca_roots,
+            capture,
+            ask_timeout,
+            suppress_ask_notice,
+        } = self;
+        let mut dropped = Vec::new();
+        let mut lost = |key: &'static str, parent_carries: bool, mine_is_neutral: bool| {
+            if parent_carries && mine_is_neutral {
+                dropped.push(key);
+            }
+        };
+        // In the order the fields are declared in the config table, so the message reads the way the
+        // file does. `Rule` carries no `PartialEq`, so `mute` compares by the only thing that can be
+        // neutral for it: an empty list.
+        lost("mute", !parent.mute.is_empty(), mute.is_empty());
+        lost(
+            "http2",
+            parent.http2 != neutral.http2,
+            *http2 == neutral.http2,
+        );
+        lost(
+            "dns_cache_ttl",
+            parent.dns_cache_ttl != neutral.dns_cache_ttl,
+            *dns_cache_ttl == neutral.dns_cache_ttl,
+        );
+        lost("pool", parent.pool != neutral.pool, *pool == neutral.pool);
+        lost(
+            "idle_timeout",
+            parent.idle_timeout != neutral.idle_timeout,
+            *idle_timeout == neutral.idle_timeout,
+        );
+        lost(
+            "max_connections",
+            parent.max_connections != neutral.max_connections,
+            *max_connections == neutral.max_connections,
+        );
+        lost(
+            "body_max_mb",
+            parent.body_max != neutral.body_max,
+            *body_max == neutral.body_max,
+        );
+        lost(
+            "ca_roots",
+            parent.ca_roots != neutral.ca_roots,
+            *ca_roots == neutral.ca_roots,
+        );
+        lost(
+            "capture",
+            parent.capture != neutral.capture,
+            *capture == neutral.capture,
+        );
+        // The two `ask` settings only where the parked wait exists at all. A layer that also changes
+        // the posture (`ask` below, `deny` here) does not *drop* them, it leaves the mode they
+        // belonged to, and the resolved view says so in one word. Reporting them here would put a
+        // second, contradictory line beside the one this policy already emits for an `ask_timeout`
+        // declared outside `ask` mode: "re-declare it to keep it" against "it is ignored".
+        if *default_action == DefaultAction::Ask {
+            lost(
+                "ask_timeout",
+                parent.ask_timeout != neutral.ask_timeout,
+                *ask_timeout == neutral.ask_timeout,
+            );
+            lost(
+                "ask_notice",
+                parent.suppress_ask_notice != neutral.suppress_ask_notice,
+                *suppress_ask_notice == neutral.suppress_ask_notice,
+            );
+        }
+        dropped
+    }
+
     /// Attach the log-suppression (`mute`) rules, returning the policy (builder style). A denied
     /// request matching one is refused as usual and counted in stats, but kept out of the default
     /// `sbx net log` view. Purely a logging filter — never consulted by [`Self::explain`].
@@ -1490,6 +1597,106 @@ mod tests {
 
     fn rule(s: &str) -> Rule {
         classify(s).unwrap_or_else(|e| panic!("classify({s:?}) failed: {e}"))
+    }
+
+    /// A policy carrying every setting a layer can set, for the comparison below to have something
+    /// to give up. Each value differs from the neutral one, which is the only property that matters
+    /// here: `pool` and `ca_roots` are `true` unset, so they are set `false`.
+    fn every_setting() -> EgressPolicy {
+        use std::time::Duration;
+        EgressPolicy::new(Vec::new(), Vec::new())
+            .with_mute(vec![rule("telemetry.example.com")])
+            .with_http2(vec![
+                Http2Host::parse("grpc.example.com").expect("a plain host parses"),
+            ])
+            .with_dns_cache_ttl(Some(Duration::from_secs(300)))
+            .with_pool(false)
+            .with_idle_timeout(Some(Duration::from_secs(45)))
+            .with_max_connections(Some(128))
+            .with_body_max(Some(64 * 1024 * 1024))
+            .with_ca_roots(false)
+            .with_capture(crate::sandbox::control::CaptureLevel::Bodies, Some(32))
+            .with_ask_timeout(Some(Duration::from_secs(90)))
+            .with_ask_notice(false)
+    }
+
+    /// What a layer gives up by declaring a `[network]` table: everything the layer below carried,
+    /// because the table rebuilds the policy instead of amending it.
+    ///
+    /// The expectation is a **literal list in the config file's own order**, never re-derived from
+    /// the policy the test just built — a table that computes its own answer agrees with any
+    /// implementation, including one that forgot a field. The neutral child is the case that
+    /// matters, because `sbx net allow --local` writes exactly that: a table of one rule.
+    #[test]
+    fn a_table_gives_up_every_setting_the_layer_below_carried() {
+        let parent = every_setting().with_default(DefaultAction::Ask);
+        let one_rule =
+            |action| EgressPolicy::new(vec![rule("example.com")], Vec::new()).with_default(action);
+        assert_eq!(
+            one_rule(DefaultAction::Ask).settings_dropped_from(&parent),
+            vec![
+                "mute",
+                "http2",
+                "dns_cache_ttl",
+                "pool",
+                "idle_timeout",
+                "max_connections",
+                "body_max_mb",
+                "ca_roots",
+                "capture",
+                "ask_timeout",
+                "ask_notice",
+            ],
+            "a table of one rule keeps none of the settings under it"
+        );
+
+        // The same table under a mode of its own gives up the same settings *except* the two that
+        // belong to the parked wait: leaving `ask` is not dropping them, and the layer is already
+        // told so wherever it declared one. Naming them here would contradict that line.
+        assert_eq!(
+            one_rule(DefaultAction::Deny).settings_dropped_from(&parent),
+            vec![
+                "mute",
+                "http2",
+                "dns_cache_ttl",
+                "pool",
+                "idle_timeout",
+                "max_connections",
+                "body_max_mb",
+                "ca_roots",
+                "capture",
+            ],
+            "the `ask` settings are the mode's, not this table's to keep"
+        );
+    }
+
+    /// The two ways a layer gives up nothing, which is what keeps the warning off the common case:
+    /// re-declaring the same value, and replacing one in the open. Both are compared by **effect**,
+    /// so neither depends on which keys the layer happened to write.
+    #[test]
+    fn re_declaring_or_replacing_a_setting_gives_nothing_up() {
+        let parent = every_setting();
+        assert!(
+            parent.settings_dropped_from(&parent).is_empty(),
+            "a layer that carries the same settings gives none of them up"
+        );
+
+        let replaced = every_setting()
+            .with_capture(crate::sandbox::control::CaptureLevel::Headers, None)
+            .with_max_connections(Some(8));
+        assert!(
+            replaced.settings_dropped_from(&parent).is_empty(),
+            "a setting declared with a different value was replaced in the open, not dropped"
+        );
+
+        // And a neutral parent has nothing to give up, whatever this layer declares — the global
+        // layer's own case, where `parent` is the built-in default.
+        assert!(
+            every_setting()
+                .settings_dropped_from(&EgressPolicy::new(Vec::new(), Vec::new()))
+                .is_empty(),
+            "nothing was carried below, so nothing is given up"
+        );
     }
 
     /// The separator rule of `*.domain`, on the shape that decides it rather than on a policy.

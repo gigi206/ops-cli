@@ -5207,6 +5207,35 @@ fn validate_network_table(
             "{source_label}: `capture_max_kb` is only meaningful with `capture = \"bodies\"` — ignored"
         ));
     }
+    // What declaring a table costs, said where it happens. The policy above was *rebuilt* from this
+    // table's keys — only an omitted `mode` is inherited — so a setting the layer below carried and
+    // this one does not reverts to the built-in value. Every other layered table amends (`[limits]`
+    // merges field by field, `seccomp`/`forward`/`devices`/`ssh_agent`/`fs` union, `[notify]`
+    // inherits per event), so a reader has no reason to expect this one to replace.
+    //
+    // It is warned rather than merged because the rules a table declares are its own by design, and
+    // because the layer that loses a setting is usually not the one that wrote it: `sbx net allow
+    // --local` writes this table for a user whose settings live in the global config.
+    if let NetworkPolicy::Allowlist(below) = parent {
+        let dropped = policy.settings_dropped_from(below);
+        if !dropped.is_empty() {
+            let list = dropped
+                .iter()
+                .map(|key| format!("`{key}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (subject, verb, pronoun) = if dropped.len() == 1 {
+                ("setting", "does", "it")
+            } else {
+                ("settings", "do", "them")
+            };
+            warnings.push(format!(
+                "{source_label}: this `[network]` table replaces the layer below rather than adding \
+                 to it, so the {subject} it carried {verb} not apply here: {list} — re-declare \
+                 {pronoun} in this table to keep {pronoun}"
+            ));
+        }
+    }
     Some(NetworkPolicy::Allowlist(policy))
 }
 

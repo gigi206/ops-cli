@@ -423,6 +423,32 @@ rules. Only a *filtering* mode (`deny`/`ask`) is inherited: an `allow` denylist,
 `shared`/`none`, or no parent posture all fall back to the safe `deny`. This lets a
 profile add rules without re-declaring the mode.
 
+### What a table does not inherit
+
+The mode is the only setting that carries down. Declaring a `[network]` table **replaces**
+the layer below rather than adding to it, so anything else that layer set reverts to the
+built-in value: `mute`, `http2`, `dns_cache_ttl`, `pool`, `idle_timeout`, `max_connections`,
+`body_max_mb`, `ca_roots`, `capture` (with its `capture_max_kb`), `ask_timeout` and
+`ask_notice`. The `allow`/`deny` rules are replaced too, which is what declaring a table is
+for.
+
+This is easy to reach without meaning to, because [`sbx net allow --local`](../cli/net)
+writes a `[network]` table into the project: a `capture` or a `ca_roots = false` set once in
+the global config stops applying there from that moment. sbx names what stopped applying:
+
+```text
+sbx: warning: .sbx.toml: this `[network]` table replaces the layer below rather than adding to it, so the settings it carried do not apply here: `ca_roots`, `capture` — re-declare them in this table to keep them
+```
+
+Re-declare the ones you want in the table that replaced them. Two things stand outside this:
+the mode, inherited when omitted (above), and `stats`, which is read outside the table and
+applies to every launch.
+
+Every other layered table composes instead of replacing: [`[limits]`](limits) merges field by
+field, [`[fs]`](fs), [`forward`](../networking/forward), [`[devices]`](devices), [`[seccomp]`](seccomp)
+and [`[ssh_agent]`](ssh-agent) union their entries, and [`[notify]`](notify) inherits per
+event.
+
 ## `default_methods` (apps)
 
 A Mode-B app's unscoped (`{...}`-less) `allow` rules default to `["GET", "HEAD"]`: an
