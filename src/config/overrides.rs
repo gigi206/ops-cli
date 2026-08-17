@@ -6,6 +6,11 @@
 //! project directory) can reach. So an override is trusted *by invocation*, distinct from the
 //! direnv-style content trust of a project config: it touches no trust marker.
 //!
+//! Trusted by invocation is not the same as safe to read, and the `@<file>` form keeps the second:
+//! it passes [`super::safety::read_safe_bytes`] like any other config file. Vouching for a path's
+//! *content* says nothing about whether the thing at that path is a plain file the invoker owns, and
+//! `SBX_CONFIG=@…` in particular can arrive from an ambient environment nobody re-read.
+//!
 //! Two surfaces reach every field. A **blob** — `--config <toml|@file>` / `SBX_CONFIG` — carries
 //! inline TOML shaped exactly like an `sbx.toml`, so it can set *any* field the schema has. A
 //! **typed flag** — `--net`/`--gui`/`--nixpkgs`/`--bind`/`--forward`/`--limit`/`--package`/
@@ -982,11 +987,17 @@ fn parse_raw_limit(value: &str) -> RawLimit {
 
 /// Parse one blob value: `@<path>` reads the file, anything else is inline TOML. The bytes are then
 /// parsed as an `sbx.toml`-shaped config.
+///
+/// The file form goes through [`super::safety::read_safe_bytes`], the gate every other config file
+/// passes, because *trusted by invocation* and *safe to read* are different claims: naming a path is
+/// the invoker vouching for its **content**, while owner, mode and file type say whether these bytes
+/// are the ones that path promised. Reading it raw let a FIFO stall the launch at the open instead of
+/// being refused, and accepted a world-writable or foreign-owned file. The refusal is the gate's own
+/// wording, and it already names the path, so this prefix does not repeat it.
 fn parse_blob(value: &str) -> Result<RawConfig, String> {
     let bytes = match value.strip_prefix('@') {
-        Some(path) => {
-            std::fs::read(path).map_err(|e| format!("cannot read override file `{path}`: {e}"))?
-        }
+        Some(path) => super::safety::read_safe_bytes(std::path::Path::new(path))
+            .map_err(|e| format!("cannot read override file: {e}"))?,
         None => value.as_bytes().to_vec(),
     };
     schema::parse(&bytes)
@@ -1571,6 +1582,45 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("cannot read override file"), "{err}");
+        // The gate names the path it failed on, so the prefix does not have to: assert the file is
+        // still identified, since an override that aborts a launch must say which one.
+        assert!(err.contains("/no/such/sbx-override.toml"), "{err}");
+    }
+
+    #[test]
+    fn a_config_file_reference_passes_the_config_safety_gate() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // An override is trusted by invocation, but the file it names still has to be one sbx would
+        // load at all. Both blob surfaces funnel through `parse_blob`, and the environment one is
+        // where it matters most: `SBX_CONFIG=@…` can arrive from an ambient environment nobody
+        // re-read, so it is exercised here too rather than assumed from the shared call.
+        let dir = crate::testutil::TmpDir::new();
+        let file = dir.join("loose.toml");
+        std::fs::write(&file, b"network = \"none\"\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let arg = format!("@{}", file.display());
+
+        let err = collect_cli(Cli {
+            config: &[&arg],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.starts_with("--config (#1):"), "{err}");
+        assert!(
+            err.contains("refusing to load config: world-writable"),
+            "{err}"
+        );
+
+        let err = ambient(AmbientOverrides {
+            config: Some(arg),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.starts_with("SBX_CONFIG:"), "{err}");
+        assert!(
+            err.contains("refusing to load config: world-writable"),
+            "{err}"
+        );
     }
 
     // --- typed flags (increment 2) ---

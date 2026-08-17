@@ -29,6 +29,13 @@ SBX_CONFIG='[limits]
 tasks_max = 4096' sbx run -- ./build.sh
 ```
 
+The `@<file>` form reads that file through the same gate as any config: a plain regular
+file, owned by you, not world-writable. Trusting an override by invocation says the
+**content** is yours to declare; it says nothing about what happens to sit at the path, so
+a FIFO, a directory or a loose-permission file is refused by name rather than launched.
+The distinction matters most for `SBX_CONFIG=@…`, which can reach `sbx` from an ambient
+environment nobody re-read.
+
 ### Typed flags: one field each
 
 Ergonomic shorthands for a single field, each with an `SBX_*` environment equivalent:
