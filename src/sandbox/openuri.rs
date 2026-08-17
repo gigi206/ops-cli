@@ -91,6 +91,14 @@ const LOG: &str = "${HOME:-/tmp}/.sbx-open.log";
 /// Emitted as POSIX `sh` (the cage synthesises `/bin/sh`) with one `case` arm per scheme. Scheme
 /// matching is case-insensitive, as URI schemes are, using bracket classes rather than a `tr`
 /// pipeline so the script stays free of any tool the cage might not carry.
+///
+/// An arm ends at the scheme's `:`, never at the `//` that may follow it. An authority is optional
+/// in the grammar the key is already validated against (`scheme ":" hier-part`), and the form
+/// without one is what a native client's private redirect uses — `com.example.app:/callback` — which
+/// is the callback case this table exists to route. Matching on `://` would answer the scheme in one
+/// spelling and fall through to the stub in the other, with the stub's message giving no hint that a
+/// handler was declared at all. The `:` terminates the scheme production, so the pattern stays exact:
+/// `cursor:*` cannot match a `cursorx:` URI.
 pub(crate) fn router(handlers: &BTreeMap<String, OpenHandler>) -> String {
     let mut out = String::from(
         "#!/bin/sh\n\
@@ -100,7 +108,7 @@ pub(crate) fn router(handlers: &BTreeMap<String, OpenHandler>) -> String {
     if !handlers.is_empty() {
         out.push_str("case \"$1\" in\n");
         for (scheme, handler) in handlers {
-            out.push_str(&format!("  {}://*)\n", case_insensitive(scheme)));
+            out.push_str(&format!("  {}:*)\n", case_insensitive(scheme)));
             let cmd = shell_argv(&handler.argv);
             match handler.mode {
                 OpenMode::Exec => out.push_str(&format!("    exec {cmd} \"$@\" ;;\n")),
@@ -250,9 +258,65 @@ mod tests {
         // spelling the config did. Bracket classes rather than `tr`: the cage need carry no tool.
         let out = router(&table(&[("cursor", handler(&["cursor"], OpenMode::Exec))]));
         assert!(
-            out.contains("[Cc][Uu][Rr][Ss][Oo][Rr]://*)"),
+            out.contains("[Cc][Uu][Rr][Ss][Oo][Rr]:*)"),
             "each letter matches either case: {out}"
         );
+    }
+
+    /// Run the generated router on one URI and return what reached stderr — the handler's word, or
+    /// the stub's.
+    ///
+    /// The script is what the cage executes, so the arms are exercised by `sh` rather than read as
+    /// text. That distinction is the point: an arm that matched no URI without an authority passed
+    /// a pattern-matching assertion for as long as the assertion checked the pattern instead of the
+    /// decision it makes.
+    fn opened(handlers: &BTreeMap<String, OpenHandler>, uri: &str) -> String {
+        let dir = crate::testutil::TmpDir::new();
+        let script = dir.join("xdg-open");
+        std::fs::write(&script, router(handlers)).expect("stage the router");
+        let out = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .arg(uri)
+            .output()
+            .expect("run the router");
+        assert!(out.status.success(), "the router always succeeds: {out:?}");
+        String::from_utf8_lossy(&out.stderr).trim().to_string()
+    }
+
+    #[test]
+    fn a_scheme_is_matched_whether_or_not_the_uri_carries_an_authority() {
+        // An authority is optional in the grammar the key is validated against, and a native
+        // client's private redirect has none — which is the callback case `[open]` exists for. The
+        // stub's message is the same one an undeclared scheme gets, so a handler missed this way
+        // reads as a handler never declared.
+        let handlers = table(&[(
+            "cursor",
+            handler(
+                &["sh", "-c", "echo handled $1 >&2", "sbx-open"],
+                OpenMode::Exec,
+            ),
+        )]);
+        for uri in [
+            "cursor://callback?code=1",
+            "cursor:/oauth2redirect",
+            "cursor:callback",
+            "CURSOR:/oauth2redirect",
+        ] {
+            assert_eq!(
+                opened(&handlers, uri),
+                format!("handled {uri}"),
+                "the declared handler opens {uri}"
+            );
+        }
+        // The `:` is what ends the pattern, so a scheme this one is a prefix of is not swallowed,
+        // and an undeclared scheme still reaches the stub.
+        for uri in ["cursorx://callback", "https://example.com"] {
+            assert_eq!(
+                opened(&handlers, uri),
+                format!("sbx: open on the host: {uri}"),
+                "{uri} is not this handler's"
+            );
+        }
     }
 
     #[test]

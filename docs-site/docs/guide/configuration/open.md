@@ -52,6 +52,11 @@ land in the middle of a command would be a quoting surface rather than a conveni
 Scheme matching is case-insensitive, as URI schemes are, so a provider that redirects to
 `CURSOR://callback` reaches the same handler as one that redirects to `cursor://callback`.
 
+An entry is chosen by its scheme alone, whatever shape the rest of the URI takes:
+`cursor://callback`, `cursor:/callback` and `cursor:callback` all reach the same handler. The `//`
+is not what identifies a link, and a private-use redirect usually has none, since there is no host
+in it to name.
+
 ## `mode`, and why it is not a detail
 
 `exec` replaces the router with the handler, so a caller that waits for the open to finish waits
