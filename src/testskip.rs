@@ -36,7 +36,11 @@ macro_rules! __skip_note {
         eprintln!("{reason}");
         if let Some(path) = std::env::var_os("SBX_SKIP_LOG") {
             use std::io::Write as _;
-            let line = format!("{reason}\n");
+            // One line per skip is the log's contract, and a reason is not always one line: a site
+            // that quotes a command's own error carries whatever newlines that error had, and the
+            // count then reads one skip as two. Folded here, at the writer, so the contract holds
+            // for every reason a future site passes; the terminal copy above keeps its shape.
+            let line = format!("{}\n", reason.replace(['\n', '\r'], " "));
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 let _ = f.write_all(line.as_bytes());
             }
