@@ -107,13 +107,16 @@ profiles (`sbx app import <file>`); see [`examples/README.md`](examples/README.m
 mise run fmt     # cargo fmt --check
 mise run lint    # cargo clippy --all-targets -- -D warnings
 mise run rustdoc # cargo doc with -D warnings (a doc reference that resolves to nothing)
-mise run test    # cargo test (the heavy sandbox e2e skip without userns/nix/network)
+mise run test    # cargo test --no-fail-fast (the heavy sandbox e2e skip without userns/nix/network)
 mise run ci      # all of the above
 ```
 
 A test whose prerequisites are absent returns early, and `cargo test` counts that as a
 pass — so `mise run test` ends by naming how many of its green tests did nothing, and
-why. On a host that is supposed to have userns, bwrap and nix, make it prove it:
+why. It runs `--no-fail-fast` for the same reason a skip is reported: without it cargo
+stops at the first target that fails and the later test binaries never run, so a red
+run says nothing about how much is red. On a host that is supposed to have userns,
+bwrap and nix, make it prove it:
 
 ```sh
 SBX_REQUIRE_CAPABLE=1 mise run test   # a missing host capability fails instead of skipping

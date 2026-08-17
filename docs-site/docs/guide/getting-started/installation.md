@@ -83,7 +83,7 @@ Common tasks are wired through mise:
 mise run fmt             # cargo fmt --check
 mise run lint            # cargo clippy --all-targets -- -D warnings
 mise run rustdoc         # cargo doc with -D warnings (catches a doc reference that resolves to nothing)
-mise run test            # cargo test (the whole suite; the sandbox e2e skip where the host cannot sandbox)
+mise run test            # cargo test --no-fail-fast (the whole suite; the sandbox e2e skip where the host cannot sandbox)
 mise run coverage        # cargo-llvm-cov coverage report (pass --html for a browsable report)
 mise run ci              # fmt + lint + rustdoc + test, as CI runs them
 ```
