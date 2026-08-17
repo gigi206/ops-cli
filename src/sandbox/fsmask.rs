@@ -614,6 +614,7 @@ mod tests {
         FsPolicy {
             deny: deny.iter().map(|s| s.to_string()).collect(),
             readonly: readonly.iter().map(|s| s.to_string()).collect(),
+            ..FsPolicy::default()
         }
     }
 

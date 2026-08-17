@@ -24,6 +24,14 @@ pub(crate) struct FsPolicy {
     pub(crate) deny: Vec<String>,
     /// Patterns the cage may read but not write.
     pub(crate) readonly: Vec<String>,
+    /// Credential shapes that close a project file by its content, checked at every open.
+    ///
+    /// Not part of [`FsPolicy::is_empty`]: that question is "are there mounts to lay down", and a
+    /// content scan lays down none. It is carried here because it belongs to the same `[fs]` table,
+    /// and for the same reason — it only ever takes access away.
+    pub(crate) scan: Vec<String>,
+    /// How much of one file the content scan reads, in KiB. `None` leaves the built-in ceiling.
+    pub(crate) scan_max_kb: Option<u64>,
 }
 
 impl FsPolicy {
@@ -48,6 +56,17 @@ impl FsPolicy {
                 self.readonly.push(entry);
             }
         }
+        for entry in extra.scan {
+            if !self.scan.contains(&entry) {
+                self.scan.push(entry);
+            }
+        }
+        // The tighter ceiling wins. A layer raising it would widen what an inner one had already
+        // narrowed, and this table is only ever allowed to take access away.
+        self.scan_max_kb = match (self.scan_max_kb, extra.scan_max_kb) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (None, other) | (other, None) => other,
+        };
     }
 }
 
@@ -292,10 +311,12 @@ mod tests {
         let mut base = FsPolicy {
             deny: vec!["a".into()],
             readonly: vec!["r".into()],
+            ..FsPolicy::default()
         };
         base.union(FsPolicy {
             deny: vec!["a".into(), "b".into()],
             readonly: vec!["r2".into()],
+            ..FsPolicy::default()
         });
         assert_eq!(base.deny, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(base.readonly, vec!["r".to_string(), "r2".to_string()]);

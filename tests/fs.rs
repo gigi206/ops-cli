@@ -284,3 +284,58 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
          the control socket — a detached session has no inline feed). Last output:\n{last}"
     );
 }
+
+#[test]
+fn fs_scan_closes_a_matching_file_inside_a_real_cage() {
+    // The one property the whole content lens rests on: the supervisor lives **outside** the cage's
+    // mount namespace, so every path a notified open names has to be resolved through the target's
+    // own `/proc` links. The unit tests fix the shape of that path; only a real cage proves it
+    // resolves. Teeth: if the resolution were wrong, every open would fail to resolve and be allowed,
+    // so the secret would come back in stdout and this test fails rather than silently passing.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    if !host_can_sandbox(project.path(), data.path()) {
+        skip_incapable!("skipping `[fs] scan` cage e2e: host cannot sandbox");
+        return;
+    }
+
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[fs]\nscan = [\"sk-[A-Za-z0-9]{12,}\"]\n",
+    )
+    .expect("write the project config");
+    std::fs::write(
+        project.path().join("carries.txt"),
+        "API key: sk-ABC123DEF456GHI789\n",
+    )
+    .expect("write the matching fixture");
+    std::fs::write(project.path().join("ordinary.txt"), "no credential here\n")
+        .expect("write the clean fixture");
+
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", "cat carries.txt; cat ordinary.txt"])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stdout.contains("sk-ABC123DEF456GHI789"),
+        "the matching file's content reached the cage, so the open was not refused across the \
+         mount namespace.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("no credential here"),
+        "the file that matches nothing must still be readable — a lens that closed everything \
+         would satisfy the assertion above without enforcing anything.\nstdout: {stdout}\nstderr: \
+         {stderr}"
+    );
+    // Why it was refused, not merely that something failed: with the path resolution broken, the
+    // read would fail for an unrelated reason and the assertion above would still pass.
+    assert!(
+        stderr.contains("its content matches") && stderr.contains("carries.txt"),
+        "the refusal must name the file and the pattern that closed it, which is what makes a real \
+         leak distinguishable from a false positive.\nstderr: {stderr}"
+    );
+}

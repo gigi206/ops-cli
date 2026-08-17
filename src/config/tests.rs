@@ -5941,12 +5941,87 @@ fn the_default_devices_grant_is_empty() {
 }
 
 /// A `RawConfig` declaring an `[fs]` table from the given deny/readonly entries.
+/// A `RawConfig` declaring an `[fs]` table carrying content-scan patterns.
+fn raw_fs_scan(scan: &[&str], scan_max_kb: Option<u64>) -> RawConfig {
+    RawConfig {
+        fs: Some(schema::RawFs {
+            rest: Default::default(),
+            scan: scan.iter().map(|s| s.to_string()).collect(),
+            scan_max_kb,
+            ..Default::default()
+        }),
+        ..RawConfig::default()
+    }
+}
+
+#[test]
+fn a_scan_pattern_that_is_not_a_regex_is_dropped_and_says_what_is_lost() {
+    let r = resolve_no_plugins(
+        raw_fs_scan(&[r"sk-[A-Za-z0-9]{20,}", "(unclosed"], None),
+        None,
+    );
+    assert_eq!(
+        r.fs.scan,
+        vec![r"sk-[A-Za-z0-9]{20,}".to_string()],
+        "the valid pattern survives its neighbour's failure"
+    );
+    let w = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("(unclosed"))
+        .unwrap_or_else(|| panic!("no warning names the broken pattern: {:?}", r.warnings));
+    assert!(
+        w.contains("no file is closed"),
+        "the warning must say what protection is lost, not merely that a line was ignored: {w}"
+    );
+}
+
+#[test]
+fn a_scan_ceiling_of_zero_is_refused_rather_than_obeyed() {
+    let r = resolve_no_plugins(raw_fs_scan(&[r"sk-[A-Za-z0-9]{20,}"], Some(0)), None);
+    assert_eq!(
+        r.fs.scan_max_kb, None,
+        "a ceiling of zero must fall back to the built-in one: obeying it would read nothing and \
+         call every file clean while `config show` still listed a scan"
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("scan_max_kb = 0")),
+        "the refusal must be visible: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn scan_patterns_union_across_layers_and_the_tighter_ceiling_wins() {
+    let mut base = super::fspolicy::FsPolicy {
+        scan: vec!["a".into()],
+        scan_max_kb: Some(512),
+        ..Default::default()
+    };
+    base.union(super::fspolicy::FsPolicy {
+        scan: vec!["a".into(), "b".into()],
+        scan_max_kb: Some(64),
+        ..Default::default()
+    });
+    assert_eq!(
+        base.scan,
+        vec!["a".to_string(), "b".to_string()],
+        "a layer adds shapes and never removes one below it"
+    );
+    assert_eq!(
+        base.scan_max_kb,
+        Some(64),
+        "the tighter ceiling wins: a layer raising it would widen what an inner one narrowed"
+    );
+}
+
 fn raw_fs(deny: &[&str], readonly: &[&str]) -> RawConfig {
     RawConfig {
         fs: Some(schema::RawFs {
             rest: Default::default(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
             readonly: readonly.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }),
         ..RawConfig::default()
     }
@@ -6031,6 +6106,7 @@ fn an_apps_fs_masks_union_onto_the_baseline() {
                 rest: Default::default(),
                 deny: vec!["app-only.key".into()],
                 readonly: vec![],
+                ..Default::default()
             }),
             ..raw_app(&["demo-app"], &[], &[], &[], None)
         },

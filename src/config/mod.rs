@@ -2612,6 +2612,25 @@ fn apply_fs(warnings: &mut Vec<String>, source: &str, raw: Option<schema::RawFs>
             }
         }
     }
+    for entry in raw.scan {
+        match crate::open_policy::validate_pattern(&entry) {
+            Ok(()) if policy.scan.contains(&entry) => {}
+            Ok(()) => policy.scan.push(entry),
+            Err(reason) => warnings.push(format!(
+                "{source}: ignoring `[fs] scan` pattern `{entry}` ({reason}) — no file is closed \
+                 for carrying that shape"
+            )),
+        }
+    }
+    // Zero would read nothing and call every file clean, which is worse than not scanning at all
+    // because `config show` would still list a scan.
+    match raw.scan_max_kb {
+        Some(0) => warnings.push(format!(
+            "{source}: ignoring `[fs] scan_max_kb = 0` — a scan that reads nothing would pass every \
+             file; leave it unset for the built-in ceiling"
+        )),
+        other => policy.scan_max_kb = other,
+    }
     policy
 }
 

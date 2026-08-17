@@ -551,6 +551,21 @@ pub(crate) struct RawFs {
     /// Project paths the cage may read but not write, in an otherwise writable tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) readonly: Vec<String>,
+    /// Credential shapes, as regular expressions, that close a project file **by its content**.
+    ///
+    /// Where `deny` names a path decided once at launch, these are matched against the bytes of
+    /// every project file the cage opens, at the moment it opens it — so a file that acquires a
+    /// secret mid-session is closed too. A file whose content matches is refused with `EACCES`
+    /// before any byte reaches the cage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) scan: Vec<String>,
+    /// How much of one file the content scan reads, in KiB. Unset leaves the built-in ceiling.
+    ///
+    /// The scan is bounded so that opening a large artefact costs a bounded read; a file longer than
+    /// this is judged on its start, and the launch says so rather than presenting a prefix as a
+    /// whole-file result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scan_max_kb: Option<u64>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,

@@ -4456,7 +4456,33 @@ fn build(
 
     let mut proc_enforce_guard = None;
     let mut proc_binds: Vec<binds::ExtraBind> = Vec::new();
-    if prep.cfg.proc.enforcing() {
+    // The content lens rides the same supervisor as exec enforcement — it is the same notification
+    // listener, read for a different syscall. So `[fs] scan` brings the supervisor up on its own:
+    // making it depend on `[proc]` would tie one guarantee to an unrelated one.
+    let content_lens = if prep.cfg.fs.scan.is_empty() {
+        None
+    } else {
+        let ceiling = prep
+            .cfg
+            .fs
+            .scan_max_kb
+            .and_then(|kb| usize::try_from(kb.saturating_mul(1024)).ok())
+            .unwrap_or(crate::open_policy::MAX_SCAN_DEFAULT);
+        match crate::open_policy::OpenPolicy::compile(&prep.cfg.fs.scan, ceiling) {
+            Ok(policy) => policy.map(|policy| {
+                // Canonical, because the bound is applied to paths the kernel has resolved.
+                let root = std::fs::canonicalize(&prep.cwd).unwrap_or_else(|_| prep.cwd.clone());
+                (policy, root)
+            }),
+            Err(e) => {
+                // Refused rather than dropped: a launch that ran with a scan it could not build
+                // would report a protection it does not have.
+                eprintln!("sbx: cannot build the `[fs] scan` content scanner: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    };
+    if prep.cfg.proc.enforcing() || content_lens.is_some() {
         // The shim is sbx's own embedded binary, laid down under the data directory. Refusing when
         // it cannot be placed is the point: the alternative would be binding some other executable
         // into the cage, which is the exposure the dedicated shim exists to remove.
@@ -4464,19 +4490,31 @@ fn build(
             eprintln!("sbx: cannot place the exec-enforcement shim: {e}");
             ExitCode::FAILURE
         })?;
+        // With `[proc]` off, the exec side is a denylist with nothing on it: every `execve` is
+        // notified and allowed, which is what the shim's filter produces anyway. The lens is what
+        // this launch asked for.
+        let exec_policy = if prep.cfg.proc.enforcing() {
+            prep.cfg.proc.clone()
+        } else {
+            crate::proc_policy::ProcPolicy::new(crate::proc_policy::ProcMode::Enforce, &[], &[])
+        };
         let (guard, wiring) = super::proc_enforce::start(
             prep.layout.data_dir(),
             &shim_bin,
-            prep.cfg.proc.clone(),
+            exec_policy,
+            content_lens,
             Arc::clone(&notify_wiring.notifier),
         )
         .map_err(|e| {
             eprintln!("sbx: cannot start exec enforcement: {e}");
             ExitCode::FAILURE
         })?;
+        // The flag rides in the closure so the filter the cage installs matches the lens the
+        // supervisor was started with — the two are decided once, together.
+        let open_lens = wiring.open_lens;
         wraps.push((
             WrapLayer::ProcEnforce,
-            Box::new(super::proc_enforce::wrap_command),
+            Box::new(move |cmd| super::proc_enforce::wrap_command(cmd, open_lens)),
         ));
         proc_binds = wiring.binds;
         proc_enforce_guard = Some(guard);

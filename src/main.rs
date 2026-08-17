@@ -23,6 +23,7 @@ mod docs_coverage;
 mod help;
 mod notify;
 mod observe;
+mod open_policy;
 mod pathfind;
 mod paths;
 mod plugins;

@@ -120,6 +120,57 @@ faster than one-for-one with the count: 100 masks cost about 32 ms, 500 about 38
 entry naming a directory closes it whatever it contains, at constant cost. Past 64 masks
 `sbx` says so; past 256 it refuses the launch rather than quietly dropping the tail.
 
+## `scan`: closing a file by what it holds
+
+`deny` needs you to know the path. `scan` does not: it names the **shapes a credential takes**,
+and every project file the cage opens is checked against them at the moment it is opened.
+
+```toml
+[fs]
+scan = [
+  "sk-[A-Za-z0-9]{20,}",
+  "AKIA[0-9A-Z]{16}",
+  "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+]
+scan_max_kb = 256
+```
+
+A file whose content matches is refused with `EACCES`, and the refusal happens **before the
+open returns**, so not one byte of it reaches the cage. The launch says which pattern closed
+which file, so a refusal can be told apart from a broken build.
+
+The difference from `deny` is *when* the question is asked. A mask is resolved once, at launch;
+`scan` is asked at every open, so a file that acquires a secret in the middle of a session is
+closed from the next open onwards, with no relaunch. This is what closes the second hole listed
+below, for content it recognises.
+
+Because the check happens at the open rather than at the read, it also covers a file the cage
+maps into memory: there is no descriptor to map without an open, and the open is what was
+refused. A symbolic link is followed the way the kernel is about to follow it, so pointing a
+link at a closed file does not reopen it.
+
+**Bounded on purpose.** Only files under the project are scanned: the read-only store, the
+system libraries and `/proc` are where the volume is and where your secrets are not.
+`scan_max_kb` bounds how much of one file is read, and a file longer than that is judged on its
+start. The launch says so when it happens, rather than presenting a prefix as a whole-file
+result. Leave it unset for the built-in ceiling; `0` is refused, since a scan that reads nothing
+would pass everything while still looking like a scan.
+
+**What it costs you.** Every open of a project file goes through the supervisor, so a build is
+slower than it is without a scan. `scan` also brings that supervisor up on its own, without
+`[proc]`, because it is the same notification listener read for a different syscall.
+
+**What it does not do.** A pattern only finds the shapes you wrote: a password that looks like
+ordinary prose is not one of them, and a scan is a backstop rather than a proof. Rewriting a file
+that currently holds a matching secret is refused too, because a truncating write opens it first;
+the file has to be closed to the cage or the pattern narrowed. And a file already open when its
+content changes keeps the descriptor it was granted.
+
+One shape to know about if your project tree spans a network or FUSE mount: the scan reads the
+file on the host side, and that read is bounded in size but not in time. A backing store that
+stalls holds up the open being decided, and the others queued behind it. A project on local disk
+is not affected.
+
 ## What it does not cover
 
 `[fs] deny` is **a reduction of exposure**, not a boundary of the same class as

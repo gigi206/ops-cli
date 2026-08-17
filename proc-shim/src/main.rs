@@ -24,7 +24,11 @@
 //!
 //! ## Usage
 //!
-//! `sbx-proc-shim <notif-socket> -- <command…>`
+//! `sbx-proc-shim <notif-socket> [open-lens] -- <command…>`
+//!
+//! `open-lens` additionally notifies on the open family, which is what lets the host supervisor read
+//! a file's content and refuse the open before any byte reaches the cage. It is opt-in: the traffic
+//! is orders of magnitude heavier than `execve`'s.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
@@ -57,14 +61,29 @@ fn fail(message: &str, code: i32) -> ! {
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    // args = [<notif-socket>, "--", payload0, payload1, …]
+    // args = [<notif-socket>, <flag…>, "--", payload0, payload1, …]
     let sep = args.iter().position(|a| a == "--");
-    let (sock, payload) = match sep {
-        Some(i) if i >= 1 && i + 1 < args.len() => (&args[0], &args[i + 1..]),
-        _ => fail("usage: sbx-proc-shim <notif-socket> -- <command…>", exit::USAGE),
+    let (sock, flags, payload) = match sep {
+        Some(i) if i >= 1 && i + 1 < args.len() => (&args[0], &args[1..i], &args[i + 1..]),
+        _ => fail(
+            "usage: sbx-proc-shim <notif-socket> [open-lens] -- <command…>",
+            exit::USAGE,
+        ),
     };
+    // An unknown flag is refused rather than ignored: a lens the launcher asked for and the shim
+    // silently dropped would leave the cage running unenforced under a name that says otherwise.
+    let mut open_lens = false;
+    for flag in flags {
+        match flag.as_os_str().to_str() {
+            Some(OPEN_LENS_FLAG) => open_lens = true,
+            _ => fail(
+                &format!("unknown flag {flag:?} — refusing to run"),
+                exit::USAGE,
+            ),
+        }
+    }
 
-    let notif_fd = match install_notif_filter() {
+    let notif_fd = match install_notif_filter(open_lens) {
         Ok(fd) => fd,
         Err(e) => fail(
             &format!("cannot install the exec filter ({e}) — refusing to run"),
@@ -87,55 +106,81 @@ fn main() {
     exec_payload(payload)
 }
 
-/// Install a `NEW_LISTENER` seccomp filter that notifies on `execve`/`execveat` and allows everything
-/// else, returning the listener fd. Requires `no_new_privs` (bubblewrap already sets it; set again to
-/// be self-contained).
-fn install_notif_filter() -> io::Result<libc::c_int> {
+/// The flag asking for the open lens, spelled the same in the launcher and here.
+const OPEN_LENS_FLAG: &str = "open-lens";
+
+/// The open-family syscalls the content lens notifies on.
+///
+/// `open` is listed beside `openat`/`openat2` because x86-64 still carries it: glibc routes through
+/// `openat`, but a static binary or a direct `syscall(2)` can issue the older number, and a lens
+/// that watched only `openat` would be a one-line walk around.
+///
+/// A syscall absent from the target's ABI is simply not in this list — `open` does not exist on
+/// aarch64, where `openat` is the only form.
+fn open_lens_syscalls() -> Vec<libc::c_long> {
+    let mut out = Vec::with_capacity(3);
+    #[cfg(target_arch = "x86_64")]
+    out.push(libc::SYS_open);
+    out.push(libc::SYS_openat);
+    out.push(libc::SYS_openat2);
+    out
+}
+
+/// Install a `NEW_LISTENER` seccomp filter that notifies on `execve`/`execveat` — and, when
+/// `open_lens` is set, on the open family too — and allows everything else, returning the listener
+/// fd. Requires `no_new_privs` (bubblewrap already sets it; set again to be self-contained).
+///
+/// The open family is opt-in because it is not the same kind of traffic: `execve` fires rarely,
+/// while a build issues thousands of opens, each of which would park a cage thread on the
+/// supervisor. A launch that does not scan content must not pay a notification per open.
+fn install_notif_filter(open_lens: bool) -> io::Result<libc::c_int> {
     // SAFETY: prctl with scalar args; no memory is shared.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // A 5-instruction cBPF program. Opcodes (asm-generic/bpf_common.h): LD|W|ABS = 0x20, JMP|JEQ|K =
-    // 0x15, RET|K = 0x06. `nr` is the first field of `seccomp_data`, at offset 0.
+    // Opcodes (asm-generic/bpf_common.h): LD|W|ABS = 0x20, JMP|JEQ|K = 0x15, RET|K = 0x06. `nr` is
+    // the first field of `seccomp_data`, at offset 0.
     const LD_ABS_W: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
     const RET_K: u16 = 0x06;
-    let filter = [
-        libc::sock_filter {
-            code: LD_ABS_W,
-            jt: 0,
-            jf: 0,
-            k: 0,
-        },
-        // if nr == execve   -> +2 (to the USER_NOTIF return)
-        libc::sock_filter {
+
+    let mut notified: Vec<libc::c_long> = vec![libc::SYS_execve, libc::SYS_execveat];
+    if open_lens {
+        notified.extend(open_lens_syscalls());
+    }
+
+    // `n` comparisons then two returns: every match jumps to the last instruction (`USER_NOTIF`),
+    // and falling off the end of the comparisons reaches the `ALLOW` just before it. Comparison `i`
+    // (1-based) therefore jumps `n + 1 - i` forward, which is the arithmetic the two-syscall filter
+    // this generalises was written out by hand.
+    let n = notified.len();
+    let mut filter = Vec::with_capacity(n + 3);
+    filter.push(libc::sock_filter {
+        code: LD_ABS_W,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    });
+    for (idx, nr) in notified.iter().enumerate() {
+        filter.push(libc::sock_filter {
             code: JEQ_K,
-            jt: 2,
+            jt: (n - idx) as u8,
             jf: 0,
-            k: libc::SYS_execve as u32,
-        },
-        // if nr == execveat -> +1
-        libc::sock_filter {
-            code: JEQ_K,
-            jt: 1,
-            jf: 0,
-            k: libc::SYS_execveat as u32,
-        },
-        // else allow
-        libc::sock_filter {
-            code: RET_K,
-            jt: 0,
-            jf: 0,
-            k: libc::SECCOMP_RET_ALLOW,
-        },
-        // execve/execveat -> notify the supervisor
-        libc::sock_filter {
-            code: RET_K,
-            jt: 0,
-            jf: 0,
-            k: libc::SECCOMP_RET_USER_NOTIF,
-        },
-    ];
+            k: *nr as u32,
+        });
+    }
+    filter.push(libc::sock_filter {
+        code: RET_K,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_ALLOW,
+    });
+    filter.push(libc::sock_filter {
+        code: RET_K,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_USER_NOTIF,
+    });
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,

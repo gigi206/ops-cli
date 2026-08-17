@@ -716,6 +716,7 @@ impl TaskEngine {
                     self.layout.data_dir(),
                     &shim,
                     policy,
+                    None,
                     invocation,
                     self.notify
                         .as_ref()
@@ -723,7 +724,7 @@ impl TaskEngine {
                         .unwrap_or_else(|| Arc::new(super::notify_sink::Notifier::disabled())),
                 )
                 .map_err(TaskError::Io)?;
-                argv = super::proc_enforce::wrap_command(argv);
+                argv = super::proc_enforce::wrap_command(argv, wiring.open_lens);
                 proc_binds = wiring.binds;
                 Some(guard)
             }

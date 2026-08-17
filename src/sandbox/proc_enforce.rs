@@ -205,6 +205,11 @@ impl ProcOverlay {
 /// notification handoff socket (writable — the shim `connect`s to it).
 pub(crate) struct Wiring {
     pub(crate) binds: Vec<ExtraBind>,
+    /// Whether the shim must additionally notify on the open family.
+    ///
+    /// Carried here rather than re-derived at the call site so that the filter the cage installs and
+    /// the lens the supervisor runs can never disagree: one launch, one answer.
+    pub(crate) open_lens: bool,
 }
 
 /// The host-side enforcement resource: the bound handoff socket, the supervisor thread, and the proc
@@ -288,9 +293,10 @@ pub(crate) fn start(
     data_dir: &Path,
     shim_bin: &Path,
     policy: ProcPolicy,
+    open: Option<(crate::open_policy::OpenPolicy, PathBuf)>,
     notifier: Arc<crate::sandbox::notify_sink::Notifier>,
 ) -> io::Result<(ProcEnforce, Wiring)> {
-    start_inner(data_dir, shim_bin, policy, "", true, notifier)
+    start_inner(data_dir, shim_bin, policy, open, "", true, notifier)
 }
 
 /// The same supervisor for **one task invocation**, which differs from a session's in two ways.
@@ -307,6 +313,7 @@ pub(crate) fn start_for_task(
     data_dir: &Path,
     shim_bin: &Path,
     policy: ProcPolicy,
+    open: Option<(crate::open_policy::OpenPolicy, PathBuf)>,
     invocation: u64,
     notifier: Arc<crate::sandbox::notify_sink::Notifier>,
 ) -> io::Result<(ProcEnforce, Wiring)> {
@@ -314,6 +321,7 @@ pub(crate) fn start_for_task(
         data_dir,
         shim_bin,
         policy,
+        open,
         &format!(".t{invocation}"),
         false,
         notifier,
@@ -324,6 +332,7 @@ fn start_inner(
     data_dir: &Path,
     shim_bin: &Path,
     policy: ProcPolicy,
+    open: Option<(crate::open_policy::OpenPolicy, PathBuf)>,
     instance: &str,
     control: bool,
     notifier: Arc<crate::sandbox::notify_sink::Notifier>,
@@ -373,9 +382,20 @@ fn start_inner(
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let kept = ring.clone();
+    let lens = open.map(|(policy, root)| OpenLens::new(policy, root));
+    let lens_armed = lens.is_some();
     let handle = std::thread::spawn(move || {
         supervise(
-            listener, &flag, &policy, &overlay, &ring, &pending, &notifier,
+            listener,
+            &flag,
+            &Deciding {
+                policy: &policy,
+                overlay: &overlay,
+                ring: &ring,
+                pending: &pending,
+                notifier: &notifier,
+                open: lens.as_ref(),
+            },
         );
     });
 
@@ -399,17 +419,27 @@ fn start_inner(
             control_socket,
             ring: kept,
         },
-        Wiring { binds },
+        Wiring {
+            binds,
+            open_lens: lens_armed,
+        },
     ))
 }
 
 /// Prepend the shim invocation to a command, so it runs under the exec filter. This is applied
 /// **innermost** (before the provisioning/egress wraps), so only the real command and its children are
 /// filtered, not the launch's own plumbing. All values are positional — no shell, no injection.
-pub(crate) fn wrap_command(cmd: Vec<OsString>) -> Vec<OsString> {
-    let mut out = Vec::with_capacity(cmd.len() + 4);
+/// The flag that asks the shim for the open lens. Spelled once here and matched literally by
+/// `proc-shim`, which refuses an unknown flag rather than running unenforced under one.
+const OPEN_LENS_FLAG: &str = "open-lens";
+
+pub(crate) fn wrap_command(cmd: Vec<OsString>, open_lens: bool) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(cmd.len() + 5);
     out.push(OsString::from(SHIM_CAGE_PATH));
     out.push(OsString::from(NOTIF_SOCK_CAGE_PATH));
+    if open_lens {
+        out.push(OsString::from(OPEN_LENS_FLAG));
+    }
     out.push(OsString::from("--"));
     out.extend(cmd);
     out
@@ -418,21 +448,25 @@ pub(crate) fn wrap_command(cmd: Vec<OsString>) -> Vec<OsString> {
 /// The supervisor thread: wait (with a stop-checking poll) for the shim's one connection, receive the
 /// listener fd, close the listening socket (no second connection is accepted), then run the receive
 /// loop until the cage's filter is gone.
-fn supervise(
-    listener: UnixListener,
-    stop: &AtomicBool,
-    policy: &ProcPolicy,
-    overlay: &ProcOverlay,
-    ring: &ExecRing,
-    pending: &PendingExec,
-    notifier: &crate::sandbox::notify_sink::Notifier,
-) {
+/// What one supervisor needs to decide a notification, carried together because every step of the
+/// receive path needs the same set.
+struct Deciding<'a> {
+    policy: &'a ProcPolicy,
+    overlay: &'a ProcOverlay,
+    ring: &'a ExecRing,
+    pending: &'a PendingExec,
+    notifier: &'a crate::sandbox::notify_sink::Notifier,
+    /// The content lens, when this launch asked for one.
+    open: Option<&'a OpenLens>,
+}
+
+fn supervise(listener: UnixListener, stop: &AtomicBool, cx: &Deciding<'_>) {
     let notif_fd = match accept_handoff(&listener, stop) {
         Some(fd) => fd,
         None => return, // stopped before the shim connected, or the handoff failed
     };
     drop(listener); // one handoff only; the agent cannot connect a second fd
-    recv_loop(notif_fd, stop, policy, overlay, ring, pending, notifier);
+    recv_loop(notif_fd, stop, cx);
     // SAFETY: notif_fd is our owned descriptor from recv_fd; closed exactly once here.
     unsafe { libc::close(notif_fd) };
 }
@@ -458,20 +492,12 @@ fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_
 /// with `EPERM`, an `allow`/continue, an `ask`-undecided by parking it in `pending` for the control
 /// plane (never blocking here — the single notification fd must keep draining). Ends when the cage's
 /// filter is gone (the fd hangs up) or on stop.
-fn recv_loop(
-    notif_fd: libc::c_int,
-    stop: &AtomicBool,
-    policy: &ProcPolicy,
-    overlay: &ProcOverlay,
-    ring: &ExecRing,
-    pending: &PendingExec,
-    notifier: &crate::sandbox::notify_sink::Notifier,
-) {
+fn recv_loop(notif_fd: libc::c_int, stop: &AtomicBool, cx: &Deciding<'_>) {
     while !stop.load(Ordering::Relaxed) {
         if !poll_readable(notif_fd, 250) {
             // Idle tick: release any parked `execve` that has waited past the decision timeout, so a
             // stalled decision never hangs a process tree.
-            pending.sweep();
+            cx.pending.sweep();
             continue;
         }
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
@@ -486,38 +512,69 @@ fn recv_loop(
             }
             return; // ENOENT / hang-up: the cage's filter is gone
         }
-        handle_notif(notif_fd, &req, policy, overlay, ring, pending, notifier);
+        handle_notif(notif_fd, &req, cx);
     }
 }
 
 /// Decide one notified `execve` and answer it. The path is read from the parked target's memory; an
 /// unreadable path (an anomaly under the ancestor invariant) is treated as unmatched — never a
 /// silent deny that could brick the whole cage, and never a silent allow of a named `deny`.
-fn handle_notif(
-    notif_fd: libc::c_int,
-    req: &libc::seccomp_notif,
-    policy: &ProcPolicy,
-    overlay: &ProcOverlay,
-    ring: &ExecRing,
-    pending: &PendingExec,
-    notifier: &crate::sandbox::notify_sink::Notifier,
-) {
+fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<'_>) {
     // Confirm the notification is still live before reading the target's memory (a reaped-and-reused
     // pid would otherwise be read/acted on as the wrong process).
     if !notif_id_valid(notif_fd, req.id) {
         return;
     }
+    // The open family is decided by *content* and answered here, never falling through to the exec
+    // policy below — which reads a different argument and would judge an open against exec rules.
+    // Checked on the syscall number rather than on the lens being present, so a notification the
+    // filter should not have produced is still answered as an open.
+    if let Some((dirfd, path_addr)) = open_args(req.data.nr, &req.data.args) {
+        let outcome = match cx.open {
+            Some(lens) => match read_exec_path(req.pid, path_addr) {
+                // An unreadable path is allowed, like an unreadable exec target: the lens takes away
+                // what it can prove, and a cage whose undecidable opens all failed would not run.
+                Some(path) if !path.is_empty() => open_is_refused(lens, req.pid, dirfd, &path),
+                _ => OpenOutcome::ALLOWED,
+            },
+            None => OpenOutcome::ALLOWED,
+        };
+        if let Some(report) = &outcome.report {
+            if report.partial {
+                crate::diag::warn(&format!(
+                    "`{}` is longer than the {} bytes the content scan reads, so it is open to the \
+                     cage on the strength of its start alone — anything past that was not examined",
+                    report.path,
+                    policy_scan_ceiling(cx.open)
+                ));
+            } else {
+                // Named rather than merely counted: a refusal a person cannot attribute to a pattern
+                // is one they will turn the lens off to escape.
+                let shapes = report.shapes.join("`, `");
+                crate::diag::warn(&format!(
+                    "closed `{}` to the cage: its content matches `{shapes}`",
+                    report.path
+                ));
+            }
+        }
+        if outcome.refused {
+            respond_errno(notif_fd, req.id, libc::EACCES);
+        } else {
+            respond_continue(notif_fd, req.id);
+        }
+        return;
+    }
     let path = read_exec_path(req.pid, req.data.args[0]).unwrap_or_default();
-    let caller = caller_chain(policy, req.pid);
+    let caller = caller_chain(cx.policy, req.pid);
     let verdict = if path.is_empty() {
         // Could not read the path: fall back to the mode's unmatched default rather than guessing a
         // name match — allow under a denylist, park under ask, refuse under an allowlist (where an
         // undecidable target is exactly the one that must not run).
-        policy.unmatched()
+        cx.policy.unmatched()
     } else {
         // Decide against the config policy folded with the live `--session` overlay (deny wins across
         // both). The overlay read-lock is held only for this decision.
-        overlay.decide(policy, &caller, &path)
+        cx.overlay.decide(cx.policy, &caller, &path)
     };
     let shown = if path.is_empty() {
         "<unreadable>"
@@ -527,7 +584,7 @@ fn handle_notif(
     let by = caller.last().map(String::as_str).unwrap_or_default();
     match verdict {
         Verdict::Allow => {
-            ring.push_verdict(req.pid, by, shown, "allow");
+            cx.ring.push_verdict(req.pid, by, shown, "allow");
             respond_continue(notif_fd, req.id);
         }
         Verdict::Deny => {
@@ -542,14 +599,14 @@ fn handle_notif(
             } else {
                 "deny"
             };
-            ring.push_verdict(req.pid, by, shown, recorded);
+            cx.ring.push_verdict(req.pid, by, shown, recorded);
             // Announce only a refusal of something that was **there**. A `PATH` walk refuses one
             // candidate per directory it passes through, and announcing those would raise a handful
             // of notifications every time a program is simply found somewhere other than the first
             // entry — while the run succeeded and nothing was kept from it. Same rule the refusal
             // report applies, for the same reason.
             if recorded == "deny" {
-                notifier.block(crate::notify::Block {
+                cx.notifier.block(crate::notify::Block {
                     event: crate::notify::NotifyEvent::Proc,
                     subject: shown.to_string(),
                     reason: "denied-by-policy".to_string(),
@@ -569,8 +626,8 @@ fn handle_notif(
         Verdict::Ask => {
             // Park it: register the kernel notification id so the control plane can answer it later.
             // The receive loop does not block — it returns to draining the next notification.
-            ring.push_verdict(req.pid, by, shown, "ask");
-            pending.park(notif_fd, req.id, req.pid, shown);
+            cx.ring.push_verdict(req.pid, by, shown, "ask");
+            cx.pending.park(notif_fd, req.id, req.pid, shown);
         }
     }
 }
@@ -795,6 +852,286 @@ fn read_exec_path(pid: u32, addr: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
+/// Where a notified open keeps its directory descriptor and its path pointer, by syscall number.
+///
+/// The three forms do not agree on argument order: `open(path, …)` has no descriptor at all and is
+/// implicitly relative to the working directory, while `openat(dirfd, path, …)` and
+/// `openat2(dirfd, path, …)` lead with one. Reading the path from the wrong register would scan an
+/// unrelated address, so the mapping is explicit and unit-tested rather than inferred at the call
+/// site.
+///
+/// `None` for any other syscall: the same receive loop also carries `execve`, which is decided
+/// elsewhere.
+fn open_args(nr: libc::c_int, args: &[u64; 6]) -> Option<(libc::c_int, u64)> {
+    #[cfg(target_arch = "x86_64")]
+    if nr as libc::c_long == libc::SYS_open {
+        return Some((libc::AT_FDCWD, args[0]));
+    }
+    if nr as libc::c_long == libc::SYS_openat || nr as libc::c_long == libc::SYS_openat2 {
+        return Some((args[0] as libc::c_int, args[1]));
+    }
+    None
+}
+
+/// One file's identity for the scan cache: the same bytes under a different name are the same
+/// answer, and a rewrite changes at least one of these fields.
+///
+/// `mtime` alone would miss a write that lands inside the same timestamp granularity, so size and
+/// inode ride along. This is a cache key, not a boundary: a rewrite that preserved all four would
+/// serve a stale verdict, which is the same window a scan-at-open filesystem has and is why the lens
+/// is a backstop rather than a proof.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileId {
+    fn of(meta: &std::fs::Metadata) -> FileId {
+        use std::os::unix::fs::MetadataExt;
+        FileId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+}
+
+/// How many distinct files the scan cache remembers within one launch.
+///
+/// A build reopens the same headers and sources over and over, which is what the cache exists for.
+/// The ceiling bounds the supervisor's own memory; past it the map is cleared rather than evicted
+/// one by one, because the cost of a miss is one bounded scan and the cost of tracking recency on
+/// every open is paid whether or not it ever helps.
+const SCAN_CACHE_MAX: usize = 8192;
+
+/// The per-launch memory of what the content scan already decided.
+#[derive(Default)]
+struct ScanCache {
+    seen: Mutex<BTreeMap<FileId, bool>>,
+}
+
+impl ScanCache {
+    /// The remembered verdict for `id`, if this launch already scanned that exact content.
+    fn get(&self, id: &FileId) -> Option<bool> {
+        self.seen.lock().ok()?.get(id).copied()
+    }
+
+    /// Remember `refused` for `id`.
+    fn put(&self, id: FileId, refused: bool) {
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        if seen.len() >= SCAN_CACHE_MAX {
+            seen.clear();
+        }
+        seen.insert(id, refused);
+    }
+}
+
+/// The scan ceiling of the lens in force, for a message that has to say how far it looked.
+fn policy_scan_ceiling(open: Option<&OpenLens>) -> usize {
+    open.map(|l| l.policy.max_scan()).unwrap_or(0)
+}
+
+/// The content lens a launch runs with: the compiled patterns, and what this launch already decided.
+///
+/// Held together because neither is useful alone — and because the cache is per launch, so two
+/// sessions never share a verdict formed against another's patterns.
+pub(crate) struct OpenLens {
+    policy: crate::open_policy::OpenPolicy,
+    cache: ScanCache,
+    /// The project root, on the host, outside which nothing is scanned.
+    ///
+    /// The lens exists for the credentials that sit in the tree an agent works in. Everything else a
+    /// cage opens — the read-only store, `/usr/lib`, `/proc` — is content the user did not write and
+    /// cannot leave a secret in, and it is also where the volume is: a build's opens are mostly
+    /// there. Bounding the scan by the project is what keeps the cost proportional to the risk.
+    ///
+    /// The bound is applied to the path the **kernel resolved**, never to the one the cage wrote, so
+    /// a symlink pointing out of the tree cannot smuggle a scan-worthy file past it — nor one
+    /// pointing in be scanned twice under two names.
+    root: PathBuf,
+}
+
+impl OpenLens {
+    pub(crate) fn new(policy: crate::open_policy::OpenPolicy, root: PathBuf) -> OpenLens {
+        OpenLens {
+            policy,
+            cache: ScanCache::default(),
+            root,
+        }
+    }
+}
+
+/// Decide one notified open: does the file it names carry a configured shape?
+///
+/// Returns `true` when the open must be refused. The supervisor reads the bytes **outside** the
+/// cage, so the answer is formed before the cage holds a descriptor — and because the refusal is an
+/// errno rather than an approval, it is not exposed to the re-pointing race that makes an *allow*
+/// racy (module header).
+///
+/// Anything the supervisor cannot read — a path it cannot resolve, a directory, a device, a file it
+/// has no permission on — is **allowed**. The lens closes what it can prove carries a secret; it is
+/// not an allowlist, and a launch whose every unreadable open failed would not survive its first
+/// `/proc` read.
+fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) -> OpenOutcome {
+    let (policy, cache) = (&lens.policy, &lens.cache);
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+    let target = open_target_path(pid, dirfd, path);
+    let Ok(cpath) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
+        return OpenOutcome::ALLOWED;
+    };
+    // Opened `O_PATH` first, which never blocks whatever sits at the path. Opening for reading
+    // straight away would hang on a FIFO with no writer — and this is the one thread every other
+    // open in the cage is queued behind, so that hang would be the whole cage's.
+    //
+    // Deliberately **without** `O_NOFOLLOW`: the kernel is about to follow the cage's symlinks, and
+    // a scan that stopped at the link would be walked around with one `ln -s`.
+    // SAFETY: cpath is a live NUL-terminated path for the duration of the call.
+    let probe = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if probe < 0 {
+        return OpenOutcome::ALLOWED;
+    }
+    // SAFETY: probe is a fresh owned descriptor; the File takes sole ownership and closes it.
+    let probe = unsafe { std::fs::File::from_raw_fd(probe) };
+    use std::os::unix::io::AsRawFd;
+    // What the kernel actually resolved, which is what the project bound is applied to.
+    let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
+        return OpenOutcome::ALLOWED;
+    };
+    if !resolved.starts_with(&lens.root) {
+        return OpenOutcome::ALLOWED;
+    }
+    let Ok(meta) = probe.metadata() else {
+        return OpenOutcome::ALLOWED;
+    };
+    if !meta.is_file() {
+        // A directory, a FIFO, a socket or a device carries no content this policy is written
+        // about, and reading one could block indefinitely.
+        return OpenOutcome::ALLOWED;
+    }
+    let id = FileId::of(&meta);
+    if let Some(remembered) = cache.get(&id) {
+        // Already decided this launch: the same answer without reopening, reading or naming — which
+        // is the whole point of the cache, and why it is consulted before the read is set up. A
+        // repeat refusal is silent on purpose: a build reopening one denied file would otherwise
+        // fill the diagnostics with the same line.
+        return OpenOutcome {
+            refused: remembered,
+            report: None,
+        };
+    }
+    // Re-opened for reading through the descriptor already resolved, so the bytes scanned belong to
+    // the file just inspected rather than to whatever the path names a moment later.
+    let Ok(mut file) = std::fs::File::open(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
+        return OpenOutcome::ALLOWED;
+    };
+    // Bounded in *size*, not in time. `S_ISREG` is true of a file on a FUSE mount, an NFS path or
+    // any other backing store that can stall, and this read is on the one thread every other open in
+    // the cage is queued behind — the same failure shape the `O_PATH` probe closes for a FIFO, left
+    // open here because bounding it needs a reader that can be abandoned rather than a ceiling.
+    let mut buf = Vec::with_capacity(policy.max_scan().min(meta.len() as usize + 1));
+    if file
+        .by_ref()
+        .take(policy.max_scan() as u64)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return OpenOutcome::ALLOWED;
+    }
+    let verdict = policy.verdict(&buf);
+    cache.put(id, verdict.matched);
+    if !verdict.matched {
+        // The dangerous truncation is *this* one. A file that matched is refused whatever was left
+        // unread, but a file that came back clean only because the scan stopped is a false negative,
+        // and staying silent about it would present a prefix as a whole-file result.
+        return OpenOutcome {
+            refused: false,
+            report: verdict.scanned.is_partial().then(|| OpenReport {
+                path: path.to_string(),
+                shapes: Vec::new(),
+                partial: true,
+            }),
+        };
+    }
+    // Naming the shapes costs a second walk, paid only here — on content already refused, once per
+    // file per launch.
+    let shapes: Vec<String> = policy
+        .matched_names(&buf)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    OpenOutcome {
+        refused: true,
+        report: Some(OpenReport {
+            path: path.to_string(),
+            shapes,
+            partial: false,
+        }),
+    }
+}
+
+/// What one notified open resolved to, and whether it is worth telling anyone.
+struct OpenOutcome {
+    refused: bool,
+    /// Present only the first time this launch scanned the file, so one reopened in a loop is
+    /// reported once.
+    report: Option<OpenReport>,
+}
+
+impl OpenOutcome {
+    const ALLOWED: OpenOutcome = OpenOutcome {
+        refused: false,
+        report: None,
+    };
+}
+
+/// What one file's first scan is worth saying: either the shapes that closed it, or that the answer
+/// covers only a prefix.
+struct OpenReport {
+    path: String,
+    /// The patterns that matched. Empty when the report is about coverage rather than a refusal.
+    shapes: Vec<String>,
+    /// Whether the scan stopped before the end of the file, leaving the rest unexamined.
+    partial: bool,
+}
+
+/// The host-side path naming what a cage's `openat(dirfd, path, …)` is about to open.
+///
+/// The supervisor runs outside the cage's mount namespace, so a path the cage wrote means something
+/// else — or nothing — applied to the host root. Every form is therefore resolved through the
+/// target's own `/proc` links, which the kernel resolves in *the target's* namespace:
+///
+/// - an absolute path, through `/proc/<pid>/root`;
+/// - a relative path against `AT_FDCWD`, through `/proc/<pid>/cwd`;
+/// - a relative path against a directory descriptor, through `/proc/<pid>/fd/<dirfd>`.
+///
+/// Concatenated rather than [`PathBuf::push`]ed, because pushing an absolute path *replaces* the
+/// prefix — which would silently turn a cage path into the supervisor's own view of it.
+///
+/// Pure construction: whether the result resolves, and to what, is what the caller's `open` finds
+/// out. Like [`read_exec_path`], nothing here closes the TOCTOU window on an *allow* — the path can
+/// be re-pointed after it is read, which is why only a refusal is sound (module header).
+fn open_target_path(pid: u32, dirfd: libc::c_int, path: &str) -> PathBuf {
+    if path.starts_with('/') {
+        return PathBuf::from(format!("/proc/{pid}/root{path}"));
+    }
+    let base = if dirfd == libc::AT_FDCWD {
+        format!("/proc/{pid}/cwd")
+    } else {
+        format!("/proc/{pid}/fd/{dirfd}")
+    };
+    // A relative path is joined normally: it cannot take over the prefix.
+    PathBuf::from(base).join(path)
+}
+
 /// Poll a descriptor for readability with a millisecond timeout. `true` = readable (or hung up, so a
 /// following read observes the end), `false` = timed out. A poll error is treated as "not readable"
 /// so the caller re-checks its stop flag rather than spinning.
@@ -850,6 +1187,87 @@ fn recv_fd(stream: &UnixStream) -> io::Result<libc::c_int> {
 }
 
 #[cfg(test)]
+mod open_path_tests {
+    use super::*;
+
+    #[test]
+    fn each_open_form_is_read_from_its_own_registers() {
+        // Distinctive values so a wrong register is visible rather than plausible.
+        let args: [u64; 6] = [11, 22, 33, 44, 55, 66];
+
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            open_args(libc::SYS_open as libc::c_int, &args),
+            Some((libc::AT_FDCWD, 11)),
+            "`open(path, …)` carries no descriptor: the path is the first argument, and the form is              implicitly relative to the working directory"
+        );
+        assert_eq!(
+            open_args(libc::SYS_openat as libc::c_int, &args),
+            Some((11, 22)),
+            "`openat(dirfd, path, …)` leads with the descriptor, so the path is the second argument"
+        );
+        assert_eq!(
+            open_args(libc::SYS_openat2 as libc::c_int, &args),
+            Some((11, 22)),
+            "`openat2` agrees with `openat` on the first two arguments"
+        );
+    }
+
+    #[test]
+    fn a_syscall_that_is_not_an_open_is_left_to_the_exec_path() {
+        let args: [u64; 6] = [11, 22, 33, 44, 55, 66];
+        assert_eq!(
+            open_args(libc::SYS_execve as libc::c_int, &args),
+            None,
+            "the same receive loop carries `execve`, which must fall through to the exec policy              rather than be read as a path to scan"
+        );
+        assert_eq!(open_args(libc::SYS_read as libc::c_int, &args), None);
+    }
+
+    #[test]
+    fn an_absolute_path_is_read_through_the_targets_own_root() {
+        assert_eq!(
+            open_target_path(42, libc::AT_FDCWD, "/etc/passwd"),
+            PathBuf::from("/proc/42/root/etc/passwd"),
+            "an absolute cage path must be resolved in the cage's mount namespace, never against \
+             the supervisor's own root"
+        );
+    }
+
+    #[test]
+    fn a_relative_path_follows_the_descriptor_it_was_opened_against() {
+        assert_eq!(
+            open_target_path(42, libc::AT_FDCWD, "secrets/prod.key"),
+            PathBuf::from("/proc/42/cwd/secrets/prod.key")
+        );
+        assert_eq!(
+            open_target_path(42, 7, "prod.key"),
+            PathBuf::from("/proc/42/fd/7/prod.key"),
+            "a path opened against a directory fd is resolved through that fd, not the cwd"
+        );
+    }
+
+    // The lint fires on the very call this test exists to pin: the point is to demonstrate that
+    // `join` discards the prefix, which is why `open_target_path` concatenates instead.
+    #[allow(clippy::join_absolute_paths)]
+    #[test]
+    fn an_absolute_path_never_takes_over_the_prefix() {
+        // The trap this guards: `PathBuf::join` with an absolute argument discards everything to its
+        // left, which would hand the supervisor its *own* /etc/shadow instead of the cage's.
+        let joined = PathBuf::from("/proc/42/root").join("/etc/shadow");
+        assert_eq!(
+            joined,
+            PathBuf::from("/etc/shadow"),
+            "join really does drop the prefix — which is why the absolute arm concatenates"
+        );
+        assert_eq!(
+            open_target_path(42, libc::AT_FDCWD, "/etc/shadow"),
+            PathBuf::from("/proc/42/root/etc/shadow")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::proc_policy::ProcMode;
@@ -869,10 +1287,243 @@ mod tests {
         assert_eq!(notif_id_valid_code(), 0x4008_2102);
     }
 
+    /// Run `payload` under a supervisor whose content lens carries `patterns`, draining every
+    /// notification until the payload exits.
+    ///
+    /// Unlike the exec harness, the notification count cannot be fixed in advance: the open lens
+    /// also traps the loader's own opens, whose number belongs to the host's libc rather than to
+    /// this test. So the loop drains until the child is gone.
+    fn run_with_open_lens(
+        payload: &[&str],
+        patterns: &[&str],
+        root: &std::path::Path,
+    ) -> (Option<i32>, String) {
+        let dir = TmpDir::new();
+        let shim = materialized_shim(&dir);
+        let sock_path = dir.join("notif.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
+
+        let mut cmd = std::process::Command::new(&shim);
+        cmd.arg(&sock_path)
+            .arg(OPEN_LENS_FLAG)
+            .arg("--")
+            .args(payload)
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = spawn_shim(&mut cmd);
+
+        let (sock, _) = listener.accept().expect("the shim never connected");
+        let notif = recv_fd(&sock).expect("receive the listener fd");
+
+        let owned: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
+        let lens = OpenLens::new(
+            crate::open_policy::OpenPolicy::compile(&owned, crate::open_policy::MAX_SCAN_DEFAULT)
+                .expect("the test patterns compile")
+                .expect("a non-empty list yields a policy"),
+            // The caller's fixture directory is the "project" here: everything else the payload
+            // opens — its loader, its libc — is out of scope exactly as the store is in a real
+            // launch. Canonicalised because the bound is applied to a resolved path.
+            std::fs::canonicalize(root).expect("canonical fixture root"),
+        );
+        // Nothing is denied by exec policy here: the lens is what the test is about.
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
+        let overlay = ProcOverlay::new();
+        let ring = Arc::new(ExecRing::new(64));
+        let pending = Arc::new(PendingExec::new());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(st) = child.try_wait().expect("poll the payload") {
+                break Some(st);
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                break None;
+            }
+            if !poll_readable(notif, 50) {
+                continue;
+            }
+            let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::ioctl(notif, notif_recv_code() as libc::Ioctl, &mut req) };
+            if rc >= 0 {
+                handle_notif(
+                    notif,
+                    &req,
+                    &Deciding {
+                        policy: &policy,
+                        overlay: &overlay,
+                        ring: &ring,
+                        pending: &pending,
+                        notifier: &crate::sandbox::notify_sink::Notifier::disabled(),
+                        open: Some(&lens),
+                    },
+                );
+            }
+        };
+        // SAFETY: notif is this test's owned descriptor, closed exactly once.
+        unsafe { libc::close(notif) };
+        let out = child
+            .wait_with_output()
+            .expect("collect the payload output");
+        let code = status.and_then(|s| s.code());
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        (code, text)
+    }
+
+    #[test]
+    fn a_file_whose_content_matches_is_refused_at_the_open() {
+        let dir = TmpDir::new();
+        let secret = dir.join("carries.txt");
+        std::fs::write(&secret, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
+
+        let (code, out) = run_with_open_lens(
+            &["/bin/cat", secret.to_str().expect("utf-8 fixture path")],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+
+        assert_ne!(
+            code,
+            Some(0),
+            "reading a file whose content matches must fail, not succeed quietly: {out}"
+        );
+        assert!(
+            !out.contains("sk-ABC123DEF456GHI789"),
+            "not one byte of the matched content may reach the cage: {out}"
+        );
+        assert!(
+            out.contains("Permission denied") || out.contains("denied"),
+            "the refusal must surface as the open's own errno: {out}"
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn measure_lens_end_to_end() {
+        let dir = TmpDir::new();
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(&tree).expect("make the tree");
+        let body =
+            "fn resolve(path: &Path) -> Option<PathBuf> { path.canonicalize().ok() }\n".repeat(430); // ~30 KiB per file
+        for i in 0..200 {
+            std::fs::write(tree.join(format!("f{i}.rs")), &body).expect("write a file");
+        }
+        let target = tree.to_str().expect("utf-8 path").to_string();
+
+        let t0 = std::time::Instant::now();
+        let bare = std::process::Command::new("/bin/grep")
+            .args(["-rl", "nothing-matches-this", &target])
+            .output()
+            .expect("run grep");
+        let bare_ms = t0.elapsed();
+        assert!(!bare.status.success() || bare.stdout.is_empty());
+
+        let t1 = std::time::Instant::now();
+        let (code, _) = run_with_open_lens(
+            &["/bin/grep", "-rl", "nothing-matches-this", &target],
+            &[r"sk-[A-Za-z0-9]{12,}", r"AKIA[0-9A-Z]{16}"],
+            &tree,
+        );
+        let lens_ms = t1.elapsed();
+
+        println!(
+            "200 files x 30 KiB — bare={bare_ms:>8.2?}  lens={lens_ms:>8.2?}  ratio={:.1}x  code={code:?}",
+            lens_ms.as_secs_f64() / bare_ms.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn a_symlink_to_matching_content_is_refused_like_its_target() {
+        let dir = TmpDir::new();
+        let secret = dir.join("carries.txt");
+        std::fs::write(&secret, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
+        let link = dir.join("innocent.txt");
+        std::os::unix::fs::symlink(&secret, &link).expect("link the fixture");
+
+        let (code, out) = run_with_open_lens(
+            &["/bin/cat", link.to_str().expect("utf-8 fixture path")],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+
+        assert_ne!(
+            code,
+            Some(0),
+            "the kernel is about to follow this link, so the scan must follow it too — otherwise \
+             one `ln -s` walks around the lens: {out}"
+        );
+        assert!(
+            !out.contains("sk-ABC123DEF456GHI789"),
+            "no byte of the linked-to content may reach the cage: {out}"
+        );
+    }
+
+    #[test]
+    fn a_fifo_does_not_wedge_the_supervisor() {
+        let dir = TmpDir::new();
+        let fifo = dir.join("pipe");
+        let cfifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+        // SAFETY: cfifo is a live NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(cfifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        let clean = dir.join("ordinary.txt");
+        std::fs::write(&clean, b"read after the fifo\n").expect("write the fixture");
+
+        // A *reader* on a FIFO with no writer is what blocks — `<>` would block nobody and prove
+        // nothing. The payload therefore issues a plain `O_RDONLY` open under `timeout`, so it parks
+        // in that open and then gives up on its own rather than leaking a process that holds the
+        // harness's pipe. The supervisor is notified of that same open: if it parked with it, the
+        // read that follows would never be decided and this test would hit its deadline.
+        let script = format!(
+            "timeout 1 cat {} >/dev/null 2>&1; cat {}",
+            fifo.to_str().expect("utf-8 fixture path"),
+            clean.to_str().expect("utf-8 fixture path")
+        );
+        let (code, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+
+        assert_eq!(
+            code,
+            Some(0),
+            "an open on a FIFO must not wedge the one thread every other open queues behind: {out}"
+        );
+        assert!(
+            out.contains("read after the fifo"),
+            "the open after the FIFO must still be decided: {out}"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_content_does_not_match_is_read_normally() {
+        let dir = TmpDir::new();
+        let clean = dir.join("ordinary.txt");
+        std::fs::write(&clean, b"just ordinary prose, no credential here\n")
+            .expect("write the fixture");
+
+        let (code, out) = run_with_open_lens(
+            &["/bin/cat", clean.to_str().expect("utf-8 fixture path")],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+
+        assert_eq!(
+            code,
+            Some(0),
+            "a file the patterns do not match must read as it always did: {out}"
+        );
+        assert!(
+            out.contains("just ordinary prose"),
+            "the content must arrive intact: {out}"
+        );
+    }
+
     #[test]
     fn wrap_command_prepends_the_shim_positionally() {
         let cmd = vec![OsString::from("node"), OsString::from("agent.js")];
-        let out = wrap_command(cmd);
+        let out = wrap_command(cmd.clone(), false);
         assert_eq!(
             out,
             vec![
@@ -882,6 +1533,24 @@ mod tests {
                 OsString::from("node"),
                 OsString::from("agent.js"),
             ]
+        );
+    }
+
+    #[test]
+    fn the_open_lens_flag_rides_before_the_separator() {
+        let cmd = vec![OsString::from("node"), OsString::from("agent.js")];
+        let out = wrap_command(cmd, true);
+        assert_eq!(
+            out,
+            vec![
+                OsString::from(SHIM_CAGE_PATH),
+                OsString::from(NOTIF_SOCK_CAGE_PATH),
+                OsString::from(OPEN_LENS_FLAG),
+                OsString::from("--"),
+                OsString::from("node"),
+                OsString::from("agent.js"),
+            ],
+            "the flag must sit between the socket and `--`, where the shim parses its flags: after              the separator it would be handed to the payload as an argument instead"
         );
     }
 
@@ -990,6 +1659,24 @@ mod tests {
         notifs: usize,
         path: Option<&str>,
     ) -> (Option<i32>, Arc<ExecRing>) {
+        run_under_supervisor_notified(
+            payload,
+            policy,
+            overlay,
+            notifs,
+            path,
+            &crate::sandbox::notify_sink::Notifier::disabled(),
+        )
+    }
+
+    fn run_under_supervisor_notified(
+        payload: &[&str],
+        policy: &ProcPolicy,
+        overlay: &ProcOverlay,
+        notifs: usize,
+        path: Option<&str>,
+        notifier: &crate::sandbox::notify_sink::Notifier,
+    ) -> (Option<i32>, Arc<ExecRing>) {
         let dir = TmpDir::new();
         let shim = materialized_shim(&dir);
         let sock_path = dir.join("notif.sock");
@@ -1017,11 +1704,14 @@ mod tests {
                 handle_notif(
                     notif,
                     &req,
-                    policy,
-                    overlay,
-                    &ring,
-                    &pending,
-                    &crate::sandbox::notify_sink::Notifier::disabled(),
+                    &Deciding {
+                        policy,
+                        overlay,
+                        ring: &ring,
+                        pending: &pending,
+                        notifier,
+                        open: None,
+                    },
                 );
             }
         }
@@ -1034,6 +1724,57 @@ mod tests {
     /// The load-bearing enforcement proof, host-side (no cage): a `deny` verdict reaches the syscall
     /// as `EPERM`, so the payload is **never executed** — there is no time-of-check/time-of-use
     /// window on a refusal. The shim reports that refusal as its own exit 126.
+    #[test]
+    fn a_denied_execve_announces_what_the_user_reads() {
+        // The refusal's own words, which nothing else asserted: they are built here and rendered by
+        // the notification path, so a wrong edit to either ships as user-visible text that every
+        // other test still passes over.
+        struct Recorder(Arc<Mutex<Vec<(String, String)>>>);
+        impl crate::sandbox::notify_sink::Sink for Recorder {
+            fn deliver(
+                &mut self,
+                summary: &str,
+                body: &str,
+                _replaces: Option<u32>,
+            ) -> Result<Option<u32>, ()> {
+                self.0
+                    .lock()
+                    .expect("recorder lock")
+                    .push((summary.to_string(), body.to_string()));
+                Ok(None)
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let notifier = crate::sandbox::notify_sink::Notifier::recording(
+            crate::notify::NotifyPolicy::uniform(crate::notify::NotifyMode::Always),
+            Box::new(Recorder(Arc::clone(&seen))),
+        );
+
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
+        let (code, _) = run_under_supervisor_notified(
+            &["/bin/true"],
+            &policy,
+            &ProcOverlay::new(),
+            1,
+            None,
+            &notifier,
+        );
+        assert_eq!(code, Some(126), "the payload must have been refused");
+
+        let announced = seen.lock().expect("recorder lock").clone();
+        let (summary, body) = announced
+            .first()
+            .unwrap_or_else(|| panic!("a denied exec announced nothing: {announced:?}"));
+        assert!(
+            summary.contains("/bin/true"),
+            "the announcement must name the program that was refused: {summary:?}"
+        );
+        assert!(
+            body.contains("exec policy"),
+            "the announcement must say what refused it, in the words the user reads: {body:?}"
+        );
+    }
+
     #[test]
     fn a_denied_execve_returns_eperm_and_the_payload_never_runs() {
         let policy = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/true".to_string()]);
