@@ -52,8 +52,11 @@ every command, apps and profiles, networking/egress, and secrets. Start there.
 It is also a Docusaurus site: `mise run docs` serves it locally with live reload, and
 `mise run docs-serve` serves the built site, which is what the search index needs.
 
-For the design rationale and threat analysis, see the `docs/*.md` design documents (the
-architecture, threat model, and security stack), linked from the guide.
+For the design rationale and the limits, see
+[Decisions and limits](docs-site/docs/guide/concepts/decisions.md): what `sbx` does not do,
+and why it is one process rather than a daemon, bubblewrap rather than raw namespaces, and a
+decrypting proxy by default. The threat analysis lives beside the model it belongs to, in
+[Security model](docs-site/docs/guide/concepts/security-model.md).
 
 ## Build
 

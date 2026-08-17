@@ -97,6 +97,6 @@ the app falls back to software rendering or fails to start. See
 
 Outside this binary, the docs site itself is validated by `mise run docs-build`, which
 treats a broken internal link as an error and refuses to finish. Links that point at
-files **outside** the guide directory (the design documents, `README.md`, the build
-config) must be full GitHub URLs, not relative paths. Read the error it prints: it names
+files **outside** the guide directory (`README.md`, the build config, anything in `src/`)
+must be full GitHub URLs, not relative paths. Read the error it prints: it names
 the page and the link it could not resolve.

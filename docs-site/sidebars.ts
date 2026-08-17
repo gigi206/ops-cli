@@ -26,6 +26,7 @@ const sidebars: SidebarsConfig = {
         'concepts/overview',
         'concepts/architecture',
         'concepts/security-model',
+        'concepts/decisions',
         'concepts/trust',
         'concepts/enforcement',
         'concepts/observability',

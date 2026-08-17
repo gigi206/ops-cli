@@ -5,9 +5,9 @@ sandbox where they can install a project's full dependency set via single-user,
 daemonless [Nix](https://nixos.org/) **without mutating the host OS**.
 
 This guide is the complete, task-oriented documentation. It is split into small,
-cross-linked pages so you can start anywhere and follow the links. For the design
-rationale and threat analysis behind each subsystem, each section links out to the
-[design documents](#design-documents).
+cross-linked pages so you can start anywhere and follow the links. Each subsystem's page
+carries its own rationale and its own limits; what cuts across all of them is gathered in
+[Decisions and limits](concepts/decisions).
 
 > New to `sbx`? Start with [What sbx is](concepts/overview), then
 > [Quick start](getting-started/quickstart).
@@ -26,6 +26,7 @@ rationale and threat analysis behind each subsystem, each section links out to t
 - [What sbx is (and is not)](concepts/overview): the reference class, the two actor modes.
 - [Architecture](concepts/architecture): the map: the boundary, the launch pipeline, the control planes, the plugin chain.
 - [Security model](concepts/security-model): same-uid, confidentiality by absence, the bind layout.
+- [Decisions and limits](concepts/decisions): what sbx does not do, and what would reopen each structural choice.
 - [The trust gate](concepts/trust): the direnv content-hash model, free vs security fields.
 - [Enforcement stack](concepts/enforcement): bubblewrap, seccomp, cgroups, and the egress firewall.
 - [Observability](concepts/observability): the process and filesystem lenses on a running cage.
@@ -154,8 +155,13 @@ rationale and threat analysis behind each subsystem, each section links out to t
 
 ---
 
-## Design documents
+## The why
 
-The guide is the *what* and *how*. The `docs/*.md` design documents in the
-repository are the *why*: the threat model and the architecture decisions behind it. They are referenced from the relevant guide pages; on
-GitHub, browse them in the repository's `docs/` directory.
+The guide is mostly the *what* and *how*, and each page argues its own subject. Two pages
+carry the *why* across subjects: [Decisions and limits](concepts/decisions), which states
+what `sbx` does not do and what would reopen each structural choice, and [Security
+model](concepts/security-model), which holds the threat analysis and names where the
+protection stops.
+
+There is no separate design-document directory. The four that once sat under `docs/` were
+folded into these pages when the site was built, and the pages are now the only copy.

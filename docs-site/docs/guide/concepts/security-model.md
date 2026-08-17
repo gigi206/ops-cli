@@ -227,3 +227,9 @@ layer can undo one below it, this holds for a project you never trusted.
 The other carriers stay open deliberately: the `package.json`, the `Makefile` and the
 workflow files *are* the work. Closing them would close the job. They are reported by the
 feed, and reading the diff is the whole control.
+
+## See also
+
+[Decisions and limits](decisions) gathers the limits stated across the other pages, which
+layers are depth rather than boundary, what a field exposes when it opens a hole, and what
+the egress proxy cannot tell you, alongside the reasons the tool has this shape.

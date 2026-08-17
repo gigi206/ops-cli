@@ -34,6 +34,10 @@ toolchain *and* confines it.
 | Provisions a toolchain | yes (nix + mise) | at build time | yes |
 | Root/daemon required | no | usually | no |
 
+What it does not *do*, as opposed to what it is not, is gathered in [Decisions and
+limits](decisions): the layers that are depth rather than boundary, the holes a field opens
+when you ask for one, and why the shape is one process rather than a daemon.
+
 ## The two actor modes
 
 `sbx` distinguishes two ways a sandbox is used, and the *default* is the locked-down
