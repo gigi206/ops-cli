@@ -775,10 +775,14 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// inside the `cmd`, so it repairs itself exactly as a step does; what they lose is the notice.
 /// And they lose all of it, not a name in a list: both consume the `opencode` bundle, which carries
 /// no step, so their `provisions` is empty and this function returns `None` for a project holding
-/// only them. The roll closes in silence rather than closing with an incomplete sentence, which is
-/// the sharper statement of the same gap and the one to weigh against the cost of closing it. What
-/// bounds that cost: each of the two prints its own restage on stderr as it runs, so what the roll
-/// withholds is the advance notice, not an account of the work.
+/// only them. In a project that also declares one of the bundles that *do* carry a step, the note
+/// prints, names those, and omits these two; in a project that declares neither, the roll closes in
+/// silence. The second outcome is the sharper statement of the same gap and the one to weigh
+/// against the cost of closing it. What bounds that cost is per app, not shared: `aionui`'s guard
+/// runs the staged binary, so a store move trips it and the restage announces itself on stderr,
+/// leaving only the advance notice missing; `open-design`'s install is keyed on the checked-out
+/// commit, which a store move does not change, so on that event it neither re-installs nor says
+/// anything, and what its `cmd` does rewrite unconditionally it rewrites in silence.
 /// That self-repair is a property of the guard each one writes, not of the shape: `aionui`'s guard
 /// tested that the staged tree was *there* rather than that it *ran*, and skipped the repair for as
 /// long as the tree existed. Widening this note to cover them would mean detecting staging inside a

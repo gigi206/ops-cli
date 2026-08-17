@@ -180,12 +180,17 @@ that position, and both consume `opencode`, which carries no step at all: `open-
 which clones its own source, and `aionui`, which stages a read-only runtime out of the store
 into its home.
 
-For those two the consequence is not a narrower channel but a silent one. `sbx upgrade
-provision` has nothing to run, and a roll that moves the store closes without a word rather
-than closing with a list they are missing from. Each still repairs itself at its next launch,
-from the guard in its own `cmd`, and both say on stderr that they are doing it, so what is absent
-is the advance notice rather than the repair or any account of it. Read the announcement above as
-bounded by what a step declares. `open-design` also advances deliberately, with
+For those two `sbx upgrade provision` has nothing to run, and what a roll that moved the store
+says depends on the rest of the project. Declare one of the eight bundles that do carry a step
+and the note prints, names those apps, and leaves these two out; declare neither and it does
+not print at all, so the roll closes without a word.
+
+Each repairs itself from the guard in its own `cmd`, but only one of them tells you. `aionui`'s
+guard runs the staged binary, so a store move trips it and it says on stderr that it is restaging.
+`open-design`'s install is keyed on the checked-out commit, which a store move does not change, so
+on that event it says nothing and re-installs nothing; what it does rewrite every launch, it
+rewrites silently. Read the announcement above as bounded by what a step declares.
+`open-design` also advances deliberately, with
 `sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1`.
 
 `task` folds like the rest: a tool that ships a brokered operation (a fixed command
