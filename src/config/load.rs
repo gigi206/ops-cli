@@ -443,7 +443,7 @@ pub(crate) fn bundles() -> (BTreeMap<String, RawBundle>, Vec<String>) {
 /// TOML, or carrying no `[bundle]` table (the tell-tale of the wrong file — an app *profile*, say,
 /// which is imported with `sbx app import` instead).
 pub(crate) fn read_bundle_fragment(path: &Path) -> Result<BTreeMap<String, RawBundle>, String> {
-    let bytes = safety::read_safe_bytes(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = safety::read_safe_bytes(path).map_err(|e| e.to_string())?;
     let raw = schema::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     if raw.bundle.is_empty() {
         return Err(format!(
@@ -465,7 +465,7 @@ pub(crate) fn read_bundle_fragment(path: &Path) -> Result<BTreeMap<String, RawBu
 pub(crate) fn read_net_groups_fragment(
     path: &Path,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
-    let bytes = safety::read_safe_bytes(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = safety::read_safe_bytes(path).map_err(|e| e.to_string())?;
     let raw = schema::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let groups = groups_of(raw.network);
     if groups.is_empty() {
@@ -497,7 +497,7 @@ fn read_project(
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
         Err(e) => {
-            warnings.push(format!("ignoring {}: {e}", path.display()));
+            warnings.push(format!("ignoring {e}"));
             return None;
         }
     };
@@ -598,7 +598,7 @@ fn read_layer(path: &Path, warnings: &mut Vec<String>) -> Option<RawConfig> {
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => {
-            warnings.push(format!("ignoring {}: {e}", path.display()));
+            warnings.push(format!("ignoring {e}"));
             None
         }
     }
@@ -903,7 +903,7 @@ fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<St
         let bytes = match safety::read_safe_bytes(&path) {
             Ok(b) => b,
             Err(e) => {
-                warnings.push(format!("ignoring profile {}: {e}", path.display()));
+                warnings.push(format!("ignoring profile {e}"));
                 continue;
             }
         };

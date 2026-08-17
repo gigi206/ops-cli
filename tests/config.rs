@@ -1260,6 +1260,32 @@ fn a_malformed_project_config_is_ignored_not_fatal() {
 }
 
 #[test]
+fn a_config_that_fails_the_safety_gate_is_named_once_and_dropped() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // The refusal a user is most likely to meet, and it used to print the path twice: the gate names
+    // the file it failed on, so whoever renders that error must not prefix it again.
+    let fx = Fixture::new();
+    fx.write_project("network = \"shared\"\n");
+    let path = fx.proj.path().join(".sbx.toml");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success(), "an unsafe config must not hard-fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to load config: world-writable"),
+        "the refusal must say why:\n{stderr}"
+    );
+    let named = stderr.matches(&*path.display().to_string()).count();
+    assert_eq!(named, 1, "the path must be named exactly once:\n{stderr}");
+    assert!(
+        !stdout.contains("shared"),
+        "the layer must be dropped, not applied:\n{stdout}"
+    );
+}
+
+#[test]
 fn a_world_writable_project_config_is_skipped() {
     use std::os::unix::fs::PermissionsExt;
     let fx = Fixture::new();

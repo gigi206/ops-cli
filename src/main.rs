@@ -784,9 +784,8 @@ fn persist_egress_rule(
             (
                 1,
                 format!(
-                    "wrote the rule but could not re-trust {}: {e} — run `sbx trust {}` so it \
+                    "wrote the rule but could not re-trust {e} — run `sbx trust {}` so it \
                      takes effect",
-                    path.display(),
                     config::PROJECT_CONFIG
                 ),
             )
@@ -848,9 +847,8 @@ fn persist_proc_rule(
             (
                 1,
                 format!(
-                    "wrote the rule but could not re-trust {}: {e} — run `sbx trust {}` so it \
+                    "wrote the rule but could not re-trust {e} — run `sbx trust {}` so it \
                      takes effect",
-                    path.display(),
                     config::PROJECT_CONFIG
                 ),
             )

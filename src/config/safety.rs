@@ -61,6 +61,14 @@ pub(crate) fn check_safe_file(f: &std::fs::File, path: &Path) -> io::Result<()> 
 /// One open serves the `fstat` and the read, so the validated metadata and the
 /// consumed bytes cannot belong to two different files (the trust hash and the
 /// later parse act on exactly these bytes).
+///
+/// **Every error returned names the file**, so a caller renders it under an action and does not
+/// prefix the path a second time: `ignoring {e}`, `cannot trust {e}`, `cannot read {e}`. The gate
+/// names the file, the caller names the action. It has to be this way round because the gate is the
+/// only layer that knows *which* file failed when a caller reads several under one verb: a trust
+/// verdict covers a sibling mise file, and "refusing to load config" about the wrong one of the two
+/// is worse than unhelpful. A caller that also renders errors of its own (a parse failure, a store
+/// write) names the path in those, since nothing else will.
 pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;

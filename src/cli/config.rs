@@ -2875,7 +2875,7 @@ fn config_edit(args: &[OsString]) -> ExitCode {
                     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                     println!("{}", render_trusted_whole_file(&path, &pal));
                 }
-                Err(e) => diag::warn(&format!("could not trust {}: {e}", path.display())),
+                Err(e) => diag::warn(&format!("could not trust {e}")),
             },
             None => diag::warn("no trust store available; cannot --trust"),
         }
@@ -2929,7 +2929,7 @@ fn report_write_trust(
                     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                     println!("{}", render_trusted_whole_file(path, &pal));
                 }
-                Err(e) => diag::warn(&format!("could not trust {}: {e}", path.display())),
+                Err(e) => diag::warn(&format!("could not trust {e}")),
             },
             None => diag::warn("no trust store available; cannot --trust"),
         }

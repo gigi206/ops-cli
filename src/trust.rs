@@ -257,6 +257,22 @@ pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
 /// mise file is refused rather than blessed, and the hash covers exactly the gated
 /// bytes of both.
 pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
+    // Every error out of this function opens with the file it is about, so a caller can name the
+    // action alone (`could not re-trust {e}`) instead of prefixing a path the message already
+    // carries. The two reads get that from the safety gate, which is also the only layer that knows
+    // *which* of the two files failed (the config, or the sibling mise file its hash covers); the
+    // store-side failures are given it here, plus the store path, because "the marker could not be
+    // written" is a different fact from "this file cannot be read" and the reader needs both.
+    let store_err = |e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{}: cannot write its trust marker under {}: {e}",
+                config_path.display(),
+                store_dir.display()
+            ),
+        )
+    };
     let sbx_bytes = crate::config::safety::read_safe_bytes(config_path)?;
     let mise_inputs = mise_inputs_for(config_path)?;
     let hash = content_hash(&sbx_bytes, &mise_inputs);
@@ -271,11 +287,12 @@ pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
         DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(store_dir)?;
-        std::fs::set_permissions(store_dir, Permissions::from_mode(0o700))?;
+            .create(store_dir)
+            .map_err(&store_err)?;
+        std::fs::set_permissions(store_dir, Permissions::from_mode(0o700)).map_err(&store_err)?;
     }
     let body = format!("{}\n{}\n", canonical_string(config_path), hash);
-    std::fs::write(marker_path(store_dir, config_path), body)
+    std::fs::write(marker_path(store_dir, config_path), body).map_err(&store_err)
 }
 
 /// Remove any trust marker for `config_path`. Returns whether one existed, so the
@@ -293,6 +310,38 @@ pub(crate) fn untrust(store_dir: &Path, config_path: &Path) -> io::Result<bool> 
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    #[test]
+    fn both_error_families_open_with_the_file_they_are_about() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // A caller renders these under an action alone (`cannot trust {e}`), so an error that does
+        // not name its file leaves the reader with none. The gate supplies that for the read side;
+        // the store side is the branch that would otherwise come back pathless, and it also has to
+        // say which of the two facts failed, since "cannot read this config" and "cannot write its
+        // marker" call for different remedies.
+        let tmp = TmpDir::new();
+        let cfg = tmp.join("sbx.toml");
+        std::fs::write(&cfg, b"network = \"none\"\n").unwrap();
+
+        let loose = tmp.join("loose.toml");
+        std::fs::write(&loose, b"network = \"none\"\n").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let err = trust(&tmp.join("store"), &loose).unwrap_err().to_string();
+        assert!(err.starts_with(&*loose.display().to_string()), "{err}");
+        assert_eq!(
+            err.matches(&*loose.display().to_string()).count(),
+            1,
+            "named once: {err}"
+        );
+
+        let ro = tmp.join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = trust(&ro.join("store"), &cfg).unwrap_err().to_string();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.starts_with(&*cfg.display().to_string()), "{err}");
+        assert!(err.contains("cannot write its trust marker under"), "{err}");
+    }
 
     #[test]
     fn hash_bytes_is_sha256_hex() {

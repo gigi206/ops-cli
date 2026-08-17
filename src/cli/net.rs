@@ -3453,8 +3453,7 @@ fn persist_egress_removal(
                     (
                         1,
                         format!(
-                            "removed the rule but could not re-trust {}: {e} — run `sbx trust {}`",
-                            path.display(),
+                            "removed the rule but could not re-trust {e} — run `sbx trust {}`",
                             config::PROJECT_CONFIG
                         ),
                     )

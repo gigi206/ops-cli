@@ -82,7 +82,7 @@ fn record_trust(path: std::path::PathBuf) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            crate::diag::error(&format!("sbx: cannot trust {}: {e}", path.display()));
+            crate::diag::error(&format!("sbx: cannot trust {e}"));
             ExitCode::FAILURE
         }
     }

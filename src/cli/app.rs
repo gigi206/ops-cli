@@ -389,7 +389,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let bytes = match config::safety::read_safe_bytes(src_path) {
         Ok(b) => b,
         Err(e) => {
-            diag::error(&format!("sbx: cannot read {}: {e}", src_path.display()));
+            diag::error(&format!("sbx: cannot read {e}"));
             return ExitCode::FAILURE;
         }
     };
