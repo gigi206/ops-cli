@@ -102,8 +102,8 @@ and its exit status.
 ### A step runs on every launch, so write it idempotent
 
 sbx does not remember that a step succeeded. It cannot: what proves an install finished is
-a path only the step knows — a rebuilt addon under a package's install directory, a binary
-under the app's home — and sbx would have to be told which, which is a second field that
+a path only the step knows (a rebuilt addon under a package's install directory, a binary
+under the app's home), and sbx would have to be told which, which is a second field that
 says what the step already knows. So the guard stays in the step, in the shape bundles
 already use:
 
@@ -113,7 +113,7 @@ provision = ["bash", "-c", "[ -e \"$HOME/.local/bin/tool\" ] || install-tool"]
 
 Without that guard the step repeats on every launch: harmless for a rebuild that checks
 its own output, wasteful for a download, and slow either way. The guard also self-heals,
-which a remembered flag would not — delete what it guards and the next launch puts it
+which a remembered flag would not: delete what it guards and the next launch puts it
 back.
 
 This is the one part sbx does not own, and it would take one thing to change that: a way
@@ -253,7 +253,7 @@ dropped silently. Nothing was lost.
 
 ## The shipped bundles
 
-The repository ships one bundle per tool — a CLI, a desktop build, a web UI's engine — under
+The repository ships one bundle per tool (a CLI, a desktop build, a web UI's engine) under
 `examples/bundle/`, each the single source of truth for what that agent needs: the namesake profile in
 `examples/app/` names it with `use` and no longer restates the requirements; a test pins the two
 together, so they cannot drift apart:
@@ -262,8 +262,8 @@ together, so they cannot drift apart:
 sbx bundle import examples/bundle/opencode.toml
 ```
 
-A bundle may itself reference shared egress groups with `@name` (its header then says
-`REQUIRES egress groups — import them once`): import those too, from
+A bundle may itself reference shared egress groups with `@name` (its header then opens with
+`REQUIRES egress groups`): import those too, from
 `examples/net-groups/`,
 with `sbx net groups import`.
 
@@ -341,7 +341,7 @@ what a tool *needs*, and the consuming app keeps its own command and its own pos
 [What a bundle may carry](#what-a-bundle-may-carry-and-what-it-may-not).
 
 Every shipped profile now names a bundle with `use`: 64 of the 71 name their own, and the
-other 7 consume **another** agent's, because nothing would ever compose them in turn —
+other 7 consume **another** agent's, because nothing would ever compose them in turn:
 `t3code` names `claude-code`; `aionui`, `opencode-web`, `open-design` and `orca-desktop`
 name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profile is a
 one-step import any more: importing one alone leaves its bundle (and any group that
