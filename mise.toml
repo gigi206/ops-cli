@@ -54,6 +54,23 @@ run = "cargo fmt --check"
 description = "Run clippy over all targets, denying warnings"
 run = "cargo clippy --all-targets -- -D warnings"
 
+[tasks.rustdoc]
+description = "Build the crate's own rustdoc, denying warnings (a doc reference that resolves to nothing)"
+# `--document-private-items` is not a nicety here: sbx is a binary crate, so without it rustdoc
+# documents almost nothing and the guard guards nothing.
+#
+# What it catches is a reference in a doc comment that names a symbol which was renamed, moved, or
+# never existed. rustdoc drops the link and renders the label as plain code font, so a normal build
+# never says the pointer is dead — and a confident, false pointer costs the reader more than no
+# pointer at all. It also catches the two ways a reference is lost silently: one that is ambiguous
+# (`load` is both a module and a function here, so the form has to say which), and one written on a
+# `mod` declaration, whose outer doc comment merges with the module's own header and moves the whole
+# block's resolution into the declaring module's scope.
+#
+# `RUSTDOCFLAGS` takes part in cargo's fingerprint, so a warm `target/doc` built without it does not
+# short-circuit this. An unchanged tree does, which is what keeps it cheap to chain.
+run = 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items'
+
 [tasks.test]
 description = "Run the full test suite and report the tests that skipped for want of a prerequisite"
 # Locally this runs the integration e2e too where the host can sandbox. CI runs
@@ -155,8 +172,8 @@ cargo clippy --bins --features bundled-nix,bundled-bwrap -- -D warnings
 '''
 
 [tasks.ci]
-description = "Full local reproduction of the CI pipeline (fmt + lint + test)"
-depends = ["fmt", "lint", "test"]
+description = "Full local reproduction of the CI pipeline (fmt + lint + rustdoc + test)"
+depends = ["fmt", "lint", "rustdoc", "test"]
 
 [tasks.docs-install]
 description = "Install the Docusaurus docs-site dependencies into docs-site/node_modules (Node tool + pinned npm packages from [tools])"

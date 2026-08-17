@@ -1,6 +1,6 @@
 # CI — runs on every push and pull request.
 #
-# Mirrors `mise run ci` (fmt + clippy + test). Unlike the local full run, the
+# Mirrors `mise run ci` (fmt + clippy + rustdoc + test). Unlike the local full run, the
 # integration e2e that need userns + nix + network are skipped on a hosted
 # runner; here they are simply not selected unless their source file changed.
 #
@@ -52,6 +52,19 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+
+  rustdoc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--document-private-items` is required, not decorative: this is a binary crate, so without
+      # it rustdoc documents almost nothing and the job passes over a tree full of dead references.
+      - run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
   test:
     name: test (change-driven)

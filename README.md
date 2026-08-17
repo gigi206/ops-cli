@@ -106,6 +106,7 @@ profiles (`sbx app import <file>`); see [`examples/README.md`](examples/README.m
 ```sh
 mise run fmt     # cargo fmt --check
 mise run lint    # cargo clippy --all-targets -- -D warnings
+mise run rustdoc # cargo doc with -D warnings (a doc reference that resolves to nothing)
 mise run test    # cargo test (the heavy sandbox e2e skip without userns/nix/network)
 mise run ci      # all of the above
 ```
