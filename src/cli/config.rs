@@ -843,6 +843,20 @@ fn grants_section(view: &config::view::ConfigView, pal: &style::Palette) -> Opti
             provenance_tag(view.fs_origin, pal)
         );
     }
+    if !view.fs_scan.is_empty() {
+        // The ceiling rides the same line: a refusal rests on how far the scan read, so a reader
+        // asking which shapes are closed is asking that at the same time.
+        let ceiling = match view.fs_scan_max_kb {
+            Some(kb) => format!("first {kb} KiB of each file"),
+            None => "built-in ceiling".to_string(),
+        };
+        let _ = writeln!(
+            o,
+            "  {h}fs scan:{r} {} {dim}(content closed at every open; {ceiling}){r}{}",
+            view.fs_scan.join(", "),
+            provenance_tag(view.fs_origin, pal)
+        );
+    }
     if !view.fs_readonly.is_empty() {
         let _ = writeln!(
             o,
@@ -1497,6 +1511,9 @@ fn apps_section(
         if !app.fs_deny.is_empty() {
             let _ = writeln!(o, "      {dim}fs deny:{r} {}", app.fs_deny.join(", "));
         }
+        if !app.fs_scan.is_empty() {
+            let _ = writeln!(o, "      {dim}fs scan:{r} {}", app.fs_scan.join(", "));
+        }
         if !app.fs_readonly.is_empty() {
             let _ = writeln!(
                 o,
@@ -2002,6 +2019,17 @@ fn render_app_detail(
             o,
             "  {h}fs deny:{r} {} {dim}(closed to the cage){r}{fs_tag}",
             view.fs_deny.join(", ")
+        );
+    }
+    if !view.fs_scan.is_empty() {
+        let ceiling = match view.fs_scan_max_kb {
+            Some(kb) => format!("first {kb} KiB of each file"),
+            None => "built-in ceiling".to_string(),
+        };
+        let _ = writeln!(
+            o,
+            "  {h}fs scan:{r} {} {dim}(content closed at every open; {ceiling}){r}{fs_tag}",
+            view.fs_scan.join(", ")
         );
     }
     if !view.fs_readonly.is_empty() {
@@ -3104,6 +3132,8 @@ mod tests {
             tasks: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -3675,6 +3705,8 @@ mod tests {
             fs_deny: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -3911,6 +3943,7 @@ mod tests {
             provisions: Vec::new(),
             fs_deny: Vec::new(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
             ssh_agent: Vec::new(),
             name: name.into(),
             cmd: Some(name.into()),
@@ -3977,6 +4010,8 @@ mod tests {
             tasks: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -4047,6 +4082,7 @@ mod tests {
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
+                fs_scan: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -4114,6 +4150,8 @@ mod tests {
             tasks: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -4165,6 +4203,7 @@ mod tests {
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
+                fs_scan: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -4243,6 +4282,7 @@ mod tests {
             provisions: Vec::new(),
             fs_deny: Vec::new(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
             ssh_agent: Vec::new(),
             name: name.into(),
             cmd: Some(name.into()),
@@ -4272,6 +4312,8 @@ mod tests {
             tasks: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -4359,6 +4401,8 @@ mod tests {
             tasks: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -4410,6 +4454,7 @@ mod tests {
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
+                fs_scan: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -4488,6 +4533,8 @@ mod tests {
             tasks: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -4539,6 +4586,7 @@ mod tests {
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
+                fs_scan: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
@@ -4617,6 +4665,8 @@ mod tests {
             tasks: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -4668,6 +4718,7 @@ mod tests {
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
+                fs_scan: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),

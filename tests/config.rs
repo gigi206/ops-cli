@@ -4952,6 +4952,54 @@ fn a_stale_string_dbus_value_is_rejected_never_silently_opening_a_portal() {
 }
 
 #[test]
+fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
+    // A refusal at the open sends a reader straight to `config show` to ask which shape closed the
+    // file and how far the scan read. Both have to be there, or the surface says less than the
+    // launch enforces. Same ungated path as the masks: `scan` only ever closes content of the
+    // project it is declared in, so an untrusted project may set it.
+    let fx = Fixture::new();
+    fx.write_project(
+        "[network]\nmode = \"deny\"\n\n[fs]\nscan = [\"sk-[A-Za-z0-9]{20,}\"]\nscan_max_kb = 256\n",
+    );
+
+    let out = fx.run(&["config", "show"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("fs scan: sk-[A-Za-z0-9]{20,}"),
+        "an untrusted project's content scan must apply and be shown:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("256 KiB"),
+        "the ceiling decides what a clean verdict rests on, so it belongs beside the shapes:\n{stdout}"
+    );
+
+    // Unset leaves the built-in ceiling, and says so rather than leaving a reader to guess.
+    let fx = Fixture::new();
+    fx.write_project("[fs]\nscan = [\"AKIA[0-9A-Z]{16}\"]\n");
+    let stdout = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).into_owned();
+    assert!(
+        stdout.contains("built-in ceiling"),
+        "an unbounded-by-config scan still has a ceiling, and the surface must name it:\n{stdout}"
+    );
+
+    // A pattern that is not a regex is dropped with a warning naming what is lost, and is never
+    // presented as effective — the same fail-open honesty a refused mask gets.
+    let fx = Fixture::new();
+    fx.write_project("[fs]\nscan = [\"(unclosed\"]\n");
+    let out = fx.run(&["config", "show"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no file is closed"),
+        "a dropped pattern fails open, so the warning has to say so:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("fs scan:"),
+        "the refused pattern must not be presented as effective"
+    );
+}
+
+#[test]
 fn fs_masks_are_honored_untrusted_and_surfaced_in_config_show() {
     // `[fs]` inverts the rule every other security table follows: it is honored from an *untrusted*
     // project, because it can only close paths of the project it is declared in. Dropping it there

@@ -122,6 +122,12 @@ pub(crate) struct ConfigView {
     /// (`[fs] readonly`), each as the entry that declared it. Empty when no layer closed anything.
     pub(crate) fs_deny: Vec<String>,
     pub(crate) fs_readonly: Vec<String>,
+    /// The credential shapes a project file's content is scanned for (`[fs] scan`), as the layers
+    /// wrote them. Empty when no layer named one, which is also when no scan runs at all.
+    pub(crate) fs_scan: Vec<String>,
+    /// How much of one file the scan reads, in KiB, when a layer bounded it below the built-in
+    /// ceiling. `None` leaves that ceiling, which is what a reader should not have to guess at.
+    pub(crate) fs_scan_max_kb: Option<u64>,
     /// Which layer supplied the masks (`Default` when no config did).
     pub(crate) fs_origin: ProvenanceView,
     /// The declared operations (`[task.<name>]`) a cage would offer, after the trust gate. This is
@@ -806,6 +812,8 @@ pub(crate) struct AppView {
     /// baseline-merged set. Empty when it closes none.
     pub(crate) fs_deny: Vec<String>,
     pub(crate) fs_readonly: Vec<String>,
+    /// The shapes this overlay scans for over the baseline — its *own* entries.
+    pub(crate) fs_scan: Vec<String>,
     /// The ssh-agent keys this overlay grants over the baseline — its *own* entries, not the
     /// baseline-merged set. Empty when it names none; the merge unions it with the baseline only for
     /// the launch itself.
@@ -885,6 +893,9 @@ pub(crate) struct AppDetailView {
     /// app closed nothing of its own (it takes the baseline's masks).
     pub(crate) fs_deny: Vec<String>,
     pub(crate) fs_readonly: Vec<String>,
+    /// The effective scan set — the app's own ∪ the baseline's, under the tighter ceiling.
+    pub(crate) fs_scan: Vec<String>,
+    pub(crate) fs_scan_max_kb: Option<u64>,
     pub(crate) fs_origin: ProvenanceView,
     /// The effective ssh-agent grant — the app's own ∪ the baseline's. The origin is `Inherited`
     /// when the app named no key of its own (it signs with whatever the baseline granted).
@@ -1119,6 +1130,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         devices_origin: resolved.devices_origin.into(),
         fs_deny: resolved.fs.deny.clone(),
         fs_readonly: resolved.fs.readonly.clone(),
+        fs_scan: resolved.fs.scan.clone(),
+        fs_scan_max_kb: resolved.fs.scan_max_kb,
         fs_origin: resolved.fs_origin.into(),
         tasks: task_views(&resolved.tasks),
         ssh_agent: resolved.ssh_agent.clone(),
@@ -1466,6 +1479,7 @@ fn app_view(
         devices: device_paths(&app.devices),
         fs_deny: app.fs.deny.clone(),
         fs_readonly: app.fs.readonly.clone(),
+        fs_scan: app.fs.scan.clone(),
         ssh_agent: app.ssh_agent.clone(),
         limits: app_limits_view(&app.limits),
         secrets: if injects {
@@ -1731,6 +1745,8 @@ fn app_detail_view(
         devices_origin,
         fs_deny: eff_fs.deny,
         fs_readonly: eff_fs.readonly,
+        fs_scan: eff_fs.scan,
+        fs_scan_max_kb: eff_fs.scan_max_kb,
         fs_origin,
         ssh_agent: eff_ssh_agent,
         ssh_agent_origin,
@@ -1939,6 +1955,8 @@ mod tests {
             fs_deny: Vec::new(),
             fs_origin: Default::default(),
             fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            fs_scan_max_kb: None,
             notify: Default::default(),
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
@@ -2027,6 +2045,7 @@ mod tests {
                 provisions: Vec::new(),
                 fs_deny: Vec::new(),
                 fs_readonly: Vec::new(),
+                fs_scan: Vec::new(),
                 ssh_agent: Vec::new(),
                 name: "demo-app".into(),
                 cmd: Some("demo-app".into()),
