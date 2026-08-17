@@ -84,6 +84,12 @@ description = "Run the full test suite and report the tests that skipped for wan
 #
 # The log is truncated first — a killed run leaves its own behind — and read only after every test
 # binary has finished, since `cargo test` runs them one target at a time.
+#
+# `--no-fail-fast` is load-bearing. Without it cargo stops at the first target that reports a
+# failure and every later test binary never runs at all: one red test in `tests/run.rs` takes the
+# five suites that sort after it with it, and the report then shows a suite with a single problem
+# rather than a suite whose tail was never asked. A green run is identical either way — every binary
+# ran — so the flag costs nothing except on the runs that have something to say.
 run = '''
 set -uo pipefail
 LOG="${SBX_SKIP_LOG:-target/test-skips.log}"
@@ -92,7 +98,7 @@ mkdir -p "$(dirname "$LOG")"
 export SBX_SKIP_LOG="$LOG"
 
 rc=0
-cargo test || rc=$?
+cargo test --no-fail-fast || rc=$?
 
 n=$(wc -l < "$LOG" | tr -d ' ')
 if [ "$n" -gt 0 ]; then

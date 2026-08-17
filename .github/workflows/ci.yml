@@ -118,11 +118,17 @@ jobs:
             esac
           done
 
+          # `--no-fail-fast` throughout: without it cargo stops at the first target that reports a
+          # failure, so one red test hides every later binary and the check reports a suite with one
+          # problem instead of a suite whose tail was never asked. A green run is identical either
+          # way. The per-suite loop below keeps going for the same reason, remembering the code.
+          rc=0
+
           if [ "$CORE_CHANGED" -eq 1 ]; then
             echo "::notice::core change detected — running the full test suite"
             # See the comment below: the systemd `systemd-run` dollar-escape test
             # is host-dependent and fails on the ubuntu-24.04 hosted runner.
-            cargo test -- --skip sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim
+            cargo test --no-fail-fast -- --skip sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim || rc=$?
           else
             echo "::notice::no core change — running unit tests (--bins) only"
             # The dollar-escape unit test asserts the behaviour of the host's
@@ -130,14 +136,16 @@ jobs:
             # versions: it fails on the ubuntu-24.04 hosted runner while passing
             # on other hosts. Skip it here so the hosted suite is deterministic;
             # it stays enabled in local full runs.
-            cargo test --bins -- --skip sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim
+            cargo test --bins --no-fail-fast -- --skip sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim || rc=$?
             if [ "${#TESTS_CHANGED[@]}" -gt 0 ]; then
               echo "::notice::changed integration test files: ${TESTS_CHANGED[*]}"
               for t in "${TESTS_CHANGED[@]}"; do
-                cargo test --test "$t"
+                cargo test --test "$t" --no-fail-fast || rc=$?
               done
             fi
           fi
+
+          exit $rc
 
       - name: Report the tests that reported ok without running
         if: always()
