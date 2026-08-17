@@ -41,7 +41,7 @@ pub(crate) struct LogView<E: 'static> {
     pub(crate) verb: &'static str,
     /// The help page printed on a usage error.
     pub(crate) page: &'static [&'static str],
-    /// What the session resolver calls this command, in "no live session '<id>'" and in the listing
+    /// What the session resolver calls this command, in `no live session '<id>'` and in the listing
     /// it prints when several are live. Deliberately not derived from [`verb`](LogView::verb): the
     /// three spell it differently today, and it is user-visible text.
     pub(crate) session_verb: &'static str,

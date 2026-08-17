@@ -42,7 +42,7 @@ pub(crate) fn load(cwd: &Path) -> Resolved {
 }
 
 /// Resolve the configuration for `cwd` restricted to `source`'s layers. `load_scoped(cwd,
-/// Source::All)` is [`load`] — the launch and full-view path; the restricted forms read fewer
+/// Source::All)` is [`load()`] — the launch and full-view path; the restricted forms read fewer
 /// config files but are otherwise byte-identical (same plugins, mise gating, bind
 /// canonicalization, and warning assembly), so a single-source view stays a faithful slice of
 /// the same resolution rather than a parallel code path.
@@ -621,7 +621,7 @@ pub(super) fn global_path() -> Option<PathBuf> {
 }
 
 /// The imported-profiles directory (`…/sbx/apps/`), a sibling of the global config. `None` when
-/// no config base resolves, like [`global_path`]; `sbx app import`/`rm`/`list` and [`load`] all
+/// no config base resolves, like [`global_path`]; `sbx app import`/`rm`/`list` and [`load()`] all
 /// route through this one place so the location can never drift.
 pub(crate) fn profiles_dir() -> Option<PathBuf> {
     global_path().and_then(|p| p.parent().map(|d| d.join(PROFILES_DIR)))
@@ -859,9 +859,9 @@ fn read_profile_apps(warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
 
 /// Read every `<name>.toml` profile under `dir`, keyed by its filename stem (the app name). Each
 /// file is a standalone top-level [`schema::RawApp`], trusted by location. Infallible, like the
-/// rest of [`load`]: an absent directory yields nothing; an unsafe, unparseable, or unsafely-named
-/// file is dropped with a warning, never aborting the load. Entries are processed in sorted order
-/// so warnings are deterministic.
+/// rest of [`mod@load`]: an absent directory yields nothing; an unsafe, unparseable, or
+/// unsafely-named file is dropped with a warning, never aborting the load. Entries are processed in
+/// sorted order so warnings are deterministic.
 fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
     let mut out = BTreeMap::new();
     let entries = match std::fs::read_dir(dir) {

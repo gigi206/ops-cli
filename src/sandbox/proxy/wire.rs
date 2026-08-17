@@ -60,7 +60,7 @@ pub(super) fn parse_head(bytes: &[u8]) -> io::Result<Head> {
 ///
 /// [`parse_head`] splits on CRLF *and* on a bare LF, so no LF survives into a name or a value. A lone
 /// CR does — the trim only reaches the ends — and so does a NUL. Every inspected request is then
-/// written out again by [`reserialize_request`](super::reserialize_request), which emits each name
+/// written out again by [`reserialize_request`], which emits each name
 /// and value verbatim.
 ///
 /// That re-serialization is what makes sbx's own reading of a request authoritative, and it is what

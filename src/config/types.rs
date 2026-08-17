@@ -214,7 +214,7 @@ pub(crate) struct MiseConfig {
     /// The project's trust verdict — a mise file is honored only when `Trusted`.
     pub(crate) state: TrustState,
     /// The `(filename, bytes)` of each mise file, read once through the safety gate
-    /// in [`load`] — the *exact* bytes the trust hash was computed over. The launcher
+    /// in [`load()`] — the *exact* bytes the trust hash was computed over. The launcher
     /// materializes these for mise rather than letting it re-read from disk, so mise
     /// sees precisely the authorized, already-hashed content (closing the window
     /// between the trust check and the read). Empty when no mise file was safely

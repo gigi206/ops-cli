@@ -44,9 +44,10 @@
 //! there, fail-closed; this module only rejects a *structural* error (a `--limit` with no `=`, a
 //! `--bind` with an empty path).
 //!
-//! Fail-closed: unlike [`super::load`], which is infallible (a bad config warns and is dropped), a
-//! malformed override is an explicit request the user got wrong — [`collect`] returns `Err`, so the
-//! launch aborts rather than silently dropping the field and running a different posture than asked.
+//! Fail-closed: unlike [`super::load()`], which is infallible (a bad config warns and is dropped),
+//! a malformed override is an explicit request the user got wrong — [`collect`] returns `Err`, so
+//! the launch aborts rather than silently dropping the field and running a different posture than
+//! asked.
 
 use super::schema::{
     self, NetworkField, NetworkTable, NotifyField, ProcField, RawBind, RawBindTable, RawConfig,

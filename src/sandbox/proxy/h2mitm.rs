@@ -7,7 +7,7 @@
 //!
 //! Security parity with the HTTP/1.1 path is the invariant, and since the verdict was folded it is
 //! no longer a parity that has to be maintained by hand: every stream goes through
-//! [`decide_https`](super::decide_https), the same function the tunnel and the absolute-form forward
+//! [`decide_https`], the same function the tunnel and the absolute-form forward
 //! call, so there is one policy decision rather than three that must be kept in step. This path
 //! passes [`AskPosture::RefuseUnsupported`](super::AskPosture), which is the single way it diverges —
 //! see the call site for why it cannot park. The `:authority`

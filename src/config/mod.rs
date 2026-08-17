@@ -10,7 +10,7 @@
 //! The layering and gating ([`resolve`]) are pure — they turn already-read configs
 //! and an already-decided trust verdict into the resolved set of environment and
 //! binds — so the whole policy matrix is unit-testable without touching the
-//! filesystem. [`load`] is the thin I/O around it, and is the one place that ties
+//! filesystem. [`load()`] is the thin I/O around it, and is the one place that ties
 //! a project's bytes, its trust verdict, and its parse together so all three act
 //! on the same inode.
 
@@ -246,7 +246,7 @@ pub(crate) struct Resolved {
     /// Extra host paths to bind, each read-only or read-write.
     pub(crate) binds: Vec<Bind>,
     /// Which layer each effective bind came from, keyed by the *canonical* path `binds`
-    /// lists (re-keyed after canonicalization in [`load`], so the lookup matches the displayed
+    /// lists (re-keyed after canonicalization in [`load()`], so the lookup matches the displayed
     /// path). A display affordance for `sbx config`, recorded only at the baseline.
     pub(crate) bind_layer: BTreeMap<PathBuf, Provenance>,
     /// Declared tools, in declaration order, each tagged with its source's trust.
@@ -281,7 +281,7 @@ pub(crate) struct Resolved {
     pub(crate) nixpkgs_project: Option<String>,
     /// The project's mise file, when one is present beside a `.sbx.toml`. Its tools
     /// are resolved (trusted-only) by a later stage; here it records the file's
-    /// presence and the gating verdict. Discovered in [`load`] (it is I/O), so the
+    /// presence and the gating verdict. Discovered in [`load()`] (it is I/O), so the
     /// pure [`resolve`] always leaves it `None`.
     pub(crate) mise: Option<MiseConfig>,
     /// The resolved network posture: the default (`Shared`) unless the global config
@@ -499,7 +499,7 @@ pub(crate) struct ResolvedApp {
     pub(crate) home_scope: AppHomeScope,
     /// Extra environment, in application order; folded over the baseline's so the app wins.
     pub(crate) env: Vec<(String, String)>,
-    /// Extra host binds this app adds (absolute; canonicalized in [`load`], like the baseline),
+    /// Extra host binds this app adds (absolute; canonicalized in [`load()`], like the baseline),
     /// each read-only or read-write.
     pub(crate) binds: Vec<Bind>,
     /// Extra tools, each tagged with its source's trust; override a baseline tool by name.

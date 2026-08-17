@@ -3210,8 +3210,8 @@ fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Palette) -> St
 /// pass through clean for scripting). Unlike a launch, this enters namespaces bubblewrap already
 /// built (via `setns`), so it provisions nothing and re-resolves no config; it re-applies the cage's
 /// confinement (seccomp denylist + `no_new_privs` + capability drop) so the joined process is
-/// confined at least as tightly as the agent. See [`super::attach`] for the mechanism and its one
-/// inherent residual (the command binary comes from the agent's own mount namespace).
+/// confined at least as tightly as the agent. See [`mod@super::attach`] for the mechanism and its
+/// one inherent residual (the command binary comes from the agent's own mount namespace).
 pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     let Some(layout) = Layout::from_env() else {
         eprintln!(
