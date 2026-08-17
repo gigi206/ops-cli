@@ -116,7 +116,15 @@ needs no re-trust. See [`sbx config`](../cli/config).
 
 Before its bytes are read and hashed, a config file must pass a **safety gate**: it
 must be a plain, owner-owned, non-world-writable regular file. A file that fails this
-is unverifiable and treated fail-closed (the trust command refuses; a launch reports
-it untrusted). The same gate protects the open file descriptor whose bytes are then
-hashed, so the validated metadata and the consumed bytes are one inode (no
-time-of-check/time-of-use window).
+is unverifiable and treated fail-closed: `sbx trust` refuses it, and a launch drops
+that layer entirely with a warning on stderr rather than applying it. The same gate
+protects the open file descriptor whose bytes are then hashed, so the validated
+metadata and the consumed bytes are one inode (no time-of-check/time-of-use window).
+
+Every surface that reads a config passes the same gate, so they cannot disagree about
+which files exist to be acted on: the layers a launch loads, the `@<file>` form of a
+[one-shot override](../configuration/overrides), and the files the editing verbs
+rewrite. `sbx config set` on a file a launch would drop refuses instead of reporting a
+success no launch would honour. The one verb that still opens such a file is
+[`sbx config edit`](../cli/config), which hands the path to your `$EDITOR` and never
+reads it itself, so a file that has not been vetted stays repairable.

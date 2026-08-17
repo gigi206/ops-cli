@@ -32,8 +32,11 @@ pub(crate) enum Scope {
 pub(crate) enum ManageError {
     /// No global config directory could be determined for a `--global` operation.
     NoGlobalDir,
-    /// Reading the target file failed (an I/O error other than "absent").
-    Read(PathBuf, String),
+    /// Reading the target file failed (an I/O error other than "absent"), or it did not pass the
+    /// config safety gate. Unlike its siblings this variant carries no path, because every error
+    /// [`super::safety::read_safe_bytes`] returns already names the file it failed on: the gate
+    /// names the file, the caller names the action.
+    Read(String),
     /// Writing the target file failed.
     Write(PathBuf, String),
     /// The existing file is not valid TOML, so it cannot be edited without clobbering it.
@@ -155,7 +158,7 @@ impl std::fmt::Display for ManageError {
                     "no global config directory (set XDG_CONFIG_HOME or HOME)"
                 )
             }
-            ManageError::Read(p, e) => write!(f, "cannot read {}: {e}", p.display()),
+            ManageError::Read(e) => write!(f, "cannot read {e}"),
             ManageError::Write(p, e) => write!(f, "cannot write {}: {e}", p.display()),
             ManageError::Parse(p, e) => write!(f, "{} is not valid TOML: {e}", p.display()),
             ManageError::BadKey(k) => write!(f, "invalid key {k:?}"),
@@ -1144,13 +1147,25 @@ fn split_key(key: &str) -> Result<Vec<String>, ManageError> {
 
 /// Parse the file into an editable document, treating an absent file as an empty one (so a `set`
 /// can create it and a `get`/`unset` simply finds nothing).
+///
+/// The bytes come through [`super::safety::read_safe_bytes`], the gate a launch applies to every
+/// config file, so the edit plane and the launch plane agree on which files exist to be acted on.
+/// They used not to: a plain `read_to_string` here meant `sbx config set` rewrote a world-writable
+/// `.sbx.toml` and reported success on a file the loader then refused, `sbx config get` printed a
+/// value no launch would use, and a non-regular target stalled the verb in the open with no
+/// diagnostic at all (`-c <fifo>` hung until killed).
+///
+/// `sbx config edit` is unaffected and remains the way to open a file that has not been vetted: it
+/// never reads the file itself, it hands the path to `$EDITOR`. What the gate refuses here is a
+/// *silent* edit of a file whose owner or mode says its content is not exclusively yours.
 fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => text
+    match super::safety::read_safe_bytes(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map_err(|e| ManageError::Parse(path.to_path_buf(), e.to_string()))?
             .parse::<DocumentMut>()
             .map_err(|e| ManageError::Parse(path.to_path_buf(), e.to_string())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
-        Err(e) => Err(ManageError::Read(path.to_path_buf(), e.to_string())),
+        Err(e) => Err(ManageError::Read(e.to_string())),
     }
 }
 
@@ -1397,6 +1412,42 @@ mod tests {
         assert_eq!(get(&p, "env.FOO").unwrap().as_deref(), Some("bar"));
         assert_eq!(get(&p, "env.MISSING").unwrap(), None);
         assert_eq!(get(&p, "absent").unwrap(), None);
+    }
+
+    #[test]
+    fn an_edit_refuses_what_a_launch_would_refuse_to_load() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // The two planes have to agree on which files exist to be acted on. A world-writable config
+        // is dropped with a warning at load, so rewriting it here and reporting success would leave
+        // the user with an edit no launch will ever read.
+        let tmp = crate::testutil::TmpDir::new();
+        let loose = doc_at(tmp.path(), "network = \"none\"\n");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let err = set(&loose, "env.FOO", "bar").unwrap_err().to_string();
+        assert!(
+            err.contains("refusing to load config: world-writable"),
+            "{err}"
+        );
+        // The gate names the file, the variant does not: exactly one occurrence of the path.
+        assert_eq!(
+            err.matches(&*loose.display().to_string()).count(),
+            1,
+            "the path must be named once: {err}"
+        );
+        assert!(get(&loose, "network").is_err(), "the read verb refuses too");
+        assert_eq!(
+            std::fs::read_to_string(&loose).unwrap(),
+            "network = \"none\"\n",
+            "a refused edit must not have written"
+        );
+
+        // A FIFO used to hang the verb in the open, with no diagnostic at all. Were the gate's open
+        // blocking, this call would deadlock rather than fail.
+        let fifo = tmp.join("fifo.toml");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+        let err = get(&fifo, "network").unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 
     #[test]
