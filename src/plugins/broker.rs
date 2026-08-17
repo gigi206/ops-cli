@@ -206,9 +206,9 @@ pub(crate) struct BrokerSpec {
     /// opening a pinentry for a passphrase answers when the human does, and 30 seconds is a typing
     /// speed rather than a fault.
     ///
-    /// So the manifest raises it, bounded by [`MAX_HOST_DEADLINE`], and the number is a property of
-    /// the protocol rather than of the machine: what waits is sbx, and how long a resource may take
-    /// is the one thing only the protocol knows.
+    /// So the manifest raises it, bounded by [`MAX_HOST_DEADLINE_SECS`], and the number is a
+    /// property of the protocol rather than of the machine: what waits is sbx, and how long a
+    /// resource may take is the one thing only the protocol knows.
     pub(crate) host_deadline: std::time::Duration,
     /// Whether the plugin also rules on the frames coming *back* from the host resource.
     ///

@@ -469,8 +469,8 @@ enum Advance {
     ProjectWide(&'static str),
     /// Neither. An inline `[flakes.<name>]` pins its inputs inside its own source and rebuilds when
     /// that source changes, so no channel advances it — and `sbx upgrade flake` deliberately skips
-    /// it ([`sandbox::flake_packages`] excludes the variant). Naming `flake` for one would send the
-    /// reader to a command that cannot move it.
+    /// it (`sandbox::packages::flake_packages` excludes the variant). Naming `flake` for one would
+    /// send the reader to a command that cannot move it.
     Floating,
 }
 

@@ -324,7 +324,7 @@ pub(crate) struct Resolved {
     /// Which layer supplied the winning `gui` posture (`Default` when neither config set it).
     pub(crate) gui_origin: Provenance,
     /// The IANA zone the cage's clock reads in, when a layer named one. `None` leaves the cage on
-    /// the built-in default ([`crate::sandbox::binds::DEFAULT_ZONE`]), which is a real zone and not
+    /// the built-in default (`sandbox::binds::DEFAULT_ZONE`), which is a real zone and not
     /// an absence — the cage always carries the database and the `/etc/localtime` link. **Not a
     /// security field** (see [`schema::RawConfig::timezone`]): the value only tells the cage what
     /// to display, and `[env] TZ` is already free, so gating it would buy nothing. Syntactically
@@ -2470,7 +2470,7 @@ fn validate_redact_min_len(warnings: &mut Vec<String>, source: &str, value: u64)
 }
 
 /// Validate a `timezone` value into the zone name the cage will link `/etc/localtime` to, dropping
-/// a malformed one with a warning (the cage keeps [`crate::sandbox::binds::DEFAULT_ZONE`]).
+/// a malformed one with a warning (the cage keeps `sandbox::binds::DEFAULT_ZONE`).
 ///
 /// This is the **syntactic** half only: the name is interpolated into a path under the cage's zone
 /// database, so it is held to what an IANA zone name can be — one or more `/`-separated segments of

@@ -106,7 +106,8 @@ pub(super) const CAGE_LOCALTIME: &str = "/etc/localtime";
 /// The zone a cage runs in when no config named one. UTC, not "absent": a cage with no
 /// `/etc/localtime` fails an FHS zone resolver outright, and this is the one zone that is a real,
 /// resolvable answer while disclosing nothing about where the host is. Naming a different zone is
-/// the user's call ([`crate::config::Config::timezone`]), because *which* zone is a location signal.
+/// the user's call ([`crate::config::Resolved::timezone`]), because *which* zone is a location
+/// signal.
 pub(crate) const DEFAULT_ZONE: &str = "UTC";
 
 /// Where the synthetic ssh client config is bound read-only. This is OpenSSH's compiled-in

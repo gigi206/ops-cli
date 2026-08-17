@@ -17,8 +17,8 @@
 //! returns the retained events (a `dropped=` line when a `--follow` cursor fell behind the ring, a
 //! `head=` cursor, then one `event …` line each) then `ok`; `LOG after=<seq>` returns only events
 //! past that cursor. The free-text `detail` is emitted **last** on an event line and taken verbatim
-//! by the reader; [`sanitize_detail`] strips it of control characters first, so it can never inject
-//! a second line.
+//! by the reader; [`super::lens::sanitize_detail`] strips it of control characters first, so it can
+//! never inject a second line.
 
 use std::io;
 use std::os::unix::net::UnixListener;
@@ -83,8 +83,8 @@ impl super::lens::Event for AgentEvent {
     }
 
     /// The fixed fields are `key=value` tokens; `detail` is emitted **last** and taken verbatim by
-    /// the reader, since it carries spaces. [`sanitize_detail`] has already stripped it of control
-    /// characters, so it cannot close the line and forge a second event.
+    /// the reader, since it carries spaces. [`super::lens::sanitize_detail`] has already stripped it
+    /// of control characters, so it cannot close the line and forge a second event.
     fn format_line(&self) -> String {
         format!(
             "event seq={} at={} kind={} detail={}\n",

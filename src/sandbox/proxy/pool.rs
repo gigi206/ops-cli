@@ -28,8 +28,8 @@
 //!
 //! The residual, stated plainly: an upstream may close a parked connection at any moment. The
 //! checkout probe catches that whenever the close has already arrived, which is the overwhelmingly
-//! common case, and [`MAX_IDLE`] keeps a connection from waiting long enough to make it likely. What
-//! remains is the window between the probe and the write — microseconds against an idle period
+//! common case, and that idle bound keeps a connection from waiting long enough to make it likely.
+//! What remains is the window between the probe and the write — microseconds against an idle period
 //! measured in seconds. A request that loses that race gets a `502`, named as such, rather than a
 //! silent empty response.
 

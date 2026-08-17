@@ -1018,7 +1018,7 @@ pub(crate) struct RawServiceReady {
     /// The port the service listens on, reached at `127.0.0.1` inside the cage.
     pub(crate) tcp: u16,
     /// How long to wait before giving up and starting the app regardless — a duration like `"30s"`,
-    /// the same grammar as `ask_timeout`. Omitted, [`READY_TIMEOUT_DEFAULT`] applies.
+    /// the same grammar as `ask_timeout`. Omitted, [`super::types::READY_TIMEOUT_DEFAULT`] applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeout: Option<String>,
 }

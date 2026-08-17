@@ -118,22 +118,23 @@ pub(crate) struct ProxyCtx {
     pub(super) flows: Option<Arc<crate::sandbox::control::FlowRegistry>>,
     /// The number of raw L4 (`tcp://`) splices currently open. Each splice holds a host thread (and
     /// its fds) for the connection's lifetime, so this caps how many an in-cage agent can open at
-    /// once (see [`MAX_CONCURRENT_SPLICES`](super::MAX_CONCURRENT_SPLICES)); the inspected L7 path never touches it. Shared across
-    /// connection threads through the [`Arc<ProxyCtx>`] the serve loop clones.
+    /// once (see `splice::MAX_CONCURRENT_SPLICES`); the inspected L7 path never touches it. Shared
+    /// across connection threads through the [`Arc<ProxyCtx>`] the serve loop clones.
     pub(super) splices: AtomicUsize,
     /// The number of connection-handling threads currently live. Each in-cage connection spawns a
     /// host thread (and holds host fds), so this caps how many an in-cage agent can open at once
-    /// (see [`MAX_CONCURRENT_CONNS`](super::MAX_CONCURRENT_CONNS)) — a burst of connections cannot exhaust host threads/fds and
-    /// take the whole session's egress down. Shared through the `Arc<ProxyCtx>`.
+    /// (see [`Self::max_conns`], the launch's `[network] max_connections`) — a burst of connections
+    /// cannot exhaust host threads/fds and take the whole session's egress down. Shared through the
+    /// `Arc<ProxyCtx>`.
     pub(super) conns: AtomicUsize,
     /// The bytes currently reserved across every connection for buffering a **request body**.
     ///
-    /// Per request the buffer is bounded by [`CHUNKED_REQUEST_CAP`](super::CHUNKED_REQUEST_CAP),
-    /// but that bound is per request: [`MAX_CONCURRENT_CONNS`](super::MAX_CONCURRENT_CONNS) of them
-    /// can be in flight at once, and the proxy runs **host-side**, outside the cage's own memory
-    /// cgroup (`cgroup::wrap` puts bwrap in the scope, not the supervisor). Without a shared
-    /// ceiling an in-cage agent could make the host allocate the product of the two. See
-    /// [`HELD_BODY_BUDGET`](super::HELD_BODY_BUDGET).
+    /// Per request the buffer is bounded by `BodyLimits::per_request` (the launch's `[network]
+    /// body_max_mb`), but that bound is per request: [`Self::max_conns`] of them can be in flight at
+    /// once, and the proxy runs **host-side**, outside the cage's own memory cgroup (`cgroup::wrap`
+    /// puts bwrap in the scope, not the supervisor). Without a shared ceiling an in-cage agent could
+    /// make the host allocate the product of the two. The sum is what [`super::BodyLimits`] bounds,
+    /// through its `total`.
     pub(super) held_bodies: std::sync::atomic::AtomicU64,
     /// The `sbx app <name>` this launch runs, if any — used only to scope the `sbx net allow`
     /// suggestion in a `denied-default` refusal body to the app (`--app <name>`). `None` for a bare

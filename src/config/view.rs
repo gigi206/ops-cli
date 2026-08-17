@@ -87,7 +87,7 @@ pub(crate) struct ConfigView {
     /// Which layer supplied the GUI posture (`Default` when neither config set it).
     pub(crate) gui_origin: ProvenanceView,
     /// The IANA zone the cage's clock reads in. Always a zone, never absent: the built-in
-    /// [`crate::sandbox::binds::DEFAULT_ZONE`] when no layer named one.
+    /// `sandbox::binds::DEFAULT_ZONE` when no layer named one.
     pub(crate) timezone: String,
     /// Which layer named the zone (`Default` when none did).
     pub(crate) timezone_origin: ProvenanceView,

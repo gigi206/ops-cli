@@ -22,14 +22,15 @@
 //! installing is refused on both sides of that state, so the only way to reach it is to place a
 //! plugin directory by hand, and the conflict is then reported (not merely warned about) by
 //! `sbx plugins list` and `sbx plugins info <scheme>`.
+//!
+//! The remote signed-store subsystem lives alongside the registry: [`catalogue`] is the
+//! offline Ed25519 trust core, and [`stores`] is the impure git-driven fetch/verify/cache
+//! shell around it. [`origin`] records where each installed plugin came from, which a manifest
+//! (identical whatever the source) cannot say.
+//! [`broker`] and [`signer`] hold the two plugin types that are not resolvers: a filter in front
+//! of a host resource, and a value-former at an HTTP request's auth point. The registry indexes
+//! both by name rather than by scheme, because neither claims a ref namespace.
 
-/// The remote signed-store subsystem lives alongside the registry: [`catalogue`] is the
-/// offline Ed25519 trust core, and [`stores`] is the impure git-driven fetch/verify/cache
-/// shell around it. [`origin`] records where each installed plugin came from, which a manifest
-/// (identical whatever the source) cannot say.
-/// [`broker`] and [`signer`] hold the two plugin types that are not resolvers: a filter in front
-/// of a host resource, and a value-former at an HTTP request's auth point. The registry indexes
-/// both by name rather than by scheme, because neither claims a ref namespace.
 pub(crate) mod broker;
 pub(crate) mod catalogue;
 pub(crate) mod origin;

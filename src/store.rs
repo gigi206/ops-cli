@@ -1421,7 +1421,7 @@ pub(crate) fn provision(
 /// Provision a **user-declared** attribute, permitting an **unfree** licence.
 ///
 /// Despite the name this is not a special case taken for known-proprietary packages: it is the
-/// single path every `nix:` entry in `[packages]` takes ([`crate::sandbox::packages`]), free or
+/// single path every `nix:` entry in `[packages]` takes (`sandbox::packages`), free or
 /// not. sbx cannot know a licence before evaluating, and an attribute is not asked twice, so the
 /// allowance is decided by *who named the attribute* rather than by what its licence turns out to
 /// be. A free package builds through here byte for byte as it would through [`provision`]; the

@@ -903,8 +903,9 @@ impl Head {
 /// [`BodyLimits::per_request`] bounds one body; this bounds their sum. The distinction matters because
 /// the proxy is host-side: [`crate::sandbox::cgroup::wrap`] puts *bwrap* in the launch's systemd
 /// scope, so the cage's `MemoryMax` governs the cage and not the supervisor holding these buffers.
-/// Without a shared ceiling, [`MAX_CONCURRENT_CONNS`] requests each buffering a maximal body would
-/// have the host allocate the product of the two — a denial of service an in-cage agent reaches
+/// Without a shared ceiling, as many requests as [`ProxyCtx::max_conns`] admits (`[network]
+/// max_connections`, which a launch may raise) each buffering a maximal body would have the host
+/// allocate the product of the two — a denial of service an in-cage agent reaches
 /// with nothing more than an allowed host and concurrency.
 ///
 /// The ceiling is **derived** from the number below rather than picked as a round figure, because
@@ -1006,7 +1007,8 @@ const POOL_HOLD_MAX: u64 = 256 * 1024;
 
 /// The reason token a request refused for want of buffer budget carries. Its own token, and a
 /// `503` rather than a `4xx`, because nothing is wrong with the request: the proxy is holding other
-/// bodies right now and will take this one when it is not — the same shape as [`MAX_CONCURRENT_SPLICES`].
+/// bodies right now and will take this one when it is not — the same shape as
+/// `splice::MAX_CONCURRENT_SPLICES`.
 const BODY_BUFFER_CAP: &str = "body-buffer-cap";
 
 /// A reservation against [`BodyLimits::total`], released when it drops.

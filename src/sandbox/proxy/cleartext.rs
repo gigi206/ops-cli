@@ -12,14 +12,14 @@ use super::*;
 /// / port / path / method / the outbound-secret tripwire / the SSRF guard), but on a connection with
 /// **no TLS**: no CONNECT tunnel, no leaf minted, no upstream certificate to validate, and — because
 /// a bearer must never travel in the clear — **no credential injection** (a secret host can only be
-/// an inspected-over-TLS `to`, so [`matching_injections`] is skipped entirely, not merely trusted to
-/// return empty). Injection and *observation* part company here: this plane injects nothing and
-/// still calls [`Credentials::observe_head`], because what it learns is what scopes that value on
-/// every other plane. The request is forwarded to the origin server in **origin-form** with the client's
-/// own `Host`, and the one response is streamed back. Every failure path is fail-closed with the same
-/// [`write_refusal`] reason categories the MITM path uses, so the agent tells a policy refusal from an
-/// unreachable host. `head_bytes` is the raw head (for the byte-exact secret tripwire); `head` is its
-/// parse.
+/// an inspected-over-TLS `to`, so `egress::resolve_injections` is skipped entirely, not merely
+/// trusted to return empty). Injection and *observation* part company here: this plane injects
+/// nothing and still calls [`Credentials::observe_head`], because what it learns is what scopes that
+/// value on every other plane. The request is forwarded to the origin server in **origin-form** with
+/// the client's own `Host`, and the one response is streamed back. Every failure path is fail-closed
+/// with the same [`write_refusal`] reason categories the MITM path uses, so the agent tells a policy
+/// refusal from an unreachable host. `head_bytes` is the raw head (for the byte-exact secret
+/// tripwire); `head` is its parse.
 pub(super) fn handle_cleartext(
     mut client: UnixStream,
     head: &Head,
