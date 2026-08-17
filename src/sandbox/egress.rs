@@ -130,8 +130,18 @@ pub(crate) struct Wiring {
 /// `exec`s the real command — which therefore stays the cage's main process, leaving
 /// an interactive `sbx run`'s pty job control unchanged. The command rides `"$@"` positionally, so
 /// nothing the agent controls is ever interpolated into the script (no shell injection,
-/// non-UTF-8 argv preserved); only sbx-owned ASCII store paths and the fixed port/socket
-/// go into the script string.
+/// non-UTF-8 argv preserved).
+///
+/// The rest of the script string is sbx-owned ASCII — the socat store path, the fixed port and
+/// socket — with one exception worth naming rather than leaving to be rediscovered: each `tcp://`
+/// destination's host goes in verbatim through [`tcp_forwarders`]. That one is a value from a rule,
+/// so it is safe by **charset**, not by ownership. A name that reaches the plan has passed the
+/// grammar's hostname production (alphanumerics, `-` and `.` between labels), and every IP literal
+/// but IPv4 loopback is dropped from the plan with a reason — which is also what keeps an IPv6
+/// literal's `:` out of a socat clause it would split. Adding a value here that holds to neither
+/// property would need the treatment [`ssh_config_host_ok`] gives its own: re-checked at the
+/// emitter, because there the stakes (a `Host` line is a pattern, not a name) do not allow resting
+/// on a property proved a layer away.
 pub(crate) fn wrap_command(
     socat: &Path,
     bash: &Path,
@@ -1716,6 +1726,38 @@ mod tests {
         assert!(plan.connect_only.is_empty(), "{:?}", plan.connect_only);
         assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
         assert!(plan.skipped[0].contains("::1"), "{:?}", plan.skipped);
+    }
+
+    /// An address the netns cannot hold is dropped from the plan with its reason, and this is also
+    /// the branch that keeps an IPv6 literal's colons out of the `PROXY:127.0.0.1:<host>:<port>`
+    /// clause [`wrap_command`] builds, where they would split the clause into another address
+    /// entirely.
+    ///
+    /// The ports are unprivileged on purpose. A privileged one leaves by the ssh path first and the
+    /// literal is never examined, which is why the neighbouring test covers a different branch than
+    /// its `::1` suggests.
+    #[test]
+    fn an_ip_literal_the_cage_cannot_hold_never_reaches_a_listener() {
+        for rule in ["tcp://[::1]:5432", "tcp://192.0.2.10:5432"] {
+            let plan = tcp_destinations(&tcp_policy(&[rule]));
+
+            assert!(
+                plan.destinations.is_empty(),
+                "{rule} got a listener: {:?}",
+                plan.destinations
+            );
+            assert!(
+                plan.connect_only.is_empty(),
+                "{rule} got a CONNECT: {:?}",
+                plan.connect_only
+            );
+            assert_eq!(plan.skipped.len(), 1, "{rule}: {:?}", plan.skipped);
+            assert!(
+                plan.skipped[0].contains("cannot hold"),
+                "{rule} must say why: {:?}",
+                plan.skipped
+            );
+        }
     }
 
     /// What cannot be given a listener is reported, never dropped in silence: the rule still governs
