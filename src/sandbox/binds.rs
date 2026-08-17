@@ -3058,9 +3058,8 @@ mod smoke {
         let cmd = vec![
             userland.shell_bin.clone().into_os_string(),
             OsString::from("-c"),
-            // resolve the synthetic user, show `/usr` is the minimal synthetic tree (only
-            // `bin`, never the host's), show `/usr/bin/env` resolves into sbx's store, list
-            // the project
+            // resolve the synthetic user, list `/usr` whole (the minimal synthetic tree, never
+            // the host's), show `/usr/bin/env` resolves into sbx's store, list the project
             OsString::from(
                 "id -un; echo USR=$(ls /usr | tr '\\n' ','); echo ENV=$(readlink /usr/bin/env); ls",
             ),
@@ -3109,11 +3108,13 @@ mod smoke {
             stdout.contains("sandbox"),
             "synthetic identity not resolved:\n{stdout}"
         );
-        // hermetic: `/usr` is the minimal synthetic tree — only `bin` (which holds the
-        // `env` symlink and the `xdg-open` stub), never the host's `/usr` (which would carry `lib`/`share`/…
-        // alongside). The cage synthesises `/usr/bin/env` and nothing else under `/usr`.
+        // hermetic: `/usr` is the minimal synthetic tree — `bin` (the `env` symlink and the
+        // `xdg-open` stub) and `share` (the zone database), each one the cage staged itself, never
+        // the host's `/usr`, which would carry `lib`, `local`, `sbin`, … alongside. Matched as the
+        // whole line: `ls` sorts, `bin` sorts first, so a `contains("USR=bin,")` holds even on a
+        // full host `/usr` — the leak this is here to catch.
         assert!(
-            stdout.contains("USR=bin,"),
+            stdout.lines().any(|l| l == "USR=bin,share,"),
             "/usr is not the minimal synthetic tree (host /usr may have leaked):\n{stdout}"
         );
         // `/usr/bin/env` is the synthetic symlink into sbx's store, so an interpreted

@@ -222,15 +222,26 @@ fn run_executes_commands_in_a_hermetic_sandbox() {
         String::from_utf8_lossy(&ls.stdout)
     );
 
-    // hermetic: `/usr` is the minimal synthetic tree — it holds only `bin` (which carries the
-    // `/usr/bin/env` symlink and the `/usr/bin/xdg-open` stub), never the host's `/usr`, which
-    // would expose `lib`/`share`/… alongside. (That `/usr/bin/env` resolves an interpreted
-    // shebang is proven separately by `a_usr_bin_env_shebang_resolves_in_the_cage`.)
+    // hermetic: `/usr` is the minimal synthetic tree — two entries, each one sbx staged itself,
+    // never the host's `/usr`, which would expose `lib`, `local`, `sbin`, … alongside. `bin` carries
+    // the `/usr/bin/env` symlink and the `/usr/bin/xdg-open` stub; `share` carries the zone database
+    // and, as the next assertion pins, nothing else. Matched as the whole listing rather than a
+    // prefix of it, so an entry staged under `/usr` later has to come past this test. (That
+    // `/usr/bin/env` resolves an interpreted shebang is proven separately by
+    // `a_usr_bin_env_shebang_resolves_in_the_cage`.)
     let usr = run_in(project.path(), data.path(), &["ls", "/usr"]);
+    let usr_out = String::from_utf8_lossy(&usr.stdout);
+    let usr_entries: Vec<&str> = usr_out.split_whitespace().collect();
     assert!(
-        usr.status.success() && String::from_utf8_lossy(&usr.stdout).trim() == "bin",
-        "/usr is not the minimal synthetic tree (host /usr may have leaked): {}",
-        String::from_utf8_lossy(&usr.stdout)
+        usr.status.success() && usr_entries == ["bin", "share"],
+        "/usr is not the minimal synthetic tree (host /usr may have leaked): {usr_out}"
+    );
+    let share = run_in(project.path(), data.path(), &["ls", "/usr/share"]);
+    let share_out = String::from_utf8_lossy(&share.stdout);
+    let share_entries: Vec<&str> = share_out.split_whitespace().collect();
+    assert!(
+        share.status.success() && share_entries == ["zoneinfo"],
+        "/usr/share is not just sbx's zone database: {share_out}"
     );
     // a host-`/usr` subtree a leak would expose is absent
     let usr_lib = run_in(project.path(), data.path(), &["ls", "/usr/lib"]);
